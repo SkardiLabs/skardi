@@ -6,8 +6,8 @@
 **The Declarative Data Contract Execution Layer for AI and Agents**<br/>
 **Turn SQL queries into live API endpoints — connect CSV, Parquet, PostgreSQL, MySQL, MongoDB, Iceberg, Lance, and S3 in a single query.**
 
-[CI]: https://github.com/BtXin/skardi/actions/workflows/ci.yml
-[CI Badge]: https://github.com/BtXin/skardi/actions/workflows/ci.yml/badge.svg
+[CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
+[CI Badge]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml/badge.svg
 
 [![CI Badge]][CI]
 
