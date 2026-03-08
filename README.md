@@ -574,7 +574,7 @@ docker run --rm -p 8080:8080 skardi
 
 ```bash
 # Clone the repository
-git clone https://github.com/BtXin/skardi.git
+git clone https://github.com/SkardiLabs/skardi.git
 cd skardi
 
 # Build server
