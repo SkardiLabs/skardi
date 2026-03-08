@@ -1,0 +1,8 @@
+metadata:
+  name: "insert_product"
+  version: "1.0"
+  description: "Insert a single product"
+
+query: |
+  INSERT INTO products (product_id, name, category, price, in_stock)
+  VALUES ({product_id}, {name}, {category}, {price}, {in_stock})

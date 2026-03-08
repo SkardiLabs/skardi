@@ -1,0 +1,18 @@
+metadata:
+  name: "federated_join_and_insert"
+  version: "1.0"
+  description: "Join CSV orders with MySQL users (filtered by name) and write aggregated results to MySQL"
+
+query: |
+  INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+  SELECT
+    u.id as user_id,
+    u.name as user_name,
+    u.email as user_email,
+    COUNT(o.order_id) as total_orders,
+    SUM(o.amount) as total_spent,
+    MAX(o.order_date) as last_order_date
+  FROM users u
+  INNER JOIN csv_orders o ON u.id = o.user_id
+  WHERE u.name = {name}
+  GROUP BY u.id, u.name, u.email

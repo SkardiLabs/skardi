@@ -1,0 +1,7 @@
+metadata:
+  name: "delete_user"
+  version: "1.0"
+  description: "Delete a user from the PostgreSQL users table by name"
+
+query: |
+  DELETE FROM users WHERE name = {name}

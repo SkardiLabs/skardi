@@ -1,0 +1,19 @@
+[package]
+name = "skardi-engine"
+version.workspace = true
+edition.workspace = true
+description = "Engine abstraction layer for query execution"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+arrow = { workspace = true }
+tracing = { workspace = true }

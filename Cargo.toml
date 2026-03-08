@@ -1,0 +1,74 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+description = "High performance query engine for both offline compute and online serving"
+authors = ["btnokami"]
+repository = "https://github.com/BtXin/skardi"
+homepage = "hhttps://github.com/BtXin/skardi"
+license = "Apache-2.0"
+
+[workspace]
+members = [ "crates/cli",
+            "crates/engine",
+            "crates/source",
+            "crates/model",
+            "crates/pipeline",
+            "crates/server"]
+
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+arrow = { version = "57.0.1", features = [
+    "prettyprint",
+    "chrono-tz",
+] }
+arrow-json = { version = "57.0.1" }
+async-trait = "0.1.88"
+axum = "0.7"
+ctor = "0.4.1"
+datafusion = { version = "52.1.0", default-features = true }
+datafusion-common = { version = "52.1.0" }
+datafusion-federation = "0.5.1"
+datafusion-substrait = "52.1.0"
+datafusion-table-providers = { version = "0.10.0", default-features = false, features = ["postgres", "mysql"] }
+env_logger = "0.11"
+futures = "0.3"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "e844d823c3834e3b9cbb98bdd4c0b4638fdc5b80" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "e844d823c3834e3b9cbb98bdd4c0b4638fdc5b80" }
+insta = { version = "1.41.1", features = ["glob", "filters"] }
+lance = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-beta.7" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-beta.7" }
+log = "0.4.27"
+object_store = { version = "0.12.4", default-features = false, features = ["aws", "gcp", "azure", "http"] }
+parking_lot = "0.12"
+parquet = { version = "57.0.1", default-features = false, features = [
+    "arrow",
+    "async",
+    "object_store",
+] }
+regex = "1.8"
+rstest = "0.25.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+skardi-engine = { path = "crates/engine" }
+sqlparser = "0.55.0"
+substrait = "0.27"
+tempfile = "3.23.0"
+tokio = { version = "1.44.2", features = ["macros", "rt", "sync"] }
+tower = "0.4"
+tower-http = "0.5"
+tract-onnx = "0.21"
+tracing = "0.1"
+url = "2.5.4"
+uuid = { version = "1.4", features = ["v4", "serde"] }
+
+[workspace.lints.clippy]
+# Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
+large_futures = "warn"
+used_underscore_binding = "warn"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
+unused_qualifications = "deny"

@@ -1,0 +1,46 @@
+  # PostgreSQL Data Source Example (commented out - uncomment and configure to use)
+  # Requires a running PostgreSQL instance with accessible tables
+data_sources:
+  - name: "products"
+    type: "postgres"
+    connection_string: "postgresql://localhost:5432/test?sslmode=disable"
+    options:
+      table: "products"              # Required: table name to register
+      schema: "public"                # Optional: schema name (default: "public")
+      user_env: "PG_USER"             # Optional: environment variable for username
+      pass_env: "PG_PASSWORD"         # Optional: environment variable for password
+    description: "PostgreSQL users table with federation query push-down"
+  #
+  # Connection String Format:
+  #   postgresql://[host][:port][/dbname][?param1=value1&...]
+  #   IMPORTANT: Username and password should NOT be included in the connection string.
+  #   Use user_env and pass_env options to specify environment variables for credentials.
+  #
+  # Options:
+  #   - table: (required) table name to register
+  #   - schema: (optional) schema name (default: "public")
+  #   - user_env: (optional) environment variable name for username
+  #              If not specified, no username will be used for authentication
+  #   - pass_env: (optional) environment variable name for password
+  #              If not specified, no password will be used for authentication
+  #
+  # Supported Query Parameters:
+  #   - sslmode: disable, allow, prefer, require, verify-ca, verify-full
+  #   - connect_timeout: connection timeout in seconds
+  #   - application_name: application name for PostgreSQL logs
+  #
+  # Features:
+  #   - Automatic schema inference from PostgreSQL table
+  #   - Federation query push-down for optimal performance
+  #   - Support for complex queries with joins across multiple tables
+  #   - Full DataFusion SQL compatibility
+  #
+  # Example with environment variables for credentials (recommended):
+  # - name: "postgres_orders"
+  #   type: "postgres"
+  #   connection_string: "postgresql://prod-db.example.com:5432/ecommerce?sslmode=require&connect_timeout=10"
+  #   options:
+  #     table: "orders"
+  #     schema: "sales"
+  #     user_env: "DB_USERNAME"
+  #     pass_env: "DB_PASSWORD"

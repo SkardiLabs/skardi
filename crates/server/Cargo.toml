@@ -1,0 +1,38 @@
+[package]
+name = "skardi-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "skardi-server"
+path = "src/main.rs"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-json = { workspace = true }
+async-trait = "0.1"
+axum = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.4", features = ["derive"] }
+datafusion = { workspace = true }
+datafusion-federation = { workspace = true }
+lance = { workspace = true }
+object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+skardi-engine = { path = "../engine" }
+pipeline = { path = "../pipeline" }
+source = { path = "../source" }
+model = { path = "../model" }
+anyhow = "1.0"
+thiserror = "1.0"
+tokio = { workspace = true, features = ["full"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

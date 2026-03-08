@@ -1,0 +1,41 @@
+data_sources:
+  # MySQL data sources
+  - name: "users"
+    type: "mysql"
+    access_mode: "read_write"
+    connection_string: "mysql://localhost:3306/mydb"
+    description: "MySQL users table"
+    options:
+      table: "users"
+      user_env: "MYSQL_USER"
+      pass_env: "MYSQL_PASSWORD"
+      ssl_mode: "disabled"
+
+  - name: "orders"
+    type: "mysql"
+    connection_string: "mysql://localhost:3306/mydb"
+    description: "MySQL orders table"
+    options:
+      table: "orders"
+      schema: "mydb"
+      user_env: "MYSQL_USER"
+      pass_env: "MYSQL_PASSWORD"
+      ssl_mode: "disabled"
+
+  - name: "user_order_stats"
+    type: "mysql"
+    access_mode: "read_write"
+    connection_string: "mysql://localhost:3306/mydb"
+    description: "MySQL table for aggregated user order statistics"
+    options:
+      table: "user_order_stats"
+      user_env: "MYSQL_USER"
+      pass_env: "MYSQL_PASSWORD"
+      ssl_mode: "disabled"
+
+  # CSV data source (for federated query demo)
+  - name: "csv_orders"
+    type: "csv"
+    access_mode: "read_only"
+    path: "crates/server/demo/sample_data/orders.csv"
+    description: "CSV file containing order data"

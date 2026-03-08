@@ -1,0 +1,11 @@
+metadata:
+  name: "insert_products_from_select"
+  version: "1.0"
+  description: "Insert multiple products from a VALUES clause"
+
+query: |
+  INSERT INTO products (product_id, name, category, price, in_stock)
+  SELECT * FROM (VALUES
+    ({product_id_1}, {name_1}, {category_1}, {price_1}, {in_stock_1}),
+    ({product_id_2}, {name_2}, {category_2}, {price_2}, {in_stock_2})
+  ) AS t(product_id, name, category, price, in_stock)

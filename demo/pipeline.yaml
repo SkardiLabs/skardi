@@ -1,0 +1,31 @@
+metadata:
+  name: product-search-demo
+  version: 1.0.0
+  description: Demonstrates SQL serving pipeline for product search and filtering
+  author: Skardi Demo
+  created_at: 2025-01-15T00:00:00.000+00:00
+  updated_at: 2025-01-15T00:00:00.000+00:00
+
+query: |
+  SELECT
+    "Index" as product_id,
+    "Name" as product_name,
+    "Description" as description,
+    "Brand" as brand,
+    "Category" as category,
+    "Price" as price,
+    "Currency" as currency,
+    "Stock" as stock_quantity,
+    "Color" as color,
+    "Size" as size,
+    "Availability" as availability_status
+  FROM products
+  WHERE 1=1
+    AND ({brand} IS NULL OR "Brand" = {brand})
+    AND ({max_price} IS NULL OR "Price" < {max_price})
+    AND ({min_price} IS NULL OR "Price" >= {min_price})
+    AND ({color} IS NULL OR "Color" = {color})
+    AND ({category} IS NULL OR "Category" = {category})
+    AND ({availability} IS NULL OR "Availability" = {availability})
+  ORDER BY "Price" ASC
+  LIMIT {limit}

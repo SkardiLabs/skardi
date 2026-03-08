@@ -1,0 +1,14 @@
+data_sources:
+  - name: "nyc_taxi"
+    type: "iceberg"
+    path: "/tmp/iceberg-warehouse"
+    description: "NYC taxi trips Iceberg catalog"
+    options:
+      namespace: "nyc"
+      table: "trips"
+
+  # Optional: CSV for federated queries
+  - name: "zones"
+    type: "csv"
+    path: "crates/server/demo/sample_data/taxi_zones.csv"
+    description: "NYC taxi zone lookup"

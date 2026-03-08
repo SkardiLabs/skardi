@@ -1,0 +1,19 @@
+metadata:
+  name: "federated-join-zones"
+  version: "1.0.0"
+  description: "Join Iceberg trips data with CSV zone lookup for enriched results"
+
+query: |
+  SELECT
+    t.trip_id,
+    t.pickup_datetime,
+    z.zone_name as pickup_zone,
+    z.borough as pickup_borough,
+    t.passenger_count,
+    t.trip_distance,
+    t.total_amount
+  FROM nyc_taxi t
+  INNER JOIN zones z ON t.pickup_location_id = z.location_id
+  WHERE z.borough = {borough}
+  ORDER BY t.pickup_datetime DESC
+  LIMIT {limit}

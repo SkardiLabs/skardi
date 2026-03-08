@@ -1,0 +1,9 @@
+data_sources:
+  - name: "products"
+    type: "csv"
+    path: "data/products.csv"
+    options:
+      has_header: true
+      delimiter: ","
+      schema_infer_max_records: 1000
+    description: "Product catalog dataset with comprehensive product information including pricing, inventory, and categorization"

@@ -1,0 +1,16 @@
+data_sources:
+  - name: "campaigns"
+    type: "postgres"
+    connection_string: "postgresql://test:test@localhost:5432/test?sslmode=disable"
+    options:
+      table: "campaigns"              # Required: table name to register
+      schema: "public"            # Optional: schema name (default: "public")
+    description: "PostgreSQL users table with federation query push-down"
+  - name: "content_ads"
+    type: "csv"
+    path: "data/content_ads.csv"
+    options:
+      has_header: true
+      delimiter: ","
+      schema_infer_max_records: 1000
+    description: "content ads dataset with comprehensive content ads information including title, description"

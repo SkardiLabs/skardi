@@ -1,0 +1,16 @@
+metadata:
+  name: "trip-statistics"
+  version: "1.0.0"
+  description: "Get aggregated trip statistics by pickup location"
+
+query: |
+  SELECT
+    pickup_location_id,
+    COUNT(*) as total_trips,
+    AVG(trip_distance) as avg_distance,
+    AVG(fare_amount) as avg_fare,
+    SUM(total_amount) as total_revenue,
+    AVG(passenger_count) as avg_passengers
+  FROM nyc_taxi
+  WHERE pickup_location_id = {location_id}
+  GROUP BY pickup_location_id

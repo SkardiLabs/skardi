@@ -1,0 +1,43 @@
+metadata:
+  name: movie-recommendation-pipeline
+  version: 2.0.0
+  description: Movie recommendation pipeline using lance_knn table function and NCF ranking
+  author: Skardi Demo
+  created_at: 2025-11-03T00:00:00.000+00:00
+  updated_at: 2025-01-30T00:00:00.000+00:00
+
+
+query: |
+  WITH last_watched AS (
+    SELECT movie_id, title
+    FROM movies
+    WHERE title = {last_watched_movie}
+    LIMIT 1
+  ),
+  knn_results AS (
+    SELECT knn.movie_id
+    FROM lance_knn(
+      'movie_embeddings',
+      'embedding',
+      (SELECT embedding FROM movie_embeddings WHERE movie_id = (SELECT movie_id FROM last_watched)),
+      10
+    ) knn
+    WHERE knn.movie_id != (SELECT movie_id FROM last_watched)
+  ),
+  ranked_recommendations AS (
+    SELECT
+      kr.movie_id,
+      onnx_predict('models/ncf.onnx', CAST({user_id} AS BIGINT), CAST(kr.movie_id AS BIGINT)) AS prediction_score
+    FROM knn_results kr
+  )
+  SELECT
+    m.movie_id,
+    m.title,
+    m.genres,
+    m.year,
+    m.genres_list,
+    rr.prediction_score
+  FROM ranked_recommendations rr
+  JOIN movies m ON rr.movie_id = m.movie_id
+  ORDER BY rr.prediction_score DESC
+  LIMIT {top_n}

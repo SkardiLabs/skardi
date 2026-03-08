@@ -1,0 +1,20 @@
+metadata:
+  name: "query-trips-by-date"
+  version: "1.0.0"
+  description: "Query NYC taxi trips for a specific date range"
+
+query: |
+  SELECT
+    trip_id,
+    pickup_datetime,
+    dropoff_datetime,
+    passenger_count,
+    trip_distance,
+    fare_amount,
+    tip_amount,
+    total_amount
+  FROM nyc_taxi
+  WHERE pickup_datetime >= {start_date}
+    AND pickup_datetime < {end_date}
+  ORDER BY pickup_datetime
+  LIMIT {limit}

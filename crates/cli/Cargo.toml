@@ -1,0 +1,34 @@
+[package]
+name = "skardi-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI tool for managing Skardi pipelines and data sources"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "skardi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+arrow = { version = "57.0.1", features = ["prettyprint"] }
+async-trait = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+datafusion = { workspace = true }
+datafusion-catalog = { version = "52.1.0" }
+datafusion-session = { version = "52.1.0" }
+dirs = "5.0"
+lance = { workspace = true }
+object_store = { workspace = true, features = ["aws", "gcp", "azure", "http"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+source = { path = "../source" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url = { workspace = true }
+
+[lints]
+workspace = true

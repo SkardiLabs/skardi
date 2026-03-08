@@ -1,0 +1,40 @@
+data_sources:
+  # PostgreSQL data sources
+  - name: "users"
+    type: "postgres"
+    access_mode: "read_write"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    description: "PostgreSQL users table"
+    options:
+      table: "users"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+
+  - name: "orders"
+    type: "postgres"
+    access_mode: "read_write"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    description: "PostgreSQL orders table"
+    options:
+      table: "orders"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+
+  - name: "user_order_stats"
+    type: "postgres"
+    access_mode: "read_write"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    description: "PostgreSQL table for aggregated user order statistics"
+    options:
+      table: "user_order_stats"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+
+  # CSV data source (shared with MySQL demo for federated query)
+  - name: "csv_orders"
+    type: "csv"
+    path: "crates/server/demo/sample_data/orders.csv"
+    description: "CSV file containing order data"

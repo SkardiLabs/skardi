@@ -1,0 +1,26 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true  }
+arrow = { workspace = true  }
+datafusion = { workspace = true }
+log = { workspace = true }
+ndarray = "0.17"
+num_cpus = "1.17.0"
+ort = "2.0.0-rc.12"
+tokio = {workspace = true,  features = ["macros", "rt-multi-thread", "sync"]}
+tracing = { workspace = true }
+
+[dev-dependencies]
+source = { path = "../source" }
+
+[lints]
+workspace = true

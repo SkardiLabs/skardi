@@ -1,0 +1,83 @@
+metadata:
+  name: lance-vector-similarity-search
+  version: 2.0.0
+  description: Demonstrates Lance vector similarity search with lance_knn table function
+  author: Skardi Demo
+  created_at: 2025-01-24T00:00:00.000+00:00
+  updated_at: 2025-01-30T00:00:00.000+00:00
+
+# This pipeline demonstrates vector similarity search using the lance_knn table function.
+# The query finds items similar to a given reference item based on vector embeddings.
+#
+# Query Pattern:
+#   1. Use lance_knn table function with:
+#      - table_name: Name of the Lance table
+#      - vector_column: Name of the embedding column
+#      - query_vector: Subquery that returns the reference vector
+#      - k: Number of nearest neighbors
+#      - filter (optional): Lance filter predicate
+#
+# Parameters:
+#   {reference_id}: ID of the reference item to find similar items for
+#   {k}: Number of nearest neighbors to return (top-k results)
+
+query: |
+  SELECT
+    knn.id,
+    knn.item_id,
+    knn.revenue,
+    knn._distance as distance
+  FROM lance_knn(
+    'sift_items',
+    'vector',
+    (SELECT vector FROM sift_items WHERE id = {reference_id}),
+    2
+  ) knn
+  WHERE knn.id != {reference_id}
+
+# Example API Call:
+#
+# POST /lance-vector-similarity-search/execute
+# {
+#   "reference_id": 1,
+#   "k": 10
+# }
+#
+# Response:
+# {
+#   "data": [
+#     {
+#       "id": 42,
+#       "item_id": 1337,
+#       "revenue": 2500.50,
+#       "distance": 0.125
+#     },
+#     ...
+#   ],
+#   "rows_affected": 10,
+#   "execution_time_ms": 15
+# }
+#
+# How It Works:
+#
+# 1. Query Parsing:
+#    - DataFusion parses SQL and recognizes lance_knn table function
+#    - Creates TableProvider from LanceKnnTableFunction
+#
+# 2. Subquery Evaluation:
+#    - The query vector subquery is converted to a physical plan
+#    - Evaluated at execution time to get the reference vector
+#
+# 3. Execution (LanceKnnExec):
+#    - Directly calls Lance Scanner.nearest()
+#    - Returns top-k nearest neighbors with _distance column
+#
+# 4. Post-processing:
+#    - Results filtered by WHERE clause (exclude reference item)
+#    - Distance column available as _distance
+#
+# Performance Benefits:
+#
+# - Index-based search: O(log N) to O(√N) depending on index type
+# - Only computes distances for candidates
+# - Typical speedup: 10x-1000x for large datasets (N > 100K)

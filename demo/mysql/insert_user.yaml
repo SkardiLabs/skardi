@@ -1,0 +1,6 @@
+metadata:
+  name: "insert_user"
+  version: "1.0"
+  description: "Insert a new user"
+
+query: "INSERT INTO users (name, email) VALUES ({name}, {email})"

@@ -1,0 +1,15 @@
+data_sources:
+  - name: "movies"
+    type: "postgres"
+    connection_string: "postgresql://localhost:5432/test?sslmode=disable"
+    options:
+      table: "movies"              # Required: table name to register
+      schema: "public"             # Optional: schema name (default: "public")
+      user_env: "PG_USER"          # Optional: environment variable for username
+      pass_env: "PG_PASSWORD"      # Optional: environment variable for password
+    description: "PostgreSQL movies table with movie_id, title, genres, year, and genres_list"
+
+  - name: "movie_embeddings"
+    type: "lance"
+    path: "data/movie_embeddings.lance"
+    description: "Lance dataset with 128-dimensional embeddings for movies, schema [movie_id, embedding]"

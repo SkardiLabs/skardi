@@ -1,0 +1,60 @@
+data_sources:
+  - name: "sift_items"
+    type: "lance"
+    path: "data/vec_data.lance/"
+    description: "Lance dataset with vector embeddings for similarity search"
+    # Schema:
+    #   - id: int64 (unique identifier)
+    #   - vector: fixed_size_list<item: float>[128] (embedding vector)
+    #   - item_id: int64 (reference to item)
+    #   - revenue: double (revenue associated with item)
+
+# Lance Vector Search Features:
+#
+# 1. lance_knn Table Function:
+#    - Explicit KNN search via SQL table function
+#    - Syntax: lance_knn(table_name, vector_column, query_vector, k, [filter])
+#    - Query vector can be a literal array or scalar subquery
+#
+# 2. Index Support:
+#    - Distance metric determined by index (L2, Cosine, Dot Product)
+#    - Supports IVF-PQ, HNSW, and other Lance index types
+#    - Automatic index utilization when available
+#
+# 3. Integration:
+#    - Seamless integration with DataFusion SQL
+#    - Results include _distance column automatically
+#    - Combine with standard SQL filtering and joins
+#
+# Example Query Patterns:
+#
+# Basic KNN Search (subquery for reference vector):
+#   SELECT
+#     knn.id, knn.item_id, knn.revenue, knn._distance as dist
+#   FROM lance_knn(
+#     'sift_items',
+#     'vector',
+#     (SELECT vector FROM sift_items WHERE id = 1),
+#     10
+#   ) knn
+#   WHERE knn.id != 1
+#
+# With CTE for reference:
+#   WITH ref AS (
+#     SELECT vector FROM sift_items WHERE id = 1
+#   )
+#   SELECT knn.id, knn.item_id, knn._distance
+#   FROM lance_knn('sift_items', 'vector', (SELECT vector FROM ref), 10) knn
+#   WHERE knn.id != 1
+#
+# With filter parameter:
+#   SELECT *
+#   FROM lance_knn(
+#     'sift_items',
+#     'vector',
+#     (SELECT vector FROM sift_items WHERE id = 1),
+#     10,
+#     'revenue > 1000'
+#   )
+#
+# For complete pipeline example, see pipeline_lance.yaml

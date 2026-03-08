@@ -1,0 +1,17 @@
+metadata:
+  name: "federated_join_and_insert"
+  version: "1.0"
+  description: "Join CSV inventory with MongoDB products and write aggregated stats"
+
+query: |
+  INSERT INTO product_stats (stat_id, category, total_products, total_value, avg_price)
+  SELECT
+    {category} as stat_id,
+    p.category,
+    COUNT(DISTINCT p.product_id) as total_products,
+    SUM(i.quantity * p.price) as total_value,
+    AVG(p.price) as avg_price
+  FROM products p
+  INNER JOIN csv_inventory i ON p.product_id = i.product_id
+  WHERE p.category = {category}
+  GROUP BY p.category

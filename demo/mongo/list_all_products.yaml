@@ -1,0 +1,6 @@
+metadata:
+  name: "list_all_products"
+  version: "1.0"
+  description: "List all products in the catalog (full scan)"
+
+query: "SELECT product_id, name, category, price, in_stock FROM products ORDER BY name"

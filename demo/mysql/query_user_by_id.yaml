@@ -1,0 +1,6 @@
+metadata:
+  name: "query_user_by_id"
+  version: "1.0"
+  description: "Query a specific user by ID"
+
+query: "SELECT id, name, email FROM users WHERE id = {user_id}"

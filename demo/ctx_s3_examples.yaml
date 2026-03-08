@@ -1,0 +1,101 @@
+data_sources:
+  - name: "products"
+    type: "csv"
+    path: "s3://datafusion-eval/products.csv"
+    options:
+      has_header: true
+      delimiter: ","
+      schema_infer_max_records: 1000
+    description: "Product catalog dataset with comprehensive product information including pricing, inventory, and categorization"
+
+# AWS Configuration for S3 Data Sources
+#
+# SECURITY NOTICE: All AWS configuration must come from environment variables.
+# The system will reject any configuration that includes AWS fields in the config file.
+#
+# REQUIRED ENVIRONMENT VARIABLES:
+#   - AWS credentials: One of the authentication methods below
+#   - AWS region: Set AWS_REGION or AWS_DEFAULT_REGION
+#
+# AUTHENTICATION METHODS (all via environment variables):
+#
+# Method 1: Environment Variables (Recommended for development/testing)
+#   Set these environment variables before running the server:
+#   export AWS_ACCESS_KEY_ID="your_access_key_id"
+#   export AWS_SECRET_ACCESS_KEY="your_secret_access_key"
+#   export AWS_REGION="us-east-1"  # or AWS_DEFAULT_REGION
+#   export AWS_SESSION_TOKEN="your_session_token"  # Optional for temporary credentials
+#
+# Method 2: AWS CLI Profiles (Recommended for local development)
+#   First, configure AWS CLI profiles (~/.aws/credentials and ~/.aws/config):
+#
+#   ~/.aws/credentials:
+#   [your-profile]
+#   aws_access_key_id = your_access_key_id
+#   aws_secret_access_key = your_secret_access_key
+#
+#   ~/.aws/config:
+#   [profile your-profile]
+#   region = us-east-1
+#
+#   Then set environment variables:
+#   export AWS_PROFILE="your-profile"
+#   export AWS_REGION="us-east-1"  # Still required to override profile region if needed
+#
+# Method 3: AWS SSO/Identity Center (Modern authentication)
+#   Configure via AWS CLI SSO:
+#   aws configure sso
+#   aws sso login --profile your-sso-profile
+#
+#   Then set:
+#   export AWS_PROFILE="your-sso-profile"
+#   export AWS_REGION="us-east-1"
+#
+# Method 4: IAM Roles/Instance Profiles (Recommended for production on AWS)
+#   No explicit credentials needed - uses AWS instance metadata service
+#   Perfect for EC2, ECS, Lambda, etc.
+#   Still requires: export AWS_REGION="us-east-1"
+#
+# S3 PATH REQUIREMENTS:
+#   - Must start with "s3://" prefix
+#   - Will be validated and connectivity tested at startup
+#   - Examples:
+#     * "s3://bucket-name/file.parquet"
+#     * "s3://bucket-name/path/to/data.csv"
+#     * "s3://bucket-name/partitioned/year=2024/month=11/data.parquet"
+#
+# SUPPORTED S3 FILE TYPES:
+#   - CSV files (type: "csv", location: "remote_s3")
+#   - Parquet files (type: "parquet", location: "remote_s3")
+#   - Lance datasets (type: "lance", location: "remote_s3")
+#
+# CONNECTIVITY VERIFICATION:
+#   The system will test S3 connectivity at startup by attempting to access each S3 path.
+#   This ensures that:
+#   - AWS credentials are valid
+#   - S3 paths exist and are accessible
+#   - IAM permissions are correctly configured
+#   - Network connectivity to S3 is working
+#
+# REQUIRED IAM PERMISSIONS:
+#   Your AWS credentials must have at minimum:
+#   - s3:GetObject (to read files)
+#   - s3:HeadObject (for connectivity testing and metadata)
+#   - s3:ListBucket (if using directory-like paths)
+#
+# Example IAM Policy:
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Action": ["s3:GetObject", "s3:HeadObject"],
+#       "Resource": "arn:aws:s3:::your-bucket-name/*"
+#     },
+#     {
+#       "Effect": "Allow",
+#       "Action": "s3:ListBucket",
+#       "Resource": "arn:aws:s3:::your-bucket-name"
+#     }
+#   ]
+# }

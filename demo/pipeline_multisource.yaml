@@ -1,0 +1,15 @@
+metadata:
+  name: campaign-join-demo
+  version: 1.0.0
+  description: Demonstrates SQL serving pipeline for join across data sources
+  author: Skardi Demo
+  created_at: 2025-01-15T00:00:00.000+00:00
+  updated_at: 2025-01-15T00:00:00.000+00:00
+
+query: |
+    select DISTINCT cad.id, cad.content_id, cad.content_type, cad.impression_cap, cap.name as campaign_name, cap.id as campaign_id, cap.campaign_type
+    from content_ads as cad
+    join campaigns as cap
+    on cad.campaign_id = cap.id
+    where cap.campaign_type = {campaign_type} AND cad.content_type = {content_type}
+    limit {limit}

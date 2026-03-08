@@ -1,0 +1,30 @@
+data_sources:
+  - name: "products"
+    type: "mongo"
+    access_mode: "read_write"
+    connection_string: "mongodb://localhost:27017"
+    description: "MongoDB products collection"
+    options:
+      database: "mydb"
+      collection: "products"
+      primary_key: "product_id"
+      user_env: "MONGO_USER"
+      pass_env: "MONGO_PASS"
+
+  - name: "product_stats"
+    type: "mongo"
+    access_mode: "read_write"
+    connection_string: "mongodb://localhost:27017"
+    description: "MongoDB collection for aggregated product statistics"
+    options:
+      database: "mydb"
+      collection: "product_stats"
+      primary_key: "stat_id"
+      user_env: "MONGO_USER"
+      pass_env: "MONGO_PASS"
+
+  # CSV data source (for federated query demo)
+  - name: "csv_inventory"
+    type: "csv"
+    path: "crates/server/demo/sample_data/product_inventory.csv"
+    description: "CSV file containing product inventory data"

@@ -1,0 +1,6 @@
+metadata:
+  name: "search_users_by_email"
+  version: "1.0"
+  description: "Search users by email pattern (SQL injection safe with LIKE)"
+
+query: "SELECT id, name, email FROM users WHERE email LIKE {email_pattern}"

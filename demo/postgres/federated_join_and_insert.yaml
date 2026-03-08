@@ -1,0 +1,19 @@
+metadata:
+  name: "federated_join_and_insert"
+  version: "1.0"
+  description: "Join CSV orders with PostgreSQL users (filtered by name) and write aggregated results to PostgreSQL"
+
+query: |
+  INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+  SELECT
+    CAST(u.id AS INT) as user_id,
+    u.name as user_name,
+    u.email as user_email,
+    CAST(COUNT(*) AS INT) as total_orders,
+    CAST(SUM(o.amount) AS DECIMAL(10,2)) as total_spent,
+    MAX(o.order_date) as last_order_date
+  FROM users u
+  INNER JOIN csv_orders o
+    ON CAST(u.id AS BIGINT) = o.user_id
+  WHERE u.name = {name}
+  GROUP BY u.id, u.name, u.email

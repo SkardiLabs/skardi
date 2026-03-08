@@ -1,0 +1,16 @@
+metadata:
+  name: "user_orders_summary"
+  version: "1.0"
+  description: "Get user's orders with total spent"
+
+query: |
+  SELECT
+    u.id,
+    u.name,
+    u.email,
+    COUNT(o.id) as order_count,
+    COALESCE(SUM(o.amount), 0) as total_spent
+  FROM users u
+  LEFT JOIN orders o ON u.id = o.user_id
+  WHERE u.id = {user_id}
+  GROUP BY u.id, u.name, u.email
