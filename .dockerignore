@@ -1,3 +1,4 @@
 target/
 data/
 model/
+.DS_Store

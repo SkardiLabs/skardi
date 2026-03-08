@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+# Cancel previous runs on the same PR/branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Install Rust
+        run: rustup toolchain install stable --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+      - uses: Swatinem/rust-cache@v2
+      - name: Check code format
+        run: cargo fmt --all -- --check
+      - name: Check the package for errors
+        run: cargo check --all
+      - name: Execute rust tests
+        run: cargo nextest run --all-features
+      - name: Execute ignored tests
+        run: cargo nextest run --all-features -- --ignored
