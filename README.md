@@ -3,8 +3,8 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**The Declarative Data Contract Execution Layer for AI and Agents, powered by Rust and Datafusion**<br/>
-**Turn SQL queries into live API endpoints — connect CSV, Parquet, PostgreSQL, MySQL, MongoDB, Iceberg, Lance, and S3 in a single query.**
+**The Declarative data runtime for AI and agents powered by Rust and Apache Datafusion.**<br/>
+**Query files, databases, data lakes, and vector stores with SQL — locally with skardi-cli or as APIs with skardi-server.**
 
 [CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
 [CI Badge]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml/badge.svg
@@ -16,12 +16,16 @@
 
 <hr />
 
-Skardi lets you define SQL queries in YAML files and instantly serve them as parameterized HTTP APIs. Connect to multiple data sources, run federated queries across them, and expose the results as REST endpoints — all without writing application code.
+Skardi lets AI agents and applications query files, databases, data lakes, and vector stores with SQL — no application code required.
+
+- **`skardi-cli`** — Run SQL queries locally against files, object stores, databases, and datalake formats. Ideal for local agents like [OpenClaw](https://github.com/openclaw/openclaw) that need structured data access without a running server.
+- **`skardi-server`** — Define SQL queries in YAML and serve them as parameterized HTTP APIs. Connect to multiple data sources, run federated queries, and expose results as REST endpoints.
 
 > **Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups. Feel free to contact us if you want to have a POC for the product.
 
 ## Key Features
 
+- **CLI for local agents & queries** — Run SQL against local files, remote object stores (S3, GCS, Azure), databases, and datalake formats — ideal for local AI agents like [OpenClaw](https://github.com/openclaw/openclaw)
 - **Declarative pipelines** — Define SQL queries in YAML, get REST APIs automatically
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
 - **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, MongoDB, Iceberg, and Lance in a single query
@@ -30,12 +34,12 @@ Skardi lets you define SQL queries in YAML files and instantly serve them as par
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime
 - **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF
-- **CLI for local & remote queries** — Run SQL against local files, remote object stores (S3, GCS, Azure), databases, and datalake formats without starting a server
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
+- [Skardi CLI](#skardi-cli)
 - [Skardi Server](#skardi-server)
   - [Running the Server](#running-the-server)
   - [API Endpoints](#api-endpoints)
@@ -44,7 +48,6 @@ Skardi lets you define SQL queries in YAML files and instantly serve them as par
   - [In-Memory Caching](#in-memory-caching)
   - [Pipeline Files](#pipeline-files)
   - [Runtime Pipeline Registration](#runtime-pipeline-registration)
-- [Skardi CLI](#skardi-cli)
 - [Supported Data Sources](#supported-data-sources)
   - [CSV](#csv)
   - [Parquet](#parquet)
@@ -65,6 +68,14 @@ Skardi lets you define SQL queries in YAML files and instantly serve them as par
 # Build
 cargo build --release
 
+# --- Skardi CLI ---
+# Query local files directly
+skardi query --sql "SELECT * FROM './data/products.csv' LIMIT 10"
+
+# Query remote files
+skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
+
+# --- Skardi Server ---
 # Start the server with a context and pipeline
 cargo run --bin skardi-server -- \
   --ctx demo/ctx.yaml \
@@ -81,10 +92,52 @@ curl -X POST http://localhost:8080/product-search-demo/execute \
 
 Skardi has two main components:
 
+- **`skardi-cli`** (`skardi`) — A command-line tool for running SQL queries against local files, remote object stores, databases, and datalake formats without starting a server. Perfect for powering local AI agents like [OpenClaw](https://github.com/openclaw/openclaw) with structured data access.
 - **`skardi-server`** — An HTTP server that loads data sources from a **context file**, registers SQL pipelines, and serves them as REST endpoints.
-- **`skardi-cli`** (`skardi`) — A command-line tool for running SQL queries against local files, remote object stores, databases, and datalake formats without starting a server.
 
 Both components use [Apache DataFusion](https://datafusion.apache.org/) as the query engine, which enables federated queries across heterogeneous data sources.
+
+## Skardi CLI
+
+The CLI lets you run SQL queries against local files, remote object stores, databases, and datalake formats — no server required. It's a great fit for local AI agents like [OpenClaw](https://github.com/openclaw/openclaw) that need to query structured data on the fly.
+
+### Install
+
+```bash
+cargo install --path crates/cli
+```
+
+### Usage
+
+```bash
+# Query files directly by path (no context file needed)
+skardi query --sql "SELECT * FROM './data/products.csv' LIMIT 10"
+skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
+skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
+
+# Query with a context file (for databases, named tables, etc.)
+skardi query --ctx ./ctx.yaml --sql "SELECT * FROM products LIMIT 10"
+
+# SQL from file
+skardi query --ctx ./ctx.yaml --file query.sql
+
+# Show table schemas
+skardi query --ctx ./ctx.yaml --schema --all
+skardi query --ctx ./ctx.yaml --schema -t products
+```
+
+**Supported sources:**
+
+| Category | Types |
+|----------|-------|
+| Local files | CSV, Parquet, JSON/NDJSON, Lance |
+| Remote stores | S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS |
+| Datalake formats | Lance, Iceberg |
+| Databases | PostgreSQL, MySQL, MongoDB |
+
+**Context file resolution** (when `--ctx` is omitted): checks `SKARDICONFIG` env var, then `~/.skardi/config/ctx.yaml`. If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
+
+For full details, see [crates/cli/README.md](crates/cli/README.md).
 
 ## Skardi Server
 
@@ -261,48 +314,6 @@ curl -X POST http://localhost:8080/register_pipeline \
   "timestamp": "2025-01-15T12:00:00.000Z"
 }
 ```
-
-## Skardi CLI
-
-The CLI lets you run SQL queries against local files, remote object stores, databases, and datalake formats — no server required.
-
-### Install
-
-```bash
-cargo install --path crates/cli
-```
-
-### Usage
-
-```bash
-# Query files directly by path (no context file needed)
-skardi query --sql "SELECT * FROM './data/products.csv' LIMIT 10"
-skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
-skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
-
-# Query with a context file (for databases, named tables, etc.)
-skardi query --ctx ./ctx.yaml --sql "SELECT * FROM products LIMIT 10"
-
-# SQL from file
-skardi query --ctx ./ctx.yaml --file query.sql
-
-# Show table schemas
-skardi query --ctx ./ctx.yaml --schema --all
-skardi query --ctx ./ctx.yaml --schema -t products
-```
-
-**Supported sources:**
-
-| Category | Types |
-|----------|-------|
-| Local files | CSV, Parquet, JSON/NDJSON, Lance |
-| Remote stores | S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS |
-| Datalake formats | Lance, Iceberg |
-| Databases | PostgreSQL, MySQL, MongoDB |
-
-**Context file resolution** (when `--ctx` is omitted): checks `SKARDICONFIG` env var, then `~/.skardi/config/ctx.yaml`. If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
-
-For full details, see [crates/cli/README.md](crates/cli/README.md).
 
 ## Supported Data Sources
 
@@ -577,14 +588,14 @@ docker run --rm -p 8080:8080 skardi
 git clone https://github.com/SkardiLabs/skardi.git
 cd skardi
 
-# Build server
-cargo build --release -p skardi-server
-
 # Build CLI
 cargo build --release -p skardi-cli
 
 # Or install CLI globally
 cargo install --path crates/cli
+
+# Build server
+cargo build --release -p skardi-server
 ```
 
 ## Demo & Examples
