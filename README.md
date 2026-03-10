@@ -199,9 +199,9 @@ data_sources:
       user_env: "PG_USER"
       pass_env: "PG_PASSWORD"
 
-  - name: "content_ads"
+  - name: "contents"
     type: "csv"
-    path: "data/content_ads.csv"
+    path: "data/contents.csv"
     options:
       has_header: true
       delimiter: ","
