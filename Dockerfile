@@ -14,14 +14,8 @@ COPY . .
 
 RUN cargo build --release -p skardi-server
 
-# Runtime stage
-FROM ubuntu:24.04
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    libstdc++6 \
-    && rm -rf /var/lib/apt/lists/*
+# Runtime stage - distroless/cc includes libstdc++ and ca-certificates
+FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /app/target/release/skardi-server /usr/local/bin/skardi-server
 

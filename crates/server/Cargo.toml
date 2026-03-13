@@ -27,7 +27,7 @@ source = { path = "../source" }
 model = { path = "../model" }
 anyhow = "1.0"
 thiserror = "1.0"
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
 tracing = { workspace = true }
