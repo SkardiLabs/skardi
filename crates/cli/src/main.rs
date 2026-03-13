@@ -19,7 +19,7 @@ use serde::Deserialize;
 use source::lance::knn_table_function::register_lance_knn_udtf;
 use source::providers::{
     iceberg::register_iceberg_table, lance::register_lance_table, mongo::register_mongo_tables,
-    mysql::register_mysql_tables, postgres::register_postgres_tables,
+    mysql::register_mysql_tables, sqlx::postgres::register_postgres_tables,
 };
 use std::collections::HashMap;
 use std::fmt;

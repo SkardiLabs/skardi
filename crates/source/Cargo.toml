@@ -27,6 +27,7 @@ mysql_async = "0.36"
 percent-encoding = "2.3"
 redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster"] }
 secrecy = "0.10"
+sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlparser = "0.53"

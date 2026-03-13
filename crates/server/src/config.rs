@@ -713,8 +713,8 @@ async fn register_data_source(
                 source.options
             );
 
-            // Register PostgreSQL table using the providers module
-            source::providers::postgres::register_postgres_tables(
+            // Register PostgreSQL table using the sqlx-based provider
+            source::providers::sqlx::postgres::register_postgres_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
