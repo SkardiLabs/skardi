@@ -12,7 +12,7 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use crate::config::{register_onnx_predict_udf, ServerConfig};
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
-    pipeline_health_check, register_pipeline,
+    pipeline_health_check,
 };
 
 /// Shared application state containing pipeline and engine
@@ -133,7 +133,6 @@ pub fn configure_routes(state: AppState) -> Router {
         .route("/health/:name", get(pipeline_health_check))
         .route("/pipelines", get(list_pipelines))
         .route("/pipeline/:name", get(get_pipelines_info))
-        .route("/register_pipeline", post(register_pipeline))
         .route("/data_source", get(get_data_sources))
         .route("/:name/execute", post(execute_pipeline_by_name))
         .with_state(state)

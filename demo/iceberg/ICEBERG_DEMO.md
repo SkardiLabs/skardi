@@ -69,7 +69,7 @@ table.append(data)
 
 ```bash
 # Navigate to the iceberg pipelines directory
-cd demo/iceberg_pipelines
+cd demo/iceberg
 
 # Create and activate a virtual environment
 python3 -m venv .venv
@@ -100,7 +100,7 @@ data_sources:
       table: "trips"
   - name: "zones"
     type: "csv"
-    path: "crates/server/demo/sample_data/taxi_zones.csv"
+    path: "demo/sample_data/taxi_zones.csv"
     description: "NYC taxi zone lookup"
 ```
 
@@ -108,8 +108,8 @@ data_sources:
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/ctx_iceberg_demo.yaml \
-  --pipeline demo/iceberg_pipelines/query_trips_by_date.yaml \
+  --ctx demo/iceberg/ctx_iceberg_demo.yaml \
+  --pipeline demo/iceberg/pipelines/ \
   --port 8080
 ```
 

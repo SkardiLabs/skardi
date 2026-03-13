@@ -47,7 +47,6 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
   - [Access Mode](#access-mode)
   - [In-Memory Caching](#in-memory-caching)
   - [Pipeline Files](#pipeline-files)
-  - [Runtime Pipeline Registration](#runtime-pipeline-registration)
 - [Supported Data Sources](#supported-data-sources)
   - [CSV](#csv)
   - [Parquet](#parquet)
@@ -156,8 +155,6 @@ cargo run --bin skardi-server -- \
 | `--pipeline` | Path to a pipeline YAML file or a directory of pipeline files |
 | `--port` | Port to listen on (default: 8080) |
 
-The server can also start without any files and accept pipelines registered at runtime via `POST /register_pipeline`.
-
 ### API Endpoints
 
 | Endpoint | Method | Description |
@@ -166,7 +163,6 @@ The server can also start without any files and accept pipelines registered at r
 | `/health/:name` | GET | Per-pipeline health check (includes data source status) |
 | `/pipelines` | GET | List all registered pipelines |
 | `/pipeline/:name` | GET | Get specific pipeline info |
-| `/register_pipeline` | POST | Register a new pipeline at runtime |
 | `/data_source` | GET | List all data sources |
 | `/:name/execute` | POST | Execute a pipeline by name |
 
@@ -190,18 +186,18 @@ You can define multiple data sources of different types in a single context file
 
 ```yaml
 data_sources:
-  - name: "campaigns"
+  - name: "users"
     type: "postgres"
     connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
     options:
-      table: "campaigns"
+      table: "users"
       schema: "public"
       user_env: "PG_USER"
       pass_env: "PG_PASSWORD"
 
-  - name: "contents"
+  - name: "orders"
     type: "csv"
-    path: "data/contents.csv"
+    path: "demo/sample_data/orders.csv"
     options:
       has_header: true
       delimiter: ","
@@ -280,16 +276,6 @@ curl -X POST http://localhost:8080/product-search-demo/execute \
 ```
 
 Use the `{param} IS NULL OR ...` pattern for optional filters — pass `null` to skip a filter.
-
-### Runtime Pipeline Registration
-
-Pipelines can be registered at runtime without restarting the server:
-
-```bash
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "path/to/pipeline.yaml"}'
-```
 
 ### Response Format
 
@@ -573,12 +559,6 @@ docker run --rm \
   --ctx /config/ctx.yaml \
   --pipeline /config/pipelines \
   --port 8080
-```
-
-Start without config and register pipelines at runtime:
-
-```bash
-docker run --rm -p 8080:8080 skardi
 ```
 
 ## Building from Source

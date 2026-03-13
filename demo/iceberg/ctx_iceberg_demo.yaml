@@ -10,5 +10,5 @@ data_sources:
   # Optional: CSV for federated queries
   - name: "zones"
     type: "csv"
-    path: "crates/server/demo/sample_data/taxi_zones.csv"
+    path: "demo/sample_data/taxi_zones.csv"
     description: "NYC taxi zone lookup"

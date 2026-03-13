@@ -26,9 +26,7 @@ Movie embeddings for recommendation pipelines:
 | File | Description |
 |------|-------------|
 | `ctx_lance.yaml` | Context file registering `vec_data.lance` |
-| `pipeline_lance.yaml` | KNN similarity search pipeline |
-| `ctx_movie_recommendation.yaml` | Context with Lance embeddings + PostgreSQL movies table |
-| `pipeline_movie_recommendation.yaml` | Movie recommendation pipeline (KNN + ONNX ranking) |
+| `pipelines/pipeline_lance.yaml` | KNN similarity search pipeline |
 
 ## How It Works
 
@@ -75,7 +73,7 @@ lance_knn(...) -> LanceKnnExec -> Lance Scanner.nearest()
 ```bash
 cargo run --bin skardi-server -- \
   --ctx demo/lance/ctx_lance.yaml \
-  --pipeline demo/lance/pipeline_lance.yaml \
+  --pipeline demo/lance/pipelines/ \
   --port 8080
 ```
 
@@ -279,7 +277,7 @@ Enable debug logs to see KNN execution:
 ```bash
 RUST_LOG=debug cargo run --bin skardi-server -- \
   --ctx demo/lance/ctx_lance.yaml \
-  --pipeline demo/lance/pipeline_lance.yaml \
+  --pipeline demo/lance/pipelines/ \
   --port 8080
 ```
 

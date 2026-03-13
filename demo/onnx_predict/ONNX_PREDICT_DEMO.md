@@ -110,7 +110,7 @@ export PG_PASSWORD="your_password"
 # Start the server
 cargo run --bin skardi-server -- \
   --ctx demo/onnx_predict/ctx_movie_recommendation.yaml \
-  --pipeline demo/onnx_predict/pipeline_movie_recommendation.yaml \
+  --pipeline demo/onnx_predict/pipelines/ \
   --port 8080
 ```
 

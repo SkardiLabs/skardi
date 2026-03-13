@@ -6,12 +6,11 @@ use axum::{
     Json,
 };
 use datafusion::prelude::SessionContext;
-use pipeline::pipeline::{Pipeline, StandardPipeline};
+use pipeline::pipeline::Pipeline;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi_engine::Engine;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::config::DataSourceType;
@@ -23,13 +22,6 @@ pub struct ExecuteRequest {
     /// Dynamic JSON parameters that match pipeline request schema
     #[serde(flatten)]
     pub parameters: HashMap<String, Value>,
-}
-
-/// Request structure for pipeline registration
-#[derive(Debug, Deserialize)]
-pub struct RegisterPipelineRequest {
-    /// Path to pipeline YAML file
-    pub path: String,
 }
 
 /// Response structure for pipeline execution
@@ -626,121 +618,6 @@ pub async fn execute_pipeline_by_name(
     );
 
     Ok(create_success_response(data, row_count, execution_time))
-}
-
-/// Register pipeline endpoint - POST /register_pipeline
-///
-/// Registers or updates a pipeline from a YAML file path.
-/// If a pipeline already exists, it updates the existing pipeline and sets updated_at.
-/// If no pipeline exists, it creates a new one and sets both created_at and updated_at.
-pub async fn register_pipeline(
-    State(app_state): State<AppState>,
-    Json(request): Json<RegisterPipelineRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::info!(
-        "Received pipeline registration request for path: {}",
-        request.path
-    );
-
-    let pipeline_path = PathBuf::from(&request.path);
-
-    // Validate that the file exists
-    if !pipeline_path.exists() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            create_error_response(
-                &format!("Pipeline file not found: {}", request.path),
-                "file_not_found",
-                Some(serde_json::json!({
-                    "path": request.path
-                })),
-            ),
-        ));
-    }
-
-    // Get the SessionContext from AppState for pipeline loading
-    let ctx = app_state.session_ctx.clone();
-
-    // Load the pipeline from the file
-    let mut new_pipeline = match StandardPipeline::load_from_file(&pipeline_path, ctx).await {
-        Ok(pipeline) => pipeline,
-        Err(e) => {
-            tracing::error!("Failed to load pipeline from {}: {}", request.path, e);
-            return Err((
-                StatusCode::BAD_REQUEST,
-                create_error_response(
-                    &format!("Failed to load pipeline: {}", e),
-                    "pipeline_load_error",
-                    Some(serde_json::json!({
-                        "path": request.path,
-                        "error": e.to_string()
-                    })),
-                ),
-            ));
-        }
-    };
-
-    // Update metadata timestamps
-    let current_time = chrono::Utc::now().to_rfc3339();
-
-    // Acquire write lock to update config
-    let mut config = app_state.config.write().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            create_error_response(
-                "Failed to acquire write lock on configuration",
-                "internal_error",
-                None,
-            ),
-        )
-    })?;
-
-    let pipeline_name = new_pipeline.name().to_string();
-
-    // If pipeline already exists, preserve created_at and update updated_at
-    // If pipeline doesn't exist, set both created_at and updated_at
-    if let Some(existing_pipeline) = config.pipelines.get(&pipeline_name) {
-        // Preserve created_at from existing pipeline if it exists
-        if let Some(ref created_at) = existing_pipeline.metadata.created_at {
-            new_pipeline.metadata.created_at = Some(created_at.clone());
-        } else {
-            new_pipeline.metadata.created_at = Some(current_time.clone());
-        }
-    } else {
-        // New pipeline, set both timestamps
-        new_pipeline.metadata.created_at = Some(current_time.clone());
-    }
-
-    // Always update updated_at to current time
-    new_pipeline.metadata.updated_at = Some(current_time);
-
-    // Insert or update the pipeline in the map
-    config
-        .pipelines
-        .insert(pipeline_name.clone(), new_pipeline.clone());
-
-    // Release the lock before responding
-    drop(config);
-
-    tracing::info!(
-        "Pipeline registered successfully: {} (version: {})",
-        new_pipeline.name(),
-        new_pipeline.version()
-    );
-
-    // Return success response with endpoint info
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Pipeline registered successfully",
-        "pipeline": {
-            "name": new_pipeline.name(),
-            "version": new_pipeline.version(),
-            "endpoint": format!("/{}/execute", pipeline_name),
-            "created_at": new_pipeline.metadata.created_at,
-            "updated_at": new_pipeline.metadata.updated_at
-        },
-        "timestamp": chrono::Utc::now().to_rfc3339()
-    })))
 }
 
 /// Convert Arrow RecordBatch to JSON array using arrow_json
