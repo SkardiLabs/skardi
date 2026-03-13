@@ -37,5 +37,5 @@ data_sources:
   - name: "csv_orders"
     type: "csv"
     access_mode: "read_only"
-    path: "crates/server/demo/sample_data/orders.csv"
+    path: "demo/sample_data/orders.csv"
     description: "CSV file containing order data"

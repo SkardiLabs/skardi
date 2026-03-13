@@ -82,7 +82,6 @@ Server listening on 0.0.0.0:8080
 | `/health/:name` | GET | Per-pipeline health check |
 | `/pipelines` | GET | List all registered pipelines |
 | `/pipeline/:name` | GET | Get specific pipeline info |
-| `/register_pipeline` | POST | Register a new pipeline |
 | `/data_source` | GET | List all data sources |
 | `/:name/execute` | POST | Execute a pipeline by name |
 

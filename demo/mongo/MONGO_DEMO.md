@@ -62,19 +62,9 @@ export MONGO_USER=root
 export MONGO_PASS=rootpass
 
 cargo run --bin skardi-server -- \
-  --ctx demo/ctx_mongo_demo.yaml \
-  --port 8080 &
-
-sleep 3
-
-for pipeline in demo/mongo_pipelines/*.yaml; do
-  curl -s -X POST http://localhost:8080/register_pipeline \
-    -H "Content-Type: application/json" \
-    -d "{\"path\": \"$pipeline\"}"
-  echo ""
-done
-
-echo "Server ready!"
+  --ctx demo/mongo/ctx_mongo_demo.yaml \
+  --pipeline demo/mongo/pipelines/ \
+  --port 8080
 ```
 
 ## Available Pipelines
@@ -94,11 +84,6 @@ echo "Server ready!"
 Query a specific product by ID using the primary key for efficient single-document retrieval.
 
 ```bash
-# First, switch to the point lookup pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "crates/server/demo/mongo_pipelines/query_product_by_id.yaml"}'
-
 # Execute the query
 curl -X POST http://localhost:8080/query_product_by_id/execute \
   -H "Content-Type: application/json" \
@@ -122,10 +107,6 @@ curl -X POST http://localhost:8080/query_product_by_id/execute \
 List all products in the catalog.
 
 ```bash
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mongo_pipelines/list_all_products.yaml"}'
-
 curl -X POST http://localhost:8080/list_all_products/execute \
   -H "Content-Type: application/json" \
   -d '{}'
@@ -154,10 +135,6 @@ curl -X POST http://localhost:8080/list_all_products/execute \
 Insert a new product (uses upsert semantics based on primary key).
 
 ```bash
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mongo_pipelines/insert_product.yaml"}'
-
 curl -X POST http://localhost:8080/insert_product/execute \
   -H "Content-Type: application/json" \
   -d '{"product_id": "PROD006", "name": "Webcam", "category": "Electronics", "price": 89.99, "in_stock": true}'
@@ -181,10 +158,6 @@ docker exec mongo-skardi mongosh -u root -p rootpass --authenticationDatabase ad
 Insert multiple products using a VALUES clause.
 
 ```bash
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "crates/server/demo/mongo_pipelines/insert_products_from_select.yaml"}'
-
 curl -X POST http://localhost:8080/insert_products_from_select/execute \
   -H "Content-Type: application/json" \
   -d '{
@@ -217,10 +190,6 @@ CSV (product_inventory.csv)     MongoDB (products)
 ```
 
 ```bash
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mongo_pipelines/federated_join_and_insert.yaml"}'
-
 # Aggregate Electronics category
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \

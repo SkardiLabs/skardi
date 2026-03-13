@@ -26,5 +26,5 @@ data_sources:
   # CSV data source (for federated query demo)
   - name: "csv_inventory"
     type: "csv"
-    path: "crates/server/demo/sample_data/product_inventory.csv"
+    path: "demo/sample_data/product_inventory.csv"
     description: "CSV file containing product inventory data"

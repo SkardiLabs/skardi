@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         Ok(config) => {
             info!("✅ Server configuration loaded successfully");
             if config.pipelines.is_empty() {
-                info!("   Pipelines: None (use POST /register_pipeline to register one)");
+                info!("   Pipelines: None (register pipelines via config at server start)");
             } else {
                 info!("   Pipelines loaded: {}", config.pipelines.len());
                 for (name, pipeline) in &config.pipelines {

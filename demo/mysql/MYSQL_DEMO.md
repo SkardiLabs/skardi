@@ -50,8 +50,8 @@ INSERT INTO orders (user_id, product, amount) VALUES
 EOF
 
 # 2b. Create sample CSV file (for federated query demo)
-mkdir -p crates/server/demo/sample_data
-cat > crates/server/demo/sample_data/orders.csv << 'EOF'
+mkdir -p demo/sample_data
+cat > demo/sample_data/orders.csv << 'EOF'
 order_id,user_id,product,amount,order_date
 1001,1,Laptop,999.99,2024-01-15
 1002,1,Mouse,29.99,2024-01-16
@@ -75,7 +75,7 @@ EOF
 
 # 5. Start Skardi
 cargo run --bin skardi-server -- \
-  --ctx crates/server/demo/ctx_mysql_demo.yaml \
+  --ctx demo/mysql/ctx_mysql_demo.yaml \
   --pipeline path/to/mysql_query_pipeline.yaml \
   --port 8080
 
@@ -98,20 +98,23 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
    export MYSQL_PASSWORD="skardi_pass"
    ```
 
-2. **Start Skardi server**:
-   ```bash
-   cargo run --bin skardi-server -- --ctx demo/ctx_mysql_demo.yaml --port 8080
-   ```
+2. **Start Skardi server with pipelines**:
 
-3. **Use pre-built query pipelines**:
-
-   Example pipeline files are provided in `demo/mysql_pipelines/`:
+   Example pipeline files are provided in `demo/mysql/pipelines/`:
    - `query_user_by_id.yaml` - Query user by ID
    - `search_users_by_email.yaml` - Search by email pattern
    - `user_orders_summary.yaml` - Get user's order summary
    - `insert_user.yaml` - Insert new user
    - `update_user_email.yaml` - Update a user's email by name
    - `delete_user.yaml` - Delete a user by name
+
+   Pass them all at server start using the `--pipeline` flag (accepts a directory or individual files):
+   ```bash
+   cargo run --bin skardi-server -- \
+     --ctx demo/mysql/ctx_mysql_demo.yaml \
+     --pipeline demo/mysql/pipelines/ \
+     --port 8080
+   ```
 
    You can also create your own:
    ```bash
@@ -124,33 +127,18 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
    EOF
    ```
 
-4. **Register and execute pipelines**:
+3. **Execute pipelines**:
 
    ```bash
-   # Register the query user by ID pipeline
-   curl -X POST http://localhost:8080/register_pipeline \
-     -H "Content-Type: application/json" \
-     -d '{"path": "demo/mysql_pipelines/query_user_by_id.yaml"}'
-
    # Execute with parameters
    curl -X POST http://localhost:8080/query_user_by_id/execute \
      -H "Content-Type: application/json" \
      -d '{"user_id": 1}'
 
-   # Register email search pipeline
-   curl -X POST http://localhost:8080/register_pipeline \
-     -H "Content-Type: application/json" \
-     -d '{"path": "demo/mysql_pipelines/search_users_by_email.yaml"}'
-
    # Search for users by email pattern
    curl -X POST http://localhost:8080/search_users_by_email/execute \
      -H "Content-Type: application/json" \
      -d '{"email_pattern": "%@example.com"}'
-
-   # Register user orders summary pipeline
-   curl -X POST http://localhost:8080/register_pipeline \
-     -H "Content-Type: application/json" \
-     -d '{"path": "demo/mysql_pipelines/user_orders_summary.yaml"}'
 
    # Get user's order summary
    curl -X POST http://localhost:8080/user_orders_summary/execute \
@@ -163,11 +151,6 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
 Insert a new user into the MySQL table:
 
 ```bash
-# Register the insert pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mysql_pipelines/insert_user.yaml"}'
-
 # Execute INSERT with parameters
 curl -X POST http://localhost:8080/insert_user/execute \
   -H "Content-Type: application/json" \
@@ -185,11 +168,6 @@ docker exec mysql-skardi mysql -u skardi_user -pskardi_pass mydb \
 Update an existing user's email address:
 
 ```bash
-# Register the update pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mysql_pipelines/update_user_email.yaml"}'
-
 # Execute UPDATE with parameters
 curl -X POST http://localhost:8080/update_user_email/execute \
   -H "Content-Type: application/json" \
@@ -224,11 +202,6 @@ UPDATE users SET email = {new_email}, name = {new_name} WHERE name = {name}
 Delete a user by name:
 
 ```bash
-# Register the delete pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mysql_pipelines/delete_user.yaml"}'
-
 # Execute DELETE with parameters
 curl -X POST http://localhost:8080/delete_user/execute \
   -H "Content-Type: application/json" \
@@ -304,11 +277,6 @@ query: |
 ### Execute
 
 ```bash
-# Register the federated query pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/mysql_pipelines/federated_join_and_insert.yaml"}'
-
 # Execute for a specific user by name
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \

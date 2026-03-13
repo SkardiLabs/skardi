@@ -60,7 +60,7 @@ EOF
 
 # 5. Start Skardi
 cargo run --bin skardi-server -- \
-  --ctx demo/ctx_postgres_demo.yaml \
+  --ctx demo/postgres/ctx_postgres_demo.yaml \
   --pipeline /tmp/pg_query_pipeline.yaml \
   --port 8080
 
@@ -83,28 +83,26 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
    export PG_PASSWORD="skardi_pass"
    ```
 
-2. **Start Skardi server**:
-   ```bash
-   cargo run --bin skardi-server -- --ctx demo/ctx_postgres_demo.yaml --port 8080
-   ```
+2. **Start Skardi server with pipelines**:
 
-3. **Use pre-built query pipelines**:
-
-   Example pipeline files are provided in `demo/postgres_pipelines/`:
+   Example pipeline files are provided in `demo/postgres/pipelines/`:
    - `query_user_by_id.yaml` - Query user by ID
    - `insert_user.yaml` - Insert new user
    - `update_user_email.yaml` - Update a user's email by name
    - `delete_user.yaml` - Delete a user by name
    - `federated_join_and_insert.yaml` - Join CSV + PostgreSQL and write results
 
-4. **Register and execute pipelines**:
+   Pass them all at server start using the `--pipeline` flag (accepts a directory or individual files):
+   ```bash
+   cargo run --bin skardi-server -- \
+     --ctx demo/postgres/ctx_postgres_demo.yaml \
+     --pipeline demo/postgres/pipelines/ \
+     --port 8080
+   ```
+
+3. **Execute pipelines**:
 
    ```bash
-   # Register the query user by ID pipeline
-   curl -X POST http://localhost:8080/register_pipeline \
-     -H "Content-Type: application/json" \
-     -d '{"path": "crates/server/demo/postgres_pipelines/query_user_by_id.yaml"}'
-
    # Execute with parameters
    curl -X POST http://localhost:8080/query_user_by_id/execute \
      -H "Content-Type: application/json" \
@@ -116,12 +114,7 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
 Insert a new user into the PostgreSQL table:
 
 ```bash
-# Register the insert pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "crates/server/demo/postgres_pipelines/insert_user.yaml"}'
-
-# Execute INSERT with parameters
+# Execute INSERT with parameters (pipeline was loaded at server start)
 curl -X POST http://localhost:8080/insert_user/execute \
   -H "Content-Type: application/json" \
   -d '{"name": "David Brown", "email": "david@example.com"}'
@@ -138,11 +131,6 @@ docker exec postgres-skardi psql -U skardi_user -d mydb \
 Update an existing user's email address:
 
 ```bash
-# Register the update pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "crates/server/demo/postgres_pipelines/update_user_email.yaml"}'
-
 # Execute UPDATE with parameters
 curl -X POST http://localhost:8080/update_user_email/execute \
   -H "Content-Type: application/json" \
@@ -177,11 +165,6 @@ UPDATE users SET email = {new_email}, name = {new_name} WHERE name = {name}
 Delete a user by name:
 
 ```bash
-# Register the delete pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/postgres_pipelines/delete_user.yaml"}'
-
 # Execute DELETE with parameters
 curl -X POST http://localhost:8080/delete_user/execute \
   -H "Content-Type: application/json" \
@@ -231,7 +214,7 @@ CSV File (orders.csv)         PostgreSQL (users table)
 
 ### Shared CSV Data Source
 
-The demo uses the same CSV file as the MySQL demo (`crates/server/demo/sample_data/orders.csv`):
+The demo uses the same CSV file as the MySQL demo (`demo/sample_data/orders.csv`):
 
 ```csv
 order_id,user_id,product,amount,order_date
@@ -248,11 +231,6 @@ order_id,user_id,product,amount,order_date
 ### Execute the Federated Query
 
 ```bash
-# Register the federated join pipeline
-curl -X POST http://localhost:8080/register_pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"path": "demo/postgres_pipelines/federated_join_and_insert.yaml"}'
-
 # Execute for Alice Smith
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
