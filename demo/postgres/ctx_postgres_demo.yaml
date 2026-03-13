@@ -36,5 +36,5 @@ data_sources:
   # CSV data source (shared with MySQL demo for federated query)
   - name: "csv_orders"
     type: "csv"
-    path: "crates/server/demo/sample_data/orders.csv"
+    path: "demo/sample_data/orders.csv"
     description: "CSV file containing order data"
