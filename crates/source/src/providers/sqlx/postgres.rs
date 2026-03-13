@@ -117,7 +117,7 @@ pub async fn register_postgres_tables(
             detect_auto_generated_columns(&sqlx_pool, &schema_name, table_name).await?;
 
         if !auto_generated_columns.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 "Detected auto-generated columns for '{}.{}': {:?}",
                 schema_name,
                 table_name,
