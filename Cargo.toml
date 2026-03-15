@@ -78,6 +78,11 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[profile.release-cli]
+inherits = "release"
+lto = true
+panic = "abort"
+
 [workspace.lints.clippy]
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
 large_futures = "warn"
