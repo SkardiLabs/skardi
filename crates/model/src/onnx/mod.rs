@@ -330,7 +330,6 @@ impl OnnxModelRegistry {
                 .commit();
         }
 
-        tracing::info!("Loading ONNX model from '{}'", model_path);
         let model = Arc::new(OnnxModel::new(model_path)?);
 
         tracing::debug!(

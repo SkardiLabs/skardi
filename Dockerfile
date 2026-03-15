@@ -14,13 +14,13 @@ COPY . .
 
 RUN cargo build --release -p skardi-server
 
-# Runtime stage
-FROM ubuntu:24.04
+# Runtime stage - debian-slim includes all required runtime dependencies
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
+    libssl3t64 \
+    zlib1g \
     ca-certificates \
-    libssl3 \
-    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/skardi-server /usr/local/bin/skardi-server

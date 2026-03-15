@@ -21,7 +21,6 @@ hex = "0.4"
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 lance = { workspace = true }
-lance-linalg = { workspace = true }
 mongodb = "3.1"
 mysql_async = "0.36"
 percent-encoding = "2.3"
