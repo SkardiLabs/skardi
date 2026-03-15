@@ -28,7 +28,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
 - **CLI for local agents & queries** — Run SQL against local files, remote object stores (S3, GCS, Azure), databases, and datalake formats — ideal for local AI agents like [OpenClaw](https://github.com/openclaw/openclaw)
 - **Declarative pipelines** — Define SQL queries in YAML, get REST APIs automatically
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
-- **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, MongoDB, Iceberg, and Lance in a single query
+- **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
 - **Vector search** — Native KNN similarity search via Lance integration
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
@@ -52,6 +52,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
   - [Parquet](#parquet)
   - [PostgreSQL](#postgresql)
   - [MySQL](#mysql)
+  - [SQLite](#sqlite)
   - [MongoDB](#mongodb)
   - [Apache Iceberg](#apache-iceberg)
   - [Lance (Vector Search)](#lance-vector-search)
@@ -132,7 +133,7 @@ skardi query --ctx ./ctx.yaml --schema -t products
 | Local files | CSV, Parquet, JSON/NDJSON, Lance |
 | Remote stores | S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS |
 | Datalake formats | Lance, Iceberg |
-| Databases | PostgreSQL, MySQL, MongoDB |
+| Databases | PostgreSQL, MySQL, SQLite, MongoDB |
 
 **Context file resolution** (when `--ctx` is omitted): checks `SKARDICONFIG` env var, then `~/.skardi/config/ctx.yaml`. If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
 
@@ -205,7 +206,7 @@ data_sources:
 
 ### Access Mode
 
-By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres` and `mysql` sources support `read_write` mode; setting it on other types will produce an error at startup.
+By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres`, `mysql`, and `sqlite` sources support `read_write` mode; setting it on other types will produce an error at startup.
 
 ```yaml
 data_sources:
@@ -365,6 +366,28 @@ export MYSQL_PASSWORD="mypassword"
 ```
 
 For detailed setup, CRUD examples, and federated queries, see [demo/mysql/MYSQL_DEMO.md](demo/mysql/MYSQL_DEMO.md).
+
+### SQLite
+
+Full CRUD support (SELECT, INSERT, UPDATE, DELETE) with no external server required — just a local `.db` file.
+
+```yaml
+- name: "users"
+  type: "sqlite"
+  path: "data/my_database.db"
+  options:
+    table: "users"
+    busy_timeout_ms: "5000"     # Optional, default: 5000
+```
+
+SQLite requires no credentials — just the path to the database file.
+
+**CLI direct path query** (no context file needed):
+```bash
+skardi query --sql "SELECT * FROM './data/my_database.db.users'"
+```
+
+For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/SQLITE_DEMO.md](demo/sqlite/SQLITE_DEMO.md).
 
 ### MongoDB
 
@@ -587,6 +610,7 @@ The [demo/](demo/) directory contains complete working examples:
 | [demo/README.md](demo/README.md) | Product search demo (CSV/Parquet) |
 | [demo/postgres/](demo/postgres/) | PostgreSQL CRUD and federated query examples |
 | [demo/mysql/](demo/mysql/) | MySQL CRUD and federated query examples |
+| [demo/sqlite/](demo/sqlite/) | SQLite CRUD and federated query examples |
 | [demo/mongo/](demo/mongo/) | MongoDB CRUD and federated query examples |
 | [demo/iceberg/](demo/iceberg/) | Apache Iceberg integration examples |
 | [demo/lance/](demo/lance/) | Lance vector search examples |

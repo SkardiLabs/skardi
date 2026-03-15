@@ -30,6 +30,29 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_rusqlite::Connection;
 
+/// Create a read-only SQLite table provider for a single table.
+pub async fn create_sqlite_table_provider(
+    db_path: &str,
+    table_name: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let pool = Arc::new(
+        SqliteConnectionPoolFactory::new(db_path, Mode::File, Duration::from_millis(5000))
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create SQLite connection pool: {}", e))?,
+    );
+
+    let factory = SqliteTableFactory::new(Arc::clone(&pool));
+    let table_ref = TableReference::bare(table_name);
+
+    let provider = factory
+        .table_provider(table_ref)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create SQLite table provider: {}", e))?;
+
+    Ok(provider)
+}
+
 /// Register SQLite tables into DataFusion SessionContext
 ///
 /// # Arguments
