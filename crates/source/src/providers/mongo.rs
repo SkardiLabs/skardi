@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// MongoDB Table Provider for DataFusion
-/// Supports read (scan) and write (insert) operations
+/// Supports read (scan), write (insert), update, and delete operations
 pub struct MongoTableProvider {
     collection: Collection<Document>,
     schema: SchemaRef,
@@ -425,6 +425,49 @@ impl TableProvider for MongoTableProvider {
             collection: self.collection.clone(),
             primary_key: self.primary_key.clone(),
         }))
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let filter_doc = exprs_to_mongo_filter(&filters, &self.primary_key)?;
+        Ok(Arc::new(MongoDmlExec::new(
+            self.collection.clone(),
+            MongoDmlOp::Delete(filter_doc),
+        )))
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if assignments.is_empty() {
+            return Err(DataFusionError::Plan(
+                "UPDATE requires at least one assignment".to_string(),
+            ));
+        }
+
+        let filter_doc = exprs_to_mongo_filter(&filters, &self.primary_key)?;
+        let mut set_doc = Document::new();
+        for (col, expr) in &assignments {
+            let value = expr_to_bson_value(expr)?;
+            let key = if col == &self.primary_key {
+                "_id".to_string()
+            } else {
+                col.clone()
+            };
+            set_doc.insert(key, value);
+        }
+        let update_doc = doc! { "$set": set_doc };
+
+        Ok(Arc::new(MongoDmlExec::new(
+            self.collection.clone(),
+            MongoDmlOp::Update(filter_doc, update_doc),
+        )))
     }
 }
 
@@ -871,6 +914,219 @@ fn create_count_batch(count: u64) -> DFResult<RecordBatch> {
     )]));
     let array: arrow::array::UInt64Array = vec![count].into();
     RecordBatch::try_new(schema, vec![Arc::new(array)]).map_err(DataFusionError::from)
+}
+
+// ─── DML support (DELETE / UPDATE) ──────────────────────────────────────────
+
+/// Converts a DataFusion literal expression to a BSON value.
+fn expr_to_bson_value(expr: &Expr) -> DFResult<Bson> {
+    match expr {
+        Expr::Literal(scalar, _) => scalar_to_bson(scalar),
+        Expr::Column(col) => Ok(Bson::String(col.name.clone())),
+        _ => Err(DataFusionError::Plan(format!(
+            "Unsupported expression for MongoDB value: {expr}"
+        ))),
+    }
+}
+
+fn scalar_to_bson(scalar: &datafusion::common::ScalarValue) -> DFResult<Bson> {
+    use datafusion::common::ScalarValue;
+    match scalar {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Ok(Bson::String(s.clone())),
+        ScalarValue::Int8(Some(v)) => Ok(Bson::Int32(*v as i32)),
+        ScalarValue::Int16(Some(v)) => Ok(Bson::Int32(*v as i32)),
+        ScalarValue::Int32(Some(v)) => Ok(Bson::Int32(*v)),
+        ScalarValue::Int64(Some(v)) => Ok(Bson::Int64(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(Bson::Int32(*v as i32)),
+        ScalarValue::UInt16(Some(v)) => Ok(Bson::Int32(*v as i32)),
+        ScalarValue::UInt32(Some(v)) => Ok(Bson::Int64(*v as i64)),
+        ScalarValue::UInt64(Some(v)) => Ok(Bson::Int64(*v as i64)),
+        ScalarValue::Float32(Some(v)) => Ok(Bson::Double(*v as f64)),
+        ScalarValue::Float64(Some(v)) => Ok(Bson::Double(*v)),
+        ScalarValue::Boolean(Some(v)) => Ok(Bson::Boolean(*v)),
+        ScalarValue::Null => Ok(Bson::Null),
+        _ => Err(DataFusionError::Plan(format!(
+            "Unsupported scalar type for MongoDB: {scalar}"
+        ))),
+    }
+}
+
+/// Converts a single DataFusion binary expression to a MongoDB filter entry.
+fn binary_expr_to_mongo(
+    left: &Expr,
+    op: &datafusion::logical_expr::Operator,
+    right: &Expr,
+    primary_key: &str,
+) -> DFResult<Document> {
+    use datafusion::logical_expr::Operator;
+
+    let (col_name, value) = match (left, right) {
+        (Expr::Column(col), expr) | (expr, Expr::Column(col)) => {
+            let field = if col.name == primary_key {
+                "_id".to_string()
+            } else {
+                col.name.clone()
+            };
+            (field, expr_to_bson_value(expr)?)
+        }
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "MongoDB filter must compare a column to a value, got: {left} {op} {right}"
+            )));
+        }
+    };
+
+    let filter = match op {
+        Operator::Eq => doc! { &col_name: value },
+        Operator::NotEq => doc! { &col_name: { "$ne": value } },
+        Operator::Lt => doc! { &col_name: { "$lt": value } },
+        Operator::LtEq => doc! { &col_name: { "$lte": value } },
+        Operator::Gt => doc! { &col_name: { "$gt": value } },
+        Operator::GtEq => doc! { &col_name: { "$gte": value } },
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "Unsupported MongoDB filter operator: {op}"
+            )));
+        }
+    };
+
+    Ok(filter)
+}
+
+/// Converts a list of DataFusion filter expressions into a single MongoDB
+/// filter document (implicit `$and`).
+fn exprs_to_mongo_filter(filters: &[Expr], primary_key: &str) -> DFResult<Document> {
+    if filters.is_empty() {
+        return Ok(doc! {});
+    }
+
+    let mut combined = Document::new();
+    for expr in filters {
+        match expr {
+            Expr::BinaryExpr(binary) => {
+                let part =
+                    binary_expr_to_mongo(&binary.left, &binary.op, &binary.right, primary_key)?;
+                for (k, v) in part {
+                    combined.insert(k, v);
+                }
+            }
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported MongoDB filter expression: {expr}"
+                )));
+            }
+        }
+    }
+
+    Ok(combined)
+}
+
+/// The kind of DML operation to execute.
+#[derive(Debug, Clone)]
+enum MongoDmlOp {
+    Delete(Document),
+    Update(Document, Document), // (filter, update)
+}
+
+/// A leaf [`ExecutionPlan`] that executes a MongoDB DML operation and returns
+/// a single row `{ count: u64 }` with the number of affected documents.
+struct MongoDmlExec {
+    collection: Collection<Document>,
+    op: MongoDmlOp,
+    schema: SchemaRef,
+    properties: datafusion::physical_plan::PlanProperties,
+}
+
+impl MongoDmlExec {
+    fn new(collection: Collection<Document>, op: MongoDmlOp) -> Self {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
+        let properties = datafusion::physical_plan::PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::execution_plan::EmissionType::Final,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        );
+        Self {
+            collection,
+            op,
+            schema,
+            properties,
+        }
+    }
+}
+
+impl Debug for MongoDmlExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "MongoDmlExec(op={:?})", self.op)
+    }
+}
+
+impl DisplayAs for MongoDmlExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        write!(f, "MongoDmlExec")
+    }
+}
+
+impl ExecutionPlan for MongoDmlExec {
+    fn name(&self) -> &str {
+        "MongoDmlExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let collection = self.collection.clone();
+        let op = self.op.clone();
+
+        let future = async move {
+            let affected = match op {
+                MongoDmlOp::Delete(filter) => {
+                    let result = collection.delete_many(filter).await.map_err(|e| {
+                        DataFusionError::Execution(format!("MongoDB delete error: {e}"))
+                    })?;
+                    result.deleted_count
+                }
+                MongoDmlOp::Update(filter, update) => {
+                    let result = collection.update_many(filter, update).await.map_err(|e| {
+                        DataFusionError::Execution(format!("MongoDB update error: {e}"))
+                    })?;
+                    result.modified_count
+                }
+            };
+
+            create_count_batch(affected)
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            futures::stream::once(future),
+        )))
+    }
 }
 
 fn build_connection_uri(

@@ -75,6 +75,8 @@ cargo run --bin skardi-server -- \
 | `list_all_products` | Full scan of all products |
 | `insert_product` | Insert a single product |
 | `insert_products_from_select` | Insert multiple products |
+| `update_product_price` | Update a product's price by ID |
+| `delete_product` | Delete a product by ID |
 | `federated_join_and_insert` | Join CSV inventory with MongoDB, insert aggregated stats |
 
 ---
@@ -173,7 +175,53 @@ curl -X POST http://localhost:8080/insert_products_from_select/execute \
 
 ---
 
-## 5. Federated Query: Join CSV + MongoDB
+## 5. Update a Product
+
+Update a product's price by its product ID.
+
+```bash
+curl -X POST http://localhost:8080/update_product_price/execute \
+  -H "Content-Type: application/json" \
+  -d '{"product_id": "PROD001", "price": 899.99}'
+```
+
+**Response:**
+```json
+{"data": [{"count": 1}], "execution_time_ms": 6, "rows": 1, "success": true}
+```
+
+**Verify in MongoDB:**
+```bash
+docker exec mongo-skardi mongosh -u root -p rootpass --authenticationDatabase admin --eval \
+  'use mydb; db.products.find({product_id: "PROD001"}).pretty()'
+```
+
+---
+
+## 6. Delete a Product
+
+Delete a product by its product ID.
+
+```bash
+curl -X POST http://localhost:8080/delete_product/execute \
+  -H "Content-Type: application/json" \
+  -d '{"product_id": "PROD006"}'
+```
+
+**Response:**
+```json
+{"data": [{"count": 1}], "execution_time_ms": 5, "rows": 1, "success": true}
+```
+
+**Verify in MongoDB:**
+```bash
+docker exec mongo-skardi mongosh -u root -p rootpass --authenticationDatabase admin --eval \
+  'use mydb; db.products.find().pretty()'
+```
+
+---
+
+## 7. Federated Query: Join CSV + MongoDB
 
 Join data from multiple sources (CSV file + MongoDB collection) and write aggregated results back to MongoDB.
 
