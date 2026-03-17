@@ -8,10 +8,13 @@ use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     stream::RecordBatchStreamAdapter,
 };
+use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::prelude::SessionContext;
 use futures::stream::StreamExt;
 use mongodb::bson::{Bson, Document, doc};
@@ -358,7 +361,13 @@ impl TableProvider for MongoTableProvider {
             .iter()
             .map(|expr| {
                 if is_primary_key_equality_filter(expr, &self.primary_key) {
-                    TableProviderFilterPushDown::Exact
+                    // Use Inexact rather than Exact so the filter is still
+                    // present in the logical plan.  DataFusion's UPDATE/DELETE
+                    // physical planner extracts filters from the logical plan
+                    // and passes them to TableProvider::update/delete_from.
+                    // With Exact, the optimizer removes the filter before the
+                    // physical planner sees it, causing unfiltered updates.
+                    TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -407,9 +416,17 @@ impl TableProvider for MongoTableProvider {
             batch
         };
 
+        let schema = batch.schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
         Ok(Arc::new(MongoExecPlan {
-            schema: batch.schema(),
+            schema,
             batch: Arc::new(RwLock::new(Some(batch))),
+            properties,
         }))
     }
 
@@ -682,6 +699,7 @@ fn arrow_value_to_bson(array: &ArrayRef, row: usize, data_type: &DataType) -> Re
 struct MongoExecPlan {
     schema: SchemaRef,
     batch: Arc<RwLock<Option<RecordBatch>>>,
+    properties: PlanProperties,
 }
 
 impl DisplayAs for MongoExecPlan {
@@ -699,17 +717,8 @@ impl ExecutionPlan for MongoExecPlan {
         self
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
-        static PROPS: std::sync::OnceLock<datafusion::physical_plan::PlanProperties> =
-            std::sync::OnceLock::new();
-        PROPS.get_or_init(|| {
-            datafusion::physical_plan::PlanProperties::new(
-                datafusion::physical_expr::EquivalenceProperties::new(self.schema.clone()),
-                datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-                datafusion::physical_plan::execution_plan::EmissionType::Final,
-                datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-            )
-        })
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -776,7 +785,7 @@ impl ExecutionPlan for MongoInsertExec {
         self
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &PlanProperties {
         self.input.properties()
     }
 
@@ -1034,7 +1043,7 @@ struct MongoDmlExec {
     collection: Collection<Document>,
     op: MongoDmlOp,
     schema: SchemaRef,
-    properties: datafusion::physical_plan::PlanProperties,
+    properties: PlanProperties,
 }
 
 impl MongoDmlExec {
@@ -1044,11 +1053,11 @@ impl MongoDmlExec {
             DataType::UInt64,
             false,
         )]));
-        let properties = datafusion::physical_plan::PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Final,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
         );
         Self {
             collection,
@@ -1080,7 +1089,7 @@ impl ExecutionPlan for MongoDmlExec {
         self
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &PlanProperties {
         &self.properties
     }
 
