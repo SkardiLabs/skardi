@@ -82,6 +82,7 @@ pub enum DataSourceType {
     Parquet,
     Postgres,
     Mysql,
+    Sqlite,
     Iceberg,
     Mongo,
     Lance,
@@ -132,6 +133,9 @@ pub enum ConfigError {
     #[error("MySQL connection failed: {name} - {error}")]
     MySQLConnectionFailed { name: String, error: String },
 
+    #[error("SQLite connection failed: {name} - {error}")]
+    SQLiteConnectionFailed { name: String, error: String },
+
     #[error("S3 path must start with 's3://' prefix: {path}")]
     InvalidS3Path { path: String },
 
@@ -141,7 +145,7 @@ pub enum ConfigError {
     #[error("S3 object store registration failed: {name} - {error}")]
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
-    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres' and 'mysql' sources support read_write mode.")]
+    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', and 'mongo' sources support read_write mode.")]
     UnsupportedWriteMode {
         name: String,
         source_type: DataSourceType,
@@ -429,6 +433,7 @@ fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
 const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Postgres,
     DataSourceType::Mysql,
+    DataSourceType::Sqlite,
     DataSourceType::Mongo,
 ];
 
@@ -608,7 +613,13 @@ async fn register_data_source(
 
     // Validate data source configuration based on path type
     match (&source.source_type, s3_storage.is_remote_path(&source.path)) {
-        (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, false) => {
+        (
+            DataSourceType::Csv
+            | DataSourceType::Parquet
+            | DataSourceType::Lance
+            | DataSourceType::Sqlite,
+            false,
+        ) => {
             // For local files, verify the file exists
             if !source.path.exists() {
                 return Err(ConfigError::DataSourceFileNotFound {
@@ -631,6 +642,9 @@ async fn register_data_source(
         }
         (DataSourceType::Iceberg, _) => {
             // Validation happened during data source registration
+        }
+        _ => {
+            // Other combinations are valid without additional checks
         }
     }
 
@@ -765,6 +779,39 @@ async fn register_data_source(
             .map_err(|e| {
                 tracing::error!("MySQL registration failed for '{}': {:?}", source.name, e);
                 ConfigError::MySQLConnectionFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Sqlite => {
+            tracing::info!(
+                "Registering SQLite table: {} from {:?} (access_mode: {:?})",
+                source.name,
+                source.path,
+                source.access_mode
+            );
+
+            let db_path =
+                source
+                    .path
+                    .to_str()
+                    .ok_or_else(|| ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: "Invalid SQLite database path".to_string(),
+                    })?;
+
+            source::providers::sqlite::register_sqlite_tables(
+                session_ctx,
+                &source.name,
+                db_path,
+                source.options.as_ref(),
+                source.access_mode.is_read_write(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("SQLite registration failed for '{}': {:?}", source.name, e);
+                ConfigError::SQLiteConnectionFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
                 }
