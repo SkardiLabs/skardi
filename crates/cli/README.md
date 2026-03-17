@@ -29,7 +29,7 @@ Execute a SQL query or show table schema(s). Data sources can come from:
 - **Local files** — CSV, Parquet, JSON/NDJSON (directly by path in SQL or via context file)
 - **Remote files** — S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS (directly by URL in SQL or via context file)
 - **Datalake formats** — Lance (directly by path in SQL or via context file), Iceberg (via context file)
-- **Databases** — PostgreSQL, MySQL, MongoDB (via context file)
+- **Databases** — PostgreSQL, MySQL, SQLite, MongoDB (via context file or direct path for SQLite)
 
 #### Query files directly (no context file needed)
 
@@ -43,6 +43,10 @@ skardi query --sql "SELECT * FROM './data/logs.json'"
 
 # Lance datasets
 skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
+
+# SQLite tables (pattern: path/to/file.db.table_name)
+skardi query --sql "SELECT * FROM './data/my_database.db.users'"
+skardi query --sql "SELECT * FROM './data/app.sqlite.customers'"
 
 # Remote files (S3, GCS, Azure)
 skardi query --sql "SELECT * FROM 's3://mybucket/data/events.parquet'"
@@ -153,6 +157,14 @@ data_sources:
       user_env: MYSQL_USER
       pass_env: MYSQL_PASS
 
+  # SQLite
+  - name: users
+    type: sqlite
+    path: data/my_database.db
+    options:
+      table: users
+      busy_timeout_ms: "5000"   # Optional
+
   # MongoDB
   - name: profiles
     type: mongo
@@ -174,6 +186,7 @@ data_sources:
 | `iceberg` | Apache Iceberg tables | Warehouse path (local or S3) |
 | `postgres` | PostgreSQL tables | `postgresql://host:port/db` |
 | `mysql` | MySQL tables | `mysql://host:port/db` |
+| `sqlite` | SQLite tables | Local file path (e.g. `data/my.db`) |
 | `mongo` | MongoDB collections | `mongodb://host:port` |
 
 **Path resolution:** Relative paths in the context file are resolved relative to your **current working directory**.
@@ -257,6 +270,9 @@ skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
 
 # Query a Lance dataset
 skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
+
+# Query a SQLite table directly
+skardi query --sql "SELECT * FROM './data/app.db.users' LIMIT 10"
 
 # With context file
 cargo run -p skardi-cli -- query --ctx ./demo/ctx.yaml --sql "SELECT * FROM products LIMIT 5"

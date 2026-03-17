@@ -388,6 +388,7 @@ pub async fn get_data_sources(
             DataSourceType::Mysql => "mysql",
             DataSourceType::Iceberg => "iceberg",
             DataSourceType::Mongo => "mongo",
+            DataSourceType::Sqlite => "sqlite",
             DataSourceType::Lance => "lance",
         };
 
@@ -396,6 +397,7 @@ pub async fn get_data_sources(
             DataSourceType::Csv
             | DataSourceType::Parquet
             | DataSourceType::Lance
+            | DataSourceType::Sqlite
             | DataSourceType::Iceberg => Some(data_source.path.to_string_lossy().to_string()),
             DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo => None,
         };
