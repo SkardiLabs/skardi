@@ -1,0 +1,7 @@
+metadata:
+  name: "update_product_price"
+  version: "1.0"
+  description: "Update a product's price by product ID"
+
+query: |
+  UPDATE products SET price = {price} WHERE product_id = {product_id}
