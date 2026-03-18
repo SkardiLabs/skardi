@@ -28,7 +28,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
 - **CLI for local agents & queries** — Run SQL against local files, remote object stores (S3, GCS, Azure), databases, and datalake formats — ideal for local AI agents like [OpenClaw](https://github.com/openclaw/openclaw)
 - **Declarative pipelines** — Define SQL queries in YAML, get REST APIs automatically
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
-- **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Iceberg, and Lance in a single query
+- **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
 - **Vector search** — Native KNN similarity search via Lance integration
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
@@ -54,6 +54,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
   - [MySQL](#mysql)
   - [SQLite](#sqlite)
   - [MongoDB](#mongodb)
+  - [Redis](#redis)
   - [Apache Iceberg](#apache-iceberg)
   - [Lance (Vector Search)](#lance-vector-search)
   - [S3 Remote Files](#s3-remote-files)
@@ -133,7 +134,7 @@ skardi query --ctx ./ctx.yaml --schema -t products
 | Local files | CSV, Parquet, JSON/NDJSON, Lance |
 | Remote stores | S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS |
 | Datalake formats | Lance, Iceberg |
-| Databases | PostgreSQL, MySQL, SQLite, MongoDB |
+| Databases | PostgreSQL, MySQL, SQLite, MongoDB, Redis |
 
 **Context file resolution** (when `--ctx` is omitted): checks `SKARDICONFIG` env var, then `~/.skardi/config/ctx.yaml`. If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
 
@@ -206,7 +207,7 @@ data_sources:
 
 ### Access Mode
 
-By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres`, `mysql`, and `sqlite` sources support `read_write` mode; setting it on other types will produce an error at startup.
+By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres`, `mysql`, `sqlite`, `mongo`, and `redis` sources support `read_write` mode; setting it on other types will produce an error at startup.
 
 ```yaml
 data_sources:
@@ -412,6 +413,24 @@ export MONGO_PASS="mypassword"
 
 For detailed setup, CRUD examples, and federated queries, see [demo/mongo/MONGO_DEMO.md](demo/mongo/MONGO_DEMO.md).
 
+### Redis
+
+Full CRUD support with point lookups (O(1) via direct key construction), full scans, and federated queries. Redis hashes map directly to SQL rows.
+
+```yaml
+- name: "products"
+  type: "redis"
+  connection_string: "redis://localhost:6379"
+  options:
+    key_space: "mydb"
+    table: "products"
+    key_column: "product_id"
+```
+
+Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column. For initially empty tables, use the `columns` option to declare the schema upfront so INSERT operations work immediately.
+
+For detailed setup, CRUD examples, and federated queries, see [demo/redis/REDIS_DEMO.md](demo/redis/REDIS_DEMO.md).
+
 ### Apache Iceberg
 
 Query Iceberg tables with support for schema evolution, partition pruning, and time travel.
@@ -612,6 +631,7 @@ The [demo/](demo/) directory contains complete working examples:
 | [demo/mysql/](demo/mysql/) | MySQL CRUD and federated query examples |
 | [demo/sqlite/](demo/sqlite/) | SQLite CRUD and federated query examples |
 | [demo/mongo/](demo/mongo/) | MongoDB CRUD and federated query examples |
+| [demo/redis/](demo/redis/) | Redis CRUD and federated query examples |
 | [demo/iceberg/](demo/iceberg/) | Apache Iceberg integration examples |
 | [demo/lance/](demo/lance/) | Lance vector search examples |
 | [demo/onnx_predict/](demo/onnx_predict/) | ONNX model inference in SQL |

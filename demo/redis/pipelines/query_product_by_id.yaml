@@ -1,0 +1,6 @@
+metadata:
+  name: "query_product_by_id"
+  version: "1.0"
+  description: "Query a specific product by ID (point lookup)"
+
+query: "SELECT * FROM products WHERE product_id = {product_id}"

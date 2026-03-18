@@ -85,6 +85,7 @@ pub enum DataSourceType {
     Sqlite,
     Iceberg,
     Mongo,
+    Redis,
     Lance,
 }
 
@@ -145,7 +146,7 @@ pub enum ConfigError {
     #[error("S3 object store registration failed: {name} - {error}")]
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
-    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', and 'mongo' sources support read_write mode.")]
+    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode.")]
     UnsupportedWriteMode {
         name: String,
         source_type: DataSourceType,
@@ -435,6 +436,7 @@ const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Mysql,
     DataSourceType::Sqlite,
     DataSourceType::Mongo,
+    DataSourceType::Redis,
 ];
 
 /// Validate data source configurations
@@ -473,7 +475,13 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 // Validate S3 configuration for S3 paths
                 s3_storage.validate_configuration(source)?;
             }
-            (DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo, false) => {
+            (
+                DataSourceType::Postgres
+                | DataSourceType::Mysql
+                | DataSourceType::Mongo
+                | DataSourceType::Redis,
+                false,
+            ) => {
                 // For database connections, ensure connection string is provided
                 if source.connection_string.is_none() {
                     return Err(ConfigError::MissingConnectionString {
@@ -637,7 +645,13 @@ async fn register_data_source(
                 .setup_object_store(session_ctx, &source.name, s3_path)
                 .await?;
         }
-        (DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo, _) => {
+        (
+            DataSourceType::Postgres
+            | DataSourceType::Mysql
+            | DataSourceType::Mongo
+            | DataSourceType::Redis,
+            _,
+        ) => {
             // Database sources don't need file path validation
         }
         (DataSourceType::Iceberg, _) => {
@@ -873,6 +887,36 @@ async fn register_data_source(
             .await
             .map_err(|e| {
                 tracing::error!("MongoDB registration failed for '{}': {:?}", source.name, e);
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Redis => {
+            tracing::info!("Registering Redis table: {}", source.name);
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            tracing::debug!(
+                "Connection string for {}: {} (options: {:?})",
+                source.name,
+                connection_string,
+                source.options
+            );
+
+            source::redis::datasource::register_redis_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+            )
+            .map_err(|e| {
+                tracing::error!("Redis registration failed for '{}': {:?}", source.name, e);
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
