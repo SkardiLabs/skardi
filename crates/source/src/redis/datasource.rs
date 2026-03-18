@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Error, Result};
 use arrow::{
     array::{
-        ArrayRef, RecordBatch, StringBuilder, as_boolean_array, as_largestring_array,
+        ArrayRef, RecordBatch, StringBuilder, UInt64Array, as_boolean_array, as_largestring_array,
         as_string_array,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -25,7 +25,7 @@ use datafusion::{
     datasource::sink::{DataSink, DataSinkExec},
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::dml::InsertOp,
+    logical_expr::{Operator, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -38,6 +38,8 @@ use derivative::Derivative;
 use futures::TryStreamExt;
 use redis::{Commands, ConnectionLike, Iter};
 use uuid::Uuid;
+
+use super::relation::RedisRelation;
 
 /// Enum representing the storage format of data in Redis.
 /// Currently supports Hash (each row as a Redis hash). Can be extended to JSON, etc.
@@ -75,18 +77,13 @@ where
         storage: RedisStorage,
         key_column: Option<String>,
     ) -> Result<Self> {
-        let prefix = if key_space.is_empty() {
-            table_name.clone()
-        } else {
-            format!("{}:{}", key_space, table_name)
-        };
+        let pattern = RedisRelation::table_data_key_pattern(&key_space, &table_name);
 
         let mut fields: Vec<Field> = vec![];
         let mut inferred_fields: Vec<String> = vec![];
 
         // TODO: Implement read from schema_key
 
-        let pattern = format!("{}:*", prefix);
         let mut iter: Iter<String> = conn
             .scan_match(&pattern)
             .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?;
@@ -227,7 +224,421 @@ where
         // Wrap in DataSinkExec to execute insertion. The DataSinkExec will handle combining input and writing.
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
+
+    /// Delete rows matching the given filters.
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let mut conn = self.conn.try_write().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to acquire write lock of redis connection: {}",
+                e
+            ))
+        })?;
+        let keys = resolve_matching_keys(
+            &mut *conn,
+            &self.key_space,
+            &self.table_name,
+            &self.schema,
+            &self.key_column,
+            &filters,
+        )?;
+        drop(conn);
+        Ok(Arc::new(RedisDmlExec::new(
+            self.conn.clone(),
+            RedisDmlOp::Delete(keys),
+        )))
+    }
+
+    /// Update rows matching the given filters with the specified assignments.
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        if assignments.is_empty() {
+            return Err(DataFusionError::Plan(
+                "UPDATE requires at least one assignment".to_string(),
+            ));
+        }
+        let fields = assignments_to_redis_fields(&assignments, &self.key_column)?;
+        let mut conn = self.conn.try_write().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to acquire write lock of redis connection: {}",
+                e
+            ))
+        })?;
+        let keys = resolve_matching_keys(
+            &mut *conn,
+            &self.key_space,
+            &self.table_name,
+            &self.schema,
+            &self.key_column,
+            &filters,
+        )?;
+        drop(conn);
+        Ok(Arc::new(RedisDmlExec::new(
+            self.conn.clone(),
+            RedisDmlOp::Update(keys, fields),
+        )))
+    }
 }
+
+// ─── Filter / Assignment helpers ────────────────────────────────────────────
+
+/// Resolve which Redis keys match the given filter expressions.
+///
+/// **Fast path**: if the only filter is `key_column = 'literal'`, construct the key directly.
+/// **Slow path**: SCAN all keys, HGETALL each, evaluate filters in-memory.
+fn resolve_matching_keys<C: ConnectionLike + Commands>(
+    conn: &mut C,
+    key_space: &str,
+    table_name: &str,
+    schema: &SchemaRef,
+    key_column: &Option<String>,
+    filters: &[Expr],
+) -> datafusion::common::Result<Vec<String>> {
+    let prefix = RedisRelation::prefix(key_space, table_name);
+
+    // Fast path: key_column equality
+    if let Some(key_col) = key_column {
+        if let Some(literal_val) = extract_key_column_eq(filters, key_col) {
+            return Ok(vec![format!("{}:{}", prefix, literal_val)]);
+        }
+    }
+
+    // Slow path: scan all keys and filter in-memory
+    let pattern = RedisRelation::table_data_key_pattern(key_space, table_name);
+    let keys: Vec<String> = conn
+        .scan_match(&pattern)
+        .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?;
+
+    if filters.is_empty() {
+        return Ok(keys);
+    }
+
+    let mut matched = Vec::new();
+    for key in keys {
+        let redis_map: HashMap<String, String> = conn
+            .hgetall(&key)
+            .map_err(|e| DataFusionError::Execution(format!("Redis HGETALL error: {}", e)))?;
+
+        // Reconstruct the full row including key_column if present
+        let mut row = redis_map;
+        if let Some(key_col) = key_column {
+            let id = key
+                .strip_prefix(&format!("{}:", prefix))
+                .unwrap_or(&key)
+                .to_string();
+            row.insert(key_col.clone(), id);
+        }
+
+        if evaluate_filters(&row, filters, schema)? {
+            matched.push(key);
+        }
+    }
+
+    Ok(matched)
+}
+
+/// If filters contain exactly one `Column(key_col) = Literal(string)`, extract the literal value.
+fn extract_key_column_eq(filters: &[Expr], key_col: &str) -> Option<String> {
+    if filters.len() != 1 {
+        return None;
+    }
+    match &filters[0] {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::Column(col), Expr::Literal(scalar, _)) if col.name() == key_col => {
+                    scalar_to_string(scalar)
+                }
+                (Expr::Literal(scalar, _), Expr::Column(col)) if col.name() == key_col => {
+                    scalar_to_string(scalar)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate all filter expressions against a row represented as a HashMap.
+fn evaluate_filters(
+    row: &HashMap<String, String>,
+    filters: &[Expr],
+    _schema: &SchemaRef,
+) -> datafusion::common::Result<bool> {
+    for filter in filters {
+        if !evaluate_expr(row, filter)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Evaluate a single filter expression against a row.
+fn evaluate_expr(row: &HashMap<String, String>, expr: &Expr) -> datafusion::common::Result<bool> {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And => {
+                Ok(evaluate_expr(row, &binary.left)? && evaluate_expr(row, &binary.right)?)
+            }
+            Operator::Or => {
+                Ok(evaluate_expr(row, &binary.left)? || evaluate_expr(row, &binary.right)?)
+            }
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                let left_val = resolve_value(row, &binary.left)?;
+                let right_val = resolve_value(row, &binary.right)?;
+                let cmp = left_val.cmp(&right_val);
+                let result = match binary.op {
+                    Operator::Eq => cmp == std::cmp::Ordering::Equal,
+                    Operator::NotEq => cmp != std::cmp::Ordering::Equal,
+                    Operator::Lt => cmp == std::cmp::Ordering::Less,
+                    Operator::LtEq => cmp != std::cmp::Ordering::Greater,
+                    Operator::Gt => cmp == std::cmp::Ordering::Greater,
+                    Operator::GtEq => cmp != std::cmp::Ordering::Less,
+                    _ => unreachable!(),
+                };
+                Ok(result)
+            }
+            _ => Err(DataFusionError::Plan(format!(
+                "Unsupported filter operator for Redis: {:?}",
+                binary.op
+            ))),
+        },
+        _ => Err(DataFusionError::Plan(format!(
+            "Unsupported filter expression for Redis: {expr}"
+        ))),
+    }
+}
+
+/// Resolve the string value of an expression in the context of a row.
+fn resolve_value(row: &HashMap<String, String>, expr: &Expr) -> datafusion::common::Result<String> {
+    match expr {
+        Expr::Column(col) => Ok(row.get(col.name()).cloned().unwrap_or_default()),
+        Expr::Literal(scalar, _) => scalar_to_string(scalar).ok_or_else(|| {
+            DataFusionError::Plan(format!("Unsupported literal type for Redis: {scalar}"))
+        }),
+        _ => Err(DataFusionError::Plan(format!(
+            "Unsupported expression in Redis filter: {expr}"
+        ))),
+    }
+}
+
+/// Convert a ScalarValue to a String.
+fn scalar_to_string(scalar: &datafusion::common::ScalarValue) -> Option<String> {
+    use datafusion::common::ScalarValue;
+    match scalar {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        ScalarValue::Int8(Some(v)) => Some(v.to_string()),
+        ScalarValue::Int16(Some(v)) => Some(v.to_string()),
+        ScalarValue::Int32(Some(v)) => Some(v.to_string()),
+        ScalarValue::Int64(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt8(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt16(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt32(Some(v)) => Some(v.to_string()),
+        ScalarValue::UInt64(Some(v)) => Some(v.to_string()),
+        ScalarValue::Float32(Some(v)) => Some(v.to_string()),
+        ScalarValue::Float64(Some(v)) => Some(v.to_string()),
+        ScalarValue::Boolean(Some(v)) => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// Convert UPDATE assignments to Redis hash field-value pairs.
+fn assignments_to_redis_fields(
+    assignments: &[(String, Expr)],
+    key_column: &Option<String>,
+) -> datafusion::common::Result<Vec<(String, String)>> {
+    let mut fields = Vec::with_capacity(assignments.len());
+    for (col, expr) in assignments {
+        if let Some(key_col) = key_column {
+            if col == key_col {
+                return Err(DataFusionError::Plan(format!(
+                    "Cannot update key column '{}'; this would require deleting and re-inserting the row",
+                    key_col
+                )));
+            }
+        }
+        let value = match expr {
+            Expr::Literal(scalar, _) => scalar_to_string(scalar).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Unsupported literal type for Redis UPDATE: {scalar}"
+                ))
+            })?,
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "Redis UPDATE only supports literal values, got: {expr}"
+                )));
+            }
+        };
+        fields.push((col.clone(), value));
+    }
+    Ok(fields)
+}
+
+// ─── DML execution plan ─────────────────────────────────────────────────────
+
+/// The kind of DML operation to execute.
+#[derive(Debug, Clone)]
+enum RedisDmlOp {
+    /// Delete the given Redis keys.
+    Delete(Vec<String>),
+    /// Update the given Redis keys with field-value pairs.
+    Update(Vec<String>, Vec<(String, String)>),
+}
+
+/// A leaf [`ExecutionPlan`] that executes a Redis DML operation and returns
+/// a single row `{ count: u64 }` with the number of affected keys.
+#[derive(Derivative)]
+#[derivative(Debug)]
+struct RedisDmlExec<C>
+where
+    C: ConnectionLike + Commands + Send + Sync + 'static,
+{
+    #[derivative(Debug = "ignore")]
+    conn: Arc<RwLock<C>>,
+    op: RedisDmlOp,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl<C> RedisDmlExec<C>
+where
+    C: ConnectionLike + Commands + Send + Sync + 'static,
+{
+    fn new(conn: Arc<RwLock<C>>, op: RedisDmlOp) -> Self {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            conn,
+            op,
+            schema,
+            properties,
+        }
+    }
+}
+
+impl<C> DisplayAs for RedisDmlExec<C>
+where
+    C: ConnectionLike + Commands + Send + Sync + 'static,
+{
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default => write!(f, "RedisDmlExec(op={:?})", self.op),
+            _ => write!(f, "RedisDmlExec"),
+        }
+    }
+}
+
+impl<C> ExecutionPlan for RedisDmlExec<C>
+where
+    C: ConnectionLike + Commands + Send + Sync + 'static,
+{
+    fn name(&self) -> &str {
+        "RedisDmlExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let mut conn = self.conn.try_write().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to acquire write lock of redis connection: {}",
+                e
+            ))
+        })?;
+
+        let affected = match &self.op {
+            RedisDmlOp::Delete(keys) => {
+                if keys.is_empty() {
+                    0u64
+                } else {
+                    let _: () = conn.del(keys).map_err(|e| {
+                        DataFusionError::Execution(format!("Redis DEL error: {}", e))
+                    })?;
+                    keys.len() as u64
+                }
+            }
+            RedisDmlOp::Update(keys, fields) => {
+                let field_refs: Vec<(&str, &str)> = fields
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                for key in keys {
+                    let _: () = conn.hset_multiple(key, &field_refs).map_err(|e| {
+                        DataFusionError::Execution(format!("Redis HSET error: {}", e))
+                    })?;
+                }
+                keys.len() as u64
+            }
+        };
+
+        let batch = create_count_batch(affected)?;
+        Ok(Box::pin(MemoryStream::try_new(
+            vec![batch],
+            self.schema.clone(),
+            None,
+        )?))
+    }
+}
+
+/// Create a single-row RecordBatch with `{ count: u64 }`.
+fn create_count_batch(count: u64) -> datafusion::common::Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]));
+    let array: UInt64Array = vec![count].into();
+    RecordBatch::try_new(schema, vec![Arc::new(array)]).map_err(DataFusionError::from)
+}
+
+// ─── Scan execution plan ────────────────────────────────────────────────────
 
 /// ExecutionPlan for scanning a Redis table (reads Redis hashes and outputs Arrow RecordBatches).
 #[derive(Derivative)]
@@ -255,12 +666,7 @@ where
     /// Helper to gather all record batches from Redis for a given partition (node).
     fn fetch_partition(&self, _partition_idx: usize) -> datafusion::common::Result<RecordBatch> {
         // TODO: Utilize partition_idx
-        let prefix = if self.key_space.is_empty() {
-            self.table_name.clone()
-        } else {
-            format!("{}:{}", self.key_space, self.table_name)
-        };
-        let pattern = format!("{}:*", prefix);
+        let pattern = RedisRelation::table_data_key_pattern(&self.key_space, &self.table_name);
 
         // Prepare builders for each projected column
         let mut builders: Vec<StringBuilder> = self
@@ -396,6 +802,8 @@ where
     }
 }
 
+// ─── DataSink for INSERT ────────────────────────────────────────────────────
+
 /// DataSink implementation for writing data into Redis.
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -474,15 +882,11 @@ where
     ) -> datafusion::common::Result<u64> {
         // TODO: Utilize context, intergrate underneath scaler, aggregate, window function, etc
 
-        let prefix = if self.key_space.is_empty() {
-            self.table_name.clone()
-        } else {
-            format!("{}:{}", self.key_space, self.table_name)
-        };
+        let prefix = RedisRelation::prefix(&self.key_space, &self.table_name);
 
         // If Overwrite or Replace, delete existing keys for this table first
         if self.insert_op == InsertOp::Overwrite || self.insert_op == InsertOp::Replace {
-            let pattern = format!("{}:*", prefix);
+            let pattern = RedisRelation::table_data_key_pattern(&self.key_space, &self.table_name);
             let mut conn_write = self.conn.try_write().map_err(|e| {
                 DataFusionError::Execution(format!(
                     "failed to acquire write lock of redis connection: {}",
@@ -557,6 +961,8 @@ where
         Ok(total_rows)
     }
 }
+
+// ─── Utilities ──────────────────────────────────────────────────────────────
 
 /// Helper function to convert a value at a given row of an Arrow array to a string.
 /// TODO: Move this to a common place instead of only for redis
@@ -668,13 +1074,73 @@ fn array_value_to_string(array: &ArrayRef, row: usize) -> datafusion::common::Re
     Ok(str)
 }
 
+// ─── Registration ───────────────────────────────────────────────────────
+
+/// Register a Redis hash table as a DataFusion table.
+///
+/// # Options
+/// * `key_space` - Namespace prefix for Redis keys (required)
+/// * `table` - Table name within the key space (required)
+/// * `key_column` - Column to use as the Redis key suffix (optional)
+pub fn register_redis_tables(
+    session_ctx: &mut datafusion::prelude::SessionContext,
+    name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    tracing::info!(
+        "Registering Redis table: {} with connection: {}",
+        name,
+        connection_string
+    );
+
+    let opts = options.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Redis data source '{}' requires options (key_space, table)",
+            name
+        )
+    })?;
+
+    let key_space = opts.get("key_space").ok_or_else(|| {
+        anyhow::anyhow!("Redis data source '{}' requires 'key_space' option", name)
+    })?;
+
+    let table = opts
+        .get("table")
+        .ok_or_else(|| anyhow::anyhow!("Redis data source '{}' requires 'table' option", name))?;
+
+    let key_column = opts.get("key_column").cloned();
+
+    let client = redis::Client::open(connection_string)
+        .map_err(|e| anyhow::anyhow!("Failed to create Redis client for '{}': {}", name, e))?;
+
+    let conn = client
+        .get_connection()
+        .map_err(|e| anyhow::anyhow!("Failed to connect to Redis for '{}': {}", name, e))?;
+
+    let redis_table = RedisTable::new(
+        conn,
+        key_space.clone(),
+        table.clone(),
+        RedisStorage::Hash,
+        key_column,
+    )?;
+
+    session_ctx
+        .register_table(name, Arc::new(redis_table))
+        .map_err(|e| anyhow::anyhow!("Failed to register Redis table '{}': {}", name, e))?;
+
+    tracing::info!("Successfully registered Redis table: {}", name);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
     use arrow::{
-        array::{Float64Array, Int32Array, StringArray},
+        array::{Float64Array, Int32Array, StringArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
         util::pretty,
@@ -921,6 +1387,230 @@ mod tests {
         assert_eq!(k2.get("item").unwrap(), "Gadget");
         assert_eq!(k2.get("qty").unwrap(), "20");
         assert_eq!(k2.get("price").unwrap(), "29.95");
+
+        Ok(())
+    }
+
+    // ─── DELETE tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_delete_by_key_column() -> Result<()> {
+        let keyspace = "itest";
+        let table = "person";
+        let prefix = format!("{keyspace}:{table}");
+
+        // Mock: DEL itest:person:1 -> returns 1
+        let del = MockCmd::new(
+            redis::cmd("DEL").arg(format!("{prefix}:1")).clone(),
+            Ok(Value::Int(1)),
+        );
+        let mock_conn = MockRedisConnection::new(vec![del]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let conn = Arc::new(RwLock::new(mock_conn));
+
+        // Use the fast path: key_column = "id", filter = id = '1'
+        let key_column = Some("id".to_string());
+        let filters = vec![Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
+                "id",
+            ))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("1".to_string())),
+                None,
+            )),
+        })];
+
+        let keys = {
+            let mut conn_guard = conn.try_write().unwrap();
+            resolve_matching_keys(
+                &mut *conn_guard,
+                keyspace,
+                table,
+                &schema,
+                &key_column,
+                &filters,
+            )?
+        };
+
+        assert_eq!(keys, vec![format!("{prefix}:1")]);
+
+        let exec = RedisDmlExec::new(conn, RedisDmlOp::Delete(keys));
+        let batch = exec.execute(0, Arc::new(TaskContext::default()))?;
+
+        // Collect the stream
+        use futures::TryStreamExt;
+        let batches: Vec<RecordBatch> = batch.try_collect().await?;
+        assert_eq!(batches.len(), 1);
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(count_arr.value(0), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_rows() -> Result<()> {
+        let keyspace = "itest";
+        let table = "person";
+        let prefix = format!("{keyspace}:{table}");
+
+        // Mock: SCAN returns 2 keys, then DEL both
+        let scan = MockCmd::new(
+            redis::cmd("SCAN")
+                .arg(0)
+                .arg("MATCH")
+                .arg(format!("{prefix}:*"))
+                .clone(),
+            Ok(Value::Array(vec![
+                Value::BulkString(format!("{prefix}:1").into_bytes()),
+                Value::BulkString(format!("{prefix}:2").into_bytes()),
+            ])),
+        );
+        let del = MockCmd::new(
+            redis::cmd("DEL")
+                .arg(format!("{prefix}:1"))
+                .arg(format!("{prefix}:2"))
+                .clone(),
+            Ok(Value::Int(2)),
+        );
+        let mock_conn = MockRedisConnection::new(vec![scan, del]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let conn = Arc::new(RwLock::new(mock_conn));
+        let key_column: Option<String> = None;
+        let filters: Vec<Expr> = vec![];
+
+        let keys = {
+            let mut conn_guard = conn.try_write().unwrap();
+            resolve_matching_keys(
+                &mut *conn_guard,
+                keyspace,
+                table,
+                &schema,
+                &key_column,
+                &filters,
+            )?
+        };
+
+        assert_eq!(keys.len(), 2);
+
+        let exec = RedisDmlExec::new(conn, RedisDmlOp::Delete(keys));
+        let batch = exec.execute(0, Arc::new(TaskContext::default()))?;
+        let batches: Vec<RecordBatch> = batch.try_collect().await?;
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(count_arr.value(0), 2);
+
+        Ok(())
+    }
+
+    // ─── UPDATE tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_update_by_key_column() -> Result<()> {
+        let keyspace = "itest";
+        let table = "person";
+        let prefix = format!("{keyspace}:{table}");
+
+        // Mock: HMSET itest:person:1 name "Updated"
+        let hset = MockCmd::new(
+            redis::cmd("HMSET")
+                .arg(format!("{prefix}:1"))
+                .arg("name")
+                .arg("Updated")
+                .clone(),
+            Ok(Value::Okay),
+        );
+        let mock_conn = MockRedisConnection::new(vec![hset]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let conn = Arc::new(RwLock::new(mock_conn));
+        let key_column = Some("id".to_string());
+
+        // Filter: id = '1'
+        let filters = vec![Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
+                "id",
+            ))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("1".to_string())),
+                None,
+            )),
+        })];
+
+        let keys = {
+            let mut conn_guard = conn.try_write().unwrap();
+            resolve_matching_keys(
+                &mut *conn_guard,
+                keyspace,
+                table,
+                &schema,
+                &key_column,
+                &filters,
+            )?
+        };
+        assert_eq!(keys, vec![format!("{prefix}:1")]);
+
+        // Assignment: name = 'Updated'
+        let assignments = vec![(
+            "name".to_string(),
+            Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Updated".to_string())),
+                None,
+            ),
+        )];
+        let fields = assignments_to_redis_fields(&assignments, &key_column)?;
+        assert_eq!(fields, vec![("name".to_string(), "Updated".to_string())]);
+
+        let exec = RedisDmlExec::new(conn, RedisDmlOp::Update(keys, fields));
+        let batch = exec.execute(0, Arc::new(TaskContext::default()))?;
+        let batches: Vec<RecordBatch> = batch.try_collect().await?;
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(count_arr.value(0), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_key_column_rejected() -> Result<()> {
+        let key_column = Some("id".to_string());
+        let assignments = vec![(
+            "id".to_string(),
+            Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("new_id".to_string())),
+                None,
+            ),
+        )];
+
+        let result = assignments_to_redis_fields(&assignments, &key_column);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Cannot update key column"));
 
         Ok(())
     }

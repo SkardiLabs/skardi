@@ -390,6 +390,7 @@ pub async fn get_data_sources(
             DataSourceType::Mongo => "mongo",
             DataSourceType::Sqlite => "sqlite",
             DataSourceType::Lance => "lance",
+            DataSourceType::Redis => "redis",
         };
 
         // Determine path or URL based on source type
@@ -399,11 +400,17 @@ pub async fn get_data_sources(
             | DataSourceType::Lance
             | DataSourceType::Sqlite
             | DataSourceType::Iceberg => Some(data_source.path.to_string_lossy().to_string()),
-            DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo => None,
+            DataSourceType::Postgres
+            | DataSourceType::Mysql
+            | DataSourceType::Mongo
+            | DataSourceType::Redis => None,
         };
 
         let url = match data_source.source_type {
-            DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo => {
+            DataSourceType::Postgres
+            | DataSourceType::Mysql
+            | DataSourceType::Mongo
+            | DataSourceType::Redis => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()
