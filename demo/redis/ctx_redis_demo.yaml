@@ -18,6 +18,7 @@ data_sources:
       key_space: "mydb"
       table: "product_stats"
       key_column: "stat_id"
+      columns: "stat_id, category, total_products, total_value, avg_price"
 
   # CSV data source (for federated query demo)
   - name: "csv_inventory"

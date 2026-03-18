@@ -50,9 +50,11 @@ The `key_column` option (`product_id`) is extracted from the Redis key suffix an
 | Pipeline | Description |
 |----------|-------------|
 | `query_product_by_id` | Point lookup by product ID |
+| `query_products_by_category` | Query products by category (non-key column) |
 | `list_all_products` | Full scan of all products |
 | `insert_product` | Insert a single product |
 | `update_product_price` | Update a product's price by ID |
+| `update_stock_by_category` | Update stock status by category (non-key column) |
 | `delete_product` | Delete a product by ID |
 | `federated_join_and_insert` | Join CSV inventory with Redis, insert aggregated stats |
 
@@ -80,7 +82,34 @@ curl -X POST http://localhost:8080/query_product_by_id/execute \
 
 ---
 
-## 2. Full Scan
+## 2. Query by Non-Key Column
+
+Query products by category. Since `category` is not the key column, this performs a full scan with server-side filtering.
+
+```bash
+curl -X POST http://localhost:8080/query_products_by_category/execute \
+  -H "Content-Type: application/json" \
+  -d '{"category": "Electronics"}'
+```
+
+**Response:**
+```json
+{
+  "data": [
+    {"product_id": "PROD002", "name": "Keyboard", "category": "Electronics", "price": "79.99", "in_stock": "true"},
+    {"product_id": "PROD001", "name": "Laptop", "category": "Electronics", "price": "999.99", "in_stock": "true"},
+    {"product_id": "PROD003", "name": "Monitor", "category": "Electronics", "price": "299.99", "in_stock": "false"},
+    {"product_id": "PROD004", "name": "Mouse", "category": "Electronics", "price": "29.99", "in_stock": "true"}
+  ],
+  "execution_time_ms": 10,
+  "rows": 4,
+  "success": true
+}
+```
+
+---
+
+## 3. Full Scan
 
 List all products in the catalog.
 
@@ -108,7 +137,7 @@ curl -X POST http://localhost:8080/list_all_products/execute \
 
 ---
 
-## 3. Insert a Product
+## 4. Insert a Product
 
 Insert a new product. Creates a Redis hash at `mydb:products:PROD006`.
 
@@ -130,7 +159,7 @@ docker exec redis-skardi redis-cli HGETALL mydb:products:PROD006
 
 ---
 
-## 4. Update a Product
+## 5. Update by Key Column
 
 Update a product's price by its product ID.
 
@@ -152,7 +181,30 @@ docker exec redis-skardi redis-cli HGETALL mydb:products:PROD001
 
 ---
 
-## 5. Delete a Product
+## 6. Update by Non-Key Column
+
+Update all products in a category. Since `category` is not the key column, this scans all keys and updates those that match.
+
+```bash
+curl -X POST http://localhost:8080/update_stock_by_category/execute \
+  -H "Content-Type: application/json" \
+  -d '{"category": "Electronics", "in_stock": "false"}'
+```
+
+**Response:**
+```json
+{"data": [{"count": 4}], "execution_time_ms": 10, "rows": 1, "success": true}
+```
+
+**Verify in Redis:**
+```bash
+docker exec redis-skardi redis-cli HGET mydb:products:PROD001 in_stock
+# → "false"
+```
+
+---
+
+## 7. Delete a Product
 
 Delete a product by its product ID.
 
@@ -174,7 +226,7 @@ docker exec redis-skardi redis-cli KEYS "mydb:products:*"
 
 ---
 
-## 6. Federated Query: Join CSV + Redis
+## 8. Federated Query: Join CSV + Redis
 
 Join data from multiple sources (CSV file + Redis) and write aggregated results back to Redis.
 
@@ -248,6 +300,25 @@ data_sources:
       table: "products"
       key_column: "product_id"
 ```
+
+### Empty Tables with Declared Schema
+
+If a Redis table has no data yet, you can declare the columns upfront so that INSERT operations work immediately:
+
+```yaml
+data_sources:
+  - name: "product_stats"
+    type: "redis"
+    access_mode: "read_write"
+    connection_string: "redis://localhost:6379"
+    options:
+      key_space: "mydb"
+      table: "product_stats"
+      key_column: "stat_id"
+      columns: "stat_id, category, total_products, total_value, avg_price"
+```
+
+The `columns` option is only used when the table is empty — once data exists in Redis, the schema is inferred from the data automatically.
 
 ### Multiple Redis Databases
 

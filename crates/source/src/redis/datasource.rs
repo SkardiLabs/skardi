@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 use arrow::{
     array::{
         ArrayRef, RecordBatch, StringBuilder, UInt64Array, as_boolean_array, as_largestring_array,
@@ -61,7 +61,10 @@ where
     key_space: String,
     table_name: String,
     storage: RedisStorage,
-    schema: SchemaRef,
+    /// Cached schema. When the table is empty at registration, this starts as a minimal
+    /// schema (key column only). On each `schema()` call, if the schema has no data fields,
+    /// we re-infer from Redis — once data appears, the schema is cached permanently.
+    schema: RwLock<SchemaRef>,
     key_column: Option<String>,
 }
 
@@ -70,28 +73,87 @@ where
     C: ConnectionLike + Commands + Send + Sync + 'static,
 {
     /// Create a new RedisTable by connecting to Redis and retrieving/inferencing the schema.
+    /// If the table is empty in Redis, registration still succeeds — using `columns` if
+    /// provided, or a minimal schema (just the key column) otherwise. The schema is
+    /// re-inferred dynamically when empty, so it picks up new fields after the first INSERT.
+    ///
+    /// `columns` — optional list of column names to declare the schema for empty tables.
+    /// This allows INSERT operations to work before any data exists in Redis.
     pub fn new(
-        mut conn: C,
+        conn: C,
         key_space: String,
         table_name: String,
         storage: RedisStorage,
         key_column: Option<String>,
+        columns: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pattern = RedisRelation::table_data_key_pattern(&key_space, &table_name);
+        let conn = Arc::new(RwLock::new(conn));
+        let mut schema = Self::infer_schema(&conn, &key_space, &table_name, &key_column)?;
+
+        // If the table is empty and explicit columns were declared, use them as the schema.
+        let has_data_fields = match &key_column {
+            Some(_) => schema.fields().len() > 1,
+            None => !schema.fields().is_empty(),
+        };
+        if !has_data_fields {
+            if let Some(cols) = columns {
+                let mut fields: Vec<Field> = vec![];
+                for col in &cols {
+                    let nullable = key_column.as_ref() != Some(col);
+                    fields.push(Field::new(col, DataType::Utf8, nullable));
+                }
+                schema = Arc::new(Schema::new(fields));
+            }
+        }
+
+        Ok(RedisTable {
+            conn,
+            key_space,
+            table_name,
+            storage,
+            schema: RwLock::new(schema),
+            key_column,
+        })
+    }
+
+    /// Infer the schema from existing Redis data. Returns a minimal schema (just the key
+    /// column) if the table is empty — SELECT will return empty results and INSERT will
+    /// work using the incoming data's schema.
+    fn infer_schema(
+        conn: &Arc<RwLock<C>>,
+        key_space: &str,
+        table_name: &str,
+        key_column: &Option<String>,
+    ) -> Result<SchemaRef> {
+        let pattern = RedisRelation::table_data_key_pattern(key_space, table_name);
 
         let mut fields: Vec<Field> = vec![];
         let mut inferred_fields: Vec<String> = vec![];
 
         // TODO: Implement read from schema_key
 
-        let mut iter: Iter<String> = conn
-            .scan_match(&pattern)
-            .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?;
-        if let Some(sample_key_result) = iter.next() {
-            let sample_key = sample_key_result
-                .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?;
-            // We found a sample key for this table; retrieve its fields
-            let entries: Vec<(String, String)> = conn
+        let mut conn_write = conn.try_write().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to acquire write lock of redis connection: {}",
+                e
+            ))
+        })?;
+        // Collect the first key from SCAN, then drop the iterator to release the borrow
+        // so we can call HGETALL on the same connection.
+        let sample_key: Option<String> =
+            {
+                let mut iter: Iter<String> = conn_write
+                    .scan_match(&pattern)
+                    .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?;
+                match iter.next() {
+                    Some(result) => Some(result.map_err(|e| {
+                        DataFusionError::Execution(format!("Redis SCAN error: {}", e))
+                    })?),
+                    None => None,
+                }
+            };
+        if let Some(sample_key) = sample_key {
+            let entries: Vec<(String, String)> = conn_write
                 .hgetall(sample_key)
                 .map_err(|e| DataFusionError::Execution(format!("Redis HGETALL error: {}", e)))?;
             // TODO: Implement refer schema from other RedisStorage other than hash, when added
@@ -99,28 +161,23 @@ where
                 inferred_fields.push(field_name.to_string());
             }
         }
-        if inferred_fields.is_empty() {
-            return Err(Error::new(DataFusionError::Plan(format!(
-                "Could not determine schema for Redis table '{}'; no schema key or data found",
-                table_name
-            ))));
-        }
+        drop(conn_write);
 
         // Sort field names to have a deterministic order (not strictly necessary, but for consistency).
         inferred_fields.sort();
 
         // If a key column is expected (used as part of key, not stored as field), include it in schema.
-        if let Some(ref key_col) = key_column {
+        if let Some(key_col) = key_column {
             // If the key column was not present in the hash fields, add it.
             if !inferred_fields.iter().any(|f| f == key_col) {
                 fields.push(Field::new(key_col, DataType::Utf8, false));
             }
         }
 
-        // Add all inferred fields(except maybe the key column if it was part of them? In Spark's case, key column is not in hash).
+        // Add all inferred fields (except maybe the key column if it was part of them).
         for field in &inferred_fields {
             // If key_column is set and equals this field, skip it here because we added it already as non-nullable.
-            if let Some(ref key_col) = key_column {
+            if let Some(key_col) = key_column {
                 if field == key_col {
                     continue;
                 }
@@ -130,16 +187,43 @@ where
             fields.push(Field::new(field, DataType::Utf8, true));
         }
 
-        // Construct schema
-        let schema = Arc::new(Schema::new(fields));
-        Ok(RedisTable {
-            conn: Arc::new(RwLock::new(conn)),
-            key_space,
-            table_name,
-            storage,
-            schema,
-            key_column,
-        })
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
+    /// Return the cached schema. If the cached schema has no data fields (empty table),
+    /// re-infer from Redis — once data appears, the result is cached permanently.
+    fn current_schema(&self) -> SchemaRef {
+        let cached = match self.schema.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return Arc::new(Schema::empty()),
+        };
+        let has_data_fields = match &self.key_column {
+            Some(_) => cached.fields().len() > 1,
+            None => !cached.fields().is_empty(),
+        };
+        if has_data_fields {
+            return cached;
+        }
+        // Schema has no data fields — try to re-infer from Redis
+        if let Ok(new_schema) = Self::infer_schema(
+            &self.conn,
+            &self.key_space,
+            &self.table_name,
+            &self.key_column,
+        ) {
+            let new_has_data = match &self.key_column {
+                Some(_) => new_schema.fields().len() > 1,
+                None => !new_schema.fields().is_empty(),
+            };
+            if new_has_data {
+                // Data appeared — cache the real schema permanently
+                if let Ok(mut guard) = self.schema.write() {
+                    *guard = new_schema.clone();
+                }
+                return new_schema;
+            }
+        }
+        cached
     }
 }
 
@@ -152,8 +236,10 @@ where
         self
     }
     /// Return the schema of the table (Arrow SchemaRef).
+    /// Re-infers the schema from Redis on each call so that new fields added by INSERT
+    /// are visible without a server restart.
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.current_schema()
     }
 
     /// Get the type of this table for metadata/catalog purposes.
@@ -170,20 +256,23 @@ where
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         // TODO: Utilize state
+        // Use the current (dynamic) schema so we pick up fields added after registration
+        let current_schema = self.current_schema();
+
         // Determine projected schema if projection push-down is requested
         let projected_schema = if let Some(indicies) = projection {
             let fieds: Vec<Field> = indicies
                 .iter()
-                .map(|&i| self.schema.field(i).clone())
+                .map(|&i| current_schema.field(i).clone())
                 .collect();
             Arc::new(Schema::new(fieds))
         } else {
-            self.schema.clone()
+            current_schema.clone()
         };
 
         // Create the execution plan for scanning Redis
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(self.schema.clone()),
+            EquivalenceProperties::new(projected_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Both,
             Boundedness::Bounded,
@@ -196,7 +285,8 @@ where
             projected_schema,
             projection: projection
                 .cloned()
-                .unwrap_or_else(|| (0..self.schema.fields().len()).collect()),
+                .unwrap_or_else(|| (0..current_schema.fields().len()).collect()),
+            key_column: self.key_column.clone(),
             filters: filters.to_owned(),
             limit,
             properties,
@@ -217,7 +307,7 @@ where
             key_space: self.key_space.clone(),
             table_name: self.table_name.clone(),
             storage: self.storage.clone(),
-            schema: Arc::clone(&self.schema),
+            schema: self.current_schema(),
             insert_op,
             key_column: self.key_column.clone(),
         };
@@ -237,11 +327,12 @@ where
                 e
             ))
         })?;
+        let current_schema = self.current_schema();
         let keys = resolve_matching_keys(
             &mut *conn,
             &self.key_space,
             &self.table_name,
-            &self.schema,
+            &current_schema,
             &self.key_column,
             &filters,
         )?;
@@ -271,11 +362,12 @@ where
                 e
             ))
         })?;
+        let current_schema = self.current_schema();
         let keys = resolve_matching_keys(
             &mut *conn,
             &self.key_space,
             &self.table_name,
-            &self.schema,
+            &current_schema,
             &self.key_column,
             &filters,
         )?;
@@ -654,6 +746,7 @@ where
     storage: RedisStorage,
     projected_schema: SchemaRef,
     projection: Vec<usize>,
+    key_column: Option<String>,
     filters: Vec<Expr>,
     limit: Option<usize>,
     properties: PlanProperties,
@@ -690,7 +783,7 @@ where
             .map_err(|e| DataFusionError::Execution(format!("Redis SCAN error: {}", e)))?;
 
         let mut count: usize = 0;
-        for key in keys {
+        for key in &keys {
             // Optionally apply a limit to stop early
             if let Some(max) = self.limit {
                 if count >= max {
@@ -700,19 +793,23 @@ where
 
             // Fetch the hash fields for this key
             let redis_map: HashMap<String, String> = conn_write
-                .hgetall(&key)
+                .hgetall(key)
                 .map_err(|e| DataFusionError::Execution(format!("Redis HGETALL error: {}", e)))?;
-            // If a key column was used (i.e., the key itself encodes a field), reconstruct that field if projected.
-            // For now, we assume all data fields are in the hash (the key field would have been stored as a hash field if no key_column optimization used).
+            // Extract the key column value from the Redis key suffix (e.g. "mydb:products:PROD001" → "PROD001")
+            let key_col_value = self
+                .key_column
+                .as_ref()
+                .map(|_| RedisRelation::table_key(&pattern, key).to_string());
             // TODO: Add other RedisStorage support other than hash
             for (j, field) in self.projected_schema.fields().iter().enumerate() {
                 let field_name = field.name();
-                let value = redis_map.get(field_name).map(|v| v.to_string());
-                // If the field is not found in the hash, it might be the key itself.
-                let cell_value = if let Some(val) = value {
-                    val
+                let cell_value = if let Some(val) = redis_map.get(field_name) {
+                    val.to_string()
+                } else if self.key_column.as_deref() == Some(field_name) {
+                    // Field is the key column — value is extracted from the Redis key suffix
+                    key_col_value.clone().unwrap_or_default()
                 } else {
-                    "".to_string() // default empty string for missing fields (could also use NULL)
+                    "".to_string()
                 };
                 builders[j].append_value(cell_value);
             }
@@ -765,6 +862,7 @@ where
             storage: self.storage.clone(),
             projected_schema: Arc::clone(&self.projected_schema),
             projection: self.projection.clone(),
+            key_column: self.key_column.clone(),
             filters: self.filters.clone(),
             limit: self.limit,
             properties: self.properties.clone(),
@@ -1110,6 +1208,12 @@ pub fn register_redis_tables(
         .ok_or_else(|| anyhow::anyhow!("Redis data source '{}' requires 'table' option", name))?;
 
     let key_column = opts.get("key_column").cloned();
+    let columns = opts.get("columns").map(|s| {
+        s.split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<String>>()
+    });
 
     let client = redis::Client::open(connection_string)
         .map_err(|e| anyhow::anyhow!("Failed to create Redis client for '{}': {}", name, e))?;
@@ -1124,6 +1228,7 @@ pub fn register_redis_tables(
         table.clone(),
         RedisStorage::Hash,
         key_column,
+        columns,
     )?;
 
     session_ctx
@@ -1236,6 +1341,7 @@ mod tests {
             keyspace.to_string(),
             table.to_string(),
             RedisStorage::Hash,
+            None,
             None,
         )?;
 

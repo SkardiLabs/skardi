@@ -427,7 +427,7 @@ Full CRUD support with point lookups (O(1) via direct key construction), full sc
     key_column: "product_id"
 ```
 
-Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column.
+Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column. For initially empty tables, use the `columns` option to declare the schema upfront so INSERT operations work immediately.
 
 For detailed setup, CRUD examples, and federated queries, see [demo/redis/REDIS_DEMO.md](demo/redis/REDIS_DEMO.md).
 
