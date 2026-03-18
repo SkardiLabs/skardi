@@ -16,8 +16,8 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::Deserialize;
-use source::lance::knn_table_function::register_lance_knn_udtf;
-use source::providers::{
+use sources::providers::lance::knn_table_function::register_lance_knn_udtf;
+use sources::providers::{
     iceberg::register_iceberg_table, lance::register_lance_table, mongo::register_mongo_tables,
     mysql::register_mysql_tables, sqlite::register_sqlite_tables,
     sqlx::postgres::register_postgres_tables,
@@ -254,7 +254,7 @@ impl UrlTableFactory for SkardiUrlTableFactory {
 
             if !table_name.is_empty() {
                 let provider =
-                    source::providers::sqlite::create_sqlite_table_provider(db_path, table_name)
+                    sources::providers::sqlite::create_sqlite_table_provider(db_path, table_name)
                         .await
                         .map_err(|e| {
                             datafusion::error::DataFusionError::Execution(e.to_string())

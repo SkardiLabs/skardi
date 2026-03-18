@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::remote_storage::{RemoteStorage, S3Storage};
-pub use source::AccessMode;
+pub use sources::AccessMode;
 
 /// CLI arguments for the Skardi server
 #[derive(Parser, Debug)]
@@ -538,15 +538,15 @@ fn validate_pipeline_sql(
     sql: &str,
     data_sources: &[DataSource],
 ) -> Result<()> {
-    use source::sql_validator::{validate_sql, SqlValidatorConfig};
+    use sources::sql_validator::{validate_sql, SqlValidatorConfig};
 
     // Build validator config from data sources
     let mut validator_config = SqlValidatorConfig::new();
     for ds in data_sources {
         let mode = if ds.access_mode.is_read_write() {
-            source::sql_validator::AccessMode::ReadWrite
+            sources::sql_validator::AccessMode::ReadWrite
         } else {
-            source::sql_validator::AccessMode::ReadOnly
+            sources::sql_validator::AccessMode::ReadOnly
         };
         validator_config = validator_config.with_table(&ds.name, mode);
     }
@@ -742,7 +742,7 @@ async fn register_data_source(
             );
 
             // Register PostgreSQL table using the sqlx-based provider
-            source::providers::sqlx::postgres::register_postgres_tables(
+            sources::providers::sqlx::postgres::register_postgres_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -782,7 +782,7 @@ async fn register_data_source(
                 source.options
             );
 
-            source::providers::mysql::register_mysql_tables(
+            sources::providers::mysql::register_mysql_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -815,7 +815,7 @@ async fn register_data_source(
                         error: "Invalid SQLite database path".to_string(),
                     })?;
 
-            source::providers::sqlite::register_sqlite_tables(
+            sources::providers::sqlite::register_sqlite_tables(
                 session_ctx,
                 &source.name,
                 db_path,
@@ -847,7 +847,7 @@ async fn register_data_source(
                         error: "Invalid warehouse path".to_string(),
                     })?;
 
-            source::providers::iceberg::register_iceberg_table(
+            sources::providers::iceberg::register_iceberg_table(
                 session_ctx,
                 &source.name,
                 warehouse_path,
@@ -878,7 +878,7 @@ async fn register_data_source(
                 source.options
             );
 
-            source::providers::mongo::register_mongo_tables(
+            sources::providers::mongo::register_mongo_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -909,7 +909,7 @@ async fn register_data_source(
                 source.options
             );
 
-            source::redis::datasource::register_redis_tables(
+            sources::providers::redis::datasource::register_redis_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -934,7 +934,7 @@ async fn register_data_source(
             let dataset_registry = optimizer_registry.map(|reg| reg.lance_datasets());
 
             // Register Lance dataset using the providers module
-            source::providers::lance::register_lance_table(
+            sources::providers::lance::register_lance_table(
                 session_ctx,
                 &source.name,
                 source.path.to_str().unwrap(),

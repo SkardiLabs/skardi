@@ -4368,7 +4368,7 @@ dependencies = [
  "ndarray 0.17.2",
  "num_cpus",
  "ort",
- "source",
+ "sources",
  "tokio",
  "tracing",
 ]
@@ -6435,7 +6435,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "source",
+ "sources",
  "tokio",
  "url",
 ]
@@ -6475,7 +6475,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "skardi-engine",
- "source",
+ "sources",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -6590,7 +6590,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "source"
+name = "sources"
 version = "0.1.0"
 dependencies = [
  "anyhow",

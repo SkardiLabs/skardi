@@ -47,7 +47,7 @@ impl RedisRelation {
     /// # Examples
     ///
     /// ```
-    /// use source::redis::relation::RedisRelation;
+    /// use sources::providers::redis::relation::RedisRelation;
     ///
     /// let pattern = "users:*";
     /// let key = "users:1234";

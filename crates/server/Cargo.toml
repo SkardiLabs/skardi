@@ -23,7 +23,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 skardi-engine = { path = "../engine" }
 pipeline = { path = "../pipeline" }
-source = { path = "../source" }
+sources = { path = "../sources" }
 model = { path = "../model" }
 anyhow = "1.0"
 thiserror = "1.0"

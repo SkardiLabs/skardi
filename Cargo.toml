@@ -10,7 +10,7 @@ license = "Apache-2.0"
 [workspace]
 members = [ "crates/cli",
             "crates/engine",
-            "crates/source",
+            "crates/sources",
             "crates/model",
             "crates/pipeline",
             "crates/server"]

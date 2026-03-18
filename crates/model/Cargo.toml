@@ -20,7 +20,7 @@ tokio = {workspace = true,  features = ["macros", "rt-multi-thread", "sync"]}
 tracing = { workspace = true }
 
 [dev-dependencies]
-source = { path = "../source" }
+sources = { path = "../sources" }
 
 [lints]
 workspace = true

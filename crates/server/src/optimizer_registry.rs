@@ -95,7 +95,10 @@ impl OptimizerRegistry {
         tracing::info!("Registering Lance table functions");
 
         // Register lance_knn table function
-        source::lance::knn_table_function::register_lance_knn_udtf(ctx, self.lance_datasets());
+        sources::providers::lance::knn_table_function::register_lance_knn_udtf(
+            ctx,
+            self.lance_datasets(),
+        );
 
         tracing::info!("✓ Registered lance_knn table function");
         Ok(())
