@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
     let mut ctx = SessionContext::new();
 
     // 2. Register the movie_embeddings Lance dataset as a table
-    source::providers::lance::register_lance_table(
+    sources::providers::lance::register_lance_table(
         &mut ctx,
         "movie_embeddings",
         "data/movie_embeddings.lance",

@@ -1,5 +1,5 @@
 [package]
-name = "source"
+name = "sources"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
