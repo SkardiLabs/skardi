@@ -1611,6 +1611,21 @@ mod tests {
         register_ci_table(&mut ctx, "orders").await;
         register_ci_table(&mut ctx, "user_order_stats").await;
 
+        // Verify the aggregation SELECT works before INSERT-SELECT
+        let agg_check = query_all(
+            &ctx,
+            "SELECT u.id, u.name, u.email, COUNT(o.id) AS cnt
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             WHERE u.name = 'Alice Smith'
+             GROUP BY u.id, u.name, u.email",
+        )
+        .await;
+        assert!(
+            total_rows(&agg_check) >= 1,
+            "aggregation SELECT returned 0 rows — Alice has no orders?"
+        );
+
         ctx.sql("DELETE FROM user_order_stats WHERE user_id = 1")
             .await
             .unwrap()
@@ -1637,6 +1652,9 @@ mod tests {
         .collect()
         .await
         .expect("execute insert-select");
+
+        // Re-register to get fresh read provider after write
+        register_ci_table(&mut ctx, "user_order_stats").await;
 
         let batches = query_all(
             &ctx,
