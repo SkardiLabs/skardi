@@ -1435,7 +1435,7 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_table(&mut ctx, "users").await;
 
-        let before = query_all(&ctx, "SELECT email FROM users WHERE id = 1").await;
+        let before = query_all(&ctx, "SELECT email FROM users WHERE id = 3").await;
         assert_eq!(total_rows(&before), 1);
         let before_email = before[0]
             .column(0)
@@ -1452,7 +1452,7 @@ mod tests {
             .await
             .expect("execute update");
 
-        let after = query_all(&ctx, "SELECT email FROM users WHERE id = 1").await;
+        let after = query_all(&ctx, "SELECT email FROM users WHERE id = 3").await;
         assert_eq!(total_rows(&after), 1);
         let after_email = after[0]
             .column(0)
