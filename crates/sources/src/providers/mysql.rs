@@ -719,4 +719,325 @@ mod tests {
 
         assert_eq!(params.get("db").unwrap().expose_secret(), "mydb");
     }
+
+    // ─── Integration test helpers ────────────────────────────────────────
+
+    /// Register a MySQL table from the CI docker service.
+    /// Expects MYSQL_USER and MYSQL_PASSWORD env vars to be set.
+    async fn register_ci_table(ctx: &mut SessionContext, table: &str) {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), table.to_string());
+        options.insert("user_env".to_string(), "MYSQL_USER".to_string());
+        options.insert("pass_env".to_string(), "MYSQL_PASSWORD".to_string());
+        options.insert("ssl_mode".to_string(), "disabled".to_string());
+        register_mysql_tables(
+            ctx,
+            table,
+            "mysql://127.0.0.1:3306/mydb",
+            Some(&options),
+            true,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
+    }
+
+    async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        let df = ctx.sql(sql).await.expect("parse sql");
+        df.collect().await.expect("collect results")
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    // ─── Scan tests (integration) ───────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_all_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT id, name, email FROM users ORDER BY id").await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_projection() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT name FROM users ORDER BY id").await;
+        assert_eq!(total_rows(&batches), 3);
+        assert_eq!(batches[0].num_columns(), 1);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Alice Smith");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT id, name FROM users WHERE id = 2").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Bob Johnson");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_limit() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT id FROM users LIMIT 2").await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    // ─── Insert test (integration) ──────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_into() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql("INSERT INTO users (name, email) VALUES ('Dave Brown', 'dave@example.com')")
+            .await
+            .expect("parse insert")
+            .collect()
+            .await
+            .expect("execute insert");
+
+        let batches = query_all(&ctx, "SELECT id, name, email FROM users ORDER BY id").await;
+        assert!(total_rows(&batches) >= 4);
+    }
+
+    // ─── Delete tests (integration) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        // Insert a row we can safely delete
+        ctx.sql("INSERT INTO users (name, email) VALUES ('DeleteMe', 'deleteme@example.com')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let before = query_all(&ctx, "SELECT id FROM users").await;
+        let before_count = total_rows(&before);
+
+        ctx.sql("DELETE FROM users WHERE name = 'DeleteMe'")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let after = query_all(&ctx, "SELECT id FROM users").await;
+        assert_eq!(total_rows(&after), before_count - 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_no_matching_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let before = query_all(&ctx, "SELECT id FROM users").await;
+        let before_count = total_rows(&before);
+
+        ctx.sql("DELETE FROM users WHERE id = 99999")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let after = query_all(&ctx, "SELECT id FROM users").await;
+        assert_eq!(total_rows(&after), before_count);
+    }
+
+    // ─── Update tests (integration) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_single_column_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql("UPDATE users SET email = 'alice_updated@example.com' WHERE name = 'Alice Smith'")
+            .await
+            .expect("parse update")
+            .collect()
+            .await
+            .expect("execute update");
+
+        let batches = query_all(&ctx, "SELECT email FROM users WHERE name = 'Alice Smith'").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let emails = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(emails.value(0), "alice_updated@example.com");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_no_matching_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let before = query_all(&ctx, "SELECT id, name, email FROM users ORDER BY id").await;
+        let before_count = total_rows(&before);
+
+        ctx.sql("UPDATE users SET email = 'nobody@example.com' WHERE id = 99999")
+            .await
+            .expect("parse update")
+            .collect()
+            .await
+            .expect("execute update");
+
+        let after = query_all(&ctx, "SELECT id FROM users").await;
+        assert_eq!(total_rows(&after), before_count);
+    }
+
+    // ─── Combined DML test (integration) ────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_update_delete_round_trip() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let before = query_all(&ctx, "SELECT id FROM users").await;
+        let before_count = total_rows(&before);
+
+        // 1. Insert
+        ctx.sql("INSERT INTO users (name, email) VALUES ('RoundTrip', 'roundtrip@example.com')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let after_insert = query_all(&ctx, "SELECT id FROM users").await;
+        assert_eq!(total_rows(&after_insert), before_count + 1);
+
+        // 2. Update
+        ctx.sql(
+            "UPDATE users SET email = 'roundtrip_updated@example.com' WHERE name = 'RoundTrip'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        let batches = query_all(&ctx, "SELECT email FROM users WHERE name = 'RoundTrip'").await;
+        let emails = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(emails.value(0), "roundtrip_updated@example.com");
+
+        // 3. Delete
+        ctx.sql("DELETE FROM users WHERE name = 'RoundTrip'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let after_delete = query_all(&ctx, "SELECT id FROM users").await;
+        assert_eq!(total_rows(&after_delete), before_count);
+    }
+
+    // ─── Multi-table tests (integration) ────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_orders_table() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "orders").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id, user_id, product, amount FROM orders ORDER BY id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_cross_table_join() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+        register_ci_table(&mut ctx, "orders").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT u.name, o.product, o.amount
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             ORDER BY o.id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_select_aggregation() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+        register_ci_table(&mut ctx, "orders").await;
+        register_ci_table(&mut ctx, "user_order_stats").await;
+
+        ctx.sql(
+            "INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+             SELECT
+               CAST(u.id AS INT),
+               u.name,
+               u.email,
+               CAST(COUNT(o.id) AS INT),
+               CAST(SUM(o.amount) AS DECIMAL(10,2)),
+               CAST('N/A' AS VARCHAR(50))
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             WHERE u.name = 'Alice Smith'
+             GROUP BY u.id, u.name, u.email",
+        )
+        .await
+        .expect("parse insert-select")
+        .collect()
+        .await
+        .expect("execute insert-select");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT user_id, user_name, total_orders FROM user_order_stats",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 1);
+    }
 }
