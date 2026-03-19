@@ -13,7 +13,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY . .
 
-RUN cargo build --release -p skardi-server
+ARG FEATURES=""
+RUN if [ -n "$FEATURES" ]; then \
+      cargo build --release -p skardi-server --features "$FEATURES"; \
+    else \
+      cargo build --release -p skardi-server; \
+    fi
 
 # Runtime stage - debian-slim includes all required runtime dependencies
 FROM debian:trixie-slim

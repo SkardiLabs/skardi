@@ -33,7 +33,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
 - **Vector search** — Native KNN similarity search via Lance integration
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime
-- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF
+- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF (requires `--features onnx`)
 
 ## Table of Contents
 
@@ -516,7 +516,12 @@ For full S3 configuration, IAM permissions, and troubleshooting, see [demo/S3_US
 
 ## ONNX Model Inference
 
-Run ONNX model predictions directly in SQL using the built-in `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
+> **Note:** ONNX support is behind a feature flag. Build with `--features onnx` to enable it:
+> ```bash
+> cargo build --release -p skardi-server --features onnx
+> ```
+
+Run ONNX model predictions directly in SQL using the `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
 
 ```sql
 onnx_predict('path/to/model.onnx', input1, input2, ...) -> FLOAT
@@ -575,6 +580,9 @@ query: |
 
 ```bash
 docker build -t skardi .
+
+# With ONNX support
+docker build -t skardi --build-arg FEATURES=onnx .
 ```
 
 ### Run with config files mounted
@@ -618,6 +626,9 @@ cargo install --path crates/cli
 
 # Build server
 cargo build --release -p skardi-server
+
+# Build server with ONNX model inference support
+cargo build --release -p skardi-server --features onnx
 ```
 
 ## Demo & Examples

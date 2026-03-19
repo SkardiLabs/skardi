@@ -7,6 +7,10 @@ edition = "2021"
 name = "skardi-server"
 path = "src/main.rs"
 
+[features]
+default = []
+onnx = ["model/onnx"]
+
 [dependencies]
 arrow = { workspace = true }
 arrow-json = { workspace = true }

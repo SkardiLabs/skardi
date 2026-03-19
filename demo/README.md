@@ -443,7 +443,7 @@ Use `Ctrl+C` to gracefully shutdown the server.
 ## Other Data Source Demos
 
 - [Lance Vector Search](lance/LANCE_DEMO.md) - KNN similarity search with Lance
-- [ONNX Predict](onnx_predict/ONNX_PREDICT_DEMO.md) - ONNX model inference in SQL
+- [ONNX Predict](onnx_predict/ONNX_PREDICT_DEMO.md) - ONNX model inference in SQL (requires `--features onnx`)
 - [PostgreSQL](postgres/POSTGRES_DEMO.md) - CRUD operations and federated queries
 - [MySQL](mysql/MYSQL_DEMO.md) - CRUD operations and federated queries
 - [MongoDB](mongo/MONGO_DEMO.md) - Document CRUD and federated queries
