@@ -1,0 +1,6 @@
+[test-groups.user-order-stats]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(test_insert_select_aggregation) | test(test_insert_select_multiple_users)'
+test-group = 'user-order-stats'
