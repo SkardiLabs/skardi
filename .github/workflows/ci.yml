@@ -204,6 +204,11 @@ jobs:
           })
           EOF
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler redis-tools
+
       - name: Seed Redis data
         run: |
           redis-cli -h 127.0.0.1 <<'EOF'
@@ -213,11 +218,6 @@ jobs:
           HSET mydb:products:PROD004 name "Mouse" category "Electronics" price "29.99" in_stock "true"
           HSET mydb:products:PROD005 name "Desk Chair" category "Furniture" price "199.99" in_stock "true"
           EOF
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
       - name: Install Rust
         run: rustup toolchain install stable --component llvm-tools-preview
       - name: Install cargo-llvm-cov
