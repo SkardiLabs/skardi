@@ -1519,4 +1519,429 @@ mod tests {
             std::env::remove_var("TEST_MONGO_USER");
         }
     }
+
+    // ─── Integration test helpers ────────────────────────────────────────
+
+    /// Register a MongoDB collection from the CI docker service.
+    /// Expects MONGO_USER and MONGO_PASS env vars to be set.
+    async fn register_ci_collection(ctx: &mut SessionContext, collection: &str, primary_key: &str) {
+        let mut options = HashMap::new();
+        options.insert("database".to_string(), "mydb".to_string());
+        options.insert("collection".to_string(), collection.to_string());
+        options.insert("primary_key".to_string(), primary_key.to_string());
+        options.insert("user_env".to_string(), "MONGO_USER".to_string());
+        options.insert("pass_env".to_string(), "MONGO_PASS".to_string());
+        register_mongo_tables(ctx, collection, "mongodb://127.0.0.1:27017", Some(&options))
+            .await
+            .unwrap_or_else(|e| panic!("register {} failed: {}", collection, e));
+    }
+
+    async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        let df = ctx.sql(sql).await.expect("parse sql");
+        df.collect().await.expect("collect results")
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    // ─── Scan tests (integration) ───────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_all_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id, name, category, price, in_stock FROM products ORDER BY product_id",
+        )
+        .await;
+        assert!(
+            total_rows(&batches) >= 5,
+            "expected at least 5 seeded rows, got {}",
+            total_rows(&batches)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_projection() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(&ctx, "SELECT name FROM products ORDER BY product_id").await;
+        assert!(
+            total_rows(&batches) >= 5,
+            "expected at least 5 seeded rows, got {}",
+            total_rows(&batches)
+        );
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id, name FROM products WHERE product_id = 'PROD001'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Laptop");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_limit() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(&ctx, "SELECT product_id FROM products LIMIT 2").await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    // ─── Insert test (integration) ──────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_into() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock)
+             VALUES ('PROD_TEST_INS', 'TestProduct', 'TestCat', 49.99, true)",
+        )
+        .await
+        .expect("parse insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id, name FROM products WHERE product_id = 'PROD_TEST_INS'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    // ─── Delete tests (integration) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // Insert a row to delete
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock)
+             VALUES ('PROD_DEL', 'DeleteMe', 'TestCat', 1.0, true)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        let before = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_DEL'",
+        )
+        .await;
+        assert_eq!(total_rows(&before), 1);
+
+        ctx.sql("DELETE FROM products WHERE product_id = 'PROD_DEL'")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let after = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_DEL'",
+        )
+        .await;
+        assert_eq!(total_rows(&after), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_no_matching_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // Verify a known row exists before and survives a no-op delete
+        let before = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD001'",
+        )
+        .await;
+        assert_eq!(total_rows(&before), 1);
+
+        ctx.sql("DELETE FROM products WHERE product_id = 'NONEXISTENT'")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let after = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD001'",
+        )
+        .await;
+        assert_eq!(total_rows(&after), 1);
+    }
+
+    // ─── Update tests (integration) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_single_column_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        ctx.sql("UPDATE products SET price = 899.99 WHERE product_id = 'PROD001'")
+            .await
+            .expect("parse update")
+            .collect()
+            .await
+            .expect("execute update");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT price FROM products WHERE product_id = 'PROD001'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let prices = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((prices.value(0) - 899.99).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_no_matching_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // Verify a known row is unchanged after a no-op update
+        let before = query_all(
+            &ctx,
+            "SELECT price FROM products WHERE product_id = 'PROD002'",
+        )
+        .await;
+        assert_eq!(total_rows(&before), 1);
+        let price_before = before[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+
+        ctx.sql("UPDATE products SET price = 0.0 WHERE product_id = 'NONEXISTENT'")
+            .await
+            .expect("parse update")
+            .collect()
+            .await
+            .expect("execute update");
+
+        let after = query_all(
+            &ctx,
+            "SELECT price FROM products WHERE product_id = 'PROD002'",
+        )
+        .await;
+        assert_eq!(total_rows(&after), 1);
+        let price_after = after[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((price_before - price_after).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_multiple_columns() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock)
+             VALUES ('PROD_TEST_MULTI', 'MultiUpdate', 'TestCat', 11.0, true)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "UPDATE products
+             SET name = 'MultiUpdateRenamed',
+                 in_stock = false
+             WHERE product_id = 'PROD_TEST_MULTI'",
+        )
+        .await
+        .expect("parse update")
+        .collect()
+        .await
+        .expect("execute update");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name, in_stock FROM products WHERE product_id = 'PROD_TEST_MULTI'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let in_stock = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "MultiUpdateRenamed");
+        assert!(!in_stock.value(0));
+
+        ctx.sql("DELETE FROM products WHERE product_id = 'PROD_TEST_MULTI'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    // ─── Combined DML test (integration) ────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_update_delete_round_trip() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // 1. Insert
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock)
+             VALUES ('PROD_RT', 'RoundTrip', 'Test', 10.0, true)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        let after_insert = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_RT'",
+        )
+        .await;
+        assert_eq!(total_rows(&after_insert), 1);
+
+        // 2. Update
+        ctx.sql("UPDATE products SET price = 20.0, name = 'RoundTripUpdated' WHERE product_id = 'PROD_RT'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batches = query_all(
+            &ctx,
+            "SELECT name, price FROM products WHERE product_id = 'PROD_RT'",
+        )
+        .await;
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "RoundTripUpdated");
+
+        // 3. Delete
+        ctx.sql("DELETE FROM products WHERE product_id = 'PROD_RT'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let after_delete = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_RT'",
+        )
+        .await;
+        assert_eq!(total_rows(&after_delete), 0);
+    }
+
+    // ─── Category filter test (integration) ─────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_by_category() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id, name FROM products WHERE category = 'Electronics' ORDER BY product_id",
+        )
+        .await;
+        // PROD001..PROD004 are Electronics
+        assert_eq!(total_rows(&batches), 4);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_by_boolean() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE in_stock = false",
+        )
+        .await;
+        // Only PROD003 (Monitor) is out of stock
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    // ─── Aggregation test (integration) ─────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_aggregation_query() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT category, COUNT(*) as cnt, SUM(price) as total
+             FROM products
+             GROUP BY category
+             ORDER BY category",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 2); // at least Electronics and Furniture
+    }
 }

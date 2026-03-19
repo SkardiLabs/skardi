@@ -366,7 +366,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
 
     fn execute(
         &self,
-        partition: usize,
+        _partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let pool = self.sqlx_pool.clone();
@@ -375,7 +375,12 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
         let op = self.op;
         let output_schema = Arc::clone(&self.output_schema);
 
-        let mut input_stream = self.input.execute(partition, context)?;
+        // Collect from all input partitions to handle multi-partition plans
+        let input_partitions = self.input.properties().partitioning.partition_count();
+        let mut input_streams: Vec<SendableRecordBatchStream> = Vec::new();
+        for p in 0..input_partitions {
+            input_streams.push(self.input.execute(p, Arc::clone(&context))?);
+        }
 
         let future = async move {
             let mut total_rows: u64 = 0;
@@ -398,34 +403,38 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
                     })?;
             }
 
-            // Collect and insert batches
-            while let Some(batch_result) = input_stream.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
+            // Collect and insert batches from all input partitions
+            for mut input_stream in input_streams {
+                while let Some(batch_result) = input_stream.next().await {
+                    let batch = batch_result?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
+                    // Project out auto-generated columns
+                    let filtered_batch = filter_batch_columns(&batch, &auto_gen_cols)?;
+                    let num_rows = filtered_batch.num_rows() as u64;
+
+                    // Build INSERT SQL using InsertBuilder from datafusion-table-providers
+                    let batches = vec![filtered_batch];
+                    let insert_sql = InsertBuilder::new(&table_ref, &batches)
+                        .build_postgres(None)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to build INSERT statement: {e}"
+                            ))
+                        })?;
+
+                    // Execute via sqlx within the transaction
+                    sqlx::query(&insert_sql)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!("Failed to execute INSERT: {e}"))
+                        })?;
+
+                    total_rows += num_rows;
                 }
-
-                // Project out auto-generated columns
-                let filtered_batch = filter_batch_columns(&batch, &auto_gen_cols)?;
-                let num_rows = filtered_batch.num_rows() as u64;
-
-                // Build INSERT SQL using InsertBuilder from datafusion-table-providers
-                let batches = vec![filtered_batch];
-                let insert_sql = InsertBuilder::new(&table_ref, &batches)
-                    .build_postgres(None)
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to build INSERT statement: {e}"))
-                    })?;
-
-                // Execute via sqlx within the transaction
-                sqlx::query(&insert_sql)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to execute INSERT: {e}"))
-                    })?;
-
-                total_rows += num_rows;
             }
 
             // Commit transaction
@@ -1246,7 +1255,472 @@ mod tests {
         assert!(sql.contains("25"));
     }
 
-    // NOTE: DB-dependent integration tests (insert with auto-generated columns,
-    // roundtrip, update/delete, overwrite) are deferred to a dedicated integration
-    // test suite that runs against a real PostgreSQL instance.
+    // ─── Integration test helpers ────────────────────────────────────────
+
+    /// Register a PostgreSQL table from the CI docker service.
+    /// Expects PG_USER and PG_PASSWORD env vars to be set.
+    async fn register_ci_table(ctx: &mut SessionContext, table: &str) {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), table.to_string());
+        options.insert("schema".to_string(), "public".to_string());
+        options.insert("user_env".to_string(), "PG_USER".to_string());
+        options.insert("pass_env".to_string(), "PG_PASSWORD".to_string());
+        register_postgres_tables(
+            ctx,
+            table,
+            "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+            Some(&options),
+            true,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
+    }
+
+    async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        let df = ctx.sql(sql).await.expect("parse sql");
+        df.collect().await.expect("collect results")
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    // ─── Scan tests (integration) ───────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_all_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT id, name, email FROM users ORDER BY id").await;
+        assert!(total_rows(&batches) >= 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_projection() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT name FROM users ORDER BY id").await;
+        assert!(total_rows(&batches) >= 3);
+        assert_eq!(batches[0].num_columns(), 1);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Alice Smith");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT id, name FROM users WHERE id = 2").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Bob Johnson");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_with_limit() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let batches = query_all(&ctx, "SELECT id FROM users LIMIT 2").await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    // ─── Insert test (integration) ──────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_into() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql("INSERT INTO users (name, email) VALUES ('Dave Brown', 'dave_pg@example.com')")
+            .await
+            .expect("parse insert")
+            .collect()
+            .await
+            .expect("execute insert");
+
+        let batches = query_all(&ctx, "SELECT id, name, email FROM users ORDER BY id").await;
+        assert!(total_rows(&batches) >= 4);
+    }
+
+    // ─── Delete tests (integration) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql("INSERT INTO users (name, email) VALUES ('PgDeleteMe', 'pgdeleteme@example.com')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let before = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgDeleteMe'").await;
+        assert_eq!(total_rows(&before), 1);
+
+        ctx.sql("DELETE FROM users WHERE name = 'PgDeleteMe'")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let after = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgDeleteMe'").await;
+        assert_eq!(total_rows(&after), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_delete_no_matching_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let before = query_all(&ctx, "SELECT id FROM users WHERE id = 1").await;
+        assert_eq!(total_rows(&before), 1);
+
+        ctx.sql("DELETE FROM users WHERE id = 99999")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let after = query_all(&ctx, "SELECT id FROM users WHERE id = 1").await;
+        assert_eq!(total_rows(&after), 1);
+    }
+
+    // ─── Update tests (integration) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_single_column_with_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql(
+            "UPDATE users SET email = 'alice_pg_updated@example.com' WHERE name = 'Alice Smith'",
+        )
+        .await
+        .expect("parse update")
+        .collect()
+        .await
+        .expect("execute update");
+
+        let batches = query_all(&ctx, "SELECT email FROM users WHERE name = 'Alice Smith'").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let emails = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(emails.value(0), "alice_pg_updated@example.com");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_no_matching_rows() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let before = query_all(&ctx, "SELECT email FROM users WHERE id = 3").await;
+        assert_eq!(total_rows(&before), 1);
+        let before_email = before[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+
+        ctx.sql("UPDATE users SET email = 'nobody@example.com' WHERE id = 99999")
+            .await
+            .expect("parse update")
+            .collect()
+            .await
+            .expect("execute update");
+
+        let after = query_all(&ctx, "SELECT email FROM users WHERE id = 3").await;
+        assert_eq!(total_rows(&after), 1);
+        let after_email = after[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert_eq!(before_email, after_email);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_multiple_columns() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES ('PgMultiUpdate', 'pg_multi_update@example.com')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "UPDATE users
+             SET name = 'PgMultiUpdateRenamed',
+                 email = 'pg_multi_update_renamed@example.com'
+             WHERE name = 'PgMultiUpdate'",
+        )
+        .await
+        .expect("parse update")
+        .collect()
+        .await
+        .expect("execute update");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name, email
+             FROM users
+             WHERE email = 'pg_multi_update_renamed@example.com'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let emails = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "PgMultiUpdateRenamed");
+        assert_eq!(emails.value(0), "pg_multi_update_renamed@example.com");
+
+        ctx.sql("DELETE FROM users WHERE email = 'pg_multi_update_renamed@example.com'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    // ─── Combined DML test (integration) ────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_update_delete_round_trip() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        // 1. Insert
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES ('PgRoundTrip', 'pgroundtrip@example.com')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        let after_insert = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgRoundTrip'").await;
+        assert_eq!(total_rows(&after_insert), 1);
+
+        // 2. Update
+        ctx.sql(
+            "UPDATE users SET email = 'pgroundtrip_updated@example.com' WHERE name = 'PgRoundTrip'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        let batches = query_all(&ctx, "SELECT email FROM users WHERE name = 'PgRoundTrip'").await;
+        let emails = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(emails.value(0), "pgroundtrip_updated@example.com");
+
+        // 3. Delete
+        ctx.sql("DELETE FROM users WHERE name = 'PgRoundTrip'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let after_delete = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgRoundTrip'").await;
+        assert_eq!(total_rows(&after_delete), 0);
+    }
+
+    // ─── Multi-table tests (integration) ────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scan_orders_table() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "orders").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id, user_id, product, amount FROM orders ORDER BY id",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_cross_table_join() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+        register_ci_table(&mut ctx, "orders").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT u.name, o.product, o.amount
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             ORDER BY o.id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_select_aggregation() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+        register_ci_table(&mut ctx, "orders").await;
+        register_ci_table(&mut ctx, "user_order_stats").await;
+
+        ctx.sql("DELETE FROM user_order_stats WHERE user_id = 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+             SELECT
+               u.id,
+               u.name,
+               u.email,
+               CAST(COUNT(o.id) AS INT),
+               CAST(SUM(o.amount) AS DECIMAL(10,2)),
+               CAST('N/A' AS VARCHAR(50))
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             WHERE u.name = 'Alice Smith'
+             GROUP BY u.id, u.name, u.email",
+        )
+        .await
+        .expect("parse insert-select")
+        .collect()
+        .await
+        .expect("execute insert-select");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT user_id, user_name, total_orders FROM user_order_stats WHERE user_id = 1",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_select_multiple_users() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+        register_ci_table(&mut ctx, "orders").await;
+        register_ci_table(&mut ctx, "user_order_stats").await;
+
+        ctx.sql(
+            "DELETE FROM user_order_stats
+             WHERE user_id IN (1, 2, 3)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+             SELECT
+               u.id,
+               u.name,
+               u.email,
+               CAST(COUNT(o.id) AS INT),
+               CAST(SUM(o.amount) AS DECIMAL(10,2)),
+               CAST('N/A' AS VARCHAR(50))
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             GROUP BY u.id, u.name, u.email",
+        )
+        .await
+        .expect("parse insert-select all")
+        .collect()
+        .await
+        .expect("execute insert-select all");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT user_name, total_orders
+             FROM user_order_stats
+             WHERE user_name IN ('Alice Smith', 'Bob Johnson', 'Carol Williams')
+             ORDER BY user_name",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_empty_table_schema_detection() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "user_order_stats").await;
+
+        // user_order_stats starts empty but schema should be detected
+        let catalog = ctx.catalog("datafusion").unwrap();
+        let schema = catalog.schema("public").unwrap();
+        let table = schema.table("user_order_stats").await.unwrap().unwrap();
+        let table_schema = table.schema();
+        let field_names: Vec<&str> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(field_names.contains(&"user_id"));
+        assert!(field_names.contains(&"user_name"));
+        assert!(field_names.contains(&"total_orders"));
+    }
 }

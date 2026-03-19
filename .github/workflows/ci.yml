@@ -19,9 +19,72 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: mydb
+          MYSQL_USER: skardi_user
+          MYSQL_PASSWORD: skardi_pass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u root -prootpass"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: mydb
+          POSTGRES_USER: skardi_user
+          POSTGRES_PASSWORD: skardi_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U skardi_user -d mydb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      mongo:
+        image: mongo:7.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: rootpass
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --eval 'db.runCommand({ping:1})' --quiet"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      MYSQL_USER: skardi_user
+      MYSQL_PASSWORD: skardi_pass
+      PG_USER: skardi_user
+      PG_PASSWORD: skardi_pass
+      MONGO_USER: root
+      MONGO_PASS: rootpass
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -46,5 +109,135 @@ jobs:
         run: cargo check --all
       - name: Execute rust tests
         run: cargo nextest run --all-features
-      - name: Execute ignored tests
+
+      - name: Install integration test dependencies
+        run: |
+          wget -qO- https://www.mongodb.org/static/pgp/server-7.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+          echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-mongosh redis-tools
+
+      - name: Seed MySQL data
+        run: |
+          mysql -h 127.0.0.1 -u skardi_user -pskardi_pass mydb <<'EOF'
+          CREATE TABLE users (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              name VARCHAR(100) NOT NULL,
+              email VARCHAR(100) UNIQUE NOT NULL
+          );
+          CREATE TABLE orders (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              user_id INT NOT NULL,
+              product VARCHAR(100) NOT NULL,
+              amount DECIMAL(10, 2) NOT NULL
+          );
+          CREATE TABLE user_order_stats (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              user_id INT NOT NULL,
+              user_name VARCHAR(100) NOT NULL,
+              user_email VARCHAR(100) NOT NULL,
+              total_orders INT NOT NULL,
+              total_spent DECIMAL(10, 2) NOT NULL,
+              last_order_date VARCHAR(50),
+              UNIQUE KEY unique_user (user_id)
+          );
+          INSERT INTO users (name, email) VALUES
+              ('Alice Smith', 'alice@example.com'),
+              ('Bob Johnson', 'bob@example.com'),
+              ('Carol Williams', 'carol@example.com');
+          INSERT INTO orders (user_id, product, amount) VALUES
+              (1, 'Laptop', 999.99),
+              (2, 'Keyboard', 79.99),
+              (3, 'Monitor', 299.99);
+          EOF
+
+      - name: Seed PostgreSQL data
+        run: |
+          PGPASSWORD=skardi_pass psql -h 127.0.0.1 -U skardi_user -d mydb <<'EOF'
+          CREATE TABLE users (
+              id SERIAL PRIMARY KEY,
+              name VARCHAR(100) NOT NULL,
+              email VARCHAR(100) UNIQUE NOT NULL
+          );
+          CREATE TABLE orders (
+              id SERIAL PRIMARY KEY,
+              user_id INT NOT NULL,
+              product VARCHAR(100) NOT NULL,
+              amount DECIMAL(10, 2) NOT NULL
+          );
+          CREATE TABLE user_order_stats (
+              user_id INT PRIMARY KEY,
+              user_name VARCHAR(100),
+              user_email VARCHAR(100),
+              total_orders INT,
+              total_spent DECIMAL(10, 2),
+              last_order_date VARCHAR(50)
+          );
+          INSERT INTO users (name, email) VALUES
+              ('Alice Smith', 'alice@example.com'),
+              ('Bob Johnson', 'bob@example.com'),
+              ('Carol Williams', 'carol@example.com');
+          INSERT INTO orders (user_id, product, amount) VALUES
+              (1, 'Laptop', 999.99),
+              (2, 'Keyboard', 79.99),
+              (3, 'Monitor', 299.99);
+          EOF
+
+      - name: Seed MongoDB data
+        run: |
+          mongosh "mongodb://root:rootpass@127.0.0.1:27017/?authSource=admin" <<'EOF'
+          use mydb
+
+          db.createCollection("products", {
+            validator: {
+              $jsonSchema: {
+                bsonType: "object",
+                required: ["product_id", "name", "price"],
+                properties: {
+                  product_id: { bsonType: "string" },
+                  name: { bsonType: "string" },
+                  category: { bsonType: "string" },
+                  price: { bsonType: "double" },
+                  in_stock: { bsonType: "bool" }
+                }
+              }
+            }
+          })
+
+          db.products.insertMany([
+            { _id: "PROD001", product_id: "PROD001", name: "Laptop", category: "Electronics", price: 999.99, in_stock: true },
+            { _id: "PROD002", product_id: "PROD002", name: "Keyboard", category: "Electronics", price: 79.99, in_stock: true },
+            { _id: "PROD003", product_id: "PROD003", name: "Monitor", category: "Electronics", price: 299.99, in_stock: false },
+            { _id: "PROD004", product_id: "PROD004", name: "Mouse", category: "Electronics", price: 29.99, in_stock: true },
+            { _id: "PROD005", product_id: "PROD005", name: "Desk Chair", category: "Furniture", price: 199.99, in_stock: true }
+          ])
+
+          db.createCollection("product_stats", {
+            validator: {
+              $jsonSchema: {
+                bsonType: "object",
+                required: ["stat_id"],
+                properties: {
+                  stat_id: { bsonType: "string" },
+                  category: { bsonType: "string" },
+                  total_products: { bsonType: "long" },
+                  total_value: { bsonType: "double" },
+                  avg_price: { bsonType: "double" }
+                }
+              }
+            }
+          })
+          EOF
+
+      - name: Seed Redis data
+        run: |
+          redis-cli -h 127.0.0.1 <<'EOF'
+          HSET mydb:products:PROD001 name "Laptop" category "Electronics" price "999.99" in_stock "true"
+          HSET mydb:products:PROD002 name "Keyboard" category "Electronics" price "79.99" in_stock "true"
+          HSET mydb:products:PROD003 name "Monitor" category "Electronics" price "299.99" in_stock "false"
+          HSET mydb:products:PROD004 name "Mouse" category "Electronics" price "29.99" in_stock "true"
+          HSET mydb:products:PROD005 name "Desk Chair" category "Furniture" price "199.99" in_stock "true"
+          EOF
+
+      - name: Execute Integration tests
         run: cargo nextest run --all-features -- --ignored
