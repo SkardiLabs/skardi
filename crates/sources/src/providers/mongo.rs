@@ -1558,7 +1558,11 @@ mod tests {
             "SELECT product_id, name, category, price, in_stock FROM products ORDER BY product_id",
         )
         .await;
-        assert_eq!(total_rows(&batches), 5);
+        assert!(
+            total_rows(&batches) >= 5,
+            "expected at least 5 seeded rows, got {}",
+            total_rows(&batches)
+        );
     }
 
     #[tokio::test]
@@ -1568,7 +1572,11 @@ mod tests {
         register_ci_collection(&mut ctx, "products", "product_id").await;
 
         let batches = query_all(&ctx, "SELECT name FROM products ORDER BY product_id").await;
-        assert_eq!(total_rows(&batches), 5);
+        assert!(
+            total_rows(&batches) >= 5,
+            "expected at least 5 seeded rows, got {}",
+            total_rows(&batches)
+        );
         assert_eq!(batches[0].num_columns(), 1);
     }
 

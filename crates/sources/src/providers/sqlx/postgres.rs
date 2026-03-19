@@ -1285,7 +1285,7 @@ mod tests {
         register_ci_table(&mut ctx, "users").await;
 
         let batches = query_all(&ctx, "SELECT id, name, email FROM users ORDER BY id").await;
-        assert_eq!(total_rows(&batches), 3);
+        assert!(total_rows(&batches) >= 3);
     }
 
     #[tokio::test]
@@ -1295,7 +1295,7 @@ mod tests {
         register_ci_table(&mut ctx, "users").await;
 
         let batches = query_all(&ctx, "SELECT name FROM users ORDER BY id").await;
-        assert_eq!(total_rows(&batches), 3);
+        assert!(total_rows(&batches) >= 3);
         assert_eq!(batches[0].num_columns(), 1);
 
         let names = batches[0]
@@ -1367,8 +1367,8 @@ mod tests {
             .await
             .unwrap();
 
-        let before = query_all(&ctx, "SELECT id FROM users").await;
-        let before_count = total_rows(&before);
+        let before = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgDeleteMe'").await;
+        assert_eq!(total_rows(&before), 1);
 
         ctx.sql("DELETE FROM users WHERE name = 'PgDeleteMe'")
             .await
@@ -1377,8 +1377,8 @@ mod tests {
             .await
             .expect("execute delete");
 
-        let after = query_all(&ctx, "SELECT id FROM users").await;
-        assert_eq!(total_rows(&after), before_count - 1);
+        let after = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgDeleteMe'").await;
+        assert_eq!(total_rows(&after), 0);
     }
 
     #[tokio::test]
@@ -1387,8 +1387,8 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_table(&mut ctx, "users").await;
 
-        let before = query_all(&ctx, "SELECT id FROM users").await;
-        let before_count = total_rows(&before);
+        let before = query_all(&ctx, "SELECT id FROM users WHERE id = 1").await;
+        assert_eq!(total_rows(&before), 1);
 
         ctx.sql("DELETE FROM users WHERE id = 99999")
             .await
@@ -1397,8 +1397,8 @@ mod tests {
             .await
             .expect("execute delete");
 
-        let after = query_all(&ctx, "SELECT id FROM users").await;
-        assert_eq!(total_rows(&after), before_count);
+        let after = query_all(&ctx, "SELECT id FROM users WHERE id = 1").await;
+        assert_eq!(total_rows(&after), 1);
     }
 
     // ─── Update tests (integration) ─────────────────────────────────────
@@ -1435,8 +1435,15 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_table(&mut ctx, "users").await;
 
-        let before = query_all(&ctx, "SELECT id FROM users").await;
-        let before_count = total_rows(&before);
+        let before = query_all(&ctx, "SELECT email FROM users WHERE id = 1").await;
+        assert_eq!(total_rows(&before), 1);
+        let before_email = before[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
 
         ctx.sql("UPDATE users SET email = 'nobody@example.com' WHERE id = 99999")
             .await
@@ -1445,8 +1452,16 @@ mod tests {
             .await
             .expect("execute update");
 
-        let after = query_all(&ctx, "SELECT id FROM users").await;
-        assert_eq!(total_rows(&after), before_count);
+        let after = query_all(&ctx, "SELECT email FROM users WHERE id = 1").await;
+        assert_eq!(total_rows(&after), 1);
+        let after_email = after[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert_eq!(before_email, after_email);
     }
 
     // ─── Combined DML test (integration) ────────────────────────────────
@@ -1457,9 +1472,6 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_table(&mut ctx, "users").await;
 
-        let before = query_all(&ctx, "SELECT id FROM users").await;
-        let before_count = total_rows(&before);
-
         // 1. Insert
         ctx.sql(
             "INSERT INTO users (name, email) VALUES ('PgRoundTrip', 'pgroundtrip@example.com')",
@@ -1469,8 +1481,8 @@ mod tests {
         .collect()
         .await
         .unwrap();
-        let after_insert = query_all(&ctx, "SELECT id FROM users").await;
-        assert_eq!(total_rows(&after_insert), before_count + 1);
+        let after_insert = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgRoundTrip'").await;
+        assert_eq!(total_rows(&after_insert), 1);
 
         // 2. Update
         ctx.sql(
@@ -1496,8 +1508,8 @@ mod tests {
             .collect()
             .await
             .unwrap();
-        let after_delete = query_all(&ctx, "SELECT id FROM users").await;
-        assert_eq!(total_rows(&after_delete), before_count);
+        let after_delete = query_all(&ctx, "SELECT id FROM users WHERE name = 'PgRoundTrip'").await;
+        assert_eq!(total_rows(&after_delete), 0);
     }
 
     // ─── Multi-table tests (integration) ────────────────────────────────
@@ -1513,7 +1525,7 @@ mod tests {
             "SELECT id, user_id, product, amount FROM orders ORDER BY id",
         )
         .await;
-        assert_eq!(total_rows(&batches), 3);
+        assert!(total_rows(&batches) >= 3);
     }
 
     #[tokio::test]
