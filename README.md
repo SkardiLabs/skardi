@@ -345,7 +345,7 @@ export PG_USER="myuser"
 export PG_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/postgres/POSTGRES_DEMO.md](demo/postgres/POSTGRES_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/postgres/README.md](demo/postgres/README.md).
 
 ### MySQL
 
@@ -366,7 +366,7 @@ export MYSQL_USER="myuser"
 export MYSQL_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mysql/MYSQL_DEMO.md](demo/mysql/MYSQL_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/mysql/README.md](demo/mysql/README.md).
 
 ### SQLite
 
@@ -388,7 +388,7 @@ SQLite requires no credentials — just the path to the database file.
 skardi query --sql "SELECT * FROM './data/my_database.db.users'"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/SQLITE_DEMO.md](demo/sqlite/SQLITE_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/README.md](demo/sqlite/README.md).
 
 ### MongoDB
 
@@ -411,7 +411,7 @@ export MONGO_USER="myuser"
 export MONGO_PASS="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mongo/MONGO_DEMO.md](demo/mongo/MONGO_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/mongo/README.md](demo/mongo/README.md).
 
 ### Redis
 
@@ -429,7 +429,7 @@ Full CRUD support with point lookups (O(1) via direct key construction), full sc
 
 Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column. For initially empty tables, use the `columns` option to declare the schema upfront so INSERT operations work immediately.
 
-For detailed setup, CRUD examples, and federated queries, see [demo/redis/REDIS_DEMO.md](demo/redis/REDIS_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/redis/README.md](demo/redis/README.md).
 
 ### Apache Iceberg
 
@@ -458,7 +458,7 @@ For S3-backed Iceberg tables:
     aws_secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
 ```
 
-For detailed setup and examples, see [demo/iceberg/ICEBERG_DEMO.md](demo/iceberg/ICEBERG_DEMO.md).
+For detailed setup and examples, see [demo/iceberg/README.md](demo/iceberg/README.md).
 
 ### Lance (Vector Search)
 
@@ -490,7 +490,7 @@ WHERE knn.id != {ref_id}
 | 100K vectors | ~500ms             | ~8ms           | 62x     |
 | 1M vectors   | ~5000ms            | ~15ms          | 333x    |
 
-For full details on vector search, see [demo/lance/LANCE_DEMO.md](demo/lance/LANCE_DEMO.md).
+For full details on vector search, see [demo/lance/README.md](demo/lance/README.md).
 
 ### S3 Remote Files
 
@@ -547,7 +547,7 @@ LIMIT 10
 
 Pre-built models are available in the `models/` directory (`ncf.onnx`, `TinyTimeMixer.onnx`).
 
-For the full guide including the movie recommendation demo, see [demo/onnx_predict/ONNX_PREDICT_DEMO.md](demo/onnx_predict/ONNX_PREDICT_DEMO.md).
+For the full guide including the movie recommendation demo, see [demo/onnx_predict/README.md](demo/onnx_predict/README.md).
 
 ## Federated Queries
 
