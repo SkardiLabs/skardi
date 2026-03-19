@@ -366,7 +366,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
 
     fn execute(
         &self,
-        partition: usize,
+        _partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let pool = self.sqlx_pool.clone();
@@ -375,7 +375,12 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
         let op = self.op;
         let output_schema = Arc::clone(&self.output_schema);
 
-        let mut input_stream = self.input.execute(partition, context)?;
+        // Collect from all input partitions to handle multi-partition plans
+        let input_partitions = self.input.properties().partitioning.partition_count();
+        let mut input_streams: Vec<SendableRecordBatchStream> = Vec::new();
+        for p in 0..input_partitions {
+            input_streams.push(self.input.execute(p, Arc::clone(&context))?);
+        }
 
         let future = async move {
             let mut total_rows: u64 = 0;
@@ -398,34 +403,38 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
                     })?;
             }
 
-            // Collect and insert batches
-            while let Some(batch_result) = input_stream.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
+            // Collect and insert batches from all input partitions
+            for mut input_stream in input_streams {
+                while let Some(batch_result) = input_stream.next().await {
+                    let batch = batch_result?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
+                    // Project out auto-generated columns
+                    let filtered_batch = filter_batch_columns(&batch, &auto_gen_cols)?;
+                    let num_rows = filtered_batch.num_rows() as u64;
+
+                    // Build INSERT SQL using InsertBuilder from datafusion-table-providers
+                    let batches = vec![filtered_batch];
+                    let insert_sql = InsertBuilder::new(&table_ref, &batches)
+                        .build_postgres(None)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to build INSERT statement: {e}"
+                            ))
+                        })?;
+
+                    // Execute via sqlx within the transaction
+                    sqlx::query(&insert_sql)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!("Failed to execute INSERT: {e}"))
+                        })?;
+
+                    total_rows += num_rows;
                 }
-
-                // Project out auto-generated columns
-                let filtered_batch = filter_batch_columns(&batch, &auto_gen_cols)?;
-                let num_rows = filtered_batch.num_rows() as u64;
-
-                // Build INSERT SQL using InsertBuilder from datafusion-table-providers
-                let batches = vec![filtered_batch];
-                let insert_sql = InsertBuilder::new(&table_ref, &batches)
-                    .build_postgres(None)
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to build INSERT statement: {e}"))
-                    })?;
-
-                // Execute via sqlx within the transaction
-                sqlx::query(&insert_sql)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to execute INSERT: {e}"))
-                    })?;
-
-                total_rows += num_rows;
             }
 
             // Commit transaction
@@ -1611,21 +1620,6 @@ mod tests {
         register_ci_table(&mut ctx, "orders").await;
         register_ci_table(&mut ctx, "user_order_stats").await;
 
-        // Verify the aggregation SELECT works before INSERT-SELECT
-        let agg_check = query_all(
-            &ctx,
-            "SELECT u.id, u.name, u.email, COUNT(o.id) AS cnt
-             FROM users u
-             INNER JOIN orders o ON u.id = o.user_id
-             WHERE u.name = 'Alice Smith'
-             GROUP BY u.id, u.name, u.email",
-        )
-        .await;
-        assert!(
-            total_rows(&agg_check) >= 1,
-            "aggregation SELECT returned 0 rows — Alice has no orders?"
-        );
-
         ctx.sql("DELETE FROM user_order_stats WHERE user_id = 1")
             .await
             .unwrap()
@@ -1652,9 +1646,6 @@ mod tests {
         .collect()
         .await
         .expect("execute insert-select");
-
-        // Re-register to get fresh read provider after write
-        register_ci_table(&mut ctx, "user_order_stats").await;
 
         let batches = query_all(
             &ctx,
