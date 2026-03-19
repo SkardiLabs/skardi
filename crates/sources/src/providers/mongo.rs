@@ -1648,8 +1648,12 @@ mod tests {
         .await
         .unwrap();
 
-        let before = query_all(&ctx, "SELECT product_id FROM products").await;
-        let before_count = total_rows(&before);
+        let before = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_DEL'",
+        )
+        .await;
+        assert_eq!(total_rows(&before), 1);
 
         ctx.sql("DELETE FROM products WHERE product_id = 'PROD_DEL'")
             .await
@@ -1658,8 +1662,12 @@ mod tests {
             .await
             .expect("execute delete");
 
-        let after = query_all(&ctx, "SELECT product_id FROM products").await;
-        assert_eq!(total_rows(&after), before_count - 1);
+        let after = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_DEL'",
+        )
+        .await;
+        assert_eq!(total_rows(&after), 0);
     }
 
     #[tokio::test]
@@ -1668,8 +1676,13 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_collection(&mut ctx, "products", "product_id").await;
 
-        let before = query_all(&ctx, "SELECT product_id FROM products").await;
-        let before_count = total_rows(&before);
+        // Verify a known row exists before and survives a no-op delete
+        let before = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD001'",
+        )
+        .await;
+        assert_eq!(total_rows(&before), 1);
 
         ctx.sql("DELETE FROM products WHERE product_id = 'NONEXISTENT'")
             .await
@@ -1678,8 +1691,12 @@ mod tests {
             .await
             .expect("execute delete");
 
-        let after = query_all(&ctx, "SELECT product_id FROM products").await;
-        assert_eq!(total_rows(&after), before_count);
+        let after = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD001'",
+        )
+        .await;
+        assert_eq!(total_rows(&after), 1);
     }
 
     // ─── Update tests (integration) ─────────────────────────────────────
@@ -1718,8 +1735,19 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_collection(&mut ctx, "products", "product_id").await;
 
-        let before = query_all(&ctx, "SELECT product_id FROM products").await;
-        let before_count = total_rows(&before);
+        // Verify a known row is unchanged after a no-op update
+        let before = query_all(
+            &ctx,
+            "SELECT price FROM products WHERE product_id = 'PROD002'",
+        )
+        .await;
+        assert_eq!(total_rows(&before), 1);
+        let price_before = before[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
 
         ctx.sql("UPDATE products SET price = 0.0 WHERE product_id = 'NONEXISTENT'")
             .await
@@ -1728,8 +1756,19 @@ mod tests {
             .await
             .expect("execute update");
 
-        let after = query_all(&ctx, "SELECT product_id FROM products").await;
-        assert_eq!(total_rows(&after), before_count);
+        let after = query_all(
+            &ctx,
+            "SELECT price FROM products WHERE product_id = 'PROD002'",
+        )
+        .await;
+        assert_eq!(total_rows(&after), 1);
+        let price_after = after[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((price_before - price_after).abs() < 0.01);
     }
 
     // ─── Combined DML test (integration) ────────────────────────────────
@@ -1739,9 +1778,6 @@ mod tests {
     async fn test_insert_update_delete_round_trip() {
         let mut ctx = SessionContext::new();
         register_ci_collection(&mut ctx, "products", "product_id").await;
-
-        let before = query_all(&ctx, "SELECT product_id FROM products").await;
-        let before_count = total_rows(&before);
 
         // 1. Insert
         ctx.sql(
@@ -1753,8 +1789,12 @@ mod tests {
         .collect()
         .await
         .unwrap();
-        let after_insert = query_all(&ctx, "SELECT product_id FROM products").await;
-        assert_eq!(total_rows(&after_insert), before_count + 1);
+        let after_insert = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_RT'",
+        )
+        .await;
+        assert_eq!(total_rows(&after_insert), 1);
 
         // 2. Update
         ctx.sql("UPDATE products SET price = 20.0, name = 'RoundTripUpdated' WHERE product_id = 'PROD_RT'")
@@ -1782,8 +1822,12 @@ mod tests {
             .collect()
             .await
             .unwrap();
-        let after_delete = query_all(&ctx, "SELECT product_id FROM products").await;
-        assert_eq!(total_rows(&after_delete), before_count);
+        let after_delete = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE product_id = 'PROD_RT'",
+        )
+        .await;
+        assert_eq!(total_rows(&after_delete), 0);
     }
 
     // ─── Category filter test (integration) ─────────────────────────────

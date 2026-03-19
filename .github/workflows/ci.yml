@@ -85,6 +85,38 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Install Rust
+        run: rustup toolchain install stable --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+      - uses: Swatinem/rust-cache@v2
+      - name: Check code format
+        run: cargo fmt --all -- --check
+      - name: Check the package for errors
+        run: cargo check --all
+      - name: Execute rust tests
+        run: cargo nextest run --all-features
+
+      - name: Install integration test dependencies
+        run: |
+          wget -qO- https://www.mongodb.org/static/pgp/server-7.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+          echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-mongosh redis-tools
+
       - name: Seed MySQL data
         run: |
           mysql -h 127.0.0.1 -u skardi_user -pskardi_pass mydb <<'EOF'
@@ -151,13 +183,6 @@ jobs:
               (3, 'Monitor', 299.99);
           EOF
 
-      - name: Install mongosh
-        run: |
-          wget -qO- https://www.mongodb.org/static/pgp/server-7.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
-          echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
-          sudo apt-get update
-          sudo apt-get install -y mongodb-mongosh
-
       - name: Seed MongoDB data
         run: |
           mongosh "mongodb://root:rootpass@127.0.0.1:27017/?authSource=admin" <<'EOF'
@@ -204,11 +229,6 @@ jobs:
           })
           EOF
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler redis-tools
-
       - name: Seed Redis data
         run: |
           redis-cli -h 127.0.0.1 <<'EOF'
@@ -218,25 +238,6 @@ jobs:
           HSET mydb:products:PROD004 name "Mouse" category "Electronics" price "29.99" in_stock "true"
           HSET mydb:products:PROD005 name "Desk Chair" category "Furniture" price "199.99" in_stock "true"
           EOF
-      - name: Install Rust
-        run: rustup toolchain install stable --component llvm-tools-preview
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: install nextest
-        uses: taiki-e/install-action@nextest
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          df -h
-      - uses: Swatinem/rust-cache@v2
-      - name: Check code format
-        run: cargo fmt --all -- --check
-      - name: Check the package for errors
-        run: cargo check --all
-      - name: Execute rust tests
-        run: cargo nextest run --all-features
+
       - name: Execute Integration tests
         run: cargo nextest run --all-features -- --ignored
