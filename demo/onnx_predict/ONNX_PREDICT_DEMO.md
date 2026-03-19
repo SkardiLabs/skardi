@@ -41,19 +41,14 @@ The context file (`ctx_movie_recommendation.yaml`) defines two data sources:
 ```yaml
 data_sources:
   - name: "movies"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/test?sslmode=disable"
-    options:
-      table: "movies"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
-    description: "Movies table with movie_id, title, genres, year"
+    type: "csv"
+    path: "demo/sample_data/movies.csv"
+    description: "CSV file with movie_id, title, genres, year, and genres_list"
 
   - name: "movie_embeddings"
     type: "lance"
     path: "data/movie_embeddings.lance"
-    description: "128-dimensional movie embeddings"
+    description: "Lance dataset with 128-dimensional embeddings for movies, schema [movie_id, embedding]"
 ```
 
 ### Pipeline
@@ -103,10 +98,6 @@ LIMIT {top_n}
 ### Running the Demo
 
 ```bash
-# Set PostgreSQL credentials
-export PG_USER="your_user"
-export PG_PASSWORD="your_password"
-
 # Start the server (requires --features onnx)
 cargo run --bin skardi-server --features onnx -- \
   --ctx demo/onnx_predict/ctx_movie_recommendation.yaml \
@@ -120,7 +111,7 @@ cargo run --bin skardi-server --features onnx -- \
 curl -X POST http://localhost:8080/movie-recommendation-pipeline/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "last_watched_movie": "Toy Story (1995)",
+    "last_watched_movie": "Toy Story",
     "user_id": 42,
     "top_n": 5
   }'
