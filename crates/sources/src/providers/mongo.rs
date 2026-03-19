@@ -471,13 +471,14 @@ impl TableProvider for MongoTableProvider {
         let filter_doc = exprs_to_mongo_filter(&filters, &self.primary_key)?;
         let mut set_doc = Document::new();
         for (col, expr) in &assignments {
+            if col == &self.primary_key {
+                return Err(DataFusionError::Plan(format!(
+                    "Cannot modify primary key column '{}' — MongoDB disallows updating _id",
+                    self.primary_key
+                )));
+            }
             let value = expr_to_bson_value(expr)?;
-            let key = if col == &self.primary_key {
-                "_id".to_string()
-            } else {
-                col.clone()
-            };
-            set_doc.insert(key, value);
+            set_doc.insert(col.clone(), value);
         }
         let update_doc = doc! { "$set": set_doc };
 
@@ -1009,15 +1010,13 @@ fn exprs_to_mongo_filter(filters: &[Expr], primary_key: &str) -> DFResult<Docume
         return Ok(doc! {});
     }
 
-    let mut combined = Document::new();
+    let mut parts = Vec::with_capacity(filters.len());
     for expr in filters {
         match expr {
             Expr::BinaryExpr(binary) => {
                 let part =
                     binary_expr_to_mongo(&binary.left, &binary.op, &binary.right, primary_key)?;
-                for (k, v) in part {
-                    combined.insert(k, v);
-                }
+                parts.push(Bson::Document(part));
             }
             _ => {
                 return Err(DataFusionError::Plan(format!(
@@ -1027,7 +1026,7 @@ fn exprs_to_mongo_filter(filters: &[Expr], primary_key: &str) -> DFResult<Docume
         }
     }
 
-    Ok(combined)
+    Ok(doc! { "$and": parts })
 }
 
 /// The kind of DML operation to execute.
