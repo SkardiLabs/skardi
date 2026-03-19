@@ -1611,7 +1611,7 @@ mod tests {
         register_ci_table(&mut ctx, "orders").await;
         register_ci_table(&mut ctx, "user_order_stats").await;
 
-        ctx.sql("DELETE FROM user_order_stats WHERE user_name = 'Bob Johnson'")
+        ctx.sql("DELETE FROM user_order_stats WHERE user_id = 1")
             .await
             .unwrap()
             .collect()
@@ -1629,7 +1629,7 @@ mod tests {
                CAST('N/A' AS VARCHAR(50))
              FROM users u
              INNER JOIN orders o ON u.id = o.user_id
-             WHERE u.name = 'Bob Johnson'
+             WHERE u.name = 'Alice Smith'
              GROUP BY u.id, u.name, u.email",
         )
         .await
@@ -1640,7 +1640,7 @@ mod tests {
 
         let batches = query_all(
             &ctx,
-            "SELECT user_id, user_name, total_orders FROM user_order_stats WHERE user_name = 'Bob Johnson'",
+            "SELECT user_id, user_name, total_orders FROM user_order_stats WHERE user_id = 1",
         )
         .await;
         assert_eq!(total_rows(&batches), 1);
@@ -1656,7 +1656,7 @@ mod tests {
 
         ctx.sql(
             "DELETE FROM user_order_stats
-             WHERE user_name IN ('Alice Smith', 'Bob Johnson', 'Carol Williams')",
+             WHERE user_id IN (1, 2, 3)",
         )
         .await
         .unwrap()
