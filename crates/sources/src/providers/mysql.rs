@@ -1081,6 +1081,13 @@ mod tests {
         register_ci_table(&mut ctx, "orders").await;
         register_ci_table(&mut ctx, "user_order_stats").await;
 
+        ctx.sql("DELETE FROM user_order_stats WHERE user_name = 'Bob Johnson'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
         ctx.sql(
             "INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
              SELECT
@@ -1092,7 +1099,7 @@ mod tests {
                CAST('N/A' AS VARCHAR(50))
              FROM users u
              INNER JOIN orders o ON u.id = o.user_id
-             WHERE u.name = 'Carol Williams'
+             WHERE u.name = 'Bob Johnson'
              GROUP BY u.id, u.name, u.email",
         )
         .await
@@ -1103,10 +1110,10 @@ mod tests {
 
         let batches = query_all(
             &ctx,
-            "SELECT user_id, user_name, total_orders FROM user_order_stats WHERE user_name = 'Carol Williams'",
+            "SELECT user_id, user_name, total_orders FROM user_order_stats WHERE user_name = 'Bob Johnson'",
         )
         .await;
-        assert!(total_rows(&batches) >= 1);
+        assert_eq!(total_rows(&batches), 1);
     }
 
     #[tokio::test]
