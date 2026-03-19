@@ -1565,7 +1565,7 @@ mod tests {
                CAST('N/A' AS VARCHAR(50))
              FROM users u
              INNER JOIN orders o ON u.id = o.user_id
-             WHERE u.name = 'Alice Smith'
+             WHERE u.name = 'Carol Williams'
              GROUP BY u.id, u.name, u.email",
         )
         .await
@@ -1576,10 +1576,10 @@ mod tests {
 
         let batches = query_all(
             &ctx,
-            "SELECT user_id, user_name, total_orders FROM user_order_stats",
+            "SELECT user_id, user_name, total_orders FROM user_order_stats WHERE user_name = 'Carol Williams'",
         )
         .await;
-        assert!(total_rows(&batches) >= 1);
+        assert_eq!(total_rows(&batches), 1);
     }
 
     #[tokio::test]
