@@ -1779,6 +1779,62 @@ mod tests {
         assert!((price_before - price_after).abs() < 0.01);
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_multiple_columns() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock)
+             VALUES ('PROD_TEST_MULTI', 'MultiUpdate', 'TestCat', 11.0, true)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "UPDATE products
+             SET name = 'MultiUpdateRenamed',
+                 in_stock = false
+             WHERE product_id = 'PROD_TEST_MULTI'",
+        )
+        .await
+        .expect("parse update")
+        .collect()
+        .await
+        .expect("execute update");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name, in_stock FROM products WHERE product_id = 'PROD_TEST_MULTI'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let in_stock = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "MultiUpdateRenamed");
+        assert!(!in_stock.value(0));
+
+        ctx.sql("DELETE FROM products WHERE product_id = 'PROD_TEST_MULTI'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
     // ─── Combined DML test (integration) ────────────────────────────────
 
     #[tokio::test]

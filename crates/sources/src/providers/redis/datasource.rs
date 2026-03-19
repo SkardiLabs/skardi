@@ -1725,12 +1725,35 @@ mod tests {
 
     /// Register a Redis table from the CI docker service.
     fn register_ci_table(ctx: &mut SessionContext, table: &str) {
+        register_ci_table_with_options(ctx, table, None);
+    }
+
+    /// Register a Redis table from the CI docker service with optional extra options.
+    fn register_ci_table_with_options(
+        ctx: &mut SessionContext,
+        table: &str,
+        extra_options: Option<&HashMap<String, String>>,
+    ) {
         let mut options = HashMap::new();
         options.insert("key_space".to_string(), "mydb".to_string());
         options.insert("table".to_string(), table.to_string());
         options.insert("key_column".to_string(), "product_id".to_string());
+        if let Some(extra) = extra_options {
+            options.extend(extra.clone());
+        }
         register_redis_tables(ctx, table, "redis://127.0.0.1:6379", Some(&options))
             .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
+    }
+
+    /// Remove all CI Redis keys for a registered table so tests can start from an empty table.
+    fn clear_ci_table(table: &str) {
+        let client = redis::Client::open("redis://127.0.0.1:6379").expect("create redis client");
+        let mut conn = client.get_connection().expect("connect to redis");
+        let pattern = format!("mydb:{table}:*");
+        let keys: Vec<String> = conn.keys(&pattern).expect("scan redis keys");
+        if !keys.is_empty() {
+            let _: usize = conn.del(keys).expect("cleanup redis keys");
+        }
     }
 
     async fn ci_query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -2077,5 +2100,75 @@ mod tests {
         )
         .await;
         assert!(ci_total_rows(&batches) >= 2); // at least Electronics and Furniture
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_empty_table_declared_schema_live() {
+        let table_name = "products_schema_live";
+        clear_ci_table(table_name);
+
+        let mut ctx = SessionContext::new();
+        let mut extra_options = HashMap::new();
+        extra_options.insert(
+            "columns".to_string(),
+            "product_id,name,category,price,in_stock".to_string(),
+        );
+        register_ci_table_with_options(&mut ctx, table_name, Some(&extra_options));
+
+        let catalog = ctx.catalog("datafusion").unwrap();
+        let schema = catalog.schema("public").unwrap();
+        let table = schema.table(table_name).await.unwrap().unwrap();
+        let table_schema = table.schema();
+        let field_names: Vec<&str> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            field_names,
+            vec!["product_id", "name", "category", "price", "in_stock"]
+        );
+
+        ctx.sql(
+            "INSERT INTO products_schema_live (product_id, name, category, price, in_stock)
+             VALUES ('PROD_SCHEMA', 'SchemaProduct', 'TestCat', '12.34', 'true')",
+        )
+        .await
+        .expect("parse insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+        let batches = ci_query_all(
+            &ctx,
+            "SELECT product_id, name, price
+             FROM products_schema_live
+             WHERE product_id = 'PROD_SCHEMA'",
+        )
+        .await;
+        assert_eq!(ci_total_rows(&batches), 1);
+
+        let product_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(product_ids.value(0), "PROD_SCHEMA");
+        assert_eq!(names.value(0), "SchemaProduct");
+
+        ctx.sql("DELETE FROM products_schema_live WHERE product_id = 'PROD_SCHEMA'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        clear_ci_table(table_name);
     }
 }

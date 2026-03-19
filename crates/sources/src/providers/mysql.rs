@@ -936,6 +936,63 @@ mod tests {
         assert_eq!(after_email, before_email);
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_multiple_columns() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES ('MySqlMultiUpdate', 'mysql_multi_update@example.com')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "UPDATE users
+             SET name = 'MySqlMultiUpdateRenamed',
+                 email = 'mysql_multi_update_renamed@example.com'
+             WHERE name = 'MySqlMultiUpdate'",
+        )
+        .await
+        .expect("parse update")
+        .collect()
+        .await
+        .expect("execute update");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name, email
+             FROM users
+             WHERE email = 'mysql_multi_update_renamed@example.com'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let emails = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "MySqlMultiUpdateRenamed");
+        assert_eq!(emails.value(0), "mysql_multi_update_renamed@example.com");
+
+        ctx.sql("DELETE FROM users WHERE email = 'mysql_multi_update_renamed@example.com'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
     // ─── Combined DML test (integration) ────────────────────────────────
 
     #[tokio::test]
@@ -1050,5 +1107,82 @@ mod tests {
         )
         .await;
         assert!(total_rows(&batches) >= 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_select_multiple_users() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+        register_ci_table(&mut ctx, "orders").await;
+        register_ci_table(&mut ctx, "user_order_stats").await;
+
+        ctx.sql(
+            "DELETE FROM user_order_stats
+             WHERE user_name IN ('Alice Smith', 'Bob Johnson', 'Carol Williams')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+             SELECT
+               CAST(u.id AS INT),
+               u.name,
+               u.email,
+               CAST(COUNT(o.id) AS INT),
+               CAST(SUM(o.amount) AS DECIMAL(10,2)),
+               CAST('N/A' AS VARCHAR(50))
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             GROUP BY u.id, u.name, u.email",
+        )
+        .await
+        .expect("parse insert-select all")
+        .collect()
+        .await
+        .expect("execute insert-select all");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT user_name, total_orders
+             FROM user_order_stats
+             WHERE user_name IN ('Alice Smith', 'Bob Johnson', 'Carol Williams')
+             ORDER BY user_name",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_user_order_stats_schema_visibility() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "user_order_stats").await;
+
+        let catalog = ctx.catalog("datafusion").unwrap();
+        let schema = catalog.schema("public").unwrap();
+        let table = schema.table("user_order_stats").await.unwrap().unwrap();
+        let table_schema = table.schema();
+        let field_names: Vec<&str> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            field_names,
+            vec![
+                "id",
+                "user_id",
+                "user_name",
+                "user_email",
+                "total_orders",
+                "total_spent",
+                "last_order_date",
+            ]
+        );
     }
 }
