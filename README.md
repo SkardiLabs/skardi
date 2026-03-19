@@ -33,7 +33,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
 - **Vector search** — Native KNN similarity search via Lance integration
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime
-- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF
+- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF (requires `--features onnx`)
 
 ## Table of Contents
 
@@ -345,7 +345,7 @@ export PG_USER="myuser"
 export PG_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/postgres/POSTGRES_DEMO.md](demo/postgres/POSTGRES_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/postgres/README.md](demo/postgres/README.md).
 
 ### MySQL
 
@@ -366,7 +366,7 @@ export MYSQL_USER="myuser"
 export MYSQL_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mysql/MYSQL_DEMO.md](demo/mysql/MYSQL_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/mysql/README.md](demo/mysql/README.md).
 
 ### SQLite
 
@@ -388,7 +388,7 @@ SQLite requires no credentials — just the path to the database file.
 skardi query --sql "SELECT * FROM './data/my_database.db.users'"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/SQLITE_DEMO.md](demo/sqlite/SQLITE_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/README.md](demo/sqlite/README.md).
 
 ### MongoDB
 
@@ -411,7 +411,7 @@ export MONGO_USER="myuser"
 export MONGO_PASS="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mongo/MONGO_DEMO.md](demo/mongo/MONGO_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/mongo/README.md](demo/mongo/README.md).
 
 ### Redis
 
@@ -429,7 +429,7 @@ Full CRUD support with point lookups (O(1) via direct key construction), full sc
 
 Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column. For initially empty tables, use the `columns` option to declare the schema upfront so INSERT operations work immediately.
 
-For detailed setup, CRUD examples, and federated queries, see [demo/redis/REDIS_DEMO.md](demo/redis/REDIS_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/redis/README.md](demo/redis/README.md).
 
 ### Apache Iceberg
 
@@ -458,7 +458,7 @@ For S3-backed Iceberg tables:
     aws_secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
 ```
 
-For detailed setup and examples, see [demo/iceberg/ICEBERG_DEMO.md](demo/iceberg/ICEBERG_DEMO.md).
+For detailed setup and examples, see [demo/iceberg/README.md](demo/iceberg/README.md).
 
 ### Lance (Vector Search)
 
@@ -490,7 +490,7 @@ WHERE knn.id != {ref_id}
 | 100K vectors | ~500ms             | ~8ms           | 62x     |
 | 1M vectors   | ~5000ms            | ~15ms          | 333x    |
 
-For full details on vector search, see [demo/lance/LANCE_DEMO.md](demo/lance/LANCE_DEMO.md).
+For full details on vector search, see [demo/lance/README.md](demo/lance/README.md).
 
 ### S3 Remote Files
 
@@ -516,7 +516,12 @@ For full S3 configuration, IAM permissions, and troubleshooting, see [demo/S3_US
 
 ## ONNX Model Inference
 
-Run ONNX model predictions directly in SQL using the built-in `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
+> **Note:** ONNX support is behind a feature flag. Build with `--features onnx` to enable it:
+> ```bash
+> cargo build --release -p skardi-server --features onnx
+> ```
+
+Run ONNX model predictions directly in SQL using the `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
 
 ```sql
 onnx_predict('path/to/model.onnx', input1, input2, ...) -> FLOAT
@@ -542,7 +547,7 @@ LIMIT 10
 
 Pre-built models are available in the `models/` directory (`ncf.onnx`, `TinyTimeMixer.onnx`).
 
-For the full guide including the movie recommendation demo, see [demo/onnx_predict/ONNX_PREDICT_DEMO.md](demo/onnx_predict/ONNX_PREDICT_DEMO.md).
+For the full guide including the movie recommendation demo, see [demo/onnx_predict/README.md](demo/onnx_predict/README.md).
 
 ## Federated Queries
 
@@ -575,6 +580,9 @@ query: |
 
 ```bash
 docker build -t skardi .
+
+# With ONNX support
+docker build -t skardi --build-arg FEATURES=onnx .
 ```
 
 ### Run with config files mounted
@@ -618,6 +626,9 @@ cargo install --path crates/cli
 
 # Build server
 cargo build --release -p skardi-server
+
+# Build server with ONNX model inference support
+cargo build --release -p skardi-server --features onnx
 ```
 
 ## Demo & Examples

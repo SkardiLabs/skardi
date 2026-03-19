@@ -9,7 +9,9 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::config::{register_onnx_predict_udf, ServerConfig};
+#[cfg(feature = "onnx")]
+use crate::config::register_onnx_predict_udf;
+use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
     pipeline_health_check,
@@ -104,6 +106,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         .map_err(|e| anyhow::anyhow!("Failed to register UDFs: {}", e))?;
 
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
     // Wrap SessionContext in Arc for sharing between engine and pipeline loading

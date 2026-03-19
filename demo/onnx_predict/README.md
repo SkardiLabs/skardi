@@ -25,9 +25,9 @@ onnx_predict('path/to/model.onnx', input1, input2, ...) -> FLOAT
 ## Prerequisites
 
 1. An ONNX model file (`.onnx`) accessible from the server's working directory
-2. The Skardi server built with model support:
+2. The Skardi server built with the `onnx` feature enabled:
    ```bash
-   cargo build --release -p skardi-server
+   cargo build --release -p skardi-server --features onnx
    ```
 
 ## Example: Movie Recommendation Pipeline
@@ -41,19 +41,14 @@ The context file (`ctx_movie_recommendation.yaml`) defines two data sources:
 ```yaml
 data_sources:
   - name: "movies"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/test?sslmode=disable"
-    options:
-      table: "movies"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
-    description: "Movies table with movie_id, title, genres, year"
+    type: "csv"
+    path: "demo/sample_data/movies.csv"
+    description: "CSV file with movie_id, title, genres, year, and genres_list"
 
   - name: "movie_embeddings"
     type: "lance"
     path: "data/movie_embeddings.lance"
-    description: "128-dimensional movie embeddings"
+    description: "Lance dataset with 128-dimensional embeddings for movies, schema [movie_id, embedding]"
 ```
 
 ### Pipeline
@@ -103,12 +98,8 @@ LIMIT {top_n}
 ### Running the Demo
 
 ```bash
-# Set PostgreSQL credentials
-export PG_USER="your_user"
-export PG_PASSWORD="your_password"
-
-# Start the server
-cargo run --bin skardi-server -- \
+# Start the server (requires --features onnx)
+cargo run --bin skardi-server --features onnx -- \
   --ctx demo/onnx_predict/ctx_movie_recommendation.yaml \
   --pipeline demo/onnx_predict/pipelines/ \
   --port 8080
@@ -120,7 +111,7 @@ cargo run --bin skardi-server -- \
 curl -X POST http://localhost:8080/movie-recommendation-pipeline/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "last_watched_movie": "Toy Story (1995)",
+    "last_watched_movie": "Toy Story",
     "user_id": 42,
     "top_n": 5
   }'
@@ -226,7 +217,7 @@ onnx_predict('model.onnx', CAST(col AS BIGINT), ...)
 ### "ORT run failed"
 This usually means the input shape or type doesn't match what the model expects. Enable debug logging to see the model's expected inputs:
 ```bash
-RUST_LOG=debug cargo run --bin skardi-server -- ...
+RUST_LOG=debug cargo run --bin skardi-server --features onnx -- ...
 ```
 
 The logs will show:
