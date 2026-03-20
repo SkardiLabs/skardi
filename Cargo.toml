@@ -44,11 +44,12 @@ datafusion-table-providers = { version = "0.10.0", default-features = false, fea
 tokio-rusqlite = "0.7"
 env_logger = "0.11"
 futures = "0.3"
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "e844d823c3834e3b9cbb98bdd4c0b4638fdc5b80" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "e844d823c3834e3b9cbb98bdd4c0b4638fdc5b80" }
+iceberg = "0.9.0"
+iceberg-datafusion = "0.9.0"
+iceberg-storage-opendal = "0.9.0"
 insta = { version = "1.41.1", features = ["glob", "filters"] }
-lance = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-beta.7", default-features = false }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-beta.7" }
+lance = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1", default-features = false }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1" }
 log = "0.4.27"
 object_store = { version = "0.12.4", default-features = false, features = ["aws", "gcp", "azure", "http"] }
 parking_lot = "0.12"

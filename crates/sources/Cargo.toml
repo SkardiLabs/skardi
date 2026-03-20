@@ -20,6 +20,7 @@ futures ={ workspace = true }
 hex = "0.4"
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 lance = { workspace = true }
 mongodb = "3.1"
 mysql_async = "0.36"

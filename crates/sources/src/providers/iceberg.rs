@@ -7,9 +7,10 @@ use anyhow::{Context, Result};
 use datafusion::prelude::SessionContext;
 use iceberg::NamespaceIdent;
 use iceberg::TableIdent;
-use iceberg::io::FileIO;
+use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::table::Table;
 use iceberg_datafusion::IcebergStaticTableProvider;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -150,11 +151,22 @@ async fn build_file_io(warehouse_path: &str, options: &HashMap<String, String>) 
         }
     }
 
-    FileIO::from_path(warehouse_path)
-        .with_context(|| format!("Failed to determine FileIO scheme for: {}", warehouse_path))?
-        .with_props(props)
-        .build()
-        .with_context(|| format!("Failed to build FileIO for warehouse: {}", warehouse_path))
+    let factory: Arc<dyn iceberg::io::StorageFactory> =
+        if warehouse_path.starts_with("s3://") || warehouse_path.starts_with("s3a://") {
+            let scheme = if warehouse_path.starts_with("s3a://") {
+                "s3a://"
+            } else {
+                "s3://"
+            };
+            Arc::new(OpenDalStorageFactory::S3 {
+                configured_scheme: scheme.to_string(),
+                customized_credential_load: None,
+            })
+        } else {
+            Arc::new(OpenDalStorageFactory::Fs)
+        };
+
+    Ok(FileIOBuilder::new(factory).with_props(props).build())
 }
 
 async fn find_latest_metadata(file_io: &FileIO, table_path: &str) -> Result<String> {
@@ -418,10 +430,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let file_io = FileIO::from_path(&format!("file://{}", temp_dir.path().display()))
-                .unwrap()
-                .build()
-                .unwrap();
+            let file_io = FileIO::new_with_fs();
 
             let table_path = format!("file://{}/ns/table", temp_dir.path().display());
             let result = find_latest_metadata(&file_io, &table_path).await;
@@ -447,10 +456,7 @@ mod tests {
             fs::write(metadata_dir.join("v1.metadata.json"), "{}").unwrap();
             fs::write(metadata_dir.join("v2.metadata.json"), "{}").unwrap();
 
-            let file_io = FileIO::from_path(&format!("file://{}", temp_dir.path().display()))
-                .unwrap()
-                .build()
-                .unwrap();
+            let file_io = FileIO::new_with_fs();
 
             let table_path = format!("file://{}", temp_dir.path().display());
             let result = find_latest_metadata(&file_io, &table_path).await;
@@ -471,10 +477,7 @@ mod tests {
             fs::write(metadata_dir.join("v2.metadata.json"), "{}").unwrap();
             fs::write(metadata_dir.join("v3.metadata.json"), "{}").unwrap();
 
-            let file_io = FileIO::from_path(&format!("file://{}", temp_dir.path().display()))
-                .unwrap()
-                .build()
-                .unwrap();
+            let file_io = FileIO::new_with_fs();
 
             let table_path = format!("file://{}", temp_dir.path().display());
             let result = find_latest_metadata(&file_io, &table_path).await;
