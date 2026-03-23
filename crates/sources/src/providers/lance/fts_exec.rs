@@ -9,6 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -32,10 +33,16 @@ pub struct LanceFtsExec {
     dataset: Arc<Dataset>,
     /// The full-text search query to execute
     fts_query: FullTextSearchQuery,
-    /// Schema of the output (dataset fields + _score)
+    /// Full schema (all dataset fields + _score)
+    full_schema: SchemaRef,
+    /// Output schema (projected subset, or full if no projection)
     schema: SchemaRef,
+    /// Optional column projection indices (into full_schema)
+    projection: Option<Vec<usize>>,
     /// Optional metadata filter from WHERE clause pushdown
     filter: Option<String>,
+    /// Optional row limit applied after FTS + filter
+    scan_limit: Option<usize>,
     /// Plan properties
     plan_properties: PlanProperties,
 }
@@ -47,10 +54,10 @@ impl LanceFtsExec {
         let lance_schema = dataset.schema();
         let mut fields: Vec<Field> = lance_schema.fields.iter().map(|f| f.into()).collect();
         fields.push(Field::new("_score", DataType::Float32, true));
-        let schema: SchemaRef = Arc::new(Schema::new(fields));
+        let full_schema: SchemaRef = Arc::new(Schema::new(fields));
 
         let plan_properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(full_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -59,15 +66,42 @@ impl LanceFtsExec {
         Ok(Self {
             dataset,
             fts_query,
-            schema,
+            full_schema: full_schema.clone(),
+            schema: full_schema,
+            projection: None,
             filter: None,
+            scan_limit: None,
             plan_properties,
         })
+    }
+
+    /// Apply a column projection (subset of columns to return)
+    pub fn with_projection(mut self, projection: Vec<usize>) -> DFResult<Self> {
+        let projected_fields: Vec<Field> = projection
+            .iter()
+            .map(|&idx| self.full_schema.field(idx).clone())
+            .collect();
+        let projected_schema: SchemaRef = Arc::new(Schema::new(projected_fields));
+        self.schema = projected_schema.clone();
+        self.projection = Some(projection);
+        self.plan_properties = PlanProperties::new(
+            EquivalenceProperties::new(projected_schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Ok(self)
     }
 
     /// Add a metadata filter predicate (e.g., "category = 'food'")
     pub fn with_filter(mut self, filter: String) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Set a row limit applied after FTS + filter
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.scan_limit = Some(limit);
         self
     }
 
@@ -83,6 +117,11 @@ impl LanceFtsExec {
         // Execute full-text search
         scanner.full_text_search(self.fts_query.clone())?;
 
+        // Apply post-filter row limit
+        if let Some(n) = self.scan_limit {
+            scanner.limit(Some(n as i64), None)?;
+        }
+
         // Collect results
         let mut stream = scanner.try_into_stream().await?;
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -90,15 +129,37 @@ impl LanceFtsExec {
             batches.push(batch_result?);
         }
 
-        if batches.is_empty() {
-            Ok(RecordBatch::new_empty(self.schema.clone()))
+        let batch = if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         } else if batches.len() == 1 {
-            Ok(batches.into_iter().next().unwrap())
+            batches.into_iter().next().unwrap()
         } else {
             let batch_schema = batches[0].schema();
             arrow::compute::concat_batches(&batch_schema, &batches)
-                .map_err(|e| anyhow::anyhow!("Failed to concatenate batches: {}", e))
-        }
+                .map_err(|e| anyhow::anyhow!("Failed to concatenate batches: {}", e))?
+        };
+
+        // Project and reorder columns to match the declared output schema.
+        // Lance's scanner may return columns in a different order than expected,
+        // and we may need only a subset when a projection is applied.
+        let columns: Vec<_> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Expected column '{}' not found in FTS result",
+                            field.name()
+                        )
+                    })
+                    .cloned()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
     }
 }
 

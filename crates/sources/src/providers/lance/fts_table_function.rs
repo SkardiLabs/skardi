@@ -251,20 +251,43 @@ impl TableProvider for LanceFtsProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mut exec = LanceFtsExec::try_new(self.dataset.clone(), self.fts_query.clone())?;
+        let mut fts_query = self.fts_query.clone();
 
-        // Convert pushed-down filter expressions to SQL string for Lance
+        // When WHERE filters are pushed down, remove the FTS retrieval limit
+        // so that all matching candidates are available for post-filter.
+        // Lance applies FTS limit before the metadata filter, which would
+        // otherwise discard valid matches.
+        if !filters.is_empty() {
+            fts_query.limit = None;
+        }
+
+        let mut exec = LanceFtsExec::try_new(self.dataset.clone(), fts_query)?;
+
+        // Apply column projection if DataFusion requests a subset of columns
+        if let Some(proj) = projection {
+            exec = exec.with_projection(proj.clone())?;
+        }
+
+        // Convert pushed-down filter expressions to SQL string for Lance.
+        // DataFusion's Expr::to_string() produces type-annotated literals like
+        // Utf8("foo") and Float64(3.14) which Lance's SQL parser doesn't understand,
+        // so we strip the type wrappers to produce standard SQL.
         if !filters.is_empty() {
             let filter_str = filters
                 .iter()
-                .map(|f| f.to_string())
+                .map(|f| expr_to_lance_sql(f))
                 .collect::<Vec<_>>()
                 .join(" AND ");
             exec = exec.with_filter(filter_str);
+        }
+
+        // Apply scan limit if provided (e.g., from SQL LIMIT clause)
+        if let Some(n) = limit {
+            exec = exec.with_limit(n);
         }
 
         Ok(Arc::new(exec))
@@ -287,6 +310,79 @@ fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
         Expr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
         Expr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
         _ => plan_err!("lance_fts: {} must be an integer literal", name),
+    }
+}
+
+/// Convert a DataFusion Expr to a plain SQL string for Lance's filter parser.
+///
+/// DataFusion's `Expr::to_string()` emits type-annotated literals (e.g. `Utf8("foo")`,
+/// `Float64(3.14)`) that Lance cannot parse. This function walks the Expr tree directly
+/// and produces standard SQL without type annotations.
+fn expr_to_lance_sql(expr: &Expr) -> String {
+    match expr {
+        Expr::Column(col) => col.name.clone(),
+
+        Expr::Literal(scalar, _) => scalar_to_sql(scalar),
+
+        Expr::BinaryExpr(binary) => {
+            let left = expr_to_lance_sql(&binary.left);
+            let right = expr_to_lance_sql(&binary.right);
+            format!("{left} {op} {right}", op = binary.op)
+        }
+
+        Expr::Not(inner) => format!("NOT ({})", expr_to_lance_sql(inner)),
+
+        Expr::IsNull(inner) => format!("{} IS NULL", expr_to_lance_sql(inner)),
+
+        Expr::IsNotNull(inner) => format!("{} IS NOT NULL", expr_to_lance_sql(inner)),
+
+        Expr::Between(between) => {
+            let expr_sql = expr_to_lance_sql(&between.expr);
+            let low = expr_to_lance_sql(&between.low);
+            let high = expr_to_lance_sql(&between.high);
+            if between.negated {
+                format!("{expr_sql} NOT BETWEEN {low} AND {high}")
+            } else {
+                format!("{expr_sql} BETWEEN {low} AND {high}")
+            }
+        }
+
+        Expr::InList(in_list) => {
+            let expr_sql = expr_to_lance_sql(&in_list.expr);
+            let values: Vec<String> = in_list.list.iter().map(|e| expr_to_lance_sql(e)).collect();
+            let list = values.join(", ");
+            if in_list.negated {
+                format!("{expr_sql} NOT IN ({list})")
+            } else {
+                format!("{expr_sql} IN ({list})")
+            }
+        }
+
+        // Fallback: use Display (may contain type annotations, but covers edge cases)
+        other => other.to_string(),
+    }
+}
+
+/// Convert a DataFusion ScalarValue to a plain SQL literal string.
+fn scalar_to_sql(scalar: &ScalarValue) -> String {
+    match scalar {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+        ScalarValue::Boolean(Some(b)) => b.to_string(),
+        ScalarValue::Int8(Some(n)) => n.to_string(),
+        ScalarValue::Int16(Some(n)) => n.to_string(),
+        ScalarValue::Int32(Some(n)) => n.to_string(),
+        ScalarValue::Int64(Some(n)) => n.to_string(),
+        ScalarValue::UInt8(Some(n)) => n.to_string(),
+        ScalarValue::UInt16(Some(n)) => n.to_string(),
+        ScalarValue::UInt32(Some(n)) => n.to_string(),
+        ScalarValue::UInt64(Some(n)) => n.to_string(),
+        ScalarValue::Float32(Some(n)) => n.to_string(),
+        ScalarValue::Float64(Some(n)) => n.to_string(),
+        ScalarValue::Null => "NULL".to_string(),
+        // Fallback for other types
+        other => other.to_string(),
     }
 }
 
@@ -625,6 +721,151 @@ mod tests {
         assert!(
             total_rows > 0,
             "Expected results for 'premium organic' OR search"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_where_category_filter() {
+        let ctx = setup_fts_context().await;
+
+        // Search with an equality filter on category
+        let df = ctx
+            .sql(
+                "SELECT id, description, category, _score \
+                 FROM lance_fts('fts_data', 'description', 'premium', 50) \
+                 WHERE category = 'electronics'",
+            )
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            total_rows > 0,
+            "Expected results for 'premium' with category filter"
+        );
+
+        // Every returned row must have category = 'electronics'
+        for batch in &batches {
+            let cats = batch
+                .column_by_name("category")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..cats.len() {
+                assert_eq!(
+                    cats.value(i),
+                    "electronics",
+                    "WHERE filter should restrict category"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_where_numeric_filter() {
+        let ctx = setup_fts_context().await;
+
+        // Search with a numeric comparison on revenue
+        let df = ctx
+            .sql(
+                "SELECT id, revenue, _score \
+                 FROM lance_fts('fts_data', 'description', 'enthusiasts', 50) \
+                 WHERE revenue > 500.0",
+            )
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+
+        for batch in &batches {
+            let revenues = batch
+                .column_by_name("revenue")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            for i in 0..revenues.len() {
+                assert!(
+                    revenues.value(i) > 500.0,
+                    "WHERE filter should restrict revenue > 500.0, got {}",
+                    revenues.value(i)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_where_compound_filter() {
+        let ctx = setup_fts_context().await;
+
+        // Search with both category and revenue filters (AND)
+        let df = ctx
+            .sql(
+                "SELECT id, description, category, revenue, _score \
+                 FROM lance_fts('fts_data', 'description', 'portable', 50) \
+                 WHERE category = 'electronics' AND revenue > 100.0",
+            )
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+
+        for batch in &batches {
+            let cats = batch
+                .column_by_name("category")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let revenues = batch
+                .column_by_name("revenue")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            for i in 0..cats.len() {
+                assert_eq!(cats.value(i), "electronics");
+                assert!(revenues.value(i) > 100.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_where_filters_reduce_results() {
+        let ctx = setup_fts_context().await;
+
+        // Run without filter
+        let df_all = ctx
+            .sql("SELECT id FROM lance_fts('fts_data', 'description', 'premium', 50)")
+            .await
+            .expect("SQL parse failed");
+        let batches_all = df_all.collect().await.expect("Query execution failed");
+        let rows_all: usize = batches_all.iter().map(|b| b.num_rows()).sum();
+
+        // Run with category filter — should return fewer (or equal) rows
+        let df_filtered = ctx
+            .sql(
+                "SELECT id FROM lance_fts('fts_data', 'description', 'premium', 50) \
+                 WHERE category = 'outdoor'",
+            )
+            .await
+            .expect("SQL parse failed");
+        let batches_filtered = df_filtered.collect().await.expect("Query execution failed");
+        let rows_filtered: usize = batches_filtered.iter().map(|b| b.num_rows()).sum();
+
+        assert!(
+            rows_filtered > 0,
+            "Filtered query should still return results"
+        );
+        assert!(
+            rows_filtered <= rows_all,
+            "Filtered results ({rows_filtered}) should be <= unfiltered ({rows_all})"
         );
     }
 }
