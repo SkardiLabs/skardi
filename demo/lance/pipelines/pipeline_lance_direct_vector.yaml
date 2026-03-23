@@ -1,0 +1,51 @@
+metadata:
+  name: lance-direct-vector-search
+  version: 1.0.0
+  description: Demonstrates Lance KNN search with a user-provided query vector
+  author: Skardi Demo
+  created_at: 2026-03-23T00:00:00.000+00:00
+  updated_at: 2026-03-23T00:00:00.000+00:00
+
+# This pipeline demonstrates vector similarity search where the query vector
+# is provided directly in the user request, rather than fetched via subquery.
+#
+# Use case: The caller already has an embedding (e.g., from an external model)
+# and wants to find nearest neighbors without a reference row in the dataset.
+#
+# Parameters:
+#   {query_vector}: The embedding vector as a literal array, e.g. [0.1, 0.2, ...]
+
+query: |
+  SELECT
+    knn.id,
+    knn.item_id,
+    knn.revenue,
+    knn._distance as distance
+  FROM lance_knn(
+    'sift_items',
+    'vector',
+    {query_vector},
+    10
+  ) knn
+
+# Example API Call:
+#
+# POST /lance-direct-vector-search/execute
+# {
+#   "query_vector": [0.1, 0.2, 0.3, ...]  (128 floats for the demo dataset)
+# }
+#
+# Response:
+# {
+#   "data": [
+#     {
+#       "id": 42,
+#       "item_id": 1337,
+#       "revenue": 2500.50,
+#       "distance": 0.125
+#     },
+#     ...
+#   ],
+#   "rows_affected": 10,
+#   "execution_time_ms": 15
+# }

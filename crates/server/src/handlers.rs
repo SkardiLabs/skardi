@@ -388,7 +388,9 @@ pub async fn get_data_sources(
             DataSourceType::Mysql => "mysql",
             DataSourceType::Iceberg => "iceberg",
             DataSourceType::Mongo => "mongo",
+            DataSourceType::Sqlite => "sqlite",
             DataSourceType::Lance => "lance",
+            DataSourceType::Redis => "redis",
         };
 
         // Determine path or URL based on source type
@@ -396,12 +398,19 @@ pub async fn get_data_sources(
             DataSourceType::Csv
             | DataSourceType::Parquet
             | DataSourceType::Lance
+            | DataSourceType::Sqlite
             | DataSourceType::Iceberg => Some(data_source.path.to_string_lossy().to_string()),
-            DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo => None,
+            DataSourceType::Postgres
+            | DataSourceType::Mysql
+            | DataSourceType::Mongo
+            | DataSourceType::Redis => None,
         };
 
         let url = match data_source.source_type {
-            DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo => {
+            DataSourceType::Postgres
+            | DataSourceType::Mysql
+            | DataSourceType::Mongo
+            | DataSourceType::Redis => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()
@@ -513,6 +522,21 @@ pub async fn execute_pipeline_by_name(
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "NULL".to_string(),
+                Value::Array(arr) if !arr.is_empty() => {
+                    // Convert JSON array to SQL array literal, e.g. [0.1, 0.2, ...]
+                    // Used for passing vectors to lance_knn
+                    let elements: Vec<String> = arr
+                        .iter()
+                        .map(|v| match v {
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Null => "NULL".to_string(),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    format!("[{}]", elements.join(", "))
+                }
                 _ => {
                     tracing::error!(
                         "Unsupported parameter type for {}: {:?}",
@@ -657,7 +681,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use pipeline::pipeline::{Pipeline, StandardPipeline};
     use skardi_engine::datafusion::DataFusionEngine;
-    use source::AccessMode;
+    use sources::AccessMode;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};

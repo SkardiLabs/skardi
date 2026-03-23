@@ -1,0 +1,7 @@
+metadata:
+  name: "delete_product"
+  version: "1.0"
+  description: "Delete a product by product ID"
+
+query: |
+  DELETE FROM products WHERE product_id = {product_id}

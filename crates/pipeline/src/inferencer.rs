@@ -181,7 +181,14 @@ impl SqlSchemaInferrer {
         let mut placeholder_index = 0;
 
         for statement in statements {
-            if let Statement::Query(query) = statement {
+            // Extract the query to analyze (either a top-level SELECT or the inner SELECT of an INSERT/UPDATE/DELETE)
+            let query = match statement {
+                Statement::Query(query) => Some(query.as_ref()),
+                Statement::Insert(insert) => insert.source.as_ref().map(|q| q.as_ref()),
+                _ => None,
+            };
+
+            if let Some(query) = query {
                 match &*query.body {
                     SetExpr::Select(select) => {
                         // Look for parameters in WHERE clauses
@@ -237,6 +244,30 @@ impl SqlSchemaInferrer {
                         }
                     }
                 }
+            }
+
+            // Handle UPDATE SET ... WHERE and DELETE ... WHERE
+            match statement {
+                Statement::Update {
+                    selection: Some(selection),
+                    ..
+                } => {
+                    self.collect_parameter_columns_ast(
+                        selection,
+                        &mut placeholder_to_column,
+                        &mut placeholder_index,
+                    );
+                }
+                Statement::Delete(delete) => {
+                    if let Some(selection) = &delete.selection {
+                        self.collect_parameter_columns_ast(
+                            selection,
+                            &mut placeholder_to_column,
+                            &mut placeholder_index,
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -415,11 +446,28 @@ impl SqlSchemaInferrer {
     }
 
     /// Extract response fields from SQL SELECT clause using DataFusion parsing
-    /// against registered tables in the SessionContext
+    /// against registered tables in the SessionContext.
+    /// For DML statements (INSERT/UPDATE/DELETE), returns a `count` field since
+    /// these operations return the number of affected rows, not data rows.
     pub async fn extract_response_fields(
         &self,
         sql: &str,
     ) -> Result<HashMap<String, InferredFieldType>> {
+        // Check if this is a DML statement (INSERT/UPDATE/DELETE)
+        // DML statements return a count of affected rows, not data
+        if self.is_dml_statement(sql) {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "count".to_string(),
+                InferredFieldType {
+                    field_type: DataType::UInt64,
+                    nullable: false,
+                    source_location: "DML statement result (rows affected)".to_string(),
+                },
+            );
+            return Ok(fields);
+        }
+
         // Parse the SQL to get the logical plan using the SessionContext
         let logical_plan = self.parse_sql_to_logical_plan(sql).await?;
 
@@ -507,6 +555,14 @@ impl SqlSchemaInferrer {
             parameter_count,
             response_field_count,
         })
+    }
+
+    /// Check if the SQL statement is a DML statement (INSERT/UPDATE/DELETE)
+    fn is_dml_statement(&self, sql: &str) -> bool {
+        let trimmed = sql.trim().to_uppercase();
+        trimmed.starts_with("INSERT")
+            || trimmed.starts_with("UPDATE")
+            || trimmed.starts_with("DELETE")
     }
 
     /// Check if parameter name follows Rust identifier rules
@@ -1038,5 +1094,80 @@ mod tests {
         assert!(parameter_order.contains(&"brand".to_string()));
         assert!(parameter_order.contains(&"min_price".to_string()));
         assert!(parameter_order.contains(&"limit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dml_response_schema_insert() {
+        let ctx = create_test_context().await;
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        // INSERT statement should return a count field, not try to create a logical plan
+        let sql = "INSERT INTO products (name, price) VALUES ({name}, {price})";
+        let fields = inferrer.extract_response_fields(sql).await.unwrap();
+
+        assert_eq!(fields.len(), 1);
+        assert!(fields.contains_key("count"));
+        assert_eq!(fields["count"].field_type, DataType::UInt64);
+        assert!(!fields["count"].nullable);
+    }
+
+    #[tokio::test]
+    async fn test_dml_response_schema_update() {
+        let ctx = create_test_context().await;
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        let sql = "UPDATE products SET price = {price} WHERE name = {name}";
+        let fields = inferrer.extract_response_fields(sql).await.unwrap();
+
+        assert_eq!(fields.len(), 1);
+        assert!(fields.contains_key("count"));
+        assert_eq!(fields["count"].field_type, DataType::UInt64);
+    }
+
+    #[tokio::test]
+    async fn test_dml_response_schema_delete() {
+        let ctx = create_test_context().await;
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        let sql = "DELETE FROM products WHERE name = {name}";
+        let fields = inferrer.extract_response_fields(sql).await.unwrap();
+
+        assert_eq!(fields.len(), 1);
+        assert!(fields.contains_key("count"));
+        assert_eq!(fields["count"].field_type, DataType::UInt64);
+    }
+
+    #[tokio::test]
+    async fn test_insert_select_parameter_extraction() {
+        let ctx = create_test_context().await;
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        // INSERT INTO ... SELECT with WHERE clause parameter
+        let sql = r#"
+            INSERT INTO products (name, price)
+            SELECT name, price
+            FROM products
+            WHERE brand = {brand}
+        "#;
+
+        let named_params = inferrer.extract_named_parameters(sql).await.unwrap();
+
+        assert_eq!(named_params.len(), 1);
+        assert!(named_params.contains_key("brand"));
+        assert_eq!(named_params["brand"].column_name, "brand");
+        assert_eq!(named_params["brand"].field_type, DataType::Utf8);
+    }
+
+    #[tokio::test]
+    async fn test_dml_is_detected() {
+        let ctx = SessionContext::new();
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        assert!(inferrer.is_dml_statement("INSERT INTO t (a) VALUES (1)"));
+        assert!(inferrer.is_dml_statement("  UPDATE t SET a = 1"));
+        assert!(inferrer.is_dml_statement("DELETE FROM t WHERE id = 1"));
+        assert!(inferrer.is_dml_statement("  insert into t (a) values (1)"));
+        assert!(!inferrer.is_dml_statement("SELECT * FROM t"));
+        assert!(!inferrer.is_dml_statement("  select * from t"));
     }
 }

@@ -1,0 +1,27 @@
+data_sources:
+  - name: "products"
+    type: "redis"
+    access_mode: "read_write"
+    connection_string: "redis://localhost:6379"
+    description: "Redis hash table for products"
+    options:
+      key_space: "mydb"
+      table: "products"
+      key_column: "product_id"
+
+  - name: "product_stats"
+    type: "redis"
+    access_mode: "read_write"
+    connection_string: "redis://localhost:6379"
+    description: "Redis hash table for aggregated product statistics"
+    options:
+      key_space: "mydb"
+      table: "product_stats"
+      key_column: "stat_id"
+      columns: "stat_id, category, total_products, total_value, avg_price"
+
+  # CSV data source (for federated query demo)
+  - name: "csv_inventory"
+    type: "csv"
+    path: "demo/sample_data/product_inventory.csv"
+    description: "CSV file containing product inventory data"

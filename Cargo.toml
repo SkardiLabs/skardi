@@ -10,7 +10,7 @@ license = "Apache-2.0"
 [workspace]
 members = [ "crates/cli",
             "crates/engine",
-            "crates/source",
+            "crates/sources",
             "crates/model",
             "crates/pipeline",
             "crates/server"]
@@ -41,13 +41,16 @@ datafusion = { version = "52.1.0", default-features = false, features = [
 datafusion-common = { version = "52.1.0" }
 datafusion-federation = "0.5.1"
 datafusion-table-providers = { version = "0.10.0", default-features = false, features = ["postgres", "mysql"] }
+tokio-rusqlite = "0.7"
 env_logger = "0.11"
 futures = "0.3"
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "e844d823c3834e3b9cbb98bdd4c0b4638fdc5b80" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "e844d823c3834e3b9cbb98bdd4c0b4638fdc5b80" }
+iceberg = "0.9.0"
+iceberg-datafusion = "0.9.0"
+iceberg-storage-opendal = "0.9.0"
 insta = { version = "1.41.1", features = ["glob", "filters"] }
-lance = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-beta.7", default-features = false }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-beta.7" }
+lance = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1", default-features = false }
+lance-index = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1" }
 log = "0.4.27"
 object_store = { version = "0.12.4", default-features = false, features = ["aws", "gcp", "azure", "http"] }
 parking_lot = "0.12"
@@ -63,7 +66,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 skardi-engine = { path = "crates/engine" }
 sqlparser = "0.55.0"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 tempfile = "3.23.0"
 tokio = { version = "1.44.2", features = ["macros", "rt", "sync"] }
 tower = "0.4"
@@ -76,6 +79,11 @@ uuid = { version = "1.4", features = ["v4", "serde"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.release-cli]
+inherits = "release"
+lto = true
+panic = "abort"
 
 [workspace.lints.clippy]
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)

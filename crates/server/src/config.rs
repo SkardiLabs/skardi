@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::remote_storage::{RemoteStorage, S3Storage};
-pub use source::AccessMode;
+pub use sources::AccessMode;
 
 /// CLI arguments for the Skardi server
 #[derive(Parser, Debug)]
@@ -82,8 +82,10 @@ pub enum DataSourceType {
     Parquet,
     Postgres,
     Mysql,
+    Sqlite,
     Iceberg,
     Mongo,
+    Redis,
     Lance,
 }
 
@@ -132,6 +134,9 @@ pub enum ConfigError {
     #[error("MySQL connection failed: {name} - {error}")]
     MySQLConnectionFailed { name: String, error: String },
 
+    #[error("SQLite connection failed: {name} - {error}")]
+    SQLiteConnectionFailed { name: String, error: String },
+
     #[error("S3 path must start with 's3://' prefix: {path}")]
     InvalidS3Path { path: String },
 
@@ -141,7 +146,7 @@ pub enum ConfigError {
     #[error("S3 object store registration failed: {name} - {error}")]
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
-    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres' and 'mysql' sources support read_write mode.")]
+    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode.")]
     UnsupportedWriteMode {
         name: String,
         source_type: DataSourceType,
@@ -281,6 +286,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         .with_context(|| "Failed to register UDFs")?;
 
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
     let ctx = Arc::new(session_ctx);
@@ -389,6 +395,7 @@ async fn load_pipeline_config(path: &Path, ctx: Arc<SessionContext>) -> Result<S
 ///   onnx_predict('path/to/model.onnx', input1, input2, ...)
 ///
 /// No pre-configuration needed — ORT runtime and models are initialized on first call.
+#[cfg(feature = "onnx")]
 pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(model::OnnxModelRegistry::new());
     registry.register_onnx_predict_udf(ctx);
@@ -429,7 +436,9 @@ fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
 const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Postgres,
     DataSourceType::Mysql,
+    DataSourceType::Sqlite,
     DataSourceType::Mongo,
+    DataSourceType::Redis,
 ];
 
 /// Validate data source configurations
@@ -468,7 +477,13 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 // Validate S3 configuration for S3 paths
                 s3_storage.validate_configuration(source)?;
             }
-            (DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo, false) => {
+            (
+                DataSourceType::Postgres
+                | DataSourceType::Mysql
+                | DataSourceType::Mongo
+                | DataSourceType::Redis,
+                false,
+            ) => {
                 // For database connections, ensure connection string is provided
                 if source.connection_string.is_none() {
                     return Err(ConfigError::MissingConnectionString {
@@ -525,15 +540,15 @@ fn validate_pipeline_sql(
     sql: &str,
     data_sources: &[DataSource],
 ) -> Result<()> {
-    use source::sql_validator::{validate_sql, SqlValidatorConfig};
+    use sources::sql_validator::{validate_sql, SqlValidatorConfig};
 
     // Build validator config from data sources
     let mut validator_config = SqlValidatorConfig::new();
     for ds in data_sources {
         let mode = if ds.access_mode.is_read_write() {
-            source::sql_validator::AccessMode::ReadWrite
+            sources::sql_validator::AccessMode::ReadWrite
         } else {
-            source::sql_validator::AccessMode::ReadOnly
+            sources::sql_validator::AccessMode::ReadOnly
         };
         validator_config = validator_config.with_table(&ds.name, mode);
     }
@@ -608,7 +623,13 @@ async fn register_data_source(
 
     // Validate data source configuration based on path type
     match (&source.source_type, s3_storage.is_remote_path(&source.path)) {
-        (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, false) => {
+        (
+            DataSourceType::Csv
+            | DataSourceType::Parquet
+            | DataSourceType::Lance
+            | DataSourceType::Sqlite,
+            false,
+        ) => {
             // For local files, verify the file exists
             if !source.path.exists() {
                 return Err(ConfigError::DataSourceFileNotFound {
@@ -626,11 +647,20 @@ async fn register_data_source(
                 .setup_object_store(session_ctx, &source.name, s3_path)
                 .await?;
         }
-        (DataSourceType::Postgres | DataSourceType::Mysql | DataSourceType::Mongo, _) => {
+        (
+            DataSourceType::Postgres
+            | DataSourceType::Mysql
+            | DataSourceType::Mongo
+            | DataSourceType::Redis,
+            _,
+        ) => {
             // Database sources don't need file path validation
         }
         (DataSourceType::Iceberg, _) => {
             // Validation happened during data source registration
+        }
+        _ => {
+            // Other combinations are valid without additional checks
         }
     }
 
@@ -714,7 +744,7 @@ async fn register_data_source(
             );
 
             // Register PostgreSQL table using the sqlx-based provider
-            source::providers::sqlx::postgres::register_postgres_tables(
+            sources::providers::sqlx::postgres::register_postgres_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -754,7 +784,7 @@ async fn register_data_source(
                 source.options
             );
 
-            source::providers::mysql::register_mysql_tables(
+            sources::providers::mysql::register_mysql_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -765,6 +795,39 @@ async fn register_data_source(
             .map_err(|e| {
                 tracing::error!("MySQL registration failed for '{}': {:?}", source.name, e);
                 ConfigError::MySQLConnectionFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Sqlite => {
+            tracing::info!(
+                "Registering SQLite table: {} from {:?} (access_mode: {:?})",
+                source.name,
+                source.path,
+                source.access_mode
+            );
+
+            let db_path =
+                source
+                    .path
+                    .to_str()
+                    .ok_or_else(|| ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: "Invalid SQLite database path".to_string(),
+                    })?;
+
+            sources::providers::sqlite::register_sqlite_tables(
+                session_ctx,
+                &source.name,
+                db_path,
+                source.options.as_ref(),
+                source.access_mode.is_read_write(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("SQLite registration failed for '{}': {:?}", source.name, e);
+                ConfigError::SQLiteConnectionFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
                 }
@@ -786,7 +849,7 @@ async fn register_data_source(
                         error: "Invalid warehouse path".to_string(),
                     })?;
 
-            source::providers::iceberg::register_iceberg_table(
+            sources::providers::iceberg::register_iceberg_table(
                 session_ctx,
                 &source.name,
                 warehouse_path,
@@ -817,7 +880,7 @@ async fn register_data_source(
                 source.options
             );
 
-            source::providers::mongo::register_mongo_tables(
+            sources::providers::mongo::register_mongo_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -826,6 +889,36 @@ async fn register_data_source(
             .await
             .map_err(|e| {
                 tracing::error!("MongoDB registration failed for '{}': {:?}", source.name, e);
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Redis => {
+            tracing::info!("Registering Redis table: {}", source.name);
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            tracing::debug!(
+                "Connection string for {}: {} (options: {:?})",
+                source.name,
+                connection_string,
+                source.options
+            );
+
+            sources::providers::redis::datasource::register_redis_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+            )
+            .map_err(|e| {
+                tracing::error!("Redis registration failed for '{}': {:?}", source.name, e);
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
@@ -843,7 +936,7 @@ async fn register_data_source(
             let dataset_registry = optimizer_registry.map(|reg| reg.lance_datasets());
 
             // Register Lance dataset using the providers module
-            source::providers::lance::register_lance_table(
+            sources::providers::lance::register_lance_table(
                 session_ctx,
                 &source.name,
                 source.path.to_str().unwrap(),

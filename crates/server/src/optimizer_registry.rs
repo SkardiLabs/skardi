@@ -11,6 +11,7 @@
 use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
+use sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -90,14 +91,18 @@ impl OptimizerRegistry {
 
     /// Register Lance-specific table functions
     ///
-    /// Registers the lance_knn table function for explicit KNN search
+    /// Registers the lance_knn and lance_fts table functions
     fn register_lance_functions(&self, ctx: &mut SessionContext) -> Result<()> {
         tracing::info!("Registering Lance table functions");
 
         // Register lance_knn table function
-        source::lance::knn_table_function::register_lance_knn_udtf(ctx, self.lance_datasets());
-
+        register_lance_knn_udtf(ctx, self.lance_datasets());
         tracing::info!("✓ Registered lance_knn table function");
+
+        // Register lance_fts table function
+        register_lance_fts_udtf(ctx, self.lance_datasets());
+        tracing::info!("✓ Registered lance_fts table function");
+
         Ok(())
     }
 

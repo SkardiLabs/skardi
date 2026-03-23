@@ -3,3 +3,4 @@
 ./*/.DS_Store
 .cursor/
 .claude/
+.venv/

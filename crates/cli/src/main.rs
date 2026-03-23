@@ -16,10 +16,12 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::Deserialize;
-use source::lance::knn_table_function::register_lance_knn_udtf;
-use source::providers::{
+use sources::providers::lance::fts_table_function::register_lance_fts_udtf;
+use sources::providers::lance::knn_table_function::register_lance_knn_udtf;
+use sources::providers::{
     iceberg::register_iceberg_table, lance::register_lance_table, mongo::register_mongo_tables,
-    mysql::register_mysql_tables, sqlx::postgres::register_postgres_tables,
+    mysql::register_mysql_tables, sqlite::register_sqlite_tables,
+    sqlx::postgres::register_postgres_tables,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -244,6 +246,25 @@ impl UrlTableFactory for SkardiUrlTableFactory {
         &self,
         url: &str,
     ) -> datafusion::error::Result<Option<Arc<dyn TableProvider>>> {
+        // Handle SQLite databases: detect patterns like "path/to/file.db.table_name"
+        let sqlite_extensions = [".db.", ".sqlite.", ".sqlite3."];
+        if let Some(ext) = sqlite_extensions.iter().find(|ext| url.contains(*ext)) {
+            let pos = url.find(ext).unwrap();
+            let db_path = &url[..pos + ext.len() - 1]; // include .db but not trailing dot
+            let table_name = &url[pos + ext.len()..];
+
+            if !table_name.is_empty() {
+                let provider =
+                    sources::providers::sqlite::create_sqlite_table_provider(db_path, table_name)
+                        .await
+                        .map_err(|e| {
+                            datafusion::error::DataFusionError::Execution(e.to_string())
+                        })?;
+
+                return Ok(Some(provider));
+            }
+        }
+
         // Handle Lance datasets by path suffix
         if url.ends_with(".lance") || url.contains(".lance/") {
             let dataset = Dataset::open(url)
@@ -297,8 +318,9 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register the lance_knn table function
+    // Register the lance_knn and lance_fts table functions
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
 
     (ctx, dataset_registry)
 }
@@ -529,6 +551,23 @@ async fn register_source(
             register_lance_table(session_ctx, &source.name, &resolved, Some(dataset_registry))
                 .await
                 .with_context(|| format!("Failed to register Lance '{}'", source.name))?;
+        }
+        "sqlite" => {
+            let path_str = source
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("SQLite source '{}': path required", source.name))?;
+            let resolved = resolve_path(path_str)?;
+
+            register_sqlite_tables(
+                session_ctx,
+                &source.name,
+                &resolved,
+                source.options.as_ref(),
+                false,
+            )
+            .await
+            .with_context(|| format!("Failed to register SQLite '{}'", source.name))?;
         }
         "iceberg" => {
             let path_str = source.path.as_deref().ok_or_else(|| {

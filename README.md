@@ -21,19 +21,20 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
 - **`skardi-cli`** — Run SQL queries locally against files, object stores, databases, and datalake formats. Ideal for local agents like [OpenClaw](https://github.com/openclaw/openclaw) that need structured data access without a running server.
 - **`skardi-server`** — Define SQL queries in YAML and serve them as parameterized HTTP APIs. Connect to multiple data sources, run federated queries, and expose results as REST endpoints.
 
-> **Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups. Feel free to contact us if you want to have a POC for the product.
+> **⚠️Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups. Feel free to contact us if you want to have a POC for the product.
 
 ## Key Features
 
 - **CLI for local agents & queries** — Run SQL against local files, remote object stores (S3, GCS, Azure), databases, and datalake formats — ideal for local AI agents like [OpenClaw](https://github.com/openclaw/openclaw)
 - **Declarative pipelines** — Define SQL queries in YAML, get REST APIs automatically
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
-- **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, MongoDB, Iceberg, and Lance in a single query
+- **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
 - **Vector search** — Native KNN similarity search via Lance integration
+- **Full-text search** — BM25-scored full-text search via Lance inverted indexes
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime
-- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF
+- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF (requires `--features onnx`)
 
 ## Table of Contents
 
@@ -52,9 +53,11 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
   - [Parquet](#parquet)
   - [PostgreSQL](#postgresql)
   - [MySQL](#mysql)
+  - [SQLite](#sqlite)
   - [MongoDB](#mongodb)
+  - [Redis](#redis)
   - [Apache Iceberg](#apache-iceberg)
-  - [Lance (Vector Search)](#lance-vector-search)
+  - [Lance (Vector Search & Full-Text Search)](#lance-vector-search--full-text-search)
   - [S3 Remote Files](#s3-remote-files)
 - [ONNX Model Inference](#onnx-model-inference)
 - [Federated Queries](#federated-queries)
@@ -132,7 +135,7 @@ skardi query --ctx ./ctx.yaml --schema -t products
 | Local files | CSV, Parquet, JSON/NDJSON, Lance |
 | Remote stores | S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS |
 | Datalake formats | Lance, Iceberg |
-| Databases | PostgreSQL, MySQL, MongoDB |
+| Databases | PostgreSQL, MySQL, SQLite, MongoDB, Redis |
 
 **Context file resolution** (when `--ctx` is omitted): checks `SKARDICONFIG` env var, then `~/.skardi/config/ctx.yaml`. If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
 
@@ -205,7 +208,7 @@ data_sources:
 
 ### Access Mode
 
-By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres` and `mysql` sources support `read_write` mode; setting it on other types will produce an error at startup.
+By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres`, `mysql`, `sqlite`, `mongo`, and `redis` sources support `read_write` mode; setting it on other types will produce an error at startup.
 
 ```yaml
 data_sources:
@@ -343,7 +346,7 @@ export PG_USER="myuser"
 export PG_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/postgres/POSTGRES_DEMO.md](demo/postgres/POSTGRES_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/postgres/README.md](demo/postgres/README.md).
 
 ### MySQL
 
@@ -364,7 +367,29 @@ export MYSQL_USER="myuser"
 export MYSQL_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mysql/MYSQL_DEMO.md](demo/mysql/MYSQL_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/mysql/README.md](demo/mysql/README.md).
+
+### SQLite
+
+Full CRUD support (SELECT, INSERT, UPDATE, DELETE) with no external server required — just a local `.db` file.
+
+```yaml
+- name: "users"
+  type: "sqlite"
+  path: "data/my_database.db"
+  options:
+    table: "users"
+    busy_timeout_ms: "5000"     # Optional, default: 5000
+```
+
+SQLite requires no credentials — just the path to the database file.
+
+**CLI direct path query** (no context file needed):
+```bash
+skardi query --sql "SELECT * FROM './data/my_database.db.users'"
+```
+
+For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/README.md](demo/sqlite/README.md).
 
 ### MongoDB
 
@@ -387,7 +412,25 @@ export MONGO_USER="myuser"
 export MONGO_PASS="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mongo/MONGO_DEMO.md](demo/mongo/MONGO_DEMO.md).
+For detailed setup, CRUD examples, and federated queries, see [demo/mongo/README.md](demo/mongo/README.md).
+
+### Redis
+
+Full CRUD support with point lookups (O(1) via direct key construction), full scans, and federated queries. Redis hashes map directly to SQL rows.
+
+```yaml
+- name: "products"
+  type: "redis"
+  connection_string: "redis://localhost:6379"
+  options:
+    key_space: "mydb"
+    table: "products"
+    key_column: "product_id"
+```
+
+Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column. For initially empty tables, use the `columns` option to declare the schema upfront so INSERT operations work immediately.
+
+For detailed setup, CRUD examples, and federated queries, see [demo/redis/README.md](demo/redis/README.md).
 
 ### Apache Iceberg
 
@@ -416,11 +459,11 @@ For S3-backed Iceberg tables:
     aws_secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
 ```
 
-For detailed setup and examples, see [demo/iceberg/ICEBERG_DEMO.md](demo/iceberg/ICEBERG_DEMO.md).
+For detailed setup and examples, see [demo/iceberg/README.md](demo/iceberg/README.md).
 
-### Lance (Vector Search)
+### Lance (Vector Search & Full-Text Search)
 
-Native KNN (K-Nearest Neighbors) similarity search using the `lance_knn` table function.
+Native KNN (K-Nearest Neighbors) similarity search using the `lance_knn` table function, and BM25-scored full-text search using the `lance_fts` table function.
 
 ```yaml
 - name: "sift_items"
@@ -429,7 +472,7 @@ Native KNN (K-Nearest Neighbors) similarity search using the `lance_knn` table f
   description: "Vector embeddings"
 ```
 
-Query with the `lance_knn` table function:
+#### Vector Search (lance_knn)
 
 ```sql
 SELECT knn.id, knn.item_id, knn._distance
@@ -448,7 +491,22 @@ WHERE knn.id != {ref_id}
 | 100K vectors | ~500ms             | ~8ms           | 62x     |
 | 1M vectors   | ~5000ms            | ~15ms          | 333x    |
 
-For full details on vector search, see [demo/lance/LANCE_DEMO.md](demo/lance/LANCE_DEMO.md).
+#### Full-Text Search (lance_fts)
+
+```sql
+-- Basic term search (BM25 scored)
+SELECT id, description, _score
+FROM lance_fts('my_table', 'description', 'search terms', 10)
+
+-- Phrase search
+SELECT * FROM lance_fts('my_table', 'description', '"exact phrase"', 10)
+
+-- With WHERE clause filter pushdown
+SELECT * FROM lance_fts('my_table', 'description', 'search terms', 10)
+WHERE category = 'food' AND price < 20
+```
+
+Requires a Lance INVERTED index on the text column. See [demo/lance/README.md](demo/lance/README.md) for full details on vector search and full-text search.
 
 ### S3 Remote Files
 
@@ -474,7 +532,12 @@ For full S3 configuration, IAM permissions, and troubleshooting, see [demo/S3_US
 
 ## ONNX Model Inference
 
-Run ONNX model predictions directly in SQL using the built-in `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
+> **Note:** ONNX support is behind a feature flag. Build with `--features onnx` to enable it:
+> ```bash
+> cargo build --release -p skardi-server --features onnx
+> ```
+
+Run ONNX model predictions directly in SQL using the `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
 
 ```sql
 onnx_predict('path/to/model.onnx', input1, input2, ...) -> FLOAT
@@ -500,7 +563,7 @@ LIMIT 10
 
 Pre-built models are available in the `models/` directory (`ncf.onnx`, `TinyTimeMixer.onnx`).
 
-For the full guide including the movie recommendation demo, see [demo/onnx_predict/ONNX_PREDICT_DEMO.md](demo/onnx_predict/ONNX_PREDICT_DEMO.md).
+For the full guide including the movie recommendation demo, see [demo/onnx_predict/README.md](demo/onnx_predict/README.md).
 
 ## Federated Queries
 
@@ -533,6 +596,9 @@ query: |
 
 ```bash
 docker build -t skardi .
+
+# With ONNX support
+docker build -t skardi --build-arg FEATURES=onnx .
 ```
 
 ### Run with config files mounted
@@ -576,6 +642,9 @@ cargo install --path crates/cli
 
 # Build server
 cargo build --release -p skardi-server
+
+# Build server with ONNX model inference support
+cargo build --release -p skardi-server --features onnx
 ```
 
 ## Demo & Examples
@@ -587,9 +656,11 @@ The [demo/](demo/) directory contains complete working examples:
 | [demo/README.md](demo/README.md) | Product search demo (CSV/Parquet) |
 | [demo/postgres/](demo/postgres/) | PostgreSQL CRUD and federated query examples |
 | [demo/mysql/](demo/mysql/) | MySQL CRUD and federated query examples |
+| [demo/sqlite/](demo/sqlite/) | SQLite CRUD and federated query examples |
 | [demo/mongo/](demo/mongo/) | MongoDB CRUD and federated query examples |
+| [demo/redis/](demo/redis/) | Redis CRUD and federated query examples |
 | [demo/iceberg/](demo/iceberg/) | Apache Iceberg integration examples |
-| [demo/lance/](demo/lance/) | Lance vector search examples |
+| [demo/lance/](demo/lance/) | Lance vector search and full-text search examples |
 | [demo/onnx_predict/](demo/onnx_predict/) | ONNX model inference in SQL |
 | [demo/S3_USAGE.md](demo/S3_USAGE.md) | S3 data source configuration guide |
 
