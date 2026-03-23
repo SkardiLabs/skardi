@@ -1,0 +1,73 @@
+metadata:
+  name: lance-full-text-search
+  version: 1.0.0
+  description: Demonstrates Lance full-text search with lance_fts table function
+  author: Skardi Demo
+  created_at: 2026-03-23T00:00:00.000+00:00
+  updated_at: 2026-03-23T00:00:00.000+00:00
+
+# This pipeline demonstrates full-text search using the lance_fts table function.
+# The query finds documents matching a search query, scored by BM25 relevance.
+#
+# Query Pattern:
+#   lance_fts(table_name, text_column, query, limit)
+#   - table_name: Name of the Lance table with an INVERTED index
+#   - text_column: Name of the text column to search
+#   - query: Search query string
+#   - limit: Maximum number of results
+#
+# WHERE clause filters are pushed down to Lance for efficient metadata filtering.
+#
+# Parameters:
+#   {search_query}: Text to search for in descriptions
+#   {category}: Optional category filter (null = no filter)
+#   {limit}: Maximum number of results to return
+
+query: |
+  SELECT
+    fts.id,
+    fts.item_id,
+    fts.revenue,
+    fts.description,
+    fts.category,
+    fts._score as relevance
+  FROM lance_fts(
+    'fts_data',
+    'description',
+    {search_query},
+    {limit}
+  ) fts
+  WHERE ({category} IS NULL OR fts.category = {category})
+
+# Example API Calls:
+#
+# Basic search:
+# POST /lance-full-text-search/execute
+# {
+#   "search_query": "premium wireless",
+#   "category": null,
+#   "limit": 10
+# }
+#
+# Search with category filter:
+# POST /lance-full-text-search/execute
+# {
+#   "search_query": "umbrella",
+#   "category": "outdoor",
+#   "limit": 5
+# }
+#
+# Phrase search:
+# POST /lance-full-text-search/execute
+# {
+#   "search_query": "\"train to boston\"",
+#   "category": null,
+#   "limit": 10
+# }
+#
+# Query Syntax:
+#   "foo bar"           -> OR search (any term matches)
+#   "+foo bar"          -> AND search (all terms must match)
+#   "\"foo bar\""       -> Phrase search (exact phrase match)
+#   "foo~"              -> Fuzzy search (typo-tolerant)
+#   "+foo -bar"         -> Boolean search (MUST/MUST_NOT)

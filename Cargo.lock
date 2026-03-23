@@ -6627,6 +6627,7 @@ dependencies = [
  "iceberg-datafusion",
  "iceberg-storage-opendal",
  "lance",
+ "lance-index",
  "mongodb",
  "mysql_async",
  "percent-encoding",

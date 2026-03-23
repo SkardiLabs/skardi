@@ -31,6 +31,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
 - **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
 - **Vector search** — Native KNN similarity search via Lance integration
+- **Full-text search** — BM25-scored full-text search via Lance inverted indexes
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime
 - **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF (requires `--features onnx`)
@@ -56,7 +57,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
   - [MongoDB](#mongodb)
   - [Redis](#redis)
   - [Apache Iceberg](#apache-iceberg)
-  - [Lance (Vector Search)](#lance-vector-search)
+  - [Lance (Vector Search & Full-Text Search)](#lance-vector-search--full-text-search)
   - [S3 Remote Files](#s3-remote-files)
 - [ONNX Model Inference](#onnx-model-inference)
 - [Federated Queries](#federated-queries)
@@ -460,9 +461,9 @@ For S3-backed Iceberg tables:
 
 For detailed setup and examples, see [demo/iceberg/README.md](demo/iceberg/README.md).
 
-### Lance (Vector Search)
+### Lance (Vector Search & Full-Text Search)
 
-Native KNN (K-Nearest Neighbors) similarity search using the `lance_knn` table function.
+Native KNN (K-Nearest Neighbors) similarity search using the `lance_knn` table function, and BM25-scored full-text search using the `lance_fts` table function.
 
 ```yaml
 - name: "sift_items"
@@ -471,7 +472,7 @@ Native KNN (K-Nearest Neighbors) similarity search using the `lance_knn` table f
   description: "Vector embeddings"
 ```
 
-Query with the `lance_knn` table function:
+#### Vector Search (lance_knn)
 
 ```sql
 SELECT knn.id, knn.item_id, knn._distance
@@ -490,7 +491,22 @@ WHERE knn.id != {ref_id}
 | 100K vectors | ~500ms             | ~8ms           | 62x     |
 | 1M vectors   | ~5000ms            | ~15ms          | 333x    |
 
-For full details on vector search, see [demo/lance/README.md](demo/lance/README.md).
+#### Full-Text Search (lance_fts)
+
+```sql
+-- Basic term search (BM25 scored)
+SELECT id, description, _score
+FROM lance_fts('my_table', 'description', 'search terms', 10)
+
+-- Phrase search
+SELECT * FROM lance_fts('my_table', 'description', '"exact phrase"', 10)
+
+-- With WHERE clause filter pushdown
+SELECT * FROM lance_fts('my_table', 'description', 'search terms', 10)
+WHERE category = 'food' AND price < 20
+```
+
+Requires a Lance INVERTED index on the text column. See [demo/lance/README.md](demo/lance/README.md) for full details on vector search and full-text search.
 
 ### S3 Remote Files
 
@@ -644,7 +660,7 @@ The [demo/](demo/) directory contains complete working examples:
 | [demo/mongo/](demo/mongo/) | MongoDB CRUD and federated query examples |
 | [demo/redis/](demo/redis/) | Redis CRUD and federated query examples |
 | [demo/iceberg/](demo/iceberg/) | Apache Iceberg integration examples |
-| [demo/lance/](demo/lance/) | Lance vector search examples |
+| [demo/lance/](demo/lance/) | Lance vector search and full-text search examples |
 | [demo/onnx_predict/](demo/onnx_predict/) | ONNX model inference in SQL |
 | [demo/S3_USAGE.md](demo/S3_USAGE.md) | S3 data source configuration guide |
 
