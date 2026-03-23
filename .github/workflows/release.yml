@@ -143,11 +143,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
+      - name: Extract version and repo
         id: version
-        run: echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+        run: |
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
         env:
           VERSION: ${{ inputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -158,8 +161,8 @@ jobs:
           build-args: |
             FEATURES=${{ matrix.features }}
           tags: |
-            ghcr.io/${{ github.repository }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}/skardi-server${{ matrix.suffix }}:latest
+            ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
