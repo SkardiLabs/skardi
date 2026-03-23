@@ -48,8 +48,6 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
 
@@ -84,7 +82,7 @@ jobs:
           EOF
 
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev:arm64
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev:arm64 libsqlite3-dev:arm64
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
@@ -130,9 +128,9 @@ jobs:
             skardi-${{ matrix.target }}.tar.gz.sha256
 
   docker:
-    name: "Build & Push Docker Image (${{ matrix.variant }}, ${{ inputs.version }})"
+    name: "Docker ${{ matrix.variant }} (${{ matrix.platform }}, ${{ inputs.version }})"
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -140,12 +138,28 @@ jobs:
           - variant: default
             features: ""
             suffix: ""
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - variant: default
+            features: ""
+            suffix: ""
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - variant: onnx
             features: "onnx"
             suffix: "-onnx"
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - variant: onnx
+            features: "onnx"
+            suffix: "-onnx"
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
 
       - name: Free up disk space
         run: |
@@ -153,9 +167,6 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -172,27 +183,74 @@ jobs:
         run: |
           echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
           echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+          PLATFORM="${{ matrix.platform }}"
+          echo "arch=${PLATFORM#*/}" >> $GITHUB_OUTPUT
         env:
           VERSION: ${{ inputs.version }}
           GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: ${{ !inputs.dry_run }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           build-args: |
             FEATURES=${{ matrix.features }}
           tags: |
-            ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}-${{ steps.version.outputs.arch }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ steps.version.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ steps.version.outputs.arch }}
+
+  docker-manifest:
+    name: "Docker Manifest ${{ matrix.variant }} (${{ inputs.version }})"
+    needs: docker
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            suffix: ""
+          - variant: onnx
+            suffix: "-onnx"
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version and repo
+        id: version
+        run: |
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          IMAGE="ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          docker manifest create "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          docker manifest push "${IMAGE}:${VERSION}"
+
+          docker manifest create "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          docker manifest push "${IMAGE}:latest"
 
   release:
     name: "Create Release (${{ inputs.version }})"
-    needs: [build, docker]
+    needs: [build, docker-manifest]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
