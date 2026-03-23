@@ -16,6 +16,7 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::Deserialize;
+use sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use sources::providers::lance::knn_table_function::register_lance_knn_udtf;
 use sources::providers::{
     iceberg::register_iceberg_table, lance::register_lance_table, mongo::register_mongo_tables,
@@ -317,8 +318,9 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register the lance_knn table function
+    // Register the lance_knn and lance_fts table functions
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
 
     (ctx, dataset_registry)
 }

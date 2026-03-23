@@ -256,6 +256,79 @@ SELECT * FROM lance_knn('embeddings', 'vector', [0.1, 0.2, ...], 10,
     'category = ''electronics''')
 ```
 
+#### Full-text search with `lance_fts`
+
+The `lance_fts` table function is built-in and lets you run full-text search (BM25) against Lance datasets with a full-text index.
+
+Like `lance_knn`, the Lance dataset must be registered first — either via a context file or by querying it by path (which auto-registers it under the file stem as the table name).
+
+```sql
+-- Syntax: lance_fts(table_name, text_column, search_query, limit)
+```
+
+Arguments:
+1. `table_name` (string) — Name of the registered Lance table
+2. `text_column` (string) — Column containing the text to search
+3. `search_query` (string) — The search query (see query syntax below)
+4. `limit` (integer) — Maximum number of results to return
+
+The result includes all columns from the table plus a `_score` column with BM25 relevance scores.
+
+**Query syntax:**
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| Term search | `'umbrella train'` | OR logic across terms, ranked by BM25 |
+| Phrase search | `'"train to boston"'` | Exact phrase match |
+| Fuzzy search | `'rammen~1'` | Typo-tolerant (edit distance 1–2) |
+| Boolean search | `'+umbrella -train'` | `+` = must include, `-` = must exclude |
+
+**Using with a context file:**
+
+```yaml
+# ctx.yaml
+data_sources:
+  - name: products
+    type: lance
+    path: data/products.lance
+```
+
+```bash
+skardi query --ctx ./ctx.yaml --sql "
+  SELECT id, description, _score
+  FROM lance_fts('products', 'description', 'wireless headphones', 10)
+"
+```
+
+**Using with direct path (no context file):**
+
+```bash
+# The path './products.lance' auto-registers as table name 'products'
+skardi query --sql "
+  SELECT * FROM lance_fts('products', 'description', 'wireless headphones', 10)
+"
+```
+
+**More examples:**
+
+```sql
+-- Term search
+SELECT * FROM lance_fts('products', 'description', 'umbrella', 10)
+
+-- Phrase search
+SELECT * FROM lance_fts('products', 'description', '"noise cancelling"', 10)
+
+-- Fuzzy search
+SELECT * FROM lance_fts('products', 'description', 'headphnes~1', 10)
+
+-- Boolean search
+SELECT * FROM lance_fts('products', 'description', '+wireless -bluetooth', 10)
+
+-- With WHERE filter
+SELECT * FROM lance_fts('products', 'description', 'premium', 50)
+WHERE category = 'electronics' AND price < 20
+```
+
 ## Examples
 
 ```bash
