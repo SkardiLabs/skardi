@@ -13,6 +13,7 @@ pub mod fts_table_function;
 pub mod knn_exec;
 pub mod knn_table_function;
 pub mod registration;
+pub mod utils;
 
 pub use fts_exec::LanceFtsExec;
 pub use fts_table_function::{LanceFtsTableFunction, register_lance_fts_udtf};
