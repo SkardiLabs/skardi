@@ -1,0 +1,57 @@
+name: Promote Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "RC tag to promote (e.g. v0.2.0-rc.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  promote-release:
+    name: Promote RC to Official Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate and extract version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RC_TAG="${{ inputs.rc_tag }}"
+
+          if [[ ! "$RC_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            echo "Error: Tag must be in format v0.0.0-rc.N"
+            exit 1
+          fi
+
+          # Verify the rc release exists
+          if ! gh release view "$RC_TAG" &>/dev/null; then
+            echo "Error: Release $RC_TAG not found"
+            exit 1
+          fi
+
+          # Strip the -rc.N suffix
+          OFFICIAL="${RC_TAG%-rc.*}"
+          echo "official=$OFFICIAL" >> $GITHUB_OUTPUT
+          echo "Promoting $RC_TAG -> $OFFICIAL"
+
+      - name: Create official release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OFFICIAL="${{ steps.version.outputs.official }}"
+          gh release create "$OFFICIAL" \
+            --target main \
+            --title "$OFFICIAL" \
+            --generate-notes \
+            --latest

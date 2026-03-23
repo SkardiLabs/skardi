@@ -1,0 +1,72 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  draft-release:
+    name: Create Draft Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Calculate next version and rc number
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find the latest official (non-rc) release
+          LATEST=$(gh release list --json tagName,isPrerelease --jq '[.[] | select(.isPrerelease == false)] | .[0].tagName // empty' 2>/dev/null || true)
+
+          if [ -z "$LATEST" ]; then
+            MAJOR=0; MINOR=0; PATCH=0
+          else
+            VERSION="${LATEST#v}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+          fi
+
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEXT="${MAJOR}.${MINOR}.${PATCH}"
+
+          # Count existing rc tags for this version to determine next rc number
+          RC_COUNT=$(gh release list --json tagName --jq "[.[] | select(.tagName | startswith(\"v${NEXT}-rc.\"))] | length" 2>/dev/null || echo "0")
+          RC_NUM=$((RC_COUNT + 1))
+
+          echo "next=$NEXT" >> $GITHUB_OUTPUT
+          echo "rc=$RC_NUM" >> $GITHUB_OUTPUT
+          echo "Next version: v${NEXT}-rc.${RC_NUM}"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="v${{ steps.version.outputs.next }}-rc.${{ steps.version.outputs.rc }}"
+          gh release create "$VERSION" \
+            --draft \
+            --prerelease \
+            --target main \
+            --title "$VERSION" \
+            --generate-notes
