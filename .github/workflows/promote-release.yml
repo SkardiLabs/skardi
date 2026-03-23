@@ -2,11 +2,6 @@ name: Promote Release
 
 on:
   workflow_dispatch:
-    inputs:
-      rc_tag:
-        description: "RC tag to promote (e.g. v0.2.0-rc.1)"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -22,28 +17,29 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Validate and extract version
+      - name: Find latest rc release
         id: version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RC_TAG="${{ inputs.rc_tag }}"
+          RC_TAG=$(gh release list --json tagName,isPrerelease \
+            --jq '[.[] | select(.isPrerelease == true) | .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+$"))] | .[0] // empty')
 
-          if [[ ! "$RC_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
-            echo "Error: Tag must be in format v0.0.0-rc.N"
+          if [ -z "$RC_TAG" ]; then
+            echo "Error: No rc releases found"
             exit 1
           fi
 
-          # Verify the rc release exists
-          if ! gh release view "$RC_TAG" &>/dev/null; then
-            echo "Error: Release $RC_TAG not found"
-            exit 1
-          fi
-
-          # Strip the -rc.N suffix
           OFFICIAL="${RC_TAG%-rc.*}"
+          echo "rc_tag=$RC_TAG" >> $GITHUB_OUTPUT
           echo "official=$OFFICIAL" >> $GITHUB_OUTPUT
           echo "Promoting $RC_TAG -> $OFFICIAL"
+
+      - name: Create and push tag
+        run: |
+          OFFICIAL="${{ steps.version.outputs.official }}"
+          git tag "$OFFICIAL"
+          git push origin "$OFFICIAL"
 
       - name: Create official release
         env:
@@ -51,7 +47,6 @@ jobs:
         run: |
           OFFICIAL="${{ steps.version.outputs.official }}"
           gh release create "$OFFICIAL" \
-            --target main \
             --title "$OFFICIAL" \
             --generate-notes \
             --latest
