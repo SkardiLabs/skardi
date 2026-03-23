@@ -1,4 +1,5 @@
 name: Promote Release
+run-name: "Promote ${{ inputs.rc_tag }}"
 
 on:
   workflow_dispatch:
