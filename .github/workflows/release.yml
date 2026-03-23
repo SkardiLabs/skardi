@@ -1,5 +1,5 @@
 name: Release
-run-name: "Release ${{ inputs.version }}"
+run-name: "Release ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}"
 
 on:
   workflow_dispatch:
@@ -8,6 +8,11 @@ on:
         description: "Version to release (e.g. v0.1.0)"
         required: true
         type: string
+      dry_run:
+        description: "Dry run (skip push/publish)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -64,9 +69,20 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+
+          # Pin all existing sources to amd64 only
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list 2>/dev/null || true
+          sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+          # Add arm64 sources (only ports.ubuntu.com carries arm64)
+          CODENAME=$(lsb_release -cs)
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/arm64.list
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME} main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-backports main restricted universe multiverse
+          EOF
+
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev:arm64
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
@@ -105,6 +121,7 @@ jobs:
           shasum -a 256 skardi-${{ matrix.target }}.tar.gz > skardi-${{ matrix.target }}.tar.gz.sha256
 
       - name: Upload artifact
+        if: ${{ !inputs.dry_run }}
         uses: actions/upload-artifact@v4
         with:
           name: skardi-${{ matrix.target }}
@@ -163,7 +180,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: ${{ !inputs.dry_run }}
           platforms: linux/amd64,linux/arm64
           build-args: |
             FEATURES=${{ matrix.features }}
@@ -182,15 +199,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download all artifacts
+        if: ${{ !inputs.dry_run }}
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.version }}
           generate_release_notes: true
           files: |
             artifacts/*
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        run: echo "Dry run complete. All build steps passed for ${{ inputs.version }}. No artifacts were pushed or published."
