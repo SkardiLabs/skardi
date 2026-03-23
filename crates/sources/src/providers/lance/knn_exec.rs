@@ -5,9 +5,10 @@
 
 use anyhow::Result;
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -42,10 +43,16 @@ pub struct LanceKnnExec {
     query_vector_column: Option<String>,
     /// Number of nearest neighbors to return (k)
     k: usize,
-    /// Schema of the output
+    /// Full schema (all dataset fields excluding vector column + _distance)
+    full_schema: SchemaRef,
+    /// Output schema (projected subset, or full if no projection)
     schema: SchemaRef,
+    /// Optional column projection indices (into full_schema)
+    projection: Option<Vec<usize>>,
     /// Optional filter predicate applied before KNN search
     filter: Option<String>,
+    /// Optional row limit applied after KNN + filter (from SQL LIMIT clause)
+    scan_limit: Option<usize>,
     /// Plan properties
     plan_properties: PlanProperties,
 }
@@ -64,22 +71,22 @@ impl LanceKnnExec {
         // Build schema: dataset fields (excluding vector column) + _distance
         // This matches the actual output from Lance's nearest() API
         let lance_schema = dataset.schema();
-        let mut fields: Vec<arrow::datatypes::Field> = lance_schema
+        let mut fields: Vec<Field> = lance_schema
             .fields
             .iter()
             .filter(|f| f.name.as_str() != vector_column)
             .map(|f| f.into())
             .collect();
-        fields.push(arrow::datatypes::Field::new(
+        fields.push(Field::new(
             "_distance",
             arrow::datatypes::DataType::Float32,
             true,
         ));
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(fields));
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
 
         // Create plan properties
         let plan_properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -92,8 +99,11 @@ impl LanceKnnExec {
             query_vector_plan: None,
             query_vector_column: None,
             k,
+            full_schema: schema.clone(),
             schema,
+            projection: None,
             filter: None,
+            scan_limit: None,
             plan_properties,
         })
     }
@@ -110,22 +120,22 @@ impl LanceKnnExec {
         // Build schema: dataset fields (excluding vector column) + _distance
         // This matches the actual output from Lance's nearest() API
         let lance_schema = dataset.schema();
-        let mut fields: Vec<arrow::datatypes::Field> = lance_schema
+        let mut fields: Vec<Field> = lance_schema
             .fields
             .iter()
             .filter(|f| f.name.as_str() != vector_column)
             .map(|f| f.into())
             .collect();
-        fields.push(arrow::datatypes::Field::new(
+        fields.push(Field::new(
             "_distance",
             arrow::datatypes::DataType::Float32,
             true,
         ));
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(fields));
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
 
         // Create plan properties
         let plan_properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -138,15 +148,42 @@ impl LanceKnnExec {
             query_vector_plan: Some(query_vector_plan),
             query_vector_column: Some(query_vector_column),
             k,
+            full_schema: schema.clone(),
             schema,
+            projection: None,
             filter: None,
+            scan_limit: None,
             plan_properties,
         })
+    }
+
+    /// Apply a column projection (subset of columns to return)
+    pub fn with_projection(mut self, projection: Vec<usize>) -> DFResult<Self> {
+        let projected_fields: Vec<Field> = projection
+            .iter()
+            .map(|&idx| self.full_schema.field(idx).clone())
+            .collect();
+        let projected_schema: SchemaRef = Arc::new(Schema::new(projected_fields));
+        self.schema = projected_schema.clone();
+        self.projection = Some(projection);
+        self.plan_properties = PlanProperties::new(
+            EquivalenceProperties::new(projected_schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Ok(self)
     }
 
     /// Add a filter predicate (e.g., "category = 'electronics'")
     pub fn with_filter(mut self, filter: String) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Set a row limit applied after KNN + filter (from SQL LIMIT clause)
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.scan_limit = Some(limit);
         self
     }
 
@@ -376,17 +413,46 @@ impl LanceKnnExec {
         // Currently users need to use `SELECT ... _distance AS desired_name` in outer query
         // to rename the column. Ideally, LanceKnnExec should detect the alias from SQL
         // and rename _distance automatically to avoid confusion.
-        if batches.is_empty() {
+        let mut batch = if batches.is_empty() {
             // Return empty batch with schema
-            Ok(RecordBatch::new_empty(self.schema.clone()))
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         } else if batches.len() == 1 {
-            Ok(batches.into_iter().next().unwrap())
+            batches.into_iter().next().unwrap()
         } else {
             // Concatenate multiple batches
             let batch_schema = batches[0].schema();
             arrow::compute::concat_batches(&batch_schema, &batches)
-                .map_err(|e| anyhow::anyhow!("Failed to concatenate batches: {}", e))
+                .map_err(|e| anyhow::anyhow!("Failed to concatenate batches: {}", e))?
+        };
+
+        // Apply scan limit if provided (from SQL LIMIT clause)
+        if let Some(n) = self.scan_limit {
+            if batch.num_rows() > n {
+                batch = batch.slice(0, n);
+            }
         }
+
+        // Project and reorder columns to match the declared output schema.
+        // Lance's scanner may return columns in a different order than expected,
+        // and we may need only a subset when a projection is applied.
+        let columns: Vec<_> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Expected column '{}' not found in KNN result",
+                            field.name()
+                        )
+                    })
+                    .cloned()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
     }
 }
 
@@ -505,8 +571,11 @@ impl Clone for LanceKnnExec {
             query_vector_plan: self.query_vector_plan.clone(),
             query_vector_column: self.query_vector_column.clone(),
             k: self.k,
+            full_schema: self.full_schema.clone(),
             schema: self.schema.clone(),
+            projection: self.projection.clone(),
             filter: self.filter.clone(),
+            scan_limit: self.scan_limit.clone(),
             plan_properties: self.plan_properties.clone(),
         }
     }

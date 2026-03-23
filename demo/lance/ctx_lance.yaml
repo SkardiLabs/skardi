@@ -11,7 +11,7 @@ data_sources:
 
   - name: "fts_data"
     type: "lance"
-    path: "data/fts_test_data.lance/"
+    path: "data/test_data.lance/"
     description: "Lance dataset with text descriptions and INVERTED FTS index"
     # Schema:
     #   - id: int64 (unique identifier)

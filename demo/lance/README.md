@@ -17,7 +17,7 @@ General-purpose vector embeddings for similarity search:
 - **item_id**: int64 - Reference to associated item
 - **revenue**: double - Revenue associated with the item
 
-### fts_test_data.lance
+### test_data.lance
 Text dataset with INVERTED FTS index for full-text search:
 - **id**: int64 - Unique identifier
 - **vector**: fixed_size_list\<float\>[128] - 128-dimensional embedding vector
@@ -37,7 +37,7 @@ Movie embeddings for recommendation pipelines:
 
 | File | Description |
 |------|-------------|
-| `ctx_lance.yaml` | Context file registering `vec_data.lance` and `fts_test_data.lance` |
+| `ctx_lance.yaml` | Context file registering `vec_data.lance` and `test_data.lance` |
 | `pipelines/pipeline_lance.yaml` | KNN similarity search pipeline |
 | `pipelines/pipeline_lance_fts.yaml` | Full-text search pipeline |
 
@@ -54,8 +54,26 @@ Parameters:
 - `table_name`: Name of the Lance table (string)
 - `vector_column`: Name of the embedding column (string)
 - `query_vector`: Query vector as literal array or scalar subquery
-- `k`: Number of nearest neighbors (integer)
+- `k`: Number of nearest neighbors to retrieve from the ANN index (integer)
 - `filter`: Optional Lance filter predicate (string)
+
+Both `lance_knn` and `lance_fts` support standard SQL clauses:
+- **WHERE** — predicates are pushed down to Lance for efficient metadata filtering
+- **LIMIT** — applied after search + filtering to cap the final result set
+- **Column projection** — only requested columns are returned
+
+### Filter Pushdown
+
+WHERE clause predicates are pushed down to Lance, so you can combine KNN search with metadata filters:
+```sql
+-- Find 50 nearest neighbors, filter to electronics, return top 5
+SELECT id, category, _distance
+FROM lance_knn('items', 'vector', (SELECT vector FROM items WHERE id = 1), 50)
+WHERE category = 'electronics'
+LIMIT 5
+```
+
+Note: `k` and `LIMIT` serve different purposes. `k` controls how many ANN candidates Lance retrieves from the index. `LIMIT` truncates the final result set after filtering. When using WHERE filters, set `k` higher than your desired result count to ensure enough candidates survive filtering.
 
 ### Query Execution
 
@@ -176,13 +194,13 @@ A test script is provided to read a real vector from the dataset and send it:
 python demo/lance/test_direct_vector_search.py
 ```
 
-## Pipeline Parameters
+## KNN Pipeline Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `reference_id` | integer | Yes | ID of the reference item to find similar items for |
-| `min_revenue` | double | No | Minimum revenue filter (null = no filter) |
-| `max_revenue` | double | No | Maximum revenue filter (null = no filter) |
+| `min_revenue` | double | No | Minimum revenue filter via WHERE pushdown (null = no filter) |
+| `max_revenue` | double | No | Maximum revenue filter via WHERE pushdown (null = no filter) |
 
 ## SQL Query Patterns
 
@@ -211,8 +229,9 @@ FROM lance_knn('sift_items', 'vector', (SELECT vector FROM ref), 10) knn
 WHERE knn.id != 1
 ```
 
-### With Filter Parameter
+### With Inline Filter Parameter
 
+The optional 5th argument applies a Lance filter predicate during ANN retrieval:
 ```sql
 SELECT *
 FROM lance_knn(
@@ -222,6 +241,37 @@ FROM lance_knn(
   10,
   'revenue > 1000'
 )
+```
+
+### With WHERE Clause Filter Pushdown
+
+WHERE clause predicates are pushed down to Lance for efficient post-retrieval filtering:
+```sql
+SELECT id, category, _distance
+FROM lance_knn(
+  'sift_items',
+  'vector',
+  (SELECT vector FROM sift_items WHERE id = 1),
+  50
+)
+WHERE category = 'electronics' AND revenue > 1000
+LIMIT 10
+```
+
+### Combining Inline Filter and WHERE Clause
+
+Both filters are combined with AND:
+```sql
+SELECT id, category, _distance
+FROM lance_knn(
+  'sift_items',
+  'vector',
+  (SELECT vector FROM sift_items WHERE id = 1),
+  50,
+  'revenue > 500'
+)
+WHERE category = 'electronics'
+LIMIT 5
 ```
 
 ### Movie Recommendation (Federated: Lance + PostgreSQL)
@@ -273,13 +323,14 @@ Results include a `_score` column (Float32) where higher values = more relevant.
 | `+foo -bar` | Boolean | MUST contain foo, MUST NOT contain bar |
 | `+foo bar` | Boolean | MUST contain foo, SHOULD contain bar |
 
-### Filter Pushdown
+### FTS Filter Pushdown
 
 WHERE clause predicates are pushed down to Lance for efficient metadata filtering:
 ```sql
 SELECT id, description, _score
 FROM lance_fts('fts_data', 'description', 'premium wireless', 10)
 WHERE category = 'electronics' AND revenue > 1000
+LIMIT 5
 ```
 
 ### Running the FTS Demo
