@@ -12,8 +12,11 @@ repos:
       - id: check-symlinks
       - id: check-yaml
       - id: end-of-file-fixer
+        exclude: ^data/
       - id: mixed-line-ending
+        exclude: ^data/
       - id: trailing-whitespace
+        exclude: ^data/
   - repo: https://github.com/psf/black
     rev: 22.10.0
     hooks:
