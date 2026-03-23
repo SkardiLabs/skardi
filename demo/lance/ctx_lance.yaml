@@ -9,52 +9,57 @@ data_sources:
     #   - item_id: int64 (reference to item)
     #   - revenue: double (revenue associated with item)
 
-# Lance Vector Search Features:
+  - name: "fts_data"
+    type: "lance"
+    path: "data/fts_test_data.lance/"
+    description: "Lance dataset with text descriptions and INVERTED FTS index"
+    # Schema:
+    #   - id: int64 (unique identifier)
+    #   - vector: fixed_size_list<item: float>[128] (embedding vector)
+    #   - item_id: int64 (reference to item)
+    #   - revenue: double (revenue associated with item)
+    #   - description: string (text description with FTS index)
+    #   - category: string (category label)
+    #
+    # To regenerate this dataset:
+    #   python scripts/prepare_fts_test_data.py
+
+# Lance Features:
 #
-# 1. lance_knn Table Function:
+# 1. lance_knn Table Function (Vector Search):
 #    - Explicit KNN search via SQL table function
 #    - Syntax: lance_knn(table_name, vector_column, query_vector, k, [filter])
 #    - Query vector can be a literal array or scalar subquery
+#    - Results include _distance column (lower = more similar)
 #
-# 2. Index Support:
-#    - Distance metric determined by index (L2, Cosine, Dot Product)
-#    - Supports IVF-PQ, HNSW, and other Lance index types
-#    - Automatic index utilization when available
+# 2. lance_fts Table Function (Full-Text Search):
+#    - BM25-scored full-text search via SQL table function
+#    - Syntax: lance_fts(table_name, text_column, query, limit)
+#    - Supports term, phrase, fuzzy, and boolean queries
+#    - Results include _score column (higher = more relevant)
+#    - WHERE clause filters are pushed down to Lance for efficiency
 #
-# 3. Integration:
-#    - Seamless integration with DataFusion SQL
-#    - Results include _distance column automatically
-#    - Combine with standard SQL filtering and joins
+# 3. Index Support:
+#    - Vector: IVF-PQ, HNSW, and other Lance index types
+#    - Text: INVERTED index with optional position tracking for phrase search
 #
 # Example Query Patterns:
 #
-# Basic KNN Search (subquery for reference vector):
-#   SELECT
-#     knn.id, knn.item_id, knn.revenue, knn._distance as dist
-#   FROM lance_knn(
-#     'sift_items',
-#     'vector',
-#     (SELECT vector FROM sift_items WHERE id = 1),
-#     10
-#   ) knn
-#   WHERE knn.id != 1
-#
-# With CTE for reference:
-#   WITH ref AS (
-#     SELECT vector FROM sift_items WHERE id = 1
-#   )
+# KNN Search:
 #   SELECT knn.id, knn.item_id, knn._distance
-#   FROM lance_knn('sift_items', 'vector', (SELECT vector FROM ref), 10) knn
+#   FROM lance_knn('sift_items', 'vector',
+#     (SELECT vector FROM sift_items WHERE id = 1), 10) knn
 #   WHERE knn.id != 1
 #
-# With filter parameter:
-#   SELECT *
-#   FROM lance_knn(
-#     'sift_items',
-#     'vector',
-#     (SELECT vector FROM sift_items WHERE id = 1),
-#     10,
-#     'revenue > 1000'
-#   )
+# Full-Text Search:
+#   SELECT id, description, _score
+#   FROM lance_fts('fts_data', 'description', 'search terms', 10)
 #
-# For complete pipeline example, see pipeline_lance.yaml
+# Phrase Search:
+#   SELECT * FROM lance_fts('fts_data', 'description', '"exact phrase"', 10)
+#
+# FTS with Filter Pushdown:
+#   SELECT * FROM lance_fts('fts_data', 'description', 'search terms', 10)
+#   WHERE category = 'electronics'
+#
+# For complete pipeline examples, see pipelines/

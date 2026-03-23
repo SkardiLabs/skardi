@@ -1,13 +1,14 @@
-# Lance Vector Search Demo
+# Lance Vector Search & Full-Text Search Demo
 
-This demo showcases Skardi's integration with Lance for high-performance vector similarity search. It demonstrates:
+This demo showcases Skardi's integration with Lance for high-performance vector similarity search and BM25-scored full-text search. It demonstrates:
 - Native ANN (Approximate Nearest Neighbor) search using Lance's Scanner.nearest() API
 - Explicit KNN search via the `lance_knn` table function
-- Seamless SQL integration for vector search queries
+- Full-text search via the `lance_fts` table function with inverted indexes
+- Seamless SQL integration for both vector and text search queries
 
 ## Datasets
 
-The demo includes two pre-built Lance datasets under `data/`:
+The demo includes Lance datasets under `data/`:
 
 ### vec_data.lance
 General-purpose vector embeddings for similarity search:
@@ -15,6 +16,17 @@ General-purpose vector embeddings for similarity search:
 - **vector**: fixed_size_list\<float\>[128] - 128-dimensional embedding vector
 - **item_id**: int64 - Reference to associated item
 - **revenue**: double - Revenue associated with the item
+
+### fts_test_data.lance
+Text dataset with INVERTED FTS index for full-text search:
+- **id**: int64 - Unique identifier
+- **vector**: fixed_size_list\<float\>[128] - 128-dimensional embedding vector
+- **item_id**: int64 - Reference to associated item
+- **revenue**: double - Revenue associated with the item
+- **description**: string - Text description (has INVERTED index with positions)
+- **category**: string - Category label
+
+To regenerate: `python scripts/prepare_fts_test_data.py`
 
 ### movie_embeddings.lance
 Movie embeddings for recommendation pipelines:
@@ -25,8 +37,9 @@ Movie embeddings for recommendation pipelines:
 
 | File | Description |
 |------|-------------|
-| `ctx_lance.yaml` | Context file registering `vec_data.lance` |
+| `ctx_lance.yaml` | Context file registering `vec_data.lance` and `fts_test_data.lance` |
 | `pipelines/pipeline_lance.yaml` | KNN similarity search pipeline |
+| `pipelines/pipeline_lance_fts.yaml` | Full-text search pipeline |
 
 ## How It Works
 
@@ -227,6 +240,140 @@ JOIN movies m ON rr.movie_id = m.movie_id
 ORDER BY rr.prediction_score DESC
 LIMIT {top_n}
 ```
+
+## Full-Text Search
+
+### lance_fts Table Function
+
+Use the `lance_fts` table function for BM25-scored full-text search:
+```sql
+SELECT * FROM lance_fts(table_name, text_column, query, limit)
+```
+
+Parameters:
+- `table_name`: Name of the Lance table with an INVERTED index (string)
+- `text_column`: Name of the text column to search (string)
+- `query`: Search query string (string)
+- `limit`: Maximum number of results (integer)
+
+Results include a `_score` column (Float32) where higher values = more relevant.
+
+### Query Syntax
+
+| Syntax | Type | Description |
+|--------|------|-------------|
+| `foo bar` | Term (OR) | Matches documents containing any term |
+| `+foo bar` | Term (AND) | All terms must be present |
+| `"foo bar"` | Phrase | Exact phrase match (requires index with positions) |
+| `foo~` / `foo~2` | Fuzzy | Typo-tolerant matching |
+| `+foo -bar` | Boolean | MUST contain foo, MUST NOT contain bar |
+| `+foo bar` | Boolean | MUST contain foo, SHOULD contain bar |
+
+### Filter Pushdown
+
+WHERE clause predicates are pushed down to Lance for efficient metadata filtering:
+```sql
+SELECT id, description, _score
+FROM lance_fts('fts_data', 'description', 'premium wireless', 10)
+WHERE category = 'electronics' AND revenue > 1000
+```
+
+### Running the FTS Demo
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/lance/ctx_lance.yaml \
+  --pipeline demo/lance/pipelines/ \
+  --port 8080
+```
+
+### Example: Basic Text Search
+
+```bash
+curl -X POST http://localhost:8080/lance-full-text-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "search_query": "premium wireless",
+    "category": null,
+    "limit": 10
+  }'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 0,
+      "item_id": 42,
+      "revenue": 1200.50,
+      "description": "A premium wireless organic speaker charger for electronics enthusiasts.",
+      "category": "electronics",
+      "relevance": 4.25
+    }
+  ],
+  "rows": 10,
+  "execution_time_ms": 5
+}
+```
+
+### Example: Search with Category Filter
+
+```bash
+curl -X POST http://localhost:8080/lance-full-text-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "search_query": "umbrella",
+    "category": "outdoor",
+    "limit": 5
+  }'
+```
+
+### Example: Phrase Search
+
+```bash
+curl -X POST http://localhost:8080/lance-full-text-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "search_query": "\"train to boston\"",
+    "category": null,
+    "limit": 10
+  }'
+```
+
+### Creating an INVERTED Index
+
+To use `lance_fts`, your Lance dataset needs an INVERTED index on the text column. Create one using the Python SDK:
+
+```python
+import lance
+
+ds = lance.dataset("data/my_dataset.lance")
+ds.create_scalar_index(
+    "text_column",
+    index_type="INVERTED",
+    with_position=True,  # Required for phrase search
+)
+```
+
+See `scripts/prepare_fts_test_data.py` for a complete example.
+
+### FTS Pipeline Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `search_query` | string | Yes | Search query (supports term, phrase, fuzzy, boolean syntax) |
+| `category` | string | No | Category filter (null = no filter) |
+| `limit` | integer | Yes | Maximum number of results |
+
+### Troubleshooting FTS
+
+#### "No results returned"
+Ensure the Lance dataset has an INVERTED index on the target column. Without an index, FTS queries return empty results.
+
+#### "Phrase search returns unexpected results"
+Verify the INVERTED index was created with `with_position=True`. Without positions, phrase queries fall back to term matching.
 
 ## Creating Your Own Vector Search Pipeline
 

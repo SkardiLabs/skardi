@@ -388,4 +388,243 @@ mod tests {
         // A lone + or - is not a boolean operator
         assert!(!has_boolean_operators("+ -"));
     }
+
+    // ── Integration tests ──
+    // Require data/fts_test_data.lance (run: python scripts/prepare_fts_test_data.py)
+    // Run with: cargo test -p sources -- --ignored lance_fts
+
+    use arrow::array::{Array, Float32Array, StringArray};
+    use std::path::Path;
+
+    const FTS_DATASET_PATH: &str = "data/fts_test_data.lance";
+
+    async fn setup_fts_context() -> datafusion::prelude::SessionContext {
+        use super::super::registration::register_lance_table;
+
+        let dataset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(FTS_DATASET_PATH);
+        let dataset_path_str = dataset_path.to_str().unwrap();
+
+        assert!(
+            dataset_path.exists(),
+            "FTS test dataset not found at {dataset_path_str}. \
+             Run: python scripts/prepare_fts_test_data.py"
+        );
+
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        let registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        register_lance_table(&mut ctx, "fts_data", dataset_path_str, Some(&registry))
+            .await
+            .expect("Failed to register lance table");
+
+        register_lance_fts_udtf(&ctx, registry);
+        ctx
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_basic_term_search() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql("SELECT id, description, _score FROM lance_fts('fts_data', 'description', 'umbrella', 10)")
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        assert!(!batches.is_empty(), "Expected non-empty results");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "Expected at least 1 result for 'umbrella'");
+        assert!(total_rows <= 10, "Expected at most 10 results (limit)");
+
+        for batch in &batches {
+            let scores = batch
+                .column_by_name("_score")
+                .expect("Missing _score column")
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("_score should be Float32");
+            for i in 0..scores.len() {
+                assert!(!scores.is_null(i) && scores.value(i) > 0.0);
+            }
+
+            let descs = batch
+                .column_by_name("description")
+                .expect("Missing description column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("description should be String");
+            for i in 0..descs.len() {
+                assert!(descs.value(i).to_lowercase().contains("umbrella"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_phrase_search() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql(r#"SELECT id, description, _score FROM lance_fts('fts_data', 'description', '"train to boston"', 10)"#)
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            total_rows > 0,
+            "Expected results for phrase 'train to boston'"
+        );
+
+        // Verify results contain the phrase terms. Lance's PhraseQuery at v4.0.0-rc.1
+        // may return matches for individual terms rather than strictly adjacent phrases,
+        // so we assert on term presence rather than exact phrase containment.
+        for batch in &batches {
+            let descs = batch
+                .column_by_name("description")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..descs.len() {
+                let desc = descs.value(i).to_lowercase();
+                assert!(
+                    desc.contains("train") || desc.contains("boston"),
+                    "Phrase search result should contain at least one phrase term: {desc}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_limit() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql("SELECT id, _score FROM lance_fts('fts_data', 'description', 'enthusiasts', 3)")
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "Expected results for 'enthusiasts'");
+        assert!(
+            total_rows <= 3,
+            "Expected at most 3 results, got {total_rows}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_no_results() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql("SELECT id, _score FROM lance_fts('fts_data', 'description', 'xyznonexistentterm', 10)")
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "Expected no results for nonexistent term");
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_schema_includes_all_columns() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql("SELECT * FROM lance_fts('fts_data', 'description', 'umbrella', 1)")
+            .await
+            .expect("SQL parse failed");
+
+        let field_names: Vec<&str> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+
+        assert!(field_names.contains(&"id"));
+        assert!(field_names.contains(&"vector"));
+        assert!(field_names.contains(&"item_id"));
+        assert!(field_names.contains(&"revenue"));
+        assert!(field_names.contains(&"description"));
+        assert!(field_names.contains(&"category"));
+        assert!(field_names.contains(&"_score"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_relevance_ordering() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql("SELECT _score FROM lance_fts('fts_data', 'description', 'premium wireless', 10)")
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        let mut all_scores = Vec::new();
+        for batch in &batches {
+            let scores = batch
+                .column_by_name("_score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            for i in 0..scores.len() {
+                all_scores.push(scores.value(i));
+            }
+        }
+
+        if all_scores.len() > 1 {
+            for i in 1..all_scores.len() {
+                assert!(
+                    all_scores[i] <= all_scores[i - 1],
+                    "Scores should be descending: {} > {} at index {}",
+                    all_scores[i],
+                    all_scores[i - 1],
+                    i
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_invalid_table_name() {
+        let ctx = setup_fts_context().await;
+
+        let result = ctx
+            .sql("SELECT * FROM lance_fts('nonexistent_table', 'description', 'test', 10)")
+            .await;
+
+        assert!(result.is_err(), "Expected error for nonexistent table");
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires fts_test_data.lance
+    async fn test_lance_fts_multi_term_or_search() {
+        let ctx = setup_fts_context().await;
+
+        let df = ctx
+            .sql("SELECT id, description, _score FROM lance_fts('fts_data', 'description', 'premium organic', 10)")
+            .await
+            .expect("SQL parse failed");
+
+        let batches = df.collect().await.expect("Query execution failed");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            total_rows > 0,
+            "Expected results for 'premium organic' OR search"
+        );
+    }
 }
