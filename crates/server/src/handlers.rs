@@ -522,7 +522,7 @@ pub async fn execute_pipeline_by_name(
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "NULL".to_string(),
-                Value::Array(arr) => {
+                Value::Array(arr) if !arr.is_empty() => {
                     // Convert JSON array to SQL array literal, e.g. [0.1, 0.2, ...]
                     // Used for passing vectors to lance_knn
                     let elements: Vec<String> = arr
