@@ -105,7 +105,7 @@ Server listening on 0.0.0.0:8080
 
 ### Example 1: Find Similar Items
 
-Find the top 10 items most similar to item with id=1:
+Find items most similar to item with id=1:
 
 ```bash
 curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
@@ -113,8 +113,7 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
   -d '{
     "reference_id": 1,
     "min_revenue": null,
-    "max_revenue": null,
-    "k": 10
+    "max_revenue": null
   }'
 ```
 
@@ -151,24 +150,30 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
   -d '{
     "reference_id": 1,
     "min_revenue": 1000.0,
-    "max_revenue": 5000.0,
-    "k": 5
+    "max_revenue": 5000.0
   }'
 ```
 
-### Example 3: Adjust Top-K Results
+### Example 3: Direct Vector Search
 
-Get more or fewer results by changing `k`:
+Instead of looking up a reference vector by ID, you can pass the query vector directly in the request. This is useful when you already have an embedding from an external model.
+
+Pipeline: `pipelines/pipeline_lance_direct_vector.yaml`
 
 ```bash
-curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
+curl -X POST http://localhost:8080/lance-direct-vector-search/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "reference_id": 1,
-    "min_revenue": null,
-    "max_revenue": null,
-    "k": 50
+    "query_vector": [0.0, 16.0, 35.0, 5.0, 32.0, ...]
   }'
+```
+
+The `query_vector` parameter accepts a JSON array of floats matching the vector dimension of the dataset (128 for the demo dataset). The server converts the array to a SQL literal for `lance_knn`.
+
+A test script is provided to read a real vector from the dataset and send it:
+
+```bash
+python demo/lance/test_direct_vector_search.py
 ```
 
 ## Pipeline Parameters
@@ -178,7 +183,6 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
 | `reference_id` | integer | Yes | ID of the reference item to find similar items for |
 | `min_revenue` | double | No | Minimum revenue filter (null = no filter) |
 | `max_revenue` | double | No | Maximum revenue filter (null = no filter) |
-| `k` | integer | Yes | Number of nearest neighbors to return (top-k) |
 
 ## SQL Query Patterns
 

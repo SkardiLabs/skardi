@@ -14,7 +14,7 @@
 //!     (SELECT embedding FROM users WHERE id = $1), 10, 'category = ''electronics''')
 //! ```
 
-use arrow::array::{Array, ArrayRef, Float32Array};
+use arrow::array::{Array, ArrayRef, Float32Array, Float64Array};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -214,10 +214,7 @@ fn try_extract_vector(expr: &Expr) -> DFResult<Option<ArrayRef>> {
                 return plan_err!("lance_knn: query_vector cannot be empty");
             }
             let values = list_arr.value(0);
-            match values.as_any().downcast_ref::<Float32Array>() {
-                Some(float_arr) => Ok(Some(Arc::new(float_arr.clone()) as ArrayRef)),
-                None => plan_err!("lance_knn: query_vector must contain Float32 values"),
-            }
+            extract_float32_array(&values)
         }
         Expr::Literal(ScalarValue::FixedSizeList(arr), _) => {
             let list_arr = arr.as_ref();
@@ -225,13 +222,24 @@ fn try_extract_vector(expr: &Expr) -> DFResult<Option<ArrayRef>> {
                 return plan_err!("lance_knn: query_vector cannot be empty");
             }
             let values = list_arr.value(0);
-            match values.as_any().downcast_ref::<Float32Array>() {
-                Some(float_arr) => Ok(Some(Arc::new(float_arr.clone()) as ArrayRef)),
-                None => plan_err!("lance_knn: query_vector must contain Float32 values"),
-            }
+            extract_float32_array(&values)
         }
         _ => Ok(None), // Not a literal, could be subquery
     }
+}
+
+/// Extract a Float32Array from an array, casting from Float64 if needed.
+/// DataFusion parses untyped float literals (e.g. `[0.1, 0.2]`) as Float64,
+/// but Lance expects Float32 vectors.
+fn extract_float32_array(values: &dyn Array) -> DFResult<Option<ArrayRef>> {
+    if let Some(f32_arr) = values.as_any().downcast_ref::<Float32Array>() {
+        return Ok(Some(Arc::new(f32_arr.clone()) as ArrayRef));
+    }
+    if let Some(f64_arr) = values.as_any().downcast_ref::<Float64Array>() {
+        let f32_arr: Float32Array = f64_arr.iter().map(|v| v.map(|x| x as f32)).collect();
+        return Ok(Some(Arc::new(f32_arr) as ArrayRef));
+    }
+    plan_err!("lance_knn: query_vector must contain Float32 or Float64 values")
 }
 
 /// Register lance_knn table function with SessionContext

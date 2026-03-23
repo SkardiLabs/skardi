@@ -522,6 +522,21 @@ pub async fn execute_pipeline_by_name(
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "NULL".to_string(),
+                Value::Array(arr) => {
+                    // Convert JSON array to SQL array literal, e.g. [0.1, 0.2, ...]
+                    // Used for passing vectors to lance_knn
+                    let elements: Vec<String> = arr
+                        .iter()
+                        .map(|v| match v {
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Null => "NULL".to_string(),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    format!("[{}]", elements.join(", "))
+                }
                 _ => {
                     tracing::error!(
                         "Unsupported parameter type for {}: {:?}",
