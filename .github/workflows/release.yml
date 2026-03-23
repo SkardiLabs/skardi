@@ -86,8 +86,18 @@ jobs:
             skardi-${{ matrix.target }}.tar.gz.sha256
 
   docker:
-    name: Build & Push Docker Image
+    name: Build & Push Docker Image (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            features: ""
+            suffix: ""
+          - variant: onnx
+            features: "onnx"
+            suffix: "-onnx"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -122,9 +132,11 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            FEATURES=${{ matrix.features }}
           tags: |
-            ghcr.io/${{ github.repository }}/skardi-server:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}/skardi-server:latest
+            ghcr.io/${{ github.repository }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}/skardi-server${{ matrix.suffix }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
