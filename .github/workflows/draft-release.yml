@@ -59,6 +59,12 @@ jobs:
           echo "rc=$RC_NUM" >> $GITHUB_OUTPUT
           echo "Next version: v${NEXT}-rc.${RC_NUM}"
 
+      - name: Create tag
+        run: |
+          VERSION="v${{ steps.version.outputs.next }}-rc.${{ steps.version.outputs.rc }}"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
       - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,6 +73,5 @@ jobs:
           gh release create "$VERSION" \
             --draft \
             --prerelease \
-            --target main \
             --title "$VERSION" \
             --generate-notes
