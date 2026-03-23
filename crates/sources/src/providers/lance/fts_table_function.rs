@@ -63,7 +63,7 @@ impl TableFunctionImpl for LanceFtsTableFunction {
 
         let table_name = extract_string(&exprs[0], "table_name")?;
         let text_column = extract_string(&exprs[1], "text_column")?;
-        let query = extract_string(&exprs[2], "query")?;
+        let query = extract_string_or_null(&exprs[2], "query")?;
         let limit = extract_int(&exprs[3], "limit")?;
 
         // Get dataset from registry
@@ -80,8 +80,13 @@ impl TableFunctionImpl for LanceFtsTableFunction {
             })?
         };
 
-        // Parse the query string into a FullTextSearchQuery
-        let fts_query = parse_fts_query(&query, &text_column, limit)?;
+        // Parse the query string into a FullTextSearchQuery.
+        // When query is None (NULL placeholder from schema inference),
+        // use a dummy query so the provider can return a valid schema.
+        let fts_query = match query {
+            Some(q) => parse_fts_query(&q, &text_column, limit)?,
+            None => parse_fts_query("__placeholder__", &text_column, limit.max(1))?,
+        };
 
         Ok(Arc::new(LanceFtsProvider { dataset, fts_query }))
     }
@@ -300,7 +305,17 @@ fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
     match expr {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
         Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
+        // Accept NULL as placeholder during pipeline validation/schema inference.
+        // The inferencer replaces {param} with NULL before plan creation.
+        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
         _ => plan_err!("lance_fts: {} must be a string literal", name),
+    }
+}
+
+fn extract_string_or_null(expr: &Expr, name: &str) -> DFResult<Option<String>> {
+    match expr {
+        Expr::Literal(ScalarValue::Null, _) => Ok(None),
+        other => extract_string(other, name).map(Some),
     }
 }
 
@@ -309,6 +324,8 @@ fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
         Expr::Literal(ScalarValue::Int64(Some(n)), _) => Ok(*n as usize),
         Expr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
         Expr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
+        // Accept NULL as placeholder during pipeline validation/schema inference
+        Expr::Literal(ScalarValue::Null, _) => Ok(0),
         _ => plan_err!("lance_fts: {} must be an integer literal", name),
     }
 }
