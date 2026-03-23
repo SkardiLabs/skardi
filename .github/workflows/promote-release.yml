@@ -45,13 +45,18 @@ jobs:
           echo "official=$OFFICIAL" >> $GITHUB_OUTPUT
           echo "Promoting $RC_TAG -> $OFFICIAL"
 
+      - name: Create and push tag
+        run: |
+          OFFICIAL="${{ steps.version.outputs.official }}"
+          git tag "$OFFICIAL"
+          git push origin "$OFFICIAL"
+
       - name: Create official release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           OFFICIAL="${{ steps.version.outputs.official }}"
           gh release create "$OFFICIAL" \
-            --target main \
             --title "$OFFICIAL" \
             --generate-notes \
             --latest
