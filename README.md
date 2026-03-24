@@ -88,7 +88,7 @@ docker pull ghcr.io/skardilabs/skardi/skardi-server-onnx:0.1.0
 Download the latest CLI binary for your platform:
 
 ```bash
-curl -fsSL https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-$(uname -m | sed 's/arm64/aarch64/')-$(case "$(uname -s)" in Linux) echo "unknown-linux-gnu";; Darwin) echo "apple-darwin";; esac).tar.gz | tar xz
+curl -fSL "https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | sed 's/Linux/unknown-linux-gnu/' | sed 's/Darwin/apple-darwin/').tar.gz" | tar xz
 sudo mv skardi /usr/local/bin/
 ```
 
