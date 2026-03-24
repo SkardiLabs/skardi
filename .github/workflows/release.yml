@@ -257,11 +257,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download CLI artifacts
         if: ${{ !inputs.dry_run }}
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: skardi-*
           merge-multiple: true
 
       - name: Create GitHub Release
