@@ -198,6 +198,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             FEATURES=${{ matrix.features }}
+          provenance: false
           tags: |
             ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}-${{ steps.version.outputs.arch }}
           cache-from: type=gha,scope=${{ matrix.variant }}-${{ steps.version.outputs.arch }}
