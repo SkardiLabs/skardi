@@ -98,8 +98,9 @@ Or download manually from the [Releases](https://github.com/SkardiLabs/skardi/re
 |----------|--------|
 | Linux x86_64 | `skardi-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux ARM64 | `skardi-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS x86_64 | `skardi-x86_64-apple-darwin.tar.gz` |
 | macOS ARM64 (Apple Silicon) | `skardi-aarch64-apple-darwin.tar.gz` |
+
+> **Note:** macOS Intel (x86_64) binaries are not provided. Apple no longer produces Intel-based Macs. You can [build from source](#building-from-source) if needed.
 
 ## Quick Start
 

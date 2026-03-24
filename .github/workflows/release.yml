@@ -1,5 +1,5 @@
 name: Release
-run-name: "Release ${{ inputs.version }}"
+run-name: "Release ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}"
 
 on:
   workflow_dispatch:
@@ -8,6 +8,11 @@ on:
         description: "Version to release (e.g. v0.1.0)"
         required: true
         type: string
+      dry_run:
+        description: "Dry run (skip push/publish)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -43,8 +48,6 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
 
@@ -63,8 +66,26 @@ jobs:
       - name: Install cross-compilation dependencies (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo dpkg --add-architecture arm64
+
+          # Pin all existing sources to amd64 only
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list 2>/dev/null || true
+          sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+          # Add arm64 sources (only ports.ubuntu.com carries arm64)
+          CODENAME=$(lsb_release -cs)
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/arm64.list
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME} main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-backports main restricted universe multiverse
+          EOF
+
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev:arm64 libsqlite3-dev:arm64
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -98,6 +119,7 @@ jobs:
           shasum -a 256 skardi-${{ matrix.target }}.tar.gz > skardi-${{ matrix.target }}.tar.gz.sha256
 
       - name: Upload artifact
+        if: ${{ !inputs.dry_run }}
         uses: actions/upload-artifact@v4
         with:
           name: skardi-${{ matrix.target }}
@@ -106,9 +128,9 @@ jobs:
             skardi-${{ matrix.target }}.tar.gz.sha256
 
   docker:
-    name: "Build & Push Docker Image (${{ matrix.variant }}, ${{ inputs.version }})"
+    name: "Docker ${{ matrix.variant }} (${{ matrix.platform }}, ${{ inputs.version }})"
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -116,12 +138,28 @@ jobs:
           - variant: default
             features: ""
             suffix: ""
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - variant: default
+            features: ""
+            suffix: ""
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - variant: onnx
             features: "onnx"
             suffix: "-onnx"
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - variant: onnx
+            features: "onnx"
+            suffix: "-onnx"
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
 
       - name: Free up disk space
         run: |
@@ -129,9 +167,6 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -143,44 +178,102 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
+      - name: Extract version and repo
         id: version
-        run: echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+        run: |
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+          PLATFORM="${{ matrix.platform }}"
+          echo "arch=${PLATFORM#*/}" >> $GITHUB_OUTPUT
         env:
           VERSION: ${{ inputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
+          push: ${{ !inputs.dry_run }}
+          platforms: ${{ matrix.platform }}
           build-args: |
             FEATURES=${{ matrix.features }}
+          provenance: false
           tags: |
-            ghcr.io/${{ github.repository }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}/skardi-server${{ matrix.suffix }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}:${{ steps.version.outputs.version }}-${{ steps.version.outputs.arch }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ steps.version.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ steps.version.outputs.arch }}
+
+  docker-manifest:
+    name: "Docker Manifest ${{ matrix.variant }} (${{ inputs.version }})"
+    needs: docker
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            suffix: ""
+          - variant: onnx
+            suffix: "-onnx"
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version and repo
+        id: version
+        run: |
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          IMAGE="ghcr.io/${{ steps.version.outputs.repo }}/skardi-server${{ matrix.suffix }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          docker manifest create "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          docker manifest push "${IMAGE}:${VERSION}"
+
+          docker manifest create "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          docker manifest push "${IMAGE}:latest"
 
   release:
     name: "Create Release (${{ inputs.version }})"
-    needs: [build, docker]
+    needs: [build, docker-manifest]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download CLI artifacts
+        if: ${{ !inputs.dry_run }}
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: skardi-*
           merge-multiple: true
 
       - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.version }}
           generate_release_notes: true
           files: |
             artifacts/*
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        run: echo "Dry run complete. All build steps passed for ${{ inputs.version }}. No artifacts were pushed or published."
