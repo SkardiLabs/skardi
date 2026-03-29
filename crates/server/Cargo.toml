@@ -30,7 +30,10 @@ pipeline = { path = "../pipeline" }
 sources = { path = "../sources" }
 model = { path = "../model", optional = true }
 anyhow = "1.0"
+bcrypt = "0.15"
+jsonwebtoken = "9"
 thiserror = "1.0"
+uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "trace", "cors"] }

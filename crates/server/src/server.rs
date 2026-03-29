@@ -1,5 +1,6 @@
 use anyhow::Result;
 use axum::{
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -11,6 +12,7 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
+use crate::auth::{self, AuthConfig};
 use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
@@ -24,6 +26,8 @@ pub struct AppState {
     pub engine: Arc<DataFusionEngine>,
     /// SessionContext for pipeline loading (shared with engine)
     pub session_ctx: Arc<SessionContext>,
+    /// Auth configuration; `None` means authentication is disabled
+    pub auth: Option<AuthConfig>,
 }
 
 /// Main server creation function - Primary public interface
@@ -115,12 +119,22 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Create DataFusion engine with the shared Arc<SessionContext>
     let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx_arc.clone()));
 
+    // Load auth configuration from environment variables
+    let auth = AuthConfig::from_env()?;
+
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState {
         config: Arc::new(RwLock::new(config)),
         engine,
         session_ctx: session_ctx_arc,
+        auth,
     };
+
+    if app_state.auth.is_some() {
+        tracing::info!("Authentication: enabled");
+    } else {
+        tracing::info!("Authentication: disabled (set SKARDI_ADMIN_EMAIL and SKARDI_ADMIN_PASSWORD to enable)");
+    }
 
     tracing::info!("Application state setup completed successfully");
 
@@ -131,13 +145,26 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
 pub fn configure_routes(state: AppState) -> Router {
     tracing::info!("Configuring HTTP routes");
 
-    Router::new()
+    // Public routes — no authentication required
+    let public_routes = Router::new()
         .route("/health", get(health_check))
+        .route("/auth/login", post(auth::login));
+
+    // Protected routes — require a valid JWT when auth is enabled
+    let protected_routes = Router::new()
         .route("/health/:name", get(pipeline_health_check))
         .route("/pipelines", get(list_pipelines))
         .route("/pipeline/:name", get(get_pipelines_info))
         .route("/data_source", get(get_data_sources))
         .route("/:name/execute", post(execute_pipeline_by_name))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::jwt_auth_middleware,
+        ));
+
+    Router::new()
+        .merge(public_routes)
+        .merge(protected_routes)
         .with_state(state)
 }
 

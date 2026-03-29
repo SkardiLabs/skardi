@@ -741,6 +741,7 @@ query: |
             config: Arc::new(RwLock::new(config)),
             engine,
             session_ctx,
+            auth: None,
         }
     }
 
@@ -821,6 +822,7 @@ query: |
             config: Arc::new(RwLock::new(config)),
             engine,
             session_ctx: session_ctx_arc,
+            auth: None,
         };
 
         let request = ExecuteRequest {
