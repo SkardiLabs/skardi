@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::catalog::Session;
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, Session};
 use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -32,10 +32,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-/// Register PostgreSQL tables into DataFusion SessionContext using sqlx for write operations.
+/// Register PostgreSQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
-/// This provider reuses datafusion-table-providers' `SqlTable` for reads (scan/federation pushdown)
-/// and uses sqlx for writes (INSERT/UPDATE/DELETE), fixing issues with auto-generated columns.
+/// Single-table mode reuses datafusion-table-providers' `SqlTable` for reads and sqlx for writes
+/// (INSERT/UPDATE/DELETE), fixing issues with auto-generated columns. Catalog mode registers a
+/// [`MemoryCatalogProvider`] with one provider per table; read-write uses one shared sqlx pool
+/// cloned per table wrapper.
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
@@ -45,10 +47,12 @@ use std::sync::Arc;
 ///   Use `user_env` and `pass_env` options instead.
 /// * `options` - Optional configuration (e.g., table name, schema)
 /// * `read_write` - If true, register as read-write table provider (allows INSERT/UPDATE/DELETE)
+/// * `hierarchy_level` - `None` → table mode (default); `Some(HierarchyLevel::Catalog)` loads the whole DB as a catalog
 ///
 /// # Options
-/// * `table` - Specific table name to register (required)
+/// * `table` - Table name (required in table mode, the default when `hierarchy_level` is `None`)
 /// * `schema` - Schema name (default: "public")
+/// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only)
 /// * `user_env` - Environment variable name for username (optional)
 /// * `pass_env` - Environment variable name for password (optional)
 pub async fn register_postgres_tables(
@@ -58,6 +62,36 @@ pub async fn register_postgres_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
+    hierarchy_level: Option<crate::HierarchyLevel>,
+) -> Result<()> {
+    let hierarchy_level = hierarchy_level.unwrap_or_default();
+    match hierarchy_level {
+        crate::HierarchyLevel::Catalog => {
+            register_postgres_catalog(session_ctx, name, connection_string, options, read_write)
+                .await
+        }
+        crate::HierarchyLevel::Table => {
+            register_single_postgres_table(
+                session_ctx,
+                name,
+                connection_string,
+                options,
+                read_write,
+            )
+            .await
+        }
+    }
+}
+
+/// Register one logical table (`options.table`) under `name` in the default catalog.
+async fn register_single_postgres_table(
+    session_ctx: &mut SessionContext,
+    name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    pg_knn_registry: Option<&DatasetRegistry>,
+    hierarchy_level: Option<crate::HierarchyLevel>,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
@@ -70,10 +104,6 @@ pub async fn register_postgres_tables(
         connection_string,
         mode_str,
     );
-
-    let table_name = options.and_then(|opts| opts.get("table")).ok_or_else(|| {
-        anyhow::anyhow!("PostgreSQL data source '{}' requires 'table' option", name)
-    })?;
 
     let schema_name = options
         .and_then(|opts| opts.get("schema"))
@@ -161,6 +191,17 @@ pub async fn register_postgres_tables(
     } else {
         read_provider
     };
+    let factory = PostgresTableFactory::new(Arc::clone(&read_pool));
+    let table_reference = TableReference::partial(schema_name.as_str(), table_name.as_str());
+    let table_provider = build_postgres_table_provider(
+        &factory,
+        connection_string,
+        options,
+        table_reference,
+        read_write,
+        None,
+    )
+    .await?;
 
     session_ctx
         .register_table(name, table_provider)
@@ -201,6 +242,241 @@ pub async fn register_postgres_tables(
     }
 
     Ok(())
+}
+
+/// Register an entire Postgres database (catalog) as a named DataFusion catalog.
+async fn register_postgres_catalog(
+    session_ctx: &mut SessionContext,
+    catalog_name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+) -> Result<()> {
+    let mode_str = if read_write {
+        "read-write"
+    } else {
+        "read-only"
+    };
+    tracing::info!(
+        "Registering PostgreSQL catalog (sqlx): {} with connection: {} ({})",
+        catalog_name,
+        connection_string,
+        mode_str,
+    );
+
+    let pool_params = parse_connection_params(connection_string, options)?;
+    let read_pool = Arc::new(
+        PostgresConnectionPool::new(pool_params)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create PostgreSQL connection pool for catalog '{}'",
+                    catalog_name
+                )
+            })?,
+    );
+
+    // Build the sqlx pool unconditionally: it is needed for table discovery in
+    // both read-only and read-write modes, and reused for writes when read_write=true.
+    let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
+    let sqlx_pool = PgPool::connect(&sqlx_url).await.with_context(|| {
+        format!(
+            "Failed to create sqlx PgPool for catalog '{}'",
+            catalog_name
+        )
+    })?;
+
+    let allowed_schemas = parse_allowed_schemas(options);
+    let schema_tables = list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_ref())
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to list PostgreSQL tables for catalog-wide registration in source '{}'",
+                catalog_name
+            )
+        })?;
+
+    if schema_tables.is_empty() {
+        tracing::warn!(
+            "No tables found in PostgreSQL catalog for source '{}'",
+            catalog_name
+        );
+    }
+
+    let write_pool = if read_write { Some(&sqlx_pool) } else { None };
+
+    let factory = PostgresTableFactory::new(Arc::clone(&read_pool));
+    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
+
+    for (schema, table_name) in &schema_tables {
+        let table_reference = TableReference::partial(schema.as_str(), table_name.as_str());
+        let table_provider = build_postgres_table_provider(
+            &factory,
+            connection_string,
+            options,
+            table_reference,
+            read_write,
+            write_pool,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to build table provider for '{}.{}' in catalog '{}'",
+                schema, table_name, catalog_name
+            )
+        })?;
+
+        if catalog_provider.schema(schema).is_none() {
+            catalog_provider
+                .register_schema(schema, Arc::new(MemorySchemaProvider::new()))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to register schema '{}' for catalog '{}': {}",
+                        schema,
+                        catalog_name,
+                        e
+                    )
+                })?;
+        }
+
+        let schema_provider = catalog_provider.schema(schema).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Schema '{}' was not found after registration in catalog '{}'",
+                schema,
+                catalog_name
+            )
+        })?;
+
+        schema_provider
+            .register_table(table_name.to_string(), table_provider)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to register table '{}.{}' in catalog '{}': {}",
+                    schema,
+                    table_name,
+                    catalog_name,
+                    e
+                )
+            })?;
+
+        tracing::debug!(
+            "Prepared '{}.{}' in catalog '{}'",
+            schema,
+            table_name,
+            catalog_name
+        );
+    }
+
+    session_ctx.register_catalog(catalog_name, catalog_provider);
+    tracing::info!(
+        "Registered PostgreSQL catalog '{}' with {} table(s) ({})",
+        catalog_name,
+        schema_tables.len(),
+        mode_str
+    );
+
+    Ok(())
+}
+
+async fn build_postgres_table_provider(
+    factory: &PostgresTableFactory,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    table_reference: TableReference,
+    read_write: bool,
+    reuse_sqlx_pool: Option<&PgPool>,
+) -> Result<Arc<dyn TableProvider>> {
+    let read_provider = factory
+        .table_provider(table_reference.clone())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create read table provider for '{}': {}",
+                table_reference,
+                e
+            )
+        })?;
+
+    if !read_write {
+        return Ok(read_provider);
+    }
+
+    let schema_name = table_reference
+        .schema()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Table reference '{}' must include a schema for read-write Postgres registration",
+                table_reference
+            )
+        })?
+        .to_string();
+    let table_name = table_reference.table().to_string();
+
+    let sqlx_pool = if let Some(pool) = reuse_sqlx_pool {
+        pool.clone()
+    } else {
+        let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
+        PgPool::connect(&sqlx_url).await.with_context(|| {
+            format!(
+                "Failed to create sqlx PgPool for '{}.{}'",
+                schema_name, table_name
+            )
+        })?
+    };
+
+    let auto_generated_columns =
+        detect_auto_generated_columns(&sqlx_pool, &schema_name, &table_name).await?;
+
+    if !auto_generated_columns.is_empty() {
+        tracing::debug!(
+            "Detected auto-generated columns for '{}.{}': {:?}",
+            schema_name,
+            table_name,
+            auto_generated_columns
+        );
+    }
+
+    Ok(Arc::new(SqlxPostgresTableProvider {
+        read_provider,
+        sqlx_pool,
+        table_reference,
+        auto_generated_columns,
+    }))
+}
+
+async fn list_postgres_tables_in_catalog(
+    pool: &PgPool,
+    allowed_schemas: Option<&Vec<String>>,
+) -> Result<Vec<(String, String)>> {
+    let mut rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_schema, table_name
+         FROM information_schema.tables
+         WHERE table_type = 'BASE TABLE'
+           AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+           AND table_schema NOT LIKE 'pg_temp_%'
+         ORDER BY table_schema, table_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    if let Some(allowed) = allowed_schemas {
+        rows.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+    }
+    Ok(rows)
+}
+
+fn parse_allowed_schemas(options: Option<&HashMap<String, String>>) -> Option<Vec<String>> {
+    let value = options.and_then(|opts| opts.get("allowed_schemas"))?;
+    let values = value
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 // ─── SqlxPostgresTableProvider ──────────────────────────────────────────────
@@ -1307,6 +1583,242 @@ mod tests {
         assert!(sql.contains("NULL"));
         assert!(sql.contains("Alice"));
         assert!(sql.contains("25"));
+    }
+
+    // ─── parse_allowed_schemas tests ────────────────────────────────────
+
+    #[test]
+    fn test_parse_allowed_schemas_none_options() {
+        let result = parse_allowed_schemas(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_missing_key() {
+        let options: HashMap<String, String> = HashMap::new();
+        let result = parse_allowed_schemas(Some(&options));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_empty_value() {
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), "".to_string());
+        let result = parse_allowed_schemas(Some(&options));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_whitespace_only() {
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), "  ,  ,  ".to_string());
+        let result = parse_allowed_schemas(Some(&options));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_single() {
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), "public".to_string());
+        let result = parse_allowed_schemas(Some(&options)).unwrap();
+        assert_eq!(result, vec!["public"]);
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_multiple() {
+        let mut options = HashMap::new();
+        options.insert(
+            "allowed_schemas".to_string(),
+            "public,private,analytics".to_string(),
+        );
+        let result = parse_allowed_schemas(Some(&options)).unwrap();
+        assert_eq!(result, vec!["public", "private", "analytics"]);
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_whitespace_trimming() {
+        let mut options = HashMap::new();
+        options.insert(
+            "allowed_schemas".to_string(),
+            " public , private , analytics ".to_string(),
+        );
+        let result = parse_allowed_schemas(Some(&options)).unwrap();
+        assert_eq!(result, vec!["public", "private", "analytics"]);
+    }
+
+    #[test]
+    fn test_parse_allowed_schemas_empty_segments_filtered() {
+        let mut options = HashMap::new();
+        options.insert(
+            "allowed_schemas".to_string(),
+            "public,,analytics".to_string(),
+        );
+        let result = parse_allowed_schemas(Some(&options)).unwrap();
+        assert_eq!(result, vec!["public", "analytics"]);
+    }
+
+    // ─── HierarchyLevel tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_hierarchy_level_default_is_table() {
+        assert_eq!(
+            crate::HierarchyLevel::default(),
+            crate::HierarchyLevel::Table
+        );
+    }
+
+    #[test]
+    fn test_hierarchy_level_as_str_table() {
+        assert_eq!(crate::HierarchyLevel::Table.as_str(), "table");
+    }
+
+    #[test]
+    fn test_hierarchy_level_as_str_catalog() {
+        assert_eq!(crate::HierarchyLevel::Catalog.as_str(), "catalog");
+    }
+
+    #[test]
+    fn test_hierarchy_level_serde_roundtrip() {
+        let table = crate::HierarchyLevel::Table;
+        let serialized = serde_json::to_string(&table).unwrap();
+        let deserialized: crate::HierarchyLevel = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, crate::HierarchyLevel::Table);
+
+        let catalog = crate::HierarchyLevel::Catalog;
+        let serialized = serde_json::to_string(&catalog).unwrap();
+        let deserialized: crate::HierarchyLevel = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, crate::HierarchyLevel::Catalog);
+    }
+
+    #[test]
+    fn test_hierarchy_level_serde_lowercase_strings() {
+        let table: crate::HierarchyLevel = serde_json::from_str("\"table\"").unwrap();
+        assert_eq!(table, crate::HierarchyLevel::Table);
+
+        let catalog: crate::HierarchyLevel = serde_json::from_str("\"catalog\"").unwrap();
+        assert_eq!(catalog, crate::HierarchyLevel::Catalog);
+    }
+
+    // ─── Catalog dispatch tests (unit) ──────────────────────────────────
+
+    /// Catalog mode should never fail with "requires 'table' option" — that error
+    /// is exclusive to single-table mode when no `table` key is provided.
+    #[tokio::test]
+    async fn test_catalog_mode_error_is_not_missing_table_option() {
+        let mut session_ctx = SessionContext::new();
+        let result = register_postgres_tables(
+            &mut session_ctx,
+            "mydb",
+            // Use an unreachable address to guarantee a connection failure without hanging.
+            "postgresql://127.0.0.1:19999/nonexistent",
+            None,
+            false,
+            Some(crate::HierarchyLevel::Catalog),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        // Catalog path must never surface the single-table "requires 'table' option" message.
+        assert!(!error_msg.contains("requires 'table' option"));
+    }
+
+    /// Table mode without a `table` option always fails with a descriptive error.
+    #[tokio::test]
+    async fn test_table_mode_requires_table_option() {
+        let mut session_ctx = SessionContext::new();
+        let result = register_postgres_tables(
+            &mut session_ctx,
+            "test_source",
+            "postgresql://localhost:5432/db",
+            None,
+            false,
+            Some(crate::HierarchyLevel::Table),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires 'table' option")
+        );
+    }
+
+    /// `None` for `hierarchy_level` defaults to table mode.
+    #[tokio::test]
+    async fn test_hierarchy_level_none_defaults_to_table_mode() {
+        let mut session_ctx = SessionContext::new();
+        let result = register_postgres_tables(
+            &mut session_ctx,
+            "test_source",
+            "postgresql://localhost:5432/db",
+            None,
+            false,
+            None, // None → Table
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires 'table' option")
+        );
+    }
+
+    // ─── allowed_schemas filtering logic tests ───────────────────────────
+
+    /// Unit-test the schema filtering logic exercised inside `list_postgres_tables_in_catalog`.
+    #[test]
+    fn test_allowed_schemas_filter_retains_matching_rows() {
+        let rows = vec![
+            ("public".to_string(), "users".to_string()),
+            ("private".to_string(), "secrets".to_string()),
+            ("analytics".to_string(), "events".to_string()),
+        ];
+
+        let allowed = vec!["public".to_string(), "analytics".to_string()];
+        let mut filtered = rows.clone();
+        filtered.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains(&("public".to_string(), "users".to_string())));
+        assert!(filtered.contains(&("analytics".to_string(), "events".to_string())));
+        assert!(!filtered.iter().any(|(s, _)| s == "private"));
+    }
+
+    #[test]
+    fn test_allowed_schemas_filter_with_no_match() {
+        let rows = vec![
+            ("public".to_string(), "users".to_string()),
+            ("private".to_string(), "secrets".to_string()),
+        ];
+
+        let allowed = vec!["analytics".to_string()];
+        let mut filtered = rows.clone();
+        filtered.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_allowed_schemas_filter_none_retains_all() {
+        // When `allowed_schemas` is None the retain is skipped and all rows are kept.
+        let rows = vec![
+            ("public".to_string(), "users".to_string()),
+            ("private".to_string(), "secrets".to_string()),
+        ];
+        let allowed: Option<Vec<String>> = None;
+        let mut filtered = rows.clone();
+        if let Some(allowed) = &allowed {
+            filtered.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+        }
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains(&("public".to_string(), "users".to_string())));
+        assert!(filtered.contains(&("private".to_string(), "secrets".to_string())));
     }
 
     // ─── Integration test helpers ────────────────────────────────────────

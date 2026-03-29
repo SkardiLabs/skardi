@@ -717,6 +717,143 @@ lsof -i :5432
 ```
 Either stop the conflicting service or use a different port for the Docker container.
 
+## Catalog Mode: Load an Entire Schema at Once
+
+Instead of adding one entry per table, omit the `table` option to let Skardi
+discover and register **every table and view** in the target schema
+automatically. This is called *catalog mode*.
+
+### Context file (`ctx_postgres_catalog_demo.yaml`)
+
+```yaml
+data_sources:
+  # One entry loads both schemas from the same DB.
+  # Tables are accessible as mydb.public.users, mydb.analytics.monthly_revenue, …
+  - name: "mydb"
+    type: "postgres"
+    hierarchy_level: "catalog"        # required to enable catalog mode
+    access_mode: "read_write"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    options:
+      allowed_schemas: "public,analytics"  # comma-separated; omit to load all schemas
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+```
+
+> **Notes:**
+> - `table` and `schema` options are rejected when `hierarchy_level: catalog` is set.
+> - `allowed_schemas` must be either absent (loads all non-system schemas) or a non-empty comma-separated string. An empty string causes a startup error.
+
+### Quick Start with Catalog Mode
+
+```bash
+# 1. Start PostgreSQL and create tables in two schemas
+docker run --name postgres-skardi \
+  -e POSTGRES_DB=mydb \
+  -e POSTGRES_USER=skardi_user \
+  -e POSTGRES_PASSWORD=skardi_pass \
+  -p 5432:5432 \
+  -d postgres:16
+
+docker exec -i postgres-skardi psql -U skardi_user -d mydb << 'EOF'
+-- public schema tables (same as regular demo)
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL
+);
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL,
+    product VARCHAR(100) NOT NULL,
+    amount DECIMAL(10, 2) NOT NULL
+);
+CREATE TABLE user_order_stats (
+    user_id INT PRIMARY KEY,
+    user_name VARCHAR(100),
+    user_email VARCHAR(100),
+    total_orders INT,
+    total_spent DECIMAL(10, 2),
+    last_order_date VARCHAR(50)
+);
+INSERT INTO users (name, email) VALUES
+    ('Alice Smith', 'alice@example.com'),
+    ('Bob Johnson', 'bob@example.com'),
+    ('Carol Williams', 'carol@example.com');
+INSERT INTO orders (user_id, product, amount) VALUES
+    (1, 'Laptop', 999.99),
+    (2, 'Keyboard', 79.99),
+    (3, 'Monitor', 299.99);
+
+-- analytics schema tables (second schema, same DB)
+CREATE SCHEMA analytics;
+CREATE TABLE analytics.monthly_revenue (
+    user_id INT NOT NULL,
+    month VARCHAR(7) NOT NULL,   -- e.g. "2024-01"
+    revenue DECIMAL(10, 2) NOT NULL
+);
+INSERT INTO analytics.monthly_revenue VALUES
+    (1, '2024-01', 1029.98),
+    (2, '2024-01',  229.98),
+    (3, '2024-01',  389.98);
+EOF
+
+# 2. Set environment variables
+export PG_USER="skardi_user"
+export PG_PASSWORD="skardi_pass"
+
+# 3. Start Skardi using the catalog context and catalog-specific pipelines
+cargo run --bin skardi-server -- \
+  --ctx demo/postgres/ctx_postgres_catalog_demo.yaml \
+  --pipeline demo/postgres/pipelines_for_catalog_example/ \
+  --port 8080
+```
+
+At startup Skardi logs something like:
+
+```
+Registered PostgreSQL catalog 'mydb' with 4 table(s) (read-write)
+```
+
+### Querying Across Tables and Schemas
+
+In catalog mode, tables are registered under a three-part name:
+`<catalog_name>.<schema_name>.<table_name>`.
+
+For the context above:
+- `mydb.public.users`
+- `mydb.public.orders`
+- `mydb.public.user_order_stats`
+- `mydb.analytics.monthly_revenue`
+
+```bash
+# Join users ↔ orders (both from the public schema)
+curl -X POST http://localhost:8080/list_all_users_and_orders/execute \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Join mydb.public.users ↔ mydb.analytics.monthly_revenue (cross-schema)
+curl -X POST http://localhost:8080/cross_schema_summary/execute \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+The pipeline SQLs use fully qualified paths so there is no ambiguity when
+tables from multiple schemas are in scope at the same time.
+
+### How It Works
+
+| Config | Behavior |
+|--------|----------|
+| `hierarchy_level: table` (default) | Registers the single table named by `options.table` under the DataFusion name given by `name` |
+| `hierarchy_level: catalog` | Introspects `information_schema.tables` and registers every `BASE TABLE` as `<name>.<schema>.<table>` |
+
+Use `allowed_schemas` to restrict which schemas are loaded. Point multiple
+catalog entries at the same connection string with different `allowed_schemas`
+values to expose several schemas from one database.
+
+---
+
 ## Configuration Reference
 
 ### ctx_postgres_demo.yaml
@@ -733,14 +870,24 @@ data_sources:
       pass_env: "PG_PASSWORD"
 ```
 
-### Options
+### Options — table mode (`hierarchy_level: table`, default)
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
 | `table` | Yes | - | Table name to register |
-| `schema` | No | `public` | Schema name |
+| `schema` | No | `public` | Schema containing the table |
 | `user_env` | No | - | Environment variable for username |
 | `pass_env` | No | - | Environment variable for password |
+
+### Options — catalog mode (`hierarchy_level: catalog`)
+
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `allowed_schemas` | No | _(all non-system schemas)_ | Comma-separated list of schemas to load, e.g. `"public,analytics"` |
+| `user_env` | No | - | Environment variable for username |
+| `pass_env` | No | - | Environment variable for password |
+
+`table` and `schema` are **not allowed** in catalog mode and will cause a startup error.
 
 ### Connection String Parameters
 

@@ -22,9 +22,9 @@ use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_ud
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
-    mongo::register_mongo_tables, mysql::register_mysql_tables, sqlite::register_sqlite_tables,
     sqlx::postgres::register_postgres_tables,
 };
+use sources::HierarchyLevel;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -80,6 +80,8 @@ struct LocalDataSource {
     path: Option<String>,
     connection_string: Option<String>,
     options: Option<HashMap<String, String>>,
+    #[serde(default)]
+    hierarchy_level: Option<HierarchyLevel>,
 }
 
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -509,6 +511,7 @@ async fn register_source(
                 source.options.as_ref(),
                 false,
                 Some(dataset_registry),
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register Postgres '{}'", source.name))?;

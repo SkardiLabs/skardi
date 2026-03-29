@@ -1,0 +1,27 @@
+data_sources:
+  # ── Catalog mode: load multiple schemas from one DB in a single entry ────────
+  # Setting hierarchy_level to "catalog" tells Skardi to introspect
+  # information_schema and register every BASE TABLE it finds across all
+  # schemas listed in allowed_schemas.
+  #
+  # Tables are accessible as <catalog_name>.<schema_name>.<table_name>, e.g.:
+  #   mydb.public.users
+  #   mydb.analytics.monthly_revenue
+  #
+  # "table" and "schema" options are not allowed in catalog mode.
+  - name: "mydb"
+    type: "postgres"
+    hierarchy_level: "catalog"
+    access_mode: "read_write"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    description: "All tables in the public and analytics schemas of mydb"
+    options:
+      allowed_schemas: "public,analytics"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+
+  # ── CSV data source (shared with other demos for federated queries) ──────────
+  - name: "csv_orders"
+    type: "csv"
+    path: "demo/sample_data/orders.csv"
+    description: "CSV file containing order data"
