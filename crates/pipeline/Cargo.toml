@@ -8,6 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 license.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 anyhow = { workspace = true }
 arrow = { workspace = true }
