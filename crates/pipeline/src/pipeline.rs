@@ -457,11 +457,11 @@ impl Pipeline for StandardPipeline {
     ///
     /// This method reads a YAML file containing only metadata and query sections.
     /// Request and response schemas are automatically inferred from the SQL query
-    /// using the provided Arc<SessionContext> with registered tables.
+    /// using the provided `Arc<SessionContext>` with registered tables.
     ///
     /// # Arguments
     /// * `file_path` - Path to the pipeline YAML file
-    /// * `ctx` - Arc<SessionContext> with registered tables for schema inference
+    /// * `ctx` - `Arc<SessionContext>` with registered tables for schema inference
     ///
     /// # Returns
     /// * `Result<Self>` - Complete pipeline instance or error with detailed context

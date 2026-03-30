@@ -43,6 +43,9 @@ jobs:
           key: ${{ runner.os }}-docs-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-docs-
 
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+
       - name: Build documentation
         # Document library crates only; skip model's onnx feature (downloads native binaries).
         # --no-deps keeps the output focused on skardi's own APIs.

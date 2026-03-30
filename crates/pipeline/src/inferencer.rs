@@ -46,7 +46,7 @@ pub struct ValidationReport {
 }
 
 impl SqlSchemaInferrer {
-    /// Create a new SQL schema inferrer with the provided Arc<SessionContext>
+    /// Create a new SQL schema inferrer with the provided `Arc<SessionContext>`
     pub fn new(datafusion_ctx: Arc<SessionContext>) -> Result<Self> {
         Ok(Self { datafusion_ctx })
     }
