@@ -285,9 +285,16 @@ jobs:
       - name: Publish model
         run: cargo publish -p model
 
+      - name: Wait for crates.io index (pipeline + model)
+        run: sleep 30
+
+      - name: Publish skardi
+        run: cargo publish -p skardi
+
       # sources is not published yet: it depends on lance via git which crates.io disallows.
-      # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml and add:
-      #   cargo publish -p sources
+      # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml, add it to
+      # the skardi facade crate, and publish with:
+      #   cargo publish -p sources  (before cargo publish -p skardi)
 
   release:
     name: "Create Release (${{ inputs.version }})"

@@ -47,19 +47,13 @@ jobs:
         run: sudo apt-get install -y protobuf-compiler
 
       - name: Build documentation
-        # Document library crates only; skip model's onnx feature (downloads native binaries).
         # --no-deps keeps the output focused on skardi's own APIs.
-        run: |
-          cargo doc \
-            --no-deps \
-            -p skardi-engine \
-            -p pipeline \
-            -p sources \
-            -p model
+        # sources is excluded from the facade crate until the lance git dep is resolved.
+        run: cargo doc --no-deps -p skardi
 
-      - name: Add redirect from root to skardi_engine
+      - name: Add redirect from root to skardi
         run: |
-          echo '<meta http-equiv="refresh" content="0; url=skardi_engine/index.html">' \
+          echo '<meta http-equiv="refresh" content="0; url=skardi/index.html">' \
             > target/doc/index.html
 
       - name: Upload Pages artifact

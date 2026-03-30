@@ -6440,6 +6440,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
+name = "skardi"
+version = "0.1.0"
+dependencies = [
+ "model",
+ "pipeline",
+ "skardi-engine",
+]
+
+[[package]]
 name = "skardi-cli"
 version = "0.1.0"
 dependencies = [

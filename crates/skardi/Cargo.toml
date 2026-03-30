@@ -1,0 +1,19 @@
+[package]
+name = "skardi"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+skardi-engine = { path = "../engine" }
+pipeline = { path = "../pipeline" }
+model = { path = "../model" }
+# sources is excluded until the lance git dependency is replaced with a crates.io version
