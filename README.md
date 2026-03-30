@@ -1,7 +1,7 @@
 <div align="center">
 <p align="center">
 
-<img src="asset/logo.png" alt="Skardi Logo" width="700">
+<img src="asset/logo.png" alt="Skardi Logo" width="700" />
 
 **The Declarative data runtime for AI and agents powered by Rust and Apache Datafusion.**<br/>
 **Query files, databases, data lakes, and vector stores with SQL — locally with skardi-cli or as APIs with skardi-server.**

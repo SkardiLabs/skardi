@@ -5,3 +5,9 @@
 .claude/
 .venv/
 .vscode/
+node_modules/
+
+# Docusaurus
+website/build/
+website/.docusaurus/
+website/docs/
