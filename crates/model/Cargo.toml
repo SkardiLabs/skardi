@@ -8,6 +8,11 @@ repository.workspace = true
 homepage.workspace = true
 license.workspace = true
 
+[package.metadata.docs.rs]
+# onnx downloads native binaries at build time which docs.rs disallows
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]

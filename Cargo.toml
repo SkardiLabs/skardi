@@ -3,8 +3,8 @@ version = "0.1.0"
 edition = "2024"
 description = "High performance query engine for both offline compute and online serving"
 authors = ["btnokami"]
-repository = "https://github.com/BtXin/skardi"
-homepage = "hhttps://github.com/BtXin/skardi"
+repository = "https://github.com/SkardiLabs/skardi"
+homepage = "https://github.com/SkardiLabs/skardi"
 license = "Apache-2.0"
 
 [workspace]
