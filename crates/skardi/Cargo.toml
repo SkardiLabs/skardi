@@ -14,6 +14,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 skardi-engine = { path = "../engine" }
-pipeline = { path = "../pipeline" }
-model = { path = "../model" }
+pipeline = { package = "skardi-pipeline", path = "../pipeline" }
+model = { package = "skardi-model", path = "../model" }
 # sources is excluded until the lance git dependency is replaced with a crates.io version

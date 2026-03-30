@@ -1,5 +1,5 @@
 [package]
-name = "model"
+name = "skardi-model"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -29,7 +29,7 @@ tokio = {workspace = true,  features = ["macros", "rt-multi-thread", "sync"]}
 tracing = { workspace = true }
 
 [dev-dependencies]
-sources = { path = "../sources" }
+sources = { package = "skardi-sources", path = "../sources" }
 
 [lints]
 workspace = true

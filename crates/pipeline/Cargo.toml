@@ -1,5 +1,5 @@
 [package]
-name = "pipeline"
+name = "skardi-pipeline"
 version.workspace = true
 edition.workspace = true
 description.workspace = true

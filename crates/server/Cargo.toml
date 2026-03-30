@@ -26,9 +26,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 skardi-engine = { path = "../engine" }
-pipeline = { path = "../pipeline" }
-sources = { path = "../sources" }
-model = { path = "../model", optional = true }
+pipeline = { package = "skardi-pipeline", path = "../pipeline" }
+sources = { package = "skardi-sources", path = "../sources" }
+model = { package = "skardi-model", path = "../model", optional = true }
 anyhow = "1.0"
 thiserror = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync"] }

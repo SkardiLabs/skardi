@@ -4379,22 +4379,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
-name = "model"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "datafusion",
- "log",
- "ndarray 0.17.2",
- "num_cpus",
- "ort",
- "sources",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "moka"
 version = "0.12.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5147,25 +5131,6 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
-
-[[package]]
-name = "pipeline"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "datafusion",
- "log",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "skardi-engine",
- "tempfile",
- "tokio",
- "tokio-test",
-]
 
 [[package]]
 name = "pkg-config"
@@ -6443,9 +6408,9 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 name = "skardi"
 version = "0.1.0"
 dependencies = [
- "model",
- "pipeline",
  "skardi-engine",
+ "skardi-model",
+ "skardi-pipeline",
 ]
 
 [[package]]
@@ -6465,7 +6430,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sources",
+ "skardi-sources",
  "tokio",
  "url",
 ]
@@ -6485,6 +6450,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "skardi-model"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "datafusion",
+ "log",
+ "ndarray 0.17.2",
+ "num_cpus",
+ "ort",
+ "skardi-sources",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "skardi-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "skardi-engine",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+]
+
+[[package]]
 name = "skardi-server"
 version = "0.1.0"
 dependencies = [
@@ -6498,14 +6498,14 @@ dependencies = [
  "datafusion",
  "datafusion-federation",
  "lance",
- "model",
  "object_store",
- "pipeline",
  "serde",
  "serde_json",
  "serde_yaml",
  "skardi-engine",
- "sources",
+ "skardi-model",
+ "skardi-pipeline",
+ "skardi-sources",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -6514,6 +6514,43 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "skardi-sources"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "datafusion-federation",
+ "datafusion-table-providers",
+ "derivative",
+ "futures",
+ "hex",
+ "iceberg",
+ "iceberg-datafusion",
+ "iceberg-storage-opendal",
+ "lance",
+ "lance-index",
+ "mongodb",
+ "mysql_async",
+ "percent-encoding",
+ "redis",
+ "redis-test",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlparser 0.53.0",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rusqlite",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -6617,43 +6654,6 @@ dependencies = [
  "byteorder",
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "sources"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "datafusion",
- "datafusion-federation",
- "datafusion-table-providers",
- "derivative",
- "futures",
- "hex",
- "iceberg",
- "iceberg-datafusion",
- "iceberg-storage-opendal",
- "lance",
- "lance-index",
- "mongodb",
- "mysql_async",
- "percent-encoding",
- "redis",
- "redis-test",
- "secrecy",
- "serde",
- "serde_json",
- "sqlparser 0.53.0",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rusqlite",
- "tracing",
- "url",
- "uuid",
 ]
 
 [[package]]
