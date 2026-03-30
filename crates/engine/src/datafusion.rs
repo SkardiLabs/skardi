@@ -46,7 +46,7 @@ impl DataFusionEngine {
         Self { ctx: Arc::new(ctx) }
     }
 
-    /// Create a new DataFusion engine instance with an Arc<SessionContext>
+    /// Create a new DataFusion engine instance with an `Arc<SessionContext>`
     ///
     /// This constructor allows creating an engine with a shared SessionContext.
     ///
@@ -73,13 +73,13 @@ impl DataFusionEngine {
         &self.ctx
     }
 
-    /// Get the Arc<SessionContext> for sharing
+    /// Get the `Arc<SessionContext>` for sharing
     ///
     /// This method allows cloning the Arc to share the SessionContext with other components.
     ///
     /// # Returns
     ///
-    /// Returns a clone of the Arc<SessionContext>
+    /// Returns a clone of the `Arc<SessionContext>`
     pub fn session_context_arc(&self) -> Arc<SessionContext> {
         self.ctx.clone()
     }

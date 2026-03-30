@@ -132,7 +132,7 @@ impl OptimizerRegistry {
 
     /// Get a clone of the Lance datasets map
     ///
-    /// Returns an Arc<RwLock<>> that can be shared with table functions
+    /// Returns an `Arc<RwLock<>>` that can be shared with table functions
     pub fn lance_datasets(&self) -> Arc<RwLock<HashMap<String, Arc<Dataset>>>> {
         Arc::clone(&self.lance_datasets)
     }
