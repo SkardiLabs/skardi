@@ -272,22 +272,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish skardi-engine
-        run: cargo publish -p skardi-engine
-
-      # Wait for crates.io to index skardi-engine before publishing dependents
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish skardi-pipeline
-        run: cargo publish -p skardi-pipeline
-
-      - name: Publish skardi-model
-        run: cargo publish -p skardi-model
-
-      - name: Wait for crates.io index (pipeline + model)
-        run: sleep 30
-
       - name: Publish skardi
         run: cargo publish -p skardi
 
