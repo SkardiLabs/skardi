@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1-rc.3"
 edition = "2024"
 description = "High performance query engine for both offline compute and online serving"
 authors = ["btnokami"]
