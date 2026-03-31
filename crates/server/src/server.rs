@@ -66,24 +66,30 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     let additional_optimizers =
         optimizer_registry.get_physical_optimizer_rules(&config.data_sources);
 
-    // Rebuild SessionState with additional physical optimizers if any
-    let state = if !additional_optimizers.is_empty() {
+    // Build physical optimizer rules: skardi rules first, tracing rule last
+    // (tracing must be last so it sees the fully optimized plan)
+    let mut physical_optimizer_rules = state.physical_optimizers().to_vec();
+    if !additional_optimizers.is_empty() {
         tracing::info!(
             "Adding {} physical optimizer(s) to SessionState",
             additional_optimizers.len()
         );
-
-        // Get current physical optimizers and add our additional ones
-        let mut physical_optimizer_rules = state.physical_optimizers().to_vec();
         physical_optimizer_rules.extend(additional_optimizers);
+    }
+    physical_optimizer_rules.push(datafusion_tracing::instrument_with_info_spans!(
+        options: datafusion_tracing::InstrumentationOptions::default()
+    ));
 
-        // Rebuild SessionState with the new optimizer rules
-        datafusion::execution::SessionStateBuilder::new_from_existing(state)
-            .with_physical_optimizer_rules(physical_optimizer_rules)
-            .build()
-    } else {
-        state
-    };
+    // Rebuild SessionState with all physical optimizer rules
+    let state = datafusion::execution::SessionStateBuilder::new_from_existing(state)
+        .with_physical_optimizer_rules(physical_optimizer_rules)
+        .build();
+
+    // Instrument analyzer and logical/physical optimizer rule phases with tracing spans
+    let state = datafusion_tracing::instrument_rules_with_info_spans!(
+        options: datafusion_tracing::RuleInstrumentationOptions::full(),
+        state: state
+    );
 
     let mut session_ctx = SessionContext::new_with_state(state);
 
