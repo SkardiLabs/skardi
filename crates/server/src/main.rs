@@ -8,16 +8,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialise OpenTelemetry (traces + metrics) before the tracing subscriber
-    let otlp_endpoint = std::env::var("OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+    let otlp_endpoint =
+        std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string());
     let (_telemetry_guard, tracer) = telemetry::init(&otlp_endpoint)?;
 
     // Initialize tracing subscriber: fmt to stdout + OTel trace export
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info".into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(
             tracing_subscriber::fmt::layer()

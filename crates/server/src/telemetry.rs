@@ -30,9 +30,7 @@ impl Drop for TelemetryGuard {
 /// can be passed into `tracing_opentelemetry::layer()`.
 ///
 /// The returned `TelemetryGuard` must be kept alive until the process exits.
-pub fn init(
-    otlp_endpoint: &str,
-) -> Result<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)> {
+pub fn init(otlp_endpoint: &str) -> Result<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)> {
     let resource = Resource::new(vec![KeyValue::new(
         opentelemetry_semantic_conventions::resource::SERVICE_NAME,
         "skardi-server",
@@ -67,5 +65,11 @@ pub fn init(
 
     global::set_meter_provider(meter_provider.clone());
 
-    Ok((TelemetryGuard { tracer_provider, meter_provider }, tracer))
+    Ok((
+        TelemetryGuard {
+            tracer_provider,
+            meter_provider,
+        },
+        tracer,
+    ))
 }
