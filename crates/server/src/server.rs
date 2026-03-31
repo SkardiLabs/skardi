@@ -4,7 +4,7 @@ use axum::{
     Router,
 };
 use datafusion::prelude::SessionContext;
-use skardi_engine::datafusion::DataFusionEngine;
+use skardi::engine::datafusion::DataFusionEngine;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use crate::config::{AccessMode, CliArgs, DataSource, DataSourceType};
     use datafusion::prelude::SessionContext;
-    use pipeline::pipeline::{Pipeline, StandardPipeline};
+    use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;

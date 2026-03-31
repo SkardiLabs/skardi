@@ -6408,9 +6408,24 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 name = "skardi"
 version = "0.1.0"
 dependencies = [
- "skardi-engine",
- "skardi-model",
- "skardi-pipeline",
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "datafusion-common",
+ "log",
+ "ndarray 0.17.2",
+ "num_cpus",
+ "ort",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "skardi-sources",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
 ]
 
 [[package]]
@@ -6436,55 +6451,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "skardi-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "datafusion",
- "datafusion-common",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "skardi-model"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "datafusion",
- "log",
- "ndarray 0.17.2",
- "num_cpus",
- "ort",
- "skardi-sources",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "skardi-pipeline"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "datafusion",
- "log",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "skardi-engine",
- "tempfile",
- "tokio",
- "tokio-test",
-]
-
-[[package]]
 name = "skardi-server"
 version = "0.1.0"
 dependencies = [
@@ -6502,9 +6468,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "skardi-engine",
- "skardi-model",
- "skardi-pipeline",
+ "skardi",
  "skardi-sources",
  "tempfile",
  "thiserror 1.0.69",

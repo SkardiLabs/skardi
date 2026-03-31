@@ -12,8 +12,31 @@ license.workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+default = []
+onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]
+
 [dependencies]
-skardi-engine = { path = "../engine" }
-pipeline = { package = "skardi-pipeline", path = "../pipeline" }
-model = { package = "skardi-model", path = "../model" }
-# sources is excluded until the lance git dependency is replaced with a crates.io version
+# engine
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+arrow = { workspace = true }
+tracing = { workspace = true }
+# pipeline
+log = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+# model
+ndarray = { version = "0.17", optional = true }
+num_cpus = { version = "1.17.0", optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = { workspace = true }
+sources = { package = "skardi-sources", path = "../sources" }

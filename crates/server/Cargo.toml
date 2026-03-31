@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-onnx = ["dep:model", "model/onnx"]
+onnx = ["skardi/onnx"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -25,10 +25,8 @@ object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-skardi-engine = { path = "../engine" }
-pipeline = { package = "skardi-pipeline", path = "../pipeline" }
+skardi = { path = "../skardi" }
 sources = { package = "skardi-sources", path = "../sources" }
-model = { package = "skardi-model", path = "../model", optional = true }
 anyhow = "1.0"
 thiserror = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync"] }

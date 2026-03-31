@@ -1,8 +1,4 @@
 //! Engine abstraction layer for query execution
-//!
-//! This crate provides a unified interface for executing SQL queries against different
-//! execution engines. The primary abstraction is the `Engine` trait which defines
-//! the contract for SQL execution.
 
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
@@ -32,7 +28,7 @@ pub trait Engine: Send + Sync {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use skardi_engine::Engine;
+    /// use skardi::engine::Engine;
     ///
     /// async fn example_usage(engine: &dyn Engine) -> anyhow::Result<()> {
     ///     let sql = "SELECT * FROM my_table WHERE id = 1";

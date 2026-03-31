@@ -8,7 +8,7 @@ use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::types::{InferredFieldType, RequestSchema, ResponseSchema};
+use super::types::{InferredFieldType, RequestSchema, ResponseSchema};
 
 /// SQL schema inference engine for extracting parameter and response schemas from SQL queries
 /// TODO: Fix the issue that extra parameters in the request is allowed

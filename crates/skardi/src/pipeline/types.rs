@@ -97,7 +97,7 @@ impl YamlSerializable for PipelineComponent {
     ///
     /// # Examples
     /// ```
-    /// use pipeline::types::{PipelineComponent, ComponentMetadata, YamlSerializable};
+    /// use skardi::pipeline::types::{PipelineComponent, ComponentMetadata, YamlSerializable};
     ///
     /// let metadata = ComponentMetadata {
     ///     name: "test_pipeline".to_string(),
