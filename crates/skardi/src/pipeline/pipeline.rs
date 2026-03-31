@@ -256,7 +256,7 @@ pub trait Pipeline {
     ///
     /// ```rust,no_run
     /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
-    /// use crate::engine::{Engine, datafusion::DataFusionEngine};
+    /// use skardi::engine::{Engine, datafusion::DataFusionEngine};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -765,8 +765,10 @@ impl Pipeline for StandardPipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::types::{ComponentMetadata, QueryDefinition, RequestSchema, ResponseSchema};
     use super::*;
+    use crate::pipeline::types::{
+        ComponentMetadata, QueryDefinition, RequestSchema, ResponseSchema,
+    };
     use std::collections::HashMap;
 
     #[tokio::test]

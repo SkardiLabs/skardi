@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::converter::{arrayref_slice_to_ndarray, columnar_values_to_arrayrefs};
-use crate::model::Model;
+use super::converter::{arrayref_slice_to_ndarray, columnar_values_to_arrayrefs};
+use crate::model::model::Model;
 
 /// Metadata about a single model input, introspected from the ONNX file.
 #[derive(Debug, Clone)]

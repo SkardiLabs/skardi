@@ -35,7 +35,7 @@ impl DataFusionEngine {
     ///
     /// ```rust,no_run
     /// use datafusion::prelude::*;
-    /// use skardi_engine::datafusion::DataFusionEngine;
+    /// use skardi::engine::datafusion::DataFusionEngine;
     ///
     /// let ctx = SessionContext::new();
     /// // Register tables, configure settings, etc.
