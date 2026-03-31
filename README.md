@@ -62,6 +62,7 @@ Skardi lets AI agents and applications query files, databases, data lakes, and v
   - [S3 Remote Files](#s3-remote-files)
 - [ONNX Model Inference](#onnx-model-inference)
 - [Federated Queries](#federated-queries)
+- [Observability](#observability)
 - [Docker](#docker)
 - [Building from Source](#building-from-source)
 
@@ -627,6 +628,49 @@ query: |
   WHERE u.name = {name}
   GROUP BY u.id, u.name
 ```
+
+## Observability
+
+`skardi-server` exports traces and metrics via [OpenTelemetry](https://opentelemetry.io/) (OTLP gRPC), giving you full visibility into query execution inside Grafana.
+
+### What is instrumented
+
+- **Traces** — Every DataFusion execution plan node is wrapped with a span. You can see `elapsed_compute`, `output_rows`, spill counts, and optimizer rule timings per query.
+- **Metrics** — Exported via OTLP and scraped by Prometheus for dashboards over time.
+
+### Local observability stack
+
+A `docker-compose.yml` is included with a pre-configured Grafana stack:
+
+| Service | Role | Port |
+|---------|------|------|
+| OTel Collector | Receives OTLP from the server, fans out to backends | 4317 (gRPC), 4318 (HTTP) |
+| Grafana Tempo | Trace storage | — |
+| Prometheus | Metric storage (scrapes collector at :8889) | 9090 |
+| Grafana Loki | Log storage | — |
+| Grafana | Visualization (Tempo + Prometheus + Loki pre-provisioned) | 3000 |
+
+```bash
+# Start the stack
+docker-compose -f observability/docker-compose.yml up -d
+
+# Run the server pointing at the collector
+OTLP_ENDPOINT=http://localhost:4317 RUST_LOG=debug cargo run -p skardi-server -- --port 8080
+```
+
+Then open Grafana at **http://localhost:3000** — all three datasources (Tempo, Prometheus, Loki) are pre-provisioned.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint to export to |
+| `RUST_LOG` | `info` | Log level. Use `debug` to see per-query DataFusion span detail |
+
+### Log levels
+
+- `RUST_LOG=info` — normal production operation; high-level server events only
+- `RUST_LOG=debug` — shows per-query DataFusion execution spans (plan nodes, row counts, optimizer timing)
 
 ## Docker
 

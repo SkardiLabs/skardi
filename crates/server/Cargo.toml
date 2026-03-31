@@ -34,7 +34,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "syn
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
 tracing = { workspace = true }
+tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics"] }
+opentelemetry-semantic-conventions = "0.27"
 url = { workspace = true }
 
 [dev-dependencies]

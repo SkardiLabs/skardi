@@ -1,4 +1,5 @@
 pub mod config;
+pub mod telemetry;
 pub mod handlers;
 pub mod optimizer_registry;
 pub mod remote_storage;

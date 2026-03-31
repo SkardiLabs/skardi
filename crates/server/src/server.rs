@@ -76,7 +76,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         );
         physical_optimizer_rules.extend(additional_optimizers);
     }
-    physical_optimizer_rules.push(datafusion_tracing::instrument_with_info_spans!(
+    physical_optimizer_rules.push(datafusion_tracing::instrument_with_debug_spans!(
         options: datafusion_tracing::InstrumentationOptions::default()
     ));
 
@@ -86,7 +86,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         .build();
 
     // Instrument analyzer and logical/physical optimizer rule phases with tracing spans
-    let state = datafusion_tracing::instrument_rules_with_info_spans!(
+    let state = datafusion_tracing::instrument_rules_with_debug_spans!(
         options: datafusion_tracing::RuleInstrumentationOptions::full(),
         state: state
     );
