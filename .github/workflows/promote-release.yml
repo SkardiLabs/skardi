@@ -49,11 +49,5 @@ jobs:
       - name: Create and push tag
         run: |
           OFFICIAL="${{ steps.version.outputs.official }}"
-
-          if git rev-parse "$OFFICIAL" &>/dev/null; then
-            echo "Error: Tag $OFFICIAL already exists. Delete it first if you want to re-promote."
-            exit 1
-          fi
-
           git tag "$OFFICIAL"
           git push origin "$OFFICIAL"
