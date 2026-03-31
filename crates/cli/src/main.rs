@@ -254,12 +254,11 @@ impl UrlTableFactory for SkardiUrlTableFactory {
             let table_name = &url[pos + ext.len()..];
 
             if !table_name.is_empty() {
-                let provider =
-                    skardi::sources::providers::sqlite::create_sqlite_table_provider(db_path, table_name)
-                        .await
-                        .map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(e.to_string())
-                        })?;
+                let provider = skardi::sources::providers::sqlite::create_sqlite_table_provider(
+                    db_path, table_name,
+                )
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
                 return Ok(Some(provider));
             }
