@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 // Re-export AccessMode for convenience
-pub use crate::access_mode::AccessMode;
+pub use crate::sources::access_mode::AccessMode;
 
 #[derive(Debug, Clone)]
 pub struct SqlValidatorConfig {

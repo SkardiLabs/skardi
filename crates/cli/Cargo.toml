@@ -26,7 +26,7 @@ object_store = { workspace = true, features = ["aws", "gcp", "azure", "http"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sources = { package = "skardi-sources", path = "../sources" }
+skardi = { path = "../skardi" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 url = { workspace = true }
 

@@ -47,7 +47,7 @@ impl RedisRelation {
     /// # Examples
     ///
     /// ```
-    /// use skardi_sources::providers::redis::relation::RedisRelation;
+    /// use skardi::sources::providers::redis::relation::RedisRelation;
     ///
     /// let pattern = "users:*";
     /// let key = "users:1234";

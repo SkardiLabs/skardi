@@ -11,7 +11,7 @@
 use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
-use sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
+use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 

@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 /// # Example
 /// ```no_run
 /// use datafusion::prelude::SessionContext;
-/// use skardi_sources::providers::lance::register_lance_table;
+/// use skardi::sources::providers::lance::register_lance_table;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let mut ctx = SessionContext::new();
