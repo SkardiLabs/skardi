@@ -3,7 +3,7 @@
 //! This module contains the DataFusion-specific implementation of the `Engine` trait,
 //! providing SQL query execution capabilities using the DataFusion query engine.
 
-use crate::Engine;
+use super::Engine;
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -35,7 +35,7 @@ impl DataFusionEngine {
     ///
     /// ```rust,no_run
     /// use datafusion::prelude::*;
-    /// use skardi_engine::datafusion::DataFusionEngine;
+    /// use skardi::engine::datafusion::DataFusionEngine;
     ///
     /// let ctx = SessionContext::new();
     /// // Register tables, configure settings, etc.

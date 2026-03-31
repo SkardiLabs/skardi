@@ -1,5 +1,5 @@
 [package]
-name = "pipeline"
+name = "skardi"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -12,23 +12,31 @@ license.workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+default = []
+onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]
+
 [dependencies]
+# engine
 anyhow = { workspace = true }
-arrow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+arrow = { workspace = true }
+tracing = { workspace = true }
+# pipeline
 log = { workspace = true }
 regex = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-skardi-engine = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
-
+# model
+ndarray = { version = "0.17", optional = true }
+num_cpus = { version = "1.17.0", optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = { workspace = true }
-
-[lints]
-workspace = true
+sources = { package = "skardi-sources", path = "../sources" }

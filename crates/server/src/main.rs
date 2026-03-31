@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use pipeline::pipeline::Pipeline;
+use skardi::pipeline::pipeline::Pipeline;
 use skardi_server::{create_server, load_server_config, CliArgs};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

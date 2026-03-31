@@ -249,6 +249,37 @@ jobs:
             "${IMAGE}:${VERSION}-arm64"
           docker manifest push "${IMAGE}:latest"
 
+  publish:
+    name: "Publish to crates.io (${{ inputs.version }})"
+    needs: validate
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust
+        run: rustup toolchain install stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish skardi
+        run: cargo publish -p skardi
+
+      # skardi-sources is not published yet: it depends on lance via git which crates.io disallows.
+      # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml, add it to
+      # the skardi facade crate, and publish with:
+      #   cargo publish -p skardi-sources  (before cargo publish -p skardi)
+
   release:
     name: "Create Release (${{ inputs.version }})"
     needs: [build, docker-manifest]

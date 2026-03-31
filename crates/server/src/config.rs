@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
-use pipeline::pipeline::{Pipeline, StandardPipeline};
 use serde::{Deserialize, Serialize};
+use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -397,7 +397,7 @@ async fn load_pipeline_config(path: &Path, ctx: Arc<SessionContext>) -> Result<S
 /// No pre-configuration needed — ORT runtime and models are initialized on first call.
 #[cfg(feature = "onnx")]
 pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
-    let registry = Arc::new(model::OnnxModelRegistry::new());
+    let registry = Arc::new(skardi::model::OnnxModelRegistry::new());
     registry.register_onnx_predict_udf(ctx);
 }
 

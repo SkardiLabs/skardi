@@ -1,15 +1,15 @@
+use crate::engine::Engine;
 use anyhow::{Result, anyhow};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use serde::Serialize;
-use skardi_engine::Engine;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::inferencer::SqlSchemaInferrer;
-use crate::types::{
+use super::inferencer::SqlSchemaInferrer;
+use super::types::{
     ComponentMetadata, QueryDefinition, RequestSchema, ResponseSchema, ValidationReport,
 };
 
@@ -36,7 +36,7 @@ pub trait Pipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::path::Path;
     /// use std::sync::Arc;
@@ -68,7 +68,7 @@ pub trait Pipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -123,7 +123,7 @@ pub trait Pipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -150,7 +150,7 @@ pub trait Pipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -181,7 +181,7 @@ pub trait Pipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -220,7 +220,7 @@ pub trait Pipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -255,8 +255,8 @@ pub trait Pipeline {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
-    /// use skardi_engine::{Engine, datafusion::DataFusionEngine};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::engine::{Engine, datafusion::DataFusionEngine};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -319,8 +319,8 @@ impl StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::StandardPipeline;
-    /// use pipeline::types::{ComponentMetadata, RequestSchema, QueryDefinition, ResponseSchema};
+    /// use skardi::pipeline::pipeline::StandardPipeline;
+    /// use skardi::pipeline::types::{ComponentMetadata, RequestSchema, QueryDefinition, ResponseSchema};
     /// use datafusion::prelude::SessionContext;
     /// use std::collections::HashMap;
     /// use std::sync::Arc;
@@ -366,8 +366,8 @@ impl StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::StandardPipeline;
-    /// use pipeline::types::{ComponentMetadata, RequestSchema, QueryDefinition, ResponseSchema};
+    /// use skardi::pipeline::pipeline::StandardPipeline;
+    /// use skardi::pipeline::types::{ComponentMetadata, RequestSchema, QueryDefinition, ResponseSchema};
     /// use datafusion::prelude::SessionContext;
     /// use std::collections::HashMap;
     /// use std::sync::Arc;
@@ -409,8 +409,8 @@ impl StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::StandardPipeline;
-    /// use pipeline::types::{ComponentMetadata, RequestSchema, QueryDefinition, ResponseSchema};
+    /// use skardi::pipeline::pipeline::StandardPipeline;
+    /// use skardi::pipeline::types::{ComponentMetadata, RequestSchema, QueryDefinition, ResponseSchema};
     /// use datafusion::prelude::SessionContext;
     /// use std::collections::HashMap;
     /// use std::sync::Arc;
@@ -468,7 +468,7 @@ impl Pipeline for StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::path::Path;
     /// use std::sync::Arc;
@@ -547,7 +547,7 @@ impl Pipeline for StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -587,7 +587,7 @@ impl Pipeline for StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -618,7 +618,7 @@ impl Pipeline for StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -653,7 +653,7 @@ impl Pipeline for StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -700,7 +700,7 @@ impl Pipeline for StandardPipeline {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// use pipeline::pipeline::{Pipeline, StandardPipeline};
+    /// use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     /// use datafusion::prelude::SessionContext;
     /// use std::sync::Arc;
     ///
@@ -766,7 +766,9 @@ impl Pipeline for StandardPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ComponentMetadata, QueryDefinition, RequestSchema, ResponseSchema};
+    use crate::pipeline::types::{
+        ComponentMetadata, QueryDefinition, RequestSchema, ResponseSchema,
+    };
     use std::collections::HashMap;
 
     #[tokio::test]

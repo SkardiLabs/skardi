@@ -1,5 +1,5 @@
 [package]
-name = "sources"
+name = "skardi-sources"
 version.workspace = true
 edition.workspace = true
 description.workspace = true

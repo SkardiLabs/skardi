@@ -6,10 +6,10 @@ use axum::{
     Json,
 };
 use datafusion::prelude::SessionContext;
-use pipeline::pipeline::Pipeline;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use skardi_engine::Engine;
+use skardi::engine::Engine;
+use skardi::pipeline::pipeline::Pipeline;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -679,8 +679,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
-    use pipeline::pipeline::{Pipeline, StandardPipeline};
-    use skardi_engine::datafusion::DataFusionEngine;
+    use skardi::engine::datafusion::DataFusionEngine;
+    use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     use sources::AccessMode;
     use std::fs;
     use std::path::PathBuf;
