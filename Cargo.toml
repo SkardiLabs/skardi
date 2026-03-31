@@ -10,7 +10,6 @@ license = "Apache-2.0"
 [workspace]
 members = [ "crates/cli",
             "crates/skardi",
-            "crates/sources",
             "crates/server"]
 
 resolver = "2"
@@ -46,9 +45,9 @@ iceberg = "0.9.0"
 iceberg-datafusion = "0.9.0"
 iceberg-storage-opendal = "0.9.0"
 insta = { version = "1.41.1", features = ["glob", "filters"] }
-lance = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1", default-features = false }
-lance-index = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1" }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v4.0.0-rc.1" }
+lance = { version = "4.0.0", default-features = false }
+lance-index = { version = "4.0.0" }
+lance-linalg = { version = "4.0.0" }
 log = "0.4.27"
 object_store = { version = "0.12.4", default-features = false, features = ["aws", "gcp", "azure", "http"] }
 parking_lot = "0.12"

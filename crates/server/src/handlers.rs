@@ -681,7 +681,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use skardi::engine::datafusion::DataFusionEngine;
     use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
-    use sources::AccessMode;
+    use skardi::sources::AccessMode;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
