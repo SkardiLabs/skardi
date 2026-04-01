@@ -3,8 +3,7 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**The Declarative data runtime for AI and agents powered by Rust and Apache Datafusion.**<br/>
-**Query files, databases, data lakes, and vector stores with SQL — locally with skardi-cli or as APIs with skardi-server.**
+**SQL across anything: query, join, and aggregate over local files, databases, S3, and propriatory stores — or turn any SQL into a parameterized HTTP API, zero application code required, written in Rust, powered by Apache Datafusion.**
 
 [CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
 [CI Badge]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml/badge.svg
@@ -16,7 +15,7 @@
 
 <hr />
 
-Skardi lets AI agents and applications query files, databases, data lakes, and vector stores with SQL — no application code required.
+Skardi runs federated SQL across files, databases, object stores, and vector stores — and turns any query into a parameterized REST API with no application code.
 
 - **`skardi-cli`** — Run SQL queries locally against files, object stores, databases, and datalake formats. Ideal for local agents like [OpenClaw](https://github.com/openclaw/openclaw) that need structured data access without a running server.
 - **`skardi-server`** — Define SQL queries in YAML and serve them as parameterized HTTP APIs. Connect to multiple data sources, run federated queries, and expose results as REST endpoints.
