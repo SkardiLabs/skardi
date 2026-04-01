@@ -1,21 +1,29 @@
 use anyhow::Result;
 use clap::Parser;
 use skardi::pipeline::pipeline::Pipeline;
-use skardi_server::{create_server, load_server_config, CliArgs};
+use skardi_server::{create_server, load_server_config, telemetry, CliArgs};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4317";
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing subscriber for logging
+    // Initialise OpenTelemetry (traces + metrics) before the tracing subscriber
+    let otlp_endpoint =
+        std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
+    let (_telemetry_guard, tracer) = telemetry::init(&otlp_endpoint)?;
+
+    // Initialize tracing subscriber: fmt to stdout + OTel trace export
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // Default to info level, with debug for our crates
-                "info,skardi_server=info,pipeline=info,skardi_engine=info,source=info".into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
+        )
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .init();
 
     info!("🚀 Starting Skardi Online Serving Pipeline Server");

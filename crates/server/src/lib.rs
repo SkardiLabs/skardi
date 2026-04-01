@@ -1,8 +1,10 @@
 pub mod config;
 pub mod handlers;
+pub mod metrics;
 pub mod optimizer_registry;
 pub mod remote_storage;
 pub mod server;
+pub mod telemetry;
 
 // Re-export public types for easy access
 pub use config::{

@@ -557,6 +557,11 @@ pub async fn execute_pipeline_by_name(
 
     // Return detailed error for parameter validation issues
     if !missing_params.is_empty() || !unsupported_params.is_empty() {
+        let elapsed_ms = start_time.elapsed().as_millis() as f64;
+        app_state
+            .metrics
+            .record_error(&pipeline_name, elapsed_ms, "parameter_validation_error");
+
         let mut error_details = serde_json::json!({
             "expected_parameters": expected_params,
             "received_parameters": request.parameters.keys().collect::<Vec<_>>()
@@ -596,6 +601,11 @@ pub async fn execute_pipeline_by_name(
             tracing::error!("Query execution failed: {}", e);
             tracing::debug!("Failed SQL query: {}", sql); // Log SQL for debugging but don't expose in response
 
+            let elapsed_ms = start_time.elapsed().as_millis() as f64;
+            app_state
+                .metrics
+                .record_error(&pipeline_name, elapsed_ms, "query_execution_error");
+
             let error_details = serde_json::json!({
                 "engine_error": e.to_string(),
                 "registered_tables": "Check server logs for data source registration status",
@@ -617,6 +627,11 @@ pub async fn execute_pipeline_by_name(
         Err(e) => {
             tracing::error!("Failed to convert results to JSON: {}", e);
 
+            let elapsed_ms = start_time.elapsed().as_millis() as f64;
+            app_state
+                .metrics
+                .record_error(&pipeline_name, elapsed_ms, "result_conversion_error");
+
             let error_details = serde_json::json!({
                 "conversion_error": e.to_string(),
                 "record_batch_schema": format!("{:?}", record_batch.schema()),
@@ -634,6 +649,10 @@ pub async fn execute_pipeline_by_name(
 
     let execution_time = start_time.elapsed().as_millis() as u64;
     let row_count = record_batch.num_rows();
+
+    app_state
+        .metrics
+        .record_success(&pipeline_name, execution_time as f64);
 
     tracing::info!(
         "Query completed successfully: {} rows in {}ms",
@@ -789,6 +808,7 @@ pub async fn serve_dashboard(State(app_state): State<AppState>) -> axum::respons
 mod tests {
     use super::*;
     use crate::config::{CliArgs, DataSource, DataSourceType, ServerConfig};
+    use crate::metrics::PipelineMetrics;
     use crate::server::AppState;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -856,6 +876,7 @@ query: |
             config: Arc::new(RwLock::new(config)),
             engine,
             session_ctx,
+            metrics: PipelineMetrics::new(),
         }
     }
 
@@ -936,6 +957,7 @@ query: |
             config: Arc::new(RwLock::new(config)),
             engine,
             session_ctx: session_ctx_arc,
+            metrics: PipelineMetrics::new(),
         };
 
         let request = ExecuteRequest {
