@@ -636,7 +636,34 @@ query: |
 ### What is instrumented
 
 - **Traces** — Every DataFusion execution plan node is wrapped with a span. You can see `elapsed_compute`, `output_rows`, spill counts, and optimizer rule timings per query.
-- **Metrics** — Exported via OTLP and scraped by Prometheus for dashboards over time.
+- **Pipeline metrics** — Per-pipeline request count, latency, and error rate exported via OTLP on every `/execute` call.
+- **Logs** — Structured logs forwarded to Loki via the OTel Collector.
+
+### Pipeline metrics
+
+Every call to `/:name/execute` records two OTel metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipeline_requests_total` | Counter | `pipeline`, `status` (`success`/`error`), `error_type` | Total requests by outcome |
+| `pipeline_latency_ms` | Histogram | `pipeline` | End-to-end handler latency in milliseconds |
+
+Example PromQL queries for Grafana dashboards:
+
+```promql
+# Requests per second per pipeline
+rate(pipeline_requests_total[5m])
+
+# Error rate (fraction of failing requests)
+rate(pipeline_requests_total{status="error"}[5m])
+  / rate(pipeline_requests_total[5m])
+
+# p99 latency per pipeline
+histogram_quantile(0.99, rate(pipeline_latency_ms_bucket[5m]))
+
+# p50 latency per pipeline
+histogram_quantile(0.50, rate(pipeline_latency_ms_bucket[5m]))
+```
 
 ### Local observability stack
 
