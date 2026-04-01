@@ -14,7 +14,7 @@ use crate::config::register_onnx_predict_udf;
 use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
-    pipeline_health_check,
+    pipeline_health_check, serve_dashboard,
 };
 
 /// Shared application state containing pipeline and engine
@@ -132,6 +132,7 @@ pub fn configure_routes(state: AppState) -> Router {
     tracing::info!("Configuring HTTP routes");
 
     Router::new()
+        .route("/", get(serve_dashboard))
         .route("/health", get(health_check))
         .route("/health/:name", get(pipeline_health_check))
         .route("/pipelines", get(list_pipelines))

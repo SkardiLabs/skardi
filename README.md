@@ -43,6 +43,7 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 - [Skardi CLI](#skardi-cli)
 - [Skardi Server](#skardi-server)
   - [Running the Server](#running-the-server)
+  - [Dashboard](#dashboard)
   - [API Endpoints](#api-endpoints)
   - [Context Files](#context-files)
   - [Access Mode](#access-mode)
@@ -195,10 +196,23 @@ cargo run --bin skardi-server -- \
 | `--pipeline` | Path to a pipeline YAML file or a directory of pipeline files |
 | `--port` | Port to listen on (default: 8080) |
 
+### Dashboard
+
+Once the server is running, open `http://localhost:8080` in your browser to access the pipeline dashboard.
+
+The dashboard lists every registered pipeline as a card showing:
+- **Endpoint URL** — the `POST` path to call, with a one-click copy button
+- **Parameters** — inferred parameter names and types from the pipeline SQL
+- **Example request** — a ready-to-run `curl` command for the pipeline
+- **Try It** — an interactive panel where you can edit the JSON body and execute the pipeline directly from the browser
+
+No configuration required — the dashboard is built into `skardi-server` and updates automatically when pipelines are loaded.
+
 ### API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Pipeline dashboard UI |
 | `/health` | GET | Service health check |
 | `/health/:name` | GET | Per-pipeline health check (includes data source status) |
 | `/pipelines` | GET | List all registered pipelines |
