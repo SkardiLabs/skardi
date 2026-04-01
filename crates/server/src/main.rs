@@ -5,11 +5,13 @@ use skardi_server::{create_server, load_server_config, telemetry, CliArgs};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4317";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialise OpenTelemetry (traces + metrics) before the tracing subscriber
     let otlp_endpoint =
-        std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string());
+        std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
     let (_telemetry_guard, tracer) = telemetry::init(&otlp_endpoint)?;
 
     // Initialize tracing subscriber: fmt to stdout + OTel trace export

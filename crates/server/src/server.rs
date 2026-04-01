@@ -16,6 +16,7 @@ use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
     pipeline_health_check,
 };
+use crate::metrics::PipelineMetrics;
 
 /// Shared application state containing pipeline and engine
 #[derive(Clone)]
@@ -24,6 +25,8 @@ pub struct AppState {
     pub engine: Arc<DataFusionEngine>,
     /// SessionContext for pipeline loading (shared with engine)
     pub session_ctx: Arc<SessionContext>,
+    /// OTel metrics instruments (request counter + latency histogram)
+    pub metrics: PipelineMetrics,
 }
 
 /// Main server creation function - Primary public interface
@@ -126,6 +129,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         config: Arc::new(RwLock::new(config)),
         engine,
         session_ctx: session_ctx_arc,
+        metrics: PipelineMetrics::new(),
     };
 
     tracing::info!("Application state setup completed successfully");

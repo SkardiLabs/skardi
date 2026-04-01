@@ -1,5 +1,6 @@
 pub mod config;
 pub mod handlers;
+pub mod metrics;
 pub mod optimizer_registry;
 pub mod remote_storage;
 pub mod server;
