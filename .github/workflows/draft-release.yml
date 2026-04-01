@@ -61,28 +61,34 @@ jobs:
           echo "rc=$RC_NUM" >> $GITHUB_OUTPUT
           echo "Next version: v${NEXT}-rc.${RC_NUM}"
 
+      - name: Install Rust
+        run: rustup toolchain install stable
+
       - name: Bump version in Cargo.toml and open PR
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NEXT="${{ steps.version.outputs.next }}"
-          BRANCH="release/bump-${NEXT}"
+          RC="${{ steps.version.outputs.rc }}"
+          FULL_VERSION="${NEXT}-rc.${RC}"
+          BRANCH="release/bump-${FULL_VERSION}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
 
           # Replace the version line in the workspace Cargo.toml
-          sed -i "s/^version = \".*\"/version = \"${NEXT}\"/" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${FULL_VERSION}\"/" Cargo.toml
+          cargo update -p skardi --precise "${FULL_VERSION}"
 
-          git add Cargo.toml
-          git commit -m "chore: bump version to ${NEXT}"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${FULL_VERSION}"
           git push origin "$BRANCH"
 
           PR_URL=$(gh pr create \
-            --title "chore: bump version to ${NEXT}" \
-            --body "Automated version bump to \`${NEXT}\` ahead of the \`v${NEXT}-rc.${{ steps.version.outputs.rc }}\` release." \
+            --title "chore: bump version to ${FULL_VERSION}" \
+            --body "Automated version bump to \`${FULL_VERSION}\` ahead of the \`v${FULL_VERSION}\` release." \
             --base main \
             --head "$BRANCH")
 
