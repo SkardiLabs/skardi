@@ -1,4 +1,5 @@
 name: Draft Release
+run-name: "Draft Release (${{ inputs.bump }} bump)"
 
 on:
   workflow_dispatch:
@@ -14,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   draft-release:
@@ -59,11 +61,90 @@ jobs:
           echo "rc=$RC_NUM" >> $GITHUB_OUTPUT
           echo "Next version: v${NEXT}-rc.${RC_NUM}"
 
-      - name: Create tag
+      - name: Install Rust
+        run: rustup toolchain install stable
+
+      - name: Bump version in Cargo.toml and open PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          NEXT="${{ steps.version.outputs.next }}"
+          RC="${{ steps.version.outputs.rc }}"
+          FULL_VERSION="${NEXT}-rc.${RC}"
+          BRANCH="release/bump-${FULL_VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clean up any leftover remote branch from a previous run
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
+          git checkout -b "$BRANCH"
+
+          # Replace the version line in the workspace Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${FULL_VERSION}\"/" Cargo.toml
+          cargo update -p skardi --precise "${FULL_VERSION}"
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${FULL_VERSION}"
+          git push --force origin "$BRANCH"
+
+          PR_URL=$(gh pr create \
+            --title "chore: bump version to ${FULL_VERSION}" \
+            --body "Automated version bump to \`${FULL_VERSION}\` ahead of the \`v${FULL_VERSION}\` release." \
+            --base main \
+            --head "$BRANCH")
+
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "PR created: $PR_URL"
+
+      - name: Wait for PR to be merged (1 hour timeout)
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_URL="${{ steps.pr.outputs.pr_url }}"
+          TIMEOUT=3600   # 1 hour in seconds
+          INTERVAL=30    # poll every 30 seconds
+          ELAPSED=0
+
+          echo "Waiting for PR to be merged: $PR_URL"
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATE=$(gh pr view "$PR_URL" --json state,mergeStateStatus --jq '.state')
+
+            if [ "$STATE" = "MERGED" ]; then
+              echo "PR merged successfully."
+              break
+            elif [ "$STATE" = "CLOSED" ]; then
+              echo "Error: PR was closed without merging."
+              exit 1
+            fi
+
+            echo "PR state: $STATE — waiting ${INTERVAL}s (elapsed: ${ELAPSED}s / ${TIMEOUT}s)"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "Error: Timed out after ${TIMEOUT}s waiting for PR to be merged."
+            exit 1
+          fi
+
+      - name: Fetch merged main and create RC tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch origin main
+          git checkout main
+          git pull origin main
+
           VERSION="v${{ steps.version.outputs.next }}-rc.${{ steps.version.outputs.rc }}"
           git tag "$VERSION"
           git push origin "$VERSION"
+          echo "Tagged: $VERSION"
 
       - name: Create draft release
         env:
