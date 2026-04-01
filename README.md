@@ -648,6 +648,23 @@ Every call to `/:name/execute` records two OTel metrics:
 | `pipeline_requests_total` | Counter | `pipeline`, `status` (`success`/`error`), `error_type` | Total requests by outcome |
 | `pipeline_latency_ms` | Histogram | `pipeline` | End-to-end handler latency in milliseconds |
 
+**Verify metrics are flowing** — the OTel Collector exposes a Prometheus scrape endpoint at `:8889`. After firing at least one request, run:
+
+```bash
+curl -s http://localhost:8889/metrics | grep pipeline
+```
+
+Expected output:
+```
+pipeline_latency_ms_bucket{pipeline="my-pipeline",le="..."} 2
+pipeline_latency_ms_count{pipeline="my-pipeline"} 2
+pipeline_latency_ms_sum{pipeline="my-pipeline"} 45.3
+pipeline_requests_total{pipeline="my-pipeline",status="success"} 1
+pipeline_requests_total{pipeline="my-pipeline",status="error",error_type="parameter_validation_error"} 1
+```
+
+> **Note:** The periodic exporter flushes every 60 seconds. If the output is empty, wait a moment and retry.
+
 Example PromQL queries for Grafana dashboards:
 
 ```promql
