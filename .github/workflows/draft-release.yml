@@ -76,6 +76,10 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clean up any leftover remote branch from a previous run
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
           git checkout -b "$BRANCH"
 
           # Replace the version line in the workspace Cargo.toml
@@ -84,7 +88,7 @@ jobs:
 
           git add Cargo.toml Cargo.lock
           git commit -m "chore: bump version to ${FULL_VERSION}"
-          git push origin "$BRANCH"
+          git push --force origin "$BRANCH"
 
           PR_URL=$(gh pr create \
             --title "chore: bump version to ${FULL_VERSION}" \
