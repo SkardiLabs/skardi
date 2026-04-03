@@ -3,27 +3,35 @@ use clap::Parser;
 use skardi::pipeline::pipeline::Pipeline;
 use skardi_server::{create_server, load_server_config, telemetry, CliArgs};
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4317";
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialise OpenTelemetry (traces + metrics) before the tracing subscriber
-    let otlp_endpoint =
-        std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
-    let (_telemetry_guard, tracer) = telemetry::init(&otlp_endpoint)?;
+    // Initialise OpenTelemetry (traces + metrics) only when OTLP_ENDPOINT is explicitly set.
+    let otlp_endpoint = std::env::var("OTLP_ENDPOINT").ok();
+    let (_telemetry_guard, otel_layer) = match telemetry::init(otlp_endpoint.as_deref())? {
+        Some((guard, tracer)) => (
+            Some(guard),
+            Some(tracing_opentelemetry::layer().with_tracer(tracer)),
+        ),
+        None => (None, None),
+    };
 
-    // Initialize tracing subscriber: fmt to stdout + OTel trace export
+    // Build a fmt filter that always suppresses OpenTelemetry SDK internal logs
+    // (e.g. export errors when no collector is reachable), regardless of RUST_LOG.
+    // Users can still control application log levels via RUST_LOG as usual.
+    let user_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let fmt_filter = tracing_subscriber::EnvFilter::new(format!(
+        "{user_filter},opentelemetry_sdk=off,opentelemetry=off"
+    ));
+
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with(
             tracing_subscriber::fmt::layer()
-                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_filter(fmt_filter),
         )
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .with(otel_layer)
         .init();
 
     info!("🚀 Starting Skardi Online Serving Pipeline Server");

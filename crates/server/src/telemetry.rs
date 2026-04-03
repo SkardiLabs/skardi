@@ -8,6 +8,8 @@ use opentelemetry_sdk::trace::TracerProvider;
 use opentelemetry_sdk::{runtime, Resource};
 
 /// Guards OTel providers — shuts them down cleanly when dropped at the end of main.
+///
+/// Only present when OTLP export is enabled (i.e. `OTLP_ENDPOINT` env var is set).
 pub struct TelemetryGuard {
     tracer_provider: TracerProvider,
     meter_provider: SdkMeterProvider,
@@ -30,7 +32,17 @@ impl Drop for TelemetryGuard {
 /// can be passed into `tracing_opentelemetry::layer()`.
 ///
 /// The returned `TelemetryGuard` must be kept alive until the process exits.
-pub fn init(otlp_endpoint: &str) -> Result<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)> {
+/// Returns `None` when `otlp_endpoint` is `None` (OTLP export disabled).
+pub fn init(
+    otlp_endpoint: Option<&str>,
+) -> Result<Option<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)>> {
+    let Some(otlp_endpoint) = otlp_endpoint else {
+        return Ok(None);
+    };
+    Ok(Some(init_inner(otlp_endpoint)?))
+}
+
+fn init_inner(otlp_endpoint: &str) -> Result<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)> {
     let resource = Resource::new(vec![KeyValue::new(
         opentelemetry_semantic_conventions::resource::SERVICE_NAME,
         "skardi-server",
