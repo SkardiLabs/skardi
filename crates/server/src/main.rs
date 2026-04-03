@@ -17,13 +17,18 @@ async fn main() -> Result<()> {
         None => (None, None),
     };
 
-    // Build a fmt filter that always suppresses OpenTelemetry SDK internal logs
-    // (e.g. export errors when no collector is reachable), regardless of RUST_LOG.
-    // Users can still control application log levels via RUST_LOG as usual.
+    // Build a fmt filter. OpenTelemetry SDK internal logs (e.g. export errors when no
+    // collector is reachable) are suppressed by default. To re-enable them, include an
+    // explicit directive for the target in RUST_LOG, e.g.:
+    //   RUST_LOG=info,opentelemetry_sdk=error
     let user_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let fmt_filter = tracing_subscriber::EnvFilter::new(format!(
-        "{user_filter},opentelemetry_sdk=off,opentelemetry=off"
-    ));
+    let fmt_filter = if user_filter.contains("opentelemetry") {
+        tracing_subscriber::EnvFilter::new(user_filter)
+    } else {
+        tracing_subscriber::EnvFilter::new(format!(
+            "{user_filter},opentelemetry_sdk=off,opentelemetry=off"
+        ))
+    };
 
     tracing_subscriber::registry()
         .with(
