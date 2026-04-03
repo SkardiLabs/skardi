@@ -75,8 +75,8 @@
         }
 
         .logo svg {
-            width: 48px;
-            height: 48px;
+            height: 52px;
+            width: auto;
         }
 
         h1 {
@@ -443,16 +443,28 @@
     <div class="container">
         <header class="main-header">
             <div class="logo">
-                <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M24 4L42 14V34L24 44L6 34V14L24 4Z" stroke="url(#grad1)" stroke-width="2" fill="none"/>
-                    <path d="M24 4V44M6 14L42 34M42 14L6 34" stroke="url(#grad1)" stroke-width="2" opacity="0.3"/>
-                    <circle cx="24" cy="24" r="8" fill="url(#grad1)"/>
+                <svg viewBox="0 0 44 56" fill="none" xmlns="http://www.w3.org/2000/svg">
                     <defs>
-                        <linearGradient id="grad1" x1="6" y1="4" x2="42" y2="44">
-                            <stop offset="0%" stop-color="#00d4aa"/>
-                            <stop offset="100%" stop-color="#00b894"/>
+                        <linearGradient id="dropGrad" x1="0" y1="0" x2="44" y2="56" gradientUnits="userSpaceOnUse">
+                            <stop offset="0%" stop-color="#62e8ff"/>
+                            <stop offset="100%" stop-color="#00b4d8"/>
                         </linearGradient>
+                        <filter id="dropGlow" x="-30%" y="-20%" width="160%" height="140%">
+                            <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur"/>
+                            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+                        </filter>
                     </defs>
+                    <!-- Water droplet body -->
+                    <path d="M22 1 C22 1,40 18,40 30 C40 40.5 32 50 22 50 C12 50 4 40.5 4 30 C4 18 22 1 22 1Z"
+                          fill="url(#dropGrad)" filter="url(#dropGlow)"/>
+                    <!-- Left leaf -->
+                    <path d="M22 14 C16 20,14 30,18 38 C20 42,22 40,22 36 C22 28,22 19,22 14Z"
+                          fill="#003a4a" opacity="0.75"/>
+                    <!-- Right leaf -->
+                    <path d="M22 14 C28 20,30 30,26 38 C24 42,22 40,22 36 C22 28,22 19,22 14Z"
+                          fill="#003a4a" opacity="0.55"/>
+                    <!-- Inner highlight -->
+                    <path d="M12 26 C11 30,12 35,14 39" stroke="#a0f4ff" stroke-width="1.8" stroke-linecap="round" opacity="0.45"/>
                 </svg>
                 <h1>Skardi</h1>
             </div>
