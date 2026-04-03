@@ -7,8 +7,14 @@
 
 [CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
 [CI Badge]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml/badge.svg
+[crates.io]: https://crates.io/crates/skardi
+[crates.io Badge]: https://img.shields.io/crates/v/skardi.svg
+[Docs]: https://docs.rs/skardi
+[Docs Badge]: https://docs.rs/skardi/badge.svg
 
 [![CI Badge]][CI]
+[![crates.io Badge]][crates.io]
+[![Docs Badge]][Docs]
 
 </p>
 </div>
