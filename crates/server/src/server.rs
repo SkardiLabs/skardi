@@ -324,6 +324,7 @@ query: |
 
         assert!(result.is_ok());
         let app_state = result.unwrap();
+        assert_no_auth(&app_state);
 
         // Verify AppState structure
         let config = app_state.config.read().unwrap();
@@ -346,6 +347,7 @@ query: |
 
         assert!(result.is_ok());
         let app_state = result.unwrap();
+        assert_no_auth(&app_state);
 
         // Verify AppState with empty data sources
         let config = app_state.config.read().unwrap();

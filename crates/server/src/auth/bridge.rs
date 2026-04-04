@@ -13,12 +13,9 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use better_auth::types_mod::ListUsersParams;
-use better_auth::{AuthSession, BetterAuth, MemoryDatabaseAdapter, SessionOps, UserOps};
+use better_auth::{BetterAuth, MemoryDatabaseAdapter, SessionOps, UserOps};
 use datafusion::catalog::Session as DFSession;
 use datafusion::datasource::memory::MemTable;
 use datafusion::datasource::{TableProvider, TableType};
@@ -26,6 +23,11 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+
+use super::types::{AuthSessionRow, AuthUserRow};
 
 // ---------------------------------------------------------------------------
 // auth_users
@@ -47,19 +49,10 @@ impl fmt::Debug for AuthUsersTable {
 
 impl AuthUsersTable {
     pub fn new(auth: Arc<BetterAuth<MemoryDatabaseAdapter>>) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("email", DataType::Utf8, true),
-            Field::new("email_verified", DataType::Boolean, false),
-            Field::new("image", DataType::Utf8, true),
-            Field::new("username", DataType::Utf8, true),
-            Field::new("role", DataType::Utf8, true),
-            Field::new("banned", DataType::Boolean, false),
-            Field::new("created_at", DataType::Utf8, false),
-            Field::new("updated_at", DataType::Utf8, false),
-        ]));
-        Self { auth, schema }
+        Self {
+            auth,
+            schema: AuthUserRow::arrow_schema(),
+        }
     }
 
     async fn build_batch(&self) -> DFResult<RecordBatch> {
@@ -69,50 +62,8 @@ impl AuthUsersTable {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let ids: Vec<Option<&str>> = users.iter().map(|u| Some(u.id.as_str())).collect();
-        let names: Vec<Option<&str>> = users.iter().map(|u| u.name.as_deref()).collect();
-        let emails: Vec<Option<&str>> = users.iter().map(|u| u.email.as_deref()).collect();
-        let email_verified: Vec<bool> = users.iter().map(|u| u.email_verified).collect();
-        let images: Vec<Option<&str>> = users.iter().map(|u| u.image.as_deref()).collect();
-        let usernames: Vec<Option<&str>> = users.iter().map(|u| u.username.as_deref()).collect();
-        let roles: Vec<Option<&str>> = users.iter().map(|u| u.role.as_deref()).collect();
-        let banned: Vec<bool> = users.iter().map(|u| u.banned).collect();
-        let created_at: Vec<Option<&str>> = users.iter().map(|_| Option::<&str>::None).collect(); // placeholder strings
-        let updated_at: Vec<Option<&str>> = users.iter().map(|_| Option::<&str>::None).collect();
-
-        // Format timestamps as RFC3339 strings.
-        let created_at_strings: Vec<String> =
-            users.iter().map(|u| u.created_at.to_rfc3339()).collect();
-        let updated_at_strings: Vec<String> =
-            users.iter().map(|u| u.updated_at.to_rfc3339()).collect();
-        let created_at_refs: Vec<Option<&str>> = created_at_strings
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect();
-        let updated_at_refs: Vec<Option<&str>> = updated_at_strings
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect();
-
-        let _ = created_at;
-        let _ = updated_at;
-
-        RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(names)),
-                Arc::new(StringArray::from(emails)),
-                Arc::new(BooleanArray::from(email_verified)),
-                Arc::new(StringArray::from(images)),
-                Arc::new(StringArray::from(usernames)),
-                Arc::new(StringArray::from(roles)),
-                Arc::new(BooleanArray::from(banned)),
-                Arc::new(StringArray::from(created_at_refs)),
-                Arc::new(StringArray::from(updated_at_refs)),
-            ],
-        )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        let rows: Vec<AuthUserRow> = users.iter().map(AuthUserRow::from).collect();
+        AuthUserRow::to_record_batch(&rows)
     }
 }
 
@@ -167,22 +118,15 @@ impl fmt::Debug for AuthSessionsTable {
 
 impl AuthSessionsTable {
     pub fn new(auth: Arc<BetterAuth<MemoryDatabaseAdapter>>) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("token", DataType::Utf8, false),
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("expires_at", DataType::Utf8, false),
-            Field::new("created_at", DataType::Utf8, false),
-            Field::new("ip_address", DataType::Utf8, true),
-            Field::new("user_agent", DataType::Utf8, true),
-        ]));
-        Self { auth, schema }
+        Self {
+            auth,
+            schema: AuthSessionRow::arrow_schema(),
+        }
     }
 
     async fn build_batch(&self) -> DFResult<RecordBatch> {
         let db = self.auth.database();
 
-        // Collect all sessions by iterating over every user.
         let (users, _) = db
             .list_users(ListUsersParams::default())
             .await
@@ -197,56 +141,8 @@ impl AuthSessionsTable {
             all_sessions.extend(sessions);
         }
 
-        let ids: Vec<Option<&str>> = all_sessions.iter().map(|s| Some(s.id.as_str())).collect();
-        let tokens: Vec<Option<&str>> = all_sessions
-            .iter()
-            .map(|s| Some(s.token.as_str()))
-            .collect();
-        let user_ids: Vec<Option<&str>> = all_sessions
-            .iter()
-            .map(|s| Some(s.user_id.as_str()))
-            .collect();
-
-        let expires_at_strings: Vec<String> = all_sessions
-            .iter()
-            .map(|s| s.expires_at().to_rfc3339())
-            .collect();
-        let created_at_strings: Vec<String> = all_sessions
-            .iter()
-            .map(|s| s.created_at.to_rfc3339())
-            .collect();
-
-        let expires_at_refs: Vec<Option<&str>> = expires_at_strings
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect();
-        let created_at_refs: Vec<Option<&str>> = created_at_strings
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect();
-
-        let ip_addresses: Vec<Option<&str>> = all_sessions
-            .iter()
-            .map(|s| s.ip_address.as_deref())
-            .collect();
-        let user_agents: Vec<Option<&str>> = all_sessions
-            .iter()
-            .map(|s| s.user_agent.as_deref())
-            .collect();
-
-        RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(tokens)),
-                Arc::new(StringArray::from(user_ids)),
-                Arc::new(StringArray::from(expires_at_refs)),
-                Arc::new(StringArray::from(created_at_refs)),
-                Arc::new(StringArray::from(ip_addresses)),
-                Arc::new(StringArray::from(user_agents)),
-            ],
-        )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        let rows: Vec<AuthSessionRow> = all_sessions.iter().map(AuthSessionRow::from).collect();
+        AuthSessionRow::to_record_batch(&rows)
     }
 }
 
@@ -301,4 +197,275 @@ pub fn register_auth_tables(
 
     tracing::info!("Registered DataFusion tables: auth_users, auth_sessions");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use better_auth::plugins::EmailPasswordPlugin;
+    use better_auth::{AuthBuilder, AuthConfig, UserOps};
+
+    async fn test_auth() -> Arc<BetterAuth<MemoryDatabaseAdapter>> {
+        let config = AuthConfig::new("test-secret-that-is-at-least-32-characters!")
+            .base_url("http://localhost:8080")
+            .base_path("/api/auth");
+
+        let auth = AuthBuilder::new(config)
+            .database(MemoryDatabaseAdapter::new())
+            .plugin(EmailPasswordPlugin::new().enable_signup(true))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(auth)
+    }
+
+    // ─── AuthUsersTable ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn users_table_schema_matches_type() {
+        let auth = test_auth().await;
+        let table = AuthUsersTable::new(Arc::clone(&auth));
+        assert_eq!(
+            table.schema(),
+            super::super::types::AuthUserRow::arrow_schema()
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+    }
+
+    #[tokio::test]
+    async fn users_table_empty_scan() {
+        let auth = test_auth().await;
+        let table = AuthUsersTable::new(Arc::clone(&auth));
+        let batch = table.build_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 9);
+    }
+
+    #[tokio::test]
+    async fn users_table_scan_after_create() {
+        let auth = test_auth().await;
+        auth.database()
+            .create_user(better_auth::types_mod::CreateUserInput {
+                name: Some("Alice".into()),
+                email: Some("alice@example.com".into()),
+                password: Some("securepass123".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let table = AuthUsersTable::new(Arc::clone(&auth));
+        let batch = table.build_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let emails = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(emails.value(0), "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn users_table_debug_format() {
+        let auth = test_auth().await;
+        let table = AuthUsersTable::new(auth);
+        let dbg = format!("{:?}", table);
+        assert!(dbg.contains("AuthUsersTable"));
+    }
+
+    // ─── AuthSessionsTable ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sessions_table_schema_matches_type() {
+        let auth = test_auth().await;
+        let table = AuthSessionsTable::new(Arc::clone(&auth));
+        assert_eq!(
+            table.schema(),
+            super::super::types::AuthSessionRow::arrow_schema()
+        );
+        assert_eq!(table.table_type(), TableType::Base);
+    }
+
+    #[tokio::test]
+    async fn sessions_table_empty_scan() {
+        let auth = test_auth().await;
+        let table = AuthSessionsTable::new(Arc::clone(&auth));
+        let batch = table.build_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 7);
+    }
+
+    #[tokio::test]
+    async fn sessions_table_scan_after_create_session() {
+        let auth = test_auth().await;
+        let user = auth
+            .database()
+            .create_user(better_auth::types_mod::CreateUserInput {
+                name: Some("Bob".into()),
+                email: Some("bob@example.com".into()),
+                password: Some("password123".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        auth.database()
+            .create_session(&user.id, None, None, None)
+            .await
+            .unwrap();
+
+        let table = AuthSessionsTable::new(Arc::clone(&auth));
+        let batch = table.build_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let user_ids = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(user_ids.value(0), user.id);
+    }
+
+    #[tokio::test]
+    async fn sessions_table_multiple_users_multiple_sessions() {
+        let auth = test_auth().await;
+
+        let u1 = auth
+            .database()
+            .create_user(better_auth::types_mod::CreateUserInput {
+                name: Some("User1".into()),
+                email: Some("u1@test.com".into()),
+                password: Some("password123".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let u2 = auth
+            .database()
+            .create_user(better_auth::types_mod::CreateUserInput {
+                name: Some("User2".into()),
+                email: Some("u2@test.com".into()),
+                password: Some("password123".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        auth.database()
+            .create_session(&u1.id, None, None, None)
+            .await
+            .unwrap();
+        auth.database()
+            .create_session(&u1.id, None, None, None)
+            .await
+            .unwrap();
+        auth.database()
+            .create_session(&u2.id, None, None, None)
+            .await
+            .unwrap();
+
+        let table = AuthSessionsTable::new(Arc::clone(&auth));
+        let batch = table.build_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn sessions_table_debug_format() {
+        let auth = test_auth().await;
+        let table = AuthSessionsTable::new(auth);
+        let dbg = format!("{:?}", table);
+        assert!(dbg.contains("AuthSessionsTable"));
+    }
+
+    // ─── register_auth_tables ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_tables_creates_both() {
+        let auth = test_auth().await;
+        let mut ctx = SessionContext::new();
+
+        register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
+
+        assert!(ctx.table("auth_users").await.is_ok());
+        assert!(ctx.table("auth_sessions").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn register_tables_duplicate_errors() {
+        let auth = test_auth().await;
+        let mut ctx = SessionContext::new();
+        register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
+
+        let result = register_auth_tables(&mut ctx, Arc::clone(&auth));
+        assert!(result.is_err(), "re-registering should fail");
+    }
+
+    #[tokio::test]
+    async fn query_registered_auth_users() {
+        let auth = test_auth().await;
+        auth.database()
+            .create_user(better_auth::types_mod::CreateUserInput {
+                name: Some("QueryUser".into()),
+                email: Some("query@test.com".into()),
+                password: Some("password123".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut ctx = SessionContext::new();
+        register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
+
+        let df = ctx.sql("SELECT id, email FROM auth_users").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        let emails = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(emails.value(0), "query@test.com");
+    }
+
+    #[tokio::test]
+    async fn query_registered_auth_sessions() {
+        let auth = test_auth().await;
+        let user = auth
+            .database()
+            .create_user(better_auth::types_mod::CreateUserInput {
+                name: Some("SessUser".into()),
+                email: Some("sess@test.com".into()),
+                password: Some("password123".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        auth.database()
+            .create_session(&user.id, None, None, None)
+            .await
+            .unwrap();
+
+        let mut ctx = SessionContext::new();
+        register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
+
+        let df = ctx
+            .sql("SELECT user_id, token FROM auth_sessions")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        let user_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(user_ids.value(0), user.id);
+    }
 }

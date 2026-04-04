@@ -34,11 +34,20 @@ impl AuthLayer {
         match mode {
             AuthMode::NoAuth => Ok(AuthLayer::None),
             AuthMode::BetterAuthInMemory => {
-                let secret = std::env::var("AUTH_SECRET")
-                    .unwrap_or_else(|_| "skardi-demo-secret-key-32-chars!!!!".to_string());
+                let secret = std::env::var("AUTH_SECRET").map_err(|_| {
+                    anyhow!(
+                        "AUTH_SECRET environment variable must be set when \
+                         AUTH_MODE=BETTER_AUTH_IN_MEMORY"
+                    )
+                })?;
 
-                let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-                let base_url = format!("http://localhost:{}", port);
+                // Prefer an explicit AUTH_BASE_URL; fall back to localhost:{PORT}.
+                // In production set AUTH_BASE_URL to the server's public URL so
+                // that cookies, redirects, and absolute links work correctly.
+                let base_url = std::env::var("AUTH_BASE_URL").unwrap_or_else(|_| {
+                    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+                    format!("http://localhost:{}", port)
+                });
 
                 let config = AuthConfig::new(secret)
                     .base_url(base_url)
@@ -72,5 +81,93 @@ impl AuthLayer {
             AuthLayer::BetterAuthInMemory(a) => Some(a),
             AuthLayer::None => Option::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── AuthLayer::None ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_no_auth() {
+        let layer = AuthLayer::build(&AuthMode::NoAuth).await.unwrap();
+        assert!(!layer.is_enabled());
+        assert!(layer.as_better_auth().is_none());
+    }
+
+    #[test]
+    fn clone_none_variant() {
+        let layer = AuthLayer::None;
+        let cloned = layer.clone();
+        assert!(!cloned.is_enabled());
+        assert!(cloned.as_better_auth().is_none());
+    }
+
+    // ─── AuthLayer::BetterAuthInMemory ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_better_auth_missing_secret_errors() {
+        unsafe { std::env::remove_var("AUTH_SECRET") };
+        let result = AuthLayer::build(&AuthMode::BetterAuthInMemory).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AUTH_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn build_better_auth_success() {
+        unsafe {
+            std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
+            std::env::remove_var("AUTH_BASE_URL");
+            std::env::remove_var("PORT");
+        }
+
+        let layer = AuthLayer::build(&AuthMode::BetterAuthInMemory)
+            .await
+            .unwrap();
+        assert!(layer.is_enabled());
+        assert!(layer.as_better_auth().is_some());
+
+        unsafe { std::env::remove_var("AUTH_SECRET") };
+    }
+
+    #[tokio::test]
+    async fn build_better_auth_respects_auth_base_url() {
+        unsafe {
+            std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
+            std::env::set_var("AUTH_BASE_URL", "https://example.com");
+        }
+
+        let layer = AuthLayer::build(&AuthMode::BetterAuthInMemory)
+            .await
+            .unwrap();
+        let auth = layer.as_better_auth().unwrap();
+        assert_eq!(auth.config().base_url, "https://example.com");
+
+        unsafe {
+            std::env::remove_var("AUTH_SECRET");
+            std::env::remove_var("AUTH_BASE_URL");
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_better_auth_shares_arc() {
+        unsafe {
+            std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
+            std::env::remove_var("AUTH_BASE_URL");
+        }
+
+        let layer = AuthLayer::build(&AuthMode::BetterAuthInMemory)
+            .await
+            .unwrap();
+        let cloned = layer.clone();
+
+        assert!(cloned.is_enabled());
+        let ptr_a = Arc::as_ptr(layer.as_better_auth().unwrap());
+        let ptr_b = Arc::as_ptr(cloned.as_better_auth().unwrap());
+        assert_eq!(ptr_a, ptr_b, "clone should share the same Arc");
+
+        unsafe { std::env::remove_var("AUTH_SECRET") };
     }
 }

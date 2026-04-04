@@ -466,10 +466,14 @@ pub async fn execute_pipeline_by_name(
     // Verify session when auth is enabled.
     if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
         let status = unauth_response.status();
-        return Err((
-            status,
-            create_error_response("Authentication required", "unauthorized", None),
-        ));
+        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
+            .await
+            .unwrap_or_default();
+        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "Authentication required".to_string());
+        return Err((status, create_error_response(&msg, "unauthorized", None)));
     }
     let start_time = Instant::now();
 
@@ -899,6 +903,7 @@ query: |
             engine,
             session_ctx,
             metrics: PipelineMetrics::new(),
+            auth_layer: crate::auth::layer::AuthLayer::None,
         }
     }
 
@@ -980,6 +985,7 @@ query: |
             engine,
             session_ctx: session_ctx_arc,
             metrics: PipelineMetrics::new(),
+            auth_layer: crate::auth::layer::AuthLayer::None,
         };
 
         let request = ExecuteRequest {
@@ -997,6 +1003,7 @@ query: |
         // Execute the pipeline by name
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
+            axum::http::HeaderMap::new(),
             Path(pipeline_name),
             Json(request),
         )
@@ -1045,6 +1052,7 @@ query: |
 
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
+            axum::http::HeaderMap::new(),
             Path("test-pipeline".to_string()),
             Json(request),
         )
@@ -1073,6 +1081,7 @@ query: |
 
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
+            axum::http::HeaderMap::new(),
             Path("test-pipeline".to_string()),
             Json(request),
         )
@@ -1093,6 +1102,7 @@ query: |
 
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
+            axum::http::HeaderMap::new(),
             Path("nonexistent-pipeline".to_string()),
             Json(request),
         )
@@ -1127,6 +1137,7 @@ query: |
         // by checking it gets to the SQL execution phase (not parameter validation error)
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
+            axum::http::HeaderMap::new(),
             Path("test-pipeline".to_string()),
             Json(request),
         )
