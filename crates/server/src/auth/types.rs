@@ -194,6 +194,7 @@ impl From<&better_auth::Session> for AuthSessionRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
 
     // ─── AuthUserRow schema ─────────────────────────────────────────────
 
@@ -525,21 +526,47 @@ mod tests {
 
     // ─── From conversions (requires better-auth types) ──────────────────
 
-    #[test]
-    fn from_better_auth_user() {
-        let now = chrono::Utc::now();
-        let ba_user = better_auth::User {
-            id: "uid-1".to_string(),
+    fn sample_better_auth_user(id: &str) -> better_auth::User {
+        better_auth::User {
+            id: id.to_string(),
             name: Some("Test User".to_string()),
             email: Some("test@example.com".to_string()),
             email_verified: true,
             image: Some("https://example.com/img.png".to_string()),
             username: Some("testuser".to_string()),
+            display_username: None,
+            two_factor_enabled: false,
             role: Some("editor".to_string()),
             banned: false,
+            ban_reason: None,
+            ban_expires: None,
+            metadata: serde_json::Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn sample_better_auth_session(id: &str) -> better_auth::Session {
+        let now = chrono::Utc::now();
+        better_auth::Session {
+            id: id.to_string(),
+            token: "tok-session-1".to_string(),
+            user_id: "uid-1".to_string(),
+            expires_at: now + chrono::Duration::hours(24),
             created_at: now,
             updated_at: now,
-        };
+            ip_address: Some("192.168.1.1".to_string()),
+            user_agent: Some("TestAgent/1.0".to_string()),
+            impersonated_by: None,
+            active_organization_id: None,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn from_better_auth_user() {
+        let ba_user = sample_better_auth_user("uid-1");
+        let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
         let row = AuthUserRow::from(&ba_user);
         assert_eq!(row.id, "uid-1");
@@ -549,24 +576,19 @@ mod tests {
         assert_eq!(row.username.as_deref(), Some("testuser"));
         assert_eq!(row.role.as_deref(), Some("editor"));
         assert!(!row.banned);
-        assert!(row.created_at.contains(&now.format("%Y-%m-%d").to_string()));
+        assert!(row.created_at.contains(&now_date));
     }
 
     #[test]
     fn from_better_auth_user_minimal() {
-        let now = chrono::Utc::now();
-        let ba_user = better_auth::User {
-            id: "uid-2".to_string(),
-            name: None,
-            email: None,
-            email_verified: false,
-            image: None,
-            username: None,
-            role: None,
-            banned: true,
-            created_at: now,
-            updated_at: now,
-        };
+        let mut ba_user = sample_better_auth_user("uid-2");
+        ba_user.name = None;
+        ba_user.email = None;
+        ba_user.email_verified = false;
+        ba_user.image = None;
+        ba_user.username = None;
+        ba_user.role = None;
+        ba_user.banned = true;
 
         let row = AuthUserRow::from(&ba_user);
         assert_eq!(row.id, "uid-2");
@@ -579,20 +601,21 @@ mod tests {
     }
 
     #[test]
+    fn from_better_auth_user_omits_image() {
+        let ba_user = sample_better_auth_user("uid-3");
+        assert!(ba_user.image.is_some(), "precondition: source has image");
+        let row = AuthUserRow::from(&ba_user);
+        let batch = AuthUserRow::to_record_batch(&[row]).unwrap();
+        assert!(
+            batch.schema().field_with_name("image").is_err(),
+            "image column must not appear in output"
+        );
+    }
+
+    #[test]
     fn from_better_auth_session() {
-        let now = chrono::Utc::now();
-        let later = now + chrono::Duration::hours(24);
-        let ba_session = better_auth::Session {
-            id: "sid-1".to_string(),
-            token: "tok-session-1".to_string(),
-            user_id: "uid-1".to_string(),
-            expires_at: later,
-            created_at: now,
-            updated_at: now,
-            ip_address: Some("192.168.1.1".to_string()),
-            user_agent: Some("TestAgent/1.0".to_string()),
-            active: true,
-        };
+        let ba_session = sample_better_auth_session("sid-1");
+        let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
         let row = AuthSessionRow::from(&ba_session);
         assert_eq!(row.id, "sid-1");
@@ -600,26 +623,15 @@ mod tests {
         assert_eq!(row.user_id, "uid-1");
         assert_eq!(row.ip_address.as_deref(), Some("192.168.1.1"));
         assert_eq!(row.user_agent.as_deref(), Some("TestAgent/1.0"));
-        assert!(row
-            .expires_at
-            .contains(&later.format("%Y-%m-%d").to_string()));
-        assert!(row.created_at.contains(&now.format("%Y-%m-%d").to_string()));
+        assert!(row.expires_at.contains(&now_date));
+        assert!(row.created_at.contains(&now_date));
     }
 
     #[test]
     fn from_better_auth_session_no_optionals() {
-        let now = chrono::Utc::now();
-        let ba_session = better_auth::Session {
-            id: "sid-2".to_string(),
-            token: "tok-session-2".to_string(),
-            user_id: "uid-2".to_string(),
-            expires_at: now,
-            created_at: now,
-            updated_at: now,
-            ip_address: None,
-            user_agent: None,
-            active: true,
-        };
+        let mut ba_session = sample_better_auth_session("sid-2");
+        ba_session.ip_address = None;
+        ba_session.user_agent = None;
 
         let row = AuthSessionRow::from(&ba_session);
         assert!(row.ip_address.is_none());

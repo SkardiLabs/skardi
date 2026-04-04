@@ -203,7 +203,8 @@ pub fn register_auth_tables(
 mod tests {
     use super::*;
     use better_auth::plugins::EmailPasswordPlugin;
-    use better_auth::{AuthBuilder, AuthConfig, UserOps};
+    use better_auth::types_mod::CreateSession;
+    use better_auth::{AuthBuilder, AuthConfig, SessionOps, UserOps};
 
     async fn test_auth() -> Arc<BetterAuth<MemoryDatabaseAdapter>> {
         let config = AuthConfig::new("test-secret-that-is-at-least-32-characters!")
@@ -245,7 +246,7 @@ mod tests {
     async fn users_table_scan_after_create() {
         let auth = test_auth().await;
         auth.database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("Alice".into()),
                 email: Some("alice@example.com".into()),
                 password: Some("securepass123".into()),
@@ -301,7 +302,7 @@ mod tests {
         let auth = test_auth().await;
         let user = auth
             .database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("Bob".into()),
                 email: Some("bob@example.com".into()),
                 password: Some("password123".into()),
@@ -311,7 +312,14 @@ mod tests {
             .unwrap();
 
         auth.database()
-            .create_session(&user.id, None, None, None)
+            .create_session(CreateSession {
+                user_id: user.id.clone(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                ip_address: None,
+                user_agent: None,
+                impersonated_by: None,
+                active_organization_id: None,
+            })
             .await
             .unwrap();
 
@@ -333,7 +341,7 @@ mod tests {
 
         let u1 = auth
             .database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("User1".into()),
                 email: Some("u1@test.com".into()),
                 password: Some("password123".into()),
@@ -344,7 +352,7 @@ mod tests {
 
         let u2 = auth
             .database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("User2".into()),
                 email: Some("u2@test.com".into()),
                 password: Some("password123".into()),
@@ -353,18 +361,20 @@ mod tests {
             .await
             .unwrap();
 
-        auth.database()
-            .create_session(&u1.id, None, None, None)
-            .await
-            .unwrap();
-        auth.database()
-            .create_session(&u1.id, None, None, None)
-            .await
-            .unwrap();
-        auth.database()
-            .create_session(&u2.id, None, None, None)
-            .await
-            .unwrap();
+        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+        for uid in [&u1.id, &u1.id, &u2.id] {
+            auth.database()
+                .create_session(CreateSession {
+                    user_id: uid.clone(),
+                    expires_at: expires,
+                    ip_address: None,
+                    user_agent: None,
+                    impersonated_by: None,
+                    active_organization_id: None,
+                })
+                .await
+                .unwrap();
+        }
 
         let table = AuthSessionsTable::new(Arc::clone(&auth));
         let batch = table.build_batch().await.unwrap();
@@ -406,7 +416,7 @@ mod tests {
     async fn query_registered_auth_users() {
         let auth = test_auth().await;
         auth.database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("QueryUser".into()),
                 email: Some("query@test.com".into()),
                 password: Some("password123".into()),
@@ -436,7 +446,7 @@ mod tests {
         let auth = test_auth().await;
         let user = auth
             .database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("SessUser".into()),
                 email: Some("sess@test.com".into()),
                 password: Some("password123".into()),
@@ -446,7 +456,14 @@ mod tests {
             .unwrap();
 
         auth.database()
-            .create_session(&user.id, None, None, None)
+            .create_session(CreateSession {
+                user_id: user.id.clone(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                ip_address: None,
+                user_agent: None,
+                impersonated_by: None,
+                active_organization_id: None,
+            })
             .await
             .unwrap();
 

@@ -200,7 +200,7 @@ pub async fn verify_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{HeaderMap, Method, Uri};
+    use axum::http::{HeaderMap, Method};
 
     // ─── to_auth_request ────────────────────────────────────────────────
 
@@ -310,7 +310,7 @@ mod tests {
         let auth_res = better_auth::AuthResponse {
             status: 200,
             headers: HashMap::new(),
-            body: "ok".to_string(),
+            body: b"ok".to_vec(),
         };
         let resp = from_auth_response(auth_res);
         assert_eq!(resp.status(), StatusCode::OK);
@@ -325,7 +325,7 @@ mod tests {
         let auth_res = better_auth::AuthResponse {
             status: 201,
             headers,
-            body: "{}".to_string(),
+            body: b"{}".to_vec(),
         };
 
         let resp = from_auth_response(auth_res);
@@ -345,7 +345,7 @@ mod tests {
         let auth_res = better_auth::AuthResponse {
             status: 9999,
             headers: HashMap::new(),
-            body: "".to_string(),
+            body: vec![],
         };
         let resp = from_auth_response(auth_res);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -448,14 +448,14 @@ mod tests {
 
     #[tokio::test]
     async fn verify_session_valid_bearer() {
-        use better_auth::UserOps;
+        use better_auth::{SessionOps, UserOps};
 
         let state = make_better_auth_state().await;
         let auth = state.auth_layer.as_better_auth().unwrap();
 
-        let _user = auth
+        let user = auth
             .database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("test".into()),
                 email: Some("t@t.com".into()),
                 password: Some("password123".into()),
@@ -466,7 +466,14 @@ mod tests {
 
         let session = auth
             .database()
-            .create_session(&_user.id, None, None, None)
+            .create_session(better_auth::types_mod::CreateSession {
+                user_id: user.id.clone(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                ip_address: None,
+                user_agent: None,
+                impersonated_by: None,
+                active_organization_id: None,
+            })
             .await
             .unwrap();
 
@@ -480,14 +487,14 @@ mod tests {
 
     #[tokio::test]
     async fn verify_session_cookie_fallback() {
-        use better_auth::UserOps;
+        use better_auth::{SessionOps, UserOps};
 
         let state = make_better_auth_state().await;
         let auth = state.auth_layer.as_better_auth().unwrap();
 
         let user = auth
             .database()
-            .create_user(better_auth::types_mod::CreateUserInput {
+            .create_user(better_auth::types_mod::CreateUser {
                 name: Some("cookie-user".into()),
                 email: Some("cookie@test.com".into()),
                 password: Some("password123".into()),
@@ -498,7 +505,14 @@ mod tests {
 
         let session = auth
             .database()
-            .create_session(&user.id, None, None, None)
+            .create_session(better_auth::types_mod::CreateSession {
+                user_id: user.id.clone(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                ip_address: None,
+                user_agent: None,
+                impersonated_by: None,
+                active_organization_id: None,
+            })
             .await
             .unwrap();
 

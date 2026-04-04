@@ -111,8 +111,13 @@ mod tests {
     async fn build_better_auth_missing_secret_errors() {
         unsafe { std::env::remove_var("AUTH_SECRET") };
         let result = AuthLayer::build(&AuthMode::BetterAuthInMemory).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("AUTH_SECRET"));
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("AUTH_SECRET"),
+                "error should mention AUTH_SECRET, got: {e}"
+            ),
+            Ok(_) => panic!("expected Err when AUTH_SECRET is unset"),
+        }
     }
 
     #[tokio::test]
