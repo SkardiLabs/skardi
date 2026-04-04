@@ -59,8 +59,19 @@ pub async fn create_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Setup application state with engine and data source registration
+/// Setup application state with engine and data source registration.
+///
+/// Authentication mode follows [`AuthMode::from_env`] (`AUTH_MODE`).
 pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
+    setup_app_state_with_mode(config, AuthMode::from_env()).await
+}
+
+/// Same as [`setup_app_state`], but uses an explicit [`AuthMode`] (for tests and callers
+/// that must not depend on process environment).
+pub async fn setup_app_state_with_mode(
+    config: ServerConfig,
+    auth_mode: AuthMode,
+) -> Result<AppState> {
     tracing::info!("Setting up application state");
 
     // Create optimizer registry for conditional optimizer registration
@@ -122,8 +133,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
-    // Initialise auth layer based on AUTH_MODE environment variable.
-    let auth_mode = AuthMode::from_env();
+    // Initialise auth layer from the chosen mode (production uses [`AuthMode::from_env`]).
     let auth_layer = AuthLayer::build(&auth_mode).await?;
 
     // Register auth_users / auth_sessions DataFusion tables when auth is on.
@@ -167,7 +177,7 @@ pub fn configure_routes(state: AppState) -> Router {
     if state.auth_layer.is_enabled() {
         tracing::info!("Auth enabled: mounting /api/auth/* routes");
         router = router.route(
-            "/api/auth/{*path}",
+            "/api/auth/*path",
             axum::routing::any(crate::auth::routes::auth_handler),
         );
     }
@@ -320,7 +330,7 @@ query: |
         let (config, _temp_dir) = create_test_config_with_data_sources_and_temp_dir().await;
         let data_source_count = config.data_sources.len();
 
-        let result = setup_app_state(config).await;
+        let result = setup_app_state_with_mode(config, AuthMode::NoAuth).await;
 
         assert!(result.is_ok());
         let app_state = result.unwrap();
@@ -343,7 +353,7 @@ query: |
     async fn test_setup_app_state_without_data_sources() {
         let config = create_test_config_without_data_sources().await;
 
-        let result = setup_app_state(config).await;
+        let result = setup_app_state_with_mode(config, AuthMode::NoAuth).await;
 
         assert!(result.is_ok());
         let app_state = result.unwrap();
@@ -365,7 +375,9 @@ query: |
     #[tokio::test]
     async fn test_app_state_clone() {
         let config = create_test_config_without_data_sources().await;
-        let app_state = setup_app_state(config).await.unwrap();
+        let app_state = setup_app_state_with_mode(config, AuthMode::NoAuth)
+            .await
+            .unwrap();
 
         // Test that AppState can be cloned (important for Axum shared state)
         let cloned_state = app_state.clone();

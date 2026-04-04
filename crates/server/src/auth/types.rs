@@ -615,7 +615,6 @@ mod tests {
     #[test]
     fn from_better_auth_session() {
         let ba_session = sample_better_auth_session("sid-1");
-        let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
         let row = AuthSessionRow::from(&ba_session);
         assert_eq!(row.id, "sid-1");
@@ -623,8 +622,8 @@ mod tests {
         assert_eq!(row.user_id, "uid-1");
         assert_eq!(row.ip_address.as_deref(), Some("192.168.1.1"));
         assert_eq!(row.user_agent.as_deref(), Some("TestAgent/1.0"));
-        assert!(row.expires_at.contains(&now_date));
-        assert!(row.created_at.contains(&now_date));
+        assert_eq!(row.expires_at, ba_session.expires_at.to_rfc3339());
+        assert_eq!(row.created_at, ba_session.created_at.to_rfc3339());
     }
 
     #[test]
