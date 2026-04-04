@@ -442,6 +442,7 @@ Use `Ctrl+C` to gracefully shutdown the server.
 
 ## Other Data Source Demos
 
+- [Authentication](auth/README.md) - Enable auth, sign up/sign in, and protect pipelines with session tokens
 - [Lance Vector Search](lance/README.md) - KNN similarity search with Lance
 - [ONNX Predict](onnx_predict/README.md) - ONNX model inference in SQL (requires `--features onnx`)
 - [PostgreSQL](postgres/README.md) - CRUD operations and federated queries

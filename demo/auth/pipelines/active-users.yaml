@@ -1,0 +1,15 @@
+metadata:
+  name: active-users
+  version: 1.0.0
+  description: Lists users who currently have an active session
+
+query: |
+  SELECT
+    u.id,
+    u.name,
+    u.email,
+    s.expires_at
+  FROM auth_users u
+  JOIN auth_sessions s ON s.user_id = u.id
+  WHERE s.expires_at > NOW()
+  LIMIT {limit}
