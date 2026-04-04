@@ -12,12 +12,14 @@ default = []
 onnx = ["skardi/onnx"]
 
 [dependencies]
+better-auth = { workspace = true }
 arrow = { workspace = true }
 arrow-json = { workspace = true }
 async-trait = "0.1"
 axum = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
+cookie = { workspace = true }
 datafusion = { workspace = true }
 datafusion-federation = { workspace = true }
 datafusion-tracing = "52.0.0"

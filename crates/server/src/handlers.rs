@@ -459,9 +459,18 @@ pub async fn get_data_sources(
 /// Execute pipeline endpoint - POST /:name/execute
 pub async fn execute_pipeline_by_name(
     State(app_state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(pipeline_name): Path<String>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Verify session when auth is enabled.
+    if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
+        let status = unauth_response.status();
+        return Err((
+            status,
+            create_error_response("Authentication required", "unauthorized", None),
+        ));
+    }
     let start_time = Instant::now();
 
     tracing::info!(
