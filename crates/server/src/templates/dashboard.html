@@ -9,21 +9,21 @@
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-primary: #0a0a0f;
-            --bg-secondary: #12121a;
-            --bg-card: #16161f;
-            --bg-elevated: #1c1c28;
-            --accent-primary: #00d4aa;
-            --accent-secondary: #00b894;
-            --accent-glow: rgba(0, 212, 170, 0.15);
-            --text-primary: #e8e8ed;
-            --text-secondary: #8b8b9a;
-            --text-muted: #5a5a6a;
-            --border-color: #2a2a3a;
-            --method-post: #ff6b9d;
-            --success: #00d4aa;
-            --error: #ff6b6b;
-            --warning: #ffd93d;
+            --bg-primary: #f4f7fa;
+            --bg-secondary: #eaf0f7;
+            --bg-card: #ffffff;
+            --bg-elevated: #e4ecf4;
+            --accent-primary: #00b894;
+            --accent-secondary: #009e7e;
+            --accent-glow: rgba(0, 184, 148, 0.12);
+            --text-primary: #1a202c;
+            --text-secondary: #4a5568;
+            --text-muted: #8896a8;
+            --border-color: #d6e0ec;
+            --method-post: #d63b82;
+            --success: #00b894;
+            --error: #e53e3e;
+            --warning: #d69e2e;
         }
 
         * {
@@ -68,25 +68,14 @@
         .logo {
             position: relative;
             z-index: 1;
-            display: inline-flex;
-            align-items: center;
-            gap: 1rem;
+            display: flex;
+            justify-content: center;
             margin-bottom: 1rem;
         }
 
-        .logo svg {
-            height: 52px;
+        .logo img {
+            height: 260px;
             width: auto;
-        }
-
-        h1 {
-            font-size: 3rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--accent-primary) 0%, #00f5d4 50%, var(--accent-secondary) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            letter-spacing: -0.02em;
         }
 
         .subtitle {
@@ -420,6 +409,53 @@
             opacity: 0.5;
         }
 
+        .search-bar {
+            position: relative;
+            z-index: 1;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.6rem;
+            margin-top: 1.25rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 0.55rem 1rem;
+            width: 320px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .search-bar:focus-within {
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .search-bar svg {
+            flex-shrink: 0;
+            color: var(--text-muted);
+        }
+
+        .search-bar input {
+            border: none;
+            outline: none;
+            background: transparent;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            width: 100%;
+        }
+
+        .search-bar input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-muted);
+            font-size: 1rem;
+        }
+
         @media (max-width: 768px) {
             .container {
                 padding: 1rem;
@@ -443,37 +479,19 @@
     <div class="container">
         <header class="main-header">
             <div class="logo">
-                <svg viewBox="0 0 44 56" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <defs>
-                        <linearGradient id="dropGrad" x1="0" y1="0" x2="44" y2="56" gradientUnits="userSpaceOnUse">
-                            <stop offset="0%" stop-color="#62e8ff"/>
-                            <stop offset="100%" stop-color="#00b4d8"/>
-                        </linearGradient>
-                        <filter id="dropGlow" x="-30%" y="-20%" width="160%" height="140%">
-                            <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur"/>
-                            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-                        </filter>
-                    </defs>
-                    <!-- Water droplet body -->
-                    <path d="M22 1 C22 1,40 18,40 30 C40 40.5 32 50 22 50 C12 50 4 40.5 4 30 C4 18 22 1 22 1Z"
-                          fill="url(#dropGrad)" filter="url(#dropGlow)"/>
-                    <!-- Left leaf -->
-                    <path d="M22 14 C16 20,14 30,18 38 C20 42,22 40,22 36 C22 28,22 19,22 14Z"
-                          fill="#003a4a" opacity="0.75"/>
-                    <!-- Right leaf -->
-                    <path d="M22 14 C28 20,30 30,26 38 C24 42,22 40,22 36 C22 28,22 19,22 14Z"
-                          fill="#003a4a" opacity="0.55"/>
-                    <!-- Inner highlight -->
-                    <path d="M12 26 C11 30,12 35,14 39" stroke="#a0f4ff" stroke-width="1.8" stroke-linecap="round" opacity="0.45"/>
-                </svg>
-                <h1>Skardi</h1>
+                <img src="/logo.png" alt="Skardi">
             </div>
-            <p class="subtitle">Pipeline Dashboard &amp; API Explorer</p>
+            <p class="subtitle">API Explorer</p>
+            <div class="search-bar">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <input type="text" id="pipeline-search" placeholder="Filter pipelines…" oninput="filterPipelines(this.value)">
+            </div>
         </header>
 
-        <section class="pipelines-grid">
+        <section class="pipelines-grid" id="pipelines-grid">
             {{PIPELINES_CONTENT}}
         </section>
+        <p class="no-results" id="no-results" style="display:none;">No pipelines match your search.</p>
     </div>
 
     <div class="toast" id="toast"></div>
@@ -500,6 +518,19 @@
             const pre = button.parentElement.querySelector('pre');
             const code = pre.textContent;
             copyToClipboard(code);
+        }
+
+        function filterPipelines(query) {
+            const q = query.toLowerCase().trim();
+            const cards = document.querySelectorAll('#pipelines-grid .pipeline-card');
+            let visible = 0;
+            cards.forEach(card => {
+                const name = card.querySelector('h2').textContent.toLowerCase();
+                const show = !q || name.includes(q);
+                card.style.display = show ? '' : 'none';
+                if (show) visible++;
+            });
+            document.getElementById('no-results').style.display = visible === 0 ? 'block' : 'none';
         }
 
         async function executeRequest(endpoint, button) {

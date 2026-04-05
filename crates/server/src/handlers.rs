@@ -690,6 +690,11 @@ fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, Box<dyn std::
 }
 
 const DASHBOARD_TEMPLATE: &str = include_str!("templates/dashboard.html");
+const LOGO_PNG: &[u8] = include_bytes!("../../../asset/logo.png");
+
+pub async fn serve_logo() -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "image/png")], LOGO_PNG)
+}
 const PIPELINE_CARD_TEMPLATE: &str = r#"<article class="pipeline-card">
     <header>
         <h2>{{NAME}}</h2>

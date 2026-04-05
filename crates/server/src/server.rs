@@ -14,7 +14,7 @@ use crate::config::register_onnx_predict_udf;
 use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
-    pipeline_health_check, serve_dashboard,
+    pipeline_health_check, serve_dashboard, serve_logo,
 };
 use crate::metrics::PipelineMetrics;
 
@@ -149,6 +149,7 @@ pub fn configure_routes(state: AppState) -> Router {
         .route("/pipeline/:name", get(get_pipelines_info))
         .route("/data_source", get(get_data_sources))
         .route("/:name/execute", post(execute_pipeline_by_name))
+        .route("/logo.png", get(serve_logo))
         .with_state(state)
 }
 
