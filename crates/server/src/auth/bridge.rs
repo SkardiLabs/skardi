@@ -1,9 +1,10 @@
 //! Arrow / DataFusion bridge for better-auth's in-memory database.
 //!
-//! Registers two virtual tables in the shared `SessionContext`:
+//! Registers two virtual tables in the shared `SessionContext` under the
+//! `auth` schema:
 //!
-//! * `auth_users`    — mirrors the [`User`] store (live read on every scan)
-//! * `auth_sessions` — mirrors the [`Session`] store (live read on every scan)
+//! * `auth.users`    — mirrors the [`User`] store (live read on every scan)
+//! * `auth.sessions` — mirrors the [`Session`] store (live read on every scan)
 //!
 //! Because the in-memory adapter holds its data behind `Arc<Mutex<…>>`, every
 //! `scan()` call grabs the current snapshot, so queries always reflect the
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use better_auth::types_mod::ListUsersParams;
 use better_auth::{BetterAuth, MemoryDatabaseAdapter, SessionOps, UserOps};
-use datafusion::catalog::Session as DFSession;
+use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, Session as DFSession};
 use datafusion::datasource::memory::MemTable;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -30,10 +31,10 @@ use arrow::record_batch::RecordBatch;
 use super::types::{AuthSessionRow, AuthUserRow};
 
 // ---------------------------------------------------------------------------
-// auth_users
+// auth.users
 // ---------------------------------------------------------------------------
 
-/// DataFusion `TableProvider` that reads the live `auth_users` snapshot.
+/// DataFusion `TableProvider` that reads the live `auth.users` snapshot.
 pub struct AuthUsersTable {
     auth: Arc<BetterAuth<MemoryDatabaseAdapter>>,
     schema: SchemaRef,
@@ -95,10 +96,10 @@ impl TableProvider for AuthUsersTable {
 }
 
 // ---------------------------------------------------------------------------
-// auth_sessions
+// auth.sessions
 // ---------------------------------------------------------------------------
 
-/// DataFusion `TableProvider` that reads the live `auth_sessions` snapshot.
+/// DataFusion `TableProvider` that reads the live `auth.sessions` snapshot.
 ///
 /// Because `SessionOps` has no "list all sessions" method, we collect every
 /// user's sessions via `get_user_sessions` — perfectly acceptable for a demo
@@ -177,25 +178,41 @@ impl TableProvider for AuthSessionsTable {
 // Registration helper
 // ---------------------------------------------------------------------------
 
-/// Register `auth_users` and `auth_sessions` virtual tables into the given
-/// DataFusion `SessionContext`.
+/// Register `auth.users` and `auth.sessions` virtual tables into the given
+/// DataFusion `SessionContext` under a dedicated `auth` schema.
 pub fn register_auth_tables(
     ctx: &mut SessionContext,
     auth: Arc<BetterAuth<MemoryDatabaseAdapter>>,
 ) -> anyhow::Result<()> {
-    ctx.register_table(
-        "auth_users",
-        Arc::new(AuthUsersTable::new(Arc::clone(&auth))),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to register auth_users table: {}", e))?;
+    let schema = Arc::new(MemorySchemaProvider::new());
 
-    ctx.register_table(
-        "auth_sessions",
-        Arc::new(AuthSessionsTable::new(Arc::clone(&auth))),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to register auth_sessions table: {}", e))?;
+    schema
+        .register_table(
+            "users".into(),
+            Arc::new(AuthUsersTable::new(Arc::clone(&auth))),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to register auth.users table: {}", e))?;
 
-    tracing::info!("Registered DataFusion tables: auth_users, auth_sessions");
+    schema
+        .register_table(
+            "sessions".into(),
+            Arc::new(AuthSessionsTable::new(Arc::clone(&auth))),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to register auth.sessions table: {}", e))?;
+
+    let catalog = ctx
+        .catalog("datafusion")
+        .ok_or_else(|| anyhow::anyhow!("Default catalog 'datafusion' not found"))?;
+
+    if catalog.schema("auth").is_some() {
+        return Err(anyhow::anyhow!("Auth schema 'auth' is already registered"));
+    }
+
+    catalog
+        .register_schema("auth", schema)
+        .map_err(|e| anyhow::anyhow!("Failed to register auth schema: {}", e))?;
+
+    tracing::info!("Registered DataFusion tables: auth.users, auth.sessions");
     Ok(())
 }
 
@@ -398,8 +415,8 @@ mod tests {
 
         register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
 
-        assert!(ctx.table("auth_users").await.is_ok());
-        assert!(ctx.table("auth_sessions").await.is_ok());
+        assert!(ctx.table("auth.users").await.is_ok());
+        assert!(ctx.table("auth.sessions").await.is_ok());
     }
 
     #[tokio::test]
@@ -428,7 +445,7 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
 
-        let df = ctx.sql("SELECT id, email FROM auth_users").await.unwrap();
+        let df = ctx.sql("SELECT id, email FROM auth.users").await.unwrap();
         let batches = df.collect().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -471,7 +488,7 @@ mod tests {
         register_auth_tables(&mut ctx, Arc::clone(&auth)).unwrap();
 
         let df = ctx
-            .sql("SELECT user_id, token FROM auth_sessions")
+            .sql("SELECT user_id, token FROM auth.sessions")
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();

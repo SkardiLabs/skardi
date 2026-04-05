@@ -7,7 +7,7 @@ This demo walks through enabling authentication on the Skardi server and using i
 When auth is enabled:
 - `POST /api/auth/sign-up/email` and `POST /api/auth/sign-in/email` are exposed for registration and login.
 - Every `/:pipeline/execute` call must carry a valid session token, either as an `Authorization: Bearer <token>` header or a session cookie.
-- Auth users and sessions are queryable as virtual SQL tables (`auth_users`, `auth_sessions`), so you can JOIN them with your own data in pipelines.
+- Auth users and sessions are queryable as virtual SQL tables (`auth.users`, `auth.sessions`), so you can JOIN them with your own data in pipelines.
 
 ## Environment Variables
 
@@ -173,8 +173,8 @@ curl -s -b cookies.txt -X POST http://localhost:8080/product-search-demo/execute
 
 When auth is enabled, two virtual tables are available inside any pipeline query:
 
-- **`auth_users`** — all registered users (id, name, email, role, created_at, …)
-- **`auth_sessions`** — all active sessions (id, token, user_id, expires_at, …)
+- **`auth.users`** — all registered users (id, name, email, role, created_at, …)
+- **`auth.sessions`** — all active sessions (id, token, user_id, expires_at, …)
 
 You can JOIN these with your own data sources. For example, create `demo/auth/pipelines/active-users.yaml`:
 
@@ -190,8 +190,8 @@ query: |
     u.name,
     u.email,
     s.expires_at
-  FROM auth_users u
-  JOIN auth_sessions s ON s.user_id = u.id
+  FROM auth.users u
+  JOIN auth.sessions s ON s.user_id = u.id
   WHERE s.expires_at > NOW()
   LIMIT {limit}
 ```

@@ -890,7 +890,6 @@ query: |
         let config = ServerConfig {
             pipelines,
             data_sources,
-
             args,
         };
 
@@ -967,7 +966,6 @@ query: |
         let config = ServerConfig {
             pipelines,
             data_sources: vec![data_source],
-
             args,
         };
 

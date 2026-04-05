@@ -9,7 +9,7 @@ query: |
     u.name,
     u.email,
     s.expires_at
-  FROM auth_users u
-  JOIN auth_sessions s ON s.user_id = u.id
+  FROM auth.users u
+  JOIN auth.sessions s ON s.user_id = u.id
   WHERE s.expires_at > NOW()
   LIMIT {limit}

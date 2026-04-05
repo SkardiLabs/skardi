@@ -18,6 +18,15 @@ pub enum AuthLayer {
     BetterAuthInMemory(Arc<BetterAuth<MemoryDatabaseAdapter>>),
 }
 
+impl std::fmt::Debug for AuthLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthLayer::None => write!(f, "AuthLayer::None"),
+            AuthLayer::BetterAuthInMemory(_) => write!(f, "AuthLayer::BetterAuthInMemory(..)"),
+        }
+    }
+}
+
 // Manual Clone: clone the Arc (reference count), never the BetterAuth itself.
 impl Clone for AuthLayer {
     fn clone(&self) -> Self {
@@ -25,6 +34,12 @@ impl Clone for AuthLayer {
             AuthLayer::None => AuthLayer::None,
             AuthLayer::BetterAuthInMemory(arc) => AuthLayer::BetterAuthInMemory(Arc::clone(arc)),
         }
+    }
+}
+
+impl Default for AuthLayer {
+    fn default() -> Self {
+        AuthLayer::None
     }
 }
 

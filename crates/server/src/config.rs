@@ -230,7 +230,7 @@ fn resolve_pipeline_files(path: Option<&PathBuf>) -> Result<Vec<PathBuf>> {
     Err(ConfigError::PipelineFileNotFound { path: path.clone() }.into())
 }
 
-/// Load complete server configuration from CLI arguments
+/// Load complete server configuration from CLI arguments.
 pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     tracing::info!("Loading server configuration");
     tracing::debug!("Pipeline path: {:?}", args.pipeline_path);
@@ -288,6 +288,18 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
+
+    // This auth layer is used only for SQL planning and is discarded after current function returns.
+    // The live auth layer is built separately in setup_app_state.
+    let planning_auth =
+        crate::auth::layer::AuthLayer::build(&crate::auth::mode::AuthMode::from_env())
+            .await
+            .with_context(|| "Failed to build auth layer for pipeline planning")?;
+
+    if let Some(auth) = planning_auth.as_better_auth() {
+        crate::auth::bridge::register_auth_tables(&mut session_ctx, auth.clone())
+            .with_context(|| "Failed to register auth tables for pipeline planning")?;
+    }
 
     let ctx = Arc::new(session_ctx);
 
