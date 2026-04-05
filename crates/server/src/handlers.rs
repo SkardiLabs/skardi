@@ -692,8 +692,14 @@ fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, Box<dyn std::
 const DASHBOARD_TEMPLATE: &str = include_str!("templates/dashboard.html");
 const LOGO_PNG: &[u8] = include_bytes!("../../../asset/logo.png");
 
-pub async fn serve_logo() -> impl axum::response::IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "image/png")], LOGO_PNG)
+static LOGO_DATA_URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn logo_data_uri() -> &'static str {
+    LOGO_DATA_URI.get_or_init(|| {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(LOGO_PNG);
+        format!("data:image/png;base64,{encoded}")
+    })
 }
 const PIPELINE_CARD_TEMPLATE: &str = r#"<article class="pipeline-card">
     <header>
@@ -805,7 +811,9 @@ pub async fn serve_dashboard(State(app_state): State<AppState>) -> axum::respons
         r#"<div class="error">Failed to load pipelines</div>"#.to_string()
     };
 
-    let html = DASHBOARD_TEMPLATE.replace("{{PIPELINES_CONTENT}}", &pipelines_html);
+    let html = DASHBOARD_TEMPLATE
+        .replace("{{LOGO_DATA_URI}}", logo_data_uri())
+        .replace("{{PIPELINES_CONTENT}}", &pipelines_html);
     axum::response::Html(html)
 }
 
