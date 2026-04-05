@@ -27,14 +27,13 @@ cargo build --bin skardi-server
 
 ## Step 1 — Start the Server with Auth Enabled
 
-From the project root, start the server with the product-search demo pipeline and auth turned on:
+From the project root, start the server with the active-users pipeline and auth turned on:
 
 ```bash
 AUTH_MODE=BETTER_AUTH_IN_MEMORY \
 AUTH_SECRET="super-secret-key-at-least-32-characters-long" \
 cargo run --bin skardi-server -- \
-  --pipeline demo/pipeline.yaml \
-  --ctx demo/ctx.yaml \
+  --pipeline demo/auth/pipelines/active-users.yaml \
   --port 8080
 ```
 
@@ -105,7 +104,7 @@ With auth enabled, unauthenticated requests are rejected:
 
 ```bash
 # Without a token — returns 401
-curl -s -X POST http://localhost:8080/product-search-demo/execute \
+curl -s -X POST http://localhost:8080/active-users/execute \
   -H "Content-Type: application/json" \
   -d '{"limit": 3}' | jq .
 ```
@@ -119,18 +118,10 @@ Add the `Authorization: Bearer` header to authenticate:
 ```bash
 TOKEN="sess_abc123..."   # replace with your actual token
 
-curl -s -X POST http://localhost:8080/product-search-demo/execute \
+curl -s -X POST http://localhost:8080/active-users/execute \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "brand": null,
-    "min_price": null,
-    "max_price": 50.0,
-    "color": null,
-    "category": null,
-    "availability": null,
-    "limit": 5
-  }' | jq .
+  -d '{"limit": 5}' | jq .
 ```
 
 **Response:**
@@ -139,17 +130,14 @@ curl -s -X POST http://localhost:8080/product-search-demo/execute \
   "success": true,
   "data": [
     {
-      "product_id": 13,
-      "product_name": "Scooter Bicycle Oven",
-      "brand": "Mclean-Aguilar",
-      "category": "Laptops & Computers",
-      "price": 1,
-      "currency": "USD",
-      "availability_status": "in_stock"
+      "id": "usr_xyz...",
+      "name": "Alice",
+      "email": "alice@example.com",
+      "expires_at": "2025-01-15T13:00:00.000Z"
     }
   ],
-  "row_count": 5,
-  "execution_time_ms": 12
+  "row_count": 1,
+  "execution_time_ms": 4
 }
 ```
 
@@ -164,7 +152,7 @@ curl -s -c cookies.txt -X POST http://localhost:8080/api/auth/sign-in/email \
   -d '{"email": "alice@example.com", "password": "mysecretpassword"}'
 
 # Use the saved cookie for pipeline execution
-curl -s -b cookies.txt -X POST http://localhost:8080/product-search-demo/execute \
+curl -s -b cookies.txt -X POST http://localhost:8080/active-users/execute \
   -H "Content-Type: application/json" \
   -d '{"limit": 3}' | jq .
 ```
@@ -176,36 +164,7 @@ When auth is enabled, two virtual tables are available inside any pipeline query
 - **`auth.users`** — all registered users (id, name, email, role, created_at, …)
 - **`auth.sessions`** — all active sessions (id, token, user_id, expires_at, …)
 
-You can JOIN these with your own data sources. For example, create `demo/auth/pipelines/active-users.yaml`:
-
-```yaml
-metadata:
-  name: active-users
-  version: 1.0.0
-  description: Lists users who currently have an active session
-
-query: |
-  SELECT
-    u.id,
-    u.name,
-    u.email,
-    s.expires_at
-  FROM auth.users u
-  JOIN auth.sessions s ON s.user_id = u.id
-  WHERE s.expires_at > NOW()
-  LIMIT {limit}
-```
-
-Start the server with this pipeline alongside the products pipeline:
-
-```bash
-AUTH_MODE=BETTER_AUTH_IN_MEMORY \
-AUTH_SECRET="super-secret-key-at-least-32-characters-long" \
-cargo run --bin skardi-server -- \
-  --pipeline demo/auth/pipelines/active-users.yaml \
-  --ctx demo/ctx.yaml \
-  --port 8080
-```
+You can JOIN these with your own data sources. The included `demo/auth/pipelines/active-users.yaml` pipeline does exactly this — it returns all users who have a currently active session.
 
 Execute it (requires a valid session token):
 
@@ -238,10 +197,10 @@ echo "==> Session token: $TOKEN"
 echo ""
 
 echo "==> Execute pipeline (authenticated)"
-curl -s -X POST "$BASE/product-search-demo/execute" \
+curl -s -X POST "$BASE/active-users/execute" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
-  -d '{"max_price": 100.0, "limit": 3}' | jq .
+  -d '{"limit": 3}' | jq .
 ```
 
 ## Auth API Reference
