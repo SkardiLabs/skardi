@@ -12,6 +12,7 @@ use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
+use skardi::sources::providers::sqlx::{register_pg_knn_udtf, PgKnnRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -27,6 +28,9 @@ pub struct OptimizerRegistry {
     /// Lance datasets indexed by table name
     /// Used by lance_knn table function to access datasets
     lance_datasets: Arc<RwLock<HashMap<String, Arc<Dataset>>>>,
+    /// Postgres pools + column schemas indexed by DataFusion table name
+    /// Used by pg_knn table function to run pgvector queries
+    pg_knn_pools: PgKnnRegistry,
 }
 
 impl OptimizerRegistry {
@@ -34,6 +38,7 @@ impl OptimizerRegistry {
     pub fn new() -> Self {
         Self {
             lance_datasets: Arc::new(RwLock::new(HashMap::new())),
+            pg_knn_pools: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -81,9 +86,9 @@ impl OptimizerRegistry {
             self.register_lance_functions(ctx)?;
         }
 
-        // Future: Register Postgres-specific UDFs
+        // Register Postgres-specific table functions
         if source_types.contains(&DataSourceType::Postgres) {
-            self.register_postgres_udfs(ctx)?;
+            self.register_postgres_functions(ctx)?;
         }
 
         Ok(())
@@ -106,9 +111,11 @@ impl OptimizerRegistry {
         Ok(())
     }
 
-    /// Register Postgres-specific UDFs (placeholder for future)
-    fn register_postgres_udfs(&self, _ctx: &mut SessionContext) -> Result<()> {
-        tracing::debug!("Postgres UDFs not yet implemented");
+    /// Register Postgres-specific table functions.
+    fn register_postgres_functions(&self, ctx: &mut SessionContext) -> Result<()> {
+        tracing::info!("Registering pg_knn table function");
+        register_pg_knn_udtf(ctx, self.pg_knn_pools());
+        tracing::info!("✓ Registered pg_knn table function");
         Ok(())
     }
 
@@ -135,6 +142,16 @@ impl OptimizerRegistry {
     /// Returns an `Arc<RwLock<>>` that can be shared with table functions
     pub fn lance_datasets(&self) -> Arc<RwLock<HashMap<String, Arc<Dataset>>>> {
         Arc::clone(&self.lance_datasets)
+    }
+
+    // === Postgres Pool Management ===
+
+    /// Get a clone of the pg_knn pool registry.
+    ///
+    /// Returns an `Arc<RwLock<>>` that can be shared with table functions
+    /// and passed into `register_postgres_tables` at registration time.
+    pub fn pg_knn_pools(&self) -> PgKnnRegistry {
+        Arc::clone(&self.pg_knn_pools)
     }
 }
 

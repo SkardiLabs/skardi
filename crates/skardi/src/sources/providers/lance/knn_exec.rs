@@ -4,7 +4,7 @@
 //! for efficient approximate nearest neighbor search.
 
 use anyhow::Result;
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, Float32Array, RecordBatch};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -12,7 +12,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics, execute_stream,
+    SendableRecordBatchStream, Statistics,
     execution_plan::{Boundedness, EmissionType},
 };
 use futures::{StreamExt, stream};
@@ -20,6 +20,8 @@ use lance::dataset::Dataset;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
+
+use crate::sources::providers::knn_utils::extract_query_vector;
 
 /// Physical execution plan for Lance KNN search
 ///
@@ -187,177 +189,20 @@ impl LanceKnnExec {
         self
     }
 
-    /// Extract query vector from child plan (for deferred extraction)
-    async fn extract_query_vector_from_plan(
-        plan: &Arc<dyn ExecutionPlan>,
-        column_name: &str,
-        context: Arc<TaskContext>,
-    ) -> Result<ArrayRef> {
-        use arrow::array::{FixedSizeListArray, Float32Array};
-        use arrow::datatypes::DataType;
-        use futures::StreamExt;
-
-        // Some executors (like SqlExec, ProjectionExec with complex subqueries) may not expose
-        // the column in their schema but will produce it when executed. We'll check the plan schema
-        // first, but if not found, execute and check the result schema.
-        let schema = plan.schema();
-        let column_index_result = schema.index_of(column_name);
-        let plan_name = plan.name();
-
-        // Determine if we need to check result schema after execution
-        let check_result_schema = column_index_result.is_err()
-            && (plan_name == "SqlExec"
-                || plan_name == "ProjectionExec"
-                || plan_name == "CooperativeExec");
-
-        // If column not found in plan schema, we'll execute and check result schema
-        // (this handles SqlExec, ProjectionExec, and other executors that produce columns through execution)
-        let (column_index, field) = if let Ok(idx) = column_index_result {
-            (idx, schema.field(idx))
-        } else if check_result_schema {
-            // For these executors, we'll execute and check the result
-            // Placeholder values - will be overwritten after execution
-            let placeholder_field = schema
-                .fields()
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("Plan '{}' has no fields in schema", plan_name))?;
-            (0, placeholder_field.as_ref())
-        } else {
-            return Err(anyhow::anyhow!(
-                "Column '{}' not found in plan '{}' schema: {}",
-                column_name,
-                plan_name,
-                column_index_result.unwrap_err()
-            ));
-        };
-
-        // Check if the column is a FixedSizeList of Float32 (vector type)
-        // (Will re-check after execution for plans that don't expose schema)
-        let is_vector_type = matches!(field.data_type(), DataType::FixedSizeList(_, _));
-
-        // For plans that need result schema check, we'll validate the type after execution
-        if !check_result_schema && !is_vector_type {
-            return Err(anyhow::anyhow!(
-                "Column '{}' is not a FixedSizeList (vector type), got: {:?}",
-                column_name,
-                field.data_type()
-            ));
-        }
-
-        // Execute the plan using execute_stream which properly handles multi-partition plans
-        let stream = execute_stream(plan.clone(), context.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to execute query vector plan: {}", e))?;
-
-        let batches: Vec<DFResult<RecordBatch>> = stream.collect().await;
-
-        if batches.is_empty() {
-            return Err(anyhow::anyhow!("Query vector plan returned no batches"));
-        }
-
-        // Get the first batch (CROSS JOIN typically returns one row)
-        let batch = batches[0]
-            .as_ref()
-            .map_err(|e| anyhow::anyhow!("Failed to get batch: {}", e))?;
-
-        if batch.num_rows() == 0 {
-            // Return a specific error that can be handled by the caller
-            // This indicates the subquery returned no rows (valid outcome, not an error)
-            return Err(anyhow::anyhow!("EMPTY_QUERY_VECTOR_RESULT"));
-        }
-
-        // For plans that don't expose schema upfront, check the result schema instead
-        let final_column_index = if check_result_schema {
-            let result_schema = batch.schema();
-            let result_idx = result_schema.index_of(column_name).map_err(|e| {
-                anyhow::anyhow!(
-                    "Column '{}' not found in '{}' result schema: {}. Valid fields: {:?}",
-                    column_name,
-                    plan_name,
-                    e,
-                    result_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name())
-                        .collect::<Vec<_>>()
-                )
-            })?;
-            result_idx
-        } else {
-            column_index
-        };
-
-        let column_array = batch.column(final_column_index);
-
-        // Validate type from result (for plans without schema) or plan (for others)
-        // Get the data type from the appropriate schema - clone it to avoid lifetime issues
-        let field_data_type: DataType = if check_result_schema {
-            batch.schema().field(final_column_index).data_type().clone()
-        } else {
-            field.data_type().clone()
-        };
-
-        let is_vector_type = matches!(&field_data_type, DataType::FixedSizeList(_, _));
-
-        if !is_vector_type {
-            return Err(anyhow::anyhow!(
-                "Column '{}' is not a FixedSizeList (vector type), got: {:?}",
-                column_name,
-                field_data_type
-            ));
-        }
-
-        // Extract the vector from FixedSizeListArray
-        let list_array = column_array
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Column '{}' is not a FixedSizeListArray", column_name)
-            })?;
-
-        use arrow::array::Array;
-        if list_array.len() == 0 {
-            return Err(anyhow::anyhow!("FixedSizeListArray is empty"));
-        }
-
-        // Get the first element (CROSS JOIN should have one row)
-        let vector_array = list_array.value(0);
-
-        // Verify it's Float32Array
-        let float_array = vector_array
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .ok_or_else(|| anyhow::anyhow!("Vector array is not Float32Array"))?;
-
-        let vector = Arc::new(float_array.clone()) as ArrayRef;
-        Ok(vector)
-    }
-
     /// Execute Lance KNN search
     async fn execute_knn(&self, context: Arc<TaskContext>) -> Result<RecordBatch> {
-        // Extract query vector if needed (deferred extraction from subquery)
-        let query_vector = if let Some(ref vector) = self.query_vector {
+        // Resolve query vector: literal or extracted from child plan.
+        let query_vector: ArrayRef = if let Some(ref vector) = self.query_vector {
             vector.clone()
-        } else if let (Some(plan), Some(column_name)) =
-            (&self.query_vector_plan, &self.query_vector_column)
-        {
-            // Extract query vector from child plan at execution time
-            // IMPORTANT: This executes the plan fresh with the current TaskContext,
-            // which ensures parameters are properly bound for this execution
-            match Self::extract_query_vector_from_plan(plan, column_name, context.clone()).await {
-                Ok(vector) => vector,
-                Err(e) => {
-                    // Check if this is an empty result error
-                    if e.to_string() == "EMPTY_QUERY_VECTOR_RESULT" {
-                        // Query vector subquery returned no rows - this is a valid outcome
-                        // (e.g., WHERE user_id = $1 matched no rows)
-                        // Return empty result set with correct schema
-                        tracing::info!(
-                            "Query vector subquery returned no rows - returning empty KNN result"
-                        );
-                        return Ok(RecordBatch::new_empty(self.schema.clone()));
-                    }
-                    // Other errors should propagate
-                    return Err(e);
+        } else if let Some(ref plan) = self.query_vector_plan {
+            match extract_query_vector(plan.clone(), context.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+            {
+                Some(vec) => Arc::new(Float32Array::from(vec)) as ArrayRef,
+                None => {
+                    tracing::debug!("lance_knn: subquery returned no rows, returning empty result");
+                    return Ok(RecordBatch::new_empty(self.schema.clone()));
                 }
             }
         } else {

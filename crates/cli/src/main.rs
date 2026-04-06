@@ -18,6 +18,7 @@ use object_store::http::HttpBuilder;
 use serde::Deserialize;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
+use skardi::sources::providers::sqlx::{PgKnnRegistry, register_pg_knn_udtf};
 use skardi::sources::providers::{
     iceberg::register_iceberg_table, lance::register_lance_table, mongo::register_mongo_tables,
     mysql::register_mysql_tables, sqlite::register_sqlite_tables,
@@ -291,9 +292,10 @@ impl UrlTableFactory for SkardiUrlTableFactory {
 }
 
 /// Create a new SessionContext with custom URL table support (built-in files + Lance)
-/// and the `lance_knn` UDTF registered. Returns the context and the shared dataset registry.
-fn new_session_context() -> (SessionContext, DatasetRegistry) {
+/// and the `lance_knn` / `pg_knn` UDTFs registered.
+fn new_session_context() -> (SessionContext, DatasetRegistry, PgKnnRegistry) {
     let dataset_registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let pg_knn_registry: PgKnnRegistry = Arc::new(RwLock::new(HashMap::new()));
     let session_store = SessionStore::new();
     let factory = Arc::new(SkardiUrlTableFactory::new(
         session_store,
@@ -321,7 +323,10 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
 
-    (ctx, dataset_registry)
+    // Register the pg_knn table function
+    register_pg_knn_udtf(&ctx, Arc::clone(&pg_knn_registry));
+
+    (ctx, dataset_registry, pg_knn_registry)
 }
 
 /// Resolve a path string: if relative (and not remote), resolve against cwd.
@@ -385,6 +390,7 @@ async fn load_and_register_all(
     ctx_path: &Path,
     session_ctx: &mut SessionContext,
     dataset_registry: &DatasetRegistry,
+    pg_knn_registry: &PgKnnRegistry,
 ) -> Result<LocalContextConfig> {
     let content = std::fs::read_to_string(ctx_path)
         .with_context(|| format!("Failed to read context file: {}", ctx_path.display()))?;
@@ -392,7 +398,7 @@ async fn load_and_register_all(
         serde_yaml::from_str(&content).context("Failed to parse context YAML")?;
 
     for source in &config.data_sources {
-        register_source(session_ctx, source, dataset_registry)
+        register_source(session_ctx, source, dataset_registry, pg_knn_registry)
             .await
             .with_context(|| format!("Failed to register data source '{}'", source.name))?;
     }
@@ -405,6 +411,7 @@ async fn register_source(
     session_ctx: &mut SessionContext,
     source: &LocalDataSource,
     dataset_registry: &DatasetRegistry,
+    pg_knn_registry: &PgKnnRegistry,
 ) -> Result<()> {
     let source_type = source.source_type.to_lowercase();
 
@@ -503,6 +510,7 @@ async fn register_source(
                 conn_str,
                 source.options.as_ref(),
                 false,
+                Some(pg_knn_registry),
             )
             .await
             .with_context(|| format!("Failed to register Postgres '{}'", source.name))?;
@@ -592,8 +600,14 @@ async fn register_source(
 }
 
 async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> {
-    let (mut session_ctx, dataset_registry) = new_session_context();
-    let config = load_and_register_all(ctx_path, &mut session_ctx, &dataset_registry).await?;
+    let (mut session_ctx, dataset_registry, pg_knn_registry) = new_session_context();
+    let config = load_and_register_all(
+        ctx_path,
+        &mut session_ctx,
+        &dataset_registry,
+        &pg_knn_registry,
+    )
+    .await?;
 
     let all_names: Vec<String> = config.data_sources.iter().map(|s| s.name.clone()).collect();
 
@@ -634,13 +648,19 @@ async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> 
 /// data sources first. If no context file is found, run the query in a bare session with
 /// URL table support (allowing direct file/lance paths in SQL).
 async fn run_query(ctx_override: Option<PathBuf>, sql: &str) -> Result<()> {
-    let (mut session_ctx, dataset_registry) = new_session_context();
+    let (mut session_ctx, dataset_registry, pg_knn_registry) = new_session_context();
 
     // Try to load context file, but don't fail if not found when no explicit --ctx was given
     let ctx_path_result = resolve_ctx_path(ctx_override.clone());
     match ctx_path_result {
         Ok(ctx_path) if ctx_path.exists() => {
-            load_and_register_all(&ctx_path, &mut session_ctx, &dataset_registry).await?;
+            load_and_register_all(
+                &ctx_path,
+                &mut session_ctx,
+                &dataset_registry,
+                &pg_knn_registry,
+            )
+            .await?;
         }
         Ok(_) if ctx_override.is_some() => {
             let path = resolve_ctx_path(ctx_override)?;
