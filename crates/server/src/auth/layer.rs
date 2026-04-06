@@ -12,9 +12,7 @@ use super::mode::AuthMode;
 /// `Arc` so that `AppState` (and all Axum handler clones) share a single
 /// live auth instance without requiring `BetterAuth` itself to be `Clone`.
 pub enum AuthLayer {
-    /// No authentication — pipeline endpoints are publicly accessible.
     None,
-    /// better-auth backed by a shared in-memory database.
     BetterAuthInMemory(Arc<BetterAuth<MemoryDatabaseAdapter>>),
 }
 
@@ -27,7 +25,6 @@ impl std::fmt::Debug for AuthLayer {
     }
 }
 
-// Manual Clone: clone the Arc (reference count), never the BetterAuth itself.
 impl Clone for AuthLayer {
     fn clone(&self) -> Self {
         match self {
@@ -44,7 +41,6 @@ impl Default for AuthLayer {
 }
 
 impl AuthLayer {
-    /// Construct the appropriate `AuthLayer` for the given [`AuthMode`].
     pub async fn build(mode: &AuthMode) -> Result<Self> {
         match mode {
             AuthMode::NoAuth => Ok(AuthLayer::None),
@@ -56,9 +52,6 @@ impl AuthLayer {
                     )
                 })?;
 
-                // Prefer an explicit AUTH_BASE_URL; fall back to localhost:{PORT}.
-                // In production set AUTH_BASE_URL to the server's public URL so
-                // that cookies, redirects, and absolute links work correctly.
                 let base_url = std::env::var("AUTH_BASE_URL").unwrap_or_else(|_| {
                     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
                     format!("http://localhost:{}", port)
@@ -90,7 +83,6 @@ impl AuthLayer {
         !matches!(self, AuthLayer::None)
     }
 
-    /// Returns a reference to the inner `BetterAuth` instance, if present.
     pub fn as_better_auth(&self) -> Option<&Arc<BetterAuth<MemoryDatabaseAdapter>>> {
         match self {
             AuthLayer::BetterAuthInMemory(a) => Some(a),
@@ -102,8 +94,6 @@ impl AuthLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ─── AuthLayer::None ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn build_no_auth() {
@@ -119,8 +109,6 @@ mod tests {
         assert!(!cloned.is_enabled());
         assert!(cloned.as_better_auth().is_none());
     }
-
-    // ─── AuthLayer::BetterAuthInMemory ──────────────────────────────────
 
     #[tokio::test]
     async fn build_better_auth_missing_secret_errors() {

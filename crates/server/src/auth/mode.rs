@@ -1,10 +1,4 @@
 /// Controls the authentication mode for the Skardi server.
-///
-/// Configured via the `AUTH_MODE` environment variable:
-/// - `NO_AUTH` (default): all pipeline endpoints are publicly accessible.
-/// - `BETTER_AUTH_IN_MEMORY`: uses better-auth backed by a shared in-memory
-///   database.  Registration and sign-in are exposed as built-in endpoints;
-///   every `/:name/execute` call must carry a valid session token.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthMode {
     /// No authentication — pipeline endpoints are open to all callers.

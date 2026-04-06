@@ -463,7 +463,6 @@ pub async fn execute_pipeline_by_name(
     Path(pipeline_name): Path<String>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Verify session when auth is enabled.
     if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
         let status = unauth_response.status();
         let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)

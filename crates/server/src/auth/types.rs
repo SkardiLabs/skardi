@@ -11,11 +11,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 
-// ---------------------------------------------------------------------------
-// AuthUserRow
-// ---------------------------------------------------------------------------
-
-/// One row of the `auth_users` virtual table.
 #[derive(Debug, Clone)]
 pub struct AuthUserRow {
     pub id: String,
@@ -104,11 +99,6 @@ impl From<&better_auth::User> for AuthUserRow {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AuthSessionRow
-// ---------------------------------------------------------------------------
-
-/// One row of the `auth_sessions` virtual table.
 #[derive(Debug, Clone)]
 pub struct AuthSessionRow {
     pub id: String,

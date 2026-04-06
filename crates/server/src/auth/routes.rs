@@ -18,10 +18,6 @@ use cookie::Cookie;
 
 use crate::server::AppState;
 
-/// Convert an Axum 0.7 `Request<Body>` into a better-auth `AuthRequest`.
-///
-/// The full request body is buffered (capped at 4 MiB) so better-auth can
-/// parse JSON payloads in its plugin handlers.
 async fn to_auth_request(req: Request<Body>) -> Result<AuthRequest, String> {
     let method = match req.method().as_str() {
         "GET" => HttpMethod::Get,
@@ -69,7 +65,6 @@ async fn to_auth_request(req: Request<Body>) -> Result<AuthRequest, String> {
     Ok(AuthRequest::from_parts(method, path, headers, body, query))
 }
 
-/// Convert a better-auth `AuthResponse` into an Axum `Response<Body>`.
 fn from_auth_response(auth_res: better_auth::AuthResponse) -> Response<Body> {
     let status = StatusCode::from_u16(auth_res.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -92,10 +87,6 @@ fn from_auth_response(auth_res: better_auth::AuthResponse) -> Response<Body> {
     })
 }
 
-/// Catch-all handler mounted at `/api/auth/*path`.
-///
-/// Forwards every method and path to `BetterAuth::handle_request`, then
-/// converts the response back into Axum's native response type.
 pub async fn auth_handler(State(state): State<AppState>, req: Request<Body>) -> impl IntoResponse {
     let auth = match state.auth_layer.as_better_auth() {
         Some(a) => a.clone(),
@@ -133,20 +124,13 @@ pub async fn auth_handler(State(state): State<AppState>, req: Request<Body>) -> 
     }
 }
 
-/// Verify that an incoming pipeline request carries a valid, non-expired
-/// session token.
-///
-/// Accepts the token either as `Authorization: Bearer <token>` or as the
-/// configured session cookie (parsed via BetterAuth's session manager).
-/// Returns `Ok(())` if the session is valid, or an `(StatusCode, Body)` error
-/// response that callers can return directly.
 pub async fn verify_session(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> Result<(), Response<Body>> {
     let auth = match state.auth_layer.as_better_auth() {
         Some(a) => a,
-        None => return Ok(()), // auth disabled — always allow
+        None => return Ok(()),
     };
 
     // Extract Bearer token from Authorization header.
