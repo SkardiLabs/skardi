@@ -386,10 +386,11 @@ mod tests {
 
         unsafe {
             std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
+            std::env::set_var("AUTH_DB_PATH", ":memory:");
             std::env::remove_var("AUTH_BASE_URL");
         }
 
-        let layer = AuthLayer::build(&crate::auth::mode::AuthMode::BetterAuthInMemory)
+        let layer = AuthLayer::build(&crate::auth::mode::AuthMode::BetterAuthDieselSqlite)
             .await
             .unwrap();
 

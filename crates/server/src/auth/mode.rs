@@ -3,15 +3,15 @@
 pub enum AuthMode {
     /// No authentication — pipeline endpoints are open to all callers.
     NoAuth,
-    /// better-auth with an in-memory database (demo / testing only).
-    BetterAuthInMemory,
+    /// better-auth backed by a persistent SQLite database via Diesel.
+    BetterAuthDieselSqlite,
 }
 
 impl AuthMode {
     /// Read `AUTH_MODE` from the environment.  Defaults to [`AuthMode::NoAuth`].
     pub fn from_env() -> Self {
         match std::env::var("AUTH_MODE").unwrap_or_default().as_str() {
-            "BETTER_AUTH_IN_MEMORY" => AuthMode::BetterAuthInMemory,
+            "BETTER_AUTH_DIESEL_SQLITE" => AuthMode::BetterAuthDieselSqlite,
             _ => AuthMode::NoAuth,
         }
     }
@@ -32,9 +32,9 @@ mod tests {
     }
 
     #[test]
-    fn from_env_better_auth_in_memory() {
-        unsafe { std::env::set_var("AUTH_MODE", "BETTER_AUTH_IN_MEMORY") };
-        assert_eq!(AuthMode::from_env(), AuthMode::BetterAuthInMemory);
+    fn from_env_better_auth_diesel_sqlite() {
+        unsafe { std::env::set_var("AUTH_MODE", "BETTER_AUTH_DIESEL_SQLITE") };
+        assert_eq!(AuthMode::from_env(), AuthMode::BetterAuthDieselSqlite);
         unsafe { std::env::remove_var("AUTH_MODE") };
     }
 
@@ -59,14 +59,14 @@ mod tests {
 
     #[test]
     fn is_enabled_better_auth() {
-        assert!(AuthMode::BetterAuthInMemory.is_enabled());
+        assert!(AuthMode::BetterAuthDieselSqlite.is_enabled());
     }
 
     #[test]
     fn clone_and_debug() {
-        let mode = AuthMode::BetterAuthInMemory;
+        let mode = AuthMode::BetterAuthDieselSqlite;
         let cloned = mode.clone();
         assert_eq!(mode, cloned);
-        assert!(format!("{:?}", mode).contains("BetterAuthInMemory"));
+        assert!(format!("{:?}", mode).contains("BetterAuthDieselSqlite"));
     }
 }

@@ -1,4 +1,4 @@
-//! Arrow / DataFusion bridge for better-auth's in-memory database.
+//! Arrow / DataFusion bridge for better-auth's SQLite database.
 //!
 //! Registers two virtual tables in the shared `SessionContext` under the
 //! `auth` schema:
@@ -6,9 +6,9 @@
 //! * `auth.users`    — mirrors the [`User`] store (live read on every scan)
 //! * `auth.sessions` — mirrors the [`Session`] store (live read on every scan)
 //!
-//! Because the in-memory adapter holds its data behind `Arc<Mutex<…>>`, every
-//! `scan()` call grabs the current snapshot, so queries always reflect the
-//! latest registrations and sign-ins without any manual refresh step.
+//! Every `scan()` call queries the underlying SQLite database through the
+//! adapter's `UserOps`/`SessionOps` trait implementations, so queries always
+//! reflect the latest state without any manual refresh step.
 
 use std::any::Any;
 use std::fmt;
@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use better_auth::types_mod::ListUsersParams;
-use better_auth::{BetterAuth, MemoryDatabaseAdapter, SessionOps, UserOps};
+use better_auth::{BetterAuth, SessionOps, UserOps};
+use better_auth_diesel_sqlite::DieselSqliteAdapter;
 use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, Session as DFSession};
 use datafusion::datasource::memory::MemTable;
 use datafusion::datasource::{TableProvider, TableType};
@@ -36,7 +37,7 @@ use super::types::{AuthSessionRow, AuthUserRow};
 
 /// DataFusion `TableProvider` that reads the live `auth.users` snapshot.
 pub struct AuthUsersTable {
-    auth: Arc<BetterAuth<MemoryDatabaseAdapter>>,
+    auth: Arc<BetterAuth<DieselSqliteAdapter>>,
     schema: SchemaRef,
 }
 
@@ -49,7 +50,7 @@ impl fmt::Debug for AuthUsersTable {
 }
 
 impl AuthUsersTable {
-    pub fn new(auth: Arc<BetterAuth<MemoryDatabaseAdapter>>) -> Self {
+    pub fn new(auth: Arc<BetterAuth<DieselSqliteAdapter>>) -> Self {
         Self {
             auth,
             schema: AuthUserRow::arrow_schema(),
@@ -102,10 +103,9 @@ impl TableProvider for AuthUsersTable {
 /// DataFusion `TableProvider` that reads the live `auth.sessions` snapshot.
 ///
 /// Because `SessionOps` has no "list all sessions" method, we collect every
-/// user's sessions via `get_user_sessions` — perfectly acceptable for a demo
-/// backed by an in-memory store.
+/// user's sessions via `get_user_sessions`.
 pub struct AuthSessionsTable {
-    auth: Arc<BetterAuth<MemoryDatabaseAdapter>>,
+    auth: Arc<BetterAuth<DieselSqliteAdapter>>,
     schema: SchemaRef,
 }
 
@@ -118,7 +118,7 @@ impl fmt::Debug for AuthSessionsTable {
 }
 
 impl AuthSessionsTable {
-    pub fn new(auth: Arc<BetterAuth<MemoryDatabaseAdapter>>) -> Self {
+    pub fn new(auth: Arc<BetterAuth<DieselSqliteAdapter>>) -> Self {
         Self {
             auth,
             schema: AuthSessionRow::arrow_schema(),
@@ -182,7 +182,7 @@ impl TableProvider for AuthSessionsTable {
 /// DataFusion `SessionContext` under a dedicated `auth` schema.
 pub fn register_auth_tables(
     ctx: &mut SessionContext,
-    auth: Arc<BetterAuth<MemoryDatabaseAdapter>>,
+    auth: Arc<BetterAuth<DieselSqliteAdapter>>,
 ) -> anyhow::Result<()> {
     let schema = Arc::new(MemorySchemaProvider::new());
 
@@ -223,13 +223,15 @@ mod tests {
     use better_auth::types_mod::CreateSession;
     use better_auth::{AuthBuilder, AuthConfig, SessionOps, UserOps};
 
-    async fn test_auth() -> Arc<BetterAuth<MemoryDatabaseAdapter>> {
+    async fn test_auth() -> Arc<BetterAuth<DieselSqliteAdapter>> {
+        let adapter = DieselSqliteAdapter::in_memory().await.unwrap();
+        adapter.run_migrations().await.unwrap();
         let config = AuthConfig::new("test-secret-that-is-at-least-32-characters!")
             .base_url("http://localhost:8080")
             .base_path("/api/auth");
 
         let auth = AuthBuilder::new(config)
-            .database(MemoryDatabaseAdapter::new())
+            .database(adapter)
             .plugin(EmailPasswordPlugin::new().enable_signup(true))
             .build()
             .await

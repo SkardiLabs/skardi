@@ -1,6 +1,6 @@
 # Skardi Auth Demo: End-to-End Authentication
 
-This demo walks through enabling authentication on the Skardi server and using it to protect production pipelines. It uses the built-in **BetterAuth in-memory** mode, which is ideal for demos, staging, and development — no external database required.
+This demo walks through enabling authentication on the Skardi server and using it to protect production pipelines. It uses **BetterAuth with a SQLite backend** (`better-auth-diesel-sqlite`), which persists users and sessions across server restarts with no external database required.
 
 ## How Auth Works
 
@@ -13,8 +13,9 @@ When auth is enabled:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AUTH_MODE` | Yes | Set to `BETTER_AUTH_IN_MEMORY` to enable auth |
+| `AUTH_MODE` | Yes | Set to `BETTER_AUTH_DIESEL_SQLITE` to enable auth |
 | `AUTH_SECRET` | Yes | Secret key used to sign sessions (32+ characters) |
+| `AUTH_DB_PATH` | No | Path to the SQLite database file (defaults to `skardi_auth.db`) |
 | `AUTH_BASE_URL` | No | Public base URL of the server (defaults to `http://localhost:<PORT>`) |
 
 ## Prerequisites
@@ -30,8 +31,9 @@ cargo build --bin skardi-server
 From the project root, start the server with the active-users pipeline and auth turned on:
 
 ```bash
-AUTH_MODE=BETTER_AUTH_IN_MEMORY \
+AUTH_MODE=BETTER_AUTH_DIESEL_SQLITE \
 AUTH_SECRET="super-secret-key-at-least-32-characters-long" \
+AUTH_DB_PATH="skardi_auth.db" \
 cargo run --bin skardi-server -- \
   --pipeline demo/auth/pipelines/active-users.yaml \
   --port 8080
@@ -201,6 +203,13 @@ curl -s -X POST "$BASE/active-users/execute" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"limit": 3}' | jq .
+
+# Users and sessions survive server restarts — sign in again with the same credentials:
+echo ""
+echo "==> Sign in (after restart)"
+curl -s -X POST "$BASE/api/auth/sign-in/email" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"mysecretpassword"}' | jq .
 ```
 
 ## Auth API Reference
@@ -244,7 +253,8 @@ Authorization: Bearer <session-token>
 
 ## Production Notes
 
-- `BETTER_AUTH_IN_MEMORY` stores all users and sessions in RAM — data is lost on restart. For production, a persistent database adapter is recommended.
+- `BETTER_AUTH_DIESEL_SQLITE` stores users and sessions in a SQLite file (`AUTH_DB_PATH`). Data persists across server restarts.
+- The SQLite database is created automatically on first startup; schema migrations run via the `better-auth-diesel-sqlite` crate.
 - Set `AUTH_BASE_URL` to your server's public URL so that cookies and redirects work correctly behind a reverse proxy.
 - Use a strong, randomly generated `AUTH_SECRET` (at minimum 32 characters). You can generate one with: `openssl rand -base64 32`
 - Session tokens are short-lived. Clients should re-authenticate when they receive a `401` response.

@@ -13,6 +13,7 @@ onnx = ["skardi/onnx"]
 
 [dependencies]
 better-auth = { workspace = true }
+better-auth-diesel-sqlite = { workspace = true }
 arrow = { workspace = true }
 arrow-json = { workspace = true }
 async-trait = "0.1"
