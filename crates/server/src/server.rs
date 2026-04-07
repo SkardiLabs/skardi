@@ -9,6 +9,8 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
+use crate::auth::layer::AuthLayer;
+use crate::auth::mode::AuthMode;
 #[cfg(feature = "candle")]
 use crate::config::register_candle_udf;
 #[cfg(feature = "onnx")]
@@ -29,6 +31,8 @@ pub struct AppState {
     pub session_ctx: Arc<SessionContext>,
     /// OTel metrics instruments (request counter + latency histogram)
     pub metrics: PipelineMetrics,
+    /// Active authentication layer (NoAuth by default)
+    pub auth_layer: AuthLayer,
 }
 
 /// Main server creation function - Primary public interface
@@ -57,7 +61,7 @@ pub async fn create_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Setup application state with engine and data source registration
+/// Setup application state with engine and data source registration.
 pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     tracing::info!("Setting up application state");
 
@@ -124,6 +128,12 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     #[cfg(feature = "candle")]
     register_candle_udf(&mut session_ctx);
 
+    // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
+    let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;
+    if let Some(auth) = auth_layer.as_better_auth() {
+        crate::auth::bridge::register_auth_tables(&mut session_ctx, auth.clone())?;
+    }
+
     // Wrap SessionContext in Arc for sharing between engine and pipeline loading
     let session_ctx_arc = Arc::new(session_ctx);
 
@@ -136,6 +146,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         engine,
         session_ctx: session_ctx_arc,
         metrics: PipelineMetrics::new(),
+        auth_layer,
     };
 
     tracing::info!("Application state setup completed successfully");
@@ -147,15 +158,24 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
 pub fn configure_routes(state: AppState) -> Router {
     tracing::info!("Configuring HTTP routes");
 
-    Router::new()
+    let mut router = Router::new()
         .route("/", get(serve_dashboard))
         .route("/health", get(health_check))
         .route("/health/:name", get(pipeline_health_check))
         .route("/pipelines", get(list_pipelines))
         .route("/pipeline/:name", get(get_pipelines_info))
         .route("/data_source", get(get_data_sources))
-        .route("/:name/execute", post(execute_pipeline_by_name))
-        .with_state(state)
+        .route("/:name/execute", post(execute_pipeline_by_name));
+
+    if state.auth_layer.is_enabled() {
+        tracing::info!("Auth enabled: mounting /api/auth/* routes");
+        router = router.route(
+            "/api/auth/*path",
+            axum::routing::any(crate::auth::routes::auth_handler),
+        );
+    }
+
+    router.with_state(state)
 }
 
 /// Setup middleware stack (tracing, CORS, etc.)
@@ -266,7 +286,6 @@ query: |
         let config = ServerConfig {
             pipelines,
             data_sources,
-
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 ctx_file: None,
@@ -285,13 +304,16 @@ query: |
         ServerConfig {
             pipelines,
             data_sources: vec![],
-
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 ctx_file: None,
                 port: 8080,
             },
         }
+    }
+
+    fn assert_no_auth(state: &AppState) {
+        assert!(!state.auth_layer.is_enabled());
     }
 
     #[tokio::test]
@@ -303,6 +325,7 @@ query: |
 
         assert!(result.is_ok());
         let app_state = result.unwrap();
+        assert_no_auth(&app_state);
 
         // Verify AppState structure
         let config = app_state.config.read().unwrap();
@@ -325,6 +348,7 @@ query: |
 
         assert!(result.is_ok());
         let app_state = result.unwrap();
+        assert_no_auth(&app_state);
 
         // Verify AppState with empty data sources
         let config = app_state.config.read().unwrap();
