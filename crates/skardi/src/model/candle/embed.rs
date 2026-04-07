@@ -97,6 +97,58 @@ impl ModelArchitecture {
 }
 
 // =============================================================================
+// Pooling strategy
+// =============================================================================
+
+/// How to reduce `[1, seq_len, hidden_size]` hidden states into a single vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolingStrategy {
+    /// Use the CLS token (first token) output. Common for BGE, GTE models.
+    Cls,
+    /// Average all token outputs (weighted by attention mask). Most common default.
+    Mean,
+    /// Use the last token output. Used by some causal-LM-based embeddings.
+    LastToken,
+}
+
+/// Mirrors the `1_Pooling/config.json` file from sentence-transformers.
+#[derive(serde::Deserialize, Default)]
+struct PoolingConfig {
+    #[serde(default)]
+    pooling_mode_cls_token: bool,
+    #[serde(default)]
+    pooling_mode_mean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_lasttoken: bool,
+}
+
+impl PoolingStrategy {
+    /// Detect pooling strategy from the model directory.
+    ///
+    /// Checks (in order):
+    /// 1. `1_Pooling/config.json` (sentence-transformers standard)
+    /// 2. Falls back to `Mean` if the file is missing or unparseable.
+    fn detect(model_dir: &Path) -> Self {
+        let pooling_config_path = model_dir.join("1_Pooling/config.json");
+        if let Ok(content) = std::fs::read_to_string(&pooling_config_path) {
+            if let Ok(config) = serde_json::from_str::<PoolingConfig>(&content) {
+                if config.pooling_mode_cls_token {
+                    return Self::Cls;
+                }
+                if config.pooling_mode_lasttoken {
+                    return Self::LastToken;
+                }
+                if config.pooling_mode_mean_tokens {
+                    return Self::Mean;
+                }
+            }
+        }
+        // Default to mean pooling — the most common strategy.
+        Self::Mean
+    }
+}
+
+// =============================================================================
 // EmbeddingModel — public API
 // =============================================================================
 
@@ -117,6 +169,7 @@ pub struct EmbeddingModel {
     backend: Box<dyn EmbeddingBackend>,
     tokenizer: Tokenizer,
     device: Device,
+    pooling: PoolingStrategy,
 }
 
 impl EmbeddingModel {
@@ -190,12 +243,19 @@ impl EmbeddingModel {
             }
         };
 
-        tracing::info!("Loaded {:?} embedding model from '{}'", arch, model_dir);
+        let pooling = PoolingStrategy::detect(dir);
+        tracing::info!(
+            "Loaded {:?} embedding model from '{}' (pooling: {:?})",
+            arch,
+            model_dir,
+            pooling
+        );
 
         Ok(Self {
             backend,
             tokenizer,
             device,
+            pooling,
         })
     }
 
@@ -241,8 +301,12 @@ impl EmbeddingModel {
             .embed(&token_ids, &attention_mask)
             .map_err(|e| anyhow!("Model forward pass failed: {}", e))?;
 
-        // Mean-pool over the token dimension → [1, hidden_size]
-        let pooled = mean_pool(&hidden)?;
+        // Pool hidden states → [1, hidden_size]
+        let pooled = match self.pooling {
+            PoolingStrategy::Cls => cls_pool(&hidden)?,
+            PoolingStrategy::Mean => mean_pool(&hidden)?,
+            PoolingStrategy::LastToken => last_token_pool(&hidden)?,
+        };
 
         let out = if normalize {
             l2_normalize(&pooled)?
@@ -257,6 +321,18 @@ impl EmbeddingModel {
     }
 }
 
+/// Take the CLS token (first token) output as the embedding.
+///
+/// Input shape:  `[batch=1, seq_len, hidden_size]`
+/// Output shape: `[1, hidden_size]`
+fn cls_pool(hidden: &Tensor) -> Result<Tensor> {
+    hidden
+        .narrow(1, 0, 1)
+        .map_err(|e| anyhow!("CLS pooling failed: {}", e))?
+        .squeeze(1)
+        .map_err(|e| anyhow!("CLS pooling squeeze failed: {}", e))
+}
+
 /// Mean-pool the last hidden state over the token dimension.
 ///
 /// Input shape:  `[batch=1, seq_len, hidden_size]`
@@ -267,6 +343,21 @@ fn mean_pool(hidden: &Tensor) -> Result<Tensor> {
         .map_err(|e| anyhow!("Unexpected hidden-state shape: {}", e))?;
     (hidden.sum(1).map_err(|e| anyhow!("{}", e))? / (n_tokens as f64))
         .map_err(|e| anyhow!("Mean pooling failed: {}", e))
+}
+
+/// Take the last token output as the embedding.
+///
+/// Input shape:  `[batch=1, seq_len, hidden_size]`
+/// Output shape: `[1, hidden_size]`
+fn last_token_pool(hidden: &Tensor) -> Result<Tensor> {
+    let (_, seq_len, _) = hidden
+        .dims3()
+        .map_err(|e| anyhow!("Unexpected hidden-state shape: {}", e))?;
+    hidden
+        .narrow(1, seq_len - 1, 1)
+        .map_err(|e| anyhow!("Last-token pooling failed: {}", e))?
+        .squeeze(1)
+        .map_err(|e| anyhow!("Last-token pooling squeeze failed: {}", e))
 }
 
 /// L2-normalise along the last dimension (in-place semantics, returns new tensor).
@@ -352,6 +443,58 @@ mod tests {
             ModelArchitecture::detect(&arch(&["SomeFutureModel"])),
             ModelArchitecture::Bert
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Pooling strategy detection
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn pooling_detect_cls_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let pooling_dir = dir.path().join("1_Pooling");
+        std::fs::create_dir_all(&pooling_dir).unwrap();
+        std::fs::write(
+            pooling_dir.join("config.json"),
+            r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#,
+        )
+        .unwrap();
+        assert_eq!(PoolingStrategy::detect(dir.path()), PoolingStrategy::Cls);
+    }
+
+    #[test]
+    fn pooling_detect_mean_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let pooling_dir = dir.path().join("1_Pooling");
+        std::fs::create_dir_all(&pooling_dir).unwrap();
+        std::fs::write(
+            pooling_dir.join("config.json"),
+            r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#,
+        )
+        .unwrap();
+        assert_eq!(PoolingStrategy::detect(dir.path()), PoolingStrategy::Mean);
+    }
+
+    #[test]
+    fn pooling_detect_lasttoken_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let pooling_dir = dir.path().join("1_Pooling");
+        std::fs::create_dir_all(&pooling_dir).unwrap();
+        std::fs::write(
+            pooling_dir.join("config.json"),
+            r#"{"pooling_mode_lasttoken": true, "pooling_mode_mean_tokens": false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            PoolingStrategy::detect(dir.path()),
+            PoolingStrategy::LastToken
+        );
+    }
+
+    #[test]
+    fn pooling_defaults_to_mean_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(PoolingStrategy::detect(dir.path()), PoolingStrategy::Mean);
     }
 
     // -------------------------------------------------------------------------
