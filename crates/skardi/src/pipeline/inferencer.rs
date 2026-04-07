@@ -614,18 +614,17 @@ impl SqlSchemaInferrer {
         Ok(plan)
     }
 
-    /// Replace {parameter_name} placeholders with typed literals for DataFusion parsing.
+    /// Replace {parameter_name} placeholders with NULL for DataFusion parsing.
     ///
-    /// Uses `''` (empty string) rather than `NULL` so that UDFs like `candle()` which
-    /// inspect their argument types during planning receive a `Utf8` value and can
-    /// return a correctly-typed output (e.g. `List<Float32>`). `NULL` is untyped and
-    /// causes downstream table functions (e.g. `lance_knn`) to see the wrong argument
-    /// count when DataFusion cannot resolve the UDF's return type.
+    /// NULL works for all SQL contexts:
+    /// - `LIMIT NULL` is valid in DataFusion (treated as no limit)
+    /// - UDFs like `candle()` have hardcoded return types independent of argument types,
+    ///   so `candle('model', NULL)` still resolves to `List<Float32>` as long as the UDF
+    ///   is registered in the SessionContext before pipeline loading.
     fn replace_parameters_for_parsing(&self, sql: &str) -> Result<String> {
         let parameter_pattern = regex::Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
             .map_err(|e| anyhow!("Failed to compile parameter regex: {}", e))?;
-        let replaced_sql = parameter_pattern.replace_all(sql, "''");
-        Ok(replaced_sql.to_string())
+        Ok(parameter_pattern.replace_all(sql, "NULL").to_string())
     }
 
     /// Infer data type from SQL context when table schema is not available
@@ -976,8 +975,8 @@ mod tests {
             "SELECT * FROM products WHERE brand = {brand} AND price > {min_price} LIMIT {limit}";
         let replaced = inferrer.replace_parameters_for_parsing(sql).unwrap();
 
-        // Should replace all {param} with '' (empty string literal)
-        let expected = "SELECT * FROM products WHERE brand = '' AND price > '' LIMIT ''";
+        // All parameters replaced with NULL
+        let expected = "SELECT * FROM products WHERE brand = NULL AND price > NULL LIMIT NULL";
         assert_eq!(replaced, expected);
     }
 

@@ -7324,7 +7324,7 @@ dependencies = [
  "arrow-json",
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "datafusion",
