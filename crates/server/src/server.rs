@@ -9,6 +9,8 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
+#[cfg(feature = "candle")]
+use crate::config::register_candle_udf;
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
 use crate::config::ServerConfig;
@@ -117,6 +119,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
+
+    // Register candle UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "candle")]
+    register_candle_udf(&mut session_ctx);
 
     // Wrap SessionContext in Arc for sharing between engine and pipeline loading
     let session_ctx_arc = Arc::new(session_ctx);

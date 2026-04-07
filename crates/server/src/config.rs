@@ -401,6 +401,20 @@ pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
     registry.register_onnx_predict_udf(ctx);
 }
 
+/// Register the `candle` UDF with the session context.
+///
+/// The UDF loads BERT-style SafeTensors models lazily from file paths provided
+/// inline in SQL:
+///   candle('path/to/model.safetensors', text_col)
+///
+/// `config.json` and `tokenizer.json` must live alongside the weights file.
+/// Models are loaded and cached on first call.
+#[cfg(feature = "candle")]
+pub fn register_candle_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::CandleModelRegistry::new());
+    registry.register_candle_udf(ctx);
+}
+
 /// Load context configuration from YAML file
 fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
     tracing::debug!("Loading context from: {:?}", path);

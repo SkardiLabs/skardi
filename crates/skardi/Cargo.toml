@@ -16,6 +16,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = []
 onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 
 [dependencies]
 # engine
@@ -36,6 +37,10 @@ serde_yaml = { workspace = true }
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17.0", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"], optional = true }
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
 # sources
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
