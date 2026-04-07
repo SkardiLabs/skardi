@@ -4,11 +4,14 @@ Setup script for the candle embedding demo.
 What this does:
   1. Downloads bge-small-en-v1.5 SafeTensors weights into models/ so Skardi
      can load them via candle().
-  2. Embeds docs.csv using the same model (via sentence-transformers) and
+  2. Embeds docs.csv using the same model (via fastembed / ONNX Runtime) and
      writes the result as a Lance dataset at data/doc_embeddings.lance.
 
+Requirements:
+  Python 3.12 is required (onnxruntime has no wheels for 3.13+).
+
 Usage (run from the project root):
-  pip install sentence-transformers lance huggingface_hub pyarrow
+  pip install fastembed lancedb huggingface_hub pyarrow
   python demo/embeddings/candle/setup.py
 """
 
@@ -33,16 +36,21 @@ MODEL_ID = "BAAI/bge-small-en-v1.5"
 
 
 def download_model():
+    required = ["model.safetensors", "config.json", "tokenizer.json"]
+    if all((MODEL_DIR / f).exists() for f in required):
+        print(f"[1/3] Model already present at {MODEL_DIR}/, skipping download.")
+        return
+
     print(f"[1/3] Downloading {MODEL_ID} into {MODEL_DIR} ...")
     from huggingface_hub import snapshot_download
 
     snapshot_download(
         repo_id=MODEL_ID,
-        allow_patterns=["model.safetensors", "config.json", "tokenizer.json"],
+        allow_patterns=required,
         local_dir=str(MODEL_DIR),
     )
     print(f"      Model files saved to {MODEL_DIR}/")
-    for f in ["model.safetensors", "config.json", "tokenizer.json"]:
+    for f in required:
         path = MODEL_DIR / f
         size = path.stat().st_size / 1024 / 1024
         print(f"      {f}: {size:.1f} MB")
@@ -70,19 +78,18 @@ def load_docs():
 
 def create_lance_dataset(docs):
     print(f"[3/3] Embedding {len(docs)} documents with {MODEL_ID} ...")
-    from sentence_transformers import SentenceTransformer
-    import lance
+    from fastembed import TextEmbedding
+    import lancedb
     import pyarrow as pa
 
-    model = SentenceTransformer(MODEL_ID)
+    # fastembed uses ONNX Runtime — no torch/numpy conflicts.
+    # It normalises embeddings by default, matching candle(..., true).
+    embed_model = TextEmbedding(MODEL_ID)
 
     contents = [d["content"] for d in docs]
-    # normalize_embeddings=True matches candle(... , true) default
-    embeddings = model.encode(
-        contents, normalize_embeddings=True, show_progress_bar=True
-    )
+    embeddings = list(embed_model.embed(contents))
 
-    dim = embeddings.shape[1]
+    dim = len(embeddings[0])
     print(f"      Embedding dimension: {dim}")
 
     table = pa.table(
@@ -97,7 +104,8 @@ def create_lance_dataset(docs):
         }
     )
 
-    lance.write_dataset(table, str(LANCE_OUT), mode="overwrite")
+    db = lancedb.connect(str(LANCE_OUT.parent))
+    db.create_table(LANCE_OUT.stem, data=table, mode="overwrite")
     print(f"      Lance dataset written to {LANCE_OUT}")
     print(f"      Schema: {table.schema}")
 

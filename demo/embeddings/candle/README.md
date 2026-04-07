@@ -12,22 +12,22 @@ SELECT id, title, content, _distance
 FROM lance_knn(
   'doc_embeddings',
   'embedding',
-  candle('models/bge-small-en-v1.5/model.safetensors', {query}),
-  {top_k}
+  candle('models/bge-small-en-v1.5', {query}),
+  10
 )
 ORDER BY _distance
-LIMIT {top_k}
+LIMIT 10
 ```
 
 `candle()` signature:
 
 ```sql
-candle(model_path, text_col [, normalize]) -> List<Float32>
+candle(model_dir, text_col [, normalize]) -> List<Float32>
 ```
 
 | Argument | Description |
 |---|---|
-| `model_path` | Path to a `.safetensors` weights file. `config.json` and `tokenizer.json` must live in the same directory. |
+| `model_dir` | Path to a directory containing a `.safetensors` weights file, `config.json`, and `tokenizer.json`. |
 | `text_col` | Text column or scalar to embed. |
 | `normalize` | Optional boolean (default `true`). `true` → L2 unit-norm vectors for cosine similarity. `false` → raw mean-pooled vectors for dot-product search. |
 
@@ -45,10 +45,12 @@ The architecture is detected automatically from `config.json`:
 
 ## Prerequisites
 
-1. **Python dependencies** for the setup script:
+1. **Python 3.12** and dependencies for the setup script:
    ```bash
-   pip install sentence-transformers lance huggingface_hub pyarrow
+   pip install fastembed lance huggingface_hub pyarrow
    ```
+   > Python 3.12 is required — `onnxruntime` (used by `fastembed`) has no
+   > pre-built wheels for Python 3.13+.
 
 2. **Build the server** with the `candle` feature:
    ```bash
@@ -97,8 +99,7 @@ cargo run --bin skardi-server --features candle -- \
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "how does similarity search work in vector databases?",
-    "top_k": 3
+    "query": "how does similarity search work in vector databases?"
   }'
 ```
 
@@ -137,17 +138,17 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 # Retrieval-Augmented Generation
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "how to ground LLM responses with retrieved documents", "top_k": 3}'
+  -d '{"query": "how to ground LLM responses with retrieved documents"}'
 
 # Arrow / columnar formats
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "columnar data formats for analytics", "top_k": 3}'
+  -d '{"query": "columnar data formats for analytics"}'
 
 # Model quantization
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "running models on CPU without a GPU", "top_k": 3}'
+  -d '{"query": "running models on CPU without a GPU"}'
 ```
 
 ## Pipeline Parameters
@@ -155,7 +156,6 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `query` | string | Yes | Free-text search query |
-| `top_k` | integer | Yes | Number of results to return |
 
 ## Directory Layout
 
@@ -180,8 +180,8 @@ models/
 ```
 
 > **Note**: `models/` lives at the project root so the path in SQL
-> (`models/bge-small-en-v1.5/model.safetensors`) is relative to wherever
-> you launch `skardi-server` from.
+> (`models/bge-small-en-v1.5`) is relative to wherever you launch
+> `skardi-server` from.
 
 ## Switching Models
 
@@ -197,7 +197,7 @@ huggingface-cli download BAAI/bge-base-en-v1.5 \
 
 ```sql
 -- Use the larger model in the pipeline
-candle('models/bge-base-en-v1.5/model.safetensors', {query})
+candle('models/bge-base-en-v1.5', {query})
 ```
 
 Re-run `setup.py` with `MODEL_ID = "BAAI/bge-base-en-v1.5"` and
@@ -208,7 +208,7 @@ with the new model's embeddings.
 
 ### "Failed to load candle model"
 Ensure the path is relative to the directory where you started `skardi-server`
-and that all three files exist: `model.safetensors`, `config.json`, `tokenizer.json`.
+and that the model directory contains all three files: `model.safetensors`, `config.json`, `tokenizer.json`.
 
 ### "table 'doc_embeddings' not found"
 Run `setup.py` first to create the Lance dataset.

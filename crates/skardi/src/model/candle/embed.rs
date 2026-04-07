@@ -111,8 +111,8 @@ impl ModelArchitecture {
 /// | `DistilBertModel` | `distilbert::DistilBertModel` |
 /// | `JinaBertModel` | `jina_bert::BertModel` |
 ///
-/// The weights file must be SafeTensors. `config.json` and `tokenizer.json`
-/// are resolved from the same directory as the weights file.
+/// The model directory must contain exactly one `.safetensors` weights file,
+/// plus `config.json` and `tokenizer.json`.
 pub struct EmbeddingModel {
     backend: Box<dyn EmbeddingBackend>,
     tokenizer: Tokenizer,
@@ -120,12 +120,19 @@ pub struct EmbeddingModel {
 }
 
 impl EmbeddingModel {
-    /// Load an embedding model from a SafeTensors weights file.
-    pub fn from_safetensors(model_path: &str) -> Result<Self> {
-        let weights_path = Path::new(model_path);
-        let dir = weights_path
-            .parent()
-            .ok_or_else(|| anyhow!("Cannot determine model directory from '{}'", model_path))?;
+    /// Load an embedding model from a directory.
+    ///
+    /// The directory must contain a single `.safetensors` weights file,
+    /// `config.json`, and `tokenizer.json`.
+    pub fn from_dir(model_dir: &str) -> Result<Self> {
+        let dir = Path::new(model_dir);
+
+        let weights_path = std::fs::read_dir(dir)
+            .map_err(|e| anyhow!("Cannot read model directory '{}': {}", model_dir, e))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+            .ok_or_else(|| anyhow!("No .safetensors file found in '{}'", model_dir))?;
 
         let config_path = dir.join("config.json");
         let tokenizer_path = dir.join("tokenizer.json");
@@ -152,7 +159,7 @@ impl EmbeddingModel {
 
         let device = Device::Cpu;
 
-        let tensors = candle_safetensors::load(weights_path, &device)
+        let tensors = candle_safetensors::load(&weights_path, &device)
             .map_err(|e| anyhow!("Failed to load safetensors weights: {}", e))?;
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
 
@@ -183,7 +190,7 @@ impl EmbeddingModel {
             }
         };
 
-        tracing::info!("Loaded {:?} embedding model from '{}'", arch, model_path);
+        tracing::info!("Loaded {:?} embedding model from '{}'", arch, model_dir);
 
         Ok(Self {
             backend,
@@ -525,9 +532,7 @@ mod tests {
     fn embedding_has_unit_norm() {
         let dir = tempfile::tempdir().unwrap();
         make_bert_fixture(dir.path());
-        let weights = dir.path().join("model.safetensors");
-
-        let model = EmbeddingModel::from_safetensors(weights.to_str().unwrap())
+        let model = EmbeddingModel::from_dir(dir.path().to_str().unwrap())
             .expect("Failed to load synthetic model");
 
         let embeddings = model
@@ -550,9 +555,7 @@ mod tests {
     fn normalize_false_returns_unnormalised_vector() {
         let dir = tempfile::tempdir().unwrap();
         make_bert_fixture(dir.path());
-        let weights = dir.path().join("model.safetensors");
-
-        let model = EmbeddingModel::from_safetensors(weights.to_str().unwrap()).unwrap();
+        let model = EmbeddingModel::from_dir(dir.path().to_str().unwrap()).unwrap();
 
         let raw = model
             .embed_texts(&["hello world"], false)
@@ -579,9 +582,7 @@ mod tests {
     fn same_text_produces_same_embedding() {
         let dir = tempfile::tempdir().unwrap();
         make_bert_fixture(dir.path());
-        let weights = dir.path().join("model.safetensors");
-
-        let model = EmbeddingModel::from_safetensors(weights.to_str().unwrap()).unwrap();
+        let model = EmbeddingModel::from_dir(dir.path().to_str().unwrap()).unwrap();
 
         let a = model
             .embed_texts(&["determinism check"], true)
@@ -603,9 +604,7 @@ mod tests {
     fn different_texts_produce_different_embeddings() {
         let dir = tempfile::tempdir().unwrap();
         make_bert_fixture(dir.path());
-        let weights = dir.path().join("model.safetensors");
-
-        let model = EmbeddingModel::from_safetensors(weights.to_str().unwrap()).unwrap();
+        let model = EmbeddingModel::from_dir(dir.path().to_str().unwrap()).unwrap();
 
         let mut out = model
             .embed_texts(&["cat", "the quick brown fox"], true)

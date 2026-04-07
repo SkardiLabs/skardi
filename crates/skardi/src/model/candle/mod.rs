@@ -5,6 +5,7 @@ use arrow::{
     array::{Array, ArrayRef, Float32Builder, ListBuilder, StringArray},
     datatypes::{DataType, Field},
 };
+use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::{
     error::DataFusionError,
     logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
@@ -41,7 +42,7 @@ impl CandleModelRegistry {
         }
     }
 
-    /// Get or lazily load an `EmbeddingModel` by SafeTensors file path.
+    /// Get or lazily load an `EmbeddingModel` by model directory path.
     pub fn get_or_load(&self, model_path: &str) -> Result<Arc<EmbeddingModel>> {
         // Fast path: already loaded
         {
@@ -52,7 +53,7 @@ impl CandleModelRegistry {
         }
 
         tracing::info!("Loading candle model from '{}'", model_path);
-        let model = Arc::new(EmbeddingModel::from_safetensors(model_path)?);
+        let model = Arc::new(EmbeddingModel::from_dir(model_path)?);
         tracing::info!("Candle model '{}' loaded and cached", model_path);
 
         let mut models = self.models.write().unwrap();
@@ -63,11 +64,11 @@ impl CandleModelRegistry {
 
     /// Register the `candle` UDF with a DataFusion `SessionContext`.
     ///
-    /// Usage: `candle('path/to/model.safetensors', text_col) -> List<Float32>`
+    /// Usage: `candle('path/to/model_dir', text_col) -> List<Float32>`
     ///
-    /// The first argument is the path to a `.safetensors` weights file. The model
-    /// directory must also contain `config.json` and `tokenizer.json`. The model
-    /// is loaded and cached on the first call.
+    /// The first argument is the path to a model directory containing a single
+    /// `.safetensors` weights file, `config.json`, and `tokenizer.json`. The
+    /// model is loaded and cached on the first call.
     pub fn register_candle_udf(self: &Arc<Self>, ctx: &mut SessionContext) {
         let udf = ScalarUDF::new_from_impl(CandleUDF::new(Arc::clone(self)));
         ctx.register_udf(udf);
@@ -157,7 +158,7 @@ impl ScalarUDFImpl for CandleUDF {
 
     fn invoke_with_args(
         &self,
-        args: datafusion::logical_expr::ScalarFunctionArgs,
+        args: ScalarFunctionArgs,
     ) -> datafusion::common::Result<ColumnarValue> {
         let args = args.args;
 

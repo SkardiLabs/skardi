@@ -108,7 +108,13 @@ impl SqlSchemaInferrer {
             // Count occurrences of this parameter in original SQL
             let param_pattern = format!(r"\{{{}\}}", regex::escape(param_name));
             let occurrences = regex::Regex::new(&param_pattern)
-                .unwrap()
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to compile parameter regex for '{}': {}",
+                        param_name,
+                        e
+                    )
+                })?
                 .find_iter(sql)
                 .count();
 
@@ -149,7 +155,8 @@ impl SqlSchemaInferrer {
         let mut sql_with_placeholders = sql.to_string();
 
         // Extract all {parameter_name} patterns and replace with ? placeholders
-        let parameter_pattern = regex::Regex::new(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}").unwrap();
+        let parameter_pattern = regex::Regex::new(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+            .map_err(|e| anyhow!("Failed to compile parameter regex: {}", e))?;
 
         // Find all matches and collect unique parameter names in order
         let mut seen_params = std::collections::HashSet::new();
@@ -164,7 +171,13 @@ impl SqlSchemaInferrer {
         // Replace each unique {parameter_name} with ? placeholders
         for param_name in &parameter_order {
             let pattern = format!(r"\{{{}\}}", regex::escape(param_name));
-            let regex = regex::Regex::new(&pattern).unwrap();
+            let regex = regex::Regex::new(&pattern).map_err(|e| {
+                anyhow!(
+                    "Failed to compile parameter regex for '{}': {}",
+                    param_name,
+                    e
+                )
+            })?;
             sql_with_placeholders = regex.replace_all(&sql_with_placeholders, "?").to_string();
         }
 
@@ -601,11 +614,17 @@ impl SqlSchemaInferrer {
         Ok(plan)
     }
 
-    /// Replace {parameter_name} placeholders with NULL for DataFusion parsing
+    /// Replace {parameter_name} placeholders with typed literals for DataFusion parsing.
+    ///
+    /// Uses `''` (empty string) rather than `NULL` so that UDFs like `candle()` which
+    /// inspect their argument types during planning receive a `Utf8` value and can
+    /// return a correctly-typed output (e.g. `List<Float32>`). `NULL` is untyped and
+    /// causes downstream table functions (e.g. `lance_knn`) to see the wrong argument
+    /// count when DataFusion cannot resolve the UDF's return type.
     fn replace_parameters_for_parsing(&self, sql: &str) -> Result<String> {
-        // Replace {parameter_name} patterns with NULL for logical plan creation
-        let parameter_pattern = regex::Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}").unwrap();
-        let replaced_sql = parameter_pattern.replace_all(sql, "NULL");
+        let parameter_pattern = regex::Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+            .map_err(|e| anyhow!("Failed to compile parameter regex: {}", e))?;
+        let replaced_sql = parameter_pattern.replace_all(sql, "''");
         Ok(replaced_sql.to_string())
     }
 
@@ -957,8 +976,8 @@ mod tests {
             "SELECT * FROM products WHERE brand = {brand} AND price > {min_price} LIMIT {limit}";
         let replaced = inferrer.replace_parameters_for_parsing(sql).unwrap();
 
-        // Should replace all {param} with NULL
-        let expected = "SELECT * FROM products WHERE brand = NULL AND price > NULL LIMIT NULL";
+        // Should replace all {param} with '' (empty string literal)
+        let expected = "SELECT * FROM products WHERE brand = '' AND price > '' LIMIT ''";
         assert_eq!(replaced, expected);
     }
 

@@ -289,6 +289,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
+    // Register candle UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "candle")]
+    register_candle_udf(&mut session_ctx);
+
     let ctx = Arc::new(session_ctx);
 
     // Resolve pipeline files from path (can be file or directory)
