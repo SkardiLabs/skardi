@@ -29,6 +29,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 skardi = { path = "../skardi" }
 anyhow = "1.0"
+base64 = "0.22"
 thiserror = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync"] }
 tower = { workspace = true }

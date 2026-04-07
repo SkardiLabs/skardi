@@ -26,11 +26,20 @@ impl Drop for TelemetryGuard {
 
 /// Initialise OpenTelemetry traces and metrics, exporting via OTLP gRPC.
 ///
+/// Returns `None` when `otlp_endpoint` is `None` — OTLP export is disabled
+/// and no providers are registered.
+///
 /// Call this before setting up the tracing subscriber so the returned tracer
 /// can be passed into `tracing_opentelemetry::layer()`.
 ///
 /// The returned `TelemetryGuard` must be kept alive until the process exits.
-pub fn init(otlp_endpoint: &str) -> Result<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)> {
+pub fn init(
+    otlp_endpoint: Option<&str>,
+) -> Result<Option<(TelemetryGuard, opentelemetry_sdk::trace::Tracer)>> {
+    let Some(otlp_endpoint) = otlp_endpoint else {
+        return Ok(None);
+    };
+
     let resource = Resource::new(vec![KeyValue::new(
         opentelemetry_semantic_conventions::resource::SERVICE_NAME,
         "skardi-server",
@@ -65,11 +74,11 @@ pub fn init(otlp_endpoint: &str) -> Result<(TelemetryGuard, opentelemetry_sdk::t
 
     global::set_meter_provider(meter_provider.clone());
 
-    Ok((
+    Ok(Some((
         TelemetryGuard {
             tracer_provider,
             meter_provider,
         },
         tracer,
-    ))
+    )))
 }
