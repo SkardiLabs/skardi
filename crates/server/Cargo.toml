@@ -10,6 +10,7 @@ path = "src/main.rs"
 [features]
 default = []
 onnx = ["skardi/onnx"]
+gguf = ["skardi/gguf"]
 
 [dependencies]
 better-auth = { workspace = true }

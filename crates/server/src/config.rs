@@ -289,6 +289,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
+    // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
+    #[cfg(feature = "gguf")]
+    register_gguf_udf(&mut session_ctx);
+
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
     let planning_auth =
@@ -411,6 +415,18 @@ async fn load_pipeline_config(path: &Path, ctx: Arc<SessionContext>) -> Result<S
 pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::OnnxModelRegistry::new());
     registry.register_onnx_predict_udf(ctx);
+}
+
+/// Register the gguf UDF with the session context.
+///
+/// The UDF loads GGUF models lazily from directory paths provided inline in SQL:
+///   gguf('path/to/model_dir', text_col)
+///
+/// No pre-configuration needed — llama.cpp backend and models are initialized on first call.
+#[cfg(feature = "gguf")]
+pub fn register_gguf_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::GgufModelRegistry::new());
+    registry.register_gguf_udf(ctx);
 }
 
 /// Load context configuration from YAML file

@@ -16,6 +16,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = []
 onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]
+gguf = ["dep:llama-cpp-4"]
 
 [dependencies]
 # engine
@@ -36,6 +37,7 @@ serde_yaml = { workspace = true }
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17.0", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"], optional = true }
+llama-cpp-4 = { version = "0.2", optional = true }
 # sources
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
@@ -63,3 +65,4 @@ uuid = { workspace = true }
 tokio-test = "0.4"
 tempfile = { workspace = true }
 redis-test = "0.13.0"
+gguf-rs-lib = "0.2"

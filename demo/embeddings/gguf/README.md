@@ -1,0 +1,213 @@
+# GGUF Embedding Demo
+
+This demo shows how to use the `gguf()` scalar UDF to run local GGUF-format
+embedding inference directly inside SQL via llama.cpp, and combine it with
+`lance_knn()` for semantic search — no external embedding API, no Python in the
+hot path.
+
+## How It Works
+
+```sql
+-- Embed the query on the fly, find the 10 nearest docs
+SELECT id, title, content, _distance
+FROM lance_knn(
+  'doc_embeddings_gguf',
+  'embedding',
+  gguf('models/embeddinggemma-300m', {query}),
+  10
+)
+ORDER BY _distance
+LIMIT 10
+```
+
+`gguf()` signature:
+
+```sql
+gguf(model_dir, text_col [, normalize]) -> List<Float32>
+```
+
+| Argument | Description |
+|---|---|
+| `model_dir` | Path to a directory containing a single `.gguf` weights file. |
+| `text_col` | Text column or scalar to embed. |
+| `normalize` | Optional boolean (default `true`). `true` → L2 unit-norm vectors for cosine similarity. `false` → raw vectors for dot-product search. |
+
+The model is loaded and cached on first call — subsequent queries pay no loading cost.
+
+### Why GGUF?
+
+GGUF models use the llama.cpp inference backend, which natively handles tensor
+naming, tokenization, and architecture wiring for all supported model families.
+No manual `config.json` or architecture detection needed — everything is embedded
+in the `.gguf` file.
+
+GGUF also supports multiple quantisation levels (Q4, Q5, Q8, F16, F32), making
+it possible to run embedding models with a fraction of the memory footprint.
+
+## Prerequisites
+
+1. **Python 3.12** and dependencies for the setup script:
+   ```bash
+   pip install llama-cpp-python lancedb huggingface_hub pyarrow
+   ```
+
+2. **Accept Google's Gemma licence** (required for the tokenizer):
+   - Visit https://huggingface.co/google/embeddinggemma-300m-qat-q8_0-unquantized
+   - Accept the licence agreement
+   - Authenticate: `huggingface-cli login`
+
+3. **Build the server** with the `gguf` feature:
+   ```bash
+   cargo build --release -p skardi-server --features gguf
+   ```
+
+## Setup
+
+Run once from the **project root** to download the model and create the Lance dataset:
+
+```bash
+python demo/embeddings/gguf/setup_gguf.py
+```
+
+This will:
+- Download `embeddinggemma-300m-qat-Q8_0.gguf` (~329 MB) into `models/embeddinggemma-300m/`
+- Download `tokenizer.json` from the gated Gemma repo
+- Embed the 15 knowledge-base documents in `data/docs.csv`
+- Write a Lance dataset to `demo/embeddings/gguf/data/doc_embeddings_gguf.lance`
+
+Expected output:
+```
+[1/4] Downloading embeddinggemma-300m-qat-Q8_0.gguf from ggml-org/embeddinggemma-300m-qat-q8_0-GGUF (~329 MB) ...
+      embeddinggemma-300m-qat-Q8_0.gguf: 329.0 MB
+[2/4] Downloading tokenizer.json from google/embeddinggemma-300m-qat-q8_0-unquantized ...
+      tokenizer.json: 31.8 MB
+[3/4] Loaded 15 documents from demo/embeddings/gguf/data/docs.csv
+[4/4] Embedding 15 documents with embeddinggemma-300m-qat-Q8_0.gguf ...
+      Embedding dimension: 256
+      Lance dataset written to demo/embeddings/gguf/data/doc_embeddings_gguf.lance
+```
+
+## Starting the Server
+
+```bash
+cargo run --bin skardi-server --features gguf -- \
+  --ctx demo/embeddings/gguf/ctx.yaml \
+  --pipeline demo/embeddings/gguf/pipelines/ \
+  --port 8080
+```
+
+## Running Queries
+
+### Semantic Search
+
+```bash
+curl -X POST http://localhost:8080/semantic-search-gguf/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "how does similarity search work in vector databases?"
+  }' | jq .
+```
+
+**Response** (truncated — returns up to 10 results):
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "title": "Vector Databases",
+      "content": "Vector databases store high-dimensional numerical vectors ...",
+      "_distance": 0.082
+    },
+    {
+      "id": 11,
+      "title": "Approximate Nearest Neighbour Search",
+      "content": "Exact nearest-neighbour search scales as O(n) per query ...",
+      "_distance": 0.143
+    }
+  ],
+  "rows": 10,
+  "execution_time_ms": 45
+}
+```
+
+### More Example Queries
+
+```bash
+# Retrieval-Augmented Generation
+curl -X POST http://localhost:8080/semantic-search-gguf/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "how to ground LLM responses with retrieved documents"}' | jq .
+
+# GGUF and quantisation
+curl -X POST http://localhost:8080/semantic-search-gguf/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "running quantised models on CPU without a GPU"}' | jq .
+
+# Arrow / columnar formats
+curl -X POST http://localhost:8080/semantic-search-gguf/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "columnar data formats for analytics"}' | jq .
+```
+
+## Pipeline Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | Yes | Free-text search query |
+
+## Directory Layout
+
+```
+demo/embeddings/gguf/
+├── README.md
+├── ctx.yaml                          — registers the Lance data source
+├── setup_gguf.py                     — one-time setup: downloads model + creates Lance dataset
+├── data/
+│   ├── docs.csv                      — 15 knowledge-base documents (source of truth)
+│   └── doc_embeddings_gguf.lance/    — created by setup_gguf.py
+└── pipelines/
+    └── pipeline_semantic_search_gguf.yaml — the semantic search pipeline
+```
+
+```
+models/
+└── embeddinggemma-300m/              — created by setup_gguf.py
+    ├── embeddinggemma-300m-qat-Q8_0.gguf
+    └── tokenizer.json
+```
+
+> **Note**: `models/` lives at the project root so the path in SQL
+> (`models/embeddinggemma-300m`) is relative to wherever you launch
+> `skardi-server` from.
+
+## Switching Models
+
+Any GGUF embedding model works. Download a different model and update the path
+in the pipeline SQL:
+
+```sql
+-- Use a different GGUF model in the pipeline
+gguf('models/nomic-embed-text-v1.5', {query})
+```
+
+Re-run `setup_gguf.py` with updated `MODEL_DIR` / `GGUF_REPO` / `GGUF_FILE`
+to rebuild the Lance dataset with the new model's embeddings.
+
+## Troubleshooting
+
+### "Failed to load GGUF model"
+Ensure the path is relative to the directory where you started `skardi-server`
+and that the model directory contains a single `.gguf` file.
+
+### "table 'doc_embeddings_gguf' not found"
+Run `setup_gguf.py` first to create the Lance dataset.
+
+### "Could not download tokenizer.json"
+The tokenizer is hosted in a gated repo. Accept the Gemma licence at
+https://huggingface.co/google/embeddinggemma-300m-qat-q8_0-unquantized
+and run `huggingface-cli login`.
+
+### Slow first query
+The first call loads and caches the model (~329 MB). Subsequent queries are fast.
+Use `RUST_LOG=info` to see load timing in the server logs.
