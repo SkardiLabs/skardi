@@ -45,7 +45,7 @@ impl GgufModelRegistry {
 
     /// Get or lazily load a `GgufEmbeddingModel` by model directory path.
     pub fn get_or_load(&self, model_path: &str) -> Result<Arc<GgufEmbeddingModel>> {
-        // Fast path: already loaded
+        // Fast path: already loaded (read lock only)
         {
             let models = self.models.read().unwrap();
             if let Some(model) = models.get(model_path) {
@@ -53,11 +53,17 @@ impl GgufModelRegistry {
             }
         }
 
+        // Slow path: acquire write lock, then double-check to avoid loading
+        // the same model twice if another thread raced us.
+        let mut models = self.models.write().unwrap();
+        if let Some(model) = models.get(model_path) {
+            return Ok(Arc::clone(model));
+        }
+
         tracing::info!("Loading GGUF model from '{}'", model_path);
         let model = Arc::new(GgufEmbeddingModel::from_dir(model_path)?);
         tracing::info!("GGUF model '{}' loaded and cached", model_path);
 
-        let mut models = self.models.write().unwrap();
         models.insert(model_path.to_string(), Arc::clone(&model));
 
         Ok(model)
@@ -89,14 +95,21 @@ impl Default for GgufModelRegistry {
 /// Convert a batch of embedding vectors into an Arrow `ListArray<Float32>`.
 ///
 /// The resulting array has one list element per input row, compatible with
-/// `lance_knn` directly.
-pub fn vecs_to_list_array(vecs: Vec<Vec<f32>>) -> ArrayRef {
+/// `lance_knn` directly. `None` entries produce null list elements.
+pub fn vecs_to_list_array(vecs: Vec<Option<Vec<f32>>>) -> ArrayRef {
     let mut builder = ListBuilder::new(Float32Builder::new());
     for vec in vecs {
-        for v in &vec {
-            builder.values().append_value(*v);
+        match vec {
+            Some(v) => {
+                for val in &v {
+                    builder.values().append_value(*val);
+                }
+                builder.append(true);
+            }
+            None => {
+                builder.append(false);
+            }
         }
-        builder.append(true);
     }
     Arc::new(builder.finish())
 }
@@ -129,6 +142,8 @@ impl GgufUDF {
     fn new(registry: Arc<GgufModelRegistry>) -> Self {
         Self {
             registry,
+            // variadic_any for consistency with the ONNX UDF; arity and types
+            // are validated in invoke_with_args (2 required + 1 optional bool).
             signature: Signature::variadic_any(Volatility::Immutable),
         }
     }
@@ -196,14 +211,15 @@ impl ScalarUDFImpl for GgufUDF {
         };
 
         // --- Extract text input (second arg) ---
-        let texts: Vec<String> = match &args[1] {
+        // Track which rows are null so we can propagate nulls in the output.
+        let (texts, null_mask): (Vec<String>, Vec<bool>) = match &args[1] {
             ColumnarValue::Array(arr) => {
                 let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
                     DataFusionError::Execution(
                         "Second argument to gguf must be a text column (Utf8)".to_string(),
                     )
                 })?;
-                (0..str_arr.len())
+                let texts = (0..str_arr.len())
                     .map(|i| {
                         if str_arr.is_null(i) {
                             String::new()
@@ -211,10 +227,12 @@ impl ScalarUDFImpl for GgufUDF {
                             str_arr.value(i).to_string()
                         }
                     })
-                    .collect()
+                    .collect();
+                let nulls = (0..str_arr.len()).map(|i| str_arr.is_null(i)).collect();
+                (texts, nulls)
             }
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => vec![s.clone()],
-            ColumnarValue::Scalar(ScalarValue::Utf8(None)) => vec![String::new()],
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => (vec![s.clone()], vec![false]),
+            ColumnarValue::Scalar(ScalarValue::Utf8(None)) => (vec![String::new()], vec![true]),
             _ => {
                 return Err(DataFusionError::Execution(
                     "Second argument to gguf must be a text column (Utf8)".to_string(),
@@ -242,12 +260,24 @@ impl ScalarUDFImpl for GgufUDF {
             DataFusionError::Execution(format!("Failed to load GGUF model '{}': {}", model_path, e))
         })?;
 
-        // --- Run embedding ---
-        let text_refs: Vec<&str> = texts.iter().map(|s: &String| s.as_str()).collect();
-        let embeddings = model.embed_texts(&text_refs, normalize).map_err(|e| {
+        // --- Run embedding (only for non-null rows) ---
+        let non_null_texts: Vec<&str> = texts
+            .iter()
+            .zip(&null_mask)
+            .filter_map(|(s, is_null)| if !is_null { Some(s.as_str()) } else { None })
+            .collect();
+
+        let non_null_embeddings = model.embed_texts(&non_null_texts, normalize).map_err(|e| {
             tracing::error!("GGUF embedding failed for model '{}': {}", model_path, e);
             DataFusionError::Execution(format!("Embedding failed: {}", e))
         })?;
+
+        // Reassemble results with nulls in the correct positions.
+        let mut emb_iter = non_null_embeddings.into_iter();
+        let embeddings: Vec<Option<Vec<f32>>> = null_mask
+            .iter()
+            .map(|&is_null| if is_null { None } else { emb_iter.next() })
+            .collect();
 
         Ok(ColumnarValue::Array(vecs_to_list_array(embeddings)))
     }
@@ -270,7 +300,7 @@ mod tests {
 
     #[test]
     fn vecs_to_list_array_shape_and_values() {
-        let vecs = vec![vec![1.0f32, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let vecs = vec![Some(vec![1.0f32, 2.0, 3.0]), Some(vec![4.0, 5.0, 6.0])];
         let arr = vecs_to_list_array(vecs);
 
         let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
@@ -306,12 +336,23 @@ mod tests {
 
     #[test]
     fn vecs_to_list_array_variable_length_vectors() {
-        let vecs = vec![vec![1.0f32, 2.0], vec![3.0, 4.0, 5.0, 6.0]];
+        let vecs = vec![Some(vec![1.0f32, 2.0]), Some(vec![3.0, 4.0, 5.0, 6.0])];
         let arr = vecs_to_list_array(vecs);
         let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list.value(0).len(), 2);
         assert_eq!(list.value(1).len(), 4);
+    }
+
+    #[test]
+    fn vecs_to_list_array_null_entries() {
+        let vecs = vec![Some(vec![1.0f32, 2.0]), None, Some(vec![3.0, 4.0])];
+        let arr = vecs_to_list_array(vecs);
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(!list.is_null(0));
+        assert!(list.is_null(1));
+        assert!(!list.is_null(2));
     }
 
     // =========================================================================

@@ -24,8 +24,10 @@ fn get_backend() -> &'static LlamaBackend {
         let mut backend = LlamaBackend::init()
             .expect("Failed to init llama backend — this should only happen once");
         // Suppress llama.cpp's verbose C-level stderr output (tensor listings,
-        // context params, etc.). We emit our own tracing logs at appropriate levels.
-        backend.void_logs();
+        // context params, etc.) unless debug-level tracing is enabled.
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            backend.void_logs();
+        }
         backend
     })
 }
@@ -44,9 +46,12 @@ pub struct GgufEmbeddingModel {
     pub n_embd: usize,
 }
 
-// SAFETY: llama.cpp internally synchronises access; the Rust bindings hold
-// a raw pointer but llama_decode is thread-safe when each thread uses its
-// own LlamaContext (which we create per-call).
+// SAFETY: `LlamaModel` holds a raw pointer to a llama.cpp model.
+// - `Send`: the model is only accessed via `&self` after construction, and
+//   llama.cpp model reads (tokenization via `str_to_token`, `n_embd`) are
+//   thread-safe.
+// - `Sync`: concurrent `embed_texts` calls are safe because each creates its
+//   own `LlamaContext` — no mutable state is shared through `&self.model`.
 unsafe impl Send for GgufEmbeddingModel {}
 unsafe impl Sync for GgufEmbeddingModel {}
 
@@ -92,6 +97,10 @@ impl GgufEmbeddingModel {
     /// Each text is decoded independently (its own batch + decode call) because
     /// BERT models in llama.cpp do not support multi-sequence batches. A shared
     /// `LlamaContext` is reused across texts with KV-cache cleared between calls.
+    ///
+    /// A new `LlamaContext` is allocated per call, sized to the longest sequence
+    /// in the batch. This is cheap for embedding models (small KV cache) and
+    /// avoids the complexity of pooling lifetime-bound contexts.
     pub fn embed_texts(&self, texts: &[&str], normalize: bool) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
