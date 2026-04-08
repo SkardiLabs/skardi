@@ -47,7 +47,7 @@ The architecture is detected automatically from `config.json`:
 
 1. **Python 3.12** and dependencies for the setup script:
    ```bash
-   pip install fastembed lance huggingface_hub pyarrow
+   pip install fastembed lance lancedb huggingface_hub pyarrow
    ```
    > Python 3.12 is required — `onnxruntime` (used by `fastembed`) has no
    > pre-built wheels for Python 3.13+.
@@ -100,10 +100,10 @@ curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
   -d '{
     "query": "how does similarity search work in vector databases?"
-  }'
+  }' | jq .
 ```
 
-**Response:**
+**Response** (truncated — returns up to 10 results):
 ```json
 {
   "success": true,
@@ -127,7 +127,7 @@ curl -X POST http://localhost:8080/semantic-search/execute \
       "_distance": 0.178
     }
   ],
-  "rows": 3,
+  "rows": 10,
   "execution_time_ms": 28
 }
 ```
@@ -138,17 +138,17 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 # Retrieval-Augmented Generation
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "how to ground LLM responses with retrieved documents"}'
+  -d '{"query": "how to ground LLM responses with retrieved documents"}' | jq .
 
 # Arrow / columnar formats
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "columnar data formats for analytics"}'
+  -d '{"query": "columnar data formats for analytics"}' | jq .
 
 # Model quantization
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "running models on CPU without a GPU"}'
+  -d '{"query": "running models on CPU without a GPU"}' | jq .
 ```
 
 ## Pipeline Parameters

@@ -182,6 +182,11 @@ impl ScalarUDFImpl for CandleUDF {
                         "Empty model path array".to_string(),
                     ));
                 }
+                if str_arr.is_null(0) {
+                    return Err(DataFusionError::Execution(
+                        "First argument to candle (model path) must not be null".to_string(),
+                    ));
+                }
                 str_arr.value(0).to_string()
             }
             _ => {

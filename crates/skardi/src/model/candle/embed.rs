@@ -180,12 +180,25 @@ impl EmbeddingModel {
     pub fn from_dir(model_dir: &str) -> Result<Self> {
         let dir = Path::new(model_dir);
 
-        let weights_path = std::fs::read_dir(dir)
-            .map_err(|e| anyhow!("Cannot read model directory '{}': {}", model_dir, e))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
-            .ok_or_else(|| anyhow!("No .safetensors file found in '{}'", model_dir))?;
+        // Prefer `model.safetensors` (single-file models). For sharded models
+        // (e.g. `model-00001-of-00003.safetensors`), fall back to the first
+        // shard alphabetically. This avoids non-deterministic `read_dir` order.
+        let canonical = dir.join("model.safetensors");
+        let weights_path = if canonical.exists() {
+            canonical
+        } else {
+            let mut safetensor_files: Vec<_> = std::fs::read_dir(dir)
+                .map_err(|e| anyhow!("Cannot read model directory '{}': {}", model_dir, e))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+                .collect();
+            safetensor_files.sort();
+            safetensor_files
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("No .safetensors file found in '{}'", model_dir))?
+        };
 
         let config_path = dir.join("config.json");
         let tokenizer_path = dir.join("tokenizer.json");
@@ -304,7 +317,7 @@ impl EmbeddingModel {
         // Pool hidden states → [1, hidden_size]
         let pooled = match self.pooling {
             PoolingStrategy::Cls => cls_pool(&hidden)?,
-            PoolingStrategy::Mean => mean_pool(&hidden)?,
+            PoolingStrategy::Mean => mean_pool(&hidden, &attention_mask)?,
             PoolingStrategy::LastToken => last_token_pool(&hidden)?,
         };
 
@@ -333,15 +346,34 @@ fn cls_pool(hidden: &Tensor) -> Result<Tensor> {
         .map_err(|e| anyhow!("CLS pooling squeeze failed: {}", e))
 }
 
-/// Mean-pool the last hidden state over the token dimension.
+/// Mean-pool the last hidden state, weighted by the attention mask.
 ///
-/// Input shape:  `[batch=1, seq_len, hidden_size]`
+/// Formula: `sum(hidden * mask) / sum(mask)` — padded tokens (mask=0) are excluded.
+///
+/// Input shapes:
+///   `hidden`:         `[batch=1, seq_len, hidden_size]`
+///   `attention_mask`:  `[batch=1, seq_len]`
 /// Output shape: `[1, hidden_size]`
-fn mean_pool(hidden: &Tensor) -> Result<Tensor> {
-    let (_, n_tokens, _) = hidden
-        .dims3()
-        .map_err(|e| anyhow!("Unexpected hidden-state shape: {}", e))?;
-    (hidden.sum(1).map_err(|e| anyhow!("{}", e))? / (n_tokens as f64))
+fn mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    // Expand mask from [1, seq_len] → [1, seq_len, 1] for broadcasting.
+    let mask = attention_mask
+        .unsqueeze(2)
+        .map_err(|e| anyhow!("{}", e))?
+        .to_dtype(hidden.dtype())
+        .map_err(|e| anyhow!("{}", e))?;
+
+    // sum(hidden * mask, dim=1) → [1, hidden_size]
+    let masked = hidden.broadcast_mul(&mask).map_err(|e| anyhow!("{}", e))?;
+    let sum = masked.sum(1).map_err(|e| anyhow!("{}", e))?;
+
+    // sum(mask, dim=1) → [1, hidden_size] (broadcast), clamped to avoid div-by-zero.
+    let count = mask
+        .sum(1)
+        .map_err(|e| anyhow!("{}", e))?
+        .clamp(1e-9, f64::MAX)
+        .map_err(|e| anyhow!("{}", e))?;
+
+    sum.broadcast_div(&count)
         .map_err(|e| anyhow!("Mean pooling failed: {}", e))
 }
 
@@ -353,6 +385,9 @@ fn last_token_pool(hidden: &Tensor) -> Result<Tensor> {
     let (_, seq_len, _) = hidden
         .dims3()
         .map_err(|e| anyhow!("Unexpected hidden-state shape: {}", e))?;
+    if seq_len == 0 {
+        return Err(anyhow!("Last-token pooling requires at least one token"));
+    }
     hidden
         .narrow(1, seq_len - 1, 1)
         .map_err(|e| anyhow!("Last-token pooling failed: {}", e))?
@@ -370,6 +405,8 @@ fn l2_normalize(t: &Tensor) -> Result<Tensor> {
         .sum_keepdim(1)
         .map_err(|e| anyhow!("{}", e))?
         .sqrt()
+        .map_err(|e| anyhow!("{}", e))?
+        .clamp(1e-12, f64::MAX)
         .map_err(|e| anyhow!("{}", e))?;
     t.broadcast_div(&norm)
         .map_err(|e| anyhow!("L2 normalisation failed: {}", e))
