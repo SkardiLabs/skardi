@@ -22,6 +22,7 @@ use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_ud
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
+    mongo::register_mongo_tables, mysql::register_mysql_tables, sqlite::register_sqlite_tables,
     sqlx::postgres::register_postgres_tables,
 };
 use sources::HierarchyLevel;
