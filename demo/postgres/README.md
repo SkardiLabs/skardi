@@ -351,7 +351,7 @@ data_sources:
 
 ### Pipelines
 
-Three pipeline files are provided in `demo/postgres/pipelines/`, one per distance metric:
+Three pipeline files are provided in `demo/postgres/pipelines/vector_demo/`, one per distance metric:
 
 | File | Operator | Score meaning |
 |---|---|---|
@@ -367,9 +367,12 @@ query: |
   SELECT id, content, metadata, _score
   FROM pg_knn('documents', 'embedding',
       (SELECT embedding FROM documents WHERE id = {seed_id}),
-      '<=>', {k})
+      '<=>', 10)
   ORDER BY _score
+  LIMIT {limit}
 ```
+
+Each pipeline accepts two parameters: `seed_id` (the document to use as the query vector) and `limit` (how many results to return). `pg_knn` fetches up to 10 candidates from Postgres; `LIMIT {limit}` trims the final result set.
 
 ### Start and query
 
@@ -378,23 +381,23 @@ Load all three pipelines at once and query each endpoint:
 ```bash
 cargo run --bin skardi-server -- \
   --ctx demo/postgres/ctx_pgvector_demo.yaml \
-  --pipeline demo/postgres/pipelines/ \
+  --pipeline demo/postgres/pipelines/vector_demo/ \
   --port 8080
 
 # Inner product
 curl -X POST http://localhost:8080/vector-search-inner-product/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "k": 3}'
+  -d '{"seed_id": 1, "limit": 3}'
 
 # L2 (Euclidean)
 curl -X POST http://localhost:8080/vector-search-l2/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "k": 3}'
+  -d '{"seed_id": 1, "limit": 3}'
 
 # Cosine
 curl -X POST http://localhost:8080/vector-search-cosine/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "k": 3}'
+  -d '{"seed_id": 1, "limit": 3}'
 ```
 
 **`<#>` inner product** — doc-2 ranks first: same direction as doc-1 but 5× larger magnitude boosts the dot product.
@@ -410,7 +413,7 @@ curl -X POST http://localhost:8080/vector-search-cosine/execute \
 }
 ```
 
-**`<->` L2** — doc-3 ranks first: it is the geometrically closest point; doc-2 ranks last despite being on-topic.
+**`<->` L2** — doc-3 ranks second: it is geometrically closer than doc-4; doc-2 ranks last despite being on-topic because of its large magnitude.
 ```json
 {
   "data": [

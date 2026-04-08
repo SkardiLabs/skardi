@@ -1,5 +1,11 @@
 //! Shared utilities for KNN execution plans (Lance and pgvector).
 
+/// Maximum number of nearest neighbours allowed in a single KNN query.
+///
+/// Enforced at planning time by both `pg_knn` and `lance_knn` table functions
+/// to prevent runaway requests from fetching arbitrarily large result sets.
+pub const MAX_KNN_K: usize = 500;
+
 use arrow::array::{Array, FixedSizeListArray, Float32Array, Float64Array, StringArray};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -39,17 +45,17 @@ pub async fn extract_query_vector(
     if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
         let values = list.value(0);
         if let Some(arr) = values.as_any().downcast_ref::<Float32Array>() {
-            return Ok(Some((0..arr.len()).map(|i| arr.value(i)).collect()));
+            return Ok(Some(arr.values().to_vec()));
         }
         if let Some(arr) = values.as_any().downcast_ref::<Float64Array>() {
-            return Ok(Some((0..arr.len()).map(|i| arr.value(i) as f32).collect()));
+            return Ok(Some(arr.values().iter().map(|&v| v as f32).collect()));
         }
     }
     if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
-        return Ok(Some((0..arr.len()).map(|i| arr.value(i)).collect()));
+        return Ok(Some(arr.values().to_vec()));
     }
     if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-        return Ok(Some((0..arr.len()).map(|i| arr.value(i) as f32).collect()));
+        return Ok(Some(arr.values().iter().map(|&v| v as f32).collect()));
     }
     // pgvector special case: the column was fetched as `embedding::text` to bypass
     // datafusion-table-providers' inability to decode the `vector` Postgres type.
@@ -92,17 +98,98 @@ pub fn parse_pgvector_text(s: &str) -> Result<Vec<f32>, String> {
 mod tests {
     use super::*;
     use arrow::array::{BooleanArray, FixedSizeListArray, Float32Array, Float64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::physical_plan::memory::MemoryExec;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+    };
+    use futures::stream;
+    use std::any::Any;
+    use std::fmt;
 
     fn task_ctx() -> Arc<TaskContext> {
         Arc::new(TaskContext::default())
     }
 
+    /// Minimal `ExecutionPlan` that serves a single pre-built `RecordBatch`.
+    struct BatchPlan {
+        batch: RecordBatch,
+        schema: SchemaRef,
+        props: PlanProperties,
+    }
+
+    impl BatchPlan {
+        fn new(batch: RecordBatch) -> Self {
+            let schema = batch.schema();
+            let props = PlanProperties::new(
+                EquivalenceProperties::new(schema.clone()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            );
+            Self {
+                batch,
+                schema,
+                props,
+            }
+        }
+    }
+
+    impl fmt::Debug for BatchPlan {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "BatchPlan")
+        }
+    }
+
+    impl DisplayAs for BatchPlan {
+        fn fmt_as(&self, _: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "BatchPlan")
+        }
+    }
+
+    impl ExecutionPlan for BatchPlan {
+        fn name(&self) -> &str {
+            "BatchPlan"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &PlanProperties {
+            &self.props
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _: usize,
+            _: Arc<TaskContext>,
+        ) -> datafusion::error::Result<SendableRecordBatchStream> {
+            let schema = self.schema.clone();
+            let batch = self.batch.clone();
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::once(async move { Ok(batch) }),
+            )))
+        }
+    }
+
     fn plan_from_batch(batch: RecordBatch) -> Arc<dyn ExecutionPlan> {
-        let schema = batch.schema();
-        Arc::new(MemoryExec::try_new(&[vec![batch]], schema, None).unwrap())
+        Arc::new(BatchPlan::new(batch))
     }
 
     // ── parse_pgvector_text ───────────────────────────────────────────────
@@ -242,20 +329,17 @@ mod tests {
     #[tokio::test]
     async fn test_extract_empty_batch_returns_none() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float32, false)]));
-        let result = extract_query_vector(
-            plan_from_batch(RecordBatch::new_empty(schema)),
-            task_ctx(),
-        )
-        .await
-        .unwrap();
+        let result =
+            extract_query_vector(plan_from_batch(RecordBatch::new_empty(schema)), task_ctx())
+                .await
+                .unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn test_extract_no_batches_returns_none() {
+    async fn test_extract_no_rows_returns_none() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float32, false)]));
-        let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(MemoryExec::try_new(&[vec![]], schema, None).unwrap());
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
         let result = extract_query_vector(plan, task_ctx()).await.unwrap();
         assert!(result.is_none());
     }

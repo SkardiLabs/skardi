@@ -20,7 +20,7 @@
 //! WHERE collection_id = 'xyz'
 //! ```
 //!
-//! Returns all non-vector columns from the table plus `_score Float32`.
+//! Returns all non-vector columns from the table plus `_score Float64`.
 //! The score is the raw pgvector distance value for the chosen metric — lower is more similar
 //! (for `inner_product` the score is negative).
 
@@ -41,6 +41,7 @@ use std::sync::{Arc, RwLock};
 
 use super::pg_knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
+use crate::sources::providers::knn_utils::MAX_KNN_K;
 
 /// Entry stored in the registry for each registered Postgres table.
 #[derive(Clone, Debug)]
@@ -131,7 +132,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
             .filter(|(name, _)| name != &vector_col)
             .map(|(name, dtype)| Field::new(name.clone(), dtype.clone(), true))
             .collect();
-        fields.push(Field::new("_score", DataType::Float32, true));
+        fields.push(Field::new("_score", DataType::Float64, true));
         let schema: SchemaRef = Arc::new(Schema::new(fields));
 
         Ok(Arc::new(PgKnnProvider {
@@ -200,10 +201,17 @@ impl TableProvider for PgKnnProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Accept all filters — we append them to the Postgres WHERE clause.
+        // Return Exact only for filters we can successfully convert to Postgres SQL.
+        // Unsupported means DataFusion will re-apply the filter on the result set.
         Ok(filters
             .iter()
-            .map(|_| TableProviderFilterPushDown::Exact)
+            .map(|expr| {
+                if expr_to_pg_sql(expr).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
             .collect())
     }
 
@@ -215,12 +223,15 @@ impl TableProvider for PgKnnProvider {
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Combine inline filter (5th argument) with WHERE-clause filters.
+        // Only filters that expr_to_pg_sql can convert are pushed down (matches supports_filters_pushdown).
         let mut parts: Vec<String> = Vec::new();
         if let Some(ref f) = self.inline_filter {
             parts.push(f.clone());
         }
         for expr in filters {
-            parts.push(expr_to_pg_sql(expr));
+            if let Some(sql) = expr_to_pg_sql(expr) {
+                parts.push(sql);
+            }
         }
         let filter = if parts.is_empty() {
             None
@@ -292,7 +303,12 @@ fn build_vector_fetch_sql(expr: &Expr) -> DFResult<String> {
         ));
     };
 
-    let col_name = subquery.subquery.schema().field(0).name().clone();
+    let col_name = subquery
+        .subquery
+        .schema()
+        .field(0)
+        .name()
+        .replace('"', "\"\"");
 
     let unparser = Unparser::new(&PostgreSqlDialect {});
     let inner_sql = unparser
@@ -356,6 +372,62 @@ pub async fn fetch_table_columns(
 
 use sqlx::Row;
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{DFSchema, Spans};
+    use datafusion::logical_expr::{EmptyRelation, LogicalPlan, logical_plan::Subquery};
+
+    fn subquery_expr_with_col(col_name: &str) -> Expr {
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            col_name,
+            DataType::Utf8,
+            true,
+        )]));
+        let df_schema = Arc::new(DFSchema::try_from(arrow_schema).unwrap());
+        let plan = Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: df_schema,
+        }));
+        Expr::ScalarSubquery(Subquery {
+            subquery: plan,
+            outer_ref_columns: vec![],
+            spans: Spans::default(),
+        })
+    }
+
+    #[test]
+    fn test_build_vector_fetch_sql_normal_col_name() {
+        let expr = subquery_expr_with_col("embedding");
+        let sql = build_vector_fetch_sql(&expr).unwrap();
+        assert!(sql.contains("\"embedding\"::text"), "sql={sql}");
+        assert!(sql.contains("AS _knn_subq LIMIT 1"), "sql={sql}");
+    }
+
+    #[test]
+    fn test_build_vector_fetch_sql_col_name_with_embedded_quote() {
+        // A column name containing " must be doubled inside the SQL identifier.
+        let expr = subquery_expr_with_col("weird\"col");
+        let sql = build_vector_fetch_sql(&expr).unwrap();
+        // weird"col → "weird""col"
+        assert!(
+            sql.contains("\"weird\"\"col\"::text"),
+            "embedded quote must be doubled; sql={sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_vector_fetch_sql_non_subquery_returns_error() {
+        let expr = Expr::Column(datafusion::common::Column::new_unqualified(
+            "not_a_subquery",
+        ));
+        assert!(build_vector_fetch_sql(&expr).is_err());
+    }
+}
+
 fn pg_type_to_arrow(
     data_type: &str,
     udt_name: &str,
@@ -388,12 +460,16 @@ fn pg_type_to_arrow(
 // ─── Argument extraction helpers ─────────────────────────────────────────────
 
 fn extract_k(expr: &Expr) -> DFResult<usize> {
-    match expr {
+    let k = match expr {
         Expr::Literal(ScalarValue::Int64(Some(n)), _) => Ok(*n as usize),
         Expr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
         Expr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
         _ => plan_err!("pg_knn: k must be a positive integer literal"),
+    }?;
+    if k == 0 || k > MAX_KNN_K {
+        return plan_err!("pg_knn: k must be between 1 and {MAX_KNN_K}, got {k}");
     }
+    Ok(k)
 }
 
 fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
@@ -422,12 +498,10 @@ fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
     };
 
     if let Some(f32_arr) = values.as_any().downcast_ref::<Float32Array>() {
-        return Ok((0..f32_arr.len()).map(|i| f32_arr.value(i)).collect());
+        return Ok(f32_arr.values().to_vec());
     }
     if let Some(f64_arr) = values.as_any().downcast_ref::<Float64Array>() {
-        return Ok((0..f64_arr.len())
-            .map(|i| f64_arr.value(i) as f32)
-            .collect());
+        return Ok(f64_arr.values().iter().map(|&v| v as f32).collect());
     }
 
     plan_err!("pg_knn: query_vec elements must be Float32 or Float64")

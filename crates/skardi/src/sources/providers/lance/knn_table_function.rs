@@ -30,6 +30,7 @@ use std::sync::{Arc, RwLock};
 
 use super::knn_exec::LanceKnnExec;
 use super::utils::expr_to_lance_sql;
+use crate::sources::providers::knn_utils::MAX_KNN_K;
 
 /// Table function that creates KNN search on Lance tables
 #[derive(Debug)]
@@ -55,7 +56,13 @@ impl TableFunctionImpl for LanceKnnTableFunction {
         // Extract string arguments
         let table_name = extract_string(&exprs[0], "table_name")?;
         let vector_column = extract_string(&exprs[1], "vector_column")?;
-        let k = extract_int(&exprs[3], "k")?;
+        let k = {
+            let k = extract_int(&exprs[3], "k")?;
+            if k == 0 || k > MAX_KNN_K {
+                return plan_err!("lance_knn: k must be between 1 and {MAX_KNN_K}, got {k}");
+            }
+            k
+        };
         let filter = if exprs.len() == 5 {
             Some(extract_string(&exprs[4], "filter")?)
         } else {

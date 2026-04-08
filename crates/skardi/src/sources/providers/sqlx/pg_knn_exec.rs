@@ -69,6 +69,7 @@ impl DistanceMetric {
 /// This bypasses datafusion-table-providers' inability to decode the Postgres
 /// `vector` type, while still producing an `ExecutionPlan` that the shared
 /// `knn_utils::extract_query_vector` utility can consume.
+#[derive(Clone)]
 pub(super) struct PgVectorFetchExec {
     pool: Arc<PgPool>,
     /// SQL that returns `embedding::text` for one row.
@@ -104,17 +105,6 @@ impl fmt::Debug for PgVectorFetchExec {
 impl DisplayAs for PgVectorFetchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "PgVectorFetchExec")
-    }
-}
-
-impl Clone for PgVectorFetchExec {
-    fn clone(&self) -> Self {
-        Self {
-            pool: Arc::clone(&self.pool),
-            sql: self.sql.clone(),
-            schema: self.schema.clone(),
-            plan_properties: self.plan_properties.clone(),
-        }
     }
 }
 
@@ -195,7 +185,7 @@ impl ExecutionPlan for PgVectorFetchExec {
 ///
 /// Runs:
 /// ```sql
-/// SELECT <cols>, "<vector_col>" <#> '<query>'::vector AS _score
+/// SELECT <cols>, ("<vector_col>" <#> '<query>'::vector) AS _score
 /// FROM "<schema>"."<table>"
 /// [WHERE <filter>]
 /// ORDER BY _score
@@ -337,8 +327,14 @@ impl PgKnnExec {
             .unwrap_or_default();
 
         let op = self.metric.operator();
+        let score_expr = format!("(\"{vec_col}\" {op} '{vec_lit}'::vector) AS _score");
+        let select_list = if cols.is_empty() {
+            score_expr
+        } else {
+            format!("{cols}, {score_expr}")
+        };
         format!(
-            "SELECT {cols}, \"{vec_col}\" {op} '{vec_lit}'::vector AS _score \
+            "SELECT {select_list} \
              FROM {table}{where_clause} \
              ORDER BY _score \
              LIMIT {k}",
@@ -360,9 +356,7 @@ impl PgKnnExec {
                 }
             }
         } else {
-            return Err(DataFusionError::Execution(
-                "pg_knn: no query vector provided".to_string(),
-            ));
+            unreachable!("PgKnnExec: both query_vector and query_vector_plan are absent");
         };
 
         let sql = self.build_query(&query_vector);
@@ -460,19 +454,7 @@ fn rows_to_batch(rows: &[sqlx::postgres::PgRow], schema: &SchemaRef) -> DFResult
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
-        let col: ArrayRef = if field.name() == "_score" {
-            let mut b = Float32Builder::new();
-            for row in rows {
-                match row.try_get::<Option<f32>, _>("_score") {
-                    Ok(v) => b.append_option(v),
-                    Err(_) => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        } else {
-            build_column(rows, field.name(), field.data_type())?
-        };
-        columns.push(col);
+        columns.push(build_column(rows, field.name(), field.data_type())?);
     }
 
     RecordBatch::try_new(schema.clone(), columns)
@@ -558,10 +540,8 @@ mod tests {
         filter: Option<&str>,
         k: usize,
     ) -> PgKnnExec {
-        let pool = Arc::new(
-            sqlx::PgPool::connect_lazy("postgresql://localhost/test")
-                .expect("lazy pool"),
-        );
+        let pool =
+            Arc::new(sqlx::PgPool::connect_lazy("postgresql://localhost/test").expect("lazy pool"));
         let mut fields: Vec<Field> = cols
             .into_iter()
             .map(|(name, dt)| Field::new(name, dt, true))
@@ -584,9 +564,15 @@ mod tests {
 
     #[test]
     fn test_metric_from_str_valid() {
-        assert_eq!(DistanceMetric::from_str("<#>").unwrap(), DistanceMetric::InnerProduct);
+        assert_eq!(
+            DistanceMetric::from_str("<#>").unwrap(),
+            DistanceMetric::InnerProduct
+        );
         assert_eq!(DistanceMetric::from_str("<->").unwrap(), DistanceMetric::L2);
-        assert_eq!(DistanceMetric::from_str("<=>").unwrap(), DistanceMetric::Cosine);
+        assert_eq!(
+            DistanceMetric::from_str("<=>").unwrap(),
+            DistanceMetric::Cosine
+        );
     }
 
     #[test]
@@ -607,7 +593,11 @@ mod tests {
 
     #[test]
     fn test_metric_operator_round_trips() {
-        for metric in [DistanceMetric::InnerProduct, DistanceMetric::L2, DistanceMetric::Cosine] {
+        for metric in [
+            DistanceMetric::InnerProduct,
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+        ] {
             let op = metric.operator();
             assert_eq!(DistanceMetric::from_str(op).unwrap(), metric);
         }
@@ -624,7 +614,10 @@ mod tests {
 
     #[test]
     fn test_format_vector_literal() {
-        assert_eq!(PgKnnExec::format_vector_literal(&[0.1, 0.2, 0.3]), "[0.1,0.2,0.3]");
+        assert_eq!(
+            PgKnnExec::format_vector_literal(&[0.1, 0.2, 0.3]),
+            "[0.1,0.2,0.3]"
+        );
     }
 
     #[test]
@@ -663,7 +656,10 @@ mod tests {
             10,
         );
         let cols = exec.select_columns();
-        assert!(cols.contains("::float8"), "Decimal128 columns must be cast to float8");
+        assert!(
+            cols.contains("::float8"),
+            "Decimal128 columns must be cast to float8"
+        );
     }
 
     // ── build_query ───────────────────────────────────────────────────────
@@ -672,12 +668,15 @@ mod tests {
     async fn test_build_query_uses_correct_operator() {
         for (metric, op) in [
             (DistanceMetric::InnerProduct, "<#>"),
-            (DistanceMetric::L2,           "<->"),
-            (DistanceMetric::Cosine,        "<=>"),
+            (DistanceMetric::L2, "<->"),
+            (DistanceMetric::Cosine, "<=>"),
         ] {
             let exec = make_exec(vec![("id", DataType::Int64)], metric, None, 10);
             let sql = exec.build_query(&[0.1, 0.2]);
-            assert!(sql.contains(op), "metric {metric:?} should use operator {op}");
+            assert!(
+                sql.contains(op),
+                "metric {metric:?} should use operator {op}"
+            );
         }
     }
 
@@ -692,7 +691,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_query_vector_literal_embedded() {
-        let exec = make_exec(vec![("id", DataType::Int64)], DistanceMetric::InnerProduct, None, 10);
+        let exec = make_exec(
+            vec![("id", DataType::Int64)],
+            DistanceMetric::InnerProduct,
+            None,
+            10,
+        );
         let sql = exec.build_query(&[0.5, 0.25]);
         assert!(sql.contains("'[0.5,0.25]'::vector"));
     }
@@ -711,14 +715,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_query_without_filter_has_no_where() {
-        let exec = make_exec(vec![("id", DataType::Int64)], DistanceMetric::Cosine, None, 10);
+        let exec = make_exec(
+            vec![("id", DataType::Int64)],
+            DistanceMetric::Cosine,
+            None,
+            10,
+        );
         let sql = exec.build_query(&[0.1]);
         assert!(!sql.contains("WHERE"));
     }
 
     #[tokio::test]
     async fn test_build_query_quotes_vector_column() {
-        let exec = make_exec(vec![("id", DataType::Int64)], DistanceMetric::Cosine, None, 10);
+        let exec = make_exec(
+            vec![("id", DataType::Int64)],
+            DistanceMetric::Cosine,
+            None,
+            10,
+        );
         let sql = exec.build_query(&[0.1]);
         assert!(sql.contains("\"embedding\""));
     }

@@ -191,7 +191,10 @@ pub async fn register_postgres_tables(
             columns,
         };
 
-        registry.write().unwrap().insert(name.to_string(), entry);
+        registry
+            .write()
+            .map_err(|e| anyhow::anyhow!("pg_knn registry lock poisoned: {}", e))?
+            .insert(name.to_string(), entry);
 
         tracing::info!("Registered '{}' in pg_knn registry for vector search", name);
     }
