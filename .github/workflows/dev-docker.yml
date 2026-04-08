@@ -3,10 +3,11 @@ name: Dev Docker Build
 on:
   workflow_dispatch:
     inputs:
-      image_name:
-        description: "Image tag to publish (e.g. my-feature, test-pg-vector)"
-        required: true
+      branch:
+        description: "Branch to build from (defaults to main)"
+        required: false
         type: string
+        default: "main"
       features:
         description: "Cargo features to enable (e.g. onnx), leave empty for default"
         required: false
@@ -23,11 +24,22 @@ env:
 
 jobs:
   docker:
-    name: "Build and push :${{ inputs.image_name }}"
+    name: "Build and push ${{ inputs.branch }}"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Generate image tag
+        id: tag
+        run: |
+          BRANCH="${{ inputs.branch }}"
+          # Sanitize branch name: replace any non-alphanumeric chars with -
+          SAFE_BRANCH=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-\|-$//g')
+          TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          echo "value=${SAFE_BRANCH}-test-img-${TIMESTAMP}" >> $GITHUB_OUTPUT
 
       - name: Free up disk space
         run: |
@@ -55,14 +67,14 @@ jobs:
           build-args: |
             FEATURES=${{ inputs.features }}
           provenance: false
-          tags: ghcr.io/skardilabs/skardi/skardi-server:${{ inputs.image_name }}
-          cache-from: type=gha,scope=dev-${{ inputs.image_name }}
-          cache-to: type=gha,mode=max,scope=dev-${{ inputs.image_name }}
+          tags: ghcr.io/skardilabs/skardi/skardi-server:${{ steps.tag.outputs.value }}
+          cache-from: type=gha,scope=dev-${{ inputs.branch }}
+          cache-to: type=gha,mode=max,scope=dev-${{ inputs.branch }}
 
       - name: Summary
         run: |
           echo "### Docker image published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ghcr.io/skardilabs/skardi/skardi-server:${{ inputs.image_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ghcr.io/skardilabs/skardi/skardi-server:${{ steps.tag.outputs.value }}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
