@@ -11,6 +11,8 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::auth::layer::AuthLayer;
 use crate::auth::mode::AuthMode;
+#[cfg(feature = "candle")]
+use crate::config::register_candle_udf;
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
 use crate::config::ServerConfig;
@@ -121,6 +123,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
+
+    // Register candle UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "candle")]
+    register_candle_udf(&mut session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;

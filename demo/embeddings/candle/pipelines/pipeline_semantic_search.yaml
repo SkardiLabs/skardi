@@ -1,0 +1,19 @@
+metadata:
+  name: semantic-search
+  version: 1.0.0
+  description: >
+    Semantic search over a knowledge-base using local BERT embeddings.
+    The candle() UDF embeds the user query on the fly; lance_knn() finds
+    the nearest documents by cosine similarity.
+  author: Skardi Demo
+
+query: |
+  SELECT id, title, content, _distance
+  FROM lance_knn(
+    'doc_embeddings',
+    'embedding',
+    candle('models/bge-small-en-v1.5', {query}),
+    10
+  )
+  ORDER BY _distance
+  LIMIT 10
