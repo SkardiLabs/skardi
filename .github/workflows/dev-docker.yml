@@ -8,11 +8,6 @@ on:
         required: false
         type: string
         default: "main"
-      features:
-        description: "Cargo features to enable (e.g. onnx), leave empty for default"
-        required: false
-        type: string
-        default: ""
 
 permissions:
   contents: read
@@ -64,8 +59,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
-          build-args: |
-            FEATURES=${{ inputs.features }}
           provenance: false
           tags: ghcr.io/skardilabs/skardi/skardi-server:${{ steps.tag.outputs.value }}
           cache-from: type=gha,scope=dev-${{ inputs.branch }}
