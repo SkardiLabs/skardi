@@ -135,7 +135,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
             .filter(|(name, _)| name != &vector_col)
             .map(|(name, dtype)| Field::new(name.clone(), dtype.clone(), true))
             .collect();
-        fields.push(Field::new("_score", DataType::Float32, true));
+        fields.push(Field::new("_score", DataType::Float64, true));
         let schema: SchemaRef = Arc::new(Schema::new(fields));
 
         Ok(Arc::new(PgKnnProvider {

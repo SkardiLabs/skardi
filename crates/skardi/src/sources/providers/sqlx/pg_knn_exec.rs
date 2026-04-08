@@ -188,7 +188,7 @@ impl ExecutionPlan for PgVectorFetchExec {
 ///
 /// Runs:
 /// ```sql
-/// SELECT <cols>, ("<vector_col>" <#> '<query>'::vector) AS _score
+/// SELECT <cols>, ("<vector_col>" <#> '<query>'::vector)::float8 AS _score
 /// FROM "<schema>"."<table>"
 /// [WHERE <filter>]
 /// ORDER BY _score
@@ -217,7 +217,7 @@ pub struct PgKnnExec {
     query_vector_plan: Option<Arc<dyn ExecutionPlan>>,
     /// Optional SQL WHERE predicate (no "WHERE" keyword)
     filter: Option<String>,
-    /// Output schema: non-vector columns + `_score Float32`
+    /// Output schema: non-vector columns + `_score Float64`
     schema: SchemaRef,
     /// Cached DataFusion plan metadata (partitioning, emission type, boundedness)
     plan_properties: PlanProperties,
@@ -330,7 +330,7 @@ impl PgKnnExec {
             .unwrap_or_default();
 
         let op = self.metric.operator();
-        let score_expr = format!("(\"{vec_col}\" {op} '{vec_lit}'::vector) AS _score");
+        let score_expr = format!("(\"{vec_col}\" {op} '{vec_lit}'::vector)::float8 AS _score");
         let select_list = if cols.is_empty() {
             score_expr
         } else {
@@ -570,6 +570,7 @@ fn build_column(rows: &[sqlx::postgres::PgRow], col: &str, dtype: &DataType) -> 
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::str::FromStr;
 
     /// Build a `PgKnnExec` with a lazy (never-connecting) pool for query-building tests.
     fn make_exec(
@@ -584,7 +585,7 @@ mod tests {
             .into_iter()
             .map(|(name, dt)| Field::new(name, dt, true))
             .collect();
-        fields.push(Field::new("_score", DataType::Float32, true));
+        fields.push(Field::new("_score", DataType::Float64, true));
         let schema = Arc::new(Schema::new(fields));
         PgKnnExec::new(
             pool,
