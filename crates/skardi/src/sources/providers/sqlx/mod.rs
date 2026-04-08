@@ -4,5 +4,5 @@ pub mod postgres;
 pub mod utils;
 
 pub use pg_knn_table_function::{
-    PgKnnEntry, PgKnnRegistry, PgKnnTableFunction, fetch_table_columns, register_pg_knn_udtf,
+    PgKnnEntry, PgKnnTableFunction, fetch_table_columns, register_pg_knn_udtf,
 };

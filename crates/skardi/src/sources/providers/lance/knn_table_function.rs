@@ -25,21 +25,21 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use lance::dataset::Dataset;
 use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::knn_exec::LanceKnnExec;
 use super::utils::expr_to_lance_sql;
 use crate::sources::providers::knn_utils::MAX_KNN_K;
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Table function that creates KNN search on Lance tables
 #[derive(Debug)]
 pub struct LanceKnnTableFunction {
-    dataset_registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>>,
+    dataset_registry: DatasetRegistry,
 }
 
 impl LanceKnnTableFunction {
-    pub fn new(dataset_registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>>) -> Self {
+    pub fn new(dataset_registry: DatasetRegistry) -> Self {
         Self { dataset_registry }
     }
 }
@@ -74,12 +74,16 @@ impl TableFunctionImpl for LanceKnnTableFunction {
             let registry = self.dataset_registry.read().map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!("Registry lock error: {}", e))
             })?;
-            registry.get(&table_name).cloned().ok_or_else(|| {
+            let entry = registry.get(&table_name).cloned().ok_or_else(|| {
                 datafusion::error::DataFusionError::Plan(format!(
                     "lance_knn: table '{}' not found in registry",
                     table_name
                 ))
-            })?
+            })?;
+            match entry {
+                DatasetEntry::Lance(ds) => ds,
+                _ => return plan_err!("lance_knn: table '{}' is not a Lance dataset", table_name),
+            }
         };
 
         // Try to extract literal vector, otherwise store expr for subquery
@@ -288,7 +292,7 @@ fn extract_float32_array(values: &dyn Array) -> DFResult<Option<ArrayRef>> {
 /// Register lance_knn table function with SessionContext
 pub fn register_lance_knn_udtf(
     ctx: &datafusion::prelude::SessionContext,
-    dataset_registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>>,
+    dataset_registry: DatasetRegistry,
 ) {
     ctx.register_udtf(
         "lance_knn",
@@ -299,6 +303,7 @@ pub fn register_lance_knn_udtf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::providers::DatasetRegistry;
     use arrow::array::{Float32Array, Int64Array, StringArray};
     use std::path::Path;
 
@@ -323,8 +328,8 @@ mod tests {
         );
 
         let mut ctx = datafusion::prelude::SessionContext::new();
-        let registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let registry: DatasetRegistry =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         register_lance_table(&mut ctx, "knn_data", dataset_path_str, Some(&registry))
             .await

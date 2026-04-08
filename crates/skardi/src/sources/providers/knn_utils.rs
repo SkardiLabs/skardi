@@ -27,15 +27,14 @@ pub async fn extract_query_vector(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
 ) -> DFResult<Option<Vec<f32>>> {
-    let stream = execute_stream(plan, context)?;
-    let batches: Vec<_> = stream.collect().await;
+    let mut stream = execute_stream(plan, context)?;
 
-    if batches.is_empty() {
-        return Ok(None);
-    }
-    let batch = batches[0]
-        .as_ref()
-        .map_err(|e| DataFusionError::Execution(format!("knn subquery error: {}", e)))?;
+    let batch = match stream.next().await {
+        None => return Ok(None),
+        Some(res) => {
+            res.map_err(|e| DataFusionError::Execution(format!("knn subquery error: {}", e)))?
+        }
+    };
     if batch.num_rows() == 0 {
         return Ok(None);
     }

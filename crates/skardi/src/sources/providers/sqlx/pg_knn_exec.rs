@@ -45,9 +45,12 @@ impl DistanceMetric {
             DistanceMetric::Cosine => "<=>",
         }
     }
+}
 
-    /// Parse from a pgvector operator string.
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for DistanceMetric {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "<#>" => Ok(DistanceMetric::InnerProduct),
             "<->" => Ok(DistanceMetric::L2),
@@ -280,7 +283,7 @@ impl PgKnnExec {
         PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
+            EmissionType::Final,
             Boundedness::Bounded,
         )
     }
@@ -462,41 +465,63 @@ fn rows_to_batch(rows: &[sqlx::postgres::PgRow], schema: &SchemaRef) -> DFResult
 }
 
 fn build_column(rows: &[sqlx::postgres::PgRow], col: &str, dtype: &DataType) -> DFResult<ArrayRef> {
-    use sqlx::Row;
+    /// Convert a sqlx error into a DataFusion execution error for a named column.
+    #[inline]
+    fn decode_err(col: &str, expected: &str, e: sqlx::Error) -> DataFusionError {
+        DataFusionError::Execution(format!(
+            "pg_knn: type mismatch decoding column '{}' as {}: {}",
+            col, expected, e
+        ))
+    }
 
     Ok(match dtype {
         DataType::Int32 => {
             let mut b = Int32Builder::new();
             for row in rows {
-                b.append_option(row.try_get::<Option<i32>, _>(col).unwrap_or(None));
+                b.append_option(
+                    row.try_get::<Option<i32>, _>(col)
+                        .map_err(|e| decode_err(col, "Int32", e))?,
+                );
             }
             Arc::new(b.finish())
         }
         DataType::Int64 => {
             let mut b = Int64Builder::new();
             for row in rows {
-                b.append_option(row.try_get::<Option<i64>, _>(col).unwrap_or(None));
+                b.append_option(
+                    row.try_get::<Option<i64>, _>(col)
+                        .map_err(|e| decode_err(col, "Int64", e))?,
+                );
             }
             Arc::new(b.finish())
         }
         DataType::Float32 => {
             let mut b = Float32Builder::new();
             for row in rows {
-                b.append_option(row.try_get::<Option<f32>, _>(col).unwrap_or(None));
+                b.append_option(
+                    row.try_get::<Option<f32>, _>(col)
+                        .map_err(|e| decode_err(col, "Float32", e))?,
+                );
             }
             Arc::new(b.finish())
         }
         DataType::Float64 => {
             let mut b = Float64Builder::new();
             for row in rows {
-                b.append_option(row.try_get::<Option<f64>, _>(col).unwrap_or(None));
+                b.append_option(
+                    row.try_get::<Option<f64>, _>(col)
+                        .map_err(|e| decode_err(col, "Float64", e))?,
+                );
             }
             Arc::new(b.finish())
         }
         DataType::Boolean => {
             let mut b = BooleanBuilder::new();
             for row in rows {
-                b.append_option(row.try_get::<Option<bool>, _>(col).unwrap_or(None));
+                b.append_option(
+                    row.try_get::<Option<bool>, _>(col)
+                        .map_err(|e| decode_err(col, "Boolean", e))?,
+                );
             }
             Arc::new(b.finish())
         }
@@ -505,20 +530,33 @@ fn build_column(rows: &[sqlx::postgres::PgRow], col: &str, dtype: &DataType) -> 
             let scale_factor = 10i128.pow(*scale as u32);
             let mut b = Decimal128Builder::new().with_data_type(dtype.clone());
             for row in rows {
-                match row.try_get::<Option<f64>, _>(col).unwrap_or(None) {
+                match row
+                    .try_get::<Option<f64>, _>(col)
+                    .map_err(|e| decode_err(col, "Decimal128 (via float8)", e))?
+                {
                     Some(v) => b.append_value((v * scale_factor as f64).round() as i128),
                     None => b.append_null(),
                 }
             }
             Arc::new(b.finish())
         }
-        // Utf8 is the catch-all: text, varchar, uuid, json, timestamp, date, etc.
+        // Utf8 catch-all: text, varchar, uuid, json, timestamp, date, etc.
+        // Decode failures are non-fatal here because schema inference maps many
+        // Postgres types to Utf8 as a best effort; warn and emit null instead.
         _ => {
             let mut b = StringBuilder::new();
             for row in rows {
                 match row.try_get::<Option<String>, _>(col) {
                     Ok(Some(s)) => b.append_value(&s),
-                    _ => b.append_null(),
+                    Ok(None) => b.append_null(),
+                    Err(e) => {
+                        tracing::warn!(
+                            column = col,
+                            error = %e,
+                            "pg_knn: failed to decode column as Utf8, emitting null"
+                        );
+                        b.append_null();
+                    }
                 }
             }
             Arc::new(b.finish())

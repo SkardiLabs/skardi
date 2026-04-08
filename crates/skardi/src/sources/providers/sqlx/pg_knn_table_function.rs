@@ -35,13 +35,14 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use sqlx::PgPool;
+use sqlx::Row;
 use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::pg_knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
 use crate::sources::providers::knn_utils::MAX_KNN_K;
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered Postgres table.
 #[derive(Clone, Debug)]
@@ -55,19 +56,16 @@ pub struct PgKnnEntry {
     pub columns: Vec<(String, DataType)>,
 }
 
-/// Registry mapping DataFusion table name → Postgres pool + schema.
-pub type PgKnnRegistry = Arc<RwLock<HashMap<String, PgKnnEntry>>>;
-
 // ─── TableFunctionImpl ───────────────────────────────────────────────────────
 
 /// Table function that performs pgvector KNN search.
 #[derive(Debug)]
 pub struct PgKnnTableFunction {
-    registry: PgKnnRegistry,
+    registry: DatasetRegistry,
 }
 
 impl PgKnnTableFunction {
-    pub fn new(registry: PgKnnRegistry) -> Self {
+    pub fn new(registry: DatasetRegistry) -> Self {
         Self { registry }
     }
 }
@@ -87,7 +85,8 @@ impl TableFunctionImpl for PgKnnTableFunction {
 
         let metric = {
             let s = extract_string(&exprs[3], "metric")?;
-            DistanceMetric::from_str(&s).map_err(datafusion::error::DataFusionError::Plan)?
+            s.parse::<DistanceMetric>()
+                .map_err(datafusion::error::DataFusionError::Plan)?
         };
 
         let k = extract_k(&exprs[4])?;
@@ -106,13 +105,17 @@ impl TableFunctionImpl for PgKnnTableFunction {
                     e
                 ))
             })?;
-            reg.get(&table_name).cloned().ok_or_else(|| {
+            let raw = reg.get(&table_name).cloned().ok_or_else(|| {
                 datafusion::error::DataFusionError::Plan(format!(
                     "pg_knn: table '{}' not found in registry. \
                      Make sure the data source is declared with type 'postgres'.",
                     table_name
                 ))
-            })?
+            })?;
+            match raw {
+                DatasetEntry::Postgres(e) => e,
+                _ => return plan_err!("pg_knn: table '{}' is not a Postgres dataset", table_name),
+            }
         };
 
         // Try to extract a literal vector. If arg[2] is a scalar subquery, unparse it
@@ -132,7 +135,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
             .filter(|(name, _)| name != &vector_col)
             .map(|(name, dtype)| Field::new(name.clone(), dtype.clone(), true))
             .collect();
-        fields.push(Field::new("_score", DataType::Float64, true));
+        fields.push(Field::new("_score", DataType::Float32, true));
         let schema: SchemaRef = Arc::new(Schema::new(fields));
 
         Ok(Arc::new(PgKnnProvider {
@@ -328,7 +331,7 @@ fn build_vector_fetch_sql(expr: &Expr) -> DFResult<String> {
 // ─── Registration ────────────────────────────────────────────────────────────
 
 /// Register the `pg_knn` table function with the DataFusion session.
-pub fn register_pg_knn_udtf(ctx: &datafusion::prelude::SessionContext, registry: PgKnnRegistry) {
+pub fn register_pg_knn_udtf(ctx: &datafusion::prelude::SessionContext, registry: DatasetRegistry) {
     ctx.register_udtf("pg_knn", Arc::new(PgKnnTableFunction::new(registry)));
 }
 
@@ -369,8 +372,6 @@ pub async fn fetch_table_columns(
 
     Ok(columns)
 }
-
-use sqlx::Row;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 

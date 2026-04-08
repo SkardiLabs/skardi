@@ -1,7 +1,7 @@
 data_sources:
   - name: "sift_items"
     type: "lance"
-    path: "data/test_data.lance/"
+    path: "data/vec_data.lance/"
     description: "Lance dataset with vector embeddings for similarity search"
     # Schema:
     #   - id: int64 (unique identifier)

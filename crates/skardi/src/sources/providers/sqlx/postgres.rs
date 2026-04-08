@@ -1,3 +1,5 @@
+use crate::sources::providers::sqlx::pg_knn_table_function::{PgKnnEntry, fetch_table_columns};
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -55,7 +57,7 @@ pub async fn register_postgres_tables(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
-    pg_knn_registry: Option<&crate::sources::providers::sqlx::pg_knn_table_function::PgKnnRegistry>,
+    pg_knn_registry: Option<&DatasetRegistry>,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
@@ -92,18 +94,14 @@ pub async fn register_postgres_tables(
     // Infer schema from information_schema.columns so that unknown Postgres types
     // (e.g. pgvector's `vector`) are mapped to Utf8 instead of causing a hard error.
     // Use pg_knn() for actual similarity search on vector columns.
-    let columns = crate::sources::providers::sqlx::pg_knn_table_function::fetch_table_columns(
-        &sqlx_pool,
-        &schema_name,
-        table_name,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "Failed to infer schema for '{}.{}' from information_schema",
-            schema_name, table_name
-        )
-    })?;
+    let columns = fetch_table_columns(&sqlx_pool, &schema_name, table_name)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to infer schema for '{}.{}' from information_schema",
+                schema_name, table_name
+            )
+        })?;
 
     if columns.is_empty() {
         return Err(anyhow::anyhow!(
@@ -185,7 +183,7 @@ pub async fn register_postgres_tables(
             table_name.replace('"', "\"\"")
         );
 
-        let entry = crate::sources::providers::sqlx::pg_knn_table_function::PgKnnEntry {
+        let entry = PgKnnEntry {
             pool: Arc::new(sqlx_pool_for_knn),
             qualified_table,
             columns,
@@ -194,7 +192,7 @@ pub async fn register_postgres_tables(
         registry
             .write()
             .map_err(|e| anyhow::anyhow!("pg_knn registry lock poisoned: {}", e))?
-            .insert(name.to_string(), entry);
+            .insert(name.to_string(), DatasetEntry::Postgres(entry));
 
         tracing::info!("Registered '{}' in pg_knn registry for vector search", name);
     }
