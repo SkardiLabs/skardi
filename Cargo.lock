@@ -7148,6 +7148,7 @@ dependencies = [
  "redis",
  "redis-test",
  "regex",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",

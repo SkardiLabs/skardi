@@ -13,6 +13,8 @@ use crate::auth::layer::AuthLayer;
 use crate::auth::mode::AuthMode;
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
+#[cfg(feature = "remote-embed")]
+use crate::config::register_remote_embed_udf;
 use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
@@ -121,6 +123,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
+
+    // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
+    #[cfg(feature = "remote-embed")]
+    register_remote_embed_udf(&mut session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;

@@ -289,6 +289,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
+    // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
+    #[cfg(feature = "remote-embed")]
+    register_remote_embed_udf(&mut session_ctx);
+
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
     let planning_auth =
@@ -411,6 +415,17 @@ async fn load_pipeline_config(path: &Path, ctx: Arc<SessionContext>) -> Result<S
 pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::OnnxModelRegistry::new());
     registry.register_onnx_predict_udf(ctx);
+}
+
+/// Register the `remote_embed` UDF for calling remote embedding APIs.
+///
+/// The UDF dispatches to OpenAI, Gemini, Voyage, or Mistral based on the
+/// provider name passed as the first SQL argument:
+///   remote_embed('openai', 'text-embedding-3-small', text_col)
+#[cfg(feature = "remote-embed")]
+pub fn register_remote_embed_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::RemoteEmbedRegistry::new());
+    registry.register_remote_embed_udf(ctx);
 }
 
 /// Load context configuration from YAML file
