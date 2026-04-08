@@ -75,8 +75,8 @@ impl EmbeddingProvider for GeminiProvider {
         let model_id = format!("models/{}", req.model);
 
         let url = format!(
-            "{}/{}:batchEmbedContents?key={}",
-            GEMINI_BATCH_EMBED_BASE, model_id, api_key
+            "{}/{}:batchEmbedContents",
+            GEMINI_BATCH_EMBED_BASE, model_id
         );
 
         let body = GeminiRequest {
@@ -92,46 +92,14 @@ impl EmbeddingProvider for GeminiProvider {
                 .collect(),
         };
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("HTTP request to Gemini API failed")?;
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Single retry with 1s backoff for rate limits
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-            let resp = self
-                .client
+        let build_request = || {
+            self.client
                 .post(&url)
+                .header("x-goog-api-key", &api_key)
                 .json(&body)
-                .send()
-                .await
-                .context("Retry HTTP request to Gemini API failed")?;
+        };
 
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("Gemini API error (status {}): {}", status, text));
-            }
-
-            let api_resp: GeminiResponse = resp
-                .json()
-                .await
-                .context("Failed to parse Gemini response")?;
-            return Ok(EmbeddingResponse {
-                embeddings: api_resp.embeddings.into_iter().map(|e| e.values).collect(),
-            });
-        }
-
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gemini API error (status {}): {}", status, text));
-        }
+        let resp = super::send_with_rate_limit_retry(build_request, "gemini").await?;
 
         let api_resp: GeminiResponse = resp
             .json()

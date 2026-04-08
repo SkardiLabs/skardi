@@ -79,59 +79,14 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
             input: req.texts,
         };
 
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("HTTP request to embedding API failed")?;
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Single retry with 1s backoff for rate limits
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-            let body = ApiRequest {
-                model: req.model,
-                input: body.input,
-            };
-            let resp = self
-                .client
+        let build_request = || {
+            self.client
                 .post(&self.base_url)
                 .bearer_auth(&api_key)
                 .json(&body)
-                .send()
-                .await
-                .context("Retry HTTP request failed")?;
+        };
 
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(anyhow!(
-                    "{} API error (status {}): {}",
-                    self.provider_name,
-                    status,
-                    text
-                ));
-            }
-
-            let api_resp: ApiResponse = resp.json().await.context("Failed to parse response")?;
-            return Ok(EmbeddingResponse {
-                embeddings: api_resp.data.into_iter().map(|d| d.embedding).collect(),
-            });
-        }
-
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "{} API error (status {}): {}",
-                self.provider_name,
-                status,
-                text
-            ));
-        }
+        let resp = super::send_with_rate_limit_retry(build_request, &self.provider_name).await?;
 
         let api_resp: ApiResponse = resp.json().await.context("Failed to parse response")?;
         Ok(EmbeddingResponse {

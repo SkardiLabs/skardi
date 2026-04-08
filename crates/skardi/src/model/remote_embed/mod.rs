@@ -4,7 +4,9 @@ pub mod provider;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::{Context, anyhow};
 use arrow::array::{Array, StringArray};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
@@ -19,9 +21,53 @@ use self::openai::OpenAiCompatibleProvider;
 use self::provider::{EmbeddingProvider, EmbeddingRequest};
 use super::{embedding_return_type, vecs_to_list_array};
 
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 const VOYAGE_EMBEDDINGS_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const MISTRAL_EMBEDDINGS_URL: &str = "https://api.mistral.ai/v1/embeddings";
+
+/// Send an HTTP request with a single retry on 429 (rate limit).
+///
+/// `build_request` is called to construct the request (possibly twice).
+/// `provider_label` is used in error messages.
+async fn send_with_rate_limit_retry(
+    build_request: impl Fn() -> reqwest::RequestBuilder,
+    provider_label: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let resp = build_request()
+        .send()
+        .await
+        .context("HTTP request to embedding API failed")?;
+
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let resp = build_request()
+            .send()
+            .await
+            .context("Retry HTTP request to embedding API failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "{provider_label} API error (status {status}): {text}"
+            ));
+        }
+        return Ok(resp);
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "{provider_label} API error (status {status}): {text}"
+        ));
+    }
+
+    Ok(resp)
+}
 
 // =============================================================================
 // RemoteEmbedRegistry — provider dispatch
@@ -44,7 +90,10 @@ impl std::fmt::Debug for RemoteEmbedRegistry {
 impl RemoteEmbedRegistry {
     /// Create a registry with the built-in providers (OpenAI, Voyage, Mistral, Gemini).
     pub fn new() -> Self {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .expect("failed to build reqwest client");
 
         let mut providers: HashMap<String, Box<dyn EmbeddingProvider>> = HashMap::new();
 
