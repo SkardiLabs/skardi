@@ -106,30 +106,65 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 **Response** (truncated — returns up to 10 results):
 ```json
 {
-  "success": true,
-  "data": [
-    {
       "id": 1,
       "title": "Vector Databases",
-      "content": "Vector databases store high-dimensional numerical vectors ...",
-      "_distance": 0.082
-    },
-    {
-      "id": 11,
-      "title": "Approximate Nearest Neighbour Search",
-      "content": "Exact nearest-neighbour search scales as O(n) per query ...",
-      "_distance": 0.143
+      "content": "Vector databases store high-dimensional numerical vectors and enable fast similarity search at scale. Unlike traditional databases that match exact values",
+      "_distance": 0.3374274
     },
     {
       "id": 9,
       "title": "Semantic Search",
-      "content": "Semantic search retrieves documents based on meaning ...",
-      "_distance": 0.178
+      "content": "Semantic search retrieves documents based on meaning rather than keyword overlap. A query and all documents are embedded into the same vector space; the most semantically similar documents are returned via nearest-neighbour search. This handles synonyms and paraphrases that would confuse keyword search.",
+      "_distance": 0.5616751
+    },
+    {
+      "id": 11,
+      "title": "Approximate Nearest Neighbour Search",
+      "content": "Exact nearest-neighbour search scales as O(n) per query. ANN algorithms like HNSW and IVF-PQ trade a small accuracy loss for sub-linear query times",
+      "_distance": 0.5843972
+    },
+    {
+      "id": 5,
+      "title": "Cosine Similarity",
+      "content": "Cosine similarity measures the angle between two vectors",
+      "_distance": 0.6529644
+    },
+    {
+      "id": 2,
+      "title": "Retrieval-Augmented Generation",
+      "content": "Retrieval-Augmented Generation (RAG) combines a retrieval step with a language model. A query is embedded into a vector and used to fetch relevant documents from a vector store. Those documents are passed as context to an LLM",
+      "_distance": 0.7315137
+    },
+    {
+      "id": 4,
+      "title": "BERT Embeddings",
+      "content": "BERT (Bidirectional Encoder Representations from Transformers) produces contextual embeddings by reading text in both directions. Fine-tuned variants like bge-small and all-MiniLM are commonly used for semantic similarity tasks. The [CLS] token or mean-pooled hidden states are used as sentence-level embeddings.",
+      "_distance": 0.7570224
+    },
+    {
+      "id": 10,
+      "title": "SQL in ML Pipelines",
+      "content": "Expressing ML pipelines in SQL keeps logic declarative and auditable. Features like CTEs",
+      "_distance": 0.81387216
+    },
+    {
+      "id": 8,
+      "title": "Lance Format",
+      "content": "Lance is a columnar storage format optimised for machine learning workloads. It supports random-access reads",
+      "_distance": 0.83116364
+    },
+    {
+      "id": 7,
+      "title": "DataFusion Query Engine",
+      "content": "DataFusion is an in-process SQL query engine written in Rust",
+      "_distance": 0.8427545
+    },
+    {
+      "id": 6,
+      "title": "Apache Arrow",
+      "content": "Apache Arrow defines a language-independent columnar memory format for flat and hierarchical data. It enables zero-copy reads between systems and is the in-memory format used by DataFusion",
+      "_distance": 0.881372
     }
-  ],
-  "rows": 10,
-  "execution_time_ms": 28
-}
 ```
 
 ### More Example Queries
