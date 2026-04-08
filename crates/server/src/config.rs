@@ -774,12 +774,14 @@ async fn register_data_source(
             );
 
             // Register PostgreSQL table using the sqlx-based provider
+            let pg_knn_registry = optimizer_registry.map(|r| r.pg_knn_pools());
             skardi::sources::providers::sqlx::postgres::register_postgres_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                pg_knn_registry.as_ref(),
             )
             .await
             .map_err(|e| {
