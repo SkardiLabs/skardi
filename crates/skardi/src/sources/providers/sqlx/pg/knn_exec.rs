@@ -218,6 +218,10 @@ pub struct PgKnnExec {
     query_vector_plan: Option<Arc<dyn ExecutionPlan>>,
     /// Optional SQL WHERE predicate (no "WHERE" keyword)
     filter: Option<String>,
+    /// Optional scan limit from an outer SQL LIMIT clause.
+    /// Applied as a post-fetch slice so the Postgres LIMIT (k) is preserved
+    /// for pgvector index utilisation.
+    scan_limit: Option<usize>,
     /// Output schema: non-vector columns + `_score Float64`
     schema: SchemaRef,
     /// Cached DataFusion plan metadata (partitioning, emission type, boundedness)
@@ -246,6 +250,7 @@ impl PgKnnExec {
             query_vector,
             query_vector_plan: None,
             filter,
+            scan_limit: None,
             schema,
             plan_properties,
         }
@@ -275,9 +280,16 @@ impl PgKnnExec {
             query_vector: Vec::new(),
             query_vector_plan: Some(child),
             filter,
+            scan_limit: None,
             schema,
             plan_properties,
         }
+    }
+
+    /// Set the scan limit (from an outer SQL LIMIT clause).
+    pub fn with_scan_limit(mut self, limit: usize) -> Self {
+        self.scan_limit = Some(limit);
+        self
     }
 
     fn make_properties(schema: &SchemaRef) -> PlanProperties {
@@ -368,7 +380,16 @@ impl PgKnnExec {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        rows_to_batch(&rows, &self.schema)
+        let mut batch = rows_to_batch(&rows, &self.schema)?;
+
+        // Apply scan limit if provided (from SQL LIMIT clause)
+        if let Some(n) = self.scan_limit {
+            if batch.num_rows() > n {
+                batch = batch.slice(0, n);
+            }
+        }
+
+        Ok(batch)
     }
 }
 
