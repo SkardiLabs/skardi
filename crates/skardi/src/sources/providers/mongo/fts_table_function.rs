@@ -69,22 +69,17 @@ impl TableFunctionImpl for MongoFtsTableFunction {
         let query = extract_string(&exprs[1], "query")?;
         let limit = extract_int(&exprs[2], "limit")?;
 
-        // Skip validation when values are NULL placeholders from pipeline schema inference.
-        // The inferencer replaces {param} with NULL, yielding empty string / 0.
-        let is_inference = query.is_empty() && limit == 0;
-        if !is_inference {
-            if query.is_empty() {
-                return plan_err!("mongo_fts: query string must not be empty");
-            }
-            if limit == 0 || limit > MAX_FTS_LIMIT {
-                return plan_err!(
-                    "mongo_fts: limit must be between 1 and {}, got {}",
-                    MAX_FTS_LIMIT,
-                    limit
-                );
-            }
+        // The inferencer replaces {param} with NULL, yielding empty string for
+        // strings and 0 for integers. Accept these as placeholders — validate only
+        // when real values are provided.
+        if !query.is_empty() && limit > MAX_FTS_LIMIT {
+            return plan_err!(
+                "mongo_fts: limit must be between 1 and {}, got {}",
+                MAX_FTS_LIMIT,
+                limit
+            );
         }
-        // Use a safe default during inference so the plan can be created.
+        // Use a safe default when limit is a NULL placeholder (0).
         let limit = if limit == 0 { 1 } else { limit };
 
         // Look up the MongoFtsEntry from the registry.
@@ -469,6 +464,92 @@ mod tests {
         assert!(
             rows >= 1,
             "expected at least 1 result for phrase 'neural network', got {rows}"
+        );
+    }
+
+    // ─── NULL placeholder tests (unit, no MongoDB needed) ────────────────
+    // The pipeline schema inferencer replaces {param} with NULL before
+    // planning. These tests verify that mongo_fts accepts NULL placeholders
+    // in any combination without erroring during call().
+
+    /// Helper: create a MongoFtsTableFunction backed by an empty registry.
+    /// call() will fail at registry lookup, but we only care about argument
+    /// validation passing first.
+    fn make_fts_function() -> MongoFtsTableFunction {
+        let registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
+        MongoFtsTableFunction::new(registry)
+    }
+
+    fn lit_str(s: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+    }
+
+    fn lit_int(n: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(n)), None)
+    }
+
+    fn lit_null() -> Expr {
+        Expr::Literal(ScalarValue::Null, None)
+    }
+
+    #[test]
+    fn test_null_query_and_null_limit_accepted() {
+        // Both params are NULL (e.g. `mongo_fts('t', {query}, {limit})`)
+        let func = make_fts_function();
+        let result = func.call(&[lit_str("some_table"), lit_null(), lit_null()]);
+        // Should fail at registry lookup, NOT at argument validation
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found in registry"),
+            "expected registry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_null_query_with_literal_limit_accepted() {
+        // Only query is NULL, limit is literal (e.g. `mongo_fts('t', {text_query}, 60)`)
+        // This is the exact case that broke the RAG hybrid search pipeline.
+        let func = make_fts_function();
+        let result = func.call(&[lit_str("some_table"), lit_null(), lit_int(60)]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found in registry"),
+            "expected registry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_literal_query_with_null_limit_accepted() {
+        // Query is literal, limit is NULL
+        let func = make_fts_function();
+        let result = func.call(&[lit_str("some_table"), lit_str("test query"), lit_null()]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found in registry"),
+            "expected registry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_limit_over_max_rejected() {
+        // Real query with limit exceeding MAX_FTS_LIMIT should fail
+        let func = make_fts_function();
+        let result = func.call(&[lit_str("some_table"), lit_str("test"), lit_int(501)]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("limit must be between 1 and 500"),
+            "expected limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_wrong_arg_count_rejected() {
+        let func = make_fts_function();
+        let result = func.call(&[lit_str("table"), lit_str("query")]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expects 3 arguments"),
+            "expected arg count error, got: {err}"
         );
     }
 }
