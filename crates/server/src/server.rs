@@ -11,6 +11,10 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::auth::layer::AuthLayer;
 use crate::auth::mode::AuthMode;
+#[cfg(feature = "candle")]
+use crate::config::register_candle_udf;
+#[cfg(feature = "gguf")]
+use crate::config::register_gguf_udf;
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
@@ -127,6 +131,12 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
     #[cfg(feature = "remote-embed")]
     register_remote_embed_udf(&mut session_ctx);
+    // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
+    #[cfg(feature = "gguf")]
+    register_gguf_udf(&mut session_ctx);
+    // Register candle UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "candle")]
+    register_candle_udf(&mut session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;

@@ -39,7 +39,7 @@ datafusion = { version = "52.1.0", default-features = false, features = [
     "sql",
 ] }
 datafusion-common = { version = "52.1.0" }
-datafusion-federation = "0.5.1"
+datafusion-federation = "=0.5.1"
 datafusion-table-providers = { version = "0.10.0", default-features = false, features = ["postgres", "mysql"] }
 tokio-rusqlite = "0.7"
 env_logger = "0.11"

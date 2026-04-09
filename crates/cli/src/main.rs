@@ -18,9 +18,10 @@ use object_store::http::HttpBuilder;
 use serde::Deserialize;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
+use skardi::sources::providers::sqlx::register_pg_knn_udtf;
 use skardi::sources::providers::{
-    iceberg::register_iceberg_table, lance::register_lance_table, mongo::register_mongo_tables,
-    mysql::register_mysql_tables, sqlite::register_sqlite_tables,
+    DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
+    mongo::register_mongo_tables, mysql::register_mysql_tables, sqlite::register_sqlite_tables,
     sqlx::postgres::register_postgres_tables,
 };
 use std::collections::HashMap;
@@ -28,9 +29,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use url::Url;
-
-/// Shared registry mapping table names to Lance datasets, used by the `lance_knn` UDTF.
-type DatasetRegistry = Arc<RwLock<HashMap<String, Arc<Dataset>>>>;
 
 #[derive(Parser)]
 #[command(name = "skardi")]
@@ -278,7 +276,10 @@ impl UrlTableFactory for SkardiUrlTableFactory {
                 .unwrap_or(url)
                 .to_string();
             if let Ok(mut reg) = self.dataset_registry.write() {
-                reg.insert(table_name, Arc::clone(&dataset_arc));
+                reg.insert(
+                    table_name,
+                    skardi::sources::providers::DatasetEntry::Lance(Arc::clone(&dataset_arc)),
+                );
             }
 
             let provider: Arc<dyn TableProvider> = dataset_arc;
@@ -291,7 +292,7 @@ impl UrlTableFactory for SkardiUrlTableFactory {
 }
 
 /// Create a new SessionContext with custom URL table support (built-in files + Lance)
-/// and the `lance_knn` UDTF registered. Returns the context and the shared dataset registry.
+/// and the `lance_knn` / `pg_knn` UDTFs registered.
 fn new_session_context() -> (SessionContext, DatasetRegistry) {
     let dataset_registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
     let session_store = SessionStore::new();
@@ -317,9 +318,10 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register the lance_knn and lance_fts table functions
+    // Register the lance_knn, lance_fts, and pg_knn table functions, all sharing one registry
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_pg_knn_udtf(&ctx, Arc::clone(&dataset_registry));
 
     (ctx, dataset_registry)
 }
@@ -503,6 +505,7 @@ async fn register_source(
                 conn_str,
                 source.options.as_ref(),
                 false,
+                Some(dataset_registry),
             )
             .await
             .with_context(|| format!("Failed to register Postgres '{}'", source.name))?;

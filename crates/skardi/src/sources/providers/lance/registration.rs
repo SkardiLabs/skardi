@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Register a Lance dataset as a table in DataFusion SessionContext
 ///
@@ -28,7 +29,7 @@ pub async fn register_lance_table(
     session_ctx: &mut SessionContext,
     name: &str,
     path: &str,
-    dataset_registry: Option<&Arc<RwLock<HashMap<String, Arc<Dataset>>>>>,
+    dataset_registry: Option<&DatasetRegistry>,
 ) -> Result<()> {
     tracing::info!("Registering Lance dataset: {} from path: {}", name, path);
 
@@ -58,7 +59,10 @@ pub async fn register_lance_table(
     // Store in registry if provided (for optimizer access)
     if let Some(registry) = dataset_registry {
         let mut datasets = registry.write().unwrap();
-        datasets.insert(name.to_string(), Arc::clone(&dataset_arc));
+        datasets.insert(
+            name.to_string(),
+            DatasetEntry::Lance(Arc::clone(&dataset_arc)),
+        );
         tracing::debug!("Stored Lance dataset '{}' in registry for optimizer", name);
     }
 
