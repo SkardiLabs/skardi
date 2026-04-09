@@ -5,7 +5,7 @@ What this does:
   1. Downloads bge-small-en-v1.5 SafeTensors weights into models/ so Skardi
      can load them via candle().
   2. Embeds docs.csv using the same model (via fastembed / ONNX Runtime) and
-     writes the result as a Lance dataset at data/doc_embeddings.lance.
+     writes the result as a Lance dataset at data/generated/doc_embeddings.lance.
 
 Requirements:
   Python 3.12 is required (onnxruntime has no wheels for 3.13+).
@@ -25,9 +25,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DEMO_DIR = Path("demo/embeddings/candle")
-DOCS_CSV = DEMO_DIR / "data" / "docs.csv"
-LANCE_OUT = DEMO_DIR / "data" / "doc_embeddings.lance"
-MODEL_DIR = Path("models/bge-small-en-v1.5")
+DOCS_CSV = Path("demo/embeddings/data/docs.csv")
+LANCE_OUT = DEMO_DIR / "data" / "generated" / "doc_embeddings.lance"
+MODEL_DIR = Path("models/generated/bge-small-en-v1.5")
 MODEL_ID = "BAAI/bge-small-en-v1.5"
 
 # ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ def main():
         print("  cd /path/to/skardi && python demo/embeddings/candle/setup.py")
         sys.exit(1)
 
-    (DEMO_DIR / "data").mkdir(parents=True, exist_ok=True)
+    (DEMO_DIR / "data" / "generated").mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     download_model()

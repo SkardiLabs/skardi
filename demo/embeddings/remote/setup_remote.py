@@ -24,8 +24,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DEMO_DIR = Path("demo/embeddings/remote")
-DOCS_CSV = DEMO_DIR / "data" / "docs.csv"
-LANCE_OUT = DEMO_DIR / "data" / "doc_embeddings_openai.lance"
+DOCS_CSV = Path("demo/embeddings/data/docs.csv")
+LANCE_OUT = DEMO_DIR / "data" / "generated" / "doc_embeddings_openai.lance"
 
 MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
@@ -112,7 +112,7 @@ def main():
         print("  cd /path/to/skardi && python demo/embeddings/remote/setup_remote.py")
         sys.exit(1)
 
-    (DEMO_DIR / "data").mkdir(parents=True, exist_ok=True)
+    (DEMO_DIR / "data" / "generated").mkdir(parents=True, exist_ok=True)
 
     docs = load_docs()
     embeddings = embed_docs(docs)

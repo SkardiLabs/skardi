@@ -1,10 +1,8 @@
 pub mod embed;
 
 use anyhow::Result;
-use arrow::{
-    array::{Array, ArrayRef, Float32Builder, ListBuilder, StringArray},
-    datatypes::{DataType, Field},
-};
+use arrow::array::{Array, StringArray};
+use arrow::datatypes::DataType;
 use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::{
     error::DataFusionError,
@@ -16,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use self::embed::GgufEmbeddingModel;
+use super::{embedding_return_type, vecs_to_list_array};
 
 // =============================================================================
 // GgufModelRegistry — lazy model cache keyed by directory path
@@ -89,32 +88,6 @@ impl Default for GgufModelRegistry {
 }
 
 // =============================================================================
-// Helper — convert Vec<Vec<f32>> to a ListArray<Float32>
-// =============================================================================
-
-/// Convert a batch of embedding vectors into an Arrow `ListArray<Float32>`.
-///
-/// The resulting array has one list element per input row, compatible with
-/// `lance_knn` directly. `None` entries produce null list elements.
-pub fn vecs_to_list_array(vecs: Vec<Option<Vec<f32>>>) -> ArrayRef {
-    let mut builder = ListBuilder::new(Float32Builder::new());
-    for vec in vecs {
-        match vec {
-            Some(v) => {
-                for val in &v {
-                    builder.values().append_value(*val);
-                }
-                builder.append(true);
-            }
-            None => {
-                builder.append(false);
-            }
-        }
-    }
-    Arc::new(builder.finish())
-}
-
-// =============================================================================
 // GgufUDF — ScalarUDFImpl
 // =============================================================================
 
@@ -163,11 +136,7 @@ impl ScalarUDFImpl for GgufUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
-        Ok(DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Float32,
-            true,
-        ))))
+        Ok(embedding_return_type())
     }
 
     fn invoke_with_args(
@@ -291,6 +260,7 @@ impl ScalarUDFImpl for GgufUDF {
 mod tests {
     use super::*;
     use arrow::array::{Array, Float32Array, ListArray};
+    use arrow::datatypes::Field;
     use datafusion::config::ConfigOptions;
     use datafusion::execution::FunctionRegistry;
 

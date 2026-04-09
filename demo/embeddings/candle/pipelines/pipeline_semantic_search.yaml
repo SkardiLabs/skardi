@@ -12,7 +12,7 @@ query: |
   FROM lance_knn(
     'doc_embeddings',
     'embedding',
-    candle('models/bge-small-en-v1.5', {query}),
+    candle('models/generated/bge-small-en-v1.5', {query}),
     10
   )
   ORDER BY _distance

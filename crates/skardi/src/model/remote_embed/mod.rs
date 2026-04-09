@@ -22,10 +22,21 @@ use self::provider::{EmbeddingProvider, EmbeddingRequest};
 use super::{embedding_return_type, vecs_to_list_array};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
 
 const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 const VOYAGE_EMBEDDINGS_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const MISTRAL_EMBEDDINGS_URL: &str = "https://api.mistral.ai/v1/embeddings";
+
+/// Parse `Retry-After` header value as seconds, falling back to `DEFAULT_RETRY_WAIT`.
+fn parse_retry_after(resp: &reqwest::Response) -> Duration {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RETRY_WAIT)
+}
 
 /// Send an HTTP request with a single retry on 429 (rate limit).
 ///
@@ -41,7 +52,9 @@ async fn send_with_rate_limit_retry(
         .context("HTTP request to embedding API failed")?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let wait = parse_retry_after(&resp);
+        tracing::warn!("{provider_label}: rate-limited (429), retrying after {wait:?}");
+        tokio::time::sleep(wait).await;
 
         let resp = build_request()
             .send()
@@ -125,6 +138,23 @@ impl RemoteEmbedRegistry {
             )),
         );
         providers.insert("gemini".to_string(), Box::new(GeminiProvider::new(client)));
+
+        // Warn eagerly about missing API keys so misconfiguration is visible at
+        // startup rather than at first query time.
+        for (name, env_var) in [
+            ("openai", "OPENAI_API_KEY"),
+            ("voyage", "VOYAGE_API_KEY"),
+            ("mistral", "MISTRAL_API_KEY"),
+            ("gemini", "GEMINI_API_KEY"),
+        ] {
+            if std::env::var(env_var).is_err() {
+                tracing::warn!(
+                    "remote_embed provider '{}': {} not set — queries using this provider will fail",
+                    name,
+                    env_var
+                );
+            }
+        }
 
         Self { providers }
     }
@@ -287,6 +317,15 @@ impl ScalarUDFImpl for RemoteEmbedUDF {
                         provider_name, model_name, e
                     ))
                 })?;
+                if resp.embeddings.len() != chunk.len() {
+                    return Err(DataFusionError::Execution(format!(
+                        "remote_embed({}, {}): provider returned {} embeddings for {} texts",
+                        provider_name,
+                        model_name,
+                        resp.embeddings.len(),
+                        chunk.len()
+                    )));
+                }
                 all_embeddings.extend(resp.embeddings);
             }
             Ok::<(), DataFusionError>(())

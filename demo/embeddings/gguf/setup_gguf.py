@@ -9,7 +9,7 @@ What this does:
   2. Downloads tokenizer.json from the base model (requires accepting Google's
      Gemma license — see Prerequisites).
   3. Embeds docs.csv using llama-cpp-python and writes a Lance dataset at
-     data/doc_embeddings_gguf.lance.
+     data/generated/doc_embeddings_gguf.lance.
 
 Prerequisites:
   1. Accept Google's EmbeddingGemma licence at
@@ -32,9 +32,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DEMO_DIR = Path("demo/embeddings/gguf")
-DOCS_CSV = DEMO_DIR / "data" / "docs.csv"
-LANCE_OUT = DEMO_DIR / "data" / "doc_embeddings_gguf.lance"
-MODEL_DIR = Path("models/embeddinggemma-300m")
+DOCS_CSV = Path("demo/embeddings/data/docs.csv")
+LANCE_OUT = DEMO_DIR / "data" / "generated" / "doc_embeddings_gguf.lance"
+MODEL_DIR = Path("models/generated/embeddinggemma-300m")
 
 GGUF_REPO = "ggml-org/embeddinggemma-300m-qat-q8_0-GGUF"
 GGUF_FILE = "embeddinggemma-300m-qat-Q8_0.gguf"
@@ -172,7 +172,7 @@ def main():
         print("  cd /path/to/skardi && python demo/embeddings/gguf/setup_gguf.py")
         sys.exit(1)
 
-    (DEMO_DIR / "data").mkdir(parents=True, exist_ok=True)
+    (DEMO_DIR / "data" / "generated").mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     download_gguf()

@@ -1,10 +1,8 @@
 pub mod embed;
 
 use anyhow::Result;
-use arrow::{
-    array::{Array, ArrayRef, Float32Builder, ListBuilder, StringArray},
-    datatypes::{DataType, Field},
-};
+use arrow::array::{Array, StringArray};
+use arrow::datatypes::{DataType, Field};
 use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::{
     error::DataFusionError,
@@ -16,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use self::embed::EmbeddingModel;
+use super::vecs_to_list_array;
 
 // =============================================================================
 // CandleModelRegistry — lazy model cache keyed by file path
@@ -80,25 +79,6 @@ impl Default for CandleModelRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// =============================================================================
-// Helper — convert Vec<Vec<f32>> to a ListArray<Float32>
-// =============================================================================
-
-/// Convert a batch of embedding vectors into an Arrow `ListArray<Float32>`.
-///
-/// The resulting array has one list element per input row, compatible with
-/// `lance_knn` directly.
-pub fn vecs_to_list_array(vecs: Vec<Vec<f32>>) -> ArrayRef {
-    let mut builder = ListBuilder::new(Float32Builder::new());
-    for vec in vecs {
-        for v in &vec {
-            builder.values().append_value(*v);
-        }
-        builder.append(true);
-    }
-    Arc::new(builder.finish())
 }
 
 // =============================================================================
@@ -260,6 +240,7 @@ impl ScalarUDFImpl for CandleUDF {
             DataFusionError::Execution(format!("Embedding failed: {}", e))
         })?;
 
+        let embeddings = embeddings.into_iter().map(Some).collect();
         Ok(ColumnarValue::Array(vecs_to_list_array(embeddings)))
     }
 }
@@ -275,7 +256,7 @@ mod tests {
 
     #[test]
     fn vecs_to_list_array_shape_and_values() {
-        let vecs = vec![vec![1.0f32, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let vecs = vec![Some(vec![1.0f32, 2.0, 3.0]), Some(vec![4.0, 5.0, 6.0])];
         let arr = vecs_to_list_array(vecs);
 
         let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
