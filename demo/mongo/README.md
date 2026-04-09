@@ -139,7 +139,7 @@ Insert a new product (uses upsert semantics based on primary key).
 ```bash
 curl -X POST http://localhost:8080/insert_product/execute \
   -H "Content-Type: application/json" \
-  -d '{"product_id": "PROD006", "name": "Webcam", "category": "Electronics", "price": 89.99, "in_stock": true}'
+  -d '{"product_id": "PROD006", "name": "Webcam", "category": "Electronics", "price": 89.99, "in_stock": true}' | jq .
 ```
 
 **Response:**
