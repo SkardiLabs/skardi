@@ -1,0 +1,33 @@
+metadata:
+  name: "search-hybrid"
+  version: "1.0.0"
+  description: >
+    Hybrid search combining vector similarity (pg_knn) and full-text keyword
+    search (mongo_fts) using Reciprocal Rank Fusion (RRF).
+    This mirrors FastGPT's hybrid search approach.
+
+# Parameters:
+#   {query}          - Natural language search query (used for vector search)
+#   {text_query}     - Tokenized search terms (used for full-text search)
+#   {vector_weight}  - Weight for vector results (e.g. 0.5)
+#   {text_weight}    - Weight for text results (e.g. 0.5)
+#   {limit}          - Maximum number of results
+
+query: |
+  SELECT
+    COALESCE(v.id, CAST(t.doc_id AS BIGINT)) AS id,
+    v.content,
+    COALESCE({vector_weight} / (60.0 + v.rk), 0)
+      + COALESCE({text_weight} / (60.0 + t.rk), 0) AS rrf_score
+  FROM (
+    SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+    FROM pg_knn('documents', 'embedding',
+        candle('models/generated/bge-small-en-v1.5', {query}),
+        '<=>', 80)
+  ) v
+  FULL OUTER JOIN (
+    SELECT doc_id, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+    FROM mongo_fts('document_texts', {text_query}, 60)
+  ) t ON v.id = CAST(t.doc_id AS BIGINT)
+  ORDER BY rrf_score DESC
+  LIMIT {limit}
