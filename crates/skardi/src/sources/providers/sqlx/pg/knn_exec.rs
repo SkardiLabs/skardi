@@ -14,6 +14,7 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 use futures::stream;
+use pgvector::Vector;
 use sqlx::PgPool;
 use sqlx::Row;
 use std::any::Any;
@@ -186,13 +187,13 @@ impl ExecutionPlan for PgVectorFetchExec {
 
 /// Physical execution plan for pgvector KNN search.
 ///
-/// Runs:
+/// Runs a parameterized query using `pgvector::Vector` via sqlx:
 /// ```sql
-/// SELECT <cols>, ("<vector_col>" <#> '<query>'::vector)::float8 AS _score
+/// SELECT <cols>, ("<vector_col>" <op> $1)::float8 AS _score
 /// FROM "<schema>"."<table>"
 /// [WHERE <filter>]
-/// ORDER BY _score
-/// LIMIT 10;
+/// ORDER BY "<vector_col>" <op> $1
+/// LIMIT <k>;
 /// ```
 ///
 /// The query vector may be supplied as a pre-computed `Vec<f32>` (literal path)
@@ -308,21 +309,15 @@ impl PgKnnExec {
             .join(", ")
     }
 
-    /// Format a query vector as a pgvector literal `'[0.1,0.2,...]'`.
-    fn format_vector_literal(vec: &[f32]) -> String {
-        let inner = vec
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("[{}]", inner)
-    }
-
-    /// Build the full KNN SELECT query.
-    fn build_query(&self, query_vector: &[f32]) -> String {
+    /// Build the parameterized KNN SELECT query.
+    ///
+    /// Uses `$1` as the bind parameter for the query vector (`pgvector::Vector`).
+    /// The raw distance expression appears in ORDER BY so pgvector indexes
+    /// (HNSW / IVFFlat) can be utilised. The `::float8` cast is only applied
+    /// in the SELECT list (`_score` column) to avoid breaking index matching.
+    fn build_query(&self) -> String {
         let cols = self.select_columns();
-        let vec_lit = Self::format_vector_literal(query_vector);
-        let vec_col = self.vector_col.replace('"', "\"\"");
+        let vec_col = format!("\"{}\"", self.vector_col.replace('"', "\"\""));
         let where_clause = self
             .filter
             .as_deref()
@@ -330,7 +325,8 @@ impl PgKnnExec {
             .unwrap_or_default();
 
         let op = self.metric.operator();
-        let score_expr = format!("(\"{vec_col}\" {op} '{vec_lit}'::vector)::float8 AS _score");
+        let dist_expr = format!("{vec_col} {op} $1");
+        let score_expr = format!("({dist_expr})::float8 AS _score");
         let select_list = if cols.is_empty() {
             score_expr
         } else {
@@ -339,7 +335,7 @@ impl PgKnnExec {
         format!(
             "SELECT {select_list} \
              FROM {table}{where_clause} \
-             ORDER BY _score \
+             ORDER BY {dist_expr} \
              LIMIT {k}",
             table = self.qualified_table,
             k = self.k,
@@ -362,10 +358,12 @@ impl PgKnnExec {
             unreachable!("PgKnnExec: both query_vector and query_vector_plan are absent");
         };
 
-        let sql = self.build_query(&query_vector);
+        let sql = self.build_query();
         tracing::debug!("pg_knn SQL: {}", sql);
 
+        let embedding = Vector::from(query_vector);
         let rows = sqlx::query(&sql)
+            .bind(embedding)
             .fetch_all(self.pool.as_ref())
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -649,27 +647,6 @@ mod tests {
         assert_eq!(DistanceMetric::default(), DistanceMetric::InnerProduct);
     }
 
-    // ── format_vector_literal ─────────────────────────────────────────────
-
-    #[test]
-    fn test_format_vector_literal() {
-        assert_eq!(
-            PgKnnExec::format_vector_literal(&[0.1, 0.2, 0.3]),
-            "[0.1,0.2,0.3]"
-        );
-    }
-
-    #[test]
-    fn test_format_vector_literal_empty() {
-        assert_eq!(PgKnnExec::format_vector_literal(&[]), "[]");
-    }
-
-    #[test]
-    fn test_format_vector_literal_single() {
-        // f32 1.0 serialises as "1", not "1.0"
-        assert_eq!(PgKnnExec::format_vector_literal(&[1.0]), "[1]");
-    }
-
     // ── select_columns ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -704,6 +681,43 @@ mod tests {
     // ── build_query ───────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn test_build_query_uses_parameterized_vector() {
+        let exec = make_exec(
+            vec![("id", DataType::Int64)],
+            DistanceMetric::InnerProduct,
+            None,
+            10,
+        );
+        let sql = exec.build_query();
+        assert!(
+            sql.contains("$1"),
+            "query should use $1 bind parameter for the vector; sql={sql}"
+        );
+        // Should NOT contain a vector literal like '[0.1,0.2]'::vector
+        assert!(
+            !sql.contains("'["),
+            "query should not contain inline vector literal; sql={sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_query_order_by_uses_raw_distance_expr() {
+        // pgvector indexes (HNSW/IVFFlat) require ORDER BY to use the raw
+        // distance operator expression, not an alias or a cast.
+        let exec = make_exec(vec![("id", DataType::Int64)], DistanceMetric::L2, None, 5);
+        let sql = exec.build_query();
+        assert!(
+            sql.contains("ORDER BY \"embedding\" <-> $1"),
+            "ORDER BY must use raw distance expression for index utilisation; sql={sql}"
+        );
+        // _score in SELECT should still have the ::float8 cast
+        assert!(
+            sql.contains("::float8 AS _score"),
+            "SELECT list should cast _score to float8; sql={sql}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_build_query_uses_correct_operator() {
         for (metric, op) in [
             (DistanceMetric::InnerProduct, "<#>"),
@@ -711,10 +725,10 @@ mod tests {
             (DistanceMetric::Cosine, "<=>"),
         ] {
             let exec = make_exec(vec![("id", DataType::Int64)], metric, None, 10);
-            let sql = exec.build_query(&[0.1, 0.2]);
+            let sql = exec.build_query();
             assert!(
                 sql.contains(op),
-                "metric {metric:?} should use operator {op}"
+                "metric {metric:?} should use operator {op}; sql={sql}"
             );
         }
     }
@@ -723,21 +737,9 @@ mod tests {
     async fn test_build_query_limit() {
         for k in [1, 5, 100] {
             let exec = make_exec(vec![("id", DataType::Int64)], DistanceMetric::L2, None, k);
-            let sql = exec.build_query(&[0.1]);
+            let sql = exec.build_query();
             assert!(sql.contains(&format!("LIMIT {k}")));
         }
-    }
-
-    #[tokio::test]
-    async fn test_build_query_vector_literal_embedded() {
-        let exec = make_exec(
-            vec![("id", DataType::Int64)],
-            DistanceMetric::InnerProduct,
-            None,
-            10,
-        );
-        let sql = exec.build_query(&[0.5, 0.25]);
-        assert!(sql.contains("'[0.5,0.25]'::vector"));
     }
 
     #[tokio::test]
@@ -748,7 +750,7 @@ mod tests {
             Some("category = 'news'"),
             10,
         );
-        let sql = exec.build_query(&[0.1, 0.2]);
+        let sql = exec.build_query();
         assert!(sql.contains("WHERE category = 'news'"));
     }
 
@@ -760,7 +762,7 @@ mod tests {
             None,
             10,
         );
-        let sql = exec.build_query(&[0.1]);
+        let sql = exec.build_query();
         assert!(!sql.contains("WHERE"));
     }
 
@@ -772,7 +774,7 @@ mod tests {
             None,
             10,
         );
-        let sql = exec.build_query(&[0.1]);
+        let sql = exec.build_query();
         assert!(sql.contains("\"embedding\""));
     }
 }

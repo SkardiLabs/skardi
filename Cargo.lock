@@ -6448,6 +6448,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgvector"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc58e2d255979a31caa7cabfa7aac654af0354220719ab7a68520ae7a91e8c0b"
+dependencies = [
+ "sqlx",
+]
+
+[[package]]
 name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8021,6 +8030,7 @@ dependencies = [
  "num_cpus",
  "ort",
  "percent-encoding",
+ "pgvector",
  "redis",
  "redis-test",
  "regex",
