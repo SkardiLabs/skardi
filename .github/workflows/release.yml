@@ -155,6 +155,16 @@ jobs:
             suffix: "-onnx"
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+          - variant: rag
+            features: "rag"
+            suffix: "-rag"
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - variant: rag
+            features: "rag"
+            suffix: "-rag"
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -217,6 +227,8 @@ jobs:
             suffix: ""
           - variant: onnx
             suffix: "-onnx"
+          - variant: rag
+            suffix: "-rag"
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
