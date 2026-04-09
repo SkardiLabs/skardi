@@ -18,6 +18,7 @@ use object_store::http::HttpBuilder;
 use serde::Deserialize;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
+use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
 use skardi::sources::providers::sqlx::register_pg_knn_udtf;
 use skardi::sources::providers::{
     DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
@@ -318,10 +319,11 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register the lance_knn, lance_fts, and pg_knn table functions, all sharing one registry
+    // Register table functions (lance_knn, lance_fts, pg_knn, mongo_fts), all sharing one registry
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_pg_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_mongo_fts_udtf(&ctx, Arc::clone(&dataset_registry));
 
     (ctx, dataset_registry)
 }
@@ -531,9 +533,15 @@ async fn register_source(
                     source.name
                 )
             })?;
-            register_mongo_tables(session_ctx, &source.name, conn_str, source.options.as_ref())
-                .await
-                .with_context(|| format!("Failed to register MongoDB '{}'", source.name))?;
+            register_mongo_tables(
+                session_ctx,
+                &source.name,
+                conn_str,
+                source.options.as_ref(),
+                Some(dataset_registry),
+            )
+            .await
+            .with_context(|| format!("Failed to register MongoDB '{}'", source.name))?;
         }
         "lance" => {
             let path_str = source

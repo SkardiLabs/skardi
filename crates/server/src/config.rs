@@ -946,11 +946,13 @@ async fn register_data_source(
                 source.options
             );
 
+            let mongo_registry = optimizer_registry.map(|r| r.datasets());
             register_mongo_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
                 source.options.as_ref(),
+                mongo_registry.as_ref(),
             )
             .await
             .map_err(|e| {

@@ -1,0 +1,15 @@
+metadata:
+  name: "fts-search"
+  version: "1.0.0"
+  description: >
+    Full-text search on a MongoDB collection with a $text index.
+    Returns matching documents ranked by MongoDB textScore (higher = more relevant).
+
+# Parameters:
+#   {query} - Search terms (space-separated for OR, "quoted" for phrase match)
+#   {limit} - Maximum number of results to return
+
+query: |
+  SELECT "dataId", "teamId", "datasetId", "collectionId", "fullTextToken", _score
+  FROM mongo_fts('dataset_data_texts', {query}, {limit})
+  ORDER BY _score DESC

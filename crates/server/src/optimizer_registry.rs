@@ -12,6 +12,7 @@ use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
+use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
 use skardi::sources::providers::sqlx::register_pg_knn_udtf;
 use skardi::sources::providers::{DatasetEntry, DatasetRegistry};
 use std::collections::{HashMap, HashSet};
@@ -89,6 +90,11 @@ impl OptimizerRegistry {
             self.register_postgres_functions(ctx)?;
         }
 
+        // Register MongoDB-specific table functions
+        if source_types.contains(&DataSourceType::Mongo) {
+            self.register_mongo_functions(ctx)?;
+        }
+
         Ok(())
     }
 
@@ -112,6 +118,14 @@ impl OptimizerRegistry {
         tracing::info!("Registering pg_knn table function");
         register_pg_knn_udtf(ctx, self.datasets());
         tracing::info!("✓ Registered pg_knn table function");
+        Ok(())
+    }
+
+    /// Register MongoDB-specific table functions.
+    fn register_mongo_functions(&self, ctx: &mut SessionContext) -> Result<()> {
+        tracing::info!("Registering mongo_fts table function");
+        register_mongo_fts_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered mongo_fts table function");
         Ok(())
     }
 
