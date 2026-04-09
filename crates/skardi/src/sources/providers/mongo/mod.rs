@@ -29,6 +29,9 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::sources::providers::DatasetEntry;
+use fts_table_function::MongoFtsEntry;
+
 /// MongoDB Table Provider for DataFusion
 /// Supports read (scan), write (insert), update, and delete operations
 pub struct MongoTableProvider {
@@ -376,18 +379,18 @@ impl TableProvider for MongoTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Build a MongoDB filter from all pushable expressions.
-        let mut filter_doc = Document::new();
-        for expr in filters {
-            if let Expr::BinaryExpr(binary) = expr {
-                if let Ok(part) =
-                    binary_expr_to_mongo(&binary.left, &binary.op, &binary.right, &self.primary_key)
-                {
-                    for (key, value) in part.iter() {
-                        filter_doc.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
+        // Use exprs_to_mongo_filter which wraps in $and to avoid key collisions
+        // when multiple filters target the same field (e.g. price > 10 AND price < 100).
+        let pushable: Vec<Expr> = filters
+            .iter()
+            .filter(|e| is_pushable_binary_filter(e))
+            .cloned()
+            .collect();
+        let filter_doc = if pushable.is_empty() {
+            Document::new()
+        } else {
+            exprs_to_mongo_filter(&pushable, &self.primary_key).unwrap_or_default()
+        };
 
         let docs = if filter_doc.is_empty() {
             tracing::debug!(
@@ -495,7 +498,7 @@ impl TableProvider for MongoTableProvider {
 
 /// Returns true if the expression is a binary comparison (=, !=, <, <=, >, >=)
 /// between a column and a literal value, which can be pushed down to MongoDB.
-fn is_pushable_binary_filter(expr: &Expr) -> bool {
+pub(crate) fn is_pushable_binary_filter(expr: &Expr) -> bool {
     use datafusion::logical_expr::Operator;
     match expr {
         Expr::BinaryExpr(binary) => {
@@ -1270,9 +1273,6 @@ pub async fn register_mongo_tables(
     // Store a MongoFtsEntry in the dataset registry (if provided) so that
     // the mongo_fts() table function can look up this collection later.
     if let Some(registry) = dataset_registry {
-        use crate::sources::providers::DatasetEntry;
-        use crate::sources::providers::mongo::fts_table_function::MongoFtsEntry;
-
         let entry = MongoFtsEntry {
             collection: provider.collection.clone(),
             schema: provider.schema.clone(),

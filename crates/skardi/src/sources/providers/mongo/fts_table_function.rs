@@ -5,9 +5,6 @@
 //! -- Basic full-text search
 //! SELECT * FROM mongo_fts('collection_name', 'search query terms', 60)
 //!
-//! -- With inline filter (4th argument)
-//! SELECT * FROM mongo_fts('collection_name', 'search terms', 60, 'teamId = "xxx"')
-//!
 //! -- With WHERE clause filter pushdown
 //! SELECT * FROM mongo_fts('collection_name', 'search terms', 100)
 //! WHERE teamId = 'team123' AND datasetId = 'ds456'
@@ -26,12 +23,12 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use mongodb::Collection;
-use mongodb::bson::Document;
+use mongodb::bson::{Bson, Document};
 use std::any::Any;
 use std::sync::Arc;
 
-use super::binary_expr_to_mongo;
 use super::fts_exec::MongoFtsExec;
+use super::{binary_expr_to_mongo, is_pushable_binary_filter};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit (matches MAX_KNN_K).
@@ -61,9 +58,9 @@ impl MongoFtsTableFunction {
 
 impl TableFunctionImpl for MongoFtsTableFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        if exprs.len() < 3 || exprs.len() > 4 {
+        if exprs.len() != 3 {
             return plan_err!(
-                "mongo_fts(collection, query, limit [, filter]) expects 3-4 arguments, got {}",
+                "mongo_fts(collection, query, limit) expects 3 arguments, got {}",
                 exprs.len()
             );
         }
@@ -89,12 +86,6 @@ impl TableFunctionImpl for MongoFtsTableFunction {
         }
         // Use a safe default during inference so the plan can be created.
         let limit = if limit == 0 { 1 } else { limit };
-
-        let inline_filter = if exprs.len() == 4 {
-            extract_string(&exprs[3], "filter").ok()
-        } else {
-            None
-        };
 
         // Look up the MongoFtsEntry from the registry.
         let entry = {
@@ -133,7 +124,6 @@ impl TableFunctionImpl for MongoFtsTableFunction {
             collection: entry.collection,
             query,
             limit,
-            inline_filter,
             schema,
             primary_key: entry.primary_key,
         }))
@@ -146,7 +136,6 @@ struct MongoFtsProvider {
     collection: Collection<Document>,
     query: String,
     limit: usize,
-    inline_filter: Option<String>,
     schema: SchemaRef,
     primary_key: String,
 }
@@ -181,7 +170,7 @@ impl TableProvider for MongoFtsProvider {
         Ok(filters
             .iter()
             .map(|expr| {
-                if can_push_to_mongo(expr) {
+                if is_pushable_binary_filter(expr) {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -197,31 +186,23 @@ impl TableProvider for MongoFtsProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Build the MongoDB filter document from inline filter + pushed-down WHERE.
-        let mut filter_doc = Document::new();
+        // Build the MongoDB filter using $and to avoid key collisions when
+        // multiple filters target the same field (e.g. price > 10 AND price < 100).
+        let mut filter_parts: Vec<Bson> = Vec::new();
 
-        // Parse inline filter (4th arg) as simple "field = value" pairs.
-        if let Some(ref f) = self.inline_filter {
-            if let Some(doc) = parse_inline_filter(f, &self.primary_key) {
-                for (key, value) in doc.iter() {
-                    filter_doc.insert(key.clone(), value.clone());
-                }
-            }
-        }
-
-        // Convert pushed-down DataFusion Expr filters to MongoDB filter entries.
         for expr in filters {
             if let Some(doc) = expr_to_mongo_filter_entry(expr, &self.primary_key) {
-                for (key, value) in doc.iter() {
-                    filter_doc.insert(key.clone(), value.clone());
-                }
+                filter_parts.push(Bson::Document(doc));
             }
         }
 
-        let filter = if filter_doc.is_empty() {
+        let filter = if filter_parts.is_empty() {
             None
+        } else if filter_parts.len() == 1 {
+            // Single filter — no need to wrap in $and.
+            filter_parts.pop().and_then(|b| b.as_document().cloned())
         } else {
-            Some(filter_doc)
+            Some(mongodb::bson::doc! { "$and": filter_parts })
         };
 
         // Build schema respecting column projection.
@@ -232,46 +213,21 @@ impl TableProvider for MongoFtsProvider {
             self.schema.clone()
         };
 
-        let mut exec = MongoFtsExec::new(
+        let exec = MongoFtsExec::new(
             self.collection.clone(),
             self.query.clone(),
             self.limit,
             filter,
+            limit,
             schema,
             self.primary_key.clone(),
         );
-
-        if let Some(n) = limit {
-            exec = exec.with_scan_limit(Some(n));
-        }
 
         Ok(Arc::new(exec))
     }
 }
 
 // ─── Filter helpers ──────────────────────────────────────────────────────────
-
-/// Check if a DataFusion expression can be pushed down to MongoDB.
-fn can_push_to_mongo(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryExpr(binary) => {
-            use datafusion::logical_expr::Operator;
-            matches!(
-                binary.op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            ) && matches!(
-                (binary.left.as_ref(), binary.right.as_ref()),
-                (Expr::Column(_), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(_))
-            )
-        }
-        _ => false,
-    }
-}
 
 /// Convert a single DataFusion Expr to a MongoDB filter Document entry.
 fn expr_to_mongo_filter_entry(expr: &Expr, primary_key: &str) -> Option<Document> {
@@ -281,21 +237,6 @@ fn expr_to_mongo_filter_entry(expr: &Expr, primary_key: &str) -> Option<Document
         }
         _ => None,
     }
-}
-
-/// Parse a simple inline filter string like `teamId = "xxx"` into a MongoDB
-/// filter document. Supports simple equality for now.
-fn parse_inline_filter(filter: &str, primary_key: &str) -> Option<Document> {
-    // Split on '=' for simple equality.
-    let parts: Vec<&str> = filter.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let field = parts[0].trim();
-    let value = parts[1].trim().trim_matches('"').trim_matches('\'');
-
-    let key = if field == primary_key { "_id" } else { field };
-    Some(mongodb::bson::doc! { key: value })
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────

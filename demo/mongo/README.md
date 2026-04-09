@@ -402,7 +402,7 @@ curl -X POST http://localhost:8080/fts-search-with-filter/execute \
 ### `mongo_fts` parameters
 
 ```sql
-mongo_fts(collection, query, limit [, filter])
+mongo_fts(collection, query, limit)
 ```
 
 | Argument | Type | Description |
@@ -410,11 +410,10 @@ mongo_fts(collection, query, limit [, filter])
 | `collection` | string | DataFusion table name (as declared in the context file) |
 | `query` | string | Search terms. Space-separated for OR; `"quoted"` for phrase match; `-term` for negation |
 | `limit` | integer | Maximum number of results (1-500) |
-| `filter` | string (optional) | Inline filter, e.g. `'teamId = "team1"'` |
 
 `_score` is MongoDB's `textScore` — higher means more relevant.
 
-Additional `WHERE` clauses are pushed down to MongoDB when possible (equality, comparison operators on indexed fields).
+`WHERE` clauses are pushed down to MongoDB when possible (equality, comparison operators on indexed fields). This also satisfies compound text index prefix requirements.
 
 ### Query syntax
 

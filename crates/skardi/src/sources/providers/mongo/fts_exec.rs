@@ -41,6 +41,7 @@ impl MongoFtsExec {
         query: String,
         limit: usize,
         filter: Option<Document>,
+        scan_limit: Option<usize>,
         schema: SchemaRef,
         primary_key: String,
     ) -> Self {
@@ -55,16 +56,11 @@ impl MongoFtsExec {
             query,
             limit,
             filter,
-            scan_limit: None,
+            scan_limit,
             schema,
             primary_key,
             plan_properties,
         }
-    }
-
-    pub fn with_scan_limit(mut self, limit: Option<usize>) -> Self {
-        self.scan_limit = limit;
-        self
     }
 
     /// Execute the MongoDB `$text` query and convert results to a RecordBatch.
@@ -79,8 +75,22 @@ impl MongoFtsExec {
             }
         }
 
-        // Project textScore as "score".
-        let projection = doc! { "score": { "$meta": "textScore" } };
+        // Build projection: include only the fields we need + textScore.
+        // This reduces network transfer for documents with many fields.
+        let mut projection = doc! { "score": { "$meta": "textScore" } };
+        for field in self.schema.fields() {
+            let name = field.name();
+            if name == "_score" {
+                // Already handled via "score" above.
+                continue;
+            }
+            let mongo_field = if name == &self.primary_key {
+                "_id"
+            } else {
+                name.as_str()
+            };
+            projection.insert(mongo_field, 1);
+        }
 
         let effective_limit = self
             .scan_limit
