@@ -22,7 +22,7 @@ static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 fn get_backend() -> &'static LlamaBackend {
     LLAMA_BACKEND.get_or_init(|| {
         let mut backend = LlamaBackend::init()
-            .expect("Failed to init llama backend — this should only happen once");
+            .expect("Failed to initialize llama.cpp backend (check CUDA/hardware support)");
         // Suppress llama.cpp's verbose C-level stderr output (tensor listings,
         // context params, etc.) unless debug-level tracing is enabled.
         if !tracing::enabled!(tracing::Level::DEBUG) {
@@ -117,6 +117,9 @@ impl GgufEmbeddingModel {
             .collect::<Result<Vec<_>>>()?;
 
         let max_seq_len = tokenised.iter().map(|t| t.len()).max().unwrap_or(0) as u32;
+        if max_seq_len == 0 {
+            return Err(anyhow!("All input texts tokenised to empty sequences"));
+        }
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(max_seq_len))
             .with_n_batch(max_seq_len)

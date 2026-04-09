@@ -114,20 +114,69 @@ curl -X POST http://localhost:8080/semantic-search-gguf/execute \
   "success": true,
   "data": [
     {
-      "id": 1,
-      "title": "Vector Databases",
-      "content": "Vector databases store high-dimensional numerical vectors ...",
-      "_distance": 0.082
+      "id": 9,
+      "title": "Semantic Search",
+      "content": "Semantic search retrieves documents based on meaning rather than keyword overlap. A query and all documents are embedded into the same vector space; the most semantically similar documents are returned via nearest-neighbour search. This handles synonyms and paraphrases that would confuse keyword search.",
+      "_distance": 189.5809
+    },
+    {
+      "id": 4,
+      "title": "BERT Embeddings",
+      "content": "BERT (Bidirectional Encoder Representations from Transformers) produces contextual embeddings by reading text in both directions. Fine-tuned variants like bge-small and all-MiniLM are commonly used for semantic similarity tasks. The [CLS] token or mean-pooled hidden states are used as sentence-level embeddings.",
+      "_distance": 197.44229
+    },
+    {
+      "id": 2,
+      "title": "Retrieval-Augmented Generation",
+      "content": "Retrieval-Augmented Generation (RAG) combines a retrieval step with a language model. A query is embedded into a vector and used to fetch relevant documents from a vector store. Those documents are passed as context to an LLM",
+      "_distance": 216.03638
     },
     {
       "id": 11,
       "title": "Approximate Nearest Neighbour Search",
-      "content": "Exact nearest-neighbour search scales as O(n) per query ...",
-      "_distance": 0.143
+      "content": "Exact nearest-neighbour search scales as O(n) per query. ANN algorithms like HNSW and IVF-PQ trade a small accuracy loss for sub-linear query times",
+      "_distance": 221.05103
+    },
+    {
+      "id": 13,
+      "title": "Mean Pooling",
+      "content": "Mean pooling aggregates the per-token hidden states from a transformer encoder into a single fixed-size vector. Each token embedding is averaged across the sequence length",
+      "_distance": 226.3469
+    },
+    {
+      "id": 6,
+      "title": "Apache Arrow",
+      "content": "Apache Arrow defines a language-independent columnar memory format for flat and hierarchical data. It enables zero-copy reads between systems and is the in-memory format used by DataFusion",
+      "_distance": 236.95584
+    },
+    {
+      "id": 12,
+      "title": "GGUF Format",
+      "content": "GGUF (GGML Universal Format) is a binary format for storing quantised neural network weights. Developed by the llama.cpp project",
+      "_distance": 264.68677
+    },
+    {
+      "id": 1,
+      "title": "Vector Databases",
+      "content": "Vector databases store high-dimensional numerical vectors and enable fast similarity search at scale. Unlike traditional databases that match exact values",
+      "_distance": 272.3685
+    },
+    {
+      "id": 8,
+      "title": "Lance Format",
+      "content": "Lance is a columnar storage format optimised for machine learning workloads. It supports random-access reads",
+      "_distance": 315.6844
+    },
+    {
+      "id": 3,
+      "title": "Transformer Architecture",
+      "content": "The Transformer architecture introduced multi-head self-attention to replace recurrent networks. Each token attends to all other tokens in the sequence",
+      "_distance": 330.20328
     }
   ],
   "rows": 10,
-  "execution_time_ms": 45
+  "execution_time_ms": 890,
+  "timestamp": "2026-04-08T16:53:11.328699+00:00"
 }
 ```
 
