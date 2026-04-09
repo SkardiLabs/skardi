@@ -4,6 +4,13 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+use skardi::sources::providers::iceberg::register_iceberg_table;
+use skardi::sources::providers::lance::register_lance_table;
+use skardi::sources::providers::mongo::register_mongo_tables;
+use skardi::sources::providers::mysql::register_mysql_tables;
+use skardi::sources::providers::redis::datasource::register_redis_tables;
+use skardi::sources::providers::sqlite::register_sqlite_tables;
+use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -802,7 +809,7 @@ async fn register_data_source(
 
             // Register PostgreSQL table using the sqlx-based provider
             let pg_knn_registry = optimizer_registry.map(|r| r.pg_knn_pools());
-            skardi::sources::providers::sqlx::postgres::register_postgres_tables(
+            register_postgres_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -843,7 +850,7 @@ async fn register_data_source(
                 source.options
             );
 
-            skardi::sources::providers::mysql::register_mysql_tables(
+            register_mysql_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -876,7 +883,7 @@ async fn register_data_source(
                         error: "Invalid SQLite database path".to_string(),
                     })?;
 
-            skardi::sources::providers::sqlite::register_sqlite_tables(
+            register_sqlite_tables(
                 session_ctx,
                 &source.name,
                 db_path,
@@ -908,7 +915,7 @@ async fn register_data_source(
                         error: "Invalid warehouse path".to_string(),
                     })?;
 
-            skardi::sources::providers::iceberg::register_iceberg_table(
+            register_iceberg_table(
                 session_ctx,
                 &source.name,
                 warehouse_path,
@@ -939,7 +946,7 @@ async fn register_data_source(
                 source.options
             );
 
-            skardi::sources::providers::mongo::register_mongo_tables(
+            register_mongo_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -970,7 +977,7 @@ async fn register_data_source(
                 source.options
             );
 
-            skardi::sources::providers::redis::datasource::register_redis_tables(
+            register_redis_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
@@ -995,7 +1002,7 @@ async fn register_data_source(
             let dataset_registry = optimizer_registry.map(|reg| reg.lance_datasets());
 
             // Register Lance dataset using the providers module
-            skardi::sources::providers::lance::register_lance_table(
+            register_lance_table(
                 session_ctx,
                 &source.name,
                 source.path.to_str().unwrap(),

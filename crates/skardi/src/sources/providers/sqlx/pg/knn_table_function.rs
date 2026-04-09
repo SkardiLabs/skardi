@@ -39,7 +39,7 @@ use sqlx::Row;
 use std::any::Any;
 use std::sync::Arc;
 
-use super::pg_knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
+use super::knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
 use crate::sources::providers::knn_utils::MAX_KNN_K;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};

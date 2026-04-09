@@ -1,4 +1,4 @@
-use crate::sources::providers::sqlx::pg_knn_table_function::{PgKnnEntry, fetch_table_columns};
+use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
