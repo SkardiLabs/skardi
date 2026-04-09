@@ -1,0 +1,19 @@
+metadata:
+  name: "vector-search-l2"
+  version: "1.0.0"
+  description: >
+    KNN similarity search using L2 (Euclidean) distance (<->).
+    Finds the k documents closest to the document identified by seed_id.
+    Score is the Euclidean distance — lower means more similar.
+
+# Parameters:
+#   {seed_id} - ID of the document whose embedding is used as the query vector
+#   {limit}   - Maximum number of results to return
+
+query: |
+  SELECT id, content, metadata, _score
+  FROM pg_knn('documents', 'embedding',
+      (SELECT embedding FROM documents WHERE id = {seed_id}),
+      '<->', 10)
+  ORDER BY _score
+  LIMIT {limit}

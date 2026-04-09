@@ -12,6 +12,8 @@ use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
+use skardi::sources::providers::sqlx::register_pg_knn_udtf;
+use skardi::sources::providers::{DatasetEntry, DatasetRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -24,16 +26,17 @@ use crate::config::{DataSource, DataSourceType};
 /// 2. **Dataset Store** - Maintains references to datasets needed by table functions
 /// 3. **Lifecycle Coordinator** - Ensures datasets are available when functions need them
 pub struct OptimizerRegistry {
-    /// Lance datasets indexed by table name
-    /// Used by lance_knn table function to access datasets
-    lance_datasets: Arc<RwLock<HashMap<String, Arc<Dataset>>>>,
+    /// Unified dataset registry indexed by table name.
+    /// Stores both Lance datasets and Postgres entries, used by
+    /// lance_knn, lance_fts, and pg_knn table functions.
+    dataset_registry: DatasetRegistry,
 }
 
 impl OptimizerRegistry {
     /// Create a new registry
     pub fn new() -> Self {
         Self {
-            lance_datasets: Arc::new(RwLock::new(HashMap::new())),
+            dataset_registry: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -81,9 +84,9 @@ impl OptimizerRegistry {
             self.register_lance_functions(ctx)?;
         }
 
-        // Future: Register Postgres-specific UDFs
+        // Register Postgres-specific table functions
         if source_types.contains(&DataSourceType::Postgres) {
-            self.register_postgres_udfs(ctx)?;
+            self.register_postgres_functions(ctx)?;
         }
 
         Ok(())
@@ -95,46 +98,54 @@ impl OptimizerRegistry {
     fn register_lance_functions(&self, ctx: &mut SessionContext) -> Result<()> {
         tracing::info!("Registering Lance table functions");
 
-        // Register lance_knn table function
-        register_lance_knn_udtf(ctx, self.lance_datasets());
+        register_lance_knn_udtf(ctx, self.datasets());
         tracing::info!("✓ Registered lance_knn table function");
 
-        // Register lance_fts table function
-        register_lance_fts_udtf(ctx, self.lance_datasets());
+        register_lance_fts_udtf(ctx, self.datasets());
         tracing::info!("✓ Registered lance_fts table function");
 
         Ok(())
     }
 
-    /// Register Postgres-specific UDFs (placeholder for future)
-    fn register_postgres_udfs(&self, _ctx: &mut SessionContext) -> Result<()> {
-        tracing::debug!("Postgres UDFs not yet implemented");
+    /// Register Postgres-specific table functions.
+    fn register_postgres_functions(&self, ctx: &mut SessionContext) -> Result<()> {
+        tracing::info!("Registering pg_knn table function");
+        register_pg_knn_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered pg_knn table function");
         Ok(())
     }
 
-    // === Lance Dataset Management ===
+    // === Dataset Management ===
 
     /// Store a Lance dataset in the registry
-    ///
-    /// Called when registering a Lance table with DataFusion.
-    /// The lance_knn table function uses this to look up datasets by name.
     pub fn register_lance_dataset(&self, table_name: &str, dataset: Arc<Dataset>) {
-        let mut datasets = self.lance_datasets.write().unwrap();
-        datasets.insert(table_name.to_string(), dataset);
+        let mut reg = self.dataset_registry.write().unwrap();
+        reg.insert(table_name.to_string(), DatasetEntry::Lance(dataset));
         tracing::debug!("Registered Lance dataset '{}' in registry", table_name);
     }
 
     /// Get a Lance dataset by table name
     pub fn get_lance_dataset(&self, table_name: &str) -> Option<Arc<Dataset>> {
-        let datasets = self.lance_datasets.read().unwrap();
-        datasets.get(table_name).cloned()
+        let reg = self.dataset_registry.read().unwrap();
+        reg.get(table_name).and_then(|e| match e {
+            DatasetEntry::Lance(ds) => Some(Arc::clone(ds)),
+            _ => None,
+        })
     }
 
-    /// Get a clone of the Lance datasets map
-    ///
-    /// Returns an `Arc<RwLock<>>` that can be shared with table functions
-    pub fn lance_datasets(&self) -> Arc<RwLock<HashMap<String, Arc<Dataset>>>> {
-        Arc::clone(&self.lance_datasets)
+    /// Get a clone of the unified dataset registry to share with table functions.
+    pub fn datasets(&self) -> DatasetRegistry {
+        Arc::clone(&self.dataset_registry)
+    }
+
+    /// Alias for `datasets()` — used when passing to `register_postgres_tables`.
+    pub fn pg_knn_pools(&self) -> DatasetRegistry {
+        self.datasets()
+    }
+
+    /// Alias for `datasets()` — used when passing to `register_lance_table`.
+    pub fn lance_datasets(&self) -> DatasetRegistry {
+        self.datasets()
     }
 }
 

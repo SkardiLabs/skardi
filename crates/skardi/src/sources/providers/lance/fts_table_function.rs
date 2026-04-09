@@ -34,21 +34,21 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
 };
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::fts_exec::LanceFtsExec;
 use super::utils::expr_to_lance_sql;
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Table function that creates full-text search on Lance tables
 #[derive(Debug)]
 pub struct LanceFtsTableFunction {
-    dataset_registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>>,
+    dataset_registry: DatasetRegistry,
 }
 
 impl LanceFtsTableFunction {
-    pub fn new(dataset_registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>>) -> Self {
+    pub fn new(dataset_registry: DatasetRegistry) -> Self {
         Self { dataset_registry }
     }
 }
@@ -73,12 +73,19 @@ impl TableFunctionImpl for LanceFtsTableFunction {
                 .dataset_registry
                 .read()
                 .map_err(|e| DataFusionError::Internal(format!("Registry lock error: {}", e)))?;
-            registry.get(&table_name).cloned().ok_or_else(|| {
+            let entry = registry.get(&table_name).cloned().ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "lance_fts: table '{}' not found in registry",
                     table_name
                 ))
-            })?
+            })?;
+            match entry {
+                DatasetEntry::Lance(ds) => Ok(ds),
+                _ => Err(DataFusionError::Plan(format!(
+                    "lance_fts: table '{}' is not a Lance dataset",
+                    table_name
+                ))),
+            }?
         };
 
         // Parse the query string into a FullTextSearchQuery.
@@ -334,7 +341,7 @@ fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
 /// Register lance_fts table function with SessionContext
 pub fn register_lance_fts_udtf(
     ctx: &datafusion::prelude::SessionContext,
-    dataset_registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>>,
+    dataset_registry: DatasetRegistry,
 ) {
     ctx.register_udtf(
         "lance_fts",
@@ -345,6 +352,7 @@ pub fn register_lance_fts_udtf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::providers::DatasetRegistry;
 
     #[test]
     fn test_parse_default_match_query() {
@@ -454,8 +462,8 @@ mod tests {
         );
 
         let mut ctx = datafusion::prelude::SessionContext::new();
-        let registry: Arc<RwLock<HashMap<String, Arc<Dataset>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let registry: DatasetRegistry =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         register_lance_table(&mut ctx, "fts_data", dataset_path_str, Some(&registry))
             .await

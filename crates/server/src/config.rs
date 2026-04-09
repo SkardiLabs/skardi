@@ -292,6 +292,9 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
     #[cfg(feature = "gguf")]
     register_gguf_udf(&mut session_ctx);
+    // Register candle UDF (lazy — models loaded on first call from inline path)
+    #[cfg(feature = "candle")]
+    register_candle_udf(&mut session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
@@ -427,6 +430,19 @@ pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
 pub fn register_gguf_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::GgufModelRegistry::new());
     registry.register_gguf_udf(ctx);
+}
+/// Register the `candle` UDF with the session context.
+///
+/// The UDF loads BERT-style SafeTensors models lazily from file paths provided
+/// inline in SQL:
+///   candle('path/to/model.safetensors', text_col)
+///
+/// `config.json` and `tokenizer.json` must live alongside the weights file.
+/// Models are loaded and cached on first call.
+#[cfg(feature = "candle")]
+pub fn register_candle_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::CandleModelRegistry::new());
+    registry.register_candle_udf(ctx);
 }
 
 /// Load context configuration from YAML file
@@ -772,12 +788,14 @@ async fn register_data_source(
             );
 
             // Register PostgreSQL table using the sqlx-based provider
+            let pg_knn_registry = optimizer_registry.map(|r| r.pg_knn_pools());
             skardi::sources::providers::sqlx::postgres::register_postgres_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                pg_knn_registry.as_ref(),
             )
             .await
             .map_err(|e| {

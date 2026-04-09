@@ -284,6 +284,216 @@ docker exec postgres-skardi psql -U skardi_user -d mydb \
 4. 📈 Aggregated: COUNT orders, SUM amounts, MAX date for that user
 5. 💾 Wrote aggregated row to PostgreSQL
 
+## pgvector: KNN Similarity Search
+
+Skardi supports [pgvector](https://github.com/pgvector/pgvector) tables via the `pg_knn()` table function. Any Postgres data source that has a `vector` column is automatically available for KNN search — no extra configuration needed.
+
+### Setup
+
+```bash
+# 1. Start PostgreSQL with pgvector
+docker run --name postgres-pgvector \
+  -e POSTGRES_DB=mydb \
+  -e POSTGRES_USER=skardi_user \
+  -e POSTGRES_PASSWORD=skardi_pass \
+  -p 5432:5432 \
+  -d pgvector/pgvector:pg16
+
+# 2. Create a table with a vector column and HNSW index
+docker exec -i postgres-pgvector psql -U skardi_user -d mydb << 'EOF'
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+    id BIGSERIAL PRIMARY KEY,
+    content TEXT NOT NULL,
+    metadata TEXT,
+    embedding vector(4)   -- use your actual dimension (e.g. 1536 for OpenAI)
+);
+
+-- One HNSW index per operator class (each metric requires its own index)
+CREATE INDEX ON documents USING hnsw (embedding vector_ip_ops)     WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON documents USING hnsw (embedding vector_l2_ops)     WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+-- Vectors are designed so each metric returns a different ranking (see "Start and query" below).
+-- doc-2 shares direction with doc-1 but has 5× larger magnitude:
+--   <#>  ranks it first  (high dot product)
+--   <->  ranks it last   (far in Euclidean space)
+--   <=>  ties it with doc-1 (direction is identical)
+INSERT INTO documents (content, metadata, embedding) VALUES
+    ('Rust systems programming',                    'doc-1', '[0.6, 0.8, 0.0, 0.0]'),
+    ('Systems programming at scale with Rust',      'doc-2', '[3.0, 4.0, 0.0, 0.0]'),
+    ('Introduction to programming languages',       'doc-3', '[0.5, 0.5, 0.5, 0.5]'),
+    ('Database query optimization',                 'doc-4', '[0.0, 0.0, 0.6, 0.8]');
+EOF
+
+# 3. Set credentials
+export PG_USER="skardi_user"
+export PG_PASSWORD="skardi_pass"
+```
+
+### Context file
+
+Add `documents` as a regular Postgres data source — `pg_knn` discovers the vector column automatically:
+
+```yaml
+# ctx_pgvector_demo.yaml
+data_sources:
+  - name: "documents"
+    type: "postgres"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    options:
+      table: "documents"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+```
+
+### Pipelines
+
+Three pipeline files are provided in `demo/postgres/pipelines/vector_demo/`, one per distance metric:
+
+| File | Operator | Score meaning |
+|---|---|---|
+| `vector_search_inner_product.yaml` | `<#>` | Negative inner product — lower (more negative) is more similar |
+| `vector_search_l2.yaml` | `<->` | Euclidean distance — lower is more similar |
+| `vector_search_cosine.yaml` | `<=>` | Cosine distance in [0, 2] — lower is more similar |
+
+Each pipeline finds documents similar to a seed document using its stored embedding as the query vector:
+
+```yaml
+# vector_search_cosine.yaml
+query: |
+  SELECT id, content, metadata, _score
+  FROM pg_knn('documents', 'embedding',
+      (SELECT embedding FROM documents WHERE id = {seed_id}),
+      '<=>', 10)
+  ORDER BY _score
+  LIMIT {limit}
+```
+
+Each pipeline accepts two parameters: `seed_id` (the document to use as the query vector) and `limit` (how many results to return). `pg_knn` fetches up to 10 candidates from Postgres; `LIMIT {limit}` trims the final result set.
+
+### Start and query
+
+Load all three pipelines at once and query each endpoint:
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/postgres/ctx_pgvector_demo.yaml \
+  --pipeline demo/postgres/pipelines/vector_demo/ \
+  --port 8080
+
+# Inner product
+curl -X POST http://localhost:8080/vector-search-inner-product/execute \
+  -H "Content-Type: application/json" \
+  -d '{"seed_id": 1, "limit": 3}'
+
+# L2 (Euclidean)
+curl -X POST http://localhost:8080/vector-search-l2/execute \
+  -H "Content-Type: application/json" \
+  -d '{"seed_id": 1, "limit": 3}'
+
+# Cosine
+curl -X POST http://localhost:8080/vector-search-cosine/execute \
+  -H "Content-Type: application/json" \
+  -d '{"seed_id": 1, "limit": 3}'
+```
+
+**`<#>` inner product** — doc-2 ranks first: same direction as doc-1 but 5× larger magnitude boosts the dot product.
+```json
+{
+  "data": [
+    {"id": 2, "content": "Systems programming at scale with Rust", "metadata": "doc-2", "_score": -5.0},
+    {"id": 1, "content": "Rust systems programming",               "metadata": "doc-1", "_score": -1.0},
+    {"id": 3, "content": "Introduction to programming languages",  "metadata": "doc-3", "_score": -0.7}
+  ],
+  "rows": 3,
+  "success": true
+}
+```
+
+**`<->` L2** — doc-3 ranks second: it is geometrically closer than doc-4; doc-2 ranks last despite being on-topic because of its large magnitude.
+```json
+{
+  "data": [
+    {"id": 1, "content": "Rust systems programming",               "metadata": "doc-1", "_score": 0.0},
+    {"id": 3, "content": "Introduction to programming languages",  "metadata": "doc-3", "_score": 0.77},
+    {"id": 4, "content": "Database query optimization",            "metadata": "doc-4", "_score": 1.41}
+  ],
+  "rows": 3,
+  "success": true
+}
+```
+
+**`<=>` cosine** — doc-2 ties with doc-1: direction is identical regardless of magnitude; doc-4 is completely orthogonal.
+```json
+{
+  "data": [
+    {"id": 1, "content": "Rust systems programming",               "metadata": "doc-1", "_score": 0.0},
+    {"id": 2, "content": "Systems programming at scale with Rust", "metadata": "doc-2", "_score": 0.0},
+    {"id": 3, "content": "Introduction to programming languages",  "metadata": "doc-3", "_score": 0.3}
+  ],
+  "rows": 3,
+  "success": true
+}
+```
+
+### `pg_knn` parameters
+
+```sql
+pg_knn(table_name, vector_col, query_vec, metric, k [, filter])
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `table_name` | string | DataFusion table name (as declared in the context file) |
+| `vector_col` | string | Name of the `vector` column to search |
+| `query_vec` | float array or subquery | Query embedding, e.g. `[0.1, 0.2, ...]` |
+| `metric` | string | pgvector operator: `<#>` (inner product), `<->` (L2), or `<=>` (cosine) |
+| `k` | integer | Number of nearest neighbours to return |
+| `filter` | string (optional) | SQL WHERE predicate pushed directly into the Postgres query |
+
+`pg_knn` runs the search entirely in Postgres, so the HNSW index is always used.
+
+`_score` is the raw pgvector distance value — lower is always more similar regardless of metric (for `inner_product` the score is negative).
+
+Additional `WHERE` clauses written in the pipeline SQL are pushed down the same way:
+
+```sql
+SELECT id, content, _score
+FROM pg_knn('documents', 'embedding', {query_vector}, 'metadata = ''doc-1''')
+WHERE _score < -0.5
+```
+
+### Cross-source join (pgvector + CSV)
+
+`pg_knn` results are a normal DataFusion table and can be joined with any other registered source. Using the CSV orders data already present in this demo:
+
+```yaml
+# Add to ctx_pgvector_demo.yaml
+data_sources:
+  - name: "documents"
+    type: "postgres"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    options:
+      table: "documents"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+  - name: "csv_orders"
+    type: "csv"
+    path: "demo/sample_data/orders.csv"
+```
+
+```sql
+-- Pipeline SQL: find semantically similar documents, then attach order data
+SELECT v.id, v.content, v._score, o.product, o.amount
+FROM pg_knn('documents', 'embedding', {query_vector}) v
+JOIN csv_orders o ON o.user_id = v.id
+ORDER BY v._score
+```
+
 ## Troubleshooting
 
 ### Connection Refused
