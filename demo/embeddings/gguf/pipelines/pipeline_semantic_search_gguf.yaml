@@ -13,7 +13,7 @@ query: |
   FROM lance_knn(
     'doc_embeddings_gguf',
     'embedding',
-    gguf('models/embeddinggemma-300m', {query}),
+    gguf('models/generated/embeddinggemma-300m', {query}),
     10
   )
   ORDER BY _distance

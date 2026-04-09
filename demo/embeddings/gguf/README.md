@@ -13,7 +13,7 @@ SELECT id, title, content, _distance
 FROM lance_knn(
   'doc_embeddings_gguf',
   'embedding',
-  gguf('models/embeddinggemma-300m', {query}),
+  gguf('models/generated/embeddinggemma-300m', {query}),
   10
 )
 ORDER BY _distance
@@ -70,10 +70,10 @@ python demo/embeddings/gguf/setup_gguf.py
 ```
 
 This will:
-- Download `embeddinggemma-300m-qat-Q8_0.gguf` (~329 MB) into `models/embeddinggemma-300m/`
+- Download `embeddinggemma-300m-qat-Q8_0.gguf` (~329 MB) into `models/generated/embeddinggemma-300m/`
 - Download `tokenizer.json` from the gated Gemma repo
-- Embed the 15 knowledge-base documents in `data/docs.csv`
-- Write a Lance dataset to `demo/embeddings/gguf/data/doc_embeddings_gguf.lance`
+- Embed the 15 knowledge-base documents in `demo/embeddings/data/docs.csv`
+- Write a Lance dataset to `demo/embeddings/gguf/data/generated/doc_embeddings_gguf.lance`
 
 Expected output:
 ```
@@ -81,10 +81,10 @@ Expected output:
       embeddinggemma-300m-qat-Q8_0.gguf: 329.0 MB
 [2/4] Downloading tokenizer.json from google/embeddinggemma-300m-qat-q8_0-unquantized ...
       tokenizer.json: 31.8 MB
-[3/4] Loaded 15 documents from demo/embeddings/gguf/data/docs.csv
+[3/4] Loaded 15 documents from demo/embeddings/data/docs.csv
 [4/4] Embedding 15 documents with embeddinggemma-300m-qat-Q8_0.gguf ...
       Embedding dimension: 256
-      Lance dataset written to demo/embeddings/gguf/data/doc_embeddings_gguf.lance
+      Lance dataset written to demo/embeddings/gguf/data/generated/doc_embeddings_gguf.lance
 ```
 
 ## Starting the Server
@@ -108,7 +108,7 @@ curl -X POST http://localhost:8080/semantic-search-gguf/execute \
   }' | jq .
 ```
 
-**Response** (truncated — returns up to 10 results):
+**Response**:
 ```json
 {
   "success": true,
@@ -213,21 +213,22 @@ demo/embeddings/gguf/
 ├── ctx.yaml                          — registers the Lance data source
 ├── setup_gguf.py                     — one-time setup: downloads model + creates Lance dataset
 ├── data/
-│   ├── docs.csv                      — 15 knowledge-base documents (source of truth)
-│   └── doc_embeddings_gguf.lance/    — created by setup_gguf.py
+│   └── generated/
+│       └── doc_embeddings_gguf.lance/ — created by setup_gguf.py
 └── pipelines/
     └── pipeline_semantic_search_gguf.yaml — the semantic search pipeline
 ```
 
 ```
 models/
-└── embeddinggemma-300m/              — created by setup_gguf.py
+└── generated/
+    └── embeddinggemma-300m/          — created by setup_gguf.py
     ├── embeddinggemma-300m-qat-Q8_0.gguf
     └── tokenizer.json
 ```
 
 > **Note**: `models/` lives at the project root so the path in SQL
-> (`models/embeddinggemma-300m`) is relative to wherever you launch
+> (`models/generated/embeddinggemma-300m`) is relative to wherever you launch
 > `skardi-server` from.
 
 ## Switching Models
@@ -237,7 +238,7 @@ in the pipeline SQL:
 
 ```sql
 -- Use a different GGUF model in the pipeline
-gguf('models/nomic-embed-text-v1.5', {query})
+gguf('models/generated/nomic-embed-text-v1.5', {query})
 ```
 
 Re-run `setup_gguf.py` with updated `MODEL_DIR` / `GGUF_REPO` / `GGUF_FILE`

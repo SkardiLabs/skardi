@@ -12,7 +12,7 @@ SELECT id, title, content, _distance
 FROM lance_knn(
   'doc_embeddings',
   'embedding',
-  candle('models/bge-small-en-v1.5', {query}),
+  candle('models/generated/bge-small-en-v1.5', {query}),
   10
 )
 ORDER BY _distance
@@ -66,20 +66,20 @@ python demo/embeddings/candle/setup.py
 ```
 
 This will:
-- Download `BAAI/bge-small-en-v1.5` SafeTensors weights into `models/bge-small-en-v1.5/`
-- Embed the 15 knowledge-base documents in `data/docs.csv`
-- Write a Lance dataset to `demo/embeddings/candle/data/doc_embeddings.lance`
+- Download `BAAI/bge-small-en-v1.5` SafeTensors weights into `models/generated/bge-small-en-v1.5/`
+- Embed the 15 knowledge-base documents in `demo/embeddings/data/docs.csv`
+- Write a Lance dataset to `demo/embeddings/candle/data/generated/doc_embeddings.lance`
 
 Expected output:
 ```
-[1/3] Downloading BAAI/bge-small-en-v1.5 into models/bge-small-en-v1.5 ...
+[1/3] Downloading BAAI/bge-small-en-v1.5 into models/generated/bge-small-en-v1.5 ...
       model.safetensors: 133.4 MB
       config.json: 0.0 MB
       tokenizer.json: 0.7 MB
-[2/3] Loaded 15 documents from demo/embeddings/candle/data/docs.csv
+[2/3] Loaded 15 documents from demo/embeddings/data/docs.csv
 [3/3] Embedding 15 documents with BAAI/bge-small-en-v1.5 ...
       Embedding dimension: 384
-      Lance dataset written to demo/embeddings/candle/data/doc_embeddings.lance
+      Lance dataset written to demo/embeddings/candle/data/generated/doc_embeddings.lance
 ```
 
 ## Starting the Server
@@ -200,22 +200,23 @@ demo/embeddings/candle/
 ├── ctx.yaml                          — registers the Lance data source
 ├── setup.py                          — one-time setup: downloads model + creates Lance dataset
 ├── data/
-│   ├── docs.csv                      — 15 knowledge-base documents (source of truth)
-│   └── doc_embeddings.lance/         — created by setup.py
+│   └── generated/
+│       └── doc_embeddings.lance/     — created by setup.py
 └── pipelines/
     └── pipeline_semantic_search.yaml — the semantic search pipeline
 ```
 
 ```
 models/
-└── bge-small-en-v1.5/               — created by setup.py
+└── generated/
+    └── bge-small-en-v1.5/           — created by setup.py
     ├── model.safetensors
     ├── config.json
     └── tokenizer.json
 ```
 
 > **Note**: `models/` lives at the project root so the path in SQL
-> (`models/bge-small-en-v1.5`) is relative to wherever you launch
+> (`models/generated/bge-small-en-v1.5`) is relative to wherever you launch
 > `skardi-server` from.
 
 ## Switching Models
@@ -227,16 +228,16 @@ different model and update the path in the pipeline SQL:
 # Download a larger, higher-quality model
 huggingface-cli download BAAI/bge-base-en-v1.5 \
   --include "model.safetensors" "config.json" "tokenizer.json" \
-  --local-dir models/bge-base-en-v1.5
+  --local-dir models/generated/bge-base-en-v1.5
 ```
 
 ```sql
 -- Use the larger model in the pipeline
-candle('models/bge-base-en-v1.5', {query})
+candle('models/generated/bge-base-en-v1.5', {query})
 ```
 
 Re-run `setup.py` with `MODEL_ID = "BAAI/bge-base-en-v1.5"` and
-`MODEL_DIR = Path("models/bge-base-en-v1.5")` to rebuild the Lance dataset
+`MODEL_DIR = Path("models/generated/bge-base-en-v1.5")` to rebuild the Lance dataset
 with the new model's embeddings.
 
 ## Troubleshooting

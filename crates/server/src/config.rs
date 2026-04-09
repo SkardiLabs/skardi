@@ -289,6 +289,9 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
+    // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
+    #[cfg(feature = "remote-embed")]
+    register_remote_embed_udf(&mut session_ctx);
     // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
     #[cfg(feature = "gguf")]
     register_gguf_udf(&mut session_ctx);
@@ -420,6 +423,16 @@ pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
     registry.register_onnx_predict_udf(ctx);
 }
 
+/// Register the `remote_embed` UDF for calling remote embedding APIs.
+///
+/// The UDF dispatches to OpenAI, Gemini, Voyage, or Mistral based on the
+/// provider name passed as the first SQL argument:
+///   remote_embed('openai', 'text-embedding-3-small', text_col)
+#[cfg(feature = "remote-embed")]
+pub fn register_remote_embed_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::RemoteEmbedRegistry::new());
+    registry.register_remote_embed_udf(ctx);
+}
 /// Register the gguf UDF with the session context.
 ///
 /// The UDF loads GGUF models lazily from directory paths provided inline in SQL:
