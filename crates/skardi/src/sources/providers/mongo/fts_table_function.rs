@@ -69,22 +69,17 @@ impl TableFunctionImpl for MongoFtsTableFunction {
         let query = extract_string(&exprs[1], "query")?;
         let limit = extract_int(&exprs[2], "limit")?;
 
-        // Skip validation when values are NULL placeholders from pipeline schema inference.
-        // The inferencer replaces {param} with NULL, yielding empty string / 0.
-        let is_inference = query.is_empty() && limit == 0;
-        if !is_inference {
-            if query.is_empty() {
-                return plan_err!("mongo_fts: query string must not be empty");
-            }
-            if limit == 0 || limit > MAX_FTS_LIMIT {
-                return plan_err!(
-                    "mongo_fts: limit must be between 1 and {}, got {}",
-                    MAX_FTS_LIMIT,
-                    limit
-                );
-            }
+        // The inferencer replaces {param} with NULL, yielding empty string for
+        // strings and 0 for integers. Accept these as placeholders — validate only
+        // when real values are provided.
+        if !query.is_empty() && limit > MAX_FTS_LIMIT {
+            return plan_err!(
+                "mongo_fts: limit must be between 1 and {}, got {}",
+                MAX_FTS_LIMIT,
+                limit
+            );
         }
-        // Use a safe default during inference so the plan can be created.
+        // Use a safe default when limit is a NULL placeholder (0).
         let limit = if limit == 0 { 1 } else { limit };
 
         // Look up the MongoFtsEntry from the registry.

@@ -509,6 +509,32 @@ data_sources:
       pass_env: "STAGING_MONGO_PASS"
 ```
 
+### Schema Inference
+
+Skardi infers the MongoDB collection schema at startup by:
+
+1. Reading the collection's `$jsonSchema` validator (if defined)
+2. Falling back to sampling existing documents
+
+If your collection is **empty and has no validator**, only the primary key field will be available in SQL. To ensure all fields are discoverable before inserting any data, define a `$jsonSchema` validator when creating the collection:
+
+```js
+db.createCollection("my_collection", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["doc_id", "fullTextToken"],
+      properties: {
+        doc_id: { bsonType: "string" },
+        fullTextToken: { bsonType: "string" }
+      }
+    }
+  }
+})
+```
+
+This is especially important for write-first workflows (e.g. RAG ingestion) where the server starts before any documents exist.
+
 ### MongoDB Atlas
 
 ```yaml
