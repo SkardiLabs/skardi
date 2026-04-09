@@ -11,6 +11,7 @@ path = "src/main.rs"
 default = []
 candle = ["skardi/candle"]
 onnx = ["skardi/onnx"]
+gguf = ["skardi/gguf"]
 
 [dependencies]
 better-auth = { workspace = true }

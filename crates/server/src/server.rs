@@ -13,6 +13,8 @@ use crate::auth::layer::AuthLayer;
 use crate::auth::mode::AuthMode;
 #[cfg(feature = "candle")]
 use crate::config::register_candle_udf;
+#[cfg(feature = "gguf")]
+use crate::config::register_gguf_udf;
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
 use crate::config::ServerConfig;
@@ -124,6 +126,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
+    // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
+    #[cfg(feature = "gguf")]
+    register_gguf_udf(&mut session_ctx);
     // Register candle UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "candle")]
     register_candle_udf(&mut session_ctx);
