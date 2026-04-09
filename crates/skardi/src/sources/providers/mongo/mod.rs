@@ -1,3 +1,6 @@
+pub mod fts_exec;
+pub mod fts_table_function;
+
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -26,12 +29,15 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::sources::providers::DatasetEntry;
+use fts_table_function::MongoFtsEntry;
+
 /// MongoDB Table Provider for DataFusion
 /// Supports read (scan), write (insert), update, and delete operations
 pub struct MongoTableProvider {
-    collection: Collection<Document>,
-    schema: SchemaRef,
-    primary_key: String,
+    pub(crate) collection: Collection<Document>,
+    pub(crate) schema: SchemaRef,
+    pub(crate) primary_key: String,
     collection_name: String,
 }
 
@@ -218,28 +224,18 @@ impl MongoTableProvider {
         Ok(Some(Schema::new(fields)))
     }
 
-    async fn point_lookup(&self, key_value: &str) -> Result<Vec<Document>> {
-        let filter = doc! { &self.primary_key: key_value };
-        let mut cursor = self
-            .collection
-            .find(filter)
-            .await
-            .with_context(|| "Failed to execute point lookup")?;
-
-        let mut results = vec![];
-        while let Some(result) = cursor.next().await {
-            let doc = result.with_context(|| "Failed to read document")?;
-            results.push(doc);
-        }
-        Ok(results)
+    async fn full_scan(&self, limit: Option<usize>) -> Result<Vec<Document>> {
+        self.filtered_scan(doc! {}, limit).await
     }
 
-    async fn full_scan(&self) -> Result<Vec<Document>> {
-        let mut cursor = self
-            .collection
-            .find(doc! {})
+    async fn filtered_scan(&self, filter: Document, limit: Option<usize>) -> Result<Vec<Document>> {
+        let mut find = self.collection.find(filter);
+        if let Some(n) = limit {
+            find = find.limit(n as i64);
+        }
+        let mut cursor = find
             .await
-            .with_context(|| "Failed to execute full scan")?;
+            .with_context(|| "Failed to execute filtered scan")?;
 
         let mut results = vec![];
         while let Some(result) = cursor.next().await {
@@ -360,13 +356,13 @@ impl TableProvider for MongoTableProvider {
         Ok(filters
             .iter()
             .map(|expr| {
-                if is_primary_key_equality_filter(expr, &self.primary_key) {
-                    // Use Inexact rather than Exact so the filter is still
-                    // present in the logical plan.  DataFusion's UPDATE/DELETE
-                    // physical planner extracts filters from the logical plan
-                    // and passes them to TableProvider::update/delete_from.
-                    // With Exact, the optimizer removes the filter before the
-                    // physical planner sees it, causing unfiltered updates.
+                if is_pushable_binary_filter(expr) {
+                    // Use Inexact so the filter is still present in the logical
+                    // plan. DataFusion's UPDATE/DELETE physical planner extracts
+                    // filters from the logical plan and passes them to
+                    // TableProvider::update/delete_from. With Exact, the
+                    // optimizer removes the filter before the physical planner
+                    // sees it, causing unfiltered updates.
                     TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -380,26 +376,37 @@ impl TableProvider for MongoTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let point_lookup_value = extract_primary_key_value(filters, &self.primary_key);
+        // Build a MongoDB filter from all pushable expressions.
+        // Use exprs_to_mongo_filter which wraps in $and to avoid key collisions
+        // when multiple filters target the same field (e.g. price > 10 AND price < 100).
+        let pushable: Vec<Expr> = filters
+            .iter()
+            .filter(|e| is_pushable_binary_filter(e))
+            .cloned()
+            .collect();
+        let filter_doc = if pushable.is_empty() {
+            Document::new()
+        } else {
+            exprs_to_mongo_filter(&pushable, &self.primary_key).unwrap_or_default()
+        };
 
-        let docs = if let Some(key_value) = point_lookup_value {
+        let docs = if filter_doc.is_empty() {
             tracing::debug!(
-                "MongoDB point lookup on {}={} for collection {}",
-                self.primary_key,
-                key_value,
+                "MongoDB full scan for collection {} (no pushable filters)",
                 self.collection_name
             );
-            self.point_lookup(&key_value)
+            self.full_scan(limit)
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?
         } else {
             tracing::debug!(
-                "MongoDB full scan for collection {} (no point lookup filter)",
-                self.collection_name
+                "MongoDB filtered scan for collection {} with filter: {:?}",
+                self.collection_name,
+                filter_doc
             );
-            self.full_scan()
+            self.filtered_scan(filter_doc, limit)
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?
         };
@@ -489,43 +496,30 @@ impl TableProvider for MongoTableProvider {
     }
 }
 
-fn is_primary_key_equality_filter(expr: &Expr, primary_key: &str) -> bool {
+/// Returns true if the expression is a binary comparison (=, !=, <, <=, >, >=)
+/// between a column and a literal value, which can be pushed down to MongoDB.
+pub(crate) fn is_pushable_binary_filter(expr: &Expr) -> bool {
+    use datafusion::logical_expr::Operator;
     match expr {
         Expr::BinaryExpr(binary) => {
-            if binary.op == datafusion::logical_expr::Operator::Eq {
-                match (binary.left.as_ref(), binary.right.as_ref()) {
-                    (Expr::Column(col), Expr::Literal(..))
-                    | (Expr::Literal(..), Expr::Column(col)) => col.name == primary_key,
-                    _ => false,
-                }
-            } else {
-                false
-            }
+            matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+            ) && matches!(
+                (binary.left.as_ref(), binary.right.as_ref()),
+                (Expr::Column(_), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(_))
+            )
         }
         _ => false,
     }
 }
 
-fn extract_primary_key_value(filters: &[Expr], primary_key: &str) -> Option<String> {
-    for filter in filters {
-        if let Expr::BinaryExpr(binary) = filter {
-            if binary.op == datafusion::logical_expr::Operator::Eq {
-                match (binary.left.as_ref(), binary.right.as_ref()) {
-                    (Expr::Column(col), Expr::Literal(lit, _)) if col.name == primary_key => {
-                        return Some(lit.to_string().trim_matches('\'').to_string());
-                    }
-                    (Expr::Literal(lit, _), Expr::Column(col)) if col.name == primary_key => {
-                        return Some(lit.to_string().trim_matches('\'').to_string());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    None
-}
-
-fn bson_to_arrow_type(value: &Bson) -> DataType {
+pub(crate) fn bson_to_arrow_type(value: &Bson) -> DataType {
     match value {
         Bson::String(_) | Bson::ObjectId(_) => DataType::Utf8,
         Bson::Int32(_) => DataType::Int32,
@@ -565,7 +559,10 @@ fn json_schema_type_to_arrow(prop: &Document) -> DataType {
     }
 }
 
-fn bson_values_to_arrow_array(values: &[Option<Bson>], data_type: &DataType) -> ArrayRef {
+pub(crate) fn bson_values_to_arrow_array(
+    values: &[Option<Bson>],
+    data_type: &DataType,
+) -> ArrayRef {
     match data_type {
         DataType::Utf8 => {
             let arr: StringArray = values
@@ -929,7 +926,7 @@ fn create_count_batch(count: u64) -> DFResult<RecordBatch> {
 // ─── DML support (DELETE / UPDATE) ──────────────────────────────────────────
 
 /// Converts a DataFusion literal expression to a BSON value.
-fn expr_to_bson_value(expr: &Expr) -> DFResult<Bson> {
+pub(crate) fn expr_to_bson_value(expr: &Expr) -> DFResult<Bson> {
     match expr {
         Expr::Literal(scalar, _) => scalar_to_bson(scalar),
         Expr::Column(col) => Ok(Bson::String(col.name.clone())),
@@ -939,7 +936,7 @@ fn expr_to_bson_value(expr: &Expr) -> DFResult<Bson> {
     }
 }
 
-fn scalar_to_bson(scalar: &datafusion::common::ScalarValue) -> DFResult<Bson> {
+pub(crate) fn scalar_to_bson(scalar: &datafusion::common::ScalarValue) -> DFResult<Bson> {
     use datafusion::common::ScalarValue;
     match scalar {
         ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Ok(Bson::String(s.clone())),
@@ -962,7 +959,7 @@ fn scalar_to_bson(scalar: &datafusion::common::ScalarValue) -> DFResult<Bson> {
 }
 
 /// Converts a single DataFusion binary expression to a MongoDB filter entry.
-fn binary_expr_to_mongo(
+pub(crate) fn binary_expr_to_mongo(
     left: &Expr,
     op: &datafusion::logical_expr::Operator,
     right: &Expr,
@@ -1005,7 +1002,7 @@ fn binary_expr_to_mongo(
 
 /// Converts a list of DataFusion filter expressions into a single MongoDB
 /// filter document (implicit `$and`).
-fn exprs_to_mongo_filter(filters: &[Expr], primary_key: &str) -> DFResult<Document> {
+pub(crate) fn exprs_to_mongo_filter(filters: &[Expr], primary_key: &str) -> DFResult<Document> {
     if filters.is_empty() {
         return Ok(doc! {});
     }
@@ -1203,6 +1200,7 @@ pub async fn register_mongo_tables(
     name: &str,
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
+    dataset_registry: Option<&crate::sources::providers::DatasetRegistry>,
 ) -> Result<()> {
     tracing::info!(
         "Registering MongoDB collection: {} with connection: {}",
@@ -1271,6 +1269,21 @@ pub async fn register_mongo_tables(
         MongoTableProvider::new(&connection_uri, database, collection, primary_key, None)
             .await
             .with_context(|| format!("Failed to create MongoDB table provider for '{}'", name))?;
+
+    // Store a MongoFtsEntry in the dataset registry (if provided) so that
+    // the mongo_fts() table function can look up this collection later.
+    if let Some(registry) = dataset_registry {
+        let entry = MongoFtsEntry {
+            collection: provider.collection.clone(),
+            schema: provider.schema.clone(),
+            primary_key: primary_key.to_string(),
+        };
+        let mut reg = registry
+            .write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire dataset registry write lock: {}", e))?;
+        reg.insert(name.to_string(), DatasetEntry::Mongo(entry));
+        tracing::debug!("Registered MongoFtsEntry '{}' in dataset registry", name);
+    }
 
     session_ctx
         .register_table(name, Arc::new(provider))
@@ -1393,6 +1406,7 @@ mod tests {
                 "test_mongo",
                 "mongodb://localhost:27017",
                 None,
+                None,
             )
             .await;
 
@@ -1415,6 +1429,7 @@ mod tests {
                 "test_mongo",
                 "mongodb://localhost:27017",
                 Some(&options),
+                None,
             )
             .await;
 
@@ -1442,6 +1457,7 @@ mod tests {
                 "test_mongo",
                 "mongodb://localhost:27017",
                 Some(&options),
+                None,
             )
             .await;
 
@@ -1471,6 +1487,7 @@ mod tests {
                 "test_mongo",
                 "mongodb://localhost:27017",
                 Some(&options),
+                None,
             )
             .await;
 
@@ -1504,6 +1521,7 @@ mod tests {
                 "test_mongo",
                 "mongodb://localhost:27017",
                 Some(&options),
+                None,
             )
             .await;
 
@@ -1531,9 +1549,15 @@ mod tests {
         options.insert("primary_key".to_string(), primary_key.to_string());
         options.insert("user_env".to_string(), "MONGO_USER".to_string());
         options.insert("pass_env".to_string(), "MONGO_PASS".to_string());
-        register_mongo_tables(ctx, collection, "mongodb://127.0.0.1:27017", Some(&options))
-            .await
-            .unwrap_or_else(|e| panic!("register {} failed: {}", collection, e));
+        register_mongo_tables(
+            ctx,
+            collection,
+            "mongodb://127.0.0.1:27017",
+            Some(&options),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} failed: {}", collection, e));
     }
 
     async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -1943,5 +1967,92 @@ mod tests {
         )
         .await;
         assert!(total_rows(&batches) >= 2); // at least Electronics and Furniture
+    }
+
+    // ─── Filter pushdown tests (integration) ────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_pushdown_greater_than() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // price > 200 should match Laptop (999.99), Monitor (299.99)
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id, price FROM products WHERE price > 200 ORDER BY product_id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_pushdown_less_than_equal() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // price <= 79.99 should match Keyboard (79.99), Mouse (29.99)
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE price <= 79.99 ORDER BY product_id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_pushdown_not_equal() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // category != 'Electronics' should match only Desk Chair (Furniture)
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE category != 'Electronics'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_pushdown_multiple_filters() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // category = 'Electronics' AND price > 100 should match Laptop (999.99), Monitor (299.99)
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE category = 'Electronics' AND price > 100 ORDER BY product_id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_limit_pushdown() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        let batches = query_all(&ctx, "SELECT product_id FROM products LIMIT 3").await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_filter_and_limit_combined() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // 4 Electronics products, but LIMIT 2 should return only 2
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE category = 'Electronics' LIMIT 2",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 2);
     }
 }

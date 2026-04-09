@@ -242,6 +242,20 @@ jobs:
               }
             }
           })
+
+          // ─── Full-text search test collection ─────────────────────────
+          db.createCollection("dataset_data_texts")
+          db.dataset_data_texts.createIndex(
+            { fullTextToken: "text" },
+            { default_language: "none" }
+          )
+          db.dataset_data_texts.insertMany([
+            { _id: "data001", dataId: "data001", teamId: "team1", datasetId: "ds1", collectionId: "col1", fullTextToken: "machine learning model training deep neural network" },
+            { _id: "data002", dataId: "data002", teamId: "team1", datasetId: "ds1", collectionId: "col1", fullTextToken: "natural language processing text classification sentiment" },
+            { _id: "data003", dataId: "data003", teamId: "team1", datasetId: "ds1", collectionId: "col2", fullTextToken: "database query optimization indexing performance tuning" },
+            { _id: "data004", dataId: "data004", teamId: "team2", datasetId: "ds2", collectionId: "col3", fullTextToken: "machine learning classification supervised training model" },
+            { _id: "data005", dataId: "data005", teamId: "team1", datasetId: "ds1", collectionId: "col1", fullTextToken: "deep learning neural network convolutional image recognition" }
+          ])
           EOF
 
       - name: Seed Redis data
