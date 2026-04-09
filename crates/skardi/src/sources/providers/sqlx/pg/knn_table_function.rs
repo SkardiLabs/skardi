@@ -39,7 +39,7 @@ use sqlx::Row;
 use std::any::Any;
 use std::sync::Arc;
 
-use super::pg_knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
+use super::knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
 use crate::sources::providers::knn_utils::MAX_KNN_K;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
@@ -223,7 +223,7 @@ impl TableProvider for PgKnnProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Combine inline filter (5th argument) with WHERE-clause filters.
         // Only filters that expr_to_pg_sql can convert are pushed down (matches supports_filters_pushdown).
@@ -250,7 +250,7 @@ impl TableProvider for PgKnnProvider {
             self.schema.clone()
         };
 
-        let exec: PgKnnExec = if let Some(ref vec) = self.literal_vector {
+        let mut exec: PgKnnExec = if let Some(ref vec) = self.literal_vector {
             // Literal path — vector known at planning time.
             PgKnnExec::new(
                 Arc::clone(&self.pool),
@@ -285,6 +285,13 @@ impl TableProvider for PgKnnProvider {
                  e.g. (SELECT embedding FROM t WHERE id = {{id}})"
             );
         };
+
+        // Apply scan limit if provided (e.g., from SQL LIMIT clause).
+        // This slices the result after the KNN search, matching lance_knn behaviour.
+        // The Postgres LIMIT (k) is preserved so HNSW/IVFFlat indexes are used.
+        if let Some(n) = limit {
+            exec = exec.with_scan_limit(n);
+        }
 
         Ok(Arc::new(exec))
     }

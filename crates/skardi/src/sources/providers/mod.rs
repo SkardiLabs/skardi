@@ -11,7 +11,7 @@ use ::lance::dataset::Dataset;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use sqlx::pg_knn_table_function::PgKnnEntry;
+use sqlx::pg::knn_table_function::PgKnnEntry;
 
 /// A single entry in the unified dataset registry.
 #[derive(Clone, Debug)]
