@@ -20,9 +20,10 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
-use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use futures::{StreamExt, stream};
 use secrecy::SecretString;
 use sqlx::PgPool;
@@ -90,6 +91,62 @@ pub async fn register_postgres_tables(
     }
 }
 
+/// Create both connection pools needed for a Postgres source.
+///
+/// Returns `(read_pool, sqlx_pool)`. The `label` is used only in error messages.
+async fn init_postgres_pools(
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    label: &str,
+) -> Result<(Arc<PostgresConnectionPool>, PgPool)> {
+    let pool_params = parse_connection_params(connection_string, options)?;
+    let read_pool = Arc::new(
+        PostgresConnectionPool::new(pool_params)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create PostgreSQL connection pool for '{}'",
+                    label
+                )
+            })?,
+    );
+
+    // Always build the sqlx pool: needed for schema introspection (handles pgvector and other
+    // custom types), and reused for writes and KNN registry population when applicable.
+    let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
+    let sqlx_pool = PgPool::connect(&sqlx_url)
+        .await
+        .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label))?;
+
+    Ok((read_pool, sqlx_pool))
+}
+
+/// Build a [`TableProvider`] for one table and optionally register it in the KNN registry.
+///
+/// `knn_key` is the lookup key inserted into the registry (e.g. the DataFusion source name in
+/// single-table mode, or `"catalog.schema.table"` in catalog mode).
+async fn build_and_register_table(
+    read_pool: &Arc<PostgresConnectionPool>,
+    sqlx_pool: &PgPool,
+    schema: &str,
+    table_name: &str,
+    read_write: bool,
+    pg_knn_registry: Option<&DatasetRegistry>,
+    knn_key: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let table_reference = TableReference::partial(schema, table_name);
+    let table_provider =
+        build_postgres_table_provider(read_pool, table_reference, read_write, sqlx_pool).await?;
+
+    if let Some(registry) = pg_knn_registry {
+        register_table_in_knn_registry(sqlx_pool, registry, knn_key, schema, table_name)
+            .await
+            .with_context(|| format!("Failed to register '{}' in pg_knn registry", knn_key))?;
+    }
+
+    Ok(table_provider)
+}
+
 /// Register one logical table (`options.table`) under `name` in the default catalog.
 async fn register_single_postgres_table(
     session_ctx: &mut SessionContext,
@@ -119,48 +176,22 @@ async fn register_single_postgres_table(
         anyhow::anyhow!("PostgreSQL single-table registration requires 'table' option")
     })?;
 
-    let pool_params = parse_connection_params(connection_string, options)?;
-    let read_pool = Arc::new(
-        PostgresConnectionPool::new(pool_params)
-            .await
-            .with_context(|| {
-                format!("Failed to create PostgreSQL connection pool for '{}'", name)
-            })?,
-    );
+    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, name).await?;
 
-    // Build the sqlx pool when needed for writes or KNN registry population.
-    let sqlx_pool = if read_write || pg_knn_registry.is_some() {
-        let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-        Some(
-            PgPool::connect(&sqlx_url)
-                .await
-                .with_context(|| format!("Failed to create sqlx PgPool for '{}'", name))?,
-        )
-    } else {
-        None
-    };
-
-    let factory = PostgresTableFactory::new(Arc::clone(&read_pool));
-    let table_reference = TableReference::partial(schema_name.as_str(), table_name.as_str());
-    let table_provider = build_postgres_table_provider(
-        &factory,
-        connection_string,
-        options,
-        table_reference,
+    let table_provider = build_and_register_table(
+        &read_pool,
+        &sqlx_pool,
+        &schema_name,
+        table_name,
         read_write,
-        sqlx_pool.as_ref(),
+        pg_knn_registry,
+        name,
     )
     .await?;
 
     session_ctx
         .register_table(name, table_provider)
         .with_context(|| format!("Failed to register table '{}' with DataFusion", name))?;
-
-    if let (Some(registry), Some(pool)) = (pg_knn_registry, &sqlx_pool) {
-        register_table_in_knn_registry(pool, registry, name, &schema_name, table_name)
-            .await
-            .with_context(|| format!("Failed to register '{}' in pg_knn registry", name))?;
-    }
 
     tracing::info!(
         "Successfully registered PostgreSQL table '{}.{}' as '{}' ({})",
@@ -169,32 +200,6 @@ async fn register_single_postgres_table(
         name,
         mode_str,
     );
-
-    // Register in the dataset registry so pg_knn() and pg_fts() UDTFs can find this table.
-    // Reuse the sqlx_pool and columns already fetched above.
-    if let Some(registry) = pg_knn_registry {
-        let qualified_table = format!(
-            "\"{}\".\"{}\"",
-            schema_name.replace('"', "\"\""),
-            table_name.replace('"', "\"\"")
-        );
-
-        let entry = PgKnnEntry {
-            pool: Arc::new(sqlx_pool_for_knn),
-            qualified_table,
-            columns,
-        };
-
-        registry
-            .write()
-            .map_err(|e| anyhow::anyhow!("pg_knn registry lock poisoned: {}", e))?
-            .insert(name.to_string(), DatasetEntry::Postgres(entry));
-
-        tracing::info!(
-            "Registered '{}' in dataset registry for pg_knn/pg_fts",
-            name
-        );
-    }
 
     Ok(())
 }
@@ -220,27 +225,8 @@ async fn register_postgres_catalog(
         mode_str,
     );
 
-    let pool_params = parse_connection_params(connection_string, options)?;
-    let read_pool = Arc::new(
-        PostgresConnectionPool::new(pool_params)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create PostgreSQL connection pool for catalog '{}'",
-                    catalog_name
-                )
-            })?,
-    );
-
-    // Build the sqlx pool unconditionally: it is needed for table discovery in
-    // both read-only and read-write modes, and reused for writes when read_write=true.
-    let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-    let sqlx_pool = PgPool::connect(&sqlx_url).await.with_context(|| {
-        format!(
-            "Failed to create sqlx PgPool for catalog '{}'",
-            catalog_name
-        )
-    })?;
+    let (read_pool, sqlx_pool) =
+        init_postgres_pools(connection_string, options, catalog_name).await?;
 
     let allowed_schemas = parse_allowed_schemas(options);
     let schema_tables = list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_ref())
@@ -259,20 +245,30 @@ async fn register_postgres_catalog(
         );
     }
 
-    let write_pool = if read_write { Some(&sqlx_pool) } else { None };
-
-    let factory = PostgresTableFactory::new(Arc::clone(&read_pool));
     let catalog_provider = Arc::new(MemoryCatalogProvider::new());
 
     for (schema, table_name) in &schema_tables {
+<<<<<<< HEAD
         let table_reference = TableReference::partial(schema.as_str(), table_name.as_str());
-        let table_provider = build_postgres_table_provider(
-            &factory,
-            connection_string,
-            options,
-            table_reference,
+        let table_provider =
+            build_postgres_table_provider(&read_pool, table_reference, read_write, &sqlx_pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to build table provider for '{}.{}' in catalog '{}'",
+                        schema, table_name, catalog_name
+                    )
+                })?;
+=======
+        let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
+        let table_provider = build_and_register_table(
+            &read_pool,
+            &sqlx_pool,
+            schema,
+            table_name,
             read_write,
-            write_pool,
+            pg_knn_registry,
+            &knn_key,
         )
         .await
         .with_context(|| {
@@ -281,6 +277,7 @@ async fn register_postgres_catalog(
                 schema, table_name, catalog_name
             )
         })?;
+>>>>>>> b1fec0d (update postgres)
 
         if catalog_provider.schema(schema).is_none() {
             catalog_provider
@@ -315,18 +312,6 @@ async fn register_postgres_catalog(
                 )
             })?;
 
-        if let Some(registry) = pg_knn_registry {
-            let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
-            register_table_in_knn_registry(&sqlx_pool, registry, &knn_key, schema, table_name)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to register '{}.{}' in pg_knn registry for catalog '{}'",
-                        schema, table_name, catalog_name
-                    )
-                })?;
-        }
-
         tracing::debug!(
             "Prepared '{}.{}' in catalog '{}'",
             schema,
@@ -346,54 +331,67 @@ async fn register_postgres_catalog(
     Ok(())
 }
 
+/// Build a DataFusion [`TableProvider`] for one Postgres table.
+///
+/// Uses `fetch_table_columns` to build the Arrow schema from `information_schema`, mapping
+/// unknown Postgres types (e.g. pgvector's `vector`) to `Utf8` instead of hard-erroring.
+/// In read-write mode the provider is wrapped in [`SqlxPostgresTableProvider`].
 async fn build_postgres_table_provider(
-    factory: &PostgresTableFactory,
-    connection_string: &str,
-    options: Option<&HashMap<String, String>>,
+    read_pool: &Arc<PostgresConnectionPool>,
     table_reference: TableReference,
     read_write: bool,
-    reuse_sqlx_pool: Option<&PgPool>,
+    sqlx_pool: &PgPool,
 ) -> Result<Arc<dyn TableProvider>> {
-    let read_provider: Arc<dyn TableProvider> = factory
-        .table_provider(table_reference.clone())
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create read table provider for '{}': {}",
-                table_reference,
-                e
-            )
-        })?;
-
-    if !read_write {
-        return Ok(read_provider);
-    }
-
     let schema_name = table_reference
         .schema()
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Table reference '{}' must include a schema for read-write Postgres registration",
+                "Table reference '{}' must include a schema",
                 table_reference
             )
         })?
         .to_string();
     let table_name = table_reference.table().to_string();
 
-    let sqlx_pool = if let Some(pool) = reuse_sqlx_pool {
-        pool.clone()
-    } else {
-        let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-        PgPool::connect(&sqlx_url).await.with_context(|| {
+    // Infer schema from information_schema so that unknown Postgres types (e.g. pgvector's
+    // `vector`) are mapped to Utf8 instead of causing a hard error.
+    let columns = fetch_table_columns(sqlx_pool, &schema_name, &table_name)
+        .await
+        .with_context(|| {
             format!(
-                "Failed to create sqlx PgPool for '{}.{}'",
+                "Failed to infer schema for '{}.{}' from information_schema",
                 schema_name, table_name
             )
-        })?
-    };
+        })?;
+
+    if columns.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No columns found for '{}.{}' in information_schema",
+            schema_name,
+            table_name
+        ));
+    }
+
+    let schema: SchemaRef = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|(col, dtype)| Field::new(col.clone(), dtype.clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+
+    let dyn_pool: Arc<DynPostgresConnectionPool> =
+        Arc::clone(read_pool) as Arc<DynPostgresConnectionPool>;
+    let read_provider: Arc<dyn TableProvider> = Arc::new(
+        SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
+            .with_dialect(Arc::new(PostgreSqlDialect {})),
+    );
+
+    if !read_write {
+        return Ok(read_provider);
+    }
 
     let auto_generated_columns =
-        detect_auto_generated_columns(&sqlx_pool, &schema_name, &table_name).await?;
+        detect_auto_generated_columns(sqlx_pool, &schema_name, &table_name).await?;
 
     if !auto_generated_columns.is_empty() {
         tracing::debug!(
@@ -406,7 +404,7 @@ async fn build_postgres_table_provider(
 
     Ok(Arc::new(SqlxPostgresTableProvider {
         read_provider,
-        sqlx_pool,
+        sqlx_pool: sqlx_pool.clone(),
         table_reference,
         auto_generated_columns,
     }))
