@@ -368,7 +368,7 @@ mod tests {
         options.insert("table".to_string(), "articles".to_string());
         options.insert("schema".to_string(), "public".to_string());
         options.insert("user_env".to_string(), "PG_USER".to_string());
-        options.insert("pass_env".to_string(), "PG_PASS".to_string());
+        options.insert("pass_env".to_string(), "PG_PASSWORD".to_string());
 
         register_postgres_tables(
             ctx,
