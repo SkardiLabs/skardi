@@ -2,8 +2,11 @@
 //!
 //! Usage:
 //! ```sql
-//! -- Basic full-text search
+//! -- Basic full-text search (defaults to 'english')
 //! SELECT * FROM pg_fts('table_name', 'text_column', 'search query', 10)
+//!
+//! -- With explicit language
+//! SELECT * FROM pg_fts('table_name', 'text_column', 'search query', 10, 'simple')
 //!
 //! -- With web-search-style syntax (quotes, OR, negation)
 //! SELECT * FROM pg_fts('table_name', 'text_column', '"exact phrase" or alternative -excluded', 20)
@@ -56,9 +59,9 @@ impl PgFtsTableFunction {
 
 impl TableFunctionImpl for PgFtsTableFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        if exprs.len() != 4 {
+        if exprs.len() < 4 || exprs.len() > 5 {
             return plan_err!(
-                "pg_fts(table, text_col, query, limit) expects 4 arguments, got {}",
+                "pg_fts(table, text_col, query, limit [, language]) expects 4-5 arguments, got {}",
                 exprs.len()
             );
         }
@@ -67,6 +70,17 @@ impl TableFunctionImpl for PgFtsTableFunction {
         let text_col = extract_string(&exprs[1], "text_col")?;
         let query = extract_string(&exprs[2], "query")?;
         let limit = extract_int(&exprs[3], "limit")?;
+
+        let language = if exprs.len() == 5 {
+            let lang = extract_string(&exprs[4], "language")?;
+            if lang.is_empty() {
+                "english".to_string()
+            } else {
+                lang
+            }
+        } else {
+            "english".to_string()
+        };
 
         // The inferencer replaces {param} with NULL, yielding empty string for
         // strings and 0 for integers. Accept these as placeholders — validate only
@@ -117,6 +131,7 @@ impl TableFunctionImpl for PgFtsTableFunction {
             text_col,
             query,
             limit,
+            language,
             schema,
         }))
     }
@@ -130,6 +145,8 @@ struct PgFtsProvider {
     text_col: String,
     query: String,
     limit: usize,
+    /// PostgreSQL text search configuration (e.g. `'english'`, `'simple'`).
+    language: String,
     schema: SchemaRef,
 }
 
@@ -208,6 +225,7 @@ impl TableProvider for PgFtsProvider {
             self.text_col.clone(),
             self.query.clone(),
             self.limit,
+            self.language.clone(),
             filter,
             schema,
         );
@@ -351,8 +369,25 @@ mod tests {
         let result = func.call(&[lit_str("table"), lit_str("col"), lit_str("query")]);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("expects 4 arguments"),
+            err.contains("expects 4-5 arguments"),
             "expected arg count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_language_accepted() {
+        let func = make_fts_function();
+        let result = func.call(&[
+            lit_str("some_table"),
+            lit_str("col"),
+            lit_str("test"),
+            lit_int(10),
+            lit_str("simple"),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found in registry"),
+            "expected registry error, got: {err}"
         );
     }
 

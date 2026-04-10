@@ -524,7 +524,7 @@ INSERT INTO articles (title, body, category) VALUES
     ('Intro to Machine Learning', 'machine learning model training deep neural network supervised algorithms', 'ai'),
     ('Natural Language Processing', 'natural language processing text classification sentiment analysis tokenization', 'ai'),
     ('Database Query Optimization', 'database query optimization indexing performance tuning relational algebra', 'database'),
-    ('Deep Learning Advances', 'machine learning classification supervised training model convolutional neural network', 'ai'),
+    ('Deep Learning Advances', 'machine learning classification supervised training model convolutional neural network', 'research'),
     ('Neural Network Architectures', 'deep learning neural network convolutional image recognition transformer attention', 'ai');
 EOF
 
@@ -583,7 +583,7 @@ curl -X POST http://localhost:8080/fts-search-with-filter/execute \
 {
   "data": [
     {"id": 1, "title": "Intro to Machine Learning",  "category": "ai", "_score": 0.075990885},
-    {"id": 4, "title": "Deep Learning Advances",      "category": "ai", "_score": 0.075990885}
+    {"id": 4, "title": "Deep Learning Advances",      "category": "research", "_score": 0.075990885}
   ],
   "rows": 2,
   "success": true
@@ -602,7 +602,7 @@ curl -X POST http://localhost:8080/fts-search-with-filter/execute \
 ### `pg_fts` parameters
 
 ```sql
-pg_fts(table_name, text_col, query, limit)
+pg_fts(table_name, text_col, query, limit [, language])
 ```
 
 | Argument | Type | Description |
@@ -611,6 +611,7 @@ pg_fts(table_name, text_col, query, limit)
 | `text_col` | string | Name of the text column to search |
 | `query` | string | Search query (parsed by `websearch_to_tsquery`) |
 | `limit` | integer | Maximum number of results to return (1–500) |
+| `language` | string (optional) | PostgreSQL text search configuration (default: `'english'`). Common values: `'simple'`, `'spanish'`, `'german'`, `'chinese'`, etc. |
 
 `_score` is the `ts_rank` value — higher means more relevant.
 

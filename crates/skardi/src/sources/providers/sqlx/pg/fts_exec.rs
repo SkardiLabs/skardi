@@ -25,10 +25,10 @@ use super::utils::rows_to_batch;
 /// Generates SQL of the form:
 /// ```sql
 /// SELECT <cols>,
-///        ts_rank(to_tsvector('english', "<text_col>"),
-///                websearch_to_tsquery('english', $1)) AS _score
+///        ts_rank(to_tsvector('<language>', "<text_col>"),
+///                websearch_to_tsquery('<language>', $1)) AS _score
 /// FROM "<schema>"."<table>"
-/// WHERE to_tsvector('english', "<text_col>") @@ websearch_to_tsquery('english', $1)
+/// WHERE to_tsvector('<language>', "<text_col>") @@ websearch_to_tsquery('<language>', $1)
 ///   [AND <filter>]
 /// ORDER BY _score DESC
 /// LIMIT <limit>
@@ -44,6 +44,8 @@ pub struct PgFtsExec {
     query: String,
     /// Maximum number of results to return.
     limit: usize,
+    /// PostgreSQL text search configuration (e.g. `'english'`, `'simple'`).
+    language: String,
     /// Optional SQL WHERE predicate (no "WHERE" keyword).
     filter: Option<String>,
     /// Optional scan limit from an outer SQL LIMIT clause.
@@ -61,6 +63,7 @@ impl PgFtsExec {
         text_col: String,
         query: String,
         limit: usize,
+        language: String,
         filter: Option<String>,
         schema: SchemaRef,
     ) -> Self {
@@ -76,6 +79,7 @@ impl PgFtsExec {
             text_col,
             query,
             limit,
+            language,
             filter,
             scan_limit: None,
             schema,
@@ -115,8 +119,9 @@ impl PgFtsExec {
     fn build_query(&self) -> String {
         let cols = self.select_columns();
         let text_col = format!("\"{}\"", self.text_col.replace('"', "\"\""));
-        let tsvec = format!("to_tsvector('english', {text_col})");
-        let tsquery = "websearch_to_tsquery('english', $1)";
+        let lang = &self.language;
+        let tsvec = format!("to_tsvector('{lang}', {text_col})");
+        let tsquery = format!("websearch_to_tsquery('{lang}', $1)");
         let rank_expr = format!("ts_rank({tsvec}, {tsquery})::float8");
         let match_expr = format!("{tsvec} @@ {tsquery}");
 
@@ -234,6 +239,17 @@ mod tests {
         filter: Option<&str>,
         limit: usize,
     ) -> PgFtsExec {
+        make_exec_with_lang(cols, text_col, query, filter, limit, "english")
+    }
+
+    fn make_exec_with_lang(
+        cols: Vec<(&str, DataType)>,
+        text_col: &str,
+        query: &str,
+        filter: Option<&str>,
+        limit: usize,
+        language: &str,
+    ) -> PgFtsExec {
         let pool =
             Arc::new(sqlx::PgPool::connect_lazy("postgresql://localhost/test").expect("lazy pool"));
         let mut fields: Vec<Field> = cols
@@ -248,6 +264,7 @@ mod tests {
             text_col.to_string(),
             query.to_string(),
             limit,
+            language.to_string(),
             filter.map(str::to_string),
             schema,
         )
@@ -392,6 +409,31 @@ mod tests {
         assert!(
             sql.contains("LIMIT 10"),
             "function limit < scan_limit should win; sql={sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_query_uses_custom_language() {
+        let exec = make_exec_with_lang(
+            vec![("id", DataType::Int64)],
+            "body",
+            "test",
+            None,
+            10,
+            "simple",
+        );
+        let sql = exec.build_query();
+        assert!(
+            sql.contains("to_tsvector('simple',"),
+            "should use custom language; sql={sql}"
+        );
+        assert!(
+            sql.contains("websearch_to_tsquery('simple',"),
+            "should use custom language; sql={sql}"
+        );
+        assert!(
+            !sql.contains("english"),
+            "should not contain default language; sql={sql}"
         );
     }
 }
