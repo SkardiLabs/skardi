@@ -23,5 +23,5 @@ pub enum DatasetEntry {
 }
 
 /// Unified registry mapping table name → dataset entry.
-/// Shared by `lance_knn`, `lance_fts`, `pg_knn`, and `mongo_fts` table functions.
+/// Shared by `lance_knn`, `lance_fts`, `pg_knn`, `pg_fts`, and `mongo_fts` table functions.
 pub type DatasetRegistry = Arc<RwLock<HashMap<String, DatasetEntry>>>;

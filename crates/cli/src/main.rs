@@ -19,7 +19,7 @@ use serde::Deserialize;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
-use skardi::sources::providers::sqlx::register_pg_knn_udtf;
+use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
     mongo::register_mongo_tables, mysql::register_mysql_tables, sqlite::register_sqlite_tables,
@@ -319,10 +319,11 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register table functions (lance_knn, lance_fts, pg_knn, mongo_fts), all sharing one registry
+    // Register table functions (lance_knn, lance_fts, pg_knn, pg_fts, mongo_fts), all sharing one registry
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_pg_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_pg_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_mongo_fts_udtf(&ctx, Arc::clone(&dataset_registry));
 
     (ctx, dataset_registry)

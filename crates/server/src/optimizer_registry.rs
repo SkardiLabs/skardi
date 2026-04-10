@@ -13,7 +13,7 @@ use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
-use skardi::sources::providers::sqlx::register_pg_knn_udtf;
+use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{DatasetEntry, DatasetRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -29,7 +29,7 @@ use crate::config::{DataSource, DataSourceType};
 pub struct OptimizerRegistry {
     /// Unified dataset registry indexed by table name.
     /// Stores both Lance datasets and Postgres entries, used by
-    /// lance_knn, lance_fts, and pg_knn table functions.
+    /// lance_knn, lance_fts, pg_knn, and pg_fts table functions.
     dataset_registry: DatasetRegistry,
 }
 
@@ -118,6 +118,10 @@ impl OptimizerRegistry {
         tracing::info!("Registering pg_knn table function");
         register_pg_knn_udtf(ctx, self.datasets());
         tracing::info!("✓ Registered pg_knn table function");
+
+        tracing::info!("Registering pg_fts table function");
+        register_pg_fts_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered pg_fts table function");
         Ok(())
     }
 
