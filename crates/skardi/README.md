@@ -14,7 +14,7 @@ Query files, databases, data lakes, and vector stores with SQL — and serve res
 |--------|-------------|
 | `engine` | SQL query execution engine backed by DataFusion |
 | `pipeline` | Declarative SQL pipelines with parameter inference |
-| `model` | ONNX model loading and inference (behind `embedding` feature) |
+| `model` | ONNX model loading and inference (behind `onnx` feature) |
 | `sources` | Data source connectors: CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance |
 
 ## Installation

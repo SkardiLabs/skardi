@@ -293,7 +293,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         .with_context(|| "Failed to register UDFs")?;
 
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
-    #[cfg(feature = "embedding")]
+    #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
     // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
@@ -424,7 +424,7 @@ async fn load_pipeline_config(path: &Path, ctx: Arc<SessionContext>) -> Result<S
 ///   onnx_predict('path/to/model.onnx', input1, input2, ...)
 ///
 /// No pre-configuration needed — ORT runtime and models are initialized on first call.
-#[cfg(feature = "embedding")]
+#[cfg(feature = "onnx")]
 pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::OnnxModelRegistry::new());
     registry.register_onnx_predict_udf(ctx);

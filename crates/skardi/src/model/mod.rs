@@ -1,11 +1,11 @@
 #[cfg(feature = "candle")]
 pub mod candle;
-#[cfg(feature = "embedding")]
+#[cfg(feature = "onnx")]
 pub mod converter;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 pub mod model;
-#[cfg(feature = "embedding")]
+#[cfg(feature = "onnx")]
 pub mod onnx;
 #[cfg(feature = "remote-embed")]
 pub mod remote_embed;
@@ -15,7 +15,7 @@ pub mod remote_embed;
 pub use candle::CandleModelRegistry;
 #[cfg(feature = "gguf")]
 pub use gguf::GgufModelRegistry;
-#[cfg(feature = "embedding")]
+#[cfg(feature = "onnx")]
 pub use onnx::OnnxModelRegistry;
 #[cfg(feature = "remote-embed")]
 pub use remote_embed::RemoteEmbedRegistry;

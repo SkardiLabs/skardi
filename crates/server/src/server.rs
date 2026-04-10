@@ -15,7 +15,7 @@ use crate::auth::mode::AuthMode;
 use crate::config::register_candle_udf;
 #[cfg(feature = "gguf")]
 use crate::config::register_gguf_udf;
-#[cfg(feature = "embedding")]
+#[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
 use crate::config::register_remote_embed_udf;
@@ -125,7 +125,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         .map_err(|e| anyhow::anyhow!("Failed to register UDFs: {}", e))?;
 
     // Register onnx_predict UDF (lazy — models loaded on first call from inline path)
-    #[cfg(feature = "embedding")]
+    #[cfg(feature = "onnx")]
     register_onnx_predict_udf(&mut session_ctx);
 
     // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
