@@ -145,16 +145,6 @@ jobs:
             suffix: ""
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - variant: onnx
-            features: "onnx"
-            suffix: "-onnx"
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - variant: onnx
-            features: "onnx"
-            suffix: "-onnx"
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
           - variant: rag
             features: "rag"
             suffix: "-rag"
@@ -225,8 +215,6 @@ jobs:
         include:
           - variant: default
             suffix: ""
-          - variant: onnx
-            suffix: "-onnx"
           - variant: rag
             suffix: "-rag"
     steps:
