@@ -1,5 +1,4 @@
-use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
-use crate::sources::providers::{DatasetEntry, DatasetRegistry};
+use crate::sources::providers::DatasetRegistry;
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -20,10 +19,9 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
-use datafusion_table_providers::postgres::DynPostgresConnectionPool;
+use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use futures::{StreamExt, stream};
 use secrecy::SecretString;
 use sqlx::PgPool;
@@ -62,15 +60,15 @@ pub async fn register_postgres_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
-    hierarchy_level: Option<crate::HierarchyLevel>,
+    hierarchy_level: Option<crate::sources::HierarchyLevel>,
 ) -> Result<()> {
     let hierarchy_level = hierarchy_level.unwrap_or_default();
     match hierarchy_level {
-        crate::HierarchyLevel::Catalog => {
+        crate::sources::HierarchyLevel::Catalog => {
             register_postgres_catalog(session_ctx, name, connection_string, options, read_write)
                 .await
         }
-        crate::HierarchyLevel::Table => {
+        crate::sources::HierarchyLevel::Table => {
             register_single_postgres_table(
                 session_ctx,
                 name,
@@ -90,8 +88,6 @@ async fn register_single_postgres_table(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
-    pg_knn_registry: Option<&DatasetRegistry>,
-    hierarchy_level: Option<crate::HierarchyLevel>,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
@@ -109,46 +105,10 @@ async fn register_single_postgres_table(
         .and_then(|opts| opts.get("schema"))
         .unwrap_or(&"public".to_string())
         .clone();
-
-    // Build connection pools.
-    // sqlx pool is used for: write operations, schema inference (information_schema),
-    // and the pg_knn registry. We create it upfront so it can be reused everywhere.
-    let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-    let sqlx_pool = PgPool::connect(&sqlx_url).await.with_context(|| {
-        format!(
-            "Failed to create sqlx PgPool for '{}.{}'",
-            schema_name, table_name
-        )
+    let table_name = options.and_then(|opts| opts.get("table")).ok_or_else(|| {
+        anyhow::anyhow!("'table' option is required for PostgreSQL single-table registration")
     })?;
 
-    // Infer schema from information_schema.columns so that unknown Postgres types
-    // (e.g. pgvector's `vector`) are mapped to Utf8 instead of causing a hard error.
-    // Use pg_knn() for actual similarity search on vector columns.
-    let columns = fetch_table_columns(&sqlx_pool, &schema_name, table_name)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to infer schema for '{}.{}' from information_schema",
-                schema_name, table_name
-            )
-        })?;
-
-    if columns.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No columns found for '{}.{}' in information_schema",
-            schema_name,
-            table_name
-        ));
-    }
-
-    let schema: SchemaRef = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|(name, dtype)| Field::new(name.clone(), dtype.clone(), true))
-            .collect::<Vec<_>>(),
-    ));
-
-    // datafusion-table-providers read pool (used by SqlTable for SELECT push-down).
     let pool_params = parse_connection_params(connection_string, options)?;
     let read_pool = Arc::new(
         PostgresConnectionPool::new(pool_params)
@@ -157,40 +117,6 @@ async fn register_single_postgres_table(
                 format!("Failed to create PostgreSQL connection pool for '{}'", name)
             })?,
     );
-
-    let table_reference = TableReference::partial(schema_name.as_str(), table_name.as_str());
-    let dyn_pool: Arc<DynPostgresConnectionPool> = read_pool;
-    let read_provider: Arc<dyn TableProvider> = Arc::new(
-        SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
-            .with_dialect(Arc::new(PostgreSqlDialect {})),
-    );
-
-    // Clone before potential move into SqlxPostgresTableProvider; PgPool is Arc-backed.
-    let sqlx_pool_for_knn = sqlx_pool.clone();
-
-    let table_provider: Arc<dyn TableProvider> = if read_write {
-        // Detect auto-generated columns at registration time
-        let auto_generated_columns =
-            detect_auto_generated_columns(&sqlx_pool, &schema_name, table_name).await?;
-
-        if !auto_generated_columns.is_empty() {
-            tracing::debug!(
-                "Detected auto-generated columns for '{}.{}': {:?}",
-                schema_name,
-                table_name,
-                auto_generated_columns
-            );
-        }
-
-        Arc::new(SqlxPostgresTableProvider {
-            read_provider,
-            sqlx_pool,
-            table_reference,
-            auto_generated_columns,
-        })
-    } else {
-        read_provider
-    };
     let factory = PostgresTableFactory::new(Arc::clone(&read_pool));
     let table_reference = TableReference::partial(schema_name.as_str(), table_name.as_str());
     let table_provider = build_postgres_table_provider(
@@ -386,7 +312,7 @@ async fn build_postgres_table_provider(
     read_write: bool,
     reuse_sqlx_pool: Option<&PgPool>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let read_provider = factory
+    let read_provider: Arc<dyn TableProvider> = factory
         .table_provider(table_reference.clone())
         .await
         .map_err(|e| {
@@ -1662,41 +1588,43 @@ mod tests {
     #[test]
     fn test_hierarchy_level_default_is_table() {
         assert_eq!(
-            crate::HierarchyLevel::default(),
-            crate::HierarchyLevel::Table
+            crate::sources::HierarchyLevel::default(),
+            crate::sources::HierarchyLevel::Table
         );
     }
 
     #[test]
     fn test_hierarchy_level_as_str_table() {
-        assert_eq!(crate::HierarchyLevel::Table.as_str(), "table");
+        assert_eq!(crate::sources::HierarchyLevel::Table.as_str(), "table");
     }
 
     #[test]
     fn test_hierarchy_level_as_str_catalog() {
-        assert_eq!(crate::HierarchyLevel::Catalog.as_str(), "catalog");
+        assert_eq!(crate::sources::HierarchyLevel::Catalog.as_str(), "catalog");
     }
 
     #[test]
     fn test_hierarchy_level_serde_roundtrip() {
-        let table = crate::HierarchyLevel::Table;
+        let table = crate::sources::HierarchyLevel::Table;
         let serialized = serde_json::to_string(&table).unwrap();
-        let deserialized: crate::HierarchyLevel = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, crate::HierarchyLevel::Table);
+        let deserialized: crate::sources::HierarchyLevel =
+            serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, crate::sources::HierarchyLevel::Table);
 
-        let catalog = crate::HierarchyLevel::Catalog;
+        let catalog = crate::sources::HierarchyLevel::Catalog;
         let serialized = serde_json::to_string(&catalog).unwrap();
-        let deserialized: crate::HierarchyLevel = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, crate::HierarchyLevel::Catalog);
+        let deserialized: crate::sources::HierarchyLevel =
+            serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, crate::sources::HierarchyLevel::Catalog);
     }
 
     #[test]
     fn test_hierarchy_level_serde_lowercase_strings() {
-        let table: crate::HierarchyLevel = serde_json::from_str("\"table\"").unwrap();
-        assert_eq!(table, crate::HierarchyLevel::Table);
+        let table: crate::sources::HierarchyLevel = serde_json::from_str("\"table\"").unwrap();
+        assert_eq!(table, crate::sources::HierarchyLevel::Table);
 
-        let catalog: crate::HierarchyLevel = serde_json::from_str("\"catalog\"").unwrap();
-        assert_eq!(catalog, crate::HierarchyLevel::Catalog);
+        let catalog: crate::sources::HierarchyLevel = serde_json::from_str("\"catalog\"").unwrap();
+        assert_eq!(catalog, crate::sources::HierarchyLevel::Catalog);
     }
 
     // ─── Catalog dispatch tests (unit) ──────────────────────────────────
@@ -1713,7 +1641,7 @@ mod tests {
             "postgresql://127.0.0.1:19999/nonexistent",
             None,
             false,
-            Some(crate::HierarchyLevel::Catalog),
+            Some(crate::sources::HierarchyLevel::Catalog),
         )
         .await;
 
@@ -1733,7 +1661,7 @@ mod tests {
             "postgresql://localhost:5432/db",
             None,
             false,
-            Some(crate::HierarchyLevel::Table),
+            Some(crate::sources::HierarchyLevel::Table),
         )
         .await;
 
