@@ -14,7 +14,7 @@ Query files, databases, data lakes, and vector stores with SQL — and serve res
 |--------|-------------|
 | `engine` | SQL query execution engine backed by DataFusion |
 | `pipeline` | Declarative SQL pipelines with parameter inference |
-| `model` | ONNX model loading and inference (behind `onnx` feature) |
+| `model` | ONNX model loading and inference (behind `rag` feature) |
 | `sources` | Data source connectors: CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance |
 
 ## Installation
@@ -23,8 +23,8 @@ Query files, databases, data lakes, and vector stores with SQL — and serve res
 [dependencies]
 skardi = "0.1"
 
-# With ONNX model inference
-skardi = { version = "0.1", features = ["onnx"] }
+# With RAG (ONNX, Candle, GGUF, remote embeddings)
+skardi = { version = "0.1", features = ["rag"] }
 ```
 
 ## Quick Start
