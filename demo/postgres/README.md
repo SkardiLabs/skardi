@@ -747,15 +747,18 @@ data_sources:
 ### Quick Start with Catalog Mode
 
 ```bash
-# 1. Start PostgreSQL and create tables in two schemas
+# 1. Start PostgreSQL with pgvector (required for vector search in catalog mode)
 docker run --name postgres-skardi \
   -e POSTGRES_DB=mydb \
   -e POSTGRES_USER=skardi_user \
   -e POSTGRES_PASSWORD=skardi_pass \
   -p 5432:5432 \
-  -d postgres:16
+  -d pgvector/pgvector:pg16
 
 docker exec -i postgres-skardi psql -U skardi_user -d mydb << 'EOF'
+-- Enable pgvector (safe to run even if the extension is already present)
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- public schema tables (same as regular demo)
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
@@ -785,6 +788,20 @@ INSERT INTO orders (user_id, product, amount) VALUES
     (2, 'Keyboard', 79.99),
     (3, 'Monitor', 299.99);
 
+-- Vector search table: loaded automatically by catalog mode because it is in public schema
+CREATE TABLE documents (
+    id BIGSERIAL PRIMARY KEY,
+    content TEXT NOT NULL,
+    metadata TEXT,
+    embedding vector(4)   -- use your actual dimension (e.g. 1536 for OpenAI)
+);
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+INSERT INTO documents (content, metadata, embedding) VALUES
+    ('Rust systems programming',                    'doc-1', '[0.6, 0.8, 0.0, 0.0]'),
+    ('Systems programming at scale with Rust',      'doc-2', '[3.0, 4.0, 0.0, 0.0]'),
+    ('Introduction to programming languages',       'doc-3', '[0.5, 0.5, 0.5, 0.5]'),
+    ('Database query optimization',                 'doc-4', '[0.0, 0.0, 0.6, 0.8]');
+
 -- analytics schema tables (second schema, same DB)
 CREATE SCHEMA analytics;
 CREATE TABLE analytics.monthly_revenue (
@@ -812,7 +829,8 @@ cargo run --bin skardi-server -- \
 At startup Skardi logs something like:
 
 ```
-Registered PostgreSQL catalog 'mydb' with 4 table(s) (read-write)
+Registered PostgreSQL catalog 'mydb' with 5 table(s) (read-write)
+Registered 'mydb.public.documents' in pg_knn registry for vector search
 ```
 
 ### Querying Across Tables and Schemas
@@ -840,6 +858,65 @@ curl -X POST http://localhost:8080/cross_schema_summary/execute \
 
 The pipeline SQLs use fully qualified paths so there is no ambiguity when
 tables from multiple schemas are in scope at the same time.
+
+### Vector Search in Catalog Mode
+
+When a table has a `vector` column it is automatically registered in the `pg_knn` registry as part of catalog loading — no extra configuration needed. The registry key uses the three-part catalog name, so `pg_knn` calls must use `'catalog.schema.table'` as the first argument:
+
+```sql
+-- mydb.public.documents was loaded as part of the catalog entry named "mydb"
+SELECT id, content, metadata, _score
+FROM pg_knn('mydb.public.documents', 'embedding',
+    [0.6, 0.8, 0.0, 0.0],
+    '<=>', 10)
+ORDER BY _score
+LIMIT {limit}
+```
+
+> **Note on the query vector:** In catalog mode the subquery seed-vector form (e.g. `SELECT embedding FROM mydb.public.documents WHERE id = {seed_id}`) cannot be used because DataFusion would unparse the three-part table reference to PostgreSQL SQL which only understands `schema.table`. Pass the query vector as a literal float array instead.
+
+A ready-made pipeline is provided at `pipelines_for_catalog_example/vector_search_catalog.yaml`. Start the server and query it:
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/postgres/ctx_postgres_catalog_demo.yaml \
+  --pipeline demo/postgres/pipelines_for_catalog_example/ \
+  --port 8080
+
+# Search with a literal query vector
+curl -X POST http://localhost:8080/vector-search-catalog/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query_vector": [0.6, 0.8, 0.0, 0.0], "limit": 3}' | jq .
+```
+
+**Example response:**
+```json
+{
+  "data": [
+    {"id": 1, "content": "Rust systems programming",               "metadata": "doc-1", "_score": 0.0},
+    {"id": 2, "content": "Systems programming at scale with Rust", "metadata": "doc-2", "_score": 0.0},
+    {"id": 3, "content": "Introduction to programming languages",  "metadata": "doc-3", "_score": 0.3}
+  ],
+  "rows": 3,
+  "success": true
+}
+```
+
+At startup Skardi logs a line for each vector-enabled table registered into the KNN registry:
+
+```
+Registered 'mydb.public.documents' in pg_knn registry for vector search
+```
+
+You can mix KNN results with regular catalog tables in the same query. For example, join the nearest-neighbor documents with the users table:
+
+```sql
+SELECT d.id, d.content, d._score, u.name AS author
+FROM pg_knn('mydb.public.documents', 'embedding',
+    [0.6, 0.8, 0.0, 0.0], '<=>', 10) d
+JOIN mydb.public.users u ON u.id = d.id
+ORDER BY d._score
+```
 
 ### How It Works
 
