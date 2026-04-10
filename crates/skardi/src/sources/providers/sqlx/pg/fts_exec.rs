@@ -117,7 +117,7 @@ impl PgFtsExec {
         let text_col = format!("\"{}\"", self.text_col.replace('"', "\"\""));
         let tsvec = format!("to_tsvector('english', {text_col})");
         let tsquery = "websearch_to_tsquery('english', $1)";
-        let rank_expr = format!("ts_rank({tsvec}, {tsquery})");
+        let rank_expr = format!("ts_rank({tsvec}, {tsquery})::float8");
         let match_expr = format!("{tsvec} @@ {tsquery}");
 
         let mut where_parts = vec![match_expr];
