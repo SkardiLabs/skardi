@@ -15,7 +15,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-rag = ["dep:ort", "dep:ndarray", "dep:num_cpus", "candle", "gguf", "remote-embed"]
+embedding = ["dep:ort", "dep:ndarray", "dep:num_cpus", "candle", "gguf", "remote-embed"]
 remote-embed = ["dep:reqwest"]
 gguf = ["dep:llama-cpp-4"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]

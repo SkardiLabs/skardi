@@ -10,7 +10,7 @@ path = "src/main.rs"
 [features]
 default = []
 candle = ["skardi/candle"]
-rag = ["skardi/rag"]
+embedding = ["skardi/embedding"]
 remote-embed = ["skardi/remote-embed"]
 gguf = ["skardi/gguf"]
 
