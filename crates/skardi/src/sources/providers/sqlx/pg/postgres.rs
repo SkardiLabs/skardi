@@ -1,4 +1,5 @@
-use crate::sources::providers::DatasetRegistry;
+use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -65,8 +66,15 @@ pub async fn register_postgres_tables(
     let hierarchy_level = hierarchy_level.unwrap_or_default();
     match hierarchy_level {
         crate::sources::HierarchyLevel::Catalog => {
-            register_postgres_catalog(session_ctx, name, connection_string, options, read_write)
-                .await
+            register_postgres_catalog(
+                session_ctx,
+                name,
+                connection_string,
+                options,
+                read_write,
+                pg_knn_registry,
+            )
+            .await
         }
         crate::sources::HierarchyLevel::Table => {
             register_single_postgres_table(
@@ -75,6 +83,7 @@ pub async fn register_postgres_tables(
                 connection_string,
                 options,
                 read_write,
+                pg_knn_registry,
             )
             .await
         }
@@ -88,6 +97,7 @@ async fn register_single_postgres_table(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
+    pg_knn_registry: Option<&DatasetRegistry>,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
@@ -117,6 +127,19 @@ async fn register_single_postgres_table(
                 format!("Failed to create PostgreSQL connection pool for '{}'", name)
             })?,
     );
+
+    // Build the sqlx pool when needed for writes or KNN registry population.
+    let sqlx_pool = if read_write || pg_knn_registry.is_some() {
+        let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
+        Some(
+            PgPool::connect(&sqlx_url)
+                .await
+                .with_context(|| format!("Failed to create sqlx PgPool for '{}'", name))?,
+        )
+    } else {
+        None
+    };
+
     let factory = PostgresTableFactory::new(Arc::clone(&read_pool));
     let table_reference = TableReference::partial(schema_name.as_str(), table_name.as_str());
     let table_provider = build_postgres_table_provider(
@@ -125,13 +148,19 @@ async fn register_single_postgres_table(
         options,
         table_reference,
         read_write,
-        None,
+        sqlx_pool.as_ref(),
     )
     .await?;
 
     session_ctx
         .register_table(name, table_provider)
         .with_context(|| format!("Failed to register table '{}' with DataFusion", name))?;
+
+    if let (Some(registry), Some(pool)) = (pg_knn_registry, &sqlx_pool) {
+        register_table_in_knn_registry(pool, registry, name, &schema_name, table_name)
+            .await
+            .with_context(|| format!("Failed to register '{}' in pg_knn registry", name))?;
+    }
 
     tracing::info!(
         "Successfully registered PostgreSQL table '{}.{}' as '{}' ({})",
@@ -177,6 +206,7 @@ async fn register_postgres_catalog(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
+    pg_knn_registry: Option<&DatasetRegistry>,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
@@ -285,6 +315,18 @@ async fn register_postgres_catalog(
                 )
             })?;
 
+        if let Some(registry) = pg_knn_registry {
+            let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
+            register_table_in_knn_registry(&sqlx_pool, registry, &knn_key, schema, table_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to register '{}.{}' in pg_knn registry for catalog '{}'",
+                        schema, table_name, catalog_name
+                    )
+                })?;
+        }
+
         tracing::debug!(
             "Prepared '{}.{}' in catalog '{}'",
             schema,
@@ -368,6 +410,51 @@ async fn build_postgres_table_provider(
         table_reference,
         auto_generated_columns,
     }))
+}
+
+/// Fetch column metadata for one table and insert a [`PgKnnEntry`] into the registry.
+///
+/// `entry_name` is the key callers use to look up the entry (e.g. the DataFusion source name
+/// in single-table mode, or `"catalog.schema.table"` in catalog mode).
+async fn register_table_in_knn_registry(
+    pool: &PgPool,
+    registry: &DatasetRegistry,
+    entry_name: &str,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<()> {
+    let columns = fetch_table_columns(pool, schema_name, table_name)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to fetch columns for pg_knn registry entry '{}'",
+                entry_name
+            )
+        })?;
+
+    let qualified_table = format!(
+        "\"{}\".\"{}\"",
+        schema_name.replace('"', "\"\""),
+        table_name.replace('"', "\"\"")
+    );
+
+    let entry = PgKnnEntry {
+        pool: Arc::new(pool.clone()),
+        qualified_table,
+        columns,
+    };
+
+    registry
+        .write()
+        .map_err(|e| anyhow::anyhow!("pg_knn registry lock poisoned: {}", e))?
+        .insert(entry_name.to_string(), DatasetEntry::Postgres(entry));
+
+    tracing::info!(
+        "Registered '{}' in pg_knn registry for vector search",
+        entry_name
+    );
+
+    Ok(())
 }
 
 async fn list_postgres_tables_in_catalog(
