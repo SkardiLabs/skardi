@@ -67,7 +67,7 @@ cargo run --bin skardi-server -- \
 # 6. Execute with parameters
 curl -X POST http://localhost:8080/pg_user_query/execute \
   -H "Content-Type: application/json" \
-  -d '{"user_id": 1}'
+  -d '{"user_id": 1}' | jq .
 ```
 
 ## Prerequisites
@@ -106,7 +106,7 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
    # Execute with parameters
    curl -X POST http://localhost:8080/query_user_by_id/execute \
      -H "Content-Type: application/json" \
-     -d '{"user_id": 1}'
+     -d '{"user_id": 1}' | jq .
    ```
 
 ## Single INSERT Example
@@ -117,7 +117,7 @@ Insert a new user into the PostgreSQL table:
 # Execute INSERT with parameters (pipeline was loaded at server start)
 curl -X POST http://localhost:8080/insert_user/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "David Brown", "email": "david@example.com"}'
+  -d '{"name": "David Brown", "email": "david@example.com"}' | jq .
 ```
 
 **Verify the insert:**
@@ -134,7 +134,7 @@ Update an existing user's email address:
 # Execute UPDATE with parameters
 curl -X POST http://localhost:8080/update_user_email/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Alice Smith", "new_email": "alice.smith@newdomain.com"}'
+  -d '{"name": "Alice Smith", "new_email": "alice.smith@newdomain.com"}' | jq .
 ```
 
 **Response:**
@@ -168,7 +168,7 @@ Delete a user by name:
 # Execute DELETE with parameters
 curl -X POST http://localhost:8080/delete_user/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "David Brown"}'
+  -d '{"name": "David Brown"}' | jq .
 ```
 
 **Response:**
@@ -234,7 +234,7 @@ order_id,user_id,product,amount,order_date
 # Execute for Alice Smith
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Alice Smith"}'
+  -d '{"name": "Alice Smith"}' | jq .
 ```
 
 **Response:**
@@ -253,12 +253,12 @@ curl -X POST http://localhost:8080/federated_join_and_insert/execute \
 # Execute for Bob Johnson
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Bob Johnson"}'
+  -d '{"name": "Bob Johnson"}' | jq .
 
 # Execute for Carol Williams
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Carol Williams"}'
+  -d '{"name": "Carol Williams"}' | jq .
 ```
 
 ### Verify Results
@@ -387,17 +387,17 @@ cargo run --bin skardi-server -- \
 # Inner product
 curl -X POST http://localhost:8080/vector-search-inner-product/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "limit": 3}'
+  -d '{"seed_id": 1, "limit": 3}' | jq .
 
 # L2 (Euclidean)
 curl -X POST http://localhost:8080/vector-search-l2/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "limit": 3}'
+  -d '{"seed_id": 1, "limit": 3}' | jq .
 
 # Cosine
 curl -X POST http://localhost:8080/vector-search-cosine/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "limit": 3}'
+  -d '{"seed_id": 1, "limit": 3}' | jq .
 ```
 
 **`<#>` inner product** — doc-2 ranks first: same direction as doc-1 but 5× larger magnitude boosts the dot product.

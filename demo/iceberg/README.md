@@ -123,7 +123,7 @@ curl -X POST http://localhost:8080/query-trips-by-date/execute \
     "start_date": "2024-01-15",
     "end_date": "2024-01-17",
     "limit": 10
-  }'
+  }' | jq .
 ```
 
 **Expected Response:**
@@ -244,7 +244,7 @@ query: |
 ```bash
 curl -X POST http://localhost:8080/federated-join-zones/execute \
   -H "Content-Type: application/json" \
-  -d '{"borough": "Manhattan", "limit": 10}'
+  -d '{"borough": "Manhattan", "limit": 10}' | jq .
 ```
 
 ## S3 Iceberg Tables

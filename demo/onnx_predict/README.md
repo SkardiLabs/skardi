@@ -114,7 +114,7 @@ curl -X POST http://localhost:8080/movie-recommendation-pipeline/execute \
     "last_watched_movie": "Toy Story",
     "user_id": 42,
     "top_n": 5
-  }'
+  }' | jq .
 ```
 
 **Expected Response:**

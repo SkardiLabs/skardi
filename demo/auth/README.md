@@ -151,7 +151,7 @@ BetterAuth also sets a session cookie on sign-in. You can pass it along in reque
 # Sign in and capture the Set-Cookie header
 curl -s -c cookies.txt -X POST http://localhost:8080/api/auth/sign-in/email \
   -H "Content-Type: application/json" \
-  -d '{"email": "alice@example.com", "password": "mysecretpassword"}'
+  -d '{"email": "alice@example.com", "password": "mysecretpassword"}' | jq .
 
 # Use the saved cookie for pipeline execution
 curl -s -b cookies.txt -X POST http://localhost:8080/active-users/execute \

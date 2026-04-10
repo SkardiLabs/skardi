@@ -132,7 +132,7 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
     "reference_id": 1,
     "min_revenue": null,
     "max_revenue": null
-  }'
+  }' | jq .
 ```
 
 Response:
@@ -169,7 +169,7 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
     "reference_id": 1,
     "min_revenue": 1000.0,
     "max_revenue": 5000.0
-  }'
+  }' | jq .
 ```
 
 ### Example 3: Direct Vector Search
@@ -183,7 +183,7 @@ curl -X POST http://localhost:8080/lance-direct-vector-search/execute \
   -H "Content-Type: application/json" \
   -d '{
     "query_vector": [0.0, 16.0, 35.0, 5.0, 32.0, ...]
-  }'
+  }' | jq .
 ```
 
 The `query_vector` parameter accepts a JSON array of floats matching the vector dimension of the dataset (128 for the demo dataset). The server converts the array to a SQL literal for `lance_knn`.
@@ -351,7 +351,7 @@ curl -X POST http://localhost:8080/lance-full-text-search/execute \
     "search_query": "premium wireless",
     "category": null,
     "limit": 10
-  }'
+  }' | jq .
 ```
 
 Response:
@@ -382,7 +382,7 @@ curl -X POST http://localhost:8080/lance-full-text-search/execute \
     "search_query": "umbrella",
     "category": "outdoor",
     "limit": 5
-  }'
+  }' | jq .
 ```
 
 ### Example: Phrase Search
@@ -394,7 +394,7 @@ curl -X POST http://localhost:8080/lance-full-text-search/execute \
     "search_query": "\"train to boston\"",
     "category": null,
     "limit": 10
-  }'
+  }' | jq .
 ```
 
 ### Creating an INVERTED Index

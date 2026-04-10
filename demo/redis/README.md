@@ -67,7 +67,7 @@ Query a specific product by ID. Uses the fast path (direct key construction, O(1
 ```bash
 curl -X POST http://localhost:8080/query_product_by_id/execute \
   -H "Content-Type: application/json" \
-  -d '{"product_id": "PROD001"}'
+  -d '{"product_id": "PROD001"}' | jq .
 ```
 
 **Response:**
@@ -89,7 +89,7 @@ Query products by category. Since `category` is not the key column, this perform
 ```bash
 curl -X POST http://localhost:8080/query_products_by_category/execute \
   -H "Content-Type: application/json" \
-  -d '{"category": "Electronics"}'
+  -d '{"category": "Electronics"}' | jq .
 ```
 
 **Response:**
@@ -116,7 +116,7 @@ List all products in the catalog.
 ```bash
 curl -X POST http://localhost:8080/list_all_products/execute \
   -H "Content-Type: application/json" \
-  -d '{}'
+  -d '{}' | jq .
 ```
 
 **Response:**
@@ -144,7 +144,7 @@ Insert a new product. Creates a Redis hash at `mydb:products:PROD006`.
 ```bash
 curl -X POST http://localhost:8080/insert_product/execute \
   -H "Content-Type: application/json" \
-  -d '{"product_id": "PROD006", "name": "Webcam", "category": "Electronics", "price": "89.99", "in_stock": "true"}'
+  -d '{"product_id": "PROD006", "name": "Webcam", "category": "Electronics", "price": "89.99", "in_stock": "true"}' | jq .
 ```
 
 **Response:**
@@ -166,7 +166,7 @@ Update a product's price by its product ID.
 ```bash
 curl -X POST http://localhost:8080/update_product_price/execute \
   -H "Content-Type: application/json" \
-  -d '{"product_id": "PROD001", "price": "899.99"}'
+  -d '{"product_id": "PROD001", "price": "899.99"}' | jq .
 ```
 
 **Response:**
@@ -188,7 +188,7 @@ Update all products in a category. Since `category` is not the key column, this 
 ```bash
 curl -X POST http://localhost:8080/update_stock_by_category/execute \
   -H "Content-Type: application/json" \
-  -d '{"category": "Electronics", "in_stock": "false"}'
+  -d '{"category": "Electronics", "in_stock": "false"}' | jq .
 ```
 
 **Response:**
@@ -211,7 +211,7 @@ Delete a product by its product ID.
 ```bash
 curl -X POST http://localhost:8080/delete_product/execute \
   -H "Content-Type: application/json" \
-  -d '{"product_id": "PROD006"}'
+  -d '{"product_id": "PROD006"}' | jq .
 ```
 
 **Response:**
@@ -246,12 +246,12 @@ CSV (product_inventory.csv)     Redis (products)
 # Aggregate Electronics category
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"category": "Electronics"}'
+  -d '{"category": "Electronics"}' | jq .
 
 # Aggregate Furniture category
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"category": "Furniture"}'
+  -d '{"category": "Furniture"}' | jq .
 ```
 
 **Verify Results:**
