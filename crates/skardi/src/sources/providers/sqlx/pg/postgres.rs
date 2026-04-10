@@ -106,7 +106,7 @@ async fn register_single_postgres_table(
         .unwrap_or(&"public".to_string())
         .clone();
     let table_name = options.and_then(|opts| opts.get("table")).ok_or_else(|| {
-        anyhow::anyhow!("'table' option is required for PostgreSQL single-table registration")
+        anyhow::anyhow!("PostgreSQL single-table registration requires 'table' option")
     })?;
 
     let pool_params = parse_connection_params(connection_string, options)?;
