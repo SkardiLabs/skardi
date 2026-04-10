@@ -570,12 +570,12 @@ cargo run --bin skardi-server -- \
 # Basic search
 curl -X POST http://localhost:8080/fts-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "machine learning", "limit": 5}'
+  -d '{"query": "machine learning", "limit": 5}' | jq .
 
 # With category filter
 curl -X POST http://localhost:8080/fts-search-with-filter/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "neural network", "category": "ai", "limit": 5}'
+  -d '{"query": "neural network", "category": "ai", "limit": 5}' | jq .
 ```
 
 **Basic search** — results ranked by `ts_rank` (higher is more relevant):

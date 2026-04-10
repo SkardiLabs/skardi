@@ -76,6 +76,7 @@ impl TableFunctionImpl for PgFtsTableFunction {
             if lang.is_empty() {
                 "english".to_string()
             } else {
+                validate_language(&lang)?;
                 lang
             }
         } else {
@@ -252,12 +253,36 @@ fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
     match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v)), _) => Ok(*v as usize),
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            if *v < 0 {
+                return plan_err!("pg_fts: '{}' must be non-negative, got {}", name, v);
+            }
+            Ok(*v as usize)
+        }
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+            if *v < 0 {
+                return plan_err!("pg_fts: '{}' must be non-negative, got {}", name, v);
+            }
+            Ok(*v as usize)
+        }
         Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
         // Accept NULL as placeholder during pipeline validation/schema inference.
         Expr::Literal(ScalarValue::Null, _) => Ok(0),
         _ => plan_err!("pg_fts: '{}' must be an integer literal", name),
+    }
+}
+
+/// Validate that the language string is a safe PostgreSQL text search configuration name.
+/// Only allows alphanumeric characters and underscores to prevent SQL injection,
+/// since the language is interpolated into SQL strings (e.g. `to_tsvector('english', ...)`).
+fn validate_language(lang: &str) -> DFResult<()> {
+    if lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(())
+    } else {
+        plan_err!(
+            "pg_fts: language must contain only alphanumeric characters and underscores, got '{}'",
+            lang
+        )
     }
 }
 
@@ -371,6 +396,39 @@ mod tests {
         assert!(
             err.contains("expects 4-5 arguments"),
             "expected arg count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_negative_limit_rejected() {
+        let func = make_fts_function();
+        let result = func.call(&[
+            lit_str("some_table"),
+            lit_str("col"),
+            lit_str("test"),
+            lit_int(-1),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-negative"),
+            "expected non-negative error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_language_rejected() {
+        let func = make_fts_function();
+        let result = func.call(&[
+            lit_str("some_table"),
+            lit_str("col"),
+            lit_str("test"),
+            lit_int(10),
+            lit_str("english'; DROP TABLE articles; --"),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("alphanumeric"),
+            "expected language validation error, got: {err}"
         );
     }
 
