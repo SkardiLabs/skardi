@@ -1228,6 +1228,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .await;
 
@@ -1641,6 +1642,7 @@ mod tests {
             "postgresql://127.0.0.1:19999/nonexistent",
             None,
             false,
+            None,
             Some(crate::sources::HierarchyLevel::Catalog),
         )
         .await;
@@ -1661,6 +1663,7 @@ mod tests {
             "postgresql://localhost:5432/db",
             None,
             false,
+            None,
             Some(crate::sources::HierarchyLevel::Table),
         )
         .await;
@@ -1684,6 +1687,7 @@ mod tests {
             "postgresql://localhost:5432/db",
             None,
             false,
+            None,
             None, // None → Table
         )
         .await;
@@ -1765,6 +1769,7 @@ mod tests {
             "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
             Some(&options),
             true,
+            None,
             None,
         )
         .await
