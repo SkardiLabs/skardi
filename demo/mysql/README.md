@@ -82,7 +82,7 @@ cargo run --bin skardi-server -- \
 # 6. Execute with parameters
 curl -X POST http://localhost:8080/mysql_user_query/execute \
   -H "Content-Type: application/json" \
-  -d '{"user_id": 1}'
+  -d '{"user_id": 1}' | jq .
 ```
 
 ## Prerequisites
@@ -133,17 +133,17 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
    # Execute with parameters
    curl -X POST http://localhost:8080/query_user_by_id/execute \
      -H "Content-Type: application/json" \
-     -d '{"user_id": 1}'
+     -d '{"user_id": 1}' | jq .
 
    # Search for users by email pattern
    curl -X POST http://localhost:8080/search_users_by_email/execute \
      -H "Content-Type: application/json" \
-     -d '{"email_pattern": "%@example.com"}'
+     -d '{"email_pattern": "%@example.com"}' | jq .
 
    # Get user's order summary
    curl -X POST http://localhost:8080/user_orders_summary/execute \
      -H "Content-Type: application/json" \
-     -d '{"user_id": 1}'
+     -d '{"user_id": 1}' | jq .
    ```
 
 ## Single INSERT Example
@@ -154,7 +154,7 @@ Insert a new user into the MySQL table:
 # Execute INSERT with parameters
 curl -X POST http://localhost:8080/insert_user/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "David Brown", "email": "david@example.com"}'
+  -d '{"name": "David Brown", "email": "david@example.com"}' | jq .
 ```
 
 **Verify the insert:**
@@ -171,7 +171,7 @@ Update an existing user's email address:
 # Execute UPDATE with parameters
 curl -X POST http://localhost:8080/update_user_email/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Alice Smith", "new_email": "alice.smith@newdomain.com"}'
+  -d '{"name": "Alice Smith", "new_email": "alice.smith@newdomain.com"}' | jq .
 ```
 
 **Response:**
@@ -205,7 +205,7 @@ Delete a user by name:
 # Execute DELETE with parameters
 curl -X POST http://localhost:8080/delete_user/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "David Brown"}'
+  -d '{"name": "David Brown"}' | jq .
 ```
 
 **Response:**
@@ -280,7 +280,7 @@ query: |
 # Execute for a specific user by name
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Alice Smith"}'
+  -d '{"name": "Alice Smith"}' | jq .
 ```
 
 **Response:**
@@ -314,12 +314,12 @@ You can execute for other users as well:
 # Execute for Bob
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Bob Johnson"}'
+  -d '{"name": "Bob Johnson"}' | jq .
 
 # Execute for Carol
 curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -H "Content-Type: application/json" \
-  -d '{"name": "Carol Williams"}'
+  -d '{"name": "Carol Williams"}' | jq .
 ```
 
 **What Happened:**
