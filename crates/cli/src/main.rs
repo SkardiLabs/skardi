@@ -576,6 +576,7 @@ async fn register_source(
                 &resolved,
                 source.options.as_ref(),
                 false,
+                None,
             )
             .await
             .with_context(|| format!("Failed to register SQLite '{}'", source.name))?;

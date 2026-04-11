@@ -13,6 +13,9 @@ use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
+use skardi::sources::providers::sqlite::{
+    register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_vec_to_binary_udf,
+};
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{DatasetEntry, DatasetRegistry};
 use std::collections::{HashMap, HashSet};
@@ -95,6 +98,11 @@ impl OptimizerRegistry {
             self.register_mongo_functions(ctx)?;
         }
 
+        // Register SQLite-specific table functions
+        if source_types.contains(&DataSourceType::Sqlite) {
+            self.register_sqlite_functions(ctx)?;
+        }
+
         Ok(())
     }
 
@@ -130,6 +138,22 @@ impl OptimizerRegistry {
         tracing::info!("Registering mongo_fts table function");
         register_mongo_fts_udtf(ctx, self.datasets());
         tracing::info!("✓ Registered mongo_fts table function");
+        Ok(())
+    }
+
+    /// Register SQLite-specific table functions.
+    fn register_sqlite_functions(&self, ctx: &mut SessionContext) -> Result<()> {
+        tracing::info!("Registering sqlite_knn table function");
+        register_sqlite_knn_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered sqlite_knn table function");
+
+        tracing::info!("Registering sqlite_fts table function");
+        register_sqlite_fts_udtf(ctx, self.datasets());
+
+        tracing::info!("Registering vec_to_binary scalar UDF");
+        register_vec_to_binary_udf(ctx);
+        tracing::info!("✓ Registered vec_to_binary scalar UDF");
+        tracing::info!("✓ Registered sqlite_fts table function");
         Ok(())
     }
 

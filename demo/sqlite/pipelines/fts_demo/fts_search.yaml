@@ -1,0 +1,15 @@
+metadata:
+  name: "sqlite-fts-search"
+  version: "1.0.0"
+  description: >
+    Full-text search on a SQLite FTS5 virtual table.
+    Returns matching rows ranked by BM25 relevance (higher _score = more relevant).
+
+# Parameters:
+#   {query} - Search terms (space-separated, "quoted" for phrase, NOT for negation)
+#   {limit} - Maximum number of results to return
+
+query: |
+  SELECT title, body, category, _score
+  FROM sqlite_fts('articles_fts', 'body', {query}, {limit})
+  ORDER BY _score DESC

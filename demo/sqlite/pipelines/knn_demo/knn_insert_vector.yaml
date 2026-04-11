@@ -1,0 +1,17 @@
+metadata:
+  name: "sqlite-knn-insert-vector"
+  version: "1.0.0"
+  description: >
+    Embed text with candle() and insert the vector into the vec0 index.
+    vec_to_binary() converts the List<Float32> embedding from candle() into
+    a packed little-endian f32 BLOB expected by sqlite-vec.
+
+# Parameters:
+#   {id}   - Item ID (must match the id used in the items table)
+#   {text} - Text to embed (e.g. item name or description)
+
+# Requires: --features candle
+
+query: |
+  INSERT INTO vec_items (item_id, embedding)
+  SELECT {id}, vec_to_binary(candle('models/generated/bge-small-en-v1.5', {text}))

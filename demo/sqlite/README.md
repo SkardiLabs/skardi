@@ -286,9 +286,288 @@ options:
   busy_timeout_ms: "10000"  # Wait up to 10 seconds for locks
 ```
 
+## Full-Text Search (FTS5)
+
+SQLite FTS5 provides indexed full-text search with BM25 relevance scoring — no external extension needed.
+
+### Setup
+
+```bash
+# Create an FTS5 virtual table
+sqlite3 demo/sqlite/fts_demo.db << 'EOF'
+CREATE VIRTUAL TABLE articles_fts USING fts5(title, body, category);
+INSERT INTO articles_fts (title, body, category) VALUES
+    ('Machine Learning Basics', 'Introduction to machine learning algorithms and neural networks', 'ai'),
+    ('Database Systems', 'Overview of relational database management systems and SQL', 'database'),
+    ('Deep Learning', 'Advanced neural network architectures for machine learning', 'ai'),
+    ('Web Development', 'Modern web frameworks and frontend technologies', 'web'),
+    ('NLP Guide', 'NLP techniques for text analysis and machine learning applications', 'ml');
+EOF
+```
+
+### Query
+
+```bash
+# Start with FTS context
+cargo run --bin skardi-server -- \
+  --ctx demo/sqlite/ctx_sqlite_fts_demo.yaml \
+  --pipeline demo/sqlite/pipelines/fts_demo/ \
+  --port 8080
+
+# Basic FTS search
+curl -X POST http://localhost:8080/sqlite-fts-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "machine learning", "limit": 10}' | jq .
+
+# Response
+{
+  "success": true,
+  "data": [
+    {
+      "title": "Deep Learning",
+      "body": "Advanced neural network architectures for machine learning",
+      "category": "ai",
+      "_score": 0.0000020624999999999997
+    },
+    {
+      "title": "Machine Learning Basics",
+      "body": "Introduction to machine learning algorithms and neural networks",
+      "category": "ai",
+      "_score": 0.0000019130434782608697
+    },
+    {
+      "title": "NLP Guide",
+      "body": "NLP techniques for text analysis and machine learning applications",
+      "category": "ml",
+      "_score": 0.0000019130434782608697
+    }
+  ],
+  "rows": 3,
+  "execution_time_ms": 16,
+  "timestamp": "2026-04-11T07:24:38.753556+00:00"
+}
+
+# FTS with category filter
+curl -X POST http://localhost:8080/sqlite-fts-search-with-filter/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "machine learning", "category": "ai", "limit": 10}' | jq .
+
+ # Response
+ {
+  "success": true,
+  "data": [
+    {
+      "title": "Deep Learning",
+      "body": "Advanced neural network architectures for machine learning",
+      "category": "ai",
+      "_score": 0.0000020624999999999997
+    },
+    {
+      "title": "Machine Learning Basics",
+      "body": "Introduction to machine learning algorithms and neural networks",
+      "category": "ai",
+      "_score": 0.0000019130434782608697
+    }
+  ],
+  "rows": 2,
+  "execution_time_ms": 6,
+  "timestamp": "2026-04-11T07:26:59.099570+00:00"
+}
+
+```
+
+### SQL Syntax
+
+```sql
+-- sqlite_fts(table, text_col, query, limit)
+SELECT title, body, category, _score
+FROM sqlite_fts('articles_fts', 'body', 'machine learning', 10)
+ORDER BY _score DESC
+
+-- With WHERE clause filter pushdown
+SELECT title, body, category, _score
+FROM sqlite_fts('articles_fts', 'body', 'neural network', 10)
+WHERE category = 'ai'
+ORDER BY _score DESC
+```
+
+FTS5 query syntax supports:
+- Plain terms (AND'd by default): `machine learning`
+- Quoted phrases: `"neural network"`
+- NOT operator: `learning NOT database`
+- OR operator: `machine OR database`
+- Prefix queries: `mach*`
+
+### Write
+
+FTS5 indexes are updated automatically on INSERT and DELETE — no rebuild needed.
+
+```bash
+# Insert a new article (immediately searchable)
+curl -X POST http://localhost:8080/sqlite-fts-insert-article/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Reinforcement Learning",
+    "body": "Reinforcement Learning works by training agents through reward signals and policy optimization",
+    "category": "ai"
+  }' | jq .
+
+# Delete an article by title
+curl -X POST http://localhost:8080/sqlite-fts-delete-article/execute \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Web Development"}' | jq .
+
+# Verify: search should now find the new article
+curl -X POST http://localhost:8080/sqlite-fts-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "reinforcement", "limit": 5}' | jq .
+```
+
+## Vector Similarity Search (sqlite-vec)
+
+KNN vector search using [sqlite-vec](https://github.com/asg017/sqlite-vec) `vec0` virtual tables with indexed vector search.
+
+### Prerequisites
+
+```bash
+pip install sqlite-vec fastembed
+```
+
+The sqlite-vec pip package provides the Python bindings for setup. However, on **macOS with Apple Silicon**, the pip dylib may be x86_64 while Skardi's bundled SQLite is arm64. In that case, compile the extension natively:
+
+```bash
+# Clone sqlite-vec source
+cd /tmp && git clone --depth 1 https://github.com/asg017/sqlite-vec.git
+
+# Compile against Skardi's bundled SQLite headers
+SQLITE_HEADERS=$(find ~/.cargo/registry/src -path "*/libsqlite3-sys-*/sqlite3/sqlite3.h" | head -1 | xargs dirname)
+cc -arch arm64 -shared -fPIC -O2 -I"$SQLITE_HEADERS" -undefined dynamic_lookup \
+  -o /path/to/your/project/demo/sqlite/vec0.dylib /tmp/sqlite-vec/sqlite-vec.c
+```
+
+### Setup
+
+```bash
+# 1. Create the database with vec0 table and seed embeddings
+#    (embeds item names using sentence-transformers all-MiniLM-L6-v2, 384 dims)
+python demo/sqlite/setup_knn_demo.py
+
+# 2. Download the candle embedding model for query-time embedding (one-time)
+python demo/embeddings/candle/setup.py
+
+# 3. Set the extension path for the server
+#    If using the pip package:
+export VEC0_PATH=$(python -c "import sqlite_vec; print(sqlite_vec.loadable_path())")
+#    If using the natively compiled dylib:
+export VEC0_PATH=demo/sqlite/vec0.dylib
+```
+
+### Query (Semantic Search)
+
+The `candle()` UDF embeds the query text on the fly using a local BERT model. No external API needed.
+
+```bash
+cargo run --bin skardi-server --features candle -- \
+  --ctx demo/sqlite/ctx_sqlite_knn_demo.yaml \
+  --pipeline demo/sqlite/pipelines/knn_demo/ \
+  --port 8080
+
+# Semantic KNN search — query is embedded on the fly
+curl -X POST http://localhost:8080/sqlite-knn-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "portable computing device", "k": 3}' | jq .
+
+# KNN with JOIN to get full item details
+curl -X POST http://localhost:8080/sqlite-knn-search-with-join/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "portable computing device", "k": 3}' | jq .
+
+# Find items similar to an existing item (scalar subquery)
+curl -X POST http://localhost:8080/sqlite-knn-search-by-seed/execute \
+  -H "Content-Type: application/json" \
+  -d '{"seed_id": 1, "k": 3}' | jq .
+```
+
+### SQL Syntax
+
+```sql
+-- Semantic search: embed query on the fly with candle()
+SELECT item_id, _score
+FROM sqlite_knn(
+  'vec_items', 'embedding',
+  candle('models/generated/bge-small-en-v1.5', 'portable computing device'),
+  10
+)
+
+-- Find similar items using an existing item's embedding (scalar subquery)
+SELECT i.name, i.category, knn._score
+FROM sqlite_knn(
+  'vec_items', 'embedding',
+  (SELECT embedding FROM vec_items WHERE item_id = 1),
+  10
+) knn
+JOIN items i ON i.id = knn.item_id
+ORDER BY knn._score
+
+-- Join with data table for full results
+SELECT i.name, i.category, knn._score
+FROM sqlite_knn(
+  'vec_items', 'embedding',
+  candle('models/generated/bge-small-en-v1.5', 'search query'),
+  10
+) knn
+JOIN items i ON i.id = knn.item_id
+ORDER BY knn._score
+
+-- Insert: embed text and write vector to the vec0 index
+-- vec_to_binary() packs List<Float32> into the BLOB format expected by vec0.
+-- Works with all embedding UDFs: candle(), gguf(), remote_embed().
+INSERT INTO vec_items (item_id, embedding)
+SELECT 6, vec_to_binary(candle('models/generated/bge-small-en-v1.5', 'Smartwatch wearable device'))
+```
+
+### Write
+
+The `candle()` UDF can be used in INSERT to embed text and write the vector directly. Wrap the embedding call with `vec_to_binary()` to convert the `List<Float32>` output into the packed f32 BLOB format expected by sqlite-vec. This works with all embedding UDFs (`candle()`, `gguf()`, `remote_embed()`).
+
+```bash
+# 1. Insert item metadata into the data table
+curl -X POST http://localhost:8080/sqlite-knn-insert-item/execute \
+  -H "Content-Type: application/json" \
+  -d '{"id": 6, "name": "Smartwatch", "category": "electronics"}' | jq .
+
+# 2. Embed the item text and insert the vector into the vec0 index
+curl -X POST http://localhost:8080/sqlite-knn-insert-vector/execute \
+  -H "Content-Type: application/json" \
+  -d '{"id": 6, "text": "Smartwatch wearable device for fitness tracking"}' | jq .
+
+# 3. Verify: the new item should be searchable immediately
+curl -X POST http://localhost:8080/sqlite-knn-search-with-join/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "wearable fitness", "k": 3}' | jq .
+
+# Delete an item and its vector
+curl -X POST http://localhost:8080/sqlite-knn-delete-vector/execute \
+  -H "Content-Type: application/json" \
+  -d '{"id": 3}' | jq .
+
+curl -X POST http://localhost:8080/sqlite-knn-delete-item/execute \
+  -H "Content-Type: application/json" \
+  -d '{"id": 3}' | jq .
+```
+
+The `extensions` option in the context file tells Skardi to load the sqlite-vec extension on each connection:
+```yaml
+options:
+  table: "vec_items"
+  extensions: "/path/to/vec0"
+```
+
 ## Context File Options
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
 | `table` | Yes | — | SQLite table name to register |
 | `busy_timeout_ms` | No | `5000` | Time in milliseconds to wait for database locks |
+| `read_pool_size` | No | `4` | Number of read connections in the pool |
+| `extensions` | No | — | Comma-separated paths to SQLite extensions to load (e.g. sqlite-vec) |

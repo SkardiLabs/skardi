@@ -1,0 +1,12 @@
+metadata:
+  name: "sqlite-knn-delete-vector"
+  version: "1.0.0"
+  description: >
+    Delete a vector from the vec0 index by item_id.
+    Should be called together with knn_delete_item to keep data and index in sync.
+
+# Parameters:
+#   {id} - Item ID whose vector to delete
+
+query: |
+  DELETE FROM vec_items WHERE item_id = {id}
