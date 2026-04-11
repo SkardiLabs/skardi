@@ -253,17 +253,13 @@ fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
     match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => Ok(*v as usize),
         Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
-            if *v < 0 {
-                return plan_err!("pg_fts: '{}' must be non-negative, got {}", name, v);
-            }
-            Ok(*v as usize)
+            plan_err!("pg_fts: '{}' must be a positive integer, got {}", name, v)
         }
+        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => Ok(*v as usize),
         Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
-            if *v < 0 {
-                return plan_err!("pg_fts: '{}' must be non-negative, got {}", name, v);
-            }
-            Ok(*v as usize)
+            plan_err!("pg_fts: '{}' must be a positive integer, got {}", name, v)
         }
         Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
         // Accept NULL as placeholder during pipeline validation/schema inference.
@@ -410,8 +406,24 @@ mod tests {
         ]);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("non-negative"),
-            "expected non-negative error, got: {err}"
+            err.contains("positive integer"),
+            "expected positive-integer error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_zero_limit_rejected() {
+        let func = make_fts_function();
+        let result = func.call(&[
+            lit_str("some_table"),
+            lit_str("col"),
+            lit_str("test"),
+            lit_int(0),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("positive integer"),
+            "expected positive-integer error, got: {err}"
         );
     }
 

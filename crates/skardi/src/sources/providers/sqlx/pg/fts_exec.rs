@@ -118,6 +118,14 @@ impl PgFtsExec {
     /// Build the full-text search SELECT query.
     ///
     /// Uses `$1` as the bind parameter for the search query string.
+    ///
+    /// NOTE: `to_tsvector(lang, col)` appears in both the WHERE and ts_rank() expressions.
+    /// PostgreSQL does not CSE these, so the conversion runs twice per matched row.
+    /// We intentionally keep the raw expression in the WHERE clause (rather than a
+    /// subquery alias) so that PostgreSQL can use a GIN index on
+    /// `to_tsvector('lang', col)` when one exists. With the index the double
+    /// computation is negligible (ts_rank only runs on matched rows); without one
+    /// the real fix is to create the index, not to restructure the query.
     fn build_query(&self) -> String {
         let cols = self.select_columns();
         let text_col = format!("\"{}\"", self.text_col.replace('"', "\"\""));

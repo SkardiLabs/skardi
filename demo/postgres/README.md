@@ -566,27 +566,66 @@ cargo run --bin skardi-server -- \
   --ctx demo/postgres/ctx_pgfts_demo.yaml \
   --pipeline demo/postgres/pipelines/fts_demo/ \
   --port 8080
+```
 
 # Basic search
+```bash
 curl -X POST http://localhost:8080/fts-search/execute \
   -H "Content-Type: application/json" \
   -d '{"query": "machine learning", "limit": 5}' | jq .
+```
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "title": "Intro to Machine Learning",
+      "category": "ai",
+      "_score": 0.09910321980714798
+    },
+    {
+      "id": 5,
+      "title": "Neural Network Architectures",
+      "category": "ai",
+      "_score": 0.09910321980714798
+    }
+  ],
+  "rows": 2,
+  "execution_time_ms": 295,
+  "timestamp": "2026-04-10T18:39:47.725679+00:00"
+}
+```
+
 
 # With category filter
+```bash
 curl -X POST http://localhost:8080/fts-search-with-filter/execute \
   -H "Content-Type: application/json" \
   -d '{"query": "neural network", "category": "ai", "limit": 5}' | jq .
 ```
 
-**Basic search** — results ranked by `ts_rank` (higher is more relevant):
 ```json
 {
+  "success": true,
   "data": [
-    {"id": 1, "title": "Intro to Machine Learning",  "category": "ai", "_score": 0.075990885},
-    {"id": 4, "title": "Deep Learning Advances",      "category": "research", "_score": 0.075990885}
+    {
+      "id": 1,
+      "title": "Intro to Machine Learning",
+      "category": "ai",
+      "_score": 0.09910321980714798
+    },
+    {
+      "id": 4,
+      "title": "Deep Learning Advances",
+      "category": "research",
+      "_score": 0.09910321980714798
+    }
   ],
   "rows": 2,
-  "success": true
+  "execution_time_ms": 252,
+  "timestamp": "2026-04-10T18:39:38.994683+00:00"
 }
 ```
 
