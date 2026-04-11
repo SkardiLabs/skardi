@@ -41,8 +41,8 @@ pub struct SqliteKnnExec {
     table_name: String,
     /// Name of the vector column in the vec0 table.
     vector_col: String,
-    /// Pre-computed query vector (literal path). Empty when using subquery path.
-    query_vector: Vec<f32>,
+    /// Pre-computed query vector (literal path). `None` when using subquery path.
+    query_vector: Option<Vec<f32>>,
     /// Child plan that yields the query vector at execution time (subquery path).
     query_vector_plan: Option<Arc<dyn ExecutionPlan>>,
     /// Number of nearest neighbours to return.
@@ -73,7 +73,7 @@ impl SqliteKnnExec {
             conn,
             table_name,
             vector_col,
-            query_vector,
+            query_vector: Some(query_vector),
             query_vector_plan: None,
             k,
             filter,
@@ -98,7 +98,7 @@ impl SqliteKnnExec {
             conn,
             table_name,
             vector_col,
-            query_vector: Vec::new(),
+            query_vector: None,
             query_vector_plan: Some(child),
             k,
             filter,
@@ -170,8 +170,8 @@ impl SqliteKnnExec {
     /// Execute the query and return all rows as a single `RecordBatch`.
     async fn run(&self, context: Arc<TaskContext>) -> DFResult<RecordBatch> {
         // Resolve query vector: literal or from child plan.
-        let query_vector: Vec<f32> = if !self.query_vector.is_empty() {
-            self.query_vector.clone()
+        let query_vector: Vec<f32> = if let Some(ref vec) = self.query_vector {
+            vec.clone()
         } else if let Some(ref plan) = self.query_vector_plan {
             match extract_query_vector(plan.clone(), context).await? {
                 Some(vec) => vec,
@@ -183,7 +183,9 @@ impl SqliteKnnExec {
                 }
             }
         } else {
-            unreachable!("SqliteKnnExec: both query_vector and query_vector_plan are absent");
+            return Err(DataFusionError::Internal(
+                "SqliteKnnExec: both query_vector and query_vector_plan are absent".to_string(),
+            ));
         };
 
         let sql = self.build_query();

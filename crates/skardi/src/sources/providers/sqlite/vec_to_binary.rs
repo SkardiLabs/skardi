@@ -7,11 +7,13 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float32Array};
+use arrow::array::{Array, BinaryBuilder, FixedSizeListArray, Float32Array, ListArray};
 use arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -53,13 +55,10 @@ impl ScalarUDFImpl for VecToBinaryUDF {
         Ok(DataType::Binary)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: datafusion::logical_expr::ScalarFunctionArgs,
-    ) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         if args.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Plan(
+            return Err(DataFusionError::Plan(
                 "vec_to_binary expects exactly 1 argument".to_string(),
             ));
         }
@@ -73,22 +72,16 @@ impl ScalarUDFImpl for VecToBinaryUDF {
             DataType::List(field) if *field.data_type() == DataType::Float32 => {
                 let list = array
                     .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "Expected ListArray".to_string(),
-                        )
-                    })?;
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| DataFusionError::Internal("Expected ListArray".to_string()))?;
                 list_f32_to_binary(list)?
             }
             DataType::FixedSizeList(field, _) if *field.data_type() == DataType::Float32 => {
                 let list = array
                     .as_any()
-                    .downcast_ref::<arrow::array::FixedSizeListArray>()
+                    .downcast_ref::<FixedSizeListArray>()
                     .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "Expected FixedSizeListArray".to_string(),
-                        )
+                        DataFusionError::Internal("Expected FixedSizeListArray".to_string())
                     })?;
                 fixed_list_f32_to_binary(list)?
             }
@@ -97,7 +90,7 @@ impl ScalarUDFImpl for VecToBinaryUDF {
                 array
             }
             other => {
-                return Err(datafusion::error::DataFusionError::Plan(format!(
+                return Err(DataFusionError::Plan(format!(
                     "vec_to_binary: unsupported input type {other}. \
                      Expected List<Float32>, FixedSizeList<Float32>, or Binary"
                 )));
@@ -109,8 +102,8 @@ impl ScalarUDFImpl for VecToBinaryUDF {
 }
 
 /// Convert a `ListArray` of `Float32` values to a `BinaryArray` of packed LE f32 bytes.
-fn list_f32_to_binary(list: &arrow::array::ListArray) -> DFResult<Arc<dyn Array>> {
-    let mut builder = arrow::array::BinaryBuilder::new();
+fn list_f32_to_binary(list: &ListArray) -> DFResult<Arc<dyn Array>> {
+    let mut builder = BinaryBuilder::new();
     for i in 0..list.len() {
         if list.is_null(i) {
             builder.append_null();
@@ -120,9 +113,7 @@ fn list_f32_to_binary(list: &arrow::array::ListArray) -> DFResult<Arc<dyn Array>
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "List elements are not Float32".to_string(),
-                    )
+                    DataFusionError::Internal("List elements are not Float32".to_string())
                 })?;
             let blob: Vec<u8> = f32_arr
                 .values()
@@ -136,8 +127,8 @@ fn list_f32_to_binary(list: &arrow::array::ListArray) -> DFResult<Arc<dyn Array>
 }
 
 /// Convert a `FixedSizeListArray` of `Float32` values to a `BinaryArray` of packed LE f32 bytes.
-fn fixed_list_f32_to_binary(list: &arrow::array::FixedSizeListArray) -> DFResult<Arc<dyn Array>> {
-    let mut builder = arrow::array::BinaryBuilder::new();
+fn fixed_list_f32_to_binary(list: &FixedSizeListArray) -> DFResult<Arc<dyn Array>> {
+    let mut builder = BinaryBuilder::new();
     for i in 0..list.len() {
         if list.is_null(i) {
             builder.append_null();
@@ -147,9 +138,7 @@ fn fixed_list_f32_to_binary(list: &arrow::array::FixedSizeListArray) -> DFResult
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "FixedSizeList elements are not Float32".to_string(),
-                    )
+                    DataFusionError::Internal("FixedSizeList elements are not Float32".to_string())
                 })?;
             let blob: Vec<u8> = f32_arr
                 .values()

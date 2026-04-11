@@ -26,16 +26,16 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{Result as DFResult, ScalarValue, plan_err};
 use datafusion::datasource::TableType;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::SqliteDialect;
 use std::any::Any;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
 use super::knn_exec::SqliteKnnExec;
+use super::{expr_to_sqlite_sql, extract_string};
 use crate::sources::providers::knn_utils::MAX_KNN_K;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
@@ -84,13 +84,10 @@ impl TableFunctionImpl for SqliteKnnTableFunction {
         // Look up connection + columns from registry.
         let entry = {
             let reg = self.registry.read().map_err(|e| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "sqlite_knn registry lock error: {}",
-                    e
-                ))
+                DataFusionError::Internal(format!("sqlite_knn registry lock error: {}", e))
             })?;
             let raw = reg.get(&table_name).cloned().ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(format!(
+                DataFusionError::Plan(format!(
                     "sqlite_knn: table '{}' not found in registry. \
                      Make sure the data source is declared with type 'sqlite' \
                      and the sqlite-vec extension is loaded via the 'extensions' option.",
@@ -150,12 +147,6 @@ impl std::fmt::Debug for SqliteKnnProvider {
             .field("k", &self.k)
             .finish()
     }
-}
-
-/// Try to convert a DataFusion `Expr` to a SQLite SQL string.
-fn expr_to_sqlite_sql(expr: &Expr) -> Option<String> {
-    let unparser = Unparser::new(&SqliteDialect {});
-    unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
 }
 
 #[async_trait]
@@ -270,27 +261,23 @@ pub fn register_sqlite_knn_udtf(ctx: &SessionContext, registry: DatasetRegistry)
 
 fn extract_k(expr: &Expr) -> DFResult<usize> {
     let k = match expr {
-        Expr::Literal(ScalarValue::Int64(Some(n)), _) => Ok(*n as usize),
-        Expr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
-        Expr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
+        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            plan_err!("sqlite_knn: k must be a positive integer, got {}", v)
+        }
+        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+            plan_err!("sqlite_knn: k must be a positive integer, got {}", v)
+        }
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
         // NULL placeholder during schema inference
         Expr::Literal(ScalarValue::Null, _) => Ok(1),
         _ => plan_err!("sqlite_knn: k must be a positive integer literal"),
     }?;
-    if k == 0 || k > MAX_KNN_K {
+    if k > MAX_KNN_K {
         return plan_err!("sqlite_knn: k must be between 1 and {MAX_KNN_K}, got {k}");
     }
     Ok(k)
-}
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        // NULL placeholder during schema inference
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!("sqlite_knn: '{}' must be a string literal", name),
-    }
 }
 
 fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
@@ -400,8 +387,24 @@ mod tests {
         ]);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("must be between 1 and 500"),
-            "expected k limit error, got: {err}"
+            err.contains("positive integer"),
+            "expected positive-integer error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_k_negative_rejected() {
+        let func = make_knn_function();
+        let result = func.call(&[
+            lit_str("some_table"),
+            lit_str("col"),
+            lit_vec(&[0.1, 0.2]),
+            lit_int(-1),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("positive integer") && err.contains("-1"),
+            "expected positive-integer error with original value, got: {err}"
         );
     }
 

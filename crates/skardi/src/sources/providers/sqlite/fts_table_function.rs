@@ -21,16 +21,16 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{Result as DFResult, ScalarValue, plan_err};
 use datafusion::datasource::TableType;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::SqliteDialect;
 use std::any::Any;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
 use super::fts_exec::SqliteFtsExec;
+use super::{expr_to_sqlite_sql, extract_string};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit.
@@ -77,13 +77,10 @@ impl TableFunctionImpl for SqliteFtsTableFunction {
         // Look up connection + columns from registry.
         let entry = {
             let reg = self.registry.read().map_err(|e| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "sqlite_fts registry lock error: {}",
-                    e
-                ))
+                DataFusionError::Internal(format!("sqlite_fts registry lock error: {}", e))
             })?;
             let raw = reg.get(&table_name).cloned().ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(format!(
+                DataFusionError::Plan(format!(
                     "sqlite_fts: table '{}' not found in registry. \
                      Make sure the data source is declared with type 'sqlite'.",
                     table_name
@@ -137,13 +134,6 @@ impl std::fmt::Debug for SqliteFtsProvider {
             .field("limit", &self.limit)
             .finish()
     }
-}
-
-/// Try to convert a DataFusion `Expr` to a SQLite SQL string suitable for
-/// use in a WHERE clause pushed down to SQLite.
-fn expr_to_sqlite_sql(expr: &Expr) -> Option<String> {
-    let unparser = Unparser::new(&SqliteDialect {});
-    unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
 }
 
 #[async_trait]
@@ -223,15 +213,6 @@ impl TableProvider for SqliteFtsProvider {
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!("sqlite_fts: '{}' must be a string literal", name),
-    }
-}
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
     match expr {
@@ -431,7 +412,7 @@ mod tests {
         path
     }
 
-    async fn register_ci_fts(ctx: &mut SessionContext) -> DatasetRegistry {
+    async fn register_ci_fts(ctx: &mut SessionContext) -> (DatasetRegistry, tempfile::TempPath) {
         let registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
         let db_path = create_fts_test_db().await;
         let db = db_path.to_str().unwrap();
@@ -451,9 +432,7 @@ mod tests {
         .expect("register fts table failed");
 
         register_sqlite_fts_udtf(ctx, Arc::clone(&registry));
-        // Leak the TempPath to keep the file alive for the test.
-        std::mem::forget(db_path);
-        registry
+        (registry, db_path)
     }
 
     async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -469,7 +448,7 @@ mod tests {
     #[ignore]
     async fn test_fts_basic_search() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
 
         let batches = query_all(
             &ctx,
@@ -499,7 +478,7 @@ mod tests {
     #[ignore]
     async fn test_fts_respects_limit() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
 
         let batches = query_all(
             &ctx,
@@ -513,7 +492,7 @@ mod tests {
     #[ignore]
     async fn test_fts_no_results() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
 
         let batches = query_all(
             &ctx,
@@ -527,7 +506,7 @@ mod tests {
     #[ignore]
     async fn test_fts_with_where_filter() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
 
         let all_batches = query_all(
             &ctx,
@@ -565,7 +544,7 @@ mod tests {
     #[ignore]
     async fn test_fts_score_ordering() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
 
         let batches = query_all(
             &ctx,
@@ -594,7 +573,7 @@ mod tests {
     #[ignore]
     async fn test_fts_phrase_search() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
 
         let batches = query_all(
             &ctx,
@@ -613,7 +592,7 @@ mod tests {
 
     /// Register FTS table as read_write so INSERT and sqlite_fts share the
     /// same connection (write conn), ensuring immediate visibility.
-    async fn register_ci_fts_rw(ctx: &mut SessionContext) -> DatasetRegistry {
+    async fn register_ci_fts_rw(ctx: &mut SessionContext) -> (DatasetRegistry, tempfile::TempPath) {
         let registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
         let db_path = create_fts_test_db().await;
         let db = db_path.to_str().unwrap();
@@ -633,15 +612,14 @@ mod tests {
         .expect("register fts table (rw) failed");
 
         register_sqlite_fts_udtf(ctx, Arc::clone(&registry));
-        std::mem::forget(db_path);
-        registry
+        (registry, db_path)
     }
 
     #[tokio::test]
     #[ignore]
     async fn test_fts_read_own_write_insert_then_search() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts_rw(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts_rw(&mut ctx).await;
 
         // Verify 'reinforcement' not found initially
         let batches = query_all(
@@ -687,7 +665,7 @@ mod tests {
     #[ignore]
     async fn test_fts_read_own_write_delete_then_search() {
         let mut ctx = SessionContext::new();
-        let _reg = register_ci_fts_rw(&mut ctx).await;
+        let (_reg, _db) = register_ci_fts_rw(&mut ctx).await;
 
         // Verify 'web frameworks' is found initially
         let batches = query_all(

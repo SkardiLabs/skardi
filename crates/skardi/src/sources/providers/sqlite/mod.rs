@@ -10,13 +10,13 @@ pub use vec_to_binary::register_vec_to_binary_udf;
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
+    Int64Array, ListArray, RecordBatch, StringArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Constraints;
+use datafusion::common::{Constraints, ScalarValue};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -1003,7 +1003,6 @@ fn arrow_value_to_sqlite(
         DataType::LargeBinary => Value::Blob(array.as_binary::<i64>().value(row).to_vec()),
         // List<Float32> → packed little-endian f32 BLOB (for sqlite-vec vec0 tables).
         DataType::List(field) if *field.data_type() == DataType::Float32 => {
-            use arrow::array::{Float32Array, ListArray};
             let list = array.as_any().downcast_ref::<ListArray>().unwrap();
             let values = list.value(row);
             let f32_arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -1016,7 +1015,6 @@ fn arrow_value_to_sqlite(
         }
         // FixedSizeList<Float32> → packed little-endian f32 BLOB.
         DataType::FixedSizeList(field, _) if *field.data_type() == DataType::Float32 => {
-            use arrow::array::{FixedSizeListArray, Float32Array};
             let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             let values = list.value(row);
             let f32_arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -1192,6 +1190,27 @@ fn build_sqlite_where_clause(filters: &[Expr]) -> DataFusionResult<String> {
 /// Quotes a SQLite identifier with double quotes, escaping any embedded double quotes.
 pub(crate) fn quote_sqlite_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Try to convert a DataFusion `Expr` to a SQLite SQL string suitable for
+/// use in a WHERE clause pushed down to SQLite.
+pub(crate) fn expr_to_sqlite_sql(expr: &Expr) -> Option<String> {
+    let unparser = Unparser::new(&SqliteDialect {});
+    unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
+}
+
+/// Extract a string literal from a DataFusion `Expr`.
+/// Returns an empty string for NULL placeholders (schema inference).
+pub(crate) fn extract_string(expr: &Expr, name: &str) -> DataFusionResult<String> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
+        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
+        _ => Err(DataFusionError::Plan(format!(
+            "sqlite: '{}' must be a string literal",
+            name
+        ))),
+    }
 }
 
 /// Produces a properly quoted table reference string for SQLite.

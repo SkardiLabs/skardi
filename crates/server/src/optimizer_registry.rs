@@ -149,11 +149,11 @@ impl OptimizerRegistry {
 
         tracing::info!("Registering sqlite_fts table function");
         register_sqlite_fts_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered sqlite_fts table function");
 
         tracing::info!("Registering vec_to_binary scalar UDF");
         register_vec_to_binary_udf(ctx);
         tracing::info!("✓ Registered vec_to_binary scalar UDF");
-        tracing::info!("✓ Registered sqlite_fts table function");
         Ok(())
     }
 
