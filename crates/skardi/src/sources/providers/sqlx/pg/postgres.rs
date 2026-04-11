@@ -247,18 +247,6 @@ async fn register_postgres_catalog(
     let catalog_provider = Arc::new(MemoryCatalogProvider::new());
 
     for (schema, table_name) in &schema_tables {
-<<<<<<< HEAD
-        let table_reference = TableReference::partial(schema.as_str(), table_name.as_str());
-        let table_provider =
-            build_postgres_table_provider(&read_pool, table_reference, read_write, &sqlx_pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to build table provider for '{}.{}' in catalog '{}'",
-                        schema, table_name, catalog_name
-                    )
-                })?;
-=======
         let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
         let table_provider = build_and_register_table(
             &read_pool,
@@ -276,7 +264,6 @@ async fn register_postgres_catalog(
                 schema, table_name, catalog_name
             )
         })?;
->>>>>>> b1fec0d (update postgres)
 
         if catalog_provider.schema(schema).is_none() {
             catalog_provider
