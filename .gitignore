@@ -6,3 +6,6 @@
 .venv/
 .vscode/
 **/generated/
+*.db
+*.db-wal
+*.db-shm
