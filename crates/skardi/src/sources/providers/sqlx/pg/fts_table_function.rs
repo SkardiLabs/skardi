@@ -482,6 +482,7 @@ mod tests {
             Some(&options),
             false,
             Some(&registry),
+            None
         )
         .await
         .expect("register articles table failed");
