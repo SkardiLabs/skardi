@@ -1,6 +1,6 @@
+use crate::sources::HierarchyLevel;
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
-use HierarchyLevel;
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -66,6 +66,11 @@ pub async fn register_postgres_tables(
     hierarchy_level: Option<HierarchyLevel>,
 ) -> Result<()> {
     let hierarchy_level = hierarchy_level.unwrap_or_default();
+    let mode_str = if read_write {
+        "read-write"
+    } else {
+        "read-only"
+    };
     match hierarchy_level {
         HierarchyLevel::Catalog => {
             register_postgres_catalog(
@@ -75,6 +80,7 @@ pub async fn register_postgres_tables(
                 options,
                 read_write,
                 pg_knn_registry,
+                mode_str,
             )
             .await
         }
@@ -86,6 +92,7 @@ pub async fn register_postgres_tables(
                 options,
                 read_write,
                 pg_knn_registry,
+                mode_str,
             )
             .await
         }
@@ -156,12 +163,8 @@ async fn register_single_postgres_table(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
+    mode_str: &str,
 ) -> Result<()> {
-    let mode_str = if read_write {
-        "read-write"
-    } else {
-        "read-only"
-    };
     tracing::info!(
         "Registering PostgreSQL table (sqlx): {} ({})",
         name,
@@ -212,12 +215,8 @@ async fn register_postgres_catalog(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
+    mode_str: &str,
 ) -> Result<()> {
-    let mode_str = if read_write {
-        "read-write"
-    } else {
-        "read-only"
-    };
     tracing::info!(
         "Registering PostgreSQL catalog (sqlx): {} ({})",
         catalog_name,
