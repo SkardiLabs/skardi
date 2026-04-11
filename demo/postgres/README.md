@@ -494,6 +494,175 @@ JOIN csv_orders o ON o.user_id = v.id
 ORDER BY v._score
 ```
 
+## Full-Text Search with `pg_fts`
+
+Skardi supports PostgreSQL's built-in full-text search via the `pg_fts()` table function. Any Postgres data source with a text column can be searched — no extra configuration needed.
+
+Under the hood, `pg_fts` uses `websearch_to_tsquery` for query parsing and `ts_rank` for relevance scoring.
+
+### Setup
+
+```bash
+# 1. Start PostgreSQL (reuse the existing container or create one)
+docker run --name postgres-skardi \
+  -e POSTGRES_DB=mydb \
+  -e POSTGRES_USER=skardi_user \
+  -e POSTGRES_PASSWORD=skardi_pass \
+  -p 5432:5432 \
+  -d postgres:16
+
+# 2. Create a table with text content
+docker exec -i postgres-skardi psql -U skardi_user -d mydb << 'EOF'
+CREATE TABLE articles (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(200) NOT NULL,
+    body TEXT NOT NULL,
+    category VARCHAR(50) NOT NULL
+);
+
+INSERT INTO articles (title, body, category) VALUES
+    ('Intro to Machine Learning', 'machine learning model training deep neural network supervised algorithms', 'ai'),
+    ('Natural Language Processing', 'natural language processing text classification sentiment analysis tokenization', 'ai'),
+    ('Database Query Optimization', 'database query optimization indexing performance tuning relational algebra', 'database'),
+    ('Deep Learning Advances', 'machine learning classification supervised training model convolutional neural network', 'research'),
+    ('Neural Network Architectures', 'deep learning neural network convolutional image recognition transformer attention', 'ai');
+EOF
+
+# 3. Set credentials
+export PG_USER="skardi_user"
+export PG_PASSWORD="skardi_pass"
+```
+
+### Context file
+
+Add `articles` as a regular Postgres data source — `pg_fts` discovers text columns automatically:
+
+```yaml
+# ctx_pgfts_demo.yaml
+data_sources:
+  - name: "articles"
+    type: "postgres"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    options:
+      table: "articles"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+```
+
+### Pipelines
+
+Two pipeline files are provided in `demo/postgres/pipelines/fts_demo/`:
+
+| File | Description |
+|---|---|
+| `fts_search.yaml` | Basic full-text search |
+| `fts_search_with_filter.yaml` | FTS with category filter pushdown |
+
+### Start and query
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/postgres/ctx_pgfts_demo.yaml \
+  --pipeline demo/postgres/pipelines/fts_demo/ \
+  --port 8080
+```
+
+# Basic search
+```bash
+curl -X POST http://localhost:8080/fts-search/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "machine learning", "limit": 5}' | jq .
+```
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "title": "Intro to Machine Learning",
+      "category": "ai",
+      "_score": 0.09910321980714798
+    },
+    {
+      "id": 5,
+      "title": "Neural Network Architectures",
+      "category": "ai",
+      "_score": 0.09910321980714798
+    }
+  ],
+  "rows": 2,
+  "execution_time_ms": 295,
+  "timestamp": "2026-04-10T18:39:47.725679+00:00"
+}
+```
+
+
+# With category filter
+```bash
+curl -X POST http://localhost:8080/fts-search-with-filter/execute \
+  -H "Content-Type: application/json" \
+  -d '{"query": "neural network", "category": "ai", "limit": 5}' | jq .
+```
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "title": "Intro to Machine Learning",
+      "category": "ai",
+      "_score": 0.09910321980714798
+    },
+    {
+      "id": 4,
+      "title": "Deep Learning Advances",
+      "category": "research",
+      "_score": 0.09910321980714798
+    }
+  ],
+  "rows": 2,
+  "execution_time_ms": 252,
+  "timestamp": "2026-04-10T18:39:38.994683+00:00"
+}
+```
+
+**Web-search-style queries** — `websearch_to_tsquery` supports:
+
+| Syntax | Meaning | Example |
+|---|---|---|
+| `foo bar` | AND (both terms required) | `machine learning` |
+| `"foo bar"` | Exact phrase | `"neural network"` |
+| `foo or bar` | OR (either term) | `machine or database` |
+| `-foo` | NOT (exclude term) | `learning -database` |
+
+### `pg_fts` parameters
+
+```sql
+pg_fts(table_name, text_col, query, limit [, language])
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `table_name` | string | DataFusion table name (as declared in the context file) |
+| `text_col` | string | Name of the text column to search |
+| `query` | string | Search query (parsed by `websearch_to_tsquery`) |
+| `limit` | integer | Maximum number of results to return (1–500) |
+| `language` | string (optional) | PostgreSQL text search configuration (default: `'english'`). Common values: `'simple'`, `'spanish'`, `'german'`, `'chinese'`, etc. |
+
+`_score` is the `ts_rank` value — higher means more relevant.
+
+Additional `WHERE` clauses written in the pipeline SQL are pushed down into the PostgreSQL query:
+
+```sql
+SELECT id, title, _score
+FROM pg_fts('articles', 'body', {query}, 10)
+WHERE category = 'ai'
+ORDER BY _score DESC
+```
+
 ## Troubleshooting
 
 ### Connection Refused

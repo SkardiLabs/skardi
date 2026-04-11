@@ -174,7 +174,7 @@ pub async fn register_postgres_tables(
         mode_str,
     );
 
-    // Register in pg_knn registry so the pg_knn() UDTF can find this table.
+    // Register in the dataset registry so pg_knn() and pg_fts() UDTFs can find this table.
     // Reuse the sqlx_pool and columns already fetched above.
     if let Some(registry) = pg_knn_registry {
         let qualified_table = format!(
@@ -194,7 +194,10 @@ pub async fn register_postgres_tables(
             .map_err(|e| anyhow::anyhow!("pg_knn registry lock poisoned: {}", e))?
             .insert(name.to_string(), DatasetEntry::Postgres(entry));
 
-        tracing::info!("Registered '{}' in pg_knn registry for vector search", name);
+        tracing::info!(
+            "Registered '{}' in dataset registry for pg_knn/pg_fts",
+            name
+        );
     }
 
     Ok(())

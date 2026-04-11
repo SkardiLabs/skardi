@@ -196,6 +196,18 @@ jobs:
               (1, 'Laptop', 999.99),
               (2, 'Keyboard', 79.99),
               (3, 'Monitor', 299.99);
+          CREATE TABLE articles (
+              id SERIAL PRIMARY KEY,
+              title VARCHAR(200) NOT NULL,
+              body TEXT NOT NULL,
+              category VARCHAR(50) NOT NULL
+          );
+          INSERT INTO articles (title, body, category) VALUES
+              ('Intro to Machine Learning', 'machine learning model training deep neural network supervised algorithms', 'ai'),
+              ('Natural Language Processing', 'natural language processing text classification sentiment analysis tokenization', 'ai'),
+              ('Database Query Optimization', 'database query optimization indexing performance tuning relational algebra', 'database'),
+              ('Deep Learning Advances', 'machine learning classification supervised training model convolutional neural network', 'research'),
+              ('Neural Network Architectures', 'deep learning neural network convolutional image recognition transformer attention', 'ai');
           EOF
 
       - name: Seed MongoDB data

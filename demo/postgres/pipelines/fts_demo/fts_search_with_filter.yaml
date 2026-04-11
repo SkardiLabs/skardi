@@ -1,0 +1,17 @@
+metadata:
+  name: "fts-search-with-filter"
+  version: "1.0.0"
+  description: >
+    Full-text search filtered by category.
+    Combines ts_rank scoring with WHERE clause filter pushdown to PostgreSQL.
+
+# Parameters:
+#   {query}    - Search terms
+#   {category} - Category to filter by
+#   {limit}    - Maximum number of results to return
+
+query: |
+  SELECT id, title, category, _score
+  FROM pg_fts('articles', 'body', {query}, {limit})
+  WHERE category = {category}
+  ORDER BY _score DESC
