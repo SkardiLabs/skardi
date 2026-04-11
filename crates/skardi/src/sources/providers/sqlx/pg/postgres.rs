@@ -1,5 +1,6 @@
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
+use HierarchyLevel;
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -62,11 +63,11 @@ pub async fn register_postgres_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
-    hierarchy_level: Option<crate::sources::HierarchyLevel>,
+    hierarchy_level: Option<HierarchyLevel>,
 ) -> Result<()> {
     let hierarchy_level = hierarchy_level.unwrap_or_default();
     match hierarchy_level {
-        crate::sources::HierarchyLevel::Catalog => {
+        HierarchyLevel::Catalog => {
             register_postgres_catalog(
                 session_ctx,
                 name,
@@ -77,7 +78,7 @@ pub async fn register_postgres_tables(
             )
             .await
         }
-        crate::sources::HierarchyLevel::Table => {
+        HierarchyLevel::Table => {
             register_single_postgres_table(
                 session_ctx,
                 name,
@@ -162,16 +163,15 @@ async fn register_single_postgres_table(
         "read-only"
     };
     tracing::info!(
-        "Registering PostgreSQL table (sqlx): {} with connection: {} ({})",
+        "Registering PostgreSQL table (sqlx): {} ({})",
         name,
-        connection_string,
         mode_str,
     );
 
     let schema_name = options
         .and_then(|opts| opts.get("schema"))
-        .unwrap_or(&"public".to_string())
-        .clone();
+        .map(|s| s.clone())
+        .unwrap_or_else(|| "public".to_string());
     let table_name = options.and_then(|opts| opts.get("table")).ok_or_else(|| {
         anyhow::anyhow!("PostgreSQL single-table registration requires 'table' option")
     })?;
@@ -219,9 +219,8 @@ async fn register_postgres_catalog(
         "read-only"
     };
     tracing::info!(
-        "Registering PostgreSQL catalog (sqlx): {} with connection: {} ({})",
+        "Registering PostgreSQL catalog (sqlx): {} ({})",
         catalog_name,
-        connection_string,
         mode_str,
     );
 
@@ -459,19 +458,27 @@ async fn list_postgres_tables_in_catalog(
     pool: &PgPool,
     allowed_schemas: Option<&Vec<String>>,
 ) -> Result<Vec<(String, String)>> {
-    let mut rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT table_schema, table_name
+    const BASE_QUERY: &str = "SELECT table_schema, table_name
          FROM information_schema.tables
-         WHERE table_type = 'BASE TABLE'
+         WHERE table_type IN ('BASE TABLE', 'VIEW')
            AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-           AND table_schema NOT LIKE 'pg_temp_%'
-         ORDER BY table_schema, table_name",
-    )
-    .fetch_all(pool)
-    .await?;
-    if let Some(allowed) = allowed_schemas {
-        rows.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
-    }
+           AND table_schema NOT LIKE 'pg_temp_%'";
+
+    let rows: Vec<(String, String)> = match allowed_schemas {
+        Some(allowed) => {
+            sqlx::query_as(&format!(
+                "{BASE_QUERY} AND table_schema = ANY($1) ORDER BY table_schema, table_name"
+            ))
+            .bind(allowed)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(&format!("{BASE_QUERY} ORDER BY table_schema, table_name"))
+                .fetch_all(pool)
+                .await?
+        }
+    };
     Ok(rows)
 }
 
@@ -1274,8 +1281,8 @@ mod tests {
         let options: HashMap<String, String> = HashMap::new();
         let schema_name = options
             .get("schema")
-            .unwrap_or(&"public".to_string())
-            .clone();
+            .map(|s| s.clone())
+            .unwrap_or_else(|| "public".to_string());
 
         assert_eq!(schema_name, "public");
     }
@@ -1287,8 +1294,8 @@ mod tests {
 
         let schema_name = options
             .get("schema")
-            .unwrap_or(&"public".to_string())
-            .clone();
+            .map(|s| s.clone())
+            .unwrap_or_else(|| "public".to_string());
 
         assert_eq!(schema_name, "custom_schema");
     }
@@ -1673,44 +1680,39 @@ mod tests {
 
     #[test]
     fn test_hierarchy_level_default_is_table() {
-        assert_eq!(
-            crate::sources::HierarchyLevel::default(),
-            crate::sources::HierarchyLevel::Table
-        );
+        assert_eq!(HierarchyLevel::default(), HierarchyLevel::Table);
     }
 
     #[test]
     fn test_hierarchy_level_as_str_table() {
-        assert_eq!(crate::sources::HierarchyLevel::Table.as_str(), "table");
+        assert_eq!(HierarchyLevel::Table.as_str(), "table");
     }
 
     #[test]
     fn test_hierarchy_level_as_str_catalog() {
-        assert_eq!(crate::sources::HierarchyLevel::Catalog.as_str(), "catalog");
+        assert_eq!(HierarchyLevel::Catalog.as_str(), "catalog");
     }
 
     #[test]
     fn test_hierarchy_level_serde_roundtrip() {
-        let table = crate::sources::HierarchyLevel::Table;
+        let table = HierarchyLevel::Table;
         let serialized = serde_json::to_string(&table).unwrap();
-        let deserialized: crate::sources::HierarchyLevel =
-            serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, crate::sources::HierarchyLevel::Table);
+        let deserialized: HierarchyLevel = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, HierarchyLevel::Table);
 
-        let catalog = crate::sources::HierarchyLevel::Catalog;
+        let catalog = HierarchyLevel::Catalog;
         let serialized = serde_json::to_string(&catalog).unwrap();
-        let deserialized: crate::sources::HierarchyLevel =
-            serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, crate::sources::HierarchyLevel::Catalog);
+        let deserialized: HierarchyLevel = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, HierarchyLevel::Catalog);
     }
 
     #[test]
     fn test_hierarchy_level_serde_lowercase_strings() {
-        let table: crate::sources::HierarchyLevel = serde_json::from_str("\"table\"").unwrap();
-        assert_eq!(table, crate::sources::HierarchyLevel::Table);
+        let table: HierarchyLevel = serde_json::from_str("\"table\"").unwrap();
+        assert_eq!(table, HierarchyLevel::Table);
 
-        let catalog: crate::sources::HierarchyLevel = serde_json::from_str("\"catalog\"").unwrap();
-        assert_eq!(catalog, crate::sources::HierarchyLevel::Catalog);
+        let catalog: HierarchyLevel = serde_json::from_str("\"catalog\"").unwrap();
+        assert_eq!(catalog, HierarchyLevel::Catalog);
     }
 
     // ─── Catalog dispatch tests (unit) ──────────────────────────────────
@@ -1728,7 +1730,7 @@ mod tests {
             None,
             false,
             None,
-            Some(crate::sources::HierarchyLevel::Catalog),
+            Some(HierarchyLevel::Catalog),
         )
         .await;
 
@@ -1749,7 +1751,7 @@ mod tests {
             None,
             false,
             None,
-            Some(crate::sources::HierarchyLevel::Table),
+            Some(HierarchyLevel::Table),
         )
         .await;
 
@@ -1787,55 +1789,32 @@ mod tests {
     }
 
     // ─── allowed_schemas filtering logic tests ───────────────────────────
+    // Filtering is pushed into SQL via `AND table_schema = ANY($1)` when
+    // `allowed_schemas` is Some.  These tests verify that `parse_allowed_schemas`
+    // produces the correct bind value that will be passed to the query.
 
-    /// Unit-test the schema filtering logic exercised inside `list_postgres_tables_in_catalog`.
     #[test]
-    fn test_allowed_schemas_filter_retains_matching_rows() {
-        let rows = vec![
-            ("public".to_string(), "users".to_string()),
-            ("private".to_string(), "secrets".to_string()),
-            ("analytics".to_string(), "events".to_string()),
-        ];
-
-        let allowed = vec!["public".to_string(), "analytics".to_string()];
-        let mut filtered = rows.clone();
-        filtered.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
-
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.contains(&("public".to_string(), "users".to_string())));
-        assert!(filtered.contains(&("analytics".to_string(), "events".to_string())));
-        assert!(!filtered.iter().any(|(s, _)| s == "private"));
+    fn test_allowed_schemas_parsed_values_are_used_as_sql_bind() {
+        let mut options = HashMap::new();
+        options.insert(
+            "allowed_schemas".to_string(),
+            "public,analytics".to_string(),
+        );
+        let allowed = parse_allowed_schemas(Some(&options)).unwrap();
+        assert_eq!(allowed, vec!["public", "analytics"]);
     }
 
     #[test]
-    fn test_allowed_schemas_filter_with_no_match() {
-        let rows = vec![
-            ("public".to_string(), "users".to_string()),
-            ("private".to_string(), "secrets".to_string()),
-        ];
-
-        let allowed = vec!["analytics".to_string()];
-        let mut filtered = rows.clone();
-        filtered.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
-
-        assert!(filtered.is_empty());
+    fn test_allowed_schemas_none_means_no_sql_filter() {
+        // None → the unrestricted SQL branch is used; no bind parameter.
+        assert!(parse_allowed_schemas(None).is_none());
     }
 
     #[test]
-    fn test_allowed_schemas_filter_none_retains_all() {
-        // When `allowed_schemas` is None the retain is skipped and all rows are kept.
-        let rows = vec![
-            ("public".to_string(), "users".to_string()),
-            ("private".to_string(), "secrets".to_string()),
-        ];
-        let allowed: Option<Vec<String>> = None;
-        let mut filtered = rows.clone();
-        if let Some(allowed) = &allowed {
-            filtered.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
-        }
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.contains(&("public".to_string(), "users".to_string())));
-        assert!(filtered.contains(&("private".to_string(), "secrets".to_string())));
+    fn test_allowed_schemas_empty_value_means_no_sql_filter() {
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), "".to_string());
+        assert!(parse_allowed_schemas(Some(&options)).is_none());
     }
 
     // ─── Integration test helpers ────────────────────────────────────────
