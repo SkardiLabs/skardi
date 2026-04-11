@@ -332,6 +332,10 @@ pub(crate) async fn read_schema_from_pragma(
     let fields: Vec<Field> = conn
         .call(
             move |conn| -> std::result::Result<Vec<Field>, tokio_rusqlite::rusqlite::Error> {
+                // Detect FTS5 virtual tables — their columns are always text,
+                // but PRAGMA table_info reports empty type strings (same as vec0).
+                let is_fts = is_fts_table(conn, &tbl);
+
                 let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", tbl))?;
                 let rows = stmt.query_map([], |row| {
                     let col_name: String = row.get(1)?;
@@ -343,7 +347,12 @@ pub(crate) async fn read_schema_from_pragma(
                 let mut fields = Vec::new();
                 for row in rows {
                     let (col_name, col_type, not_null, is_pk) = row?;
-                    let data_type = sqlite_type_to_arrow(&col_type, is_pk);
+                    let data_type = if is_fts && col_type.is_empty() && !is_pk {
+                        // FTS5 columns are always text.
+                        DataType::Utf8
+                    } else {
+                        sqlite_type_to_arrow(&col_type, is_pk)
+                    };
                     fields.push(Field::new(col_name, data_type, !not_null));
                 }
                 Ok(fields)
@@ -353,6 +362,22 @@ pub(crate) async fn read_schema_from_pragma(
         .map_err(|e| anyhow::anyhow!("PRAGMA table_info failed: {}", e))?;
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Check if a table is an FTS5 virtual table by inspecting sqlite_master.
+fn is_fts_table(conn: &tokio_rusqlite::rusqlite::Connection, table_name: &str) -> bool {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .map(|sql| {
+        let upper = sql.to_uppercase();
+        upper.contains("FTS5") || upper.contains("FTS4") || upper.contains("FTS3")
+    })
+    .unwrap_or(false)
 }
 
 #[async_trait]
