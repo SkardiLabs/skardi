@@ -287,6 +287,7 @@ query: |
             options: None,
             access_mode: AccessMode::default(),
             enable_cache: false,
+            hierarchy_level: None,
         }];
 
         let pipeline = create_test_pipeline().await;

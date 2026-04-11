@@ -948,6 +948,7 @@ query: |
             }),
             access_mode: AccessMode::default(),
             enable_cache: false,
+            hierarchy_level: None,
         };
 
         // Create pipeline that queries the registered data source

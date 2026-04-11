@@ -16,6 +16,7 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::Deserialize;
+use skardi::sources::HierarchyLevel;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
@@ -80,6 +81,8 @@ struct LocalDataSource {
     path: Option<String>,
     connection_string: Option<String>,
     options: Option<HashMap<String, String>>,
+    #[serde(default)]
+    hierarchy_level: Option<HierarchyLevel>,
 }
 
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -509,6 +512,7 @@ async fn register_source(
                 source.options.as_ref(),
                 false,
                 Some(dataset_registry),
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register Postgres '{}'", source.name))?;
