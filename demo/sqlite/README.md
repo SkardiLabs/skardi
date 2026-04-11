@@ -433,17 +433,7 @@ KNN vector search using [sqlite-vec](https://github.com/asg017/sqlite-vec) `vec0
 pip install sqlite-vec fastembed
 ```
 
-The sqlite-vec pip package provides the Python bindings for setup. However, on **macOS with Apple Silicon**, the pip dylib may be x86_64 while Skardi's bundled SQLite is arm64. In that case, compile the extension natively:
-
-```bash
-# Clone sqlite-vec source
-cd /tmp && git clone --depth 1 https://github.com/asg017/sqlite-vec.git
-
-# Compile against Skardi's bundled SQLite headers
-SQLITE_HEADERS=$(find ~/.cargo/registry/src -path "*/libsqlite3-sys-*/sqlite3/sqlite3.h" | head -1 | xargs dirname)
-cc -arch arm64 -shared -fPIC -O2 -I"$SQLITE_HEADERS" -undefined dynamic_lookup \
-  -o /path/to/your/project/demo/sqlite/vec0.dylib /tmp/sqlite-vec/sqlite-vec.c
-```
+The sqlite-vec pip package provides the Python bindings for setup.
 
 ### Setup
 
@@ -458,8 +448,6 @@ python demo/embeddings/candle/setup.py
 # 3. Set the extension path for the server
 #    If using the pip package:
 export VEC0_PATH=$(python -c "import sqlite_vec; print(sqlite_vec.loadable_path())")
-#    If using the natively compiled dylib:
-export VEC0_PATH=demo/sqlite/vec0.dylib
 ```
 
 ### Query (Semantic Search)
