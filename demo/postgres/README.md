@@ -848,12 +848,12 @@ For the context above:
 # Join users ↔ orders (both from the public schema)
 curl -X POST http://localhost:8080/list_all_users_and_orders/execute \
   -H "Content-Type: application/json" \
-  -d '{}'
+  -d '{}' | jq .
 
 # Join mydb.public.users ↔ mydb.analytics.monthly_revenue (cross-schema)
 curl -X POST http://localhost:8080/cross_schema_summary/execute \
   -H "Content-Type: application/json" \
-  -d '{}'
+  -d '{}' | jq .
 ```
 
 The pipeline SQLs use fully qualified paths so there is no ambiguity when
