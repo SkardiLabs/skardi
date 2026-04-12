@@ -11,10 +11,13 @@
 [crates.io Badge]: https://img.shields.io/crates/v/skardi.svg
 [Docs]: https://docs.rs/skardi
 [Docs Badge]: https://docs.rs/skardi/badge.svg
+[Discord]: https://discord.gg/S5YQQPEV2m
+[Discord Badge]: https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white
 
 [![CI Badge]][CI]
 [![crates.io Badge]][crates.io]
 [![Docs Badge]][Docs]
+[![Discord Badge]][Discord]
 
 </p>
 </div>
@@ -43,6 +46,7 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 
 ## Table of Contents
 
+- [Cloud (Sealos)](#cloud-sealos)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
@@ -71,6 +75,11 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 - [Observability](#observability)
 - [Docker](#docker)
 - [Building from Source](#building-from-source)
+- [Community](#community)
+
+## Cloud (Sealos)
+
+The fastest way to get started is with **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — a collection of ready-to-deploy Skardi templates for [Sealos](https://sealos.io). Launch a fully configured Skardi server in the cloud with one click, no local setup required.
 
 ## Installation
 
@@ -808,6 +817,10 @@ The [demo/](demo/) directory contains complete working examples:
 | [demo/lance/](demo/lance/) | Lance vector search and full-text search examples |
 | [demo/onnx_predict/](demo/onnx_predict/) | ONNX model inference in SQL |
 | [demo/S3_USAGE.md](demo/S3_USAGE.md) | S3 data source configuration guide |
+
+## Community
+
+Have questions, ideas, or want to share what you're building with Skardi? Join us on [Discord](https://discord.gg/S5YQQPEV2m)!
 
 ## License
 
