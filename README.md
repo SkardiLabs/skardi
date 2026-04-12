@@ -12,7 +12,7 @@
 [Docs]: https://docs.rs/skardi
 [Docs Badge]: https://docs.rs/skardi/badge.svg
 [Discord]: https://discord.gg/S5YQQPEV2m
-[Discord Badge]: https://img.shields.io/discord/1234567890?label=Discord&logo=discord&logoColor=white
+[Discord Badge]: https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white
 
 [![CI Badge]][CI]
 [![crates.io Badge]][crates.io]
