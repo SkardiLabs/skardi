@@ -36,9 +36,8 @@ use std::sync::Arc;
 /// Register PostgreSQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
 /// Single-table mode reuses datafusion-table-providers' `SqlTable` for reads and sqlx for writes
-/// (INSERT/UPDATE/DELETE), fixing issues with auto-generated columns. Catalog mode registers a
-/// [`MemoryCatalogProvider`] with one provider per table; read-write uses one shared sqlx pool
-/// cloned per table wrapper.
+/// (INSERT/UPDATE/DELETE), fixing issues with auto-generated columns. Catalog mode registers one provider per table;
+/// read-write uses one shared sqlx pool cloned per table wrapper.
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
