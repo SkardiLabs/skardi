@@ -188,6 +188,16 @@ impl SqliteKnnExec {
             ));
         };
 
+        // sqlite-vec packs the query as raw little-endian f32 bytes; NaN/Inf
+        // would be silently accepted by the C extension and produce undefined
+        // distance results. Reject them up front with a clear error.
+        if !query_vector.iter().all(|f| f.is_finite()) {
+            return Err(DataFusionError::Plan(
+                "sqlite_knn: query vector contains NaN or Inf — only finite f32 values are allowed"
+                    .to_string(),
+            ));
+        }
+
         let sql = self.build_query();
         tracing::debug!("sqlite_knn SQL: {}", sql);
 
@@ -215,8 +225,7 @@ impl SqliteKnnExec {
                     let mut rows = stmt.query([vec_bytes])?;
                     while let Some(row) = rows.next()? {
                         for col_idx in 0..num_cols {
-                            let val: tokio_rusqlite::rusqlite::types::Value =
-                                row.get_unwrap(col_idx);
+                            let val: tokio_rusqlite::rusqlite::types::Value = row.get(col_idx)?;
                             col_values[col_idx].push(val);
                         }
                     }

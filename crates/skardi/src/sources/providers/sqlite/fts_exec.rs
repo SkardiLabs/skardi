@@ -164,8 +164,7 @@ impl SqliteFtsExec {
                     let mut rows = stmt.query([&query])?;
                     while let Some(row) = rows.next()? {
                         for col_idx in 0..num_cols {
-                            let val: tokio_rusqlite::rusqlite::types::Value =
-                                row.get_unwrap(col_idx);
+                            let val: tokio_rusqlite::rusqlite::types::Value = row.get(col_idx)?;
                             col_values[col_idx].push(val);
                         }
                     }

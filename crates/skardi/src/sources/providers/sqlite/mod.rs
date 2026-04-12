@@ -292,6 +292,29 @@ impl SqliteTableProvider {
     }
 }
 
+/// Validate an extension path before loading: must be absolute and free of
+/// `..` traversal components. Catches typos or misconfigured options that
+/// could cause SQLite to load an unintended shared library.
+fn validate_extension_path(path: &str) -> Result<()> {
+    use std::path::{Component, Path};
+
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        anyhow::bail!(
+            "SQLite extension path must be absolute, got '{}'. \
+             Use an absolute path to the extension shared library.",
+            path
+        );
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        anyhow::bail!(
+            "SQLite extension path must not contain '..' components, got '{}'",
+            path
+        );
+    }
+    Ok(())
+}
+
 /// Enable WAL mode, set busy timeout, and optionally load extensions on a connection.
 async fn init_connection(
     conn: &Connection,
@@ -299,6 +322,9 @@ async fn init_connection(
     extensions: &[String],
 ) -> Result<()> {
     let timeout = busy_timeout_ms;
+    for ext_path in extensions {
+        validate_extension_path(ext_path)?;
+    }
     let exts = extensions.to_vec();
     conn.call(
         move |conn| -> std::result::Result<(), tokio_rusqlite::rusqlite::Error> {
@@ -413,7 +439,7 @@ impl TableProvider for SqliteTableProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let conn = self.next_read_conn();
-        Ok(Arc::new(SQLiteScanExec::new(
+        Ok(Arc::new(SqliteScanExec::new(
             conn,
             self.table_reference.clone(),
             Arc::clone(&self.schema),
@@ -430,7 +456,7 @@ impl TableProvider for SqliteTableProvider {
         op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let conn = self.write_conn()?;
-        Ok(Arc::new(SQLiteInsertExec::new(
+        Ok(Arc::new(SqliteInsertExec::new(
             conn,
             self.table_reference.clone(),
             Arc::clone(&self.schema),
@@ -448,7 +474,7 @@ impl TableProvider for SqliteTableProvider {
         let table = quote_sqlite_table(&self.table_reference);
         let where_clause = build_sqlite_where_clause(&filters)?;
         let sql = format!("DELETE FROM {table}{where_clause}");
-        Ok(Arc::new(SQLiteDmlExec::new(conn, sql)))
+        Ok(Arc::new(SqliteDmlExec::new(conn, sql)))
     }
 
     async fn update(
@@ -484,15 +510,15 @@ impl TableProvider for SqliteTableProvider {
         let table = quote_sqlite_table(&self.table_reference);
         let where_clause = build_sqlite_where_clause(&filters)?;
         let sql = format!("UPDATE {table} SET {set_clause}{where_clause}");
-        Ok(Arc::new(SQLiteDmlExec::new(conn, sql)))
+        Ok(Arc::new(SqliteDmlExec::new(conn, sql)))
     }
 }
 
-// ─── SQLiteScanExec ──────────────────────────────────────────────────────────
+// ─── SqliteScanExec ──────────────────────────────────────────────────────────
 
 /// Execution plan that reads from SQLite via `SELECT` with projection,
 /// filter pushdown, and limit support.
-struct SQLiteScanExec {
+struct SqliteScanExec {
     conn: Arc<Connection>,
     table_reference: TableReference,
     /// Full table schema from PRAGMA.
@@ -505,7 +531,7 @@ struct SQLiteScanExec {
     properties: PlanProperties,
 }
 
-impl SQLiteScanExec {
+impl SqliteScanExec {
     fn new(
         conn: Arc<Connection>,
         table_reference: TableReference,
@@ -566,21 +592,21 @@ impl SQLiteScanExec {
     }
 }
 
-impl fmt::Debug for SQLiteScanExec {
+impl fmt::Debug for SqliteScanExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SQLiteScanExec(table={})", self.table_reference)
+        write!(f, "SqliteScanExec(table={})", self.table_reference)
     }
 }
 
-impl DisplayAs for SQLiteScanExec {
+impl DisplayAs for SqliteScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SQLiteScanExec: table={}", self.table_reference)
+        write!(f, "SqliteScanExec: table={}", self.table_reference)
     }
 }
 
-impl ExecutionPlan for SQLiteScanExec {
+impl ExecutionPlan for SqliteScanExec {
     fn name(&self) -> &str {
-        "SQLiteScanExec"
+        "SqliteScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -633,7 +659,7 @@ impl ExecutionPlan for SQLiteScanExec {
                         while let Some(row) = rows.next()? {
                             for col_idx in 0..num_cols {
                                 let val: tokio_rusqlite::rusqlite::types::Value =
-                                    row.get_unwrap(col_idx);
+                                    row.get(col_idx)?;
                                 col_values[col_idx].push(val);
                             }
                         }
@@ -732,10 +758,10 @@ pub(crate) fn sqlite_values_to_arrow(
     }
 }
 
-// ─── SQLiteInsertExec ────────────────────────────────────────────────────────
+// ─── SqliteInsertExec ────────────────────────────────────────────────────────
 
 /// Execution plan that consumes input batches and inserts them into SQLite.
-struct SQLiteInsertExec {
+struct SqliteInsertExec {
     conn: Arc<Connection>,
     table_reference: TableReference,
     table_schema: SchemaRef,
@@ -745,7 +771,7 @@ struct SQLiteInsertExec {
     properties: PlanProperties,
 }
 
-impl SQLiteInsertExec {
+impl SqliteInsertExec {
     fn new(
         conn: Arc<Connection>,
         table_reference: TableReference,
@@ -776,21 +802,21 @@ impl SQLiteInsertExec {
     }
 }
 
-impl fmt::Debug for SQLiteInsertExec {
+impl fmt::Debug for SqliteInsertExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SQLiteInsertExec(table={})", self.table_reference)
+        write!(f, "SqliteInsertExec(table={})", self.table_reference)
     }
 }
 
-impl DisplayAs for SQLiteInsertExec {
+impl DisplayAs for SqliteInsertExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SQLiteInsertExec")
+        write!(f, "SqliteInsertExec")
     }
 }
 
-impl ExecutionPlan for SQLiteInsertExec {
+impl ExecutionPlan for SqliteInsertExec {
     fn name(&self) -> &str {
-        "SQLiteInsertExec"
+        "SqliteInsertExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -821,7 +847,7 @@ impl ExecutionPlan for SQLiteInsertExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "SQLiteInsertExec expects exactly one child".to_string(),
+                "SqliteInsertExec expects exactly one child".to_string(),
             ));
         }
         Ok(Arc::new(Self::new(
@@ -1029,18 +1055,18 @@ fn arrow_value_to_sqlite(
     }
 }
 
-// ─── SQLiteDmlExec (DELETE / UPDATE) ─────────────────────────────────────────
+// ─── SqliteDmlExec (DELETE / UPDATE) ─────────────────────────────────────────
 
 /// A leaf `ExecutionPlan` that executes a pre-built SQLite DML statement
 /// and returns a single row `{ count: u64 }` with the number of affected rows.
-struct SQLiteDmlExec {
+struct SqliteDmlExec {
     conn: Arc<Connection>,
     sql: String,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
-impl SQLiteDmlExec {
+impl SqliteDmlExec {
     fn new(conn: Arc<Connection>, sql: String) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -1062,21 +1088,21 @@ impl SQLiteDmlExec {
     }
 }
 
-impl fmt::Debug for SQLiteDmlExec {
+impl fmt::Debug for SqliteDmlExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SQLiteDmlExec(sql={})", self.sql)
+        write!(f, "SqliteDmlExec(sql={})", self.sql)
     }
 }
 
-impl DisplayAs for SQLiteDmlExec {
+impl DisplayAs for SqliteDmlExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SQLiteDmlExec")
+        write!(f, "SqliteDmlExec")
     }
 }
 
-impl ExecutionPlan for SQLiteDmlExec {
+impl ExecutionPlan for SqliteDmlExec {
     fn name(&self) -> &str {
-        "SQLiteDmlExec"
+        "SqliteDmlExec"
     }
 
     fn as_any(&self) -> &dyn Any {

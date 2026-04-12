@@ -421,6 +421,24 @@ curl -X POST http://localhost:8080/sqlite-fts-delete-article/execute \
 curl -X POST http://localhost:8080/sqlite-fts-search/execute \
   -H "Content-Type: application/json" \
   -d '{"query": "reinforcement", "limit": 5}' | jq .
+
+Response :
+
+{
+  "success": true,
+  "data": [
+    {
+      "title": "Reinforcement Learning",
+      "body": "Reinforcement Learning works by training agents through reward signals and policy optimization",
+      "category": "ai",
+      "_score": 1.1554256414233957
+    }
+  ],
+  "rows": 1,
+  "execution_time_ms": 9,
+  "timestamp": "2026-04-12T06:50:20.190923+00:00"
+}
+
 ```
 
 ## Vector Similarity Search (sqlite-vec)
@@ -465,15 +483,93 @@ curl -X POST http://localhost:8080/sqlite-knn-search/execute \
   -H "Content-Type: application/json" \
   -d '{"query": "portable computing device", "k": 3}' | jq .
 
+# Response (scores depend on the embedding model — exact values will vary)
+{
+  "success": true,
+  "data": [
+    {
+      "item_id": 1,
+      "_score": 0.6727945804595947
+    },
+    {
+      "item_id": 4,
+      "_score": 0.7535505890846252
+    },
+    {
+      "item_id": 5,
+      "_score": 0.8204019665718079
+    }
+  ],
+  "rows": 3,
+  "execution_time_ms": 295,
+  "timestamp": "2026-04-12T06:58:58.032915+00:00"
+}
+
 # KNN with JOIN to get full item details
 curl -X POST http://localhost:8080/sqlite-knn-search-with-join/execute \
   -H "Content-Type: application/json" \
   -d '{"query": "portable computing device", "k": 3}' | jq .
 
+# Response
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "name": "Laptop",
+      "category": "electronics",
+      "_score": 0.6727945804595947
+    },
+    {
+      "id": 4,
+      "name": "Tablet",
+      "category": "electronics",
+      "_score": 0.7535505890846252
+    },
+    {
+      "id": 5,
+      "name": "Notebook",
+      "category": "education",
+      "_score": 0.8204019665718079
+    }
+  ],
+  "rows": 3,
+  "execution_time_ms": 201,
+  "timestamp": "2026-04-12T06:59:14.064319+00:00"
+}
+
 # Find items similar to an existing item (scalar subquery)
 curl -X POST http://localhost:8080/sqlite-knn-search-by-seed/execute \
   -H "Content-Type: application/json" \
   -d '{"seed_id": 1, "k": 3}' | jq .
+
+# Response
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "name": "Laptop",
+      "category": "electronics",
+      "_score": 0.0
+    },
+    {
+      "id": 5,
+      "name": "Notebook",
+      "category": "education",
+      "_score": 0.5731309652328491
+    },
+    {
+      "id": 4,
+      "name": "Tablet",
+      "category": "electronics",
+      "_score": 0.6620298624038696
+    }
+  ],
+  "rows": 3,
+  "execution_time_ms": 31,
+  "timestamp": "2026-04-12T06:59:38.149485+00:00"
+}
 ```
 
 ### SQL Syntax
@@ -549,6 +645,18 @@ The `extensions` option in the context file tells Skardi to load the sqlite-vec 
 options:
   table: "vec_items"
   extensions: "/path/to/vec0"
+```
+
+## Cleanup
+
+The demo creates local SQLite database files under `demo/sqlite/`. These are
+covered by `.gitignore`, but you can remove them when you're done:
+
+```bash
+# Stop the server (Ctrl-C in its terminal) before removing files.
+rm -f demo/sqlite/demo.db demo/sqlite/demo.db-wal demo/sqlite/demo.db-shm
+rm -f demo/sqlite/fts_demo.db demo/sqlite/fts_demo.db-wal demo/sqlite/fts_demo.db-shm
+rm -f demo/sqlite/knn_demo.db demo/sqlite/knn_demo.db-wal demo/sqlite/knn_demo.db-shm
 ```
 
 ## Context File Options

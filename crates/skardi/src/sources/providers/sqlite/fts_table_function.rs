@@ -62,17 +62,21 @@ impl TableFunctionImpl for SqliteFtsTableFunction {
         let table_name = extract_string(&exprs[0], "table")?;
         let text_col = extract_string(&exprs[1], "text_col")?;
         let query = extract_string(&exprs[2], "query")?;
-        let limit = extract_int(&exprs[3], "limit")?;
-
-        // Accept NULL/empty placeholders during pipeline validation.
-        if !query.is_empty() && limit > MAX_FTS_LIMIT {
-            return plan_err!(
-                "sqlite_fts: limit must be between 1 and {}, got {}",
-                MAX_FTS_LIMIT,
-                limit
-            );
-        }
-        let limit = if limit == 0 { 1 } else { limit };
+        // `extract_int` returns `None` for NULL literals (placeholder mode used
+        // by pipeline validation) and `Some(v)` for a real value, which is
+        // already guaranteed positive. In placeholder mode, substitute a stub
+        // limit of 1 so downstream planning succeeds.
+        let limit = match extract_int(&exprs[3], "limit")? {
+            None => 1,
+            Some(v) if v > MAX_FTS_LIMIT => {
+                return plan_err!(
+                    "sqlite_fts: limit must be between 1 and {}, got {}",
+                    MAX_FTS_LIMIT,
+                    v
+                );
+            }
+            Some(v) => v,
+        };
 
         // Look up connection + columns from registry.
         let entry = {
@@ -214,9 +218,14 @@ impl TableProvider for SqliteFtsProvider {
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
 
-fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
+/// Extract an integer literal argument.
+///
+/// Returns `Ok(None)` for NULL (placeholder mode used during pipeline validation).
+/// Returns `Ok(Some(v))` for a strictly positive integer literal. Any zero or
+/// negative literal is rejected with a planning error.
+fn extract_int(expr: &Expr, name: &str) -> DFResult<Option<usize>> {
     match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => Ok(Some(*v as usize)),
         Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
             plan_err!(
                 "sqlite_fts: '{}' must be a positive integer, got {}",
@@ -224,7 +233,7 @@ fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
                 v
             )
         }
-        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => Ok(*v as usize),
+        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => Ok(Some(*v as usize)),
         Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
             plan_err!(
                 "sqlite_fts: '{}' must be a positive integer, got {}",
@@ -232,8 +241,13 @@ fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
                 v
             )
         }
-        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
-        Expr::Literal(ScalarValue::Null, _) => Ok(0),
+        Expr::Literal(ScalarValue::UInt64(Some(0)), _)
+        | Expr::Literal(ScalarValue::UInt32(Some(0)), _) => {
+            plan_err!("sqlite_fts: '{}' must be a positive integer, got 0", name)
+        }
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(Some(*v as usize)),
+        Expr::Literal(ScalarValue::UInt32(Some(v)), _) => Ok(Some(*v as usize)),
+        Expr::Literal(ScalarValue::Null, _) => Ok(None),
         _ => plan_err!("sqlite_fts: '{}' must be an integer literal", name),
     }
 }
@@ -334,6 +348,23 @@ mod tests {
         assert!(
             err.contains("limit must be between 1 and 500"),
             "expected limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_uint_zero_limit_rejected() {
+        // Unsigned 0 must not slip past the positive-integer guard.
+        let func = make_fts_function();
+        let result = func.call(&[
+            lit_str("some_table"),
+            lit_str("col"),
+            lit_str("test"),
+            Expr::Literal(ScalarValue::UInt64(Some(0)), None),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("positive integer"),
+            "expected positive-integer error, got: {err}"
         );
     }
 

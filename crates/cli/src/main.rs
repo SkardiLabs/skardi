@@ -22,8 +22,15 @@ use skardi::sources::providers::lance::knn_table_function::register_lance_knn_ud
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
-    DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
-    mongo::register_mongo_tables, mysql::register_mysql_tables, sqlite::register_sqlite_tables,
+    DatasetRegistry,
+    iceberg::register_iceberg_table,
+    lance::register_lance_table,
+    mongo::register_mongo_tables,
+    mysql::register_mysql_tables,
+    sqlite::{
+        register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_sqlite_tables,
+        register_vec_to_binary_udf,
+    },
     sqlx::postgres::register_postgres_tables,
 };
 use std::collections::HashMap;
@@ -313,7 +320,7 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
     ));
 
     let session_id = base_ctx.session_id().to_string();
-    let ctx: SessionContext = base_ctx
+    let mut ctx: SessionContext = base_ctx
         .into_state_builder()
         .with_session_id(session_id)
         .with_catalog_list(catalog_list)
@@ -322,12 +329,17 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register table functions (lance_knn, lance_fts, pg_knn, pg_fts, mongo_fts), all sharing one registry
+    // Register table functions (lance_knn, lance_fts, pg_knn, pg_fts,
+    // mongo_fts, sqlite_knn, sqlite_fts) and the vec_to_binary scalar UDF,
+    // all sharing one registry.
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_pg_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_pg_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_mongo_fts_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_sqlite_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_sqlite_fts_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_vec_to_binary_udf(&mut ctx);
 
     (ctx, dataset_registry)
 }
@@ -580,7 +592,7 @@ async fn register_source(
                 &resolved,
                 source.options.as_ref(),
                 false,
-                None,
+                Some(dataset_registry),
             )
             .await
             .with_context(|| format!("Failed to register SQLite '{}'", source.name))?;

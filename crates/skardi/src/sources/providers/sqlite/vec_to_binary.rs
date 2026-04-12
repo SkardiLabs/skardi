@@ -86,7 +86,10 @@ impl ScalarUDFImpl for VecToBinaryUDF {
                 fixed_list_f32_to_binary(list)?
             }
             DataType::Binary => {
-                // Already binary — pass through.
+                // Already a packed-f32 BLOB (e.g. read directly from a vec0
+                // table or produced by a prior vec_to_binary call). Forward it
+                // unchanged so chained pipelines and round-trips work without
+                // an extra encode/decode step.
                 array
             }
             other => {
