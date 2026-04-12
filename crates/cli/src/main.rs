@@ -594,6 +594,7 @@ async fn register_source(
                 source.options.as_ref(),
                 false,
                 Some(dataset_registry),
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register SQLite '{}'", source.name))?;

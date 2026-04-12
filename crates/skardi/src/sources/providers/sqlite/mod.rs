@@ -37,12 +37,18 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_rusqlite::Connection;
 
+use crate::sources::hierarchy::{HierarchyLevel, build_catalog, parse_allowed_schemas};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Default number of read connections in the pool.
 const DEFAULT_READ_POOL_SIZE: usize = 4;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RETRIES: u32 = 3;
 
 /// Create a read-only SQLite table provider for a single table.
 pub async fn create_sqlite_table_provider(
@@ -62,19 +68,28 @@ pub async fn create_sqlite_table_provider(
     Ok(Arc::new(provider))
 }
 
-/// Register SQLite tables into DataFusion SessionContext
+/// Register SQLite tables or a whole database (catalog) into a DataFusion [`SessionContext`].
+///
+/// Single-table mode (default) registers one table under `name`. Catalog mode registers a
+/// [`MemoryCatalogProvider`] with one provider per table across all non-system tables in the
+/// database (SQLite schema `main`).
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
-/// * `name` - Name to register the table as
+/// * `name` - Name to register the table (table mode) or catalog (catalog mode) as
 /// * `db_path` - Path to the SQLite database file (e.g., "/data/my.db")
-/// * `options` - Optional configuration (e.g., table name)
-/// * `read_write` - If true, register as read-write table provider (allows INSERT/UPDATE/DELETE)
+/// * `options` - Optional configuration (see below)
+/// * `read_write` - If true, register as read-write (allows INSERT/UPDATE/DELETE)
+/// * `registry` - Optional dataset registry for sqlite_knn / sqlite_fts table functions
+/// * `hierarchy_level` - `None` → table mode (default); `Some(HierarchyLevel::Catalog)` loads the whole DB
 ///
 /// # Options
-/// * `table` - Specific table name to register (required)
+/// * `table` - Table name (required in table mode, not used in catalog mode)
 /// * `busy_timeout_ms` - Busy timeout in milliseconds (optional, defaults to 5000)
-/// * `read_pool_size` - Number of read connections (optional, defaults to 4)
+/// * `read_pool_size` - Number of read connections per table (optional, defaults to 4)
+/// * `extensions` - Comma-separated extension paths to load (e.g. sqlite-vec)
+/// * `extensions_env` - Comma-separated env var names whose values are extension paths
+/// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only; SQLite schema is `main`)
 pub async fn register_sqlite_tables(
     session_ctx: &mut SessionContext,
     name: &str,
@@ -82,12 +97,52 @@ pub async fn register_sqlite_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     registry: Option<&DatasetRegistry>,
+    hierarchy_level: Option<HierarchyLevel>,
 ) -> Result<()> {
+    let hierarchy_level = hierarchy_level.unwrap_or_default();
     let mode_str = if read_write {
         "read-write"
     } else {
         "read-only"
     };
+    match hierarchy_level {
+        HierarchyLevel::Catalog => {
+            register_sqlite_catalog(
+                session_ctx,
+                name,
+                db_path,
+                options,
+                read_write,
+                mode_str,
+                registry,
+            )
+            .await
+        }
+        HierarchyLevel::Table => {
+            register_single_sqlite_table(
+                session_ctx,
+                name,
+                db_path,
+                options,
+                read_write,
+                mode_str,
+                registry,
+            )
+            .await
+        }
+    }
+}
+
+/// Register one SQLite table under `name` in the default catalog.
+async fn register_single_sqlite_table(
+    session_ctx: &mut SessionContext,
+    name: &str,
+    db_path: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
+    registry: Option<&DatasetRegistry>,
+) -> Result<()> {
     tracing::info!(
         "Registering SQLite table: {} with path: {} ({})",
         name,
@@ -188,6 +243,213 @@ pub async fn register_sqlite_tables(
     );
 
     Ok(())
+}
+
+/// Register an entire SQLite database as a named DataFusion catalog.
+///
+/// All non-system tables and views in the `main` schema are registered automatically.
+/// Tables are addressable with the three-part reference `catalog.main.table`.
+async fn register_sqlite_catalog(
+    session_ctx: &mut SessionContext,
+    catalog_name: &str,
+    db_path: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
+    registry: Option<&DatasetRegistry>,
+) -> Result<()> {
+    tracing::info!(
+        "Registering SQLite catalog: {} ({})",
+        catalog_name,
+        mode_str
+    );
+
+    let busy_timeout_ms: u64 = options
+        .and_then(|opts| opts.get("busy_timeout_ms"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+
+    let read_pool_size: usize = options
+        .and_then(|opts| opts.get("read_pool_size"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_READ_POOL_SIZE);
+
+    let mut extensions: Vec<String> = options
+        .and_then(|opts| opts.get("extensions"))
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    if let Some(env_key) = options.and_then(|opts| opts.get("extensions_env")) {
+        for key in env_key.split(',') {
+            let key = key.trim();
+            if let Ok(val) = std::env::var(key) {
+                extensions.push(val);
+            } else {
+                tracing::warn!("SQLite extension env var '{}' not set, skipping", key);
+            }
+        }
+    }
+
+    let mut schema_tables = {
+        let mut last_err = anyhow::anyhow!("unreachable");
+        let mut result = None;
+        for attempt in 1..=MAX_RETRIES {
+            match timeout(
+                CONNECT_TIMEOUT,
+                list_sqlite_tables_in_catalog(db_path, busy_timeout_ms, &extensions),
+            )
+            .await
+            {
+                Ok(Ok(rows)) => {
+                    result = Some(rows);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = e.context(format!(
+                        "Failed to list SQLite tables for catalog '{}'",
+                        catalog_name
+                    ));
+                    tracing::warn!(
+                        "SQLite catalog '{}': introspection attempt {}/{} failed: {}",
+                        catalog_name,
+                        attempt,
+                        MAX_RETRIES,
+                        last_err
+                    );
+                }
+                Err(_) => {
+                    last_err = anyhow::anyhow!(
+                        "Timed out after {}s opening SQLite database for catalog '{}'. \
+                         Check that the database file is accessible.",
+                        CONNECT_TIMEOUT.as_secs(),
+                        catalog_name
+                    );
+                    tracing::warn!(
+                        "SQLite catalog '{}': introspection attempt {}/{} timed out",
+                        catalog_name,
+                        attempt,
+                        MAX_RETRIES
+                    );
+                }
+            }
+        }
+        result.ok_or(last_err)?
+    };
+
+    let allowed_schemas = parse_allowed_schemas(options);
+    if let Some(ref allowed) = allowed_schemas {
+        schema_tables.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+    }
+
+    if schema_tables.is_empty() {
+        tracing::warn!(
+            "No tables found in SQLite catalog for source '{}'",
+            catalog_name
+        );
+    }
+
+    let table_count = schema_tables.len();
+
+    let db_path_owned = db_path.to_string();
+    let extensions_arc = Arc::new(extensions);
+    let catalog_name_owned = catalog_name.to_string();
+
+    build_catalog(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        |schema, table_name| {
+            let db_path_c = db_path_owned.clone();
+            let extensions_c = Arc::clone(&extensions_arc);
+            let registry_c = registry.map(Arc::clone);
+            let catalog_c = catalog_name_owned.clone();
+            async move {
+                let provider = SqliteTableProvider::new(
+                    &db_path_c,
+                    TableReference::bare(table_name.as_str()),
+                    busy_timeout_ms,
+                    read_pool_size,
+                    read_write,
+                    &extensions_c,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create SQLite table provider for '{}.{}'",
+                        schema, table_name
+                    )
+                })?;
+
+                if let Some(registry) = registry_c {
+                    let columns: Vec<(String, DataType)> = provider
+                        .schema
+                        .fields()
+                        .iter()
+                        .map(|f| (f.name().clone(), f.data_type().clone()))
+                        .collect();
+                    let entry = SqliteEntry {
+                        conn: Arc::clone(&provider.read_pool[0]),
+                        table_name: table_name.clone(),
+                        columns,
+                    };
+                    let key = format!("{}.{}.{}", catalog_c, schema, table_name);
+                    let mut reg = registry
+                        .write()
+                        .map_err(|e| anyhow::anyhow!("sqlite registry lock error: {}", e))?;
+                    reg.insert(key, DatasetEntry::Sqlite(entry));
+                }
+
+                Ok(Arc::new(provider) as Arc<dyn TableProvider>)
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("Failed to build SQLite catalog '{}'", catalog_name))?;
+
+    tracing::info!(
+        "Registered SQLite catalog '{}' with {} table(s) ({})",
+        catalog_name,
+        table_count,
+        mode_str
+    );
+
+    Ok(())
+}
+
+/// List all non-system tables and views in the SQLite database's `main` schema.
+async fn list_sqlite_tables_in_catalog(
+    db_path: &str,
+    busy_timeout_ms: u64,
+    extensions: &[String],
+) -> Result<Vec<(String, String)>> {
+    let conn = Connection::open(db_path).await.with_context(|| {
+        format!(
+            "Failed to open SQLite database for catalog introspection: {}",
+            db_path
+        )
+    })?;
+    init_connection(&conn, busy_timeout_ms, extensions).await?;
+
+    let names: Vec<String> = conn
+        .call(
+            move |conn| -> std::result::Result<Vec<String>, tokio_rusqlite::rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type IN ('table', 'view') \
+                       AND name NOT LIKE 'sqlite_%' \
+                     ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(names)
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list tables in SQLite catalog: {}", e))?;
+
+    // SQLite's primary schema is always "main"
+    Ok(names.into_iter().map(|t| ("main".to_string(), t)).collect())
 }
 
 // ─── SqliteTableProvider ─────────────────────────────────────────────────────
