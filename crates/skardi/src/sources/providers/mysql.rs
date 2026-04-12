@@ -38,8 +38,7 @@ const MAX_RETRIES: u32 = 3;
 
 /// Register MySQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
-/// Single-table mode (default) registers one table under `name`.  Catalog mode registers a
-/// [`MemoryCatalogProvider`] with one provider per table across all non-system schemas.
+/// Single-table mode (default) registers one table under `name`.  Catalog mode registers one provider per table across all non-system schemas.
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
