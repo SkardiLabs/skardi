@@ -1,0 +1,12 @@
+metadata:
+  name: "sqlite-fts-delete-article"
+  version: "1.0.0"
+  description: >
+    Delete an article from the FTS5 virtual table by title.
+    The FTS5 index is updated automatically on DELETE.
+
+# Parameters:
+#   {title} - Title of the article to delete
+
+query: |
+  DELETE FROM articles_fts WHERE title = {title}

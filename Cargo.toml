@@ -41,7 +41,7 @@ datafusion = { version = "52.1.0", default-features = false, features = [
 datafusion-common = { version = "52.1.0" }
 datafusion-federation = "=0.5.1"
 datafusion-table-providers = { version = "0.10.0", default-features = false, features = ["postgres", "mysql"] }
-tokio-rusqlite = "0.7"
+tokio-rusqlite = { version = "0.7", features = ["bundled", "load_extension"] }
 env_logger = "0.11"
 futures = "0.3"
 iceberg = "0.9.0"

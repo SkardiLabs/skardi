@@ -929,12 +929,14 @@ async fn register_data_source(
                         error: "Invalid SQLite database path".to_string(),
                     })?;
 
+            let sqlite_registry = optimizer_registry.map(|r| r.datasets());
             register_sqlite_tables(
                 session_ctx,
                 &source.name,
                 db_path,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                sqlite_registry.as_ref(),
             )
             .await
             .map_err(|e| {

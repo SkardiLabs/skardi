@@ -1,12 +1,22 @@
+pub mod fts_exec;
+pub mod fts_table_function;
+pub mod knn_exec;
+pub mod knn_table_function;
+pub mod vec_to_binary;
+
+pub use fts_table_function::register_sqlite_fts_udtf;
+pub use knn_table_function::{SqliteEntry, register_sqlite_knn_udtf};
+pub use vec_to_binary::register_vec_to_binary_udf;
+
 use anyhow::{Context, Result};
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
+    Int64Array, ListArray, RecordBatch, StringArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Constraints;
+use datafusion::common::{Constraints, ScalarValue};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -29,6 +39,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_rusqlite::Connection;
 
+use crate::sources::providers::{DatasetEntry, DatasetRegistry};
+
 /// Default number of read connections in the pool.
 const DEFAULT_READ_POOL_SIZE: usize = 4;
 
@@ -44,6 +56,7 @@ pub async fn create_sqlite_table_provider(
         5000,
         DEFAULT_READ_POOL_SIZE,
         false,
+        &[],
     )
     .await?;
     Ok(Arc::new(provider))
@@ -68,6 +81,7 @@ pub async fn register_sqlite_tables(
     db_path: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
+    registry: Option<&DatasetRegistry>,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
@@ -96,6 +110,23 @@ pub async fn register_sqlite_tables(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_READ_POOL_SIZE);
 
+    // Comma-separated list of extension paths to load (e.g. sqlite-vec).
+    // Supports both literal paths (`extensions`) and env var names (`extensions_env`).
+    let mut extensions: Vec<String> = options
+        .and_then(|opts| opts.get("extensions"))
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    if let Some(env_key) = options.and_then(|opts| opts.get("extensions_env")) {
+        for key in env_key.split(',') {
+            let key = key.trim();
+            if let Ok(val) = std::env::var(key) {
+                extensions.push(val);
+            } else {
+                tracing::warn!("SQLite extension env var '{}' not set, skipping", key);
+            }
+        }
+    }
+
     tracing::debug!(
         "Connecting to SQLite table: {} in database '{}' as '{}'",
         table_name,
@@ -111,6 +142,7 @@ pub async fn register_sqlite_tables(
         busy_timeout_ms,
         read_pool_size,
         read_write,
+        &extensions,
     )
     .await
     .with_context(|| {
@@ -119,6 +151,26 @@ pub async fn register_sqlite_tables(
             table_name
         )
     })?;
+
+    // Populate the registry for sqlite_knn / sqlite_fts table functions.
+    if let Some(registry) = registry {
+        let columns: Vec<(String, DataType)> = provider
+            .schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect();
+        let entry = SqliteEntry {
+            conn: Arc::clone(&provider.read_pool[0]),
+            table_name: table_name.clone(),
+            columns,
+        };
+        let mut reg = registry
+            .write()
+            .map_err(|e| anyhow::anyhow!("sqlite registry lock error: {}", e))?;
+        reg.insert(name.to_string(), DatasetEntry::Sqlite(entry));
+        tracing::debug!("Registered SQLite table '{}' in dataset registry", name);
+    }
 
     session_ctx
         .register_table(name, Arc::new(provider))
@@ -171,13 +223,14 @@ impl fmt::Debug for SqliteTableProvider {
 }
 
 impl SqliteTableProvider {
-    /// Open connections, enable WAL mode, read schema from PRAGMA table_info().
+    /// Open connections, enable WAL mode, load extensions, read schema from PRAGMA table_info().
     async fn new(
         db_path: &str,
         table_reference: TableReference,
         busy_timeout_ms: u64,
         read_pool_size: usize,
         read_write: bool,
+        extensions: &[String],
     ) -> Result<Self> {
         let pool_size = read_pool_size.max(1);
 
@@ -187,7 +240,7 @@ impl SqliteTableProvider {
             let conn = Connection::open(db_path)
                 .await
                 .with_context(|| format!("Failed to open SQLite read connection: {}", db_path))?;
-            init_connection(&conn, busy_timeout_ms).await?;
+            init_connection(&conn, busy_timeout_ms, extensions).await?;
             read_pool.push(Arc::new(conn));
         }
 
@@ -196,7 +249,7 @@ impl SqliteTableProvider {
             let conn = Connection::open(db_path)
                 .await
                 .with_context(|| format!("Failed to open SQLite write connection: {}", db_path))?;
-            init_connection(&conn, busy_timeout_ms).await?;
+            init_connection(&conn, busy_timeout_ms, extensions).await?;
             Some(Arc::new(conn))
         } else {
             None
@@ -239,13 +292,56 @@ impl SqliteTableProvider {
     }
 }
 
-/// Enable WAL mode and set busy timeout on a connection.
-async fn init_connection(conn: &Connection, busy_timeout_ms: u64) -> Result<()> {
+/// Validate an extension path before loading: must be absolute and free of
+/// `..` traversal components. Catches typos or misconfigured options that
+/// could cause SQLite to load an unintended shared library.
+fn validate_extension_path(path: &str) -> Result<()> {
+    use std::path::{Component, Path};
+
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        anyhow::bail!(
+            "SQLite extension path must be absolute, got '{}'. \
+             Use an absolute path to the extension shared library.",
+            path
+        );
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        anyhow::bail!(
+            "SQLite extension path must not contain '..' components, got '{}'",
+            path
+        );
+    }
+    Ok(())
+}
+
+/// Enable WAL mode, set busy timeout, and optionally load extensions on a connection.
+async fn init_connection(
+    conn: &Connection,
+    busy_timeout_ms: u64,
+    extensions: &[String],
+) -> Result<()> {
     let timeout = busy_timeout_ms;
+    for ext_path in extensions {
+        validate_extension_path(ext_path)?;
+    }
+    let exts = extensions.to_vec();
     conn.call(
         move |conn| -> std::result::Result<(), tokio_rusqlite::rusqlite::Error> {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "busy_timeout", timeout)?;
+
+            // Load dynamic extensions (e.g. sqlite-vec for vec0 virtual tables).
+            if !exts.is_empty() {
+                // SAFETY: extension loading is intentionally enabled here based on
+                // user-configured `extensions` option. We disable it again after loading.
+                unsafe { conn.load_extension_enable()? };
+                for ext_path in &exts {
+                    unsafe { conn.load_extension(ext_path, None::<&str>)? };
+                }
+                conn.load_extension_disable()?;
+            }
+
             Ok(())
         },
     )
@@ -254,22 +350,35 @@ async fn init_connection(conn: &Connection, busy_timeout_ms: u64) -> Result<()> 
 }
 
 /// Read schema via PRAGMA table_info().
-async fn read_schema_from_pragma(conn: &Connection, table_name: &str) -> Result<SchemaRef> {
+pub(crate) async fn read_schema_from_pragma(
+    conn: &Connection,
+    table_name: &str,
+) -> Result<SchemaRef> {
     let tbl = table_name.to_string();
     let fields: Vec<Field> = conn
         .call(
             move |conn| -> std::result::Result<Vec<Field>, tokio_rusqlite::rusqlite::Error> {
+                // Detect FTS5 virtual tables — their columns are always text,
+                // but PRAGMA table_info reports empty type strings (same as vec0).
+                let is_fts = is_fts_table(conn, &tbl);
+
                 let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", tbl))?;
                 let rows = stmt.query_map([], |row| {
                     let col_name: String = row.get(1)?;
                     let col_type: String = row.get(2)?;
                     let not_null: bool = row.get(3)?;
-                    Ok((col_name, col_type, not_null))
+                    let is_pk: bool = row.get::<_, i32>(5)? != 0;
+                    Ok((col_name, col_type, not_null, is_pk))
                 })?;
                 let mut fields = Vec::new();
                 for row in rows {
-                    let (col_name, col_type, not_null) = row?;
-                    let data_type = sqlite_type_to_arrow(&col_type);
+                    let (col_name, col_type, not_null, is_pk) = row?;
+                    let data_type = if is_fts && col_type.is_empty() && !is_pk {
+                        // FTS5 columns are always text.
+                        DataType::Utf8
+                    } else {
+                        sqlite_type_to_arrow(&col_type, is_pk)
+                    };
                     fields.push(Field::new(col_name, data_type, !not_null));
                 }
                 Ok(fields)
@@ -279,6 +388,22 @@ async fn read_schema_from_pragma(conn: &Connection, table_name: &str) -> Result<
         .map_err(|e| anyhow::anyhow!("PRAGMA table_info failed: {}", e))?;
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Check if a table is an FTS5 virtual table by inspecting sqlite_master.
+fn is_fts_table(conn: &tokio_rusqlite::rusqlite::Connection, table_name: &str) -> bool {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .map(|sql| {
+        let upper = sql.to_uppercase();
+        upper.contains("FTS5") || upper.contains("FTS4") || upper.contains("FTS3")
+    })
+    .unwrap_or(false)
 }
 
 #[async_trait]
@@ -314,7 +439,7 @@ impl TableProvider for SqliteTableProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let conn = self.next_read_conn();
-        Ok(Arc::new(SQLiteScanExec::new(
+        Ok(Arc::new(SqliteScanExec::new(
             conn,
             self.table_reference.clone(),
             Arc::clone(&self.schema),
@@ -331,7 +456,7 @@ impl TableProvider for SqliteTableProvider {
         op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let conn = self.write_conn()?;
-        Ok(Arc::new(SQLiteInsertExec::new(
+        Ok(Arc::new(SqliteInsertExec::new(
             conn,
             self.table_reference.clone(),
             Arc::clone(&self.schema),
@@ -349,7 +474,7 @@ impl TableProvider for SqliteTableProvider {
         let table = quote_sqlite_table(&self.table_reference);
         let where_clause = build_sqlite_where_clause(&filters)?;
         let sql = format!("DELETE FROM {table}{where_clause}");
-        Ok(Arc::new(SQLiteDmlExec::new(conn, sql)))
+        Ok(Arc::new(SqliteDmlExec::new(conn, sql)))
     }
 
     async fn update(
@@ -385,15 +510,15 @@ impl TableProvider for SqliteTableProvider {
         let table = quote_sqlite_table(&self.table_reference);
         let where_clause = build_sqlite_where_clause(&filters)?;
         let sql = format!("UPDATE {table} SET {set_clause}{where_clause}");
-        Ok(Arc::new(SQLiteDmlExec::new(conn, sql)))
+        Ok(Arc::new(SqliteDmlExec::new(conn, sql)))
     }
 }
 
-// ─── SQLiteScanExec ──────────────────────────────────────────────────────────
+// ─── SqliteScanExec ──────────────────────────────────────────────────────────
 
 /// Execution plan that reads from SQLite via `SELECT` with projection,
 /// filter pushdown, and limit support.
-struct SQLiteScanExec {
+struct SqliteScanExec {
     conn: Arc<Connection>,
     table_reference: TableReference,
     /// Full table schema from PRAGMA.
@@ -406,7 +531,7 @@ struct SQLiteScanExec {
     properties: PlanProperties,
 }
 
-impl SQLiteScanExec {
+impl SqliteScanExec {
     fn new(
         conn: Arc<Connection>,
         table_reference: TableReference,
@@ -467,21 +592,21 @@ impl SQLiteScanExec {
     }
 }
 
-impl fmt::Debug for SQLiteScanExec {
+impl fmt::Debug for SqliteScanExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SQLiteScanExec(table={})", self.table_reference)
+        write!(f, "SqliteScanExec(table={})", self.table_reference)
     }
 }
 
-impl DisplayAs for SQLiteScanExec {
+impl DisplayAs for SqliteScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SQLiteScanExec: table={}", self.table_reference)
+        write!(f, "SqliteScanExec: table={}", self.table_reference)
     }
 }
 
-impl ExecutionPlan for SQLiteScanExec {
+impl ExecutionPlan for SqliteScanExec {
     fn name(&self) -> &str {
-        "SQLiteScanExec"
+        "SqliteScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -534,7 +659,7 @@ impl ExecutionPlan for SQLiteScanExec {
                         while let Some(row) = rows.next()? {
                             for col_idx in 0..num_cols {
                                 let val: tokio_rusqlite::rusqlite::types::Value =
-                                    row.get_unwrap(col_idx);
+                                    row.get(col_idx)?;
                                 col_values[col_idx].push(val);
                             }
                         }
@@ -563,7 +688,7 @@ impl ExecutionPlan for SQLiteScanExec {
 }
 
 /// Convert a column of `rusqlite::types::Value` into an Arrow `ArrayRef`.
-fn sqlite_values_to_arrow(
+pub(crate) fn sqlite_values_to_arrow(
     values: &[tokio_rusqlite::rusqlite::types::Value],
     data_type: &DataType,
 ) -> ArrayRef {
@@ -633,10 +758,10 @@ fn sqlite_values_to_arrow(
     }
 }
 
-// ─── SQLiteInsertExec ────────────────────────────────────────────────────────
+// ─── SqliteInsertExec ────────────────────────────────────────────────────────
 
 /// Execution plan that consumes input batches and inserts them into SQLite.
-struct SQLiteInsertExec {
+struct SqliteInsertExec {
     conn: Arc<Connection>,
     table_reference: TableReference,
     table_schema: SchemaRef,
@@ -646,7 +771,7 @@ struct SQLiteInsertExec {
     properties: PlanProperties,
 }
 
-impl SQLiteInsertExec {
+impl SqliteInsertExec {
     fn new(
         conn: Arc<Connection>,
         table_reference: TableReference,
@@ -677,21 +802,21 @@ impl SQLiteInsertExec {
     }
 }
 
-impl fmt::Debug for SQLiteInsertExec {
+impl fmt::Debug for SqliteInsertExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SQLiteInsertExec(table={})", self.table_reference)
+        write!(f, "SqliteInsertExec(table={})", self.table_reference)
     }
 }
 
-impl DisplayAs for SQLiteInsertExec {
+impl DisplayAs for SqliteInsertExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SQLiteInsertExec")
+        write!(f, "SqliteInsertExec")
     }
 }
 
-impl ExecutionPlan for SQLiteInsertExec {
+impl ExecutionPlan for SqliteInsertExec {
     fn name(&self) -> &str {
-        "SQLiteInsertExec"
+        "SqliteInsertExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -722,7 +847,7 @@ impl ExecutionPlan for SQLiteInsertExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "SQLiteInsertExec expects exactly one child".to_string(),
+                "SqliteInsertExec expects exactly one child".to_string(),
             ));
         }
         Ok(Arc::new(Self::new(
@@ -902,22 +1027,46 @@ fn arrow_value_to_sqlite(
         DataType::LargeUtf8 => Value::Text(array.as_string::<i64>().value(row).to_string()),
         DataType::Binary => Value::Blob(array.as_binary::<i32>().value(row).to_vec()),
         DataType::LargeBinary => Value::Blob(array.as_binary::<i64>().value(row).to_vec()),
+        // List<Float32> → packed little-endian f32 BLOB (for sqlite-vec vec0 tables).
+        DataType::List(field) if *field.data_type() == DataType::Float32 => {
+            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = list.value(row);
+            let f32_arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
+            let blob: Vec<u8> = f32_arr
+                .values()
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            Value::Blob(blob)
+        }
+        // FixedSizeList<Float32> → packed little-endian f32 BLOB.
+        DataType::FixedSizeList(field, _) if *field.data_type() == DataType::Float32 => {
+            let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let values = list.value(row);
+            let f32_arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
+            let blob: Vec<u8> = f32_arr
+                .values()
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            Value::Blob(blob)
+        }
         _ => Value::Text(format!("{:?}", array.as_ref())),
     }
 }
 
-// ─── SQLiteDmlExec (DELETE / UPDATE) ─────────────────────────────────────────
+// ─── SqliteDmlExec (DELETE / UPDATE) ─────────────────────────────────────────
 
 /// A leaf `ExecutionPlan` that executes a pre-built SQLite DML statement
 /// and returns a single row `{ count: u64 }` with the number of affected rows.
-struct SQLiteDmlExec {
+struct SqliteDmlExec {
     conn: Arc<Connection>,
     sql: String,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
-impl SQLiteDmlExec {
+impl SqliteDmlExec {
     fn new(conn: Arc<Connection>, sql: String) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -939,21 +1088,21 @@ impl SQLiteDmlExec {
     }
 }
 
-impl fmt::Debug for SQLiteDmlExec {
+impl fmt::Debug for SqliteDmlExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SQLiteDmlExec(sql={})", self.sql)
+        write!(f, "SqliteDmlExec(sql={})", self.sql)
     }
 }
 
-impl DisplayAs for SQLiteDmlExec {
+impl DisplayAs for SqliteDmlExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SQLiteDmlExec")
+        write!(f, "SqliteDmlExec")
     }
 }
 
-impl ExecutionPlan for SQLiteDmlExec {
+impl ExecutionPlan for SqliteDmlExec {
     fn name(&self) -> &str {
-        "SQLiteDmlExec"
+        "SqliteDmlExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1016,9 +1165,23 @@ impl ExecutionPlan for SQLiteDmlExec {
 // ─── Helper functions ────────────────────────────────────────────────────────
 
 /// Map SQLite type affinity strings to Arrow DataTypes.
-fn sqlite_type_to_arrow(sqlite_type: &str) -> DataType {
+///
+/// `is_pk` indicates whether the column is a primary key. Virtual tables
+/// (e.g. sqlite-vec vec0) report empty type strings for all columns via
+/// PRAGMA table_info. Primary key columns with empty type are INTEGER rowids;
+/// non-pk columns with empty type are typically BLOBs (e.g. vector embeddings).
+pub(crate) fn sqlite_type_to_arrow(sqlite_type: &str, is_pk: bool) -> DataType {
     let upper = sqlite_type.to_uppercase();
-    if upper.contains("INT") {
+    if upper.is_empty() {
+        if is_pk {
+            // Virtual table primary keys (rowid) are always INTEGER.
+            DataType::Int64
+        } else {
+            // Non-pk virtual table columns (e.g. vec0 embeddings) — map to
+            // Binary so BLOB data is preserved correctly.
+            DataType::Binary
+        }
+    } else if upper.contains("INT") {
         DataType::Int64
     } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUBLE") {
         DataType::Float64
@@ -1051,8 +1214,29 @@ fn build_sqlite_where_clause(filters: &[Expr]) -> DataFusionResult<String> {
 }
 
 /// Quotes a SQLite identifier with double quotes, escaping any embedded double quotes.
-fn quote_sqlite_ident(s: &str) -> String {
+pub(crate) fn quote_sqlite_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Try to convert a DataFusion `Expr` to a SQLite SQL string suitable for
+/// use in a WHERE clause pushed down to SQLite.
+pub(crate) fn expr_to_sqlite_sql(expr: &Expr) -> Option<String> {
+    let unparser = Unparser::new(&SqliteDialect {});
+    unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
+}
+
+/// Extract a string literal from a DataFusion `Expr`.
+/// Returns an empty string for NULL placeholders (schema inference).
+pub(crate) fn extract_string(expr: &Expr, name: &str) -> DataFusionResult<String> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
+        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
+        _ => Err(DataFusionError::Plan(format!(
+            "sqlite: '{}' must be a string literal",
+            name
+        ))),
+    }
 }
 
 /// Produces a properly quoted table reference string for SQLite.
@@ -1065,7 +1249,19 @@ fn quote_sqlite_table(tbl: &TableReference) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{Array as _, Int64Array};
+
+    #[test]
+    fn test_empty_type_maps_to_binary_for_non_pk() {
+        // vec0 virtual tables report empty type strings for vector columns.
+        assert_eq!(sqlite_type_to_arrow("", false), DataType::Binary);
+    }
+
+    #[test]
+    fn test_empty_type_maps_to_int64_for_pk() {
+        // vec0 primary key columns report empty type but are INTEGER rowids.
+        assert_eq!(sqlite_type_to_arrow("", true), DataType::Int64);
+    }
 
     #[test]
     fn test_quote_sqlite_ident() {
@@ -1084,9 +1280,15 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut session_ctx = SessionContext::new();
-            let result =
-                register_sqlite_tables(&mut session_ctx, "test_table", "/tmp/test.db", None, false)
-                    .await;
+            let result = register_sqlite_tables(
+                &mut session_ctx,
+                "test_table",
+                "/tmp/test.db",
+                None,
+                false,
+                None,
+            )
+            .await;
 
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
@@ -1127,7 +1329,7 @@ mod tests {
     async fn register_test_table(ctx: &mut SessionContext, db_path: &str) {
         let mut options = HashMap::new();
         options.insert("table".to_string(), "test_items".to_string());
-        register_sqlite_tables(ctx, "test_items", db_path, Some(&options), true)
+        register_sqlite_tables(ctx, "test_items", db_path, Some(&options), true, None)
             .await
             .expect("register sqlite table");
     }
@@ -1548,7 +1750,7 @@ mod tests {
         ] {
             let mut options = HashMap::new();
             options.insert("table".to_string(), table_name.to_string());
-            register_sqlite_tables(ctx, reg_name, db_path, Some(&options), true)
+            register_sqlite_tables(ctx, reg_name, db_path, Some(&options), true, None)
                 .await
                 .unwrap_or_else(|e| panic!("register {} failed: {}", reg_name, e));
         }
@@ -1697,5 +1899,201 @@ mod tests {
         )
         .await;
         assert_eq!(total_rows(&batches), 3);
+    }
+
+    // ─── Read-your-own-write tests ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_read_own_write_insert_then_select() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        // Insert via DataFusion
+        ctx.sql("INSERT INTO test_items (id, name, value) VALUES (4, 'dave', 40)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Read back immediately — must see the new row
+        let batches = query_all(&ctx, "SELECT id, name FROM test_items WHERE id = 4").await;
+        assert_eq!(
+            total_rows(&batches),
+            1,
+            "inserted row must be visible immediately"
+        );
+
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "dave");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_read_own_write_delete_then_select() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        // Delete via DataFusion
+        ctx.sql("DELETE FROM test_items WHERE id = 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Read back — deleted row must be gone
+        let batches = query_all(&ctx, "SELECT id FROM test_items WHERE id = 1").await;
+        assert_eq!(total_rows(&batches), 0, "deleted row must not be visible");
+
+        // Other rows still present
+        let batches = query_all(&ctx, "SELECT id FROM test_items").await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_read_own_write_update_then_select() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        // Update via DataFusion
+        ctx.sql("UPDATE test_items SET value = 999 WHERE id = 2")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Read back — must see updated value
+        let batches = query_all(&ctx, "SELECT value FROM test_items WHERE id = 2").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            values.value(0),
+            999,
+            "updated value must be visible immediately"
+        );
+    }
+
+    // ─── Virtual-table empty-type column tests ─────────────────────────
+
+    /// Create a temp SQLite database with a table that has an empty-type column
+    /// (simulates vec0 virtual table behaviour where PRAGMA reports '' for
+    /// vector columns).
+    async fn create_empty_type_db() -> tempfile::TempPath {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = tmp.into_temp_path();
+        let db_path = path.to_str().unwrap().to_string();
+
+        let conn = Connection::open(&db_path).await.expect("open temp sqlite");
+        conn.call(|conn| -> Result<(), tokio_rusqlite::rusqlite::Error> {
+            // Use "" as the column type to simulate vec0's PRAGMA output.
+            conn.execute_batch(
+                "CREATE TABLE blob_items (
+                     id   INTEGER PRIMARY KEY,
+                     data \"\"  -- empty type, like vec0 virtual tables
+                 );",
+            )?;
+
+            // Insert packed f32 BLOBs.
+            let vecs: Vec<(i64, Vec<f32>)> =
+                vec![(1, vec![1.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0])];
+            let mut stmt = conn.prepare("INSERT INTO blob_items (id, data) VALUES (?1, ?2)")?;
+            for (id, vec) in &vecs {
+                let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(tokio_rusqlite::rusqlite::params![id, blob])?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed blob_items table");
+        conn.close().await.expect("close seed connection");
+
+        path
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_empty_type_column_read_as_binary() {
+        let db_path = create_empty_type_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "blob_items".to_string());
+        register_sqlite_tables(&mut ctx, "blob_items", db, Some(&options), false, None)
+            .await
+            .expect("register blob_items");
+
+        // Read back — data column should be Binary, not Utf8
+        let batches = query_all(&ctx, "SELECT id, data FROM blob_items ORDER BY id").await;
+        assert_eq!(total_rows(&batches), 2);
+
+        let schema = batches[0].schema();
+        let data_field = schema.field_with_name("data").unwrap();
+        assert_eq!(
+            *data_field.data_type(),
+            DataType::Binary,
+            "empty-type column should map to Binary"
+        );
+
+        // Verify BLOB content is preserved (first row: [1.0, 0.0, 0.0])
+        let data_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("data column should be BinaryArray");
+        let blob = data_col.value(0);
+        assert_eq!(blob.len(), 12, "3 × f32 = 12 bytes");
+
+        let floats: Vec<f32> = blob
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(floats, vec![1.0f32, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_empty_type_column_subquery_extracts_blob() {
+        let db_path = create_empty_type_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "blob_items".to_string());
+        register_sqlite_tables(&mut ctx, "blob_items", db, Some(&options), false, None)
+            .await
+            .expect("register blob_items");
+
+        // Subquery fetching a BLOB column should work (simulates the vec0
+        // subquery path in sqlite_knn).
+        let batches = query_all(&ctx, "SELECT data FROM blob_items WHERE id = 1").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let data_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("subquery should return BinaryArray");
+        assert!(!data_col.is_null(0), "BLOB should not be null");
+        assert_eq!(data_col.value(0).len(), 12);
     }
 }
