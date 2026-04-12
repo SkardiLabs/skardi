@@ -1,0 +1,21 @@
+metadata:
+  name: "vector-search-catalog"
+  version: "1.0.0"
+  description: >
+    KNN similarity search against a pgvector column loaded as part of a catalog entry.
+    In catalog mode the pg_knn registry key is "catalog.schema.table", so the first
+    argument must use the fully-qualified three-part name.
+    Pass a literal float array as {query_vector} — e.g. [0.6, 0.8, 0.0, 0.0].
+    Score is cosine distance in [0, 2] — lower means more similar.
+
+# Parameters:
+#   {query_vector} - Float array to search against, e.g. [0.6, 0.8, 0.0, 0.0]
+#   {limit}        - Maximum number of results to return
+
+query: |
+  SELECT id, content, metadata, _score
+  FROM pg_knn('mydb.public.documents', 'embedding',
+      {query_vector},
+      '<=>', 10)
+  ORDER BY _score
+  LIMIT {limit}

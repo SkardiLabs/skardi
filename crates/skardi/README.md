@@ -23,8 +23,8 @@ Query files, databases, data lakes, and vector stores with SQL — and serve res
 [dependencies]
 skardi = "0.1"
 
-# With ONNX model inference
-skardi = { version = "0.1", features = ["onnx"] }
+# With embedding (ONNX, Candle, GGUF, remote embeddings)
+skardi = { version = "0.1", features = ["embedding"] }
 ```
 
 ## Quick Start

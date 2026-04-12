@@ -35,7 +35,7 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
 - **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
-- **Vector search** — Native KNN similarity search via Lance integration
+- **Vector search** — Native KNN similarity search via Lance integration, or via PG vector.
 - **Full-text search** — BM25-scored full-text search via Lance inverted indexes
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime

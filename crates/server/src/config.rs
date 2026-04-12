@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::remote_storage::{RemoteStorage, S3Storage};
 pub use skardi::sources::AccessMode;
+pub use skardi::sources::HierarchyLevel;
 
 /// CLI arguments for the Skardi server
 #[derive(Parser, Debug)]
@@ -73,6 +74,9 @@ pub struct DataSource {
     pub schema: Option<HashMap<String, String>>,
     /// Optional format-specific options
     pub options: Option<HashMap<String, String>>,
+    /// Registration hierarchy level for database sources (`None` / omitted → table)
+    #[serde(default)]
+    pub hierarchy_level: Option<HierarchyLevel>,
     /// Access mode: read_only (default) or read_write
     #[serde(default)]
     pub access_mode: AccessMode,
@@ -167,6 +171,12 @@ pub enum ConfigError {
 
     #[error("Write operation not allowed on data source '{table_name}'. The data source is configured with 'read_only' access mode. Set access_mode to 'read_write' to enable write operations.")]
     WriteOperationNotAllowed { table_name: String },
+
+    #[error("Data source '{name}' uses hierarchy_level 'catalog' but also specifies the '{option}' option. In catalog mode use 'allowed_schemas' to filter schemas; 'table' and 'schema' are not allowed.")]
+    CatalogModeConflictingOptions { name: String, option: String },
+
+    #[error("Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\".")]
+    EmptyAllowedSchemas { name: String },
 }
 
 // ============================================================================
@@ -536,6 +546,41 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
             .into());
         }
 
+        // Catalog mode must not mix with per-table / per-schema options
+        if source.source_type == DataSourceType::Postgres
+            && source.hierarchy_level == Some(HierarchyLevel::Catalog)
+        {
+            for conflicting in &["table", "schema"] {
+                if source
+                    .options
+                    .as_ref()
+                    .map(|o| o.contains_key(*conflicting))
+                    .unwrap_or(false)
+                {
+                    return Err(ConfigError::CatalogModeConflictingOptions {
+                        name: source.name.clone(),
+                        option: conflicting.to_string(),
+                    }
+                    .into());
+                }
+            }
+
+            // allowed_schemas, if present, must not be an empty string
+            if let Some(value) = source
+                .options
+                .as_ref()
+                .and_then(|o| o.get("allowed_schemas"))
+            {
+                let has_entry = value.split(',').any(|s| !s.trim().is_empty());
+                if !has_entry {
+                    return Err(ConfigError::EmptyAllowedSchemas {
+                        name: source.name.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
+
         match (&source.source_type, s3_storage.is_remote_path(&source.path)) {
             (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, true) => {
                 // Validate S3 configuration for S3 paths
@@ -816,6 +861,7 @@ async fn register_data_source(
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
                 pg_knn_registry.as_ref(),
+                source.hierarchy_level,
             )
             .await
             .map_err(|e| {
