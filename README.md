@@ -38,11 +38,13 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
 - **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
-- **Vector search** — Native KNN similarity search via Lance integration, or via PG vector.
+- **Vector search** — Native KNN similarity search via Lance, `pg_knn` for PostgreSQL pgvector, and SQLite-vec; generate embeddings inline via GGUF (local) or remote embedding APIs
 - **Full-text search** — BM25-scored full-text search via Lance inverted indexes
+- **Catalog mode** — Load an entire PostgreSQL, MySQL, or SQLite database as a DataFusion catalog with a single config entry; no per-table registration needed
+- **Simple auth** — Drop-in user authentication via [better-auth](https://www.better-auth.com/) backed by an internal SQLite database
 - **S3 support** — Read CSV, Parquet, and Lance files directly from S3
 - **Docker ready** — Ship as a container with your config files mounted at runtime
-- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF (requires `--features onnx`)
+- **ONNX inference** — Run ONNX model predictions inline in SQL via the `onnx_predict` UDF
 
 ## Table of Contents
 
@@ -70,6 +72,8 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
   - [Apache Iceberg](#apache-iceberg)
   - [Lance (Vector Search & Full-Text Search)](#lance-vector-search--full-text-search)
   - [S3 Remote Files](#s3-remote-files)
+- [Catalog Mode](#catalog-mode)
+- [Authentication](#authentication)
 - [ONNX Model Inference](#onnx-model-inference)
 - [Federated Queries](#federated-queries)
 - [Observability](#observability)
@@ -88,15 +92,11 @@ The fastest way to get started is with **[skardi-skills](https://github.com/Skar
 Pre-built Docker images are published to GitHub Container Registry on every release.
 
 ```bash
-# Default image
+# Latest release
 docker pull ghcr.io/skardilabs/skardi/skardi-server:latest
-
-# With ONNX inference support
-docker pull ghcr.io/skardilabs/skardi/skardi-server-onnx:latest
 
 # Pull a specific version
 docker pull ghcr.io/skardilabs/skardi/skardi-server:0.1.0
-docker pull ghcr.io/skardilabs/skardi/skardi-server-onnx:0.1.0
 ```
 
 ### CLI Binary
@@ -597,12 +597,47 @@ export AWS_SECRET_ACCESS_KEY="your_secret"
 
 For full S3 configuration, IAM permissions, and troubleshooting, see [demo/S3_USAGE.md](demo/S3_USAGE.md).
 
-## ONNX Model Inference
+## Catalog Mode
 
-> **Note:** ONNX support is behind a feature flag. Build with `--features onnx` to enable it:
-> ```bash
-> cargo build --release -p skardi-server --features onnx
-> ```
+Instead of registering tables one by one, set `hierarchy_level: "catalog"` on a data source to load the entire database automatically. Every table and view is registered under a named DataFusion catalog and queried with a three-part reference.
+
+Supported for **PostgreSQL**, **MySQL**, and **SQLite**.
+
+```yaml
+data_sources:
+  - name: "mydb_catalog"
+    type: "postgres"          # or mysql / sqlite
+    hierarchy_level: "catalog"
+    connection_string: "postgres://localhost:5432/mydb"
+    options:
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+      # Optionally restrict to specific schemas:
+      # allowed_schemas: "public,analytics"
+```
+
+Tables are then addressable as `catalog.schema.table`:
+
+```sql
+-- PostgreSQL / MySQL
+SELECT * FROM mydb_catalog.public.users LIMIT 10;
+
+-- SQLite (schema is always "main")
+SELECT * FROM mydb_catalog.main.users LIMIT 10;
+```
+
+See the demo directories for full working examples:
+- [demo/postgres/](demo/postgres/) — `ctx_postgres_catalog_demo.yaml`
+- [demo/mysql/](demo/mysql/) — `ctx_mysql_catalog_demo.yaml`
+- [demo/sqlite/](demo/sqlite/) — `ctx_sqlite_catalog_demo.yaml`
+
+## Authentication
+
+Skardi supports drop-in user authentication via **[better-auth](https://www.better-auth.com/)**, backed by an internal SQLite database — no external auth service required. Protect your pipeline endpoints with session-based auth by adding a single config block.
+
+See [demo/](demo/) for a working example.
+
+## ONNX Model Inference
 
 Run ONNX model predictions directly in SQL using the `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
 
@@ -750,9 +785,6 @@ Then open Grafana at **http://localhost:3000** — all three datasources (Tempo,
 
 ```bash
 docker build -t skardi .
-
-# With ONNX support
-docker build -t skardi --build-arg FEATURES=onnx .
 ```
 
 ### Run with config files mounted
@@ -797,8 +829,8 @@ cargo install --path crates/cli
 # Build server
 cargo build --release -p skardi-server
 
-# Build server with ONNX model inference support
-cargo build --release -p skardi-server --features onnx
+# Build server (ONNX inference included)
+cargo build --release -p skardi-server
 ```
 
 ## Demo & Examples
