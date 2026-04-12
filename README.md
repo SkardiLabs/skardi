@@ -38,7 +38,8 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
 - **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
-- **Vector search** — Native KNN similarity search via Lance, `pg_knn` for PostgreSQL pgvector, and SQLite-vec; generate embeddings inline via GGUF (local) or remote embedding APIs (requires `--features embedding`)
+- **Vector search** — Native KNN similarity search via Lance, `pg_knn` for PostgreSQL pgvector, and SQLite-vec
+- **Embedding inference** — Generate embeddings inline via GGUF, Candle, or remote embedding APIs (requires `--features embedding`)
 - **Full-text search** — BM25-scored full-text search via Lance inverted indexes
 - **Catalog mode** — Load an entire PostgreSQL, MySQL, or SQLite database as a DataFusion catalog with a single config entry; no per-table registration needed
 - **Simple auth** — Drop-in user authentication via [better-auth](https://www.better-auth.com/) backed by an internal SQLite database
@@ -639,6 +640,11 @@ See [demo/](demo/) for a working example.
 
 ## ONNX Model Inference
 
+> **Note:** ONNX, GGUF, Candle, and remote embedding support require building with `--features embedding`:
+> ```bash
+> cargo build --release -p skardi-server --features embedding
+> ```
+
 Run ONNX model predictions directly in SQL using the `onnx_predict` scalar UDF. Models are loaded lazily on first use and cached in memory.
 
 ```sql
@@ -786,7 +792,7 @@ Then open Grafana at **http://localhost:3000** — all three datasources (Tempo,
 ```bash
 docker build -t skardi .
 
-# With embedding support (GGUF, remote embed, pg_knn)
+# With embedding support (ONNX, GGUF, Candle, remote embed)
 docker build -t skardi --build-arg FEATURES=embedding .
 ```
 
@@ -832,10 +838,7 @@ cargo install --path crates/cli
 # Build server
 cargo build --release -p skardi-server
 
-# Build server
-cargo build --release -p skardi-server
-
-# Build server with embedding support (GGUF, remote embed, pg_knn)
+# With embedding support (ONNX, GGUF, Candle, remote embed)
 cargo build --release -p skardi-server --features embedding
 ```
 
