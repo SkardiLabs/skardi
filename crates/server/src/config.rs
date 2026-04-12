@@ -547,7 +547,8 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         }
 
         // Catalog mode must not mix with per-table / per-schema options
-        if source.source_type == DataSourceType::Postgres
+        if (source.source_type == DataSourceType::Postgres
+            || source.source_type == DataSourceType::Mysql)
             && source.hierarchy_level == Some(HierarchyLevel::Catalog)
         {
             for conflicting in &["table", "schema"] {
@@ -902,6 +903,7 @@ async fn register_data_source(
                 connection_string,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                source.hierarchy_level,
             )
             .await
             .map_err(|e| {

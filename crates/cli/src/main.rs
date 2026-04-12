@@ -539,6 +539,7 @@ async fn register_source(
                 conn_str,
                 source.options.as_ref(),
                 false,
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register MySQL '{}'", source.name))?;

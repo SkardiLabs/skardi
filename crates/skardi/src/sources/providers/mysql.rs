@@ -1,3 +1,4 @@
+use crate::sources::hierarchy::{HierarchyLevel, build_catalog, parse_allowed_schemas};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -19,6 +20,7 @@ use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use futures::stream;
 use mysql_async::prelude::Queryable;
@@ -28,36 +30,88 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 
-/// Register MySQL tables into DataFusion SessionContext
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RETRIES: u32 = 3;
+
+/// Register MySQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
+///
+/// Single-table mode (default) registers one table under `name`.  Catalog mode registers a
+/// [`MemoryCatalogProvider`] with one provider per table across all non-system schemas.
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
-/// * `name` - Name to register the table as
+/// * `name` - Name to register the table (table mode) or catalog (catalog mode) as
 /// * `connection_string` - MySQL connection string (e.g., "mysql://host:port/db")
 ///   Note: Username and password should NOT be included in the connection string.
 ///   Use `user_env` and `pass_env` options instead.
-/// * `options` - Optional configuration (e.g., table name, schema)
-/// * `read_write` - If true, register as read-write table provider (allows INSERT/UPDATE/DELETE)
+/// * `options` - Optional configuration (see below)
+/// * `read_write` - If true, register as read-write (allows INSERT/UPDATE/DELETE)
+/// * `hierarchy_level` - `None` → table mode (default); `Some(HierarchyLevel::Catalog)` loads the whole DB
 ///
 /// # Options
-/// * `table` - Specific table name to register (required)
-/// * `schema` - Schema/database name (optional, can be in connection string)
-/// * `user_env` - Environment variable name for username (optional, if not set, no username is used)
-/// * `pass_env` - Environment variable name for password (optional, if not set, no password is used)
-/// * `ssl_mode` - SSL mode: "disabled", "preferred", "required" (optional, defaults to "disabled" for local dev)
+/// * `table` - Table name (required in table mode)
+/// * `schema` - Database/schema name (optional in table mode)
+/// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only)
+/// * `user_env` - Environment variable name for username
+/// * `pass_env` - Environment variable name for password
+/// * `ssl_mode` - "disabled" | "preferred" | "required" (default: "disabled")
 pub async fn register_mysql_tables(
     session_ctx: &mut SessionContext,
     name: &str,
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
+    hierarchy_level: Option<HierarchyLevel>,
+) -> Result<()> {
+    let hierarchy_level = hierarchy_level.unwrap_or_default();
+    let mode_str = if read_write {
+        "read-write"
+    } else {
+        "read-only"
+    };
+    match hierarchy_level {
+        HierarchyLevel::Catalog => {
+            register_mysql_catalog(
+                session_ctx,
+                name,
+                connection_string,
+                options,
+                read_write,
+                mode_str,
+            )
+            .await
+        }
+        HierarchyLevel::Table => {
+            register_single_mysql_table(
+                session_ctx,
+                name,
+                connection_string,
+                options,
+                read_write,
+                mode_str,
+            )
+            .await
+        }
+    }
+}
+
+/// Register one MySQL table under `name` in the default catalog.
+async fn register_single_mysql_table(
+    session_ctx: &mut SessionContext,
+    name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
 ) -> Result<()> {
     tracing::info!(
-        "Registering MySQL table: {} with connection: {} (read_write: {})",
+        "Registering MySQL table: {} with connection: {} ({})",
         name,
         connection_string,
-        read_write
+        mode_str
     );
     tracing::debug!("Options: {:?}", options);
 
@@ -85,26 +139,229 @@ pub async fn register_mysql_tables(
             .with_context(|| format!("Failed to create MySQL connection pool for '{}'", name))?,
     );
 
-    let factory = MySQLTableFactory::new(Arc::clone(&pool));
-
     let table_reference = if let Some(schema) = schema_name {
         TableReference::partial(schema.as_str(), table_name.as_str())
     } else {
         TableReference::bare(table_name.as_str())
     };
 
-    let mode_str = if read_write {
-        "read-write"
-    } else {
-        "read-only"
-    };
     tracing::debug!(
         "Creating MySQL table provider ({}) for: {:?}",
         mode_str,
         table_reference
     );
 
-    let table_provider = if read_write {
+    let table_provider =
+        build_mysql_table_provider(Arc::clone(&pool), table_reference.clone(), read_write).await?;
+
+    session_ctx
+        .register_table(name, table_provider)
+        .map_err(|e| {
+            tracing::error!("Failed to register table with DataFusion: {:?}", e);
+            e
+        })
+        .with_context(|| format!("Failed to register MySQL table '{}' with DataFusion", name))?;
+
+    tracing::info!(
+        "Successfully registered MySQL table '{}' as '{}' ({})",
+        table_reference,
+        name,
+        mode_str
+    );
+
+    Ok(())
+}
+
+/// Register an entire MySQL database as a named DataFusion catalog.
+async fn register_mysql_catalog(
+    session_ctx: &mut SessionContext,
+    catalog_name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
+) -> Result<()> {
+    tracing::info!("Registering MySQL catalog: {} ({})", catalog_name, mode_str,);
+
+    let params = parse_connection_params(connection_string, options)?;
+    let pool = Arc::new({
+        let mut last_err = anyhow::anyhow!("unreachable");
+        let mut succeeded = false;
+        let mut result = None;
+        for attempt in 1..=MAX_RETRIES {
+            match timeout(CONNECT_TIMEOUT, MySQLConnectionPool::new(params.clone())).await {
+                Ok(Ok(p)) => {
+                    succeeded = true;
+                    result = Some(p);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = anyhow::anyhow!(e).context(format!(
+                        "Failed to create MySQL connection pool for catalog '{}'",
+                        catalog_name
+                    ));
+                    tracing::warn!(
+                        "MySQL catalog '{}': connection attempt {}/{} failed: {}",
+                        catalog_name,
+                        attempt,
+                        MAX_RETRIES,
+                        last_err
+                    );
+                }
+                Err(_) => {
+                    last_err = anyhow::anyhow!(
+                        "Timed out after {}s connecting to MySQL for catalog '{}'. \
+                         Check that MySQL is reachable and credentials are correct.",
+                        CONNECT_TIMEOUT.as_secs(),
+                        catalog_name
+                    );
+                    tracing::warn!(
+                        "MySQL catalog '{}': connection attempt {}/{} timed out",
+                        catalog_name,
+                        attempt,
+                        MAX_RETRIES
+                    );
+                }
+            }
+        }
+        if !succeeded {
+            return Err(last_err);
+        }
+        result.unwrap()
+    });
+
+    let allowed_schemas = parse_allowed_schemas(options);
+    let schema_tables = {
+        let mut last_err = anyhow::anyhow!("unreachable");
+        let mut result = None;
+        for attempt in 1..=MAX_RETRIES {
+            match timeout(
+                CONNECT_TIMEOUT,
+                list_mysql_tables_in_catalog(&pool, allowed_schemas.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(rows)) => {
+                    result = Some(rows);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = e.context(format!(
+                        "Failed to list MySQL tables for catalog-wide registration in source '{}'",
+                        catalog_name
+                    ));
+                    tracing::warn!(
+                        "MySQL catalog '{}': introspection attempt {}/{} failed: {}",
+                        catalog_name,
+                        attempt,
+                        MAX_RETRIES,
+                        last_err
+                    );
+                }
+                Err(_) => {
+                    last_err = anyhow::anyhow!(
+                        "Timed out after {}s querying information_schema for catalog '{}'. \
+                         Check that MySQL is reachable and credentials are correct.",
+                        CONNECT_TIMEOUT.as_secs(),
+                        catalog_name
+                    );
+                    tracing::warn!(
+                        "MySQL catalog '{}': introspection attempt {}/{} timed out",
+                        catalog_name,
+                        attempt,
+                        MAX_RETRIES
+                    );
+                }
+            }
+        }
+        result.ok_or(last_err)?
+    };
+
+    if schema_tables.is_empty() {
+        tracing::warn!(
+            "No tables found in MySQL catalog for source '{}'",
+            catalog_name
+        );
+    }
+
+    let table_count = schema_tables.len();
+
+    build_catalog(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        |_schema, table_name| {
+            let pool = Arc::clone(&pool);
+            async move {
+                // Use a bare reference: the pool is already connected to the right database,
+                // and MySQLTableFactory's table_exists check only matches unqualified names.
+                let table_reference = TableReference::bare(table_name.as_str());
+                build_mysql_table_provider(pool, table_reference, read_write).await
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("Failed to build MySQL catalog '{}'", catalog_name))?;
+
+    tracing::info!(
+        "Registered MySQL catalog '{}' with {} table(s) ({})",
+        catalog_name,
+        table_count,
+        mode_str
+    );
+
+    Ok(())
+}
+
+/// List all user tables and views across a MySQL instance via `information_schema`.
+///
+/// Reuses the already-established `pool` connection (avoiding a second handshake).
+/// Excludes built-in system schemas (`mysql`, `information_schema`, `performance_schema`, `sys`).
+/// When `allowed_schemas` is `Some`, only those schemas are returned.
+async fn list_mysql_tables_in_catalog(
+    pool: &MySQLConnectionPool,
+    allowed_schemas: Option<&Vec<String>>,
+) -> Result<Vec<(String, String)>> {
+    let db_conn = pool.connect().await.map_err(|e| {
+        anyhow::anyhow!("Failed to connect to MySQL for catalog introspection: {e}")
+    })?;
+
+    let mysql_conn = db_conn
+        .as_any()
+        .downcast_ref::<datafusion_table_providers::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection>()
+        .ok_or_else(|| anyhow::anyhow!("Unexpected MySQL connection type during catalog introspection"))?;
+
+    let mut conn = mysql_conn.conn.lock().await;
+
+    let mut rows: Vec<(String, String)> = conn
+        .query_map(
+            "SELECT table_schema, table_name
+             FROM information_schema.tables
+             WHERE table_type IN ('BASE TABLE', 'VIEW')
+               AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+             ORDER BY table_schema, table_name",
+            |(schema, table): (String, String)| (schema, table),
+        )
+        .await
+        .with_context(|| "Failed to query information_schema for catalog listing")?;
+
+    if let Some(allowed) = allowed_schemas {
+        rows.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+    }
+
+    Ok(rows)
+}
+
+/// Build a [`TableProvider`] for a single MySQL table, wrapping read-write providers in
+/// [`MySQLDmlProvider`] to expose `DELETE` and `UPDATE` support.
+async fn build_mysql_table_provider(
+    pool: Arc<MySQLConnectionPool>,
+    table_reference: TableReference,
+    read_write: bool,
+) -> Result<Arc<dyn TableProvider>> {
+    let factory = MySQLTableFactory::new(Arc::clone(&pool));
+
+    let inner = if read_write {
         factory
             .read_write_table_provider(table_reference.clone())
             .await
@@ -128,33 +385,17 @@ pub async fn register_mysql_tables(
             })?
     };
 
-    // Wrap read-write providers to expose DELETE/UPDATE support
-    let table_provider: Arc<dyn TableProvider> = if read_write {
+    let result: Arc<dyn TableProvider> = if read_write {
         Arc::new(MySQLDmlProvider {
-            inner: table_provider,
-            pool: Arc::clone(&pool),
-            table_reference: table_reference.clone(),
+            inner,
+            pool,
+            table_reference,
         })
     } else {
-        table_provider
+        inner
     };
 
-    session_ctx
-        .register_table(name, table_provider)
-        .map_err(|e| {
-            tracing::error!("Failed to register table with DataFusion: {:?}", e);
-            e
-        })
-        .with_context(|| format!("Failed to register MySQL table '{}' with DataFusion", name))?;
-
-    tracing::info!(
-        "Successfully registered MySQL table '{}' as '{}' ({})",
-        table_reference,
-        name,
-        mode_str
-    );
-
-    Ok(())
+    Ok(result)
 }
 
 // ─── DML support wrapper ────────────────────────────────────────────────────
@@ -652,12 +893,53 @@ mod tests {
                 "mysql://localhost:3306/db",
                 None,
                 false,
+                None,
             )
             .await;
 
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
             assert!(error_msg.contains("requires 'table' option"));
+        });
+    }
+
+    // ─── HierarchyLevel dispatch tests ──────────────────────────────────
+
+    #[test]
+    fn test_hierarchy_level_default_is_table() {
+        assert_eq!(HierarchyLevel::default(), HierarchyLevel::Table);
+    }
+
+    #[test]
+    fn test_hierarchy_level_none_routes_to_table_mode() {
+        // None → table mode → fails with "requires 'table' option", not a catalog error.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut ctx = SessionContext::new();
+            let err =
+                register_mysql_tables(&mut ctx, "t", "mysql://localhost/db", None, false, None)
+                    .await
+                    .unwrap_err();
+            assert!(err.to_string().contains("requires 'table' option"));
+        });
+    }
+
+    #[test]
+    fn test_hierarchy_level_table_explicit_routes_to_table_mode() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut ctx = SessionContext::new();
+            let err = register_mysql_tables(
+                &mut ctx,
+                "t",
+                "mysql://localhost/db",
+                None,
+                false,
+                Some(HierarchyLevel::Table),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("requires 'table' option"));
         });
     }
 
@@ -736,9 +1018,29 @@ mod tests {
             "mysql://127.0.0.1:3306/mydb",
             Some(&options),
             true,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
+    }
+
+    /// Register the entire CI MySQL database as a catalog under `catalog_name`.
+    /// Expects MYSQL_USER and MYSQL_PASSWORD env vars to be set.
+    async fn register_ci_catalog(ctx: &mut SessionContext, catalog_name: &str) {
+        let mut options = HashMap::new();
+        options.insert("user_env".to_string(), "MYSQL_USER".to_string());
+        options.insert("pass_env".to_string(), "MYSQL_PASSWORD".to_string());
+        options.insert("ssl_mode".to_string(), "disabled".to_string());
+        register_mysql_tables(
+            ctx,
+            catalog_name,
+            "mysql://127.0.0.1:3306/mydb",
+            Some(&options),
+            false,
+            Some(HierarchyLevel::Catalog),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register catalog {} failed: {}", catalog_name, e));
     }
 
     async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -1162,6 +1464,140 @@ mod tests {
         )
         .await;
         assert!(total_rows(&batches) >= 3);
+    }
+
+    // ─── Catalog mode tests (integration) ───────────────────────────────
+
+    /// Catalog is registered and contains the expected schema + tables.
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_registers_expected_tables() {
+        let mut ctx = SessionContext::new();
+        register_ci_catalog(&mut ctx, "mydb_catalog").await;
+
+        let catalog = ctx.catalog("mydb_catalog").expect("catalog not found");
+        let schema = catalog.schema("mydb").expect("schema 'mydb' not found");
+        assert!(
+            schema.table("users").await.unwrap().is_some(),
+            "table 'users' missing from catalog"
+        );
+        assert!(
+            schema.table("orders").await.unwrap().is_some(),
+            "table 'orders' missing from catalog"
+        );
+    }
+
+    /// Tables can be queried using the three-part `catalog.schema.table` reference.
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_scan_via_qualified_name() {
+        let mut ctx = SessionContext::new();
+        register_ci_catalog(&mut ctx, "mydb_catalog").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id, name FROM mydb_catalog.mydb.users ORDER BY id",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 3);
+    }
+
+    /// Two tables from the same catalog can be joined with qualified references.
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_cross_table_join() {
+        let mut ctx = SessionContext::new();
+        register_ci_catalog(&mut ctx, "mydb_catalog").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT u.name, o.product
+             FROM mydb_catalog.mydb.users u
+             INNER JOIN mydb_catalog.mydb.orders o ON u.id = o.user_id
+             ORDER BY o.id",
+        )
+        .await;
+        assert!(total_rows(&batches) >= 3);
+    }
+
+    /// `allowed_schemas` restricts catalog registration to the listed schemas.
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_allowed_schemas_includes_only_listed() {
+        let mut ctx = SessionContext::new();
+        let mut options = HashMap::new();
+        options.insert("user_env".to_string(), "MYSQL_USER".to_string());
+        options.insert("pass_env".to_string(), "MYSQL_PASSWORD".to_string());
+        options.insert("ssl_mode".to_string(), "disabled".to_string());
+        options.insert("allowed_schemas".to_string(), "mydb".to_string());
+
+        register_mysql_tables(
+            &mut ctx,
+            "filtered_catalog",
+            "mysql://127.0.0.1:3306/mydb",
+            Some(&options),
+            false,
+            Some(HierarchyLevel::Catalog),
+        )
+        .await
+        .expect("register filtered catalog");
+
+        let catalog = ctx.catalog("filtered_catalog").expect("catalog not found");
+        assert!(
+            catalog.schema("mydb").is_some(),
+            "allowed schema 'mydb' should be present"
+        );
+        assert!(
+            catalog.schema("information_schema").is_none(),
+            "system schema should be excluded"
+        );
+    }
+
+    /// Read-write catalog mode allows INSERT and subsequent scan via qualified name.
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_read_write_insert_and_scan() {
+        let mut ctx = SessionContext::new();
+        let mut options = HashMap::new();
+        options.insert("user_env".to_string(), "MYSQL_USER".to_string());
+        options.insert("pass_env".to_string(), "MYSQL_PASSWORD".to_string());
+        options.insert("ssl_mode".to_string(), "disabled".to_string());
+
+        register_mysql_tables(
+            &mut ctx,
+            "mydb_rw",
+            "mysql://127.0.0.1:3306/mydb",
+            Some(&options),
+            true,
+            Some(HierarchyLevel::Catalog),
+        )
+        .await
+        .expect("register rw catalog");
+
+        ctx.sql(
+            "INSERT INTO mydb_rw.mydb.users (name, email)
+             VALUES ('CatalogInsert', 'catalog_insert@example.com')",
+        )
+        .await
+        .expect("parse insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id FROM mydb_rw.mydb.users WHERE name = 'CatalogInsert'",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1);
+
+        // Cleanup
+        ctx.sql("DELETE FROM mydb_rw.mydb.users WHERE name = 'CatalogInsert'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -1,11 +1,11 @@
-use crate::sources::HierarchyLevel;
+use crate::sources::hierarchy::{HierarchyLevel, build_catalog, parse_allowed_schemas};
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, Session};
+use datafusion::catalog::Session;
 use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -243,73 +243,40 @@ async fn register_postgres_catalog(
         );
     }
 
-    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
+    let table_count = schema_tables.len();
+    let catalog_name_owned = catalog_name.to_string();
+    let knn_registry = pg_knn_registry.map(Arc::clone);
 
-    for (schema, table_name) in &schema_tables {
-        let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
-        let table_provider = build_and_register_table(
-            &read_pool,
-            &sqlx_pool,
-            schema,
-            table_name,
-            read_write,
-            pg_knn_registry,
-            &knn_key,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to build table provider for '{}.{}' in catalog '{}'",
-                schema, table_name, catalog_name
-            )
-        })?;
-
-        if catalog_provider.schema(schema).is_none() {
-            catalog_provider
-                .register_schema(schema, Arc::new(MemorySchemaProvider::new()))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to register schema '{}' for catalog '{}': {}",
-                        schema,
-                        catalog_name,
-                        e
-                    )
-                })?;
-        }
-
-        let schema_provider = catalog_provider.schema(schema).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Schema '{}' was not found after registration in catalog '{}'",
-                schema,
-                catalog_name
-            )
-        })?;
-
-        schema_provider
-            .register_table(table_name.to_string(), table_provider)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to register table '{}.{}' in catalog '{}': {}",
-                    schema,
-                    table_name,
-                    catalog_name,
-                    e
+    build_catalog(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        |schema, table_name| {
+            let read_pool = Arc::clone(&read_pool);
+            let sqlx_pool = sqlx_pool.clone();
+            let catalog_name = catalog_name_owned.clone();
+            let knn_registry = knn_registry.clone();
+            async move {
+                let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
+                build_and_register_table(
+                    &read_pool,
+                    &sqlx_pool,
+                    &schema,
+                    &table_name,
+                    read_write,
+                    knn_registry.as_ref(),
+                    &knn_key,
                 )
-            })?;
+                .await
+            }
+        },
+    )
+    .await?;
 
-        tracing::debug!(
-            "Prepared '{}.{}' in catalog '{}'",
-            schema,
-            table_name,
-            catalog_name
-        );
-    }
-
-    session_ctx.register_catalog(catalog_name, catalog_provider);
     tracing::info!(
         "Registered PostgreSQL catalog '{}' with {} table(s) ({})",
         catalog_name,
-        schema_tables.len(),
+        table_count,
         mode_str
     );
 
@@ -466,21 +433,6 @@ async fn list_postgres_tables_in_catalog(
         }
     };
     Ok(rows)
-}
-
-fn parse_allowed_schemas(options: Option<&HashMap<String, String>>) -> Option<Vec<String>> {
-    let value = options.and_then(|opts| opts.get("allowed_schemas"))?;
-    let values = value
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
-    }
 }
 
 // ─── SqlxPostgresTableProvider ──────────────────────────────────────────────
