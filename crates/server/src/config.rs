@@ -493,6 +493,13 @@ fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
     Ok(context_config.data_sources)
 }
 
+/// Data source types that support catalog (whole-database) registration mode.
+const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
+    DataSourceType::Postgres,
+    DataSourceType::Mysql,
+    DataSourceType::Sqlite,
+];
+
 /// Data source types that support read_write access mode
 const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Postgres,
@@ -534,8 +541,7 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         }
 
         // Catalog mode must not mix with per-table / per-schema options
-        if (source.source_type == DataSourceType::Postgres
-            || source.source_type == DataSourceType::Mysql)
+        if CATALOG_SUPPORTED_SOURCES.contains(&source.source_type)
             && source.hierarchy_level == HierarchyLevel::Catalog
         {
             for conflicting in &["table", "schema"] {
@@ -926,6 +932,7 @@ async fn register_data_source(
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
                 sqlite_registry.as_ref(),
+                source.hierarchy_level,
             )
             .await
             .map_err(|e| {

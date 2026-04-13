@@ -248,6 +248,65 @@ curl -X POST http://localhost:8080/federated_join_and_insert/execute \
   -d '{"name": "Carol Williams"}' | jq .
 ```
 
+## Catalog Mode
+
+Instead of registering tables one by one, you can expose an entire SQLite database as a
+DataFusion **catalog**. Every non-system table and view is registered automatically, and
+you query them with the three-part `catalog.main.table` syntax (SQLite's primary schema
+is always `main`).
+
+### Context file
+
+```yaml
+# demo/sqlite/ctx_sqlite_catalog_demo.yaml
+data_sources:
+  - name: "demo_catalog"
+    type: "sqlite"
+    hierarchy_level: "catalog"
+    path: "demo/sqlite/demo.db"
+    description: "Entire demo.db SQLite database registered as a DataFusion catalog"
+```
+
+### Start the server
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/sqlite/ctx_sqlite_catalog_demo.yaml \
+  --pipeline demo/sqlite/pipelines/catalog_demo/ \
+  --port 8080
+```
+
+### Example queries
+
+Tables are referenced as `<catalog>.main.<table>`:
+
+```bash
+# List users (limit 10)
+curl -X POST http://localhost:8080/sqlite-catalog-list-users/execute \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 10}' | jq .
+
+# Join users and orders through the catalog
+curl -X POST http://localhost:8080/sqlite-catalog-cross-table-join/execute \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 20}' | jq .
+
+# Aggregate order totals per user
+curl -X POST http://localhost:8080/sqlite-catalog-user-order-summary/execute \
+  -H "Content-Type: application/json" \
+  -d '{"min_orders": 1}' | jq .
+```
+
+### Table mode vs catalog mode at a glance
+
+| | Table mode (default) | Catalog mode |
+|---|---|---|
+| `hierarchy_level` | `table` or omit | `catalog` |
+| `table` option | required | not used |
+| SQL reference | `table_name` | `catalog.main.table` |
+| Tables loaded | one | all non-system |
+| Good for | single-table APIs | cross-table joins, schema discovery |
+
 ## Troubleshooting
 
 ### Database File Not Found

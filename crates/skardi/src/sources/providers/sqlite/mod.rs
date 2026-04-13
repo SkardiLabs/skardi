@@ -39,6 +39,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_rusqlite::Connection;
 
+use crate::sources::DataSourceType;
+use crate::sources::hierarchy::{
+    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Default number of read connections in the pool.
@@ -62,19 +66,28 @@ pub async fn create_sqlite_table_provider(
     Ok(Arc::new(provider))
 }
 
-/// Register SQLite tables into DataFusion SessionContext
+/// Register SQLite tables or a whole database (catalog) into a DataFusion [`SessionContext`].
+///
+/// Single-table mode (default) registers one table under `name`. Catalog mode registers a
+/// `MemoryCatalogProvider` with one provider per table across all non-system tables in the
+/// database (SQLite schema `main`).
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
-/// * `name` - Name to register the table as
+/// * `name` - Name to register the table (table mode) or catalog (catalog mode) as
 /// * `db_path` - Path to the SQLite database file (e.g., "/data/my.db")
-/// * `options` - Optional configuration (e.g., table name)
-/// * `read_write` - If true, register as read-write table provider (allows INSERT/UPDATE/DELETE)
+/// * `options` - Optional configuration (see below)
+/// * `read_write` - If true, register as read-write (allows INSERT/UPDATE/DELETE)
+/// * `registry` - Optional dataset registry for sqlite_knn / sqlite_fts table functions
+/// * `hierarchy_level` - `HierarchyLevel::Table` (default) or `HierarchyLevel::Catalog` loads the whole DB
 ///
 /// # Options
-/// * `table` - Specific table name to register (required)
+/// * `table` - Table name (required in table mode, not used in catalog mode)
 /// * `busy_timeout_ms` - Busy timeout in milliseconds (optional, defaults to 5000)
-/// * `read_pool_size` - Number of read connections (optional, defaults to 4)
+/// * `read_pool_size` - Number of read connections per table (optional, defaults to 4)
+/// * `extensions` - Comma-separated extension paths to load (e.g. sqlite-vec)
+/// * `extensions_env` - Comma-separated env var names whose values are extension paths
+/// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only; SQLite schema is `main`)
 pub async fn register_sqlite_tables(
     session_ctx: &mut SessionContext,
     name: &str,
@@ -82,12 +95,51 @@ pub async fn register_sqlite_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     registry: Option<&DatasetRegistry>,
+    hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
     let mode_str = if read_write {
         "read-write"
     } else {
         "read-only"
     };
+    match hierarchy_level {
+        HierarchyLevel::Catalog => {
+            register_sqlite_catalog(
+                session_ctx,
+                name,
+                db_path,
+                options,
+                read_write,
+                mode_str,
+                registry,
+            )
+            .await
+        }
+        HierarchyLevel::Table => {
+            register_single_sqlite_table(
+                session_ctx,
+                name,
+                db_path,
+                options,
+                read_write,
+                mode_str,
+                registry,
+            )
+            .await
+        }
+    }
+}
+
+/// Register one SQLite table under `name` in the default catalog.
+async fn register_single_sqlite_table(
+    session_ctx: &mut SessionContext,
+    name: &str,
+    db_path: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
+    registry: Option<&DatasetRegistry>,
+) -> Result<()> {
     tracing::info!(
         "Registering SQLite table: {} with path: {} ({})",
         name,
@@ -190,6 +242,244 @@ pub async fn register_sqlite_tables(
     Ok(())
 }
 
+/// Register an entire SQLite database as a named DataFusion catalog.
+///
+/// All non-system tables and views in the `main` schema are registered automatically.
+/// Tables are addressable with the three-part reference `catalog.main.table`.
+///
+/// A single [`Connection`] pool (configured via `read_pool_size`) is opened once and
+/// shared across every table provider in the catalog, rather than allocating a fresh pool
+/// per table. This keeps file-descriptor usage bounded regardless of table count.
+///
+/// If a `registry` is supplied, each table is inserted under the key
+/// `"<catalog>.<schema>.<table>"` so that `sqlite_knn` / `sqlite_fts` can look it up with the
+/// same three-part identifier that appears in SQL (e.g. `sqlite_knn('demo.main.vec_items', …)`).
+async fn register_sqlite_catalog(
+    session_ctx: &mut SessionContext,
+    catalog_name: &str,
+    db_path: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
+    registry: Option<&DatasetRegistry>,
+) -> Result<()> {
+    tracing::info!(
+        "Registering SQLite catalog: {} ({})",
+        catalog_name,
+        mode_str
+    );
+
+    let busy_timeout_ms: u64 = options
+        .and_then(|opts| opts.get("busy_timeout_ms"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+
+    let read_pool_size: usize = options
+        .and_then(|opts| opts.get("read_pool_size"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_READ_POOL_SIZE);
+
+    let mut extensions: Vec<String> = options
+        .and_then(|opts| opts.get("extensions"))
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    if let Some(env_key) = options.and_then(|opts| opts.get("extensions_env")) {
+        for key in env_key.split(',') {
+            let key = key.trim();
+            if let Ok(val) = std::env::var(key) {
+                extensions.push(val);
+            } else {
+                tracing::warn!("SQLite extension env var '{}' not set, skipping", key);
+            }
+        }
+    }
+
+    let label = SourceLabel::new(
+        DataSourceType::Sqlite,
+        HierarchyLevel::Catalog,
+        catalog_name,
+    );
+
+    // Open the shared read/write pool exactly once and reuse it across every table in
+    // the catalog. Without this, each table would allocate its own `read_pool_size`
+    // connections and blow up FD usage on databases with many tables.
+    let (read_pool, write_conn) = open_sqlite_pool(
+        db_path,
+        busy_timeout_ms,
+        read_pool_size,
+        read_write,
+        &extensions,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to open shared SQLite pool for catalog '{}'",
+            catalog_name
+        )
+    })?;
+
+    // Use one of the shared connections for introspection rather than opening another.
+    let intro_conn = Arc::clone(&read_pool[0]);
+    let mut schema_tables = retry_with_timeout(label, "sqlite_master introspection", || async {
+        list_sqlite_tables_in_catalog(&intro_conn).await
+    })
+    .await?;
+
+    let allowed_schemas = parse_allowed_schemas(options);
+    if let Some(ref allowed) = allowed_schemas {
+        if !allowed.iter().any(|s| s == "main") {
+            tracing::warn!(
+                "SQLite catalog '{}' has allowed_schemas={:?} which excludes 'main'; \
+                 all SQLite tables live in schema 'main' so no tables will be registered",
+                catalog_name,
+                allowed
+            );
+        }
+        schema_tables.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
+    }
+
+    if schema_tables.is_empty() {
+        tracing::warn!(
+            "No tables found in SQLite catalog for source '{}'",
+            catalog_name
+        );
+    }
+
+    let table_count = schema_tables.len();
+
+    let shared_read_pool = Arc::new(read_pool);
+    let shared_write_conn = write_conn;
+    let catalog_name_owned = catalog_name.to_string();
+
+    build_catalog(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        |schema, table_name| {
+            let read_pool_c = Arc::clone(&shared_read_pool);
+            let write_conn_c = shared_write_conn.clone();
+            let registry_c = registry.map(Arc::clone);
+            let catalog_c = catalog_name_owned.clone();
+            async move {
+                let provider = SqliteTableProvider::from_shared_pool(
+                    (*read_pool_c).clone(),
+                    write_conn_c,
+                    TableReference::bare(table_name.as_str()),
+                    read_write,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create SQLite table provider for '{}.{}'",
+                        schema, table_name
+                    )
+                })?;
+
+                if let Some(registry) = registry_c {
+                    let columns: Vec<(String, DataType)> = provider
+                        .schema
+                        .fields()
+                        .iter()
+                        .map(|f| (f.name().clone(), f.data_type().clone()))
+                        .collect();
+                    let entry = SqliteEntry {
+                        conn: Arc::clone(&provider.read_pool[0]),
+                        table_name: table_name.clone(),
+                        columns,
+                    };
+                    // Key matches the three-part SQL reference so that UDTF callers can use
+                    // e.g. `sqlite_knn('demo.main.vec_items', ...)` — the UDTF looks up by
+                    // the exact string the caller passes.
+                    let key = format!("{}.{}.{}", catalog_c, schema, table_name);
+                    let mut reg = registry
+                        .write()
+                        .map_err(|e| anyhow::anyhow!("sqlite registry lock error: {}", e))?;
+                    reg.insert(key, DatasetEntry::Sqlite(entry));
+                }
+
+                Ok(Arc::new(provider) as Arc<dyn TableProvider>)
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("Failed to build SQLite catalog '{}'", catalog_name))?;
+
+    tracing::info!(
+        "Registered SQLite catalog '{}' with {} table(s) ({})",
+        catalog_name,
+        table_count,
+        mode_str
+    );
+
+    Ok(())
+}
+
+/// List user tables and views in the SQLite database's `main` schema.
+///
+/// Filters out:
+/// * SQLite's internal bookkeeping tables (`sqlite_%` — e.g. `sqlite_sequence`, `sqlite_stat*`).
+/// * Virtual-table shadow tables, which have `sql IS NULL` in `sqlite_master` (e.g. the
+///   `<name>_data` / `_idx` / `_config` tables auto-created by FTS5 and `vec0`).
+///   DataFusion cannot meaningfully register these on their own, and attempting to do so
+///   would fail schema introspection at best or corrupt the parent virtual table at worst.
+async fn list_sqlite_tables_in_catalog(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let names: Vec<String> = conn
+        .call(
+            move |conn| -> std::result::Result<Vec<String>, tokio_rusqlite::rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type IN ('table', 'view') \
+                       AND name NOT LIKE 'sqlite_%' \
+                       AND sql IS NOT NULL \
+                     ORDER BY name",
+                )?;
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list tables in SQLite catalog: {}", e))?;
+
+    // SQLite's primary schema is always "main"
+    Ok(names.into_iter().map(|t| ("main".to_string(), t)).collect())
+}
+
+/// Open and initialize a SQLite connection pool (read + optional write) that can be shared
+/// across multiple [`SqliteTableProvider`] instances, as is done by catalog mode.
+///
+/// Each connection has WAL mode enabled, the configured busy timeout applied, and all
+/// requested dynamic extensions loaded by [`init_connection`].
+async fn open_sqlite_pool(
+    db_path: &str,
+    busy_timeout_ms: u64,
+    read_pool_size: usize,
+    read_write: bool,
+    extensions: &[String],
+) -> Result<(Vec<Arc<Connection>>, Option<Arc<Connection>>)> {
+    let pool_size = read_pool_size.max(1);
+
+    let mut read_pool = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let conn = Connection::open(db_path)
+            .await
+            .with_context(|| format!("Failed to open SQLite read connection: {}", db_path))?;
+        init_connection(&conn, busy_timeout_ms, extensions).await?;
+        read_pool.push(Arc::new(conn));
+    }
+
+    let write_conn = if read_write {
+        let conn = Connection::open(db_path)
+            .await
+            .with_context(|| format!("Failed to open SQLite write connection: {}", db_path))?;
+        init_connection(&conn, busy_timeout_ms, extensions).await?;
+        Some(Arc::new(conn))
+    } else {
+        None
+    };
+
+    Ok((read_pool, write_conn))
+}
+
 // ─── SqliteTableProvider ─────────────────────────────────────────────────────
 
 /// A custom SQLite table provider using tokio-rusqlite directly.
@@ -232,30 +522,32 @@ impl SqliteTableProvider {
         read_write: bool,
         extensions: &[String],
     ) -> Result<Self> {
-        let pool_size = read_pool_size.max(1);
+        let (read_pool, write_conn) = open_sqlite_pool(
+            db_path,
+            busy_timeout_ms,
+            read_pool_size,
+            read_write,
+            extensions,
+        )
+        .await?;
+        Self::from_shared_pool(read_pool, write_conn, table_reference, read_write).await
+    }
 
-        // Open read connections
-        let mut read_pool = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let conn = Connection::open(db_path)
-                .await
-                .with_context(|| format!("Failed to open SQLite read connection: {}", db_path))?;
-            init_connection(&conn, busy_timeout_ms, extensions).await?;
-            read_pool.push(Arc::new(conn));
+    /// Build a provider on top of a pre-initialized connection pool.
+    ///
+    /// Catalog mode uses this to share a single pool across every table in the database
+    /// instead of allocating a fresh pool per table. Each call still runs `PRAGMA
+    /// table_info` against the first read connection to derive the table schema.
+    async fn from_shared_pool(
+        read_pool: Vec<Arc<Connection>>,
+        write_conn: Option<Arc<Connection>>,
+        table_reference: TableReference,
+        read_write: bool,
+    ) -> Result<Self> {
+        if read_pool.is_empty() {
+            anyhow::bail!("SqliteTableProvider::from_shared_pool requires a non-empty read pool");
         }
 
-        // Open write connection if read-write
-        let write_conn = if read_write {
-            let conn = Connection::open(db_path)
-                .await
-                .with_context(|| format!("Failed to open SQLite write connection: {}", db_path))?;
-            init_connection(&conn, busy_timeout_ms, extensions).await?;
-            Some(Arc::new(conn))
-        } else {
-            None
-        };
-
-        // Read schema from any read connection
         let schema = read_schema_from_pragma(&read_pool[0], table_reference.table()).await?;
 
         if schema.fields().is_empty() {
@@ -1287,6 +1579,7 @@ mod tests {
                 None,
                 false,
                 None,
+                HierarchyLevel::Table,
             )
             .await;
 
@@ -1329,9 +1622,17 @@ mod tests {
     async fn register_test_table(ctx: &mut SessionContext, db_path: &str) {
         let mut options = HashMap::new();
         options.insert("table".to_string(), "test_items".to_string());
-        register_sqlite_tables(ctx, "test_items", db_path, Some(&options), true, None)
-            .await
-            .expect("register sqlite table");
+        register_sqlite_tables(
+            ctx,
+            "test_items",
+            db_path,
+            Some(&options),
+            true,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register sqlite table");
     }
 
     /// Collect a SELECT query and return all batches.
@@ -1750,9 +2051,17 @@ mod tests {
         ] {
             let mut options = HashMap::new();
             options.insert("table".to_string(), table_name.to_string());
-            register_sqlite_tables(ctx, reg_name, db_path, Some(&options), true, None)
-                .await
-                .unwrap_or_else(|e| panic!("register {} failed: {}", reg_name, e));
+            register_sqlite_tables(
+                ctx,
+                reg_name,
+                db_path,
+                Some(&options),
+                true,
+                None,
+                HierarchyLevel::Table,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("register {} failed: {}", reg_name, e));
         }
     }
 
@@ -2038,9 +2347,17 @@ mod tests {
 
         let mut options = HashMap::new();
         options.insert("table".to_string(), "blob_items".to_string());
-        register_sqlite_tables(&mut ctx, "blob_items", db, Some(&options), false, None)
-            .await
-            .expect("register blob_items");
+        register_sqlite_tables(
+            &mut ctx,
+            "blob_items",
+            db,
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register blob_items");
 
         // Read back — data column should be Binary, not Utf8
         let batches = query_all(&ctx, "SELECT id, data FROM blob_items ORDER BY id").await;
@@ -2079,9 +2396,17 @@ mod tests {
 
         let mut options = HashMap::new();
         options.insert("table".to_string(), "blob_items".to_string());
-        register_sqlite_tables(&mut ctx, "blob_items", db, Some(&options), false, None)
-            .await
-            .expect("register blob_items");
+        register_sqlite_tables(
+            &mut ctx,
+            "blob_items",
+            db,
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register blob_items");
 
         // Subquery fetching a BLOB column should work (simulates the vec0
         // subquery path in sqlite_knn).
@@ -2095,5 +2420,333 @@ mod tests {
             .expect("subquery should return BinaryArray");
         assert!(!data_col.is_null(0), "BLOB should not be null");
         assert_eq!(data_col.value(0).len(), 12);
+    }
+
+    // ─── Catalog mode tests ─────────────────────────────────────────────
+
+    /// Create a temp SQLite database with a couple of related tables and a view so that
+    /// catalog-mode tests can exercise three-part references, cross-table joins, and
+    /// view registration without depending on any dynamic extensions.
+    async fn create_catalog_test_db() -> tempfile::TempPath {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = tmp.into_temp_path();
+        let db_path = path.to_str().unwrap().to_string();
+
+        let conn = Connection::open(&db_path).await.expect("open temp sqlite");
+        conn.call(|conn| -> Result<(), tokio_rusqlite::rusqlite::Error> {
+            conn.execute_batch(
+                "CREATE TABLE users (
+                     id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name  TEXT    NOT NULL
+                 );
+                 INSERT INTO users (name) VALUES ('alice'), ('bob'), ('carol');
+
+                 CREATE TABLE orders (
+                     id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL,
+                     amount  INTEGER NOT NULL
+                 );
+                 INSERT INTO orders (user_id, amount) VALUES (1, 100), (1, 50), (2, 200);
+
+                 CREATE VIEW user_totals AS
+                     SELECT u.name AS name, SUM(o.amount) AS total
+                     FROM users u
+                     JOIN orders o ON u.id = o.user_id
+                     GROUP BY u.id, u.name;",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed catalog db");
+        conn.close().await.expect("close seed connection");
+
+        path
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_list_sqlite_tables_filters_internal_and_shadow_tables() {
+        // AUTOINCREMENT on `users`/`orders` causes SQLite to auto-create `sqlite_sequence`,
+        // which must be filtered by the `name NOT LIKE 'sqlite_%'` clause.
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db).await.expect("open");
+        init_connection(&conn, 5000, &[]).await.expect("init");
+        let tables = list_sqlite_tables_in_catalog(&conn)
+            .await
+            .expect("list tables");
+
+        let names: Vec<&str> = tables.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(names.contains(&"users"), "expected users in {:?}", names);
+        assert!(names.contains(&"orders"), "expected orders in {:?}", names);
+        assert!(
+            names.contains(&"user_totals"),
+            "expected user_totals view in {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("sqlite_")),
+            "sqlite_* internal tables must be filtered: {:?}",
+            names
+        );
+
+        // Every schema pair should be ("main", _).
+        for (schema, _) in &tables {
+            assert_eq!(schema, "main");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_registers_all_user_tables_and_views() {
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            None,
+            false,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog");
+
+        let users = query_all(&ctx, "SELECT id FROM demo.main.users ORDER BY id").await;
+        assert_eq!(total_rows(&users), 3);
+
+        let orders = query_all(&ctx, "SELECT id FROM demo.main.orders ORDER BY id").await;
+        assert_eq!(total_rows(&orders), 3);
+
+        // Views are registered the same way as base tables.
+        let totals = query_all(
+            &ctx,
+            "SELECT name, total FROM demo.main.user_totals ORDER BY name",
+        )
+        .await;
+        assert_eq!(total_rows(&totals), 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_cross_table_join() {
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            None,
+            false,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT u.name, SUM(o.amount) AS total \
+             FROM demo.main.users u \
+             JOIN demo.main.orders o ON u.id = o.user_id \
+             GROUP BY u.name \
+             ORDER BY u.name",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_excludes_sqlite_sequence() {
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            None,
+            false,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog");
+
+        // sqlite_sequence is auto-created by AUTOINCREMENT but must never surface in the catalog.
+        let result = ctx
+            .sql("SELECT * FROM demo.main.sqlite_sequence")
+            .await
+            .and_then(|df| futures::executor::block_on(df.collect()));
+        assert!(
+            result.is_err(),
+            "sqlite_sequence should not be registered in the catalog"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_allowed_schemas_main_includes_all() {
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), "main".to_string());
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog");
+
+        let users = query_all(&ctx, "SELECT id FROM demo.main.users ORDER BY id").await;
+        assert_eq!(total_rows(&users), 3);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_allowed_schemas_non_main_is_empty() {
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), "public".to_string());
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog");
+
+        // The catalog is registered but no tables are attached — any reference should
+        // fail at planning time.
+        let result = ctx.sql("SELECT * FROM demo.main.users").await;
+        assert!(
+            result.is_err(),
+            "allowed_schemas=public should register no tables under SQLite's 'main' schema"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_read_write_mode_allows_inserts() {
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            None,
+            true,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog rw");
+
+        ctx.sql("INSERT INTO demo.main.users (name) VALUES ('dave')")
+            .await
+            .expect("parse insert")
+            .collect()
+            .await
+            .expect("execute insert");
+
+        let batches = query_all(&ctx, "SELECT name FROM demo.main.users WHERE name = 'dave'").await;
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_empty_database_is_ok() {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = tmp.into_temp_path();
+        let db = path.to_str().unwrap();
+
+        // Materialize an empty database file.
+        let conn = Connection::open(db).await.expect("open empty db");
+        conn.close().await.expect("close empty db");
+
+        let mut ctx = SessionContext::new();
+        // An empty database should register successfully (with a warning) rather than erroring.
+        register_sqlite_tables(
+            &mut ctx,
+            "demo",
+            db,
+            None,
+            false,
+            None,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register empty catalog");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_catalog_shares_single_read_pool() {
+        // Catalog mode should allocate exactly `read_pool_size` read connections total,
+        // not `read_pool_size * table_count`. We verify this indirectly by observing
+        // that each registered provider holds Arc-clones of the *same* underlying
+        // connections — i.e. the Arc pointers overlap across providers.
+        let db_path = create_catalog_test_db().await;
+        let db = db_path.to_str().unwrap();
+
+        let (read_pool, write_conn) = open_sqlite_pool(db, 5000, 2, false, &[])
+            .await
+            .expect("open shared pool");
+        assert_eq!(read_pool.len(), 2);
+        assert!(write_conn.is_none());
+
+        let users_provider = SqliteTableProvider::from_shared_pool(
+            read_pool.clone(),
+            None,
+            TableReference::bare("users"),
+            false,
+        )
+        .await
+        .expect("users provider");
+
+        let orders_provider = SqliteTableProvider::from_shared_pool(
+            read_pool.clone(),
+            None,
+            TableReference::bare("orders"),
+            false,
+        )
+        .await
+        .expect("orders provider");
+
+        // Both providers should reference the *same* underlying connections, not fresh ones.
+        for (u, o) in users_provider
+            .read_pool
+            .iter()
+            .zip(orders_provider.read_pool.iter())
+        {
+            assert!(
+                Arc::ptr_eq(u, o),
+                "catalog providers must share the same connections"
+            );
+        }
     }
 }
