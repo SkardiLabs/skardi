@@ -163,7 +163,7 @@ where
 ///
 /// The factory receives owned `(schema, table_name)` strings and returns a future that resolves
 /// to the provider for that table. The factory is invoked once per table in the input order,
-/// and up to [`CATALOG_BUILD_CONCURRENCY`] of the resulting futures are driven in parallel via
+/// and up to `CATALOG_BUILD_CONCURRENCY` of the resulting futures are driven in parallel via
 /// [`StreamExt::buffer_unordered`]. The first error short-circuits the whole call.
 ///
 /// Providers are registered into the [`MemoryCatalogProvider`] in lexicographic
