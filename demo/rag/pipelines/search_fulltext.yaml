@@ -2,14 +2,17 @@ metadata:
   name: "search-fulltext"
   version: "1.0.0"
   description: >
-    Full-text keyword search via MongoDB $text index.
-    The query should be pre-tokenized (space-separated) for Chinese text.
+    Full-text keyword search via PostgreSQL's built-in text search
+    (websearch_to_tsquery + ts_rank), exposed through the pg_fts table
+    function. Searches the same `content` column that holds the text
+    used to generate the pgvector embedding, so FTS and vector search
+    stay on a single source of truth.
 
 # Parameters:
-#   {query} - Search terms (space-separated for OR, "quoted" for phrase)
+#   {query} - Search terms (web-search syntax: AND, "phrase", or, -not)
 #   {limit} - Maximum number of results
 
 query: |
-  SELECT doc_id, "fullTextToken", _score
-  FROM mongo_fts('document_texts', {query}, {limit})
+  SELECT id, content, _score
+  FROM pg_fts('documents', 'content', {query}, {limit})
   ORDER BY _score DESC

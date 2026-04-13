@@ -1,25 +1,14 @@
 data_sources:
-  # PostgreSQL with pgvector for vector embeddings
+  # Single PostgreSQL table holds both the raw content (searched via pg_fts)
+  # and the pgvector embedding (searched via pg_knn). One INSERT writes both,
+  # and hybrid search joins both signals from the same row.
   - name: "documents"
     type: "postgres"
     access_mode: "read_write"
     connection_string: "postgresql://localhost:5432/ragdb?sslmode=disable"
-    description: "PostgreSQL table with pgvector embeddings for semantic search"
+    description: "PostgreSQL table with pgvector embeddings and full-text search over content"
     options:
       table: "documents"
       schema: "public"
       user_env: "PG_USER"
       pass_env: "PG_PASSWORD"
-
-  # MongoDB for full-text search (pre-tokenized text)
-  - name: "document_texts"
-    type: "mongo"
-    access_mode: "read_write"
-    connection_string: "mongodb://localhost:27017"
-    description: "MongoDB collection with text index for keyword search"
-    options:
-      database: "ragdb"
-      collection: "document_texts"
-      primary_key: "doc_id"
-      user_env: "MONGO_USER"
-      pass_env: "MONGO_PASS"

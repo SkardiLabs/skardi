@@ -3,20 +3,22 @@ metadata:
   version: "1.0.0"
   description: >
     Hybrid search combining vector similarity (pg_knn) and full-text keyword
-    search (mongo_fts) using Reciprocal Rank Fusion (RRF).
-    This mirrors FastGPT's hybrid search approach.
+    search (pg_fts) using Reciprocal Rank Fusion (RRF). Both signals come
+    from the same `documents` table — the vector from the `embedding` column
+    and the keyword match from the `content` column — so a single INSERT
+    keeps them in sync.
 
 # Parameters:
 #   {query}          - Natural language search query (used for vector search)
-#   {text_query}     - Tokenized search terms (used for full-text search)
+#   {text_query}     - Keyword search terms (web-search syntax for pg_fts)
 #   {vector_weight}  - Weight for vector results (e.g. 0.5)
 #   {text_weight}    - Weight for text results (e.g. 0.5)
 #   {limit}          - Maximum number of results
 
 query: |
   SELECT
-    COALESCE(v.id, CAST(t.doc_id AS BIGINT)) AS id,
-    v.content,
+    COALESCE(v.id, t.id) AS id,
+    COALESCE(v.content, t.content) AS content,
     COALESCE({vector_weight} / (60.0 + v.rk), 0)
       + COALESCE({text_weight} / (60.0 + t.rk), 0) AS rrf_score
   FROM (
@@ -26,8 +28,8 @@ query: |
         '<=>', 80)
   ) v
   FULL OUTER JOIN (
-    SELECT doc_id, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
-    FROM mongo_fts('document_texts', {text_query}, 60)
-  ) t ON v.id = CAST(t.doc_id AS BIGINT)
+    SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+    FROM pg_fts('documents', 'content', {text_query}, 60)
+  ) t ON v.id = t.id
   ORDER BY rrf_score DESC
   LIMIT {limit}
