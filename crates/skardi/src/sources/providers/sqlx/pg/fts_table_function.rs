@@ -464,6 +464,7 @@ mod tests {
     // ─── pg_fts integration tests ───────────────────────────────────────
     // Require CI PostgreSQL with seeded articles table containing a text column.
 
+    use crate::sources::HierarchyLevel;
     use crate::sources::providers::sqlx::pg::postgres::register_postgres_tables;
 
     async fn register_ci_fts(ctx: &mut SessionContext) -> DatasetRegistry {
@@ -482,7 +483,7 @@ mod tests {
             Some(&options),
             false,
             Some(&registry),
-            None,
+            HierarchyLevel::Table,
         )
         .await
         .expect("register articles table failed");

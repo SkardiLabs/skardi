@@ -1,4 +1,7 @@
-use crate::sources::hierarchy::{HierarchyLevel, build_catalog, parse_allowed_schemas};
+use crate::sources::DataSourceType;
+use crate::sources::hierarchy::{
+    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -21,20 +24,16 @@ use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use futures::stream;
 use mysql_async::prelude::Queryable;
-use mysql_async::{Params, Row};
+use mysql_async::{Params, Row, Value};
 use secrecy::SecretString;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::timeout;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_RETRIES: u32 = 3;
 
 /// Register MySQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
@@ -48,7 +47,7 @@ const MAX_RETRIES: u32 = 3;
 ///   Use `user_env` and `pass_env` options instead.
 /// * `options` - Optional configuration (see below)
 /// * `read_write` - If true, register as read-write (allows INSERT/UPDATE/DELETE)
-/// * `hierarchy_level` - `None` → table mode (default); `Some(HierarchyLevel::Catalog)` loads the whole DB
+/// * `hierarchy_level` - [`HierarchyLevel::Table`] (default) or [`HierarchyLevel::Catalog`]
 ///
 /// # Options
 /// * `table` - Table name (required in table mode)
@@ -63,9 +62,8 @@ pub async fn register_mysql_tables(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
-    hierarchy_level: Option<HierarchyLevel>,
+    hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
-    let hierarchy_level = hierarchy_level.unwrap_or_default();
     let mode_str = if read_write {
         "read-write"
     } else {
@@ -132,10 +130,15 @@ async fn register_single_mysql_table(
 
     let params = parse_connection_params(connection_string, options)?;
 
+    let label = SourceLabel::new(DataSourceType::Mysql, HierarchyLevel::Table, name);
     let pool = Arc::new(
-        MySQLConnectionPool::new(params)
-            .await
-            .with_context(|| format!("Failed to create MySQL connection pool for '{}'", name))?,
+        retry_with_timeout(label, "pool creation", || async {
+            MySQLConnectionPool::new(params.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+        .with_context(|| format!("Failed to create MySQL connection pool for '{}'", name))?,
     );
 
     let table_reference = if let Some(schema) = schema_name {
@@ -183,98 +186,34 @@ async fn register_mysql_catalog(
     tracing::info!("Registering MySQL catalog: {} ({})", catalog_name, mode_str,);
 
     let params = parse_connection_params(connection_string, options)?;
-    let pool = Arc::new({
-        let mut last_err = anyhow::anyhow!("unreachable");
-        let mut succeeded = false;
-        let mut result = None;
-        for attempt in 1..=MAX_RETRIES {
-            match timeout(CONNECT_TIMEOUT, MySQLConnectionPool::new(params.clone())).await {
-                Ok(Ok(p)) => {
-                    succeeded = true;
-                    result = Some(p);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    last_err = anyhow::anyhow!(e).context(format!(
-                        "Failed to create MySQL connection pool for catalog '{}'",
-                        catalog_name
-                    ));
-                    tracing::warn!(
-                        "MySQL catalog '{}': connection attempt {}/{} failed: {}",
-                        catalog_name,
-                        attempt,
-                        MAX_RETRIES,
-                        last_err
-                    );
-                }
-                Err(_) => {
-                    last_err = anyhow::anyhow!(
-                        "Timed out after {}s connecting to MySQL for catalog '{}'. \
-                         Check that MySQL is reachable and credentials are correct.",
-                        CONNECT_TIMEOUT.as_secs(),
-                        catalog_name
-                    );
-                    tracing::warn!(
-                        "MySQL catalog '{}': connection attempt {}/{} timed out",
-                        catalog_name,
-                        attempt,
-                        MAX_RETRIES
-                    );
-                }
-            }
-        }
-        if !succeeded {
-            return Err(last_err);
-        }
-        result.unwrap()
-    });
+    let label = SourceLabel::new(DataSourceType::Mysql, HierarchyLevel::Catalog, catalog_name);
+
+    let pool = Arc::new(
+        retry_with_timeout(label, "pool creation", || async {
+            MySQLConnectionPool::new(params.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create MySQL connection pool for catalog '{}'",
+                catalog_name
+            )
+        })?,
+    );
 
     let allowed_schemas = parse_allowed_schemas(options);
-    let schema_tables = {
-        let mut last_err = anyhow::anyhow!("unreachable");
-        let mut result = None;
-        for attempt in 1..=MAX_RETRIES {
-            match timeout(
-                CONNECT_TIMEOUT,
-                list_mysql_tables_in_catalog(&pool, allowed_schemas.as_ref()),
-            )
-            .await
-            {
-                Ok(Ok(rows)) => {
-                    result = Some(rows);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    last_err = e.context(format!(
-                        "Failed to list MySQL tables for catalog-wide registration in source '{}'",
-                        catalog_name
-                    ));
-                    tracing::warn!(
-                        "MySQL catalog '{}': introspection attempt {}/{} failed: {}",
-                        catalog_name,
-                        attempt,
-                        MAX_RETRIES,
-                        last_err
-                    );
-                }
-                Err(_) => {
-                    last_err = anyhow::anyhow!(
-                        "Timed out after {}s querying information_schema for catalog '{}'. \
-                         Check that MySQL is reachable and credentials are correct.",
-                        CONNECT_TIMEOUT.as_secs(),
-                        catalog_name
-                    );
-                    tracing::warn!(
-                        "MySQL catalog '{}': introspection attempt {}/{} timed out",
-                        catalog_name,
-                        attempt,
-                        MAX_RETRIES
-                    );
-                }
-            }
-        }
-        result.ok_or(last_err)?
-    };
+    let schema_tables = retry_with_timeout(label, "information_schema introspection", || async {
+        list_mysql_tables_in_catalog(&pool, allowed_schemas.as_deref()).await
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to list MySQL tables for catalog-wide registration in source '{}'",
+            catalog_name
+        )
+    })?;
 
     if schema_tables.is_empty() {
         tracing::warn!(
@@ -316,10 +255,14 @@ async fn register_mysql_catalog(
 ///
 /// Reuses the already-established `pool` connection (avoiding a second handshake).
 /// Excludes built-in system schemas (`mysql`, `information_schema`, `performance_schema`, `sys`).
-/// When `allowed_schemas` is `Some`, only those schemas are returned.
+/// When `allowed_schemas` is `Some`, the filter is pushed into the SQL `WHERE` clause as a
+/// parameterized `IN (...)` list rather than filtered client-side.
+// TODO: downcasts to `MySQLConnection`, an internal type of datafusion-table-providers. A
+// minor version bump could reshape that type and break this at runtime. Upstream a typed
+// accessor (or expose `information_schema` listing) so we can drop the downcast.
 async fn list_mysql_tables_in_catalog(
     pool: &MySQLConnectionPool,
-    allowed_schemas: Option<&Vec<String>>,
+    allowed_schemas: Option<&[String]>,
 ) -> Result<Vec<(String, String)>> {
     let db_conn = pool.connect().await.map_err(|e| {
         anyhow::anyhow!("Failed to connect to MySQL for catalog introspection: {e}")
@@ -327,26 +270,41 @@ async fn list_mysql_tables_in_catalog(
 
     let mysql_conn = db_conn
         .as_any()
-        .downcast_ref::<datafusion_table_providers::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection>()
-        .ok_or_else(|| anyhow::anyhow!("Unexpected MySQL connection type during catalog introspection"))?;
+        .downcast_ref::<MySQLConnection>()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unexpected MySQL connection type during catalog introspection")
+        })?;
 
     let mut conn = mysql_conn.conn.lock().await;
 
-    let mut rows: Vec<(String, String)> = conn
-        .query_map(
-            "SELECT table_schema, table_name
-             FROM information_schema.tables
-             WHERE table_type IN ('BASE TABLE', 'VIEW')
-               AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
-             ORDER BY table_schema, table_name",
-            |(schema, table): (String, String)| (schema, table),
-        )
-        .await
-        .with_context(|| "Failed to query information_schema for catalog listing")?;
+    const BASE_QUERY: &str = "SELECT table_schema, table_name
+         FROM information_schema.tables
+         WHERE table_type IN ('BASE TABLE', 'VIEW')
+           AND table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')";
 
-    if let Some(allowed) = allowed_schemas {
-        rows.retain(|(schema, _)| allowed.iter().any(|s| s == schema));
-    }
+    let rows: Vec<(String, String)> = match allowed_schemas {
+        Some(allowed) if !allowed.is_empty() => {
+            let placeholders = vec!["?"; allowed.len()].join(",");
+            let query = format!(
+                "{BASE_QUERY} AND table_schema IN ({placeholders}) \
+                 ORDER BY table_schema, table_name"
+            );
+            let params: Vec<Value> = allowed.iter().map(|s| Value::from(s.clone())).collect();
+            conn.exec_map(
+                query,
+                Params::Positional(params),
+                |(schema, table): (String, String)| (schema, table),
+            )
+            .await
+            .with_context(|| "Failed to query information_schema for catalog listing")?
+        }
+        _ => {
+            let query = format!("{BASE_QUERY} ORDER BY table_schema, table_name");
+            conn.query_map(query, |(schema, table): (String, String)| (schema, table))
+                .await
+                .with_context(|| "Failed to query information_schema for catalog listing")?
+        }
+    };
 
     Ok(rows)
 }
@@ -892,7 +850,7 @@ mod tests {
                 "mysql://localhost:3306/db",
                 None,
                 false,
-                None,
+                HierarchyLevel::default(),
             )
             .await;
 
@@ -910,15 +868,21 @@ mod tests {
     }
 
     #[test]
-    fn test_hierarchy_level_none_routes_to_table_mode() {
-        // None → table mode → fails with "requires 'table' option", not a catalog error.
+    fn test_hierarchy_level_default_routes_to_table_mode() {
+        // Default → table mode → fails with "requires 'table' option", not a catalog error.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut ctx = SessionContext::new();
-            let err =
-                register_mysql_tables(&mut ctx, "t", "mysql://localhost/db", None, false, None)
-                    .await
-                    .unwrap_err();
+            let err = register_mysql_tables(
+                &mut ctx,
+                "t",
+                "mysql://localhost/db",
+                None,
+                false,
+                HierarchyLevel::default(),
+            )
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains("requires 'table' option"));
         });
     }
@@ -934,7 +898,7 @@ mod tests {
                 "mysql://localhost/db",
                 None,
                 false,
-                Some(HierarchyLevel::Table),
+                HierarchyLevel::Table,
             )
             .await
             .unwrap_err();
@@ -1017,7 +981,7 @@ mod tests {
             "mysql://127.0.0.1:3306/mydb",
             Some(&options),
             true,
-            None,
+            HierarchyLevel::Table,
         )
         .await
         .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
@@ -1036,7 +1000,7 @@ mod tests {
             "mysql://127.0.0.1:3306/mydb",
             Some(&options),
             false,
-            Some(HierarchyLevel::Catalog),
+            HierarchyLevel::Catalog,
         )
         .await
         .unwrap_or_else(|e| panic!("register catalog {} failed: {}", catalog_name, e));
@@ -1536,7 +1500,7 @@ mod tests {
             "mysql://127.0.0.1:3306/mydb",
             Some(&options),
             false,
-            Some(HierarchyLevel::Catalog),
+            HierarchyLevel::Catalog,
         )
         .await
         .expect("register filtered catalog");
@@ -1568,7 +1532,7 @@ mod tests {
             "mysql://127.0.0.1:3306/mydb",
             Some(&options),
             true,
-            Some(HierarchyLevel::Catalog),
+            HierarchyLevel::Catalog,
         )
         .await
         .expect("register rw catalog");

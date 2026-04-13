@@ -9,7 +9,6 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::auth::layer::AuthLayer;
 use crate::auth::mode::AuthMode;
 #[cfg(feature = "candle")]
 use crate::config::register_candle_udf;
@@ -25,6 +24,7 @@ use crate::handlers::{
     pipeline_health_check, serve_dashboard,
 };
 use crate::metrics::PipelineMetrics;
+use crate::{auth::layer::AuthLayer, OptimizerRegistry};
 
 /// Shared application state containing pipeline and engine
 #[derive(Clone)]
@@ -70,7 +70,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     tracing::info!("Setting up application state");
 
     // Create optimizer registry for conditional optimizer registration
-    let optimizer_registry = Arc::new(crate::OptimizerRegistry::new());
+    let optimizer_registry = Arc::new(OptimizerRegistry::new());
 
     // Create federation-enabled DataFusion SessionState
     let state = datafusion_federation::default_session_state();
@@ -287,7 +287,7 @@ query: |
             options: None,
             access_mode: AccessMode::default(),
             enable_cache: false,
-            hierarchy_level: None,
+            hierarchy_level: Default::default(),
         }];
 
         let pipeline = create_test_pipeline().await;
