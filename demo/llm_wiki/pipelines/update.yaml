@@ -1,0 +1,23 @@
+metadata:
+  name: "wiki-update"
+  version: "1.0.0"
+  description: >
+    Update an existing LLM Wiki page in place. Re-embeds the new content
+    inline with candle so both pg_fts and pg_knn see the refreshed page
+    atomically from the same row. No-op if {slug} does not exist; use
+    wiki-create for new pages.
+
+# Parameters:
+#   {slug}      - Page identifier of the row to update
+#   {title}     - New title
+#   {page_type} - New page_type
+#   {content}   - New markdown body (re-embedded inline)
+
+query: |
+  UPDATE wikidb.public.wiki_pages
+  SET title      = {title},
+      page_type  = {page_type},
+      content    = {content},
+      embedding  = candle('models/generated/bge-small-en-v1.5', {content}),
+      updated_at = now()
+  WHERE slug = {slug}

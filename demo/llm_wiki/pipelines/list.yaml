@@ -1,0 +1,20 @@
+metadata:
+  name: "wiki-list"
+  version: "1.0.0"
+  description: >
+    List wiki pages filtered by page_type and slug prefix, ordered
+    alphabetically by slug. This is how an LLM agent regenerates index.md,
+    finds orphan pages during a lint pass, or browses a category.
+
+# Parameters:
+#   {page_type_pattern} - LIKE pattern for page_type, e.g. "entity" or "%"
+#   {slug_prefix}       - LIKE pattern for slug,      e.g. "entity/%" or "%"
+#   {limit}             - Maximum number of rows to return
+
+query: |
+  SELECT slug, title, page_type
+  FROM wikidb.public.wiki_pages
+  WHERE page_type LIKE {page_type_pattern}
+    AND slug      LIKE {slug_prefix}
+  ORDER BY slug
+  LIMIT {limit}

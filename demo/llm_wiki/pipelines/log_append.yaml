@@ -1,0 +1,22 @@
+metadata:
+  name: "wiki-log-append"
+  version: "1.0.0"
+  description: >
+    Append an entry to the wiki activity log — Karpathy's append-only log.md
+    equivalent. Used by the LLM agent to record ingests, queries, and
+    maintenance passes so future sessions can reconstruct what has already
+    been done.
+
+# Parameters:
+#   {event_type} - ingest | query | lint | note
+#   {slug}       - Related wiki page slug, or "" if not page-specific
+#   {message}    - Free-form markdown message describing the event
+
+query: |
+  INSERT INTO wikidb.public.wiki_log (event_type, slug, message, created_at)
+  VALUES (
+    {event_type},
+    {slug},
+    {message},
+    now()
+  )
