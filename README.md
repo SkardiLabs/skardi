@@ -16,7 +16,6 @@
 [Discord]: https://discord.gg/S5YQQPEV2m
 [Discord Badge]: https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white
 
-
 [![CI Badge]][CI]
 [![crates.io Badge]][crates.io]
 [![Docs Badge]][Docs]
