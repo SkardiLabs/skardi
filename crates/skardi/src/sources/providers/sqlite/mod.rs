@@ -37,18 +37,16 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::time::timeout;
 use tokio_rusqlite::Connection;
 
-use crate::sources::hierarchy::{HierarchyLevel, build_catalog, parse_allowed_schemas};
+use crate::sources::DataSourceType;
+use crate::sources::hierarchy::{
+    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Default number of read connections in the pool.
 const DEFAULT_READ_POOL_SIZE: usize = 4;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_RETRIES: u32 = 3;
 
 /// Create a read-only SQLite table provider for a single table.
 pub async fn create_sqlite_table_provider(
@@ -81,7 +79,7 @@ pub async fn create_sqlite_table_provider(
 /// * `options` - Optional configuration (see below)
 /// * `read_write` - If true, register as read-write (allows INSERT/UPDATE/DELETE)
 /// * `registry` - Optional dataset registry for sqlite_knn / sqlite_fts table functions
-/// * `hierarchy_level` - `None` → table mode (default); `Some(HierarchyLevel::Catalog)` loads the whole DB
+/// * `hierarchy_level` - `HierarchyLevel::Table` (default) or `HierarchyLevel::Catalog` loads the whole DB
 ///
 /// # Options
 /// * `table` - Table name (required in table mode, not used in catalog mode)
@@ -97,9 +95,8 @@ pub async fn register_sqlite_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     registry: Option<&DatasetRegistry>,
-    hierarchy_level: Option<HierarchyLevel>,
+    hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
-    let hierarchy_level = hierarchy_level.unwrap_or_default();
     let mode_str = if read_write {
         "read-write"
     } else {
@@ -289,51 +286,15 @@ async fn register_sqlite_catalog(
         }
     }
 
-    let mut schema_tables = {
-        let mut last_err = anyhow::anyhow!("unreachable");
-        let mut result = None;
-        for attempt in 1..=MAX_RETRIES {
-            match timeout(
-                CONNECT_TIMEOUT,
-                list_sqlite_tables_in_catalog(db_path, busy_timeout_ms, &extensions),
-            )
-            .await
-            {
-                Ok(Ok(rows)) => {
-                    result = Some(rows);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    last_err = e.context(format!(
-                        "Failed to list SQLite tables for catalog '{}'",
-                        catalog_name
-                    ));
-                    tracing::warn!(
-                        "SQLite catalog '{}': introspection attempt {}/{} failed: {}",
-                        catalog_name,
-                        attempt,
-                        MAX_RETRIES,
-                        last_err
-                    );
-                }
-                Err(_) => {
-                    last_err = anyhow::anyhow!(
-                        "Timed out after {}s opening SQLite database for catalog '{}'. \
-                         Check that the database file is accessible.",
-                        CONNECT_TIMEOUT.as_secs(),
-                        catalog_name
-                    );
-                    tracing::warn!(
-                        "SQLite catalog '{}': introspection attempt {}/{} timed out",
-                        catalog_name,
-                        attempt,
-                        MAX_RETRIES
-                    );
-                }
-            }
-        }
-        result.ok_or(last_err)?
-    };
+    let label = SourceLabel::new(
+        DataSourceType::Sqlite,
+        HierarchyLevel::Catalog,
+        catalog_name,
+    );
+    let mut schema_tables = retry_with_timeout(label, "sqlite_master introspection", || async {
+        list_sqlite_tables_in_catalog(db_path, busy_timeout_ms, &extensions).await
+    })
+    .await?;
 
     let allowed_schemas = parse_allowed_schemas(options);
     if let Some(ref allowed) = allowed_schemas {
@@ -1549,6 +1510,7 @@ mod tests {
                 None,
                 false,
                 None,
+                HierarchyLevel::Table,
             )
             .await;
 
@@ -1591,9 +1553,17 @@ mod tests {
     async fn register_test_table(ctx: &mut SessionContext, db_path: &str) {
         let mut options = HashMap::new();
         options.insert("table".to_string(), "test_items".to_string());
-        register_sqlite_tables(ctx, "test_items", db_path, Some(&options), true, None)
-            .await
-            .expect("register sqlite table");
+        register_sqlite_tables(
+            ctx,
+            "test_items",
+            db_path,
+            Some(&options),
+            true,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register sqlite table");
     }
 
     /// Collect a SELECT query and return all batches.
@@ -2012,9 +1982,17 @@ mod tests {
         ] {
             let mut options = HashMap::new();
             options.insert("table".to_string(), table_name.to_string());
-            register_sqlite_tables(ctx, reg_name, db_path, Some(&options), true, None)
-                .await
-                .unwrap_or_else(|e| panic!("register {} failed: {}", reg_name, e));
+            register_sqlite_tables(
+                ctx,
+                reg_name,
+                db_path,
+                Some(&options),
+                true,
+                None,
+                HierarchyLevel::Table,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("register {} failed: {}", reg_name, e));
         }
     }
 
@@ -2300,9 +2278,17 @@ mod tests {
 
         let mut options = HashMap::new();
         options.insert("table".to_string(), "blob_items".to_string());
-        register_sqlite_tables(&mut ctx, "blob_items", db, Some(&options), false, None)
-            .await
-            .expect("register blob_items");
+        register_sqlite_tables(
+            &mut ctx,
+            "blob_items",
+            db,
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register blob_items");
 
         // Read back — data column should be Binary, not Utf8
         let batches = query_all(&ctx, "SELECT id, data FROM blob_items ORDER BY id").await;
@@ -2341,9 +2327,17 @@ mod tests {
 
         let mut options = HashMap::new();
         options.insert("table".to_string(), "blob_items".to_string());
-        register_sqlite_tables(&mut ctx, "blob_items", db, Some(&options), false, None)
-            .await
-            .expect("register blob_items");
+        register_sqlite_tables(
+            &mut ctx,
+            "blob_items",
+            db,
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register blob_items");
 
         // Subquery fetching a BLOB column should work (simulates the vec0
         // subquery path in sqlite_knn).

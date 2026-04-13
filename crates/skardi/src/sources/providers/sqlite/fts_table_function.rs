@@ -417,6 +417,7 @@ mod tests {
     use arrow::array::{Array, Float64Array, RecordBatch, StringArray};
 
     use super::super::register_sqlite_tables;
+    use crate::sources::hierarchy::HierarchyLevel;
 
     async fn create_fts_test_db() -> tempfile::TempPath {
         let tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -458,6 +459,7 @@ mod tests {
             Some(&options),
             false,
             Some(&registry),
+            HierarchyLevel::Table,
         )
         .await
         .expect("register fts table failed");
@@ -638,6 +640,7 @@ mod tests {
             Some(&options),
             true,
             Some(&registry),
+            HierarchyLevel::Table,
         )
         .await
         .expect("register fts table (rw) failed");

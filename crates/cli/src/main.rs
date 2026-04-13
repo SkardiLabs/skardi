@@ -89,7 +89,7 @@ struct LocalDataSource {
     connection_string: Option<String>,
     options: Option<HashMap<String, String>>,
     #[serde(default)]
-    hierarchy_level: Option<HierarchyLevel>,
+    hierarchy_level: HierarchyLevel,
 }
 
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {

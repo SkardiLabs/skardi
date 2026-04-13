@@ -431,6 +431,7 @@ mod tests {
     use arrow::array::{Float64Array as F64Array, Int64Array, RecordBatch};
 
     use super::super::register_sqlite_tables;
+    use crate::sources::hierarchy::HierarchyLevel;
 
     fn vec_ext_path() -> Option<String> {
         std::env::var("SQLITE_VEC_PATH").ok()
@@ -495,9 +496,17 @@ mod tests {
         options.insert("table".to_string(), "vec_items".to_string());
         options.insert("extensions".to_string(), ext_path.to_string());
 
-        register_sqlite_tables(ctx, "vec_items", db, Some(&options), false, Some(&registry))
-            .await
-            .expect("register vec_items table failed");
+        register_sqlite_tables(
+            ctx,
+            "vec_items",
+            db,
+            Some(&options),
+            false,
+            Some(&registry),
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register vec_items table failed");
 
         register_sqlite_knn_udtf(ctx, Arc::clone(&registry));
         (registry, db_path)
@@ -667,6 +676,7 @@ mod tests {
             Some(&options),
             true, // read_write
             Some(&registry),
+            HierarchyLevel::Table,
         )
         .await
         .expect("register vec_items table (rw) failed");
