@@ -3,8 +3,8 @@
 //! Registers two virtual tables in the shared `SessionContext` under the
 //! `auth` schema:
 //!
-//! * `auth.users`    — mirrors the [`User`] store (live read on every scan)
-//! * `auth.sessions` — mirrors the [`Session`] store (live read on every scan)
+//! * `auth.users`    — mirrors the `User` store (live read on every scan)
+//! * `auth.sessions` — mirrors the `Session` store (live read on every scan)
 //!
 //! Every `scan()` call queries the underlying SQLite database through the
 //! adapter's `UserOps`/`SessionOps` trait implementations, so queries always

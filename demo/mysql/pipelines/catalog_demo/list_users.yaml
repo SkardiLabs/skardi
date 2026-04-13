@@ -1,0 +1,15 @@
+metadata:
+  name: "mysql-catalog-list-users"
+  version: "1.0.0"
+  description: >
+    Scan the users table via a three-part catalog reference.
+    Demonstrates catalog mode: tables are addressed as catalog.schema.table.
+
+# Parameters:
+#   {limit} - Maximum number of rows to return
+
+query: |
+  SELECT id, name, email
+  FROM mydb_catalog.mydb.users
+  ORDER BY id
+  LIMIT {limit}

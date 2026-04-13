@@ -1,11 +1,14 @@
-use crate::sources::HierarchyLevel;
+use crate::sources::DataSourceType;
+use crate::sources::hierarchy::{
+    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+};
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, Session};
+use datafusion::catalog::Session;
 use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -36,9 +39,8 @@ use std::sync::Arc;
 /// Register PostgreSQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
 /// Single-table mode reuses datafusion-table-providers' `SqlTable` for reads and sqlx for writes
-/// (INSERT/UPDATE/DELETE), fixing issues with auto-generated columns. Catalog mode registers a
-/// [`MemoryCatalogProvider`] with one provider per table; read-write uses one shared sqlx pool
-/// cloned per table wrapper.
+/// (INSERT/UPDATE/DELETE), fixing issues with auto-generated columns. Catalog mode registers one provider per table;
+/// read-write uses one shared sqlx pool cloned per table wrapper.
 ///
 /// # Arguments
 /// * `session_ctx` - DataFusion session context to register tables into
@@ -48,10 +50,10 @@ use std::sync::Arc;
 ///   Use `user_env` and `pass_env` options instead.
 /// * `options` - Optional configuration (e.g., table name, schema)
 /// * `read_write` - If true, register as read-write table provider (allows INSERT/UPDATE/DELETE)
-/// * `hierarchy_level` - `None` → table mode (default); `Some(HierarchyLevel::Catalog)` loads the whole DB as a catalog
+/// * `hierarchy_level` - [`HierarchyLevel::Table`] (default) or [`HierarchyLevel::Catalog`]
 ///
 /// # Options
-/// * `table` - Table name (required in table mode, the default when `hierarchy_level` is `None`)
+/// * `table` - Table name (required in table mode)
 /// * `schema` - Schema name (default: "public")
 /// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only)
 /// * `user_env` - Environment variable name for username (optional)
@@ -63,9 +65,8 @@ pub async fn register_postgres_tables(
     options: Option<&HashMap<String, String>>,
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
-    hierarchy_level: Option<HierarchyLevel>,
+    hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
-    let hierarchy_level = hierarchy_level.unwrap_or_default();
     let mode_str = if read_write {
         "read-write"
     } else {
@@ -101,30 +102,40 @@ pub async fn register_postgres_tables(
 
 /// Create both connection pools needed for a Postgres source.
 ///
-/// Returns `(read_pool, sqlx_pool)`. The `label` is used only in error messages.
+/// Returns `(read_pool, sqlx_pool)`. The `label` identifies the source (kind + mode + name)
+/// in retry tracing and error context. Each pool's construction is wrapped in
+/// [`retry_with_timeout`] for parity with the MySQL path.
 async fn init_postgres_pools(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
-    label: &str,
+    label: SourceLabel<'_>,
 ) -> Result<(Arc<PostgresConnectionPool>, PgPool)> {
     let pool_params = parse_connection_params(connection_string, options)?;
     let read_pool = Arc::new(
-        PostgresConnectionPool::new(pool_params)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create PostgreSQL connection pool for '{}'",
-                    label
-                )
-            })?,
+        retry_with_timeout(label, "read pool creation", || async {
+            PostgresConnectionPool::new(pool_params.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create PostgreSQL connection pool for '{}'",
+                label.name
+            )
+        })?,
     );
 
     // Always build the sqlx pool: needed for schema introspection (handles pgvector and other
     // custom types), and reused for writes and KNN registry population when applicable.
     let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-    let sqlx_pool = PgPool::connect(&sqlx_url)
-        .await
-        .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label))?;
+    let sqlx_pool = retry_with_timeout(label, "sqlx pool creation", || async {
+        PgPool::connect(&sqlx_url)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    })
+    .await
+    .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label.name))?;
 
     Ok((read_pool, sqlx_pool))
 }
@@ -179,7 +190,8 @@ async fn register_single_postgres_table(
         anyhow::anyhow!("PostgreSQL single-table registration requires 'table' option")
     })?;
 
-    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, name).await?;
+    let label = SourceLabel::new(DataSourceType::Postgres, HierarchyLevel::Table, name);
+    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, label).await?;
 
     let table_provider = build_and_register_table(
         &read_pool,
@@ -223,18 +235,24 @@ async fn register_postgres_catalog(
         mode_str,
     );
 
-    let (read_pool, sqlx_pool) =
-        init_postgres_pools(connection_string, options, catalog_name).await?;
+    let label = SourceLabel::new(
+        DataSourceType::Postgres,
+        HierarchyLevel::Catalog,
+        catalog_name,
+    );
+    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, label).await?;
 
     let allowed_schemas = parse_allowed_schemas(options);
-    let schema_tables = list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_ref())
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to list PostgreSQL tables for catalog-wide registration in source '{}'",
-                catalog_name
-            )
-        })?;
+    let schema_tables = retry_with_timeout(label, "information_schema introspection", || async {
+        list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_deref()).await
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to list PostgreSQL tables for catalog-wide registration in source '{}'",
+            catalog_name
+        )
+    })?;
 
     if schema_tables.is_empty() {
         tracing::warn!(
@@ -243,73 +261,40 @@ async fn register_postgres_catalog(
         );
     }
 
-    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
+    let table_count = schema_tables.len();
+    let catalog_name_owned = catalog_name.to_string();
+    let knn_registry = pg_knn_registry.map(Arc::clone);
 
-    for (schema, table_name) in &schema_tables {
-        let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
-        let table_provider = build_and_register_table(
-            &read_pool,
-            &sqlx_pool,
-            schema,
-            table_name,
-            read_write,
-            pg_knn_registry,
-            &knn_key,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to build table provider for '{}.{}' in catalog '{}'",
-                schema, table_name, catalog_name
-            )
-        })?;
-
-        if catalog_provider.schema(schema).is_none() {
-            catalog_provider
-                .register_schema(schema, Arc::new(MemorySchemaProvider::new()))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to register schema '{}' for catalog '{}': {}",
-                        schema,
-                        catalog_name,
-                        e
-                    )
-                })?;
-        }
-
-        let schema_provider = catalog_provider.schema(schema).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Schema '{}' was not found after registration in catalog '{}'",
-                schema,
-                catalog_name
-            )
-        })?;
-
-        schema_provider
-            .register_table(table_name.to_string(), table_provider)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to register table '{}.{}' in catalog '{}': {}",
-                    schema,
-                    table_name,
-                    catalog_name,
-                    e
+    build_catalog(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        |schema, table_name| {
+            let read_pool = Arc::clone(&read_pool);
+            let sqlx_pool = sqlx_pool.clone();
+            let catalog_name = catalog_name_owned.clone();
+            let knn_registry = knn_registry.clone();
+            async move {
+                let knn_key = format!("{}.{}.{}", catalog_name, schema, table_name);
+                build_and_register_table(
+                    &read_pool,
+                    &sqlx_pool,
+                    &schema,
+                    &table_name,
+                    read_write,
+                    knn_registry.as_ref(),
+                    &knn_key,
                 )
-            })?;
+                .await
+            }
+        },
+    )
+    .await?;
 
-        tracing::debug!(
-            "Prepared '{}.{}' in catalog '{}'",
-            schema,
-            table_name,
-            catalog_name
-        );
-    }
-
-    session_ctx.register_catalog(catalog_name, catalog_provider);
     tracing::info!(
         "Registered PostgreSQL catalog '{}' with {} table(s) ({})",
         catalog_name,
-        schema_tables.len(),
+        table_count,
         mode_str
     );
 
@@ -440,9 +425,13 @@ async fn register_table_in_knn_registry(
     Ok(())
 }
 
+// TODO: this function builds on sqlx directly, which keeps it decoupled from
+// datafusion-table-providers' internal connection types. The MySQL counterpart
+// (`list_mysql_tables_in_catalog`) still downcasts to an internal `MySQLConnection`.
+// Upstream a typed introspection accessor so both paths can drop the coupling.
 async fn list_postgres_tables_in_catalog(
     pool: &PgPool,
-    allowed_schemas: Option<&Vec<String>>,
+    allowed_schemas: Option<&[String]>,
 ) -> Result<Vec<(String, String)>> {
     const BASE_QUERY: &str = "SELECT table_schema, table_name
          FROM information_schema.tables
@@ -466,21 +455,6 @@ async fn list_postgres_tables_in_catalog(
         }
     };
     Ok(rows)
-}
-
-fn parse_allowed_schemas(options: Option<&HashMap<String, String>>) -> Option<Vec<String>> {
-    let value = options.and_then(|opts| opts.get("allowed_schemas"))?;
-    let values = value
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
-    }
 }
 
 // ─── SqlxPostgresTableProvider ──────────────────────────────────────────────
@@ -1306,7 +1280,7 @@ mod tests {
                 None,
                 false,
                 None,
-                None,
+                HierarchyLevel::default(),
             )
             .await;
 
@@ -1716,7 +1690,7 @@ mod tests {
             None,
             false,
             None,
-            Some(HierarchyLevel::Catalog),
+            HierarchyLevel::Catalog,
         )
         .await;
 
@@ -1737,7 +1711,7 @@ mod tests {
             None,
             false,
             None,
-            Some(HierarchyLevel::Table),
+            HierarchyLevel::Table,
         )
         .await;
 
@@ -1750,9 +1724,9 @@ mod tests {
         );
     }
 
-    /// `None` for `hierarchy_level` defaults to table mode.
+    /// Default `HierarchyLevel` routes to table mode.
     #[tokio::test]
-    async fn test_hierarchy_level_none_defaults_to_table_mode() {
+    async fn test_hierarchy_level_default_is_table_mode() {
         let mut session_ctx = SessionContext::new();
         let result = register_postgres_tables(
             &mut session_ctx,
@@ -1761,7 +1735,7 @@ mod tests {
             None,
             false,
             None,
-            None, // None → Table
+            HierarchyLevel::default(),
         )
         .await;
 
@@ -1820,7 +1794,7 @@ mod tests {
             Some(&options),
             true,
             None,
-            None,
+            HierarchyLevel::Table,
         )
         .await
         .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));

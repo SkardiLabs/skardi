@@ -89,7 +89,7 @@ struct LocalDataSource {
     connection_string: Option<String>,
     options: Option<HashMap<String, String>>,
     #[serde(default)]
-    hierarchy_level: Option<HierarchyLevel>,
+    hierarchy_level: HierarchyLevel,
 }
 
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -539,6 +539,7 @@ async fn register_source(
                 conn_str,
                 source.options.as_ref(),
                 false,
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register MySQL '{}'", source.name))?;

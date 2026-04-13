@@ -18,7 +18,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::remote_storage::{RemoteStorage, S3Storage};
+use crate::OptimizerRegistry;
 pub use skardi::sources::AccessMode;
+pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
 
 /// CLI arguments for the Skardi server
@@ -74,30 +76,15 @@ pub struct DataSource {
     pub schema: Option<HashMap<String, String>>,
     /// Optional format-specific options
     pub options: Option<HashMap<String, String>>,
-    /// Registration hierarchy level for database sources (`None` / omitted → table)
+    /// Registration hierarchy level for database sources (omitted → table)
     #[serde(default)]
-    pub hierarchy_level: Option<HierarchyLevel>,
+    pub hierarchy_level: HierarchyLevel,
     /// Access mode: read_only (default) or read_write
     #[serde(default)]
     pub access_mode: AccessMode,
     /// If true, load the entire table into memory at startup (only for Csv, Parquet, Iceberg)
     #[serde(default)]
     pub enable_cache: bool,
-}
-
-/// Supported data source types
-#[derive(Debug, Clone, Deserialize, Serialize, Hash, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum DataSourceType {
-    Csv,
-    Parquet,
-    Postgres,
-    Mysql,
-    Sqlite,
-    Iceberg,
-    Mongo,
-    Redis,
-    Lance,
 }
 
 /// Context configuration file structure
@@ -263,7 +250,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     };
 
     // Create optimizer registry before SessionState
-    let optimizer_registry = Arc::new(crate::optimizer_registry::OptimizerRegistry::new());
+    let optimizer_registry = Arc::new(OptimizerRegistry::new());
 
     // Create federation-enabled SessionState
     let state = datafusion_federation::default_session_state();
@@ -547,8 +534,9 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         }
 
         // Catalog mode must not mix with per-table / per-schema options
-        if source.source_type == DataSourceType::Postgres
-            && source.hierarchy_level == Some(HierarchyLevel::Catalog)
+        if (source.source_type == DataSourceType::Postgres
+            || source.source_type == DataSourceType::Mysql)
+            && source.hierarchy_level == HierarchyLevel::Catalog
         {
             for conflicting in &["table", "schema"] {
                 if source
@@ -902,6 +890,7 @@ async fn register_data_source(
                 connection_string,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                source.hierarchy_level,
             )
             .await
             .map_err(|e| {

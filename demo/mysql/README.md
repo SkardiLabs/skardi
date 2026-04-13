@@ -328,6 +328,83 @@ curl -X POST http://localhost:8080/federated_join_and_insert/execute \
 3. 📈 Aggregated: COUNT orders, SUM amounts, MAX date for the specified user
 4. 💾 Wrote 1 aggregated row to MySQL (transactional)
 
+## Catalog Mode
+
+Instead of registering tables one by one, you can expose an entire MySQL database as a
+DataFusion **catalog**. Every table and view in every non-system schema is registered
+automatically, and you query them with the three-part `catalog.schema.table` syntax.
+
+### Context file
+
+```yaml
+# demo/mysql/ctx_mysql_catalog_demo.yaml
+data_sources:
+  - name: "mydb_catalog"
+    type: "mysql"
+    hierarchy_level: "catalog"
+    connection_string: "mysql://localhost:3306/mydb"
+    description: "Entire mydb database registered as a DataFusion catalog"
+    options:
+      user_env: "MYSQL_USER"
+      pass_env: "MYSQL_PASSWORD"
+      ssl_mode: "disabled"
+      # Optionally restrict to specific schemas:
+      # allowed_schemas: "mydb,analytics"
+```
+
+### Start the server
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/mysql/ctx_mysql_catalog_demo.yaml \
+  --pipeline demo/mysql/pipelines/catalog_demo/ \
+  --port 8080
+```
+
+### Example queries
+
+Tables are referenced as `<catalog>.<schema>.<table>`:
+
+```bash
+# List users (limit 10)
+curl -X POST http://localhost:8080/mysql-catalog-list-users/execute \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 10}' | jq .
+
+# Join users and orders through the catalog
+curl -X POST http://localhost:8080/mysql-catalog-cross-table-join/execute \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 20}' | jq .
+
+# Aggregate order totals per user
+curl -X POST http://localhost:8080/mysql-catalog-user-order-summary/execute \
+  -H "Content-Type: application/json" \
+  -d '{"min_orders": 1}' | jq .
+```
+
+### Restrict to specific schemas
+
+Add `allowed_schemas` to the options to limit which schemas are loaded:
+
+```yaml
+options:
+  allowed_schemas: "mydb,analytics"
+```
+
+Only the listed schemas will be registered. System schemas (`mysql`,
+`information_schema`, `performance_schema`, `sys`) are always excluded regardless of
+this setting.
+
+### Table mode vs catalog mode at a glance
+
+| | Table mode (default) | Catalog mode |
+|---|---|---|
+| `hierarchy_level` | `table` or omit | `catalog` |
+| `table` option | required | not used |
+| SQL reference | `table_name` | `catalog.schema.table` |
+| Tables loaded | one | all (filtered by `allowed_schemas`) |
+| Good for | single-table APIs | cross-table joins, schema discovery |
+
 ## Troubleshooting
 
 ### Connection Refused

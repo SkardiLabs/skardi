@@ -248,7 +248,7 @@ mod tests {
             options: None,
             access_mode: crate::config::AccessMode::default(),
             enable_cache: false,
-            hierarchy_level: None,
+            hierarchy_level: Default::default(),
         }];
 
         // Should not register Lance functions for CSV-only data sources
