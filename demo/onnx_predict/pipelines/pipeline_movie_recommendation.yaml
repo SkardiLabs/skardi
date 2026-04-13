@@ -6,6 +6,11 @@ metadata:
   created_at: 2025-11-03T00:00:00.000+00:00
   updated_at: 2025-01-30T00:00:00.000+00:00
 
+# Parameters:
+#   {last_watched_movie} - Title of the last movie the user watched (seed for KNN)
+#   {k}                  - Number of KNN candidates fetched before NCF re-ranking
+#   {user_id}            - User id passed to the NCF model
+#   {top_n}              - Final number of recommendations to return
 
 query: |
   WITH last_watched AS (
@@ -20,7 +25,7 @@ query: |
       'movie_embeddings',
       'embedding',
       (SELECT embedding FROM movie_embeddings WHERE movie_id = (SELECT movie_id FROM last_watched)),
-      10
+      {k}
     ) knn
     WHERE knn.movie_id != (SELECT movie_id FROM last_watched)
   ),

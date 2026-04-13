@@ -104,7 +104,8 @@ cargo run --bin skardi-server --features gguf -- \
 curl -X POST http://localhost:8080/semantic-search-gguf/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "how does similarity search work in vector databases?"
+    "query": "how does similarity search work in vector databases?",
+    "k": 10
   }' | jq .
 ```
 
@@ -186,17 +187,17 @@ curl -X POST http://localhost:8080/semantic-search-gguf/execute \
 # Retrieval-Augmented Generation
 curl -X POST http://localhost:8080/semantic-search-gguf/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "how to ground LLM responses with retrieved documents"}' | jq .
+  -d '{"query": "how to ground LLM responses with retrieved documents", "k": 10}' | jq .
 
 # GGUF and quantisation
 curl -X POST http://localhost:8080/semantic-search-gguf/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "running quantised models on CPU without a GPU"}' | jq .
+  -d '{"query": "running quantised models on CPU without a GPU", "k": 5}' | jq .
 
 # Arrow / columnar formats
 curl -X POST http://localhost:8080/semantic-search-gguf/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "columnar data formats for analytics"}' | jq .
+  -d '{"query": "columnar data formats for analytics", "k": 5}' | jq .
 ```
 
 ## Pipeline Parameters
@@ -204,6 +205,7 @@ curl -X POST http://localhost:8080/semantic-search-gguf/execute \
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `query` | string | Yes | Free-text search query |
+| `k` | integer | Yes | Number of nearest neighbours to return |
 
 ## Directory Layout
 

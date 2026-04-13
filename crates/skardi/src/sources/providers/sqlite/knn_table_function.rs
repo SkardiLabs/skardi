@@ -36,7 +36,7 @@ use tokio_rusqlite::Connection;
 
 use super::knn_exec::SqliteKnnExec;
 use super::{expr_to_sqlite_sql, extract_string};
-use crate::sources::providers::knn_utils::MAX_KNN_K;
+use crate::sources::providers::knn_utils::extract_k;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered SQLite table.
@@ -76,7 +76,7 @@ impl TableFunctionImpl for SqliteKnnTableFunction {
 
         let table_name = extract_string(&exprs[0], "table")?;
         let vector_col = extract_string(&exprs[1], "vector_col")?;
-        let k = extract_k(&exprs[3])?;
+        let k = extract_k(&exprs[3], "sqlite_knn")?;
 
         // Try to extract a literal vector.
         let literal_vector = extract_vector(&exprs[2]).ok();
@@ -258,27 +258,6 @@ pub fn register_sqlite_knn_udtf(ctx: &SessionContext, registry: DatasetRegistry)
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_k(expr: &Expr) -> DFResult<usize> {
-    let k = match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => Ok(*v as usize),
-        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
-            plan_err!("sqlite_knn: k must be a positive integer, got {}", v)
-        }
-        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => Ok(*v as usize),
-        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
-            plan_err!("sqlite_knn: k must be a positive integer, got {}", v)
-        }
-        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok(*v as usize),
-        // NULL placeholder during schema inference
-        Expr::Literal(ScalarValue::Null, _) => Ok(1),
-        _ => plan_err!("sqlite_knn: k must be a positive integer literal"),
-    }?;
-    if k > MAX_KNN_K {
-        return plan_err!("sqlite_knn: k must be between 1 and {MAX_KNN_K}, got {k}");
-    }
-    Ok(k)
-}
 
 fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
     let values: Arc<dyn arrow::array::Array> = match expr {
