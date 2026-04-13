@@ -14,6 +14,7 @@ metadata:
 #
 # Parameters:
 #   {query_vector}: The embedding vector as a literal array, e.g. [0.1, 0.2, ...]
+#   {k}:            Number of nearest neighbours to return
 
 query: |
   SELECT
@@ -25,14 +26,15 @@ query: |
     'sift_items',
     'vector',
     {query_vector},
-    10
+    {k}
   ) knn
 
 # Example API Call:
 #
 # POST /lance-direct-vector-search/execute
 # {
-#   "query_vector": [0.1, 0.2, 0.3, ...]  (128 floats for the demo dataset)
+#   "query_vector": [0.1, 0.2, 0.3, ...],  (128 floats for the demo dataset)
+#   "k": 10
 # }
 #
 # Response:

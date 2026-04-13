@@ -367,12 +367,12 @@ query: |
   SELECT id, content, metadata, _score
   FROM pg_knn('documents', 'embedding',
       (SELECT embedding FROM documents WHERE id = {seed_id}),
-      '<=>', 10)
+      '<=>', {k})
   ORDER BY _score
   LIMIT {limit}
 ```
 
-Each pipeline accepts two parameters: `seed_id` (the document to use as the query vector) and `limit` (how many results to return). `pg_knn` fetches up to 10 candidates from Postgres; `LIMIT {limit}` trims the final result set.
+Each pipeline accepts three parameters: `seed_id` (the document to use as the query vector), `k` (how many candidates `pg_knn` pulls from the ANN index), and `limit` (how many rows to return after the outer `ORDER BY`). Typically `k >= limit`.
 
 ### Start and query
 
@@ -387,17 +387,17 @@ cargo run --bin skardi-server -- \
 # Inner product
 curl -X POST http://localhost:8080/vector-search-inner-product/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "limit": 3}' | jq .
+  -d '{"seed_id": 1, "k": 10, "limit": 3}' | jq .
 
 # L2 (Euclidean)
 curl -X POST http://localhost:8080/vector-search-l2/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "limit": 3}' | jq .
+  -d '{"seed_id": 1, "k": 10, "limit": 3}' | jq .
 
 # Cosine
 curl -X POST http://localhost:8080/vector-search-cosine/execute \
   -H "Content-Type: application/json" \
-  -d '{"seed_id": 1, "limit": 3}' | jq .
+  -d '{"seed_id": 1, "k": 10, "limit": 3}' | jq .
 ```
 
 **`<#>` inner product** — doc-2 ranks first: same direction as doc-1 but 5× larger magnitude boosts the dot product.
@@ -886,7 +886,7 @@ cargo run --bin skardi-server -- \
 # Search with a literal query vector
 curl -X POST http://localhost:8080/vector-search-catalog/execute \
   -H "Content-Type: application/json" \
-  -d '{"query_vector": [0.6, 0.8, 0.0, 0.0], "limit": 3}' | jq .
+  -d '{"query_vector": [0.6, 0.8, 0.0, 0.0], "k": 10, "limit": 3}' | jq .
 ```
 
 **Example response:**

@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use super::knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
-use crate::sources::providers::knn_utils::MAX_KNN_K;
+use crate::sources::providers::knn_utils::extract_k;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered Postgres table.
@@ -89,7 +89,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
                 .map_err(datafusion::error::DataFusionError::Plan)?
         };
 
-        let k = extract_k(&exprs[4])?;
+        let k = extract_k(&exprs[4], "pg_knn")?;
 
         let inline_filter = if exprs.len() == 6 {
             extract_string(&exprs[5], "filter").ok()
@@ -466,19 +466,6 @@ fn pg_type_to_arrow(
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_k(expr: &Expr) -> DFResult<usize> {
-    let k = match expr {
-        Expr::Literal(ScalarValue::Int64(Some(n)), _) => Ok(*n as usize),
-        Expr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
-        Expr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
-        _ => plan_err!("pg_knn: k must be a positive integer literal"),
-    }?;
-    if k == 0 || k > MAX_KNN_K {
-        return plan_err!("pg_knn: k must be between 1 and {MAX_KNN_K}, got {k}");
-    }
-    Ok(k)
-}
 
 fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
     match expr {

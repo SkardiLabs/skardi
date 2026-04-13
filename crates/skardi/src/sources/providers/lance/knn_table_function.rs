@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use super::knn_exec::LanceKnnExec;
 use super::utils::expr_to_lance_sql;
-use crate::sources::providers::knn_utils::MAX_KNN_K;
+use crate::sources::providers::knn_utils::extract_k;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Table function that creates KNN search on Lance tables
@@ -56,13 +56,7 @@ impl TableFunctionImpl for LanceKnnTableFunction {
         // Extract string arguments
         let table_name = extract_string(&exprs[0], "table_name")?;
         let vector_column = extract_string(&exprs[1], "vector_column")?;
-        let k = {
-            let k = extract_int(&exprs[3], "k")?;
-            if k == 0 || k > MAX_KNN_K {
-                return plan_err!("lance_knn: k must be between 1 and {MAX_KNN_K}, got {k}");
-            }
-            k
-        };
+        let k = extract_k(&exprs[3], "lance_knn")?;
         let filter = if exprs.len() == 5 {
             Some(extract_string(&exprs[4], "filter")?)
         } else {
@@ -241,15 +235,6 @@ fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
         Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
         _ => plan_err!("lance_knn: {} must be a string literal", name),
-    }
-}
-
-fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
-    match expr {
-        Expr::Literal(ScalarValue::Int64(Some(n)), _) => Ok(*n as usize),
-        Expr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
-        Expr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
-        _ => plan_err!("lance_knn: {} must be an integer literal", name),
     }
 }
 

@@ -8,12 +8,13 @@ metadata:
 
 # Parameters:
 #   {seed_id} - ID of the document whose embedding is used as the query vector
-#   {limit}   - Maximum number of results to return
+#   {k}       - Number of candidates pg_knn fetches from the ANN index
+#   {limit}   - Maximum number of results to return (trims the final result set)
 
 query: |
   SELECT id, content, metadata, _score
   FROM pg_knn('documents', 'embedding',
       (SELECT embedding FROM documents WHERE id = {seed_id}),
-      '<#>', 10)
+      '<#>', {k})
   ORDER BY _score
   LIMIT {limit}

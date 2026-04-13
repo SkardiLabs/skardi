@@ -10,12 +10,13 @@ metadata:
 
 # Parameters:
 #   {query_vector} - Float array to search against, e.g. [0.6, 0.8, 0.0, 0.0]
-#   {limit}        - Maximum number of results to return
+#   {k}            - Number of candidates pg_knn fetches from the ANN index
+#   {limit}        - Maximum number of results to return (trims the final result set)
 
 query: |
   SELECT id, content, metadata, _score
   FROM pg_knn('mydb.public.documents', 'embedding',
       {query_vector},
-      '<=>', 10)
+      '<=>', {k})
   ORDER BY _score
   LIMIT {limit}

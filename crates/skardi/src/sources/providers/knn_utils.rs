@@ -9,11 +9,47 @@ pub const MAX_KNN_K: usize = 500;
 use arrow::array::{
     Array, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, StringArray,
 };
+use datafusion::common::{ScalarValue, plan_err};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use futures::StreamExt;
 use std::sync::Arc;
+
+/// Extract the `k` argument for a KNN table function from a planning-time expression.
+///
+/// Accepts positive integer literals (`Int32`, `Int64`, `UInt64`) and enforces the
+/// global [`MAX_KNN_K`] upper bound. During pipeline schema inference, pipeline
+/// `{param}` placeholders are converted to SQL `?` which reach the table function
+/// as `ScalarValue::Null` — in that case we return a dummy value of `1` so inference
+/// succeeds. The real integer is substituted textually at request time before
+/// re-planning, so the dummy value never runs.
+///
+/// `fn_name` is used as the error-message prefix (e.g. `"sqlite_knn"`).
+pub fn extract_k(expr: &Expr, fn_name: &str) -> DFResult<usize> {
+    let k = match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => *v as usize,
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            return plan_err!("{fn_name}: k must be a positive integer, got {v}");
+        }
+        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => *v as usize,
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+            return plan_err!("{fn_name}: k must be a positive integer, got {v}");
+        }
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) if *v > 0 => *v as usize,
+        // Pipeline `{k}` parameter arrives as `?` → Null during schema inference.
+        // Return a dummy value; the real k is substituted textually at execute time.
+        Expr::Literal(ScalarValue::Null, _) => 1,
+        _ => {
+            return plan_err!("{fn_name}: k must be a positive integer literal");
+        }
+    };
+    if k > MAX_KNN_K {
+        return plan_err!("{fn_name}: k must be between 1 and {MAX_KNN_K}, got {k}");
+    }
+    Ok(k)
+}
 
 /// Execute a child plan and extract the first row's first column as `Vec<f32>`.
 ///

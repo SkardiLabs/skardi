@@ -7,13 +7,16 @@ metadata:
     the nearest documents by cosine similarity.
   author: Skardi Demo
 
+# Parameters:
+#   {query} - Natural language search query (embedded on the fly)
+#   {k}     - Number of nearest neighbours to return
+
 query: |
   SELECT id, title, content, _distance
   FROM lance_knn(
     'doc_embeddings',
     'embedding',
     candle('models/generated/bge-small-en-v1.5', {query}),
-    10
+    {k}
   )
   ORDER BY _distance
-  LIMIT 10

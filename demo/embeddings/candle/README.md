@@ -99,11 +99,12 @@ cargo run --bin skardi-server --features candle -- \
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "how does similarity search work in vector databases?"
+    "query": "how does similarity search work in vector databases?",
+    "k": 10
   }' | jq .
 ```
 
-**Response** (truncated — returns up to 10 results):
+**Response** (truncated — returns up to `k` results):
 ```json
 {
       "id": 1,
@@ -173,17 +174,17 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 # Retrieval-Augmented Generation
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "how to ground LLM responses with retrieved documents"}' | jq .
+  -d '{"query": "how to ground LLM responses with retrieved documents", "k": 10}' | jq .
 
 # Arrow / columnar formats
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "columnar data formats for analytics"}' | jq .
+  -d '{"query": "columnar data formats for analytics", "k": 5}' | jq .
 
 # Model quantization
 curl -X POST http://localhost:8080/semantic-search/execute \
   -H "Content-Type: application/json" \
-  -d '{"query": "running models on CPU without a GPU"}' | jq .
+  -d '{"query": "running models on CPU without a GPU", "k": 5}' | jq .
 ```
 
 ## Pipeline Parameters
@@ -191,6 +192,7 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `query` | string | Yes | Free-text search query |
+| `k` | integer | Yes | Number of nearest neighbours to return |
 
 ## Directory Layout
 

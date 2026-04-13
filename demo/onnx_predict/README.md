@@ -63,7 +63,7 @@ WITH last_watched AS (
   WHERE title = {last_watched_movie}
   LIMIT 1
 ),
--- Step 2: Find 10 similar movies via Lance KNN
+-- Step 2: Find {k} similar movies via Lance KNN
 knn_results AS (
   SELECT knn.movie_id
   FROM lance_knn(
@@ -71,7 +71,7 @@ knn_results AS (
     'embedding',
     (SELECT embedding FROM movie_embeddings
      WHERE movie_id = (SELECT movie_id FROM last_watched)),
-    10
+    {k}
   ) knn
   WHERE knn.movie_id != (SELECT movie_id FROM last_watched)
 ),
@@ -112,6 +112,7 @@ curl -X POST http://localhost:8080/movie-recommendation-pipeline/execute \
   -H "Content-Type: application/json" \
   -d '{
     "last_watched_movie": "Toy Story",
+    "k": 10,
     "user_id": 42,
     "top_n": 5
   }' | jq .
@@ -141,6 +142,7 @@ curl -X POST http://localhost:8080/movie-recommendation-pipeline/execute \
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `last_watched_movie` | string | Yes | Title of the movie to find recommendations for |
+| `k` | integer | Yes | Number of KNN candidates fetched before NCF re-ranking |
 | `user_id` | integer | Yes | User ID for personalized scoring |
 | `top_n` | integer | Yes | Number of recommendations to return |
 

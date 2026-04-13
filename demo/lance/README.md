@@ -130,6 +130,7 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
   -H "Content-Type: application/json" \
   -d '{
     "reference_id": 1,
+    "k": 50,
     "min_revenue": null,
     "max_revenue": null
   }' | jq .
@@ -167,6 +168,7 @@ curl -X POST http://localhost:8080/lance-vector-similarity-search/execute \
   -H "Content-Type: application/json" \
   -d '{
     "reference_id": 1,
+    "k": 50,
     "min_revenue": 1000.0,
     "max_revenue": 5000.0
   }' | jq .
@@ -182,7 +184,8 @@ Pipeline: `pipelines/pipeline_lance_direct_vector.yaml`
 curl -X POST http://localhost:8080/lance-direct-vector-search/execute \
   -H "Content-Type: application/json" \
   -d '{
-    "query_vector": [0.0, 16.0, 35.0, 5.0, 32.0, ...]
+    "query_vector": [0.0, 16.0, 35.0, 5.0, 32.0, ...],
+    "k": 10
   }' | jq .
 ```
 
@@ -199,6 +202,7 @@ python demo/lance/test_direct_vector_search.py
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `reference_id` | integer | Yes | ID of the reference item to find similar items for |
+| `k` | integer | Yes | Number of nearest neighbours to retrieve from the ANN index |
 | `min_revenue` | double | No | Minimum revenue filter via WHERE pushdown (null = no filter) |
 | `max_revenue` | double | No | Maximum revenue filter via WHERE pushdown (null = no filter) |
 

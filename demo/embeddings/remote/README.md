@@ -45,7 +45,7 @@ cargo run --bin skardi-server --features remote-embed -- \
 ```bash
 curl -s "http://localhost:8080/semantic-search-remote/execute" \
   -H 'Content-Type: application/json' \
-  -d '{"query": "how does semantic search work?"}' | jq .
+  -d '{"query": "how does semantic search work?", "k": 10}' | jq .
 ```
 
 **Response**:

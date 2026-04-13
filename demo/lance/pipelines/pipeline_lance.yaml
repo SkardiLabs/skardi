@@ -24,8 +24,9 @@ metadata:
 #
 # Parameters:
 #   {reference_id}: ID of the reference item to find similar items for
-#   {min_revenue}: Optional minimum revenue filter (null = no filter)
-#   {max_revenue}: Optional maximum revenue filter (null = no filter)
+#   {k}:            Number of nearest neighbours to retrieve from the ANN index
+#   {min_revenue}:  Optional minimum revenue filter (null = no filter)
+#   {max_revenue}:  Optional maximum revenue filter (null = no filter)
 
 query: |
   SELECT
@@ -37,7 +38,7 @@ query: |
     'sift_items',
     'vector',
     (SELECT vector FROM sift_items WHERE id = {reference_id}),
-    50
+    {k}
   ) knn
   WHERE knn.id != {reference_id}
     AND ({min_revenue} IS NULL OR knn.revenue >= {min_revenue})
@@ -49,6 +50,7 @@ query: |
 # POST /lance-vector-similarity-search/execute
 # {
 #   "reference_id": 1,
+#   "k": 50,
 #   "min_revenue": null,
 #   "max_revenue": null
 # }
@@ -57,6 +59,7 @@ query: |
 # POST /lance-vector-similarity-search/execute
 # {
 #   "reference_id": 1,
+#   "k": 50,
 #   "min_revenue": 1000.0,
 #   "max_revenue": 5000.0
 # }
