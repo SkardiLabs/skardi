@@ -69,7 +69,7 @@ pub async fn create_sqlite_table_provider(
 /// Register SQLite tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
 /// Single-table mode (default) registers one table under `name`. Catalog mode registers a
-/// [`MemoryCatalogProvider`] with one provider per table across all non-system tables in the
+/// `MemoryCatalogProvider` with one provider per table across all non-system tables in the
 /// database (SQLite schema `main`).
 ///
 /// # Arguments
