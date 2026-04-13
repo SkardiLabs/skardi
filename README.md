@@ -5,6 +5,8 @@
 
 **SQL across anything: query, join, and aggregate over local files, databases, S3, and vector stores — or turn any SQL into a parameterized HTTP API, zero application code required, written in Rust, powered by Apache Datafusion.**
 
+[License]: https://opensource.org/licenses/Apache-2.0
+[License Badge]: https://img.shields.io/badge/License-Apache%202.0-orange.svg
 [CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
 [CI Badge]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml/badge.svg
 [crates.io]: https://crates.io/crates/skardi
@@ -14,10 +16,14 @@
 [Discord]: https://discord.gg/S5YQQPEV2m
 [Discord Badge]: https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white
 
+
 [![CI Badge]][CI]
 [![crates.io Badge]][crates.io]
 [![Docs Badge]][Docs]
 [![Discord Badge]][Discord]
+[![License Badge]][License]
+
+[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/)
 
 </p>
 </div>
