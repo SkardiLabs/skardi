@@ -1,6 +1,6 @@
 # Hybrid Search / RAG Demo
 
-This demo shows a complete FastGPT-style hybrid search pipeline using Skardi,
+This demo shows a complete hybrid search pipeline using Skardi,
 backed by a **single PostgreSQL table** that holds both the raw content and
 the vector embedding:
 
