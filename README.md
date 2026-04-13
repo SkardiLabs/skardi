@@ -273,7 +273,7 @@ data_sources:
 
   - name: "orders"
     type: "csv"
-    path: "demo/sample_data/orders.csv"
+    path: "docs/sample_data/orders.csv"
     options:
       has_header: true
       delimiter: ","
@@ -419,7 +419,7 @@ export PG_USER="myuser"
 export PG_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/postgres/README.md](demo/postgres/README.md).
+For detailed setup, CRUD examples, and federated queries, see [docs/postgres/README.md](docs/postgres/README.md).
 
 ### MySQL
 
@@ -440,7 +440,7 @@ export MYSQL_USER="myuser"
 export MYSQL_PASSWORD="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mysql/README.md](demo/mysql/README.md).
+For detailed setup, CRUD examples, and federated queries, see [docs/mysql/README.md](docs/mysql/README.md).
 
 ### SQLite
 
@@ -462,7 +462,7 @@ SQLite requires no credentials — just the path to the database file.
 skardi query --sql "SELECT * FROM './data/my_database.db.users'"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/sqlite/README.md](demo/sqlite/README.md).
+For detailed setup, CRUD examples, and federated queries, see [docs/sqlite/README.md](docs/sqlite/README.md).
 
 ### MongoDB
 
@@ -485,7 +485,7 @@ export MONGO_USER="myuser"
 export MONGO_PASS="mypassword"
 ```
 
-For detailed setup, CRUD examples, and federated queries, see [demo/mongo/README.md](demo/mongo/README.md).
+For detailed setup, CRUD examples, and federated queries, see [docs/mongo/README.md](docs/mongo/README.md).
 
 ### Redis
 
@@ -503,7 +503,7 @@ Full CRUD support with point lookups (O(1) via direct key construction), full sc
 
 Redis keys follow the pattern `{key_space}:{table}:{key_column_value}`, where `key_column` is extracted from the key suffix and exposed as a SQL column. For initially empty tables, use the `columns` option to declare the schema upfront so INSERT operations work immediately.
 
-For detailed setup, CRUD examples, and federated queries, see [demo/redis/README.md](demo/redis/README.md).
+For detailed setup, CRUD examples, and federated queries, see [docs/redis/README.md](docs/redis/README.md).
 
 ### Apache Iceberg
 
@@ -532,7 +532,7 @@ For S3-backed Iceberg tables:
     aws_secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
 ```
 
-For detailed setup and examples, see [demo/iceberg/README.md](demo/iceberg/README.md).
+For detailed setup and examples, see [docs/iceberg/README.md](docs/iceberg/README.md).
 
 ### Lance (Vector Search & Full-Text Search)
 
@@ -579,7 +579,7 @@ SELECT * FROM lance_fts('my_table', 'description', 'search terms', 10)
 WHERE category = 'food' AND price < 20
 ```
 
-Requires a Lance INVERTED index on the text column. See [demo/lance/README.md](demo/lance/README.md) for full details on vector search and full-text search.
+Requires a Lance INVERTED index on the text column. See [docs/lance/README.md](docs/lance/README.md) for full details on vector search and full-text search.
 
 ### S3 Remote Files
 
@@ -601,7 +601,7 @@ export AWS_SECRET_ACCESS_KEY="your_secret"
 # Or use: export AWS_PROFILE="your_profile"
 ```
 
-For full S3 configuration, IAM permissions, and troubleshooting, see [demo/S3_USAGE.md](demo/S3_USAGE.md).
+For full S3 configuration, IAM permissions, and troubleshooting, see [docs/S3_USAGE.md](docs/S3_USAGE.md).
 
 ## Catalog Mode
 
@@ -632,16 +632,16 @@ SELECT * FROM mydb_catalog.public.users LIMIT 10;
 SELECT * FROM mydb_catalog.main.users LIMIT 10;
 ```
 
-See the demo directories for full working examples:
-- [demo/postgres/](demo/postgres/) — `ctx_postgres_catalog_demo.yaml`
-- [demo/mysql/](demo/mysql/) — `ctx_mysql_catalog_demo.yaml`
-- [demo/sqlite/](demo/sqlite/) — `ctx_sqlite_catalog_demo.yaml`
+See the docs directories for full working examples:
+- [docs/postgres/](docs/postgres/) — `ctx_postgres_catalog_demo.yaml`
+- [docs/mysql/](docs/mysql/) — `ctx_mysql_catalog_demo.yaml`
+- [docs/sqlite/](docs/sqlite/) — `ctx_sqlite_catalog_demo.yaml`
 
 ## Authentication
 
 Skardi supports drop-in user authentication via **[better-auth](https://www.better-auth.com/)**, backed by an internal SQLite database — no external auth service required. Protect your pipeline endpoints with session-based auth by adding a single config block.
 
-See [demo/](demo/) for a working example.
+See [demo/simple_backend/](demo/simple_backend/) for a working example.
 
 ## ONNX Model Inference
 
@@ -676,7 +676,7 @@ LIMIT 10
 
 Pre-built models are available in the `models/` directory (`ncf.onnx`, `TinyTimeMixer.onnx`).
 
-For the full guide including the movie recommendation demo, see [demo/onnx_predict/README.md](demo/onnx_predict/README.md).
+For the full guide including the movie recommendation demo, see [docs/onnx_predict.md](docs/onnx_predict.md).
 
 ## Federated Queries
 
@@ -849,20 +849,32 @@ cargo build --release -p skardi-server --features embedding
 
 ## Demo & Examples
 
-The [demo/](demo/) directory contains complete working examples:
+### Data Source & Feature Reference ([docs/](docs/))
+
+Reference guides for each data source type and feature:
+
+| Path | Description |
+|------|-------------|
+| [docs/postgres/](docs/postgres/) | PostgreSQL CRUD, federated queries, and catalog mode |
+| [docs/mysql/](docs/mysql/) | MySQL CRUD, federated queries, and catalog mode |
+| [docs/sqlite/](docs/sqlite/) | SQLite CRUD, federated queries, and catalog mode |
+| [docs/mongo/](docs/mongo/) | MongoDB CRUD and federated query examples |
+| [docs/redis/](docs/redis/) | Redis CRUD and federated query examples |
+| [docs/iceberg/](docs/iceberg/) | Apache Iceberg integration examples |
+| [docs/lance/](docs/lance/) | Lance vector search and full-text search examples |
+| [docs/onnx_predict.md](docs/onnx_predict.md) | `onnx_predict` UDF reference |
+| [docs/S3_USAGE.md](docs/S3_USAGE.md) | S3 data source configuration guide |
+
+### Application Examples ([demo/](demo/))
+
+Complete working applications you can run locally:
 
 | Directory | Description |
 |-----------|-------------|
-| [demo/basic/README.md](demo/README.md) | Product search demo (CSV/Parquet) |
-| [demo/postgres/](demo/postgres/) | PostgreSQL CRUD and federated query examples |
-| [demo/mysql/](demo/mysql/) | MySQL CRUD and federated query examples |
-| [demo/sqlite/](demo/sqlite/) | SQLite CRUD and federated query examples |
-| [demo/mongo/](demo/mongo/) | MongoDB CRUD and federated query examples |
-| [demo/redis/](demo/redis/) | Redis CRUD and federated query examples |
-| [demo/iceberg/](demo/iceberg/) | Apache Iceberg integration examples |
-| [demo/lance/](demo/lance/) | Lance vector search and full-text search examples |
-| [demo/onnx_predict/](demo/onnx_predict/) | ONNX model inference in SQL |
-| [demo/S3_USAGE.md](demo/S3_USAGE.md) | S3 data source configuration guide |
+| [demo/simple_backend/](demo/simple_backend/) | Zero-code REST backend with SQLite and optional auth |
+| [demo/llm_wiki/](demo/llm_wiki/) | Wikipedia Q&A with LLM and vector search |
+| [demo/rag/](demo/rag/) | Retrieval-augmented generation pipeline |
+| [demo/movie_recommendation/](demo/movie_recommendation/) | Movie recommendations with ONNX NCF model |
 
 ## Community
 

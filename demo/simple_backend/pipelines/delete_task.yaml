@@ -1,0 +1,10 @@
+metadata:
+  name: "delete-task"
+  version: "1.0.0"
+  description: "Delete a task by ID."
+
+# Parameters:
+#   {id} - Task ID to delete
+
+query: |
+  DELETE FROM tasks WHERE id = {id}
