@@ -853,7 +853,7 @@ The [demo/](demo/) directory contains complete working examples:
 
 | Directory | Description |
 |-----------|-------------|
-| [demo/README.md](demo/README.md) | Product search demo (CSV/Parquet) |
+| [demo/basic/README.md](demo/README.md) | Product search demo (CSV/Parquet) |
 | [demo/postgres/](demo/postgres/) | PostgreSQL CRUD and federated query examples |
 | [demo/mysql/](demo/mysql/) | MySQL CRUD and federated query examples |
 | [demo/sqlite/](demo/sqlite/) | SQLite CRUD and federated query examples |
