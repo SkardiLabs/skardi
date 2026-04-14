@@ -58,7 +58,7 @@ pub async fn register_lance_table(
 
     // Store in registry if provided (for optimizer access)
     if let Some(registry) = dataset_registry {
-        let mut datasets = registry.write().unwrap();
+        let mut datasets = registry.write().unwrap_or_else(|p| p.into_inner());
         datasets.insert(
             name.to_string(),
             DatasetEntry::Lance(Arc::clone(&dataset_arc)),

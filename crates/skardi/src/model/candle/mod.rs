@@ -27,7 +27,7 @@ pub struct CandleModelRegistry {
 
 impl std::fmt::Debug for CandleModelRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let models = self.models.read().unwrap();
+        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
         f.debug_struct("CandleModelRegistry")
             .field("loaded_models", &models.keys().collect::<Vec<_>>())
             .finish()
@@ -45,7 +45,7 @@ impl CandleModelRegistry {
     pub fn get_or_load(&self, model_path: &str) -> Result<Arc<EmbeddingModel>> {
         // Fast path: already loaded
         {
-            let models = self.models.read().unwrap();
+            let models = self.models.read().unwrap_or_else(|p| p.into_inner());
             if let Some(model) = models.get(model_path) {
                 return Ok(Arc::clone(model));
             }
@@ -55,7 +55,7 @@ impl CandleModelRegistry {
         let model = Arc::new(EmbeddingModel::from_dir(model_path)?);
         tracing::info!("Candle model '{}' loaded and cached", model_path);
 
-        let mut models = self.models.write().unwrap();
+        let mut models = self.models.write().unwrap_or_else(|p| p.into_inner());
         models.insert(model_path.to_string(), Arc::clone(&model));
 
         Ok(model)

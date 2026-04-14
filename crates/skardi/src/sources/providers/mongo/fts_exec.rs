@@ -137,7 +137,10 @@ impl MongoFtsExec {
                 } else {
                     doc.get(name).cloned()
                 };
-                columns.get_mut(name).unwrap().push(value);
+                columns
+                    .get_mut(name)
+                    .expect("column inserted for every schema field above")
+                    .push(value);
             }
         }
 
@@ -147,7 +150,9 @@ impl MongoFtsExec {
             .fields()
             .iter()
             .map(|field| {
-                let values = columns.get(field.name()).unwrap();
+                let values = columns
+                    .get(field.name())
+                    .expect("column inserted for every schema field above");
                 if field.name() == "_score" {
                     // textScore is always a double — build Float64Array directly.
                     let scores: Vec<Option<f64>> = values

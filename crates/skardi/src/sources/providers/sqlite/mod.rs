@@ -1146,7 +1146,7 @@ impl ExecutionPlan for SqliteInsertExec {
             Arc::clone(&self.conn),
             self.table_reference.clone(),
             Arc::clone(&self.table_schema),
-            children.into_iter().next().unwrap(),
+            children.into_iter().next().expect("len == 1 checked above"),
             self.op,
         )))
     }
@@ -1321,9 +1321,15 @@ fn arrow_value_to_sqlite(
         DataType::LargeBinary => Value::Blob(array.as_binary::<i64>().value(row).to_vec()),
         // List<Float32> → packed little-endian f32 BLOB (for sqlite-vec vec0 tables).
         DataType::List(field) if *field.data_type() == DataType::Float32 => {
-            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("DataType::List guarantees ListArray");
             let values = list.value(row);
-            let f32_arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
+            let f32_arr = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("List<Float32> guarantees Float32Array values");
             let blob: Vec<u8> = f32_arr
                 .values()
                 .iter()
@@ -1333,9 +1339,15 @@ fn arrow_value_to_sqlite(
         }
         // FixedSizeList<Float32> → packed little-endian f32 BLOB.
         DataType::FixedSizeList(field, _) if *field.data_type() == DataType::Float32 => {
-            let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let list = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("DataType::FixedSizeList guarantees FixedSizeListArray");
             let values = list.value(row);
-            let f32_arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
+            let f32_arr = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("FixedSizeList<Float32> guarantees Float32Array values");
             let blob: Vec<u8> = f32_arr
                 .values()
                 .iter()

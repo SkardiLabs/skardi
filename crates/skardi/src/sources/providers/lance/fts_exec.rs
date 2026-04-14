@@ -132,7 +132,10 @@ impl LanceFtsExec {
         let batch = if batches.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         } else if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
+            batches
+                .into_iter()
+                .next()
+                .expect("len == 1 guarantees first element")
         } else {
             let batch_schema = batches[0].schema();
             arrow::compute::concat_batches(&batch_schema, &batches)

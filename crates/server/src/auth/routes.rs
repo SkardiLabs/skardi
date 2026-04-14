@@ -83,7 +83,7 @@ fn from_auth_response(auth_res: better_auth::AuthResponse) -> Response<Body> {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::empty())
-            .unwrap()
+            .expect("empty body with valid status always builds")
     })
 }
 
@@ -94,7 +94,7 @@ pub async fn auth_handler(State(state): State<AppState>, req: Request<Body>) -> 
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from(r#"{"error":"auth not enabled"}"#))
-                .unwrap()
+                .expect("static response always builds")
                 .into_response();
         }
     };
@@ -106,7 +106,7 @@ pub async fn auth_handler(State(state): State<AppState>, req: Request<Body>) -> 
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Body::from(body))
-                .unwrap()
+                .expect("static response always builds")
                 .into_response();
         }
     };
@@ -118,7 +118,7 @@ pub async fn auth_handler(State(state): State<AppState>, req: Request<Body>) -> 
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(body))
-                .unwrap()
+                .expect("static response always builds")
                 .into_response()
         }
     }
@@ -159,7 +159,7 @@ pub async fn verify_session(
                 .status(StatusCode::UNAUTHORIZED)
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"error":"Authentication required"}"#))
-                .unwrap());
+                .expect("static response always builds"));
         }
     };
 
@@ -177,7 +177,7 @@ pub async fn verify_session(
             .status(StatusCode::UNAUTHORIZED)
             .header("Content-Type", "application/json")
             .body(Body::from(r#"{"error":"Invalid or expired session"}"#))
-            .unwrap())
+            .expect("static response always builds"))
     }
 }
 

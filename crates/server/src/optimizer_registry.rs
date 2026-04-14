@@ -161,14 +161,20 @@ impl OptimizerRegistry {
 
     /// Store a Lance dataset in the registry
     pub fn register_lance_dataset(&self, table_name: &str, dataset: Arc<Dataset>) {
-        let mut reg = self.dataset_registry.write().unwrap();
+        let mut reg = self
+            .dataset_registry
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         reg.insert(table_name.to_string(), DatasetEntry::Lance(dataset));
         tracing::debug!("Registered Lance dataset '{}' in registry", table_name);
     }
 
     /// Get a Lance dataset by table name
     pub fn get_lance_dataset(&self, table_name: &str) -> Option<Arc<Dataset>> {
-        let reg = self.dataset_registry.read().unwrap();
+        let reg = self
+            .dataset_registry
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         reg.get(table_name).and_then(|e| match e {
             DatasetEntry::Lance(ds) => Some(Arc::clone(ds)),
             _ => None,

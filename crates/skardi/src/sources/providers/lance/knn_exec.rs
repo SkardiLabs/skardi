@@ -262,7 +262,10 @@ impl LanceKnnExec {
             // Return empty batch with schema
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         } else if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
+            batches
+                .into_iter()
+                .next()
+                .expect("len == 1 guarantees first element")
         } else {
             // Concatenate multiple batches
             let batch_schema = batches[0].schema();

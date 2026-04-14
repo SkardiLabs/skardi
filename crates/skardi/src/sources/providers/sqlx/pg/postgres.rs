@@ -666,7 +666,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
             self.sqlx_pool.clone(),
             self.table_reference.clone(),
             self.auto_generated_columns.clone(),
-            children.into_iter().next().unwrap(),
+            children.into_iter().next().expect("len == 1 checked above"),
             self.op,
         )))
     }

@@ -174,6 +174,9 @@ pub enum ConfigError {
         "Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\"."
     )]
     EmptyAllowedSchemas { name: String },
+
+    #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
+    NonUtf8Path { name: String, path: PathBuf },
 }
 
 // ============================================================================
@@ -802,13 +805,17 @@ async fn register_data_source(
                 }
             }
 
+            let path_str = source
+                .path
+                .to_str()
+                .ok_or_else(|| ConfigError::NonUtf8Path {
+                    name: source.name.clone(),
+                    path: source.path.clone(),
+                })?;
+
             // Register the CSV file as a table
             session_ctx
-                .register_csv(
-                    &source.name,
-                    source.path.to_str().unwrap(),
-                    csv_read_options,
-                )
+                .register_csv(&source.name, path_str, csv_read_options)
                 .await
                 .map_err(|e| ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
@@ -822,11 +829,19 @@ async fn register_data_source(
                 source.path
             );
 
+            let path_str = source
+                .path
+                .to_str()
+                .ok_or_else(|| ConfigError::NonUtf8Path {
+                    name: source.name.clone(),
+                    path: source.path.clone(),
+                })?;
+
             // Register the Parquet file as a table
             session_ctx
                 .register_parquet(
                     &source.name,
-                    source.path.to_str().unwrap(),
+                    path_str,
                     datafusion::prelude::ParquetReadOptions::default(),
                 )
                 .await
@@ -1057,11 +1072,19 @@ async fn register_data_source(
             // Get the dataset registry if optimizer registry is provided
             let dataset_registry = optimizer_registry.map(|reg| reg.lance_datasets());
 
+            let path_str = source
+                .path
+                .to_str()
+                .ok_or_else(|| ConfigError::NonUtf8Path {
+                    name: source.name.clone(),
+                    path: source.path.clone(),
+                })?;
+
             // Register Lance dataset using the providers module
             register_lance_table(
                 session_ctx,
                 &source.name,
-                source.path.to_str().unwrap(),
+                path_str,
                 dataset_registry.as_ref(),
             )
             .await

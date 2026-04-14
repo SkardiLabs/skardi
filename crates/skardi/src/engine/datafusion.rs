@@ -133,7 +133,10 @@ impl Engine for DataFusionEngine {
             }
             1 => {
                 // Single batch - return it directly
-                Ok(batches.into_iter().next().unwrap())
+                Ok(batches
+                    .into_iter()
+                    .next()
+                    .expect("len == 1 guarantees first element"))
             }
             _ => {
                 // Multiple batches - concatenate them into a single RecordBatch

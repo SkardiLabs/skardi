@@ -667,7 +667,8 @@ impl Pipeline for StandardPipeline {
     fn to_yaml(&self) -> Result<String> {
         // This is a placeholder. In a real scenario, you'd serialize the entire pipeline
         // using the YamlSerializable trait.
-        Ok(serde_yaml::to_string(self).unwrap())
+        serde_yaml::to_string(self)
+            .map_err(|e| anyhow!("Failed to serialize pipeline to YAML: {}", e))
     }
 
     /// Get pipeline name from metadata
