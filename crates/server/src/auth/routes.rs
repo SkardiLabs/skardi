@@ -95,7 +95,7 @@ pub async fn auth_handler(State(state): State<AppState>, req: Request<Body>) -> 
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from(r#"{"error":"auth not enabled"}"#))
                 .unwrap()
-                .into_response()
+                .into_response();
         }
     };
 
@@ -159,7 +159,7 @@ pub async fn verify_session(
                 .status(StatusCode::UNAUTHORIZED)
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"error":"Authentication required"}"#))
-                .unwrap())
+                .unwrap());
         }
     };
 

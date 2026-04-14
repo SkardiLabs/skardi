@@ -1,11 +1,11 @@
 use anyhow::Result;
+use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::TracerProvider;
-use opentelemetry_sdk::{runtime, Resource};
+use opentelemetry_sdk::{Resource, runtime};
 
 /// Guards OTel providers — shuts them down cleanly when dropped at the end of main.
 pub struct TelemetryGuard {

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::auth::mode::AuthMode;
+use crate::config::ServerConfig;
 #[cfg(feature = "candle")]
 use crate::config::register_candle_udf;
 #[cfg(feature = "gguf")]
@@ -18,13 +19,12 @@ use crate::config::register_gguf_udf;
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
 use crate::config::register_remote_embed_udf;
-use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
     pipeline_health_check, serve_dashboard,
 };
 use crate::metrics::PipelineMetrics;
-use crate::{auth::layer::AuthLayer, OptimizerRegistry};
+use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
 /// Shared application state containing pipeline and engine
 #[derive(Clone)]

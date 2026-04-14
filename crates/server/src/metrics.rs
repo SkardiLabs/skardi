@@ -1,4 +1,4 @@
-use opentelemetry::{global, metrics::Counter, metrics::Histogram, KeyValue};
+use opentelemetry::{KeyValue, global, metrics::Counter, metrics::Histogram};
 
 /// Per-pipeline OTel metrics instruments.
 ///

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use skardi::pipeline::pipeline::Pipeline;
-use skardi_server::{create_server, load_server_config, telemetry, CliArgs};
+use skardi_server::{CliArgs, create_server, load_server_config, telemetry};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

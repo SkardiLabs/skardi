@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::remote_storage::{RemoteStorage, S3Storage};
 use crate::OptimizerRegistry;
+use crate::remote_storage::{RemoteStorage, S3Storage};
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -144,25 +144,35 @@ pub enum ConfigError {
     #[error("S3 object store registration failed: {name} - {error}")]
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
-    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode.")]
+    #[error(
+        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode."
+    )]
     UnsupportedWriteMode {
         name: String,
         source_type: DataSourceType,
     },
 
-    #[error("DDL operation not allowed: {operation} on data source '{table_name}'. DDL operations (CREATE, DROP, ALTER, etc.) are not permitted.")]
+    #[error(
+        "DDL operation not allowed: {operation} on data source '{table_name}'. DDL operations (CREATE, DROP, ALTER, etc.) are not permitted."
+    )]
     DdlOperationNotAllowed {
         operation: String,
         table_name: String,
     },
 
-    #[error("Write operation not allowed on data source '{table_name}'. The data source is configured with 'read_only' access mode. Set access_mode to 'read_write' to enable write operations.")]
+    #[error(
+        "Write operation not allowed on data source '{table_name}'. The data source is configured with 'read_only' access mode. Set access_mode to 'read_write' to enable write operations."
+    )]
     WriteOperationNotAllowed { table_name: String },
 
-    #[error("Data source '{name}' uses hierarchy_level 'catalog' but also specifies the '{option}' option. In catalog mode use 'allowed_schemas' to filter schemas; 'table' and 'schema' are not allowed.")]
+    #[error(
+        "Data source '{name}' uses hierarchy_level 'catalog' but also specifies the '{option}' option. In catalog mode use 'allowed_schemas' to filter schemas; 'table' and 'schema' are not allowed."
+    )]
     CatalogModeConflictingOptions { name: String, option: String },
 
-    #[error("Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\".")]
+    #[error(
+        "Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\"."
+    )]
     EmptyAllowedSchemas { name: String },
 }
 
@@ -643,7 +653,7 @@ fn validate_pipeline_sql(
     sql: &str,
     data_sources: &[DataSource],
 ) -> Result<()> {
-    use skardi::sources::sql_validator::{validate_sql, SqlValidatorConfig};
+    use skardi::sources::sql_validator::{SqlValidatorConfig, validate_sql};
 
     // Build validator config from data sources
     let mut validator_config = SqlValidatorConfig::new();
@@ -1488,24 +1498,30 @@ query: |
 
         // Should find 3 pipeline files (yaml, yml, YAML), sorted alphabetically
         assert_eq!(result.len(), 3);
-        assert!(result[0]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("a_pipeline"));
-        assert!(result[1]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("b_pipeline"));
-        assert!(result[2]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("c_pipeline"));
+        assert!(
+            result[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("a_pipeline")
+        );
+        assert!(
+            result[1]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("b_pipeline")
+        );
+        assert!(
+            result[2]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("c_pipeline")
+        );
     }
 
     #[test]
