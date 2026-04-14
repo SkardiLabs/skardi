@@ -8002,7 +8002,7 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "skardi"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -8055,7 +8055,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-cli"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -8077,7 +8077,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-server"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
