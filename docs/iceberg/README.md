@@ -1,6 +1,6 @@
-# Apache Iceberg Integration Demo
+# Apache Iceberg Integration
 
-This guide demonstrates how to integrate Apache Iceberg tables with Skardi.
+This guide covers how to integrate Apache Iceberg tables with Skardi.
 
 ## Overview
 

@@ -1,6 +1,6 @@
-# MySQL Integration Demo
+# MySQL Integration
 
-This guide demonstrates how to integrate MySQL tables with Skardi, including INSERT, UPDATE, DELETE operations and federated queries with CSV data.
+This guide covers how to integrate MySQL tables with Skardi, including INSERT, UPDATE, DELETE operations and federated queries with CSV data.
 
 ## Quick Start (Docker)
 
@@ -49,7 +49,7 @@ INSERT INTO orders (user_id, product, amount) VALUES
     (3, 'Monitor', 299.99);
 EOF
 
-# 2b. Create sample CSV file (for federated query demo)
+# 2b. Create sample CSV file (for federated query example)
 mkdir -p docs/sample_data
 cat > docs/sample_data/orders.csv << 'EOF'
 order_id,user_id,product,amount,order_date
@@ -90,7 +90,7 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
 1. **MySQL Server** running locally or remotely
 2. **MySQL Database** with test tables
 
-## Running the Demo
+## Running the Example
 
 1. **Set environment variables**:
    ```bash

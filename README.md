@@ -237,7 +237,7 @@ cargo build --release -p skardi-server --features embedding
 
 ## Community
 
-Have questions, ideas, or want to share what you're building with Skardi? Join us on [Discord](https://discord.gg/S5YQQPEV2m)!
+Have questions, ideas, or want to share what you're building with Skardi? Join us on [Discord](https://discord.gg/S5YQQPEV2m) !
 
 ## License
 

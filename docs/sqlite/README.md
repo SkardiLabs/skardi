@@ -1,6 +1,6 @@
-# SQLite Integration Demo
+# SQLite Integration
 
-This guide demonstrates how to integrate SQLite databases with Skardi, including INSERT, UPDATE, DELETE operations and federated queries with CSV data.
+This guide covers how to integrate SQLite databases with Skardi, including INSERT, UPDATE, DELETE operations and federated queries with CSV data.
 
 ## Quick Start
 
@@ -39,7 +39,7 @@ INSERT INTO orders (user_id, product, amount) VALUES
     (3, 'Monitor', 299.99);
 EOF
 
-# 1b. Create sample CSV file (for federated query demo)
+# 1b. Create sample CSV file (for federated query example)
 mkdir -p docs/sample_data
 cat > docs/sample_data/orders.csv << 'EOF'
 order_id,user_id,product,amount,order_date
@@ -83,7 +83,7 @@ skardi query --sql "SELECT * FROM './data/app.sqlite.customers'"
 skardi query --sql "SELECT * FROM './data/app.sqlite3.customers'"
 ```
 
-## Running the Demo
+## Running the Example
 
 1. **Create the database** (see Quick Start step 1 above)
 
@@ -708,7 +708,7 @@ options:
 
 ## Cleanup
 
-The demo creates local SQLite database files under `docs/sqlite/`. These are
+The examples in this guide create local SQLite database files under `docs/sqlite/`. These are
 covered by `.gitignore`, but you can remove them when you're done:
 
 ```bash

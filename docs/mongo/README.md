@@ -1,4 +1,4 @@
-# MongoDB Integration Demo
+# MongoDB Integration
 
 This guide demonstrates how to integrate MongoDB collections with Skardi.
 

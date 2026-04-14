@@ -1,6 +1,6 @@
-# Candle Embedding Demo
+# Candle Embeddings
 
-This demo shows how to use the `candle()` scalar UDF to run local BERT-style
+This guide shows how to use the `candle()` scalar UDF to run local BERT-style
 embedding inference directly inside SQL, and combine it with `lance_knn()` for
 semantic search — no external embedding API, no Python in the hot path.
 

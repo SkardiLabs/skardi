@@ -1,6 +1,6 @@
-# PostgreSQL Integration Demo
+# PostgreSQL Integration
 
-This guide demonstrates how to integrate PostgreSQL tables with Skardi, including INSERT, UPDATE, DELETE operations and federated queries with CSV data.
+This guide covers how to integrate PostgreSQL tables with Skardi, including INSERT, UPDATE, DELETE operations and federated queries with CSV data.
 
 ## Quick Start (Docker)
 
@@ -75,7 +75,7 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
 1. **PostgreSQL Server** running locally or remotely
 2. **PostgreSQL Database** with test tables
 
-## Running the Demo
+## Running the Example
 
 1. **Set environment variables**:
    ```bash
@@ -214,7 +214,7 @@ CSV File (orders.csv)         PostgreSQL (users table)
 
 ### Shared CSV Data Source
 
-The demo uses the same CSV file as the MySQL demo (`docs/sample_data/orders.csv`):
+This guide uses the same CSV file as the MySQL guide (`docs/sample_data/orders.csv`):
 
 ```csv
 order_id,user_id,product,amount,order_date
@@ -468,7 +468,7 @@ WHERE _score < -0.5
 
 ### Cross-source join (pgvector + CSV)
 
-`pg_knn` results are a normal DataFusion table and can be joined with any other registered source. Using the CSV orders data already present in this demo:
+`pg_knn` results are a normal DataFusion table and can be joined with any other registered source. Using the CSV orders data already present in this guide:
 
 ```yaml
 # Add to ctx_pgvector_demo.yaml
@@ -759,7 +759,7 @@ docker exec -i postgres-skardi psql -U skardi_user -d mydb << 'EOF'
 -- Enable pgvector (safe to run even if the extension is already present)
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- public schema tables (same as regular demo)
+-- public schema tables (same as the regular example)
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,

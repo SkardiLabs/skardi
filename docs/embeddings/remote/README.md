@@ -1,4 +1,4 @@
-# Remote Embedding Demo (OpenAI)
+# Remote Embeddings (OpenAI)
 
 Semantic search over a small knowledge base using OpenAI's
 `text-embedding-3-small` model via Skardi's `remote_embed()` UDF.

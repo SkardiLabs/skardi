@@ -1,6 +1,6 @@
-# Skardi Auth Demo: End-to-End Authentication
+# Skardi Auth: End-to-End Authentication
 
-This demo walks through enabling authentication on the Skardi server and using it to protect production pipelines. It uses **BetterAuth with a SQLite backend** (`better-auth-diesel-sqlite`), which persists users and sessions across server restarts with no external database required.
+This guide walks through enabling authentication on the Skardi server and using it to protect production pipelines. It uses **BetterAuth with a SQLite backend** (`better-auth-diesel-sqlite`), which persists users and sessions across server restarts with no external database required.
 
 ## How Auth Works
 

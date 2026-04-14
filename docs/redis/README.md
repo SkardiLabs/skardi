@@ -1,6 +1,6 @@
-# Redis Integration Demo
+# Redis Integration
 
-This guide demonstrates how to integrate Redis hash tables with Skardi.
+This guide covers how to integrate Redis hash tables with Skardi.
 
 ## Quick Start
 

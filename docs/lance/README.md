@@ -1,6 +1,6 @@
-# Lance Vector Search & Full-Text Search Demo
+# Lance Vector Search & Full-Text Search
 
-This demo showcases Skardi's integration with Lance for high-performance vector similarity search and BM25-scored full-text search. It demonstrates:
+This guide covers Skardi's integration with Lance for high-performance vector similarity search and BM25-scored full-text search. It demonstrates:
 - Native ANN (Approximate Nearest Neighbor) search using Lance's Scanner.nearest() API
 - Explicit KNN search via the `lance_knn` table function
 - Full-text search via the `lance_fts` table function with inverted indexes
@@ -8,7 +8,7 @@ This demo showcases Skardi's integration with Lance for high-performance vector 
 
 ## Datasets
 
-The demo includes Lance datasets under `data/`:
+Skardi ships with sample Lance datasets under `data/`:
 
 ### vec_data.lance
 General-purpose vector embeddings for similarity search:
@@ -33,7 +33,7 @@ Movie embeddings for recommendation pipelines:
 - **movie_id**: int64 - Movie identifier
 - **embedding**: fixed_size_list\<float\>[128] - 128-dimensional movie embedding
 
-## Demo Components
+## Components
 
 | File | Description |
 |------|-------------|
@@ -97,7 +97,7 @@ lance_knn(...) -> LanceKnnExec -> Lance Scanner.nearest()
 
 *Benchmarks: 128-dim vectors, k=10, IVF-PQ index, Intel Core i9*
 
-## Running the Demo
+## Running the Example
 
 ### Start the Server
 
@@ -189,7 +189,7 @@ curl -X POST http://localhost:8080/lance-direct-vector-search/execute \
   }' | jq .
 ```
 
-The `query_vector` parameter accepts a JSON array of floats matching the vector dimension of the dataset (128 for the demo dataset). The server converts the array to a SQL literal for `lance_knn`.
+The `query_vector` parameter accepts a JSON array of floats matching the vector dimension of the dataset (128 for the sample dataset). The server converts the array to a SQL literal for `lance_knn`.
 
 A test script is provided to read a real vector from the dataset and send it:
 
@@ -337,7 +337,7 @@ WHERE category = 'electronics' AND revenue > 1000
 LIMIT 5
 ```
 
-### Running the FTS Demo
+### Running the FTS Example
 
 ```bash
 cargo run --bin skardi-server -- \

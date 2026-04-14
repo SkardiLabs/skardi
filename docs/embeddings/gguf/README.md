@@ -1,6 +1,6 @@
-# GGUF Embedding Demo
+# GGUF Embeddings
 
-This demo shows how to use the `gguf()` scalar UDF to run local GGUF-format
+This guide shows how to use the `gguf()` scalar UDF to run local GGUF-format
 embedding inference directly inside SQL via llama.cpp, and combine it with
 `lance_knn()` for semantic search — no external embedding API, no Python in the
 hot path.

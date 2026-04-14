@@ -1,17 +1,17 @@
-# Skardi Server Demo: Product Search Pipeline
+# Skardi Server: Product Search Pipeline
 
-This demo showcases the Skardi Online Serving Pipeline's ability to serve SQL queries over a products dataset. The demo includes a pre-configured pipeline that allows filtering and searching through a comprehensive product catalog.
+This guide walks through the Skardi Online Serving Pipeline's ability to serve SQL queries over a products dataset. It uses a pre-configured pipeline that allows filtering and searching through a comprehensive product catalog.
 
 ## Dataset Overview
 
-The demo uses a `products.csv` dataset with 10,000+ product records containing:
+The example uses a `products.csv` dataset with 10,000+ product records containing:
 - **Product Information**: ID, Name, Description, Brand, Category
 - **Pricing**: Price (USD), Currency
 - **Inventory**: Stock quantity, Availability status
 - **Product Details**: Color, Size, EAN code
 - **Internal Data**: Internal ID for tracking
 
-## Demo Components
+## Components
 
 - **`pipeline.yaml`**: Defines the SQL query pipeline with filtering parameters
 - **`ctx.yaml`**: Registers the products.csv dataset as a data source
@@ -48,9 +48,9 @@ query: |
 
 2. **Dataset location**: Verify the products.csv file exists at `data/products.csv` relative to the project root
 
-## Starting the Demo Server
+## Starting the Server
 
-Navigate to the project root and start the server with the demo configuration:
+Navigate to the project root and start the server with the provided configuration:
 
 ```bash
 cargo run --bin skardi-server -- \
@@ -147,7 +147,7 @@ curl http://localhost:8080/pipelines
 }
 ```
 
-## Demo Query Examples
+## Query Examples
 
 ### Example 1: Get Top 5 Cheapest Products
 ```bash
@@ -425,7 +425,7 @@ All error responses follow this structure:
 
 ## Performance Notes
 
-- The demo loads the entire products.csv dataset into memory for optimal query performance
+- The server loads the entire products.csv dataset into memory for optimal query performance
 - Query execution times are typically under 50ms for filtered queries
 - The pipeline includes execution time metrics in the response
 - Consider the `limit` parameter to control response size for large result sets
@@ -440,7 +440,7 @@ Use `Ctrl+C` to gracefully shutdown the server.
 2. **"Connection refused"**: Check that the server started successfully and is listening on the correct port
 3. **"Empty response"**: Check that your query parameters match available data in the dataset
 
-## Other Data Source Demos
+## Other Data Source Guides
 
 - [Authentication](auth/README.md) - Enable auth, sign up/sign in, and protect pipelines with session tokens
 - [Lance Vector Search](lance/README.md) - KNN similarity search with Lance
