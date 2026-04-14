@@ -5,6 +5,9 @@
 
 **SQL across anything: query, join, and aggregate over local files, databases, S3, and vector stores — or turn any SQL into a parameterized HTTP API, zero application code required, written in Rust, powered by Apache Datafusion.**
 
+<a href="https://skardilabs.github.io/skardi-docs/">Documentation</a> •
+<a href="https://discord.gg/S5YQQPEV2m">Discord</a> •
+
 [License]: https://opensource.org/licenses/Apache-2.0
 [License Badge]: https://img.shields.io/badge/License-Apache%202.0-orange.svg
 [CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
@@ -16,11 +19,11 @@
 [Discord]: https://discord.gg/S5YQQPEV2m
 [Discord Badge]: https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white
 
+[![License Badge]][License]
 [![CI Badge]][CI]
 [![crates.io Badge]][crates.io]
 [![Docs Badge]][Docs]
 [![Discord Badge]][Discord]
-[![License Badge]][License]
 
 [![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/)
 
@@ -55,6 +58,17 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 ## Cloud (Sealos)
 
 The fastest way to get started is with **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — a collection of ready-to-deploy Skardi templates for [Sealos](https://sealos.io). Launch a fully configured Skardi server in the cloud with one click, no local setup required.
+
+## Architecture
+
+<details>
+<summary>Click to expand Skardi's architecture diagram</summary>
+
+<p align="center">
+  <img src="asset/architecture.png" alt="Skardi Architecture" width="800">
+</p>
+
+</details>
 
 ## Installation
 
@@ -223,6 +237,7 @@ cargo build --release -p skardi-server --features embedding
 | [docs/redis/](docs/redis/) | Redis CRUD and federated query examples |
 | [docs/iceberg/](docs/iceberg/) | Apache Iceberg integration examples |
 | [docs/lance/](docs/lance/) | Lance vector search and full-text search examples |
+| [docs/embeddings/](docs/embeddings/) | Inline embedding inference (Candle, GGUF, remote APIs) for semantic search |
 | [docs/onnx_predict.md](docs/onnx_predict.md) | `onnx_predict` UDF reference |
 | [docs/S3_USAGE.md](docs/S3_USAGE.md) | S3 data source configuration guide |
 
@@ -234,6 +249,39 @@ cargo build --release -p skardi-server --features embedding
 | [demo/llm_wiki/](demo/llm_wiki/) | Wikipedia Q&A with LLM and vector search |
 | [demo/rag/](demo/rag/) | Retrieval-augmented generation pipeline |
 | [demo/movie_recommendation/](demo/movie_recommendation/) | Movie recommendations with ONNX NCF model |
+
+
+
+## Powered By Skardi
+
+Built something powered by Skardi? Show it off in your README with one of our badges:
+
+<picture>
+  <img src="asset/powered-by-skardi.svg" alt="Powered by Skardi">
+</picture>
+
+```markdown
+[![Made with Skardi](https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi.svg)](https://github.com/SkardiLabs/skardi)
+```
+
+Dark mode variant:
+
+<picture>
+  <img src="asset/powered-by-skardi-dark.svg" alt="Powered by Skardi">
+</picture>
+
+```markdown
+[![Made with Skardi](https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi-dark.svg)](https://github.com/SkardiLabs/skardi)
+```
+
+Auto-switching (light/dark):
+
+```markdown
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi-dark.svg">
+  <img alt="Made with Skardi" src="https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi.svg">
+</picture>
+```
 
 ## Community
 

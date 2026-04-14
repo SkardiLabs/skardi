@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use better_auth::plugins::EmailPasswordPlugin;
 use better_auth::{AuthBuilder, AuthConfig, BetterAuth};
 use better_auth_diesel_sqlite::DieselSqliteAdapter;

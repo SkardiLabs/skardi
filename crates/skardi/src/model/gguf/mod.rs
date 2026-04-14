@@ -28,7 +28,7 @@ pub struct GgufModelRegistry {
 
 impl std::fmt::Debug for GgufModelRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let models = self.models.read().unwrap();
+        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
         f.debug_struct("GgufModelRegistry")
             .field("loaded_models", &models.keys().collect::<Vec<_>>())
             .finish()
@@ -46,7 +46,7 @@ impl GgufModelRegistry {
     pub fn get_or_load(&self, model_path: &str) -> Result<Arc<GgufEmbeddingModel>> {
         // Fast path: already loaded (read lock only)
         {
-            let models = self.models.read().unwrap();
+            let models = self.models.read().unwrap_or_else(|p| p.into_inner());
             if let Some(model) = models.get(model_path) {
                 return Ok(Arc::clone(model));
             }
@@ -54,7 +54,7 @@ impl GgufModelRegistry {
 
         // Slow path: acquire write lock, then double-check to avoid loading
         // the same model twice if another thread raced us.
-        let mut models = self.models.write().unwrap();
+        let mut models = self.models.write().unwrap_or_else(|p| p.into_inner());
         if let Some(model) = models.get(model_path) {
             return Ok(Arc::clone(model));
         }

@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::remote_storage::{RemoteStorage, S3Storage};
 use crate::OptimizerRegistry;
+use crate::remote_storage::{RemoteStorage, S3Storage};
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -144,26 +144,39 @@ pub enum ConfigError {
     #[error("S3 object store registration failed: {name} - {error}")]
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
-    #[error("Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode.")]
+    #[error(
+        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode."
+    )]
     UnsupportedWriteMode {
         name: String,
         source_type: DataSourceType,
     },
 
-    #[error("DDL operation not allowed: {operation} on data source '{table_name}'. DDL operations (CREATE, DROP, ALTER, etc.) are not permitted.")]
+    #[error(
+        "DDL operation not allowed: {operation} on data source '{table_name}'. DDL operations (CREATE, DROP, ALTER, etc.) are not permitted."
+    )]
     DdlOperationNotAllowed {
         operation: String,
         table_name: String,
     },
 
-    #[error("Write operation not allowed on data source '{table_name}'. The data source is configured with 'read_only' access mode. Set access_mode to 'read_write' to enable write operations.")]
+    #[error(
+        "Write operation not allowed on data source '{table_name}'. The data source is configured with 'read_only' access mode. Set access_mode to 'read_write' to enable write operations."
+    )]
     WriteOperationNotAllowed { table_name: String },
 
-    #[error("Data source '{name}' uses hierarchy_level 'catalog' but also specifies the '{option}' option. In catalog mode use 'allowed_schemas' to filter schemas; 'table' and 'schema' are not allowed.")]
+    #[error(
+        "Data source '{name}' uses hierarchy_level 'catalog' but also specifies the '{option}' option. In catalog mode use 'allowed_schemas' to filter schemas; 'table' and 'schema' are not allowed."
+    )]
     CatalogModeConflictingOptions { name: String, option: String },
 
-    #[error("Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\".")]
+    #[error(
+        "Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\"."
+    )]
     EmptyAllowedSchemas { name: String },
+
+    #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
+    NonUtf8Path { name: String, path: PathBuf },
 }
 
 // ============================================================================
@@ -643,7 +656,7 @@ fn validate_pipeline_sql(
     sql: &str,
     data_sources: &[DataSource],
 ) -> Result<()> {
-    use skardi::sources::sql_validator::{validate_sql, SqlValidatorConfig};
+    use skardi::sources::sql_validator::{SqlValidatorConfig, validate_sql};
 
     // Build validator config from data sources
     let mut validator_config = SqlValidatorConfig::new();
@@ -792,13 +805,17 @@ async fn register_data_source(
                 }
             }
 
+            let path_str = source
+                .path
+                .to_str()
+                .ok_or_else(|| ConfigError::NonUtf8Path {
+                    name: source.name.clone(),
+                    path: source.path.clone(),
+                })?;
+
             // Register the CSV file as a table
             session_ctx
-                .register_csv(
-                    &source.name,
-                    source.path.to_str().unwrap(),
-                    csv_read_options,
-                )
+                .register_csv(&source.name, path_str, csv_read_options)
                 .await
                 .map_err(|e| ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
@@ -812,11 +829,19 @@ async fn register_data_source(
                 source.path
             );
 
+            let path_str = source
+                .path
+                .to_str()
+                .ok_or_else(|| ConfigError::NonUtf8Path {
+                    name: source.name.clone(),
+                    path: source.path.clone(),
+                })?;
+
             // Register the Parquet file as a table
             session_ctx
                 .register_parquet(
                     &source.name,
-                    source.path.to_str().unwrap(),
+                    path_str,
                     datafusion::prelude::ParquetReadOptions::default(),
                 )
                 .await
@@ -1047,11 +1072,19 @@ async fn register_data_source(
             // Get the dataset registry if optimizer registry is provided
             let dataset_registry = optimizer_registry.map(|reg| reg.lance_datasets());
 
+            let path_str = source
+                .path
+                .to_str()
+                .ok_or_else(|| ConfigError::NonUtf8Path {
+                    name: source.name.clone(),
+                    path: source.path.clone(),
+                })?;
+
             // Register Lance dataset using the providers module
             register_lance_table(
                 session_ctx,
                 &source.name,
-                source.path.to_str().unwrap(),
+                path_str,
                 dataset_registry.as_ref(),
             )
             .await
@@ -1488,24 +1521,30 @@ query: |
 
         // Should find 3 pipeline files (yaml, yml, YAML), sorted alphabetically
         assert_eq!(result.len(), 3);
-        assert!(result[0]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("a_pipeline"));
-        assert!(result[1]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("b_pipeline"));
-        assert!(result[2]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("c_pipeline"));
+        assert!(
+            result[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("a_pipeline")
+        );
+        assert!(
+            result[1]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("b_pipeline")
+        );
+        assert!(
+            result[2]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("c_pipeline")
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
@@ -677,7 +677,7 @@ pub async fn execute_pipeline_by_name(
 
 /// Convert Arrow RecordBatch to JSON array using arrow_json
 fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    use arrow_json::{writer::JsonArray, WriterBuilder};
+    use arrow_json::{WriterBuilder, writer::JsonArray};
     use serde_json::Map;
 
     // Write the record batch to JSON using arrow_json with null value inclusion

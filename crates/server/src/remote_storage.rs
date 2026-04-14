@@ -411,9 +411,11 @@ options:
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("AWS configuration"));
-        assert!(error
-            .to_string()
-            .contains("must not be stored in configuration files"));
+        assert!(
+            error
+                .to_string()
+                .contains("must not be stored in configuration files")
+        );
     }
 
     #[test]

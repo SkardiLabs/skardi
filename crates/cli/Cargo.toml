@@ -13,7 +13,7 @@ name = "skardi"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["candle", "gguf", "onnx", "remote-embed"]
 candle = ["skardi/candle"]
 gguf = ["skardi/gguf"]
 onnx = ["skardi/onnx"]
