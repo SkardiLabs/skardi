@@ -239,39 +239,6 @@ Check [Supported Data Sources](#supported-data-sources) for individual data sour
 | [demo/rag/](demo/rag/) | Retrieval-augmented generation pipeline |
 | [demo/movie_recommendation/](demo/movie_recommendation/) | Movie recommendations with ONNX NCF model |
 
-
-
-## Powered By Skardi
-
-Built something powered by Skardi? Show it off in your README with one of our badges:
-
-<picture>
-  <img src="asset/powered-by-skardi.svg" alt="Powered by Skardi">
-</picture>
-
-```markdown
-[![Made with Skardi](https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi.svg)](https://github.com/SkardiLabs/skardi)
-```
-
-Dark mode variant:
-
-<picture>
-  <img src="asset/powered-by-skardi-dark.svg" alt="Powered by Skardi">
-</picture>
-
-```markdown
-[![Made with Skardi](https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi-dark.svg)](https://github.com/SkardiLabs/skardi)
-```
-
-Auto-switching (light/dark):
-
-```markdown
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi-dark.svg">
-  <img alt="Made with Skardi" src="https://raw.githubusercontent.com/SkardiLabs/skardi/main/asset/powered-by-skardi.svg">
-</picture>
-```
-
 ## Community
 
 Have questions, ideas, or want to share what you're building with Skardi? Join us on [Discord](https://discord.gg/S5YQQPEV2m) !
