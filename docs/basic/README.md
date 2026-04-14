@@ -1,4 +1,4 @@
-# Skardi Server: Product Search Pipeline
+# Skardi Server Basic: Product Search Pipeline
 
 This guide walks through the Skardi Online Serving Pipeline's ability to serve SQL queries over a products dataset. It uses a pre-configured pipeline that allows filtering and searching through a comprehensive product catalog.
 
