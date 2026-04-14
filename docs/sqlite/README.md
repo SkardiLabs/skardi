@@ -8,7 +8,7 @@ SQLite requires no external server — just a local `.db` file:
 
 ```bash
 # 1. Create the SQLite database and test data
-sqlite3 demo/sqlite/demo.db << 'EOF'
+sqlite3 docs/sqlite/demo.db << 'EOF'
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -40,8 +40,8 @@ INSERT INTO orders (user_id, product, amount) VALUES
 EOF
 
 # 1b. Create sample CSV file (for federated query demo)
-mkdir -p demo/sample_data
-cat > demo/sample_data/orders.csv << 'EOF'
+mkdir -p docs/sample_data
+cat > docs/sample_data/orders.csv << 'EOF'
 order_id,user_id,product,amount,order_date
 1001,1,Laptop,999.99,2024-01-15
 1002,1,Mouse,29.99,2024-01-16
@@ -53,8 +53,8 @@ EOF
 
 # 2. Start Skardi server
 cargo run --bin skardi-server -- \
-  --ctx demo/sqlite/ctx_sqlite_demo.yaml \
-  --pipeline demo/sqlite/pipelines/ \
+  --ctx docs/sqlite/ctx_sqlite_demo.yaml \
+  --pipeline docs/sqlite/pipelines/ \
   --port 8080
 
 # 3. Execute with parameters
@@ -69,13 +69,13 @@ SQLite tables can be queried directly by path — no context file needed. Use th
 
 ```bash
 # Query a table directly
-skardi query --sql "SELECT * FROM './demo/sqlite/demo.db.users'"
+skardi query --sql "SELECT * FROM './docs/sqlite/demo.db.users'"
 
 # Join two tables from the same database
 skardi query --sql "
   SELECT u.name, o.product, o.amount
-  FROM './demo/sqlite/demo.db.users' u
-  JOIN './demo/sqlite/demo.db.orders' o ON u.id = o.user_id
+  FROM './docs/sqlite/demo.db.users' u
+  JOIN './docs/sqlite/demo.db.orders' o ON u.id = o.user_id
 "
 
 # Works with .sqlite and .sqlite3 extensions too
@@ -89,7 +89,7 @@ skardi query --sql "SELECT * FROM './data/app.sqlite3.customers'"
 
 2. **Start Skardi server with pipelines**:
 
-   Example pipeline files are provided in `demo/sqlite/pipelines/`:
+   Example pipeline files are provided in `docs/sqlite/pipelines/`:
    - `query_user_by_id.yaml` - Query user by ID
    - `insert_user.yaml` - Insert new user
    - `update_user_email.yaml` - Update a user's email by name
@@ -99,8 +99,8 @@ skardi query --sql "SELECT * FROM './data/app.sqlite3.customers'"
    Pass them all at server start using the `--pipeline` flag (accepts a directory or individual files):
    ```bash
    cargo run --bin skardi-server -- \
-     --ctx demo/sqlite/ctx_sqlite_demo.yaml \
-     --pipeline demo/sqlite/pipelines/ \
+     --ctx docs/sqlite/ctx_sqlite_demo.yaml \
+     --pipeline docs/sqlite/pipelines/ \
      --port 8080
    ```
 
@@ -126,7 +126,7 @@ curl -X POST http://localhost:8080/insert_user/execute \
 
 **Verify the insert:**
 ```bash
-sqlite3 demo/sqlite/demo.db "SELECT * FROM users"
+sqlite3 docs/sqlite/demo.db "SELECT * FROM users"
 ```
 
 ## UPDATE Example
@@ -154,7 +154,7 @@ The `count` field reports the number of rows affected. A value of `0` means no r
 
 **Verify the update:**
 ```bash
-sqlite3 demo/sqlite/demo.db "SELECT * FROM users WHERE name = 'Alice Smith'"
+sqlite3 docs/sqlite/demo.db "SELECT * FROM users WHERE name = 'Alice Smith'"
 ```
 
 ## DELETE Example
@@ -180,7 +180,7 @@ curl -X POST http://localhost:8080/delete_user/execute \
 
 **Verify the delete:**
 ```bash
-sqlite3 demo/sqlite/demo.db "SELECT * FROM users"
+sqlite3 docs/sqlite/demo.db "SELECT * FROM users"
 ```
 
 > **Note:** Omitting the `WHERE` clause deletes all rows in the table. Always double-check your filter parameters before executing a DELETE pipeline against production data.
@@ -227,7 +227,7 @@ curl -X POST http://localhost:8080/federated_join_and_insert/execute \
 ### Verify Results
 
 ```bash
-sqlite3 demo/sqlite/demo.db "SELECT * FROM user_order_stats"
+sqlite3 docs/sqlite/demo.db "SELECT * FROM user_order_stats"
 ```
 
 **Output (after executing for "Alice Smith"):**
@@ -258,12 +258,12 @@ is always `main`).
 ### Context file
 
 ```yaml
-# demo/sqlite/ctx_sqlite_catalog_demo.yaml
+# docs/sqlite/ctx_sqlite_catalog_demo.yaml
 data_sources:
   - name: "demo_catalog"
     type: "sqlite"
     hierarchy_level: "catalog"
-    path: "demo/sqlite/demo.db"
+    path: "docs/sqlite/demo.db"
     description: "Entire demo.db SQLite database registered as a DataFusion catalog"
 ```
 
@@ -271,8 +271,8 @@ data_sources:
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/sqlite/ctx_sqlite_catalog_demo.yaml \
-  --pipeline demo/sqlite/pipelines/catalog_demo/ \
+  --ctx docs/sqlite/ctx_sqlite_catalog_demo.yaml \
+  --pipeline docs/sqlite/pipelines/catalog_demo/ \
   --port 8080
 ```
 
@@ -315,7 +315,7 @@ Error: Failed to create SQLite connection pool
 ```
 **Solution**: Verify the database file exists and the path is correct:
 ```bash
-ls -la demo/sqlite/demo.db
+ls -la docs/sqlite/demo.db
 ```
 
 ### Table Not Found
@@ -324,8 +324,8 @@ Error: Failed to create table provider
 ```
 **Solution**: Verify the table exists in the database:
 ```bash
-sqlite3 demo/sqlite/demo.db ".tables"
-sqlite3 demo/sqlite/demo.db ".schema users"
+sqlite3 docs/sqlite/demo.db ".tables"
+sqlite3 docs/sqlite/demo.db ".schema users"
 ```
 
 ### Database Locked
@@ -335,7 +335,7 @@ Error: database is locked
 **Solution**: SQLite only allows one writer at a time. Check if another process has the database open:
 ```bash
 # Check for processes using the database file
-lsof demo/sqlite/demo.db
+lsof docs/sqlite/demo.db
 ```
 
 You can also increase the busy timeout via the `busy_timeout_ms` option in the context file:
@@ -353,7 +353,7 @@ SQLite FTS5 provides indexed full-text search with BM25 relevance scoring — no
 
 ```bash
 # Create an FTS5 virtual table
-sqlite3 demo/sqlite/fts_demo.db << 'EOF'
+sqlite3 docs/sqlite/fts_demo.db << 'EOF'
 CREATE VIRTUAL TABLE articles_fts USING fts5(title, body, category);
 INSERT INTO articles_fts (title, body, category) VALUES
     ('Machine Learning Basics', 'Introduction to machine learning algorithms and neural networks', 'ai'),
@@ -369,8 +369,8 @@ EOF
 ```bash
 # Start with FTS context
 cargo run --bin skardi-server -- \
-  --ctx demo/sqlite/ctx_sqlite_fts_demo.yaml \
-  --pipeline demo/sqlite/pipelines/fts_demo/ \
+  --ctx docs/sqlite/ctx_sqlite_fts_demo.yaml \
+  --pipeline docs/sqlite/pipelines/fts_demo/ \
   --port 8080
 
 # Basic FTS search
@@ -517,10 +517,10 @@ The sqlite-vec pip package provides the Python bindings for setup.
 ```bash
 # 1. Create the database with vec0 table and seed embeddings
 #    (embeds item names using sentence-transformers all-MiniLM-L6-v2, 384 dims)
-python demo/sqlite/setup_knn_demo.py
+python docs/sqlite/setup_knn_demo.py
 
 # 2. Download the candle embedding model for query-time embedding (one-time)
-python demo/embeddings/candle/setup.py
+python docs/embeddings/candle/setup.py
 
 # 3. Set the extension path for the server
 #    If using the pip package:
@@ -533,8 +533,8 @@ The `candle()` UDF embeds the query text on the fly using a local BERT model. No
 
 ```bash
 cargo run --bin skardi-server --features candle -- \
-  --ctx demo/sqlite/ctx_sqlite_knn_demo.yaml \
-  --pipeline demo/sqlite/pipelines/knn_demo/ \
+  --ctx docs/sqlite/ctx_sqlite_knn_demo.yaml \
+  --pipeline docs/sqlite/pipelines/knn_demo/ \
   --port 8080
 
 # Semantic KNN search — query is embedded on the fly
@@ -708,14 +708,14 @@ options:
 
 ## Cleanup
 
-The demo creates local SQLite database files under `demo/sqlite/`. These are
+The demo creates local SQLite database files under `docs/sqlite/`. These are
 covered by `.gitignore`, but you can remove them when you're done:
 
 ```bash
 # Stop the server (Ctrl-C in its terminal) before removing files.
-rm -f demo/sqlite/demo.db demo/sqlite/demo.db-wal demo/sqlite/demo.db-shm
-rm -f demo/sqlite/fts_demo.db demo/sqlite/fts_demo.db-wal demo/sqlite/fts_demo.db-shm
-rm -f demo/sqlite/knn_demo.db demo/sqlite/knn_demo.db-wal demo/sqlite/knn_demo.db-shm
+rm -f docs/sqlite/demo.db docs/sqlite/demo.db-wal docs/sqlite/demo.db-shm
+rm -f docs/sqlite/fts_demo.db docs/sqlite/fts_demo.db-wal docs/sqlite/fts_demo.db-shm
+rm -f docs/sqlite/knn_demo.db docs/sqlite/knn_demo.db-wal docs/sqlite/knn_demo.db-shm
 ```
 
 ## Context File Options

@@ -7,12 +7,12 @@ as the query vector to the API endpoint.
 Usage:
     1. Start the server:
        cargo run --bin skardi-server -- \
-         --ctx demo/lance/ctx_lance.yaml \
-         --pipeline demo/lance/pipelines/ \
+         --ctx docs/lance/ctx_lance.yaml \
+         --pipeline docs/lance/pipelines/ \
          --port 8080
 
     2. Run this script:
-       python demo/lance/test_direct_vector_search.py
+       python docs/lance/test_direct_vector_search.py
 """
 
 import json

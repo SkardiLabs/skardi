@@ -62,13 +62,13 @@ The architecture is detected automatically from `config.json`:
 Run once from the **project root** to download the model and create the Lance dataset:
 
 ```bash
-python demo/embeddings/candle/setup.py
+python docs/embeddings/candle/setup.py
 ```
 
 This will:
 - Download `BAAI/bge-small-en-v1.5` SafeTensors weights into `models/generated/bge-small-en-v1.5/`
-- Embed the 15 knowledge-base documents in `demo/embeddings/data/docs.csv`
-- Write a Lance dataset to `demo/embeddings/candle/data/generated/doc_embeddings.lance`
+- Embed the 15 knowledge-base documents in `docs/embeddings/data/docs.csv`
+- Write a Lance dataset to `docs/embeddings/candle/data/generated/doc_embeddings.lance`
 
 Expected output:
 ```
@@ -76,18 +76,18 @@ Expected output:
       model.safetensors: 133.4 MB
       config.json: 0.0 MB
       tokenizer.json: 0.7 MB
-[2/3] Loaded 15 documents from demo/embeddings/data/docs.csv
+[2/3] Loaded 15 documents from docs/embeddings/data/docs.csv
 [3/3] Embedding 15 documents with BAAI/bge-small-en-v1.5 ...
       Embedding dimension: 384
-      Lance dataset written to demo/embeddings/candle/data/generated/doc_embeddings.lance
+      Lance dataset written to docs/embeddings/candle/data/generated/doc_embeddings.lance
 ```
 
 ## Starting the Server
 
 ```bash
 cargo run --bin skardi-server --features candle -- \
-  --ctx demo/embeddings/candle/ctx.yaml \
-  --pipeline demo/embeddings/candle/pipelines/ \
+  --ctx docs/embeddings/candle/ctx.yaml \
+  --pipeline docs/embeddings/candle/pipelines/ \
   --port 8080
 ```
 
@@ -197,7 +197,7 @@ curl -X POST http://localhost:8080/semantic-search/execute \
 ## Directory Layout
 
 ```
-demo/embeddings/candle/
+docs/embeddings/candle/
 ├── README.md
 ├── ctx.yaml                          — registers the Lance data source
 ├── setup.py                          — one-time setup: downloads model + creates Lance dataset

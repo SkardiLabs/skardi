@@ -1,5 +1,5 @@
 data_sources:
   - name: "doc_embeddings_openai"
     type: "lance"
-    path: "demo/embeddings/remote/data/generated/doc_embeddings_openai.lance"
+    path: "docs/embeddings/remote/data/generated/doc_embeddings_openai.lance"
     description: "Lance dataset with OpenAI text-embedding-3-small embeddings for knowledge-base docs. Schema: [id, title, content, embedding(1536)]"

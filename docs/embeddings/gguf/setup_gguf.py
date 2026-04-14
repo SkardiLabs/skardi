@@ -20,7 +20,7 @@ Prerequisites:
        pip install llama-cpp-python lancedb huggingface_hub pyarrow
 
 Usage (run from the project root):
-  python demo/embeddings/gguf/setup_gguf.py
+  python docs/embeddings/gguf/setup_gguf.py
 """
 
 import sys
@@ -31,8 +31,8 @@ from pathlib import Path
 # Paths (all relative to the project root, where you run this script from)
 # ---------------------------------------------------------------------------
 
-DEMO_DIR = Path("demo/embeddings/gguf")
-DOCS_CSV = Path("demo/embeddings/data/docs.csv")
+DEMO_DIR = Path("docs/embeddings/gguf")
+DOCS_CSV = Path("docs/embeddings/data/docs.csv")
 LANCE_OUT = DEMO_DIR / "data" / "generated" / "doc_embeddings_gguf.lance"
 MODEL_DIR = Path("models/generated/embeddinggemma-300m")
 
@@ -169,7 +169,7 @@ def create_lance_dataset(docs):
 def main():
     if not Path("Cargo.toml").exists():
         print("ERROR: Run this script from the Skardi project root.")
-        print("  cd /path/to/skardi && python demo/embeddings/gguf/setup_gguf.py")
+        print("  cd /path/to/skardi && python docs/embeddings/gguf/setup_gguf.py")
         sys.exit(1)
 
     (DEMO_DIR / "data" / "generated").mkdir(parents=True, exist_ok=True)

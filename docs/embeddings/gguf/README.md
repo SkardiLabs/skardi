@@ -66,14 +66,14 @@ it possible to run embedding models with a fraction of the memory footprint.
 Run once from the **project root** to download the model and create the Lance dataset:
 
 ```bash
-python demo/embeddings/gguf/setup_gguf.py
+python docs/embeddings/gguf/setup_gguf.py
 ```
 
 This will:
 - Download `embeddinggemma-300m-qat-Q8_0.gguf` (~329 MB) into `models/generated/embeddinggemma-300m/`
 - Download `tokenizer.json` from the gated Gemma repo
-- Embed the 15 knowledge-base documents in `demo/embeddings/data/docs.csv`
-- Write a Lance dataset to `demo/embeddings/gguf/data/generated/doc_embeddings_gguf.lance`
+- Embed the 15 knowledge-base documents in `docs/embeddings/data/docs.csv`
+- Write a Lance dataset to `docs/embeddings/gguf/data/generated/doc_embeddings_gguf.lance`
 
 Expected output:
 ```
@@ -81,18 +81,18 @@ Expected output:
       embeddinggemma-300m-qat-Q8_0.gguf: 329.0 MB
 [2/4] Downloading tokenizer.json from google/embeddinggemma-300m-qat-q8_0-unquantized ...
       tokenizer.json: 31.8 MB
-[3/4] Loaded 15 documents from demo/embeddings/data/docs.csv
+[3/4] Loaded 15 documents from docs/embeddings/data/docs.csv
 [4/4] Embedding 15 documents with embeddinggemma-300m-qat-Q8_0.gguf ...
       Embedding dimension: 256
-      Lance dataset written to demo/embeddings/gguf/data/generated/doc_embeddings_gguf.lance
+      Lance dataset written to docs/embeddings/gguf/data/generated/doc_embeddings_gguf.lance
 ```
 
 ## Starting the Server
 
 ```bash
 cargo run --bin skardi-server --features gguf -- \
-  --ctx demo/embeddings/gguf/ctx.yaml \
-  --pipeline demo/embeddings/gguf/pipelines/ \
+  --ctx docs/embeddings/gguf/ctx.yaml \
+  --pipeline docs/embeddings/gguf/pipelines/ \
   --port 8080
 ```
 
@@ -210,7 +210,7 @@ curl -X POST http://localhost:8080/semantic-search-gguf/execute \
 ## Directory Layout
 
 ```
-demo/embeddings/gguf/
+docs/embeddings/gguf/
 ├── README.md
 ├── ctx.yaml                          — registers the Lance data source
 ├── setup_gguf.py                     — one-time setup: downloads model + creates Lance dataset

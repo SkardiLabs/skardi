@@ -23,11 +23,11 @@ Semantic search over a small knowledge base using OpenAI's
 Run from the **project root**:
 
 ```bash
-python demo/embeddings/remote/setup_remote.py
+python docs/embeddings/remote/setup_remote.py
 ```
 
 This will:
-1. Load `demo/embeddings/data/docs.csv` (15 short knowledge-base articles)
+1. Load `docs/embeddings/data/docs.csv` (15 short knowledge-base articles)
 2. Embed every document with OpenAI `text-embedding-3-small` (1536-dim)
 3. Write a Lance dataset to `data/generated/doc_embeddings_openai.lance`
 
@@ -35,8 +35,8 @@ This will:
 
 ```bash
 cargo run --bin skardi-server --features remote-embed -- \
-  --ctx demo/embeddings/remote/ctx.yaml \
-  --pipeline demo/embeddings/remote/pipelines/ \
+  --ctx docs/embeddings/remote/ctx.yaml \
+  --pipeline docs/embeddings/remote/pipelines/ \
   --port 8080
 ```
 

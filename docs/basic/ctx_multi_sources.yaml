@@ -1,7 +1,7 @@
 data_sources:
   - name: "orders"
     type: "csv"
-    path: "demo/sample_data/orders.csv"
+    path: "docs/sample_data/orders.csv"
     options:
       has_header: true
       delimiter: ","
@@ -9,7 +9,7 @@ data_sources:
     description: "CSV order data with user purchases"
   - name: "inventory"
     type: "csv"
-    path: "demo/sample_data/product_inventory.csv"
+    path: "docs/sample_data/product_inventory.csv"
     options:
       has_header: true
       delimiter: ","

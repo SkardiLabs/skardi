@@ -54,8 +54,8 @@ Navigate to the project root and start the server with the demo configuration:
 
 ```bash
 cargo run --bin skardi-server -- \
-  --pipeline demo/pipeline.yaml \
-  --ctx demo/ctx.yaml \
+  --pipeline docs/basic/pipeline.yaml \
+  --ctx docs/basic/ctx.yaml \
   --port 8080
 ```
 
@@ -63,8 +63,8 @@ You should see output similar to:
 ```
 Starting Skardi Online Serving Pipeline Server
 CLI Arguments parsed successfully
-   Pipeline file: Some("demo/pipeline.yaml")
-   Context file: Some("demo/ctx.yaml")
+   Pipeline file: Some("docs/basic/pipeline.yaml")
+   Context file: Some("docs/basic/ctx.yaml")
    Port: 8080
 Loading server configuration...
 Server configuration loaded successfully

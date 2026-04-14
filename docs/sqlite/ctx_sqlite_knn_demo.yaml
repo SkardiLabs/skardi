@@ -2,7 +2,7 @@ data_sources:
   - name: "vec_items"
     type: "sqlite"
     access_mode: "read_write"
-    path: "demo/sqlite/knn_demo.db"
+    path: "docs/sqlite/knn_demo.db"
     description: "SQLite vec0 virtual table for vector similarity search"
     options:
       table: "vec_items"
@@ -13,7 +13,7 @@ data_sources:
   - name: "items"
     type: "sqlite"
     access_mode: "read_write"
-    path: "demo/sqlite/knn_demo.db"
+    path: "docs/sqlite/knn_demo.db"
     description: "SQLite data table with item metadata"
     options:
       table: "items"

@@ -3,14 +3,14 @@ data_sources:
   - name: "users"
     type: "sqlite"
     access_mode: "read_write"
-    path: "demo/sqlite/demo.db"
+    path: "docs/sqlite/demo.db"
     description: "SQLite users table"
     options:
       table: "users"
 
   - name: "orders"
     type: "sqlite"
-    path: "demo/sqlite/demo.db"
+    path: "docs/sqlite/demo.db"
     description: "SQLite orders table"
     options:
       table: "orders"
@@ -18,7 +18,7 @@ data_sources:
   - name: "user_order_stats"
     type: "sqlite"
     access_mode: "read_write"
-    path: "demo/sqlite/demo.db"
+    path: "docs/sqlite/demo.db"
     description: "SQLite table for aggregated user order statistics"
     options:
       table: "user_order_stats"
@@ -27,5 +27,5 @@ data_sources:
   - name: "csv_orders"
     type: "csv"
     access_mode: "read_only"
-    path: "demo/sample_data/orders.csv"
+    path: "docs/sample_data/orders.csv"
     description: "CSV file containing order data"

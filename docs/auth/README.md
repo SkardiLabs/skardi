@@ -35,7 +35,7 @@ AUTH_MODE=BETTER_AUTH_DIESEL_SQLITE \
 AUTH_SECRET="super-secret-key-at-least-32-characters-long" \
 AUTH_DB_PATH="skardi_auth.db" \
 cargo run --bin skardi-server -- \
-  --pipeline demo/auth/pipelines/active-users.yaml \
+  --pipeline docs/auth/pipelines/active-users.yaml \
   --port 8080
 ```
 
@@ -166,7 +166,7 @@ When auth is enabled, two virtual tables are available inside any pipeline query
 - **`auth.users`** — all registered users (id, name, email, role, created_at, …)
 - **`auth.sessions`** — all active sessions (id, token, user_id, expires_at, …)
 
-You can JOIN these with your own data sources. The included `demo/auth/pipelines/active-users.yaml` pipeline does exactly this — it returns all users who have a currently active session.
+You can JOIN these with your own data sources. The included `docs/auth/pipelines/active-users.yaml` pipeline does exactly this — it returns all users who have a currently active session.
 
 Execute it (requires a valid session token):
 

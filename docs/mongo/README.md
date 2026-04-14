@@ -62,8 +62,8 @@ export MONGO_USER=root
 export MONGO_PASS=rootpass
 
 cargo run --bin skardi-server -- \
-  --ctx demo/mongo/ctx_mongo_demo.yaml \
-  --pipeline demo/mongo/pipelines/ \
+  --ctx docs/mongo/ctx_mongo_demo.yaml \
+  --pipeline docs/mongo/pipelines/ \
   --port 8080
 ```
 
@@ -338,7 +338,7 @@ data_sources:
 
 ### Pipelines
 
-Two pipeline files are provided in `demo/mongo/pipelines/fts_demo/`:
+Two pipeline files are provided in `docs/mongo/pipelines/fts_demo/`:
 
 | File | Description |
 |---|---|
@@ -359,8 +359,8 @@ query: |
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/mongo/ctx_mongo_fts_demo.yaml \
-  --pipeline demo/mongo/pipelines/fts_demo/ \
+  --ctx docs/mongo/ctx_mongo_fts_demo.yaml \
+  --pipeline docs/mongo/pipelines/fts_demo/ \
   --port 8080
 
 # Basic search: find documents about "machine learning"

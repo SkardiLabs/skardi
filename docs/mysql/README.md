@@ -50,8 +50,8 @@ INSERT INTO orders (user_id, product, amount) VALUES
 EOF
 
 # 2b. Create sample CSV file (for federated query demo)
-mkdir -p demo/sample_data
-cat > demo/sample_data/orders.csv << 'EOF'
+mkdir -p docs/sample_data
+cat > docs/sample_data/orders.csv << 'EOF'
 order_id,user_id,product,amount,order_date
 1001,1,Laptop,999.99,2024-01-15
 1002,1,Mouse,29.99,2024-01-16
@@ -75,7 +75,7 @@ EOF
 
 # 5. Start Skardi
 cargo run --bin skardi-server -- \
-  --ctx demo/mysql/ctx_mysql_demo.yaml \
+  --ctx docs/mysql/ctx_mysql_demo.yaml \
   --pipeline path/to/mysql_query_pipeline.yaml \
   --port 8080
 
@@ -100,7 +100,7 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
 
 2. **Start Skardi server with pipelines**:
 
-   Example pipeline files are provided in `demo/mysql/pipelines/`:
+   Example pipeline files are provided in `docs/mysql/pipelines/`:
    - `query_user_by_id.yaml` - Query user by ID
    - `search_users_by_email.yaml` - Search by email pattern
    - `user_orders_summary.yaml` - Get user's order summary
@@ -111,8 +111,8 @@ curl -X POST http://localhost:8080/mysql_user_query/execute \
    Pass them all at server start using the `--pipeline` flag (accepts a directory or individual files):
    ```bash
    cargo run --bin skardi-server -- \
-     --ctx demo/mysql/ctx_mysql_demo.yaml \
-     --pipeline demo/mysql/pipelines/ \
+     --ctx docs/mysql/ctx_mysql_demo.yaml \
+     --pipeline docs/mysql/pipelines/ \
      --port 8080
    ```
 
@@ -337,7 +337,7 @@ automatically, and you query them with the three-part `catalog.schema.table` syn
 ### Context file
 
 ```yaml
-# demo/mysql/ctx_mysql_catalog_demo.yaml
+# docs/mysql/ctx_mysql_catalog_demo.yaml
 data_sources:
   - name: "mydb_catalog"
     type: "mysql"
@@ -356,8 +356,8 @@ data_sources:
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/mysql/ctx_mysql_catalog_demo.yaml \
-  --pipeline demo/mysql/pipelines/catalog_demo/ \
+  --ctx docs/mysql/ctx_mysql_catalog_demo.yaml \
+  --pipeline docs/mysql/pipelines/catalog_demo/ \
   --port 8080
 ```
 

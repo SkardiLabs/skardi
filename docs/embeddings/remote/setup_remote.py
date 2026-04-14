@@ -11,7 +11,7 @@ Prerequisites:
        pip install openai lancedb pyarrow
 
 Usage (run from the project root):
-  python demo/embeddings/remote/setup_remote.py
+  python docs/embeddings/remote/setup_remote.py
 """
 
 import csv
@@ -23,8 +23,8 @@ from pathlib import Path
 # Paths (all relative to the project root)
 # ---------------------------------------------------------------------------
 
-DEMO_DIR = Path("demo/embeddings/remote")
-DOCS_CSV = Path("demo/embeddings/data/docs.csv")
+DEMO_DIR = Path("docs/embeddings/remote")
+DOCS_CSV = Path("docs/embeddings/data/docs.csv")
 LANCE_OUT = DEMO_DIR / "data" / "generated" / "doc_embeddings_openai.lance"
 
 MODEL = "text-embedding-3-small"
@@ -109,7 +109,7 @@ def create_lance_dataset(docs, embeddings):
 def main():
     if not Path("Cargo.toml").exists():
         print("ERROR: Run this script from the Skardi project root.")
-        print("  cd /path/to/skardi && python demo/embeddings/remote/setup_remote.py")
+        print("  cd /path/to/skardi && python docs/embeddings/remote/setup_remote.py")
         sys.exit(1)
 
     (DEMO_DIR / "data" / "generated").mkdir(parents=True, exist_ok=True)

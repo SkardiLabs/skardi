@@ -60,7 +60,7 @@ EOF
 
 # 5. Start Skardi
 cargo run --bin skardi-server -- \
-  --ctx demo/postgres/ctx_postgres_demo.yaml \
+  --ctx docs/postgres/ctx_postgres_demo.yaml \
   --pipeline /tmp/pg_query_pipeline.yaml \
   --port 8080
 
@@ -85,7 +85,7 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
 
 2. **Start Skardi server with pipelines**:
 
-   Example pipeline files are provided in `demo/postgres/pipelines/`:
+   Example pipeline files are provided in `docs/postgres/pipelines/`:
    - `query_user_by_id.yaml` - Query user by ID
    - `insert_user.yaml` - Insert new user
    - `update_user_email.yaml` - Update a user's email by name
@@ -95,8 +95,8 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
    Pass them all at server start using the `--pipeline` flag (accepts a directory or individual files):
    ```bash
    cargo run --bin skardi-server -- \
-     --ctx demo/postgres/ctx_postgres_demo.yaml \
-     --pipeline demo/postgres/pipelines/ \
+     --ctx docs/postgres/ctx_postgres_demo.yaml \
+     --pipeline docs/postgres/pipelines/ \
      --port 8080
    ```
 
@@ -214,7 +214,7 @@ CSV File (orders.csv)         PostgreSQL (users table)
 
 ### Shared CSV Data Source
 
-The demo uses the same CSV file as the MySQL demo (`demo/sample_data/orders.csv`):
+The demo uses the same CSV file as the MySQL demo (`docs/sample_data/orders.csv`):
 
 ```csv
 order_id,user_id,product,amount,order_date
@@ -351,7 +351,7 @@ data_sources:
 
 ### Pipelines
 
-Three pipeline files are provided in `demo/postgres/pipelines/vector_demo/`, one per distance metric:
+Three pipeline files are provided in `docs/postgres/pipelines/vector_demo/`, one per distance metric:
 
 | File | Operator | Score meaning |
 |---|---|---|
@@ -380,8 +380,8 @@ Load all three pipelines at once and query each endpoint:
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/postgres/ctx_pgvector_demo.yaml \
-  --pipeline demo/postgres/pipelines/vector_demo/ \
+  --ctx docs/postgres/ctx_pgvector_demo.yaml \
+  --pipeline docs/postgres/pipelines/vector_demo/ \
   --port 8080
 
 # Inner product
@@ -483,7 +483,7 @@ data_sources:
       pass_env: "PG_PASSWORD"
   - name: "csv_orders"
     type: "csv"
-    path: "demo/sample_data/orders.csv"
+    path: "docs/sample_data/orders.csv"
 ```
 
 ```sql
@@ -552,7 +552,7 @@ data_sources:
 
 ### Pipelines
 
-Two pipeline files are provided in `demo/postgres/pipelines/fts_demo/`:
+Two pipeline files are provided in `docs/postgres/pipelines/fts_demo/`:
 
 | File | Description |
 |---|---|
@@ -563,8 +563,8 @@ Two pipeline files are provided in `demo/postgres/pipelines/fts_demo/`:
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/postgres/ctx_pgfts_demo.yaml \
-  --pipeline demo/postgres/pipelines/fts_demo/ \
+  --ctx docs/postgres/ctx_pgfts_demo.yaml \
+  --pipeline docs/postgres/pipelines/fts_demo/ \
   --port 8080
 ```
 
@@ -821,8 +821,8 @@ export PG_PASSWORD="skardi_pass"
 
 # 3. Start Skardi using the catalog context and catalog-specific pipelines
 cargo run --bin skardi-server -- \
-  --ctx demo/postgres/ctx_postgres_catalog_demo.yaml \
-  --pipeline demo/postgres/pipelines_for_catalog_example/ \
+  --ctx docs/postgres/ctx_postgres_catalog_demo.yaml \
+  --pipeline docs/postgres/pipelines_for_catalog_example/ \
   --port 8080
 ```
 
@@ -879,8 +879,8 @@ A ready-made pipeline is provided at `pipelines_for_catalog_example/vector_searc
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/postgres/ctx_postgres_catalog_demo.yaml \
-  --pipeline demo/postgres/pipelines_for_catalog_example/ \
+  --ctx docs/postgres/ctx_postgres_catalog_demo.yaml \
+  --pipeline docs/postgres/pipelines_for_catalog_example/ \
   --port 8080
 
 # Search with a literal query vector

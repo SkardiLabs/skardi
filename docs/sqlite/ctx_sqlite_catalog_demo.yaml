@@ -5,7 +5,7 @@ data_sources:
   - name: "demo_catalog"
     type: "sqlite"
     hierarchy_level: "catalog"
-    path: "demo/sqlite/demo.db"
+    path: "docs/sqlite/demo.db"
     description: "Entire demo.db SQLite database registered as a named DataFusion catalog"
     # options:
     #   Restrict to specific schemas (optional — SQLite schema is always "main"):

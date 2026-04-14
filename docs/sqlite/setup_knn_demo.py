@@ -6,7 +6,7 @@ and inserts them into the vec0 virtual table.
 
 Usage:
     pip install sqlite-vec fastembed
-    python demo/sqlite/setup_knn_demo.py
+    python docs/sqlite/setup_knn_demo.py
 """
 
 import os
@@ -15,7 +15,7 @@ import struct
 
 import sqlite_vec
 
-DB_PATH = "demo/sqlite/knn_demo.db"
+DB_PATH = "docs/sqlite/knn_demo.db"
 
 ITEMS = [
     (1, "Laptop", "electronics"),

@@ -103,8 +103,8 @@ lance_knn(...) -> LanceKnnExec -> Lance Scanner.nearest()
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/lance/ctx_lance.yaml \
-  --pipeline demo/lance/pipelines/ \
+  --ctx docs/lance/ctx_lance.yaml \
+  --pipeline docs/lance/pipelines/ \
   --port 8080
 ```
 
@@ -112,8 +112,8 @@ Expected output:
 ```
 Starting Skardi Online Serving Pipeline Server
 CLI Arguments parsed successfully
-   Pipeline file: Some("demo/lance/pipeline_lance.yaml")
-   Context file: Some("demo/lance/ctx_lance.yaml")
+   Pipeline file: Some("docs/lance/pipeline_lance.yaml")
+   Context file: Some("docs/lance/ctx_lance.yaml")
    Port: 8080
 Server configuration loaded successfully
    Pipeline: lance-vector-similarity-search
@@ -194,7 +194,7 @@ The `query_vector` parameter accepts a JSON array of floats matching the vector 
 A test script is provided to read a real vector from the dataset and send it:
 
 ```bash
-python demo/lance/test_direct_vector_search.py
+python docs/lance/test_direct_vector_search.py
 ```
 
 ## KNN Pipeline Parameters
@@ -341,8 +341,8 @@ LIMIT 5
 
 ```bash
 cargo run --bin skardi-server -- \
-  --ctx demo/lance/ctx_lance.yaml \
-  --pipeline demo/lance/pipelines/ \
+  --ctx docs/lance/ctx_lance.yaml \
+  --pipeline docs/lance/pipelines/ \
   --port 8080
 ```
 
@@ -482,8 +482,8 @@ Enable debug logs to see KNN execution:
 
 ```bash
 RUST_LOG=debug cargo run --bin skardi-server -- \
-  --ctx demo/lance/ctx_lance.yaml \
-  --pipeline demo/lance/pipelines/ \
+  --ctx docs/lance/ctx_lance.yaml \
+  --pipeline docs/lance/pipelines/ \
   --port 8080
 ```
 

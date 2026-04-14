@@ -21,8 +21,8 @@ EOF
 
 # 3. Start Skardi server
 cargo run --bin skardi-server -- \
-  --ctx demo/redis/ctx_redis_demo.yaml \
-  --pipeline demo/redis/pipelines/ \
+  --ctx docs/redis/ctx_redis_demo.yaml \
+  --pipeline docs/redis/pipelines/ \
   --port 8080
 ```
 

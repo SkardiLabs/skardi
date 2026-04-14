@@ -105,8 +105,8 @@ skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
 # --- Skardi Server ---
 # Start the server with a context and pipeline
 cargo run --bin skardi-server -- \
-  --ctx demo/ctx.yaml \
-  --pipeline demo/pipeline.yaml \
+  --ctx docs/basic/ctx.yaml \
+  --pipeline docs/basic/pipeline.yaml \
   --port 8080
 
 # Execute the pipeline

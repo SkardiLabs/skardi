@@ -1,7 +1,7 @@
 data_sources:
   - name: "movies"
     type: "csv"
-    path: "demo/sample_data/movies.csv"
+    path: "docs/sample_data/movies.csv"
     description: "CSV file with movie_id, title, genres, year, and genres_list"
 
   - name: "movie_embeddings"

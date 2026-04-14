@@ -12,7 +12,7 @@ Requirements:
 
 Usage (run from the project root):
   pip install fastembed lancedb huggingface_hub pyarrow
-  python demo/embeddings/candle/setup.py
+  python docs/embeddings/candle/setup.py
 """
 
 import os
@@ -24,8 +24,8 @@ from pathlib import Path
 # Paths (all relative to the project root, where you run this script from)
 # ---------------------------------------------------------------------------
 
-DEMO_DIR = Path("demo/embeddings/candle")
-DOCS_CSV = Path("demo/embeddings/data/docs.csv")
+DEMO_DIR = Path("docs/embeddings/candle")
+DOCS_CSV = Path("docs/embeddings/data/docs.csv")
 LANCE_OUT = DEMO_DIR / "data" / "generated" / "doc_embeddings.lance"
 MODEL_DIR = Path("models/generated/bge-small-en-v1.5")
 MODEL_ID = "BAAI/bge-small-en-v1.5"
@@ -119,7 +119,7 @@ def main():
     # Verify we are running from the project root
     if not Path("Cargo.toml").exists():
         print("ERROR: Run this script from the Skardi project root.")
-        print("  cd /path/to/skardi && python demo/embeddings/candle/setup.py")
+        print("  cd /path/to/skardi && python docs/embeddings/candle/setup.py")
         sys.exit(1)
 
     (DEMO_DIR / "data" / "generated").mkdir(parents=True, exist_ok=True)
