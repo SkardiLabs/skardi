@@ -16,6 +16,14 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::Deserialize;
+#[cfg(feature = "candle")]
+use skardi::model::CandleModelRegistry;
+#[cfg(feature = "gguf")]
+use skardi::model::GgufModelRegistry;
+#[cfg(feature = "onnx")]
+use skardi::model::OnnxModelRegistry;
+#[cfg(feature = "remote-embed")]
+use skardi::model::RemoteEmbedRegistry;
 use skardi::sources::HierarchyLevel;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
@@ -90,6 +98,18 @@ struct LocalDataSource {
     options: Option<HashMap<String, String>>,
     #[serde(default)]
     hierarchy_level: HierarchyLevel,
+    /// "read" (default) or "read_write". Currently honored by the SQLite source.
+    #[serde(default)]
+    access_mode: Option<String>,
+}
+
+impl LocalDataSource {
+    fn is_read_write(&self) -> bool {
+        matches!(
+            self.access_mode.as_deref(),
+            Some("read_write") | Some("readwrite") | Some("rw")
+        )
+    }
 }
 
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -340,6 +360,28 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
     register_sqlite_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_sqlite_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_vec_to_binary_udf(&mut ctx);
+
+    // Embedding UDFs (gated by feature flags, lazy model loading on first call).
+    #[cfg(feature = "onnx")]
+    {
+        let registry = Arc::new(OnnxModelRegistry::new());
+        registry.register_onnx_predict_udf(&mut ctx);
+    }
+    #[cfg(feature = "remote-embed")]
+    {
+        let registry = Arc::new(RemoteEmbedRegistry::new());
+        registry.register_remote_embed_udf(&mut ctx);
+    }
+    #[cfg(feature = "gguf")]
+    {
+        let registry = Arc::new(GgufModelRegistry::new());
+        registry.register_gguf_udf(&mut ctx);
+    }
+    #[cfg(feature = "candle")]
+    {
+        let registry = Arc::new(CandleModelRegistry::new());
+        registry.register_candle_udf(&mut ctx);
+    }
 
     (ctx, dataset_registry)
 }
@@ -592,7 +634,7 @@ async fn register_source(
                 &source.name,
                 &resolved,
                 source.options.as_ref(),
-                false,
+                source.is_read_write(),
                 Some(dataset_registry),
                 source.hierarchy_level,
             )
