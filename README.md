@@ -228,18 +228,7 @@ cargo build --release -p skardi-server --features embedding
 
 ### Data Source & Feature Reference ([docs/](docs/))
 
-| Path | Description |
-|------|-------------|
-| [docs/postgres/](docs/postgres/) | PostgreSQL CRUD, federated queries, and catalog mode |
-| [docs/mysql/](docs/mysql/) | MySQL CRUD, federated queries, and catalog mode |
-| [docs/sqlite/](docs/sqlite/) | SQLite CRUD, federated queries, and catalog mode |
-| [docs/mongo/](docs/mongo/) | MongoDB CRUD and federated query examples |
-| [docs/redis/](docs/redis/) | Redis CRUD and federated query examples |
-| [docs/iceberg/](docs/iceberg/) | Apache Iceberg integration examples |
-| [docs/lance/](docs/lance/) | Lance vector search and full-text search examples |
-| [docs/embeddings/](docs/embeddings/) | Inline embedding inference (Candle, GGUF, remote APIs) for semantic search |
-| [docs/onnx_predict.md](docs/onnx_predict.md) | `onnx_predict` UDF reference |
-| [docs/S3_USAGE.md](docs/S3_USAGE.md) | S3 data source configuration guide |
+Check [Supported Data Sources](#supported-data-sources) for individual data source demos.
 
 ### Application Examples ([demo/](demo/))
 
