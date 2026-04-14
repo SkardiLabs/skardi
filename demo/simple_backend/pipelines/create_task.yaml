@@ -1,0 +1,12 @@
+metadata:
+  name: "create-task"
+  version: "1.0.0"
+  description: "Create a new task for a user."
+
+# Parameters:
+#   {user_id} - Owner user ID
+#   {title}   - Task title
+
+query: |
+  INSERT INTO tasks (user_id, title)
+  VALUES ({user_id}, {title})

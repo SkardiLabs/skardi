@@ -1,8 +1,0 @@
-data_sources:
-  - name: "articles_fts"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "demo/sqlite/fts_demo.db"
-    description: "SQLite FTS5 virtual table for full-text search"
-    options:
-      table: "articles_fts"

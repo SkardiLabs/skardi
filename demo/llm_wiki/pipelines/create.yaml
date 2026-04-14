@@ -1,0 +1,26 @@
+metadata:
+  name: "wiki-create"
+  version: "1.0.0"
+  description: >
+    Create a new LLM Wiki page. A single INSERT writes the markdown content
+    (searchable via pg_fts) and embeds it inline with candle (searchable via
+    pg_knn) into the same wiki_pages row — both search paths are populated
+    atomically with no second write. Fails if the slug already exists; use
+    wiki-update to edit an existing page.
+
+# Parameters:
+#   {slug}      - Stable page identifier, e.g. "entity/alan-turing"
+#   {title}     - Human-readable page title
+#   {page_type} - entity | concept | summary | index | schema
+#   {content}   - Markdown body (used for both FTS and vector embedding)
+
+query: |
+  INSERT INTO wikidb.public.wiki_pages (slug, title, page_type, content, embedding, updated_at)
+  VALUES (
+    {slug},
+    {title},
+    {page_type},
+    {content},
+    candle('models/generated/bge-small-en-v1.5', {content}),
+    now()
+  )

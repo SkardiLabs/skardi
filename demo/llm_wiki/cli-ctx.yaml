@@ -1,0 +1,8 @@
+data_sources:
+  - name: wiki
+    type: sqlite
+    path: demo/llm_wiki/wiki.db
+    access_mode: read_write
+    hierarchy_level: catalog
+    options:
+      extensions_env: SQLITE_VEC_PATH

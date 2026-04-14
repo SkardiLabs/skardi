@@ -1,5 +1,0 @@
-data_sources:
-  - name: "doc_embeddings"
-    type: "lance"
-    path: "demo/embeddings/candle/data/generated/doc_embeddings.lance"
-    description: "Lance dataset with bge-small-en-v1.5 embeddings for knowledge-base docs. Schema: [id, title, content, embedding(384)]"
