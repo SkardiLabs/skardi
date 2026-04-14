@@ -1,5 +1,218 @@
 # LLM Wiki Demo
 
+This demo has two flavours: a **CLI / SQLite** version that runs entirely through
+`skardi-cli` against a local file (no server, no Docker), and the **server / PostgreSQL** version below.
+
+---
+
+## CLI version — `skardi-cli` + SQLite + `sqlite-vec` + FTS5
+
+The same wiki primitives (`create`, `update`, `get`, `grep`, `ls`) run end-to-end
+through `skardi query`. A regular `wiki_pages` table holds canonical state
+(slug, title, page_type, content, embedding); `AFTER INSERT` / `AFTER UPDATE`
+triggers fan rows out to an FTS5 virtual table for keyword search and a
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) `vec0` virtual table for
+KNN — so a single `INSERT` (or `UPDATE`) keeps content and embedding in sync.
+Embeddings are computed inline by the `candle()` UDF (same model as the server
+version).
+
+### 1. Install the CLI with embedding support
+
+```bash
+cargo install --path crates/cli --features candle
+```
+
+### 2. Get the `sqlite-vec` extension
+
+Build or download the `vec0` shared library — see the
+[sqlite-vec install guide](https://alexgarcia.xyz/sqlite-vec/installation.html).
+Then:
+
+```bash
+export SQLITE_VEC_PATH=/absolute/path/to/vec0.dylib   # or .so / .dll
+
+#    If using the pip package:
+export SQLITE_VEC_PATH=$(python -c "import sqlite_vec; print(sqlite_vec.loadable_path())")
+```
+
+### 3. Download the embedding model
+
+```bash
+pip install huggingface_hub
+python -c "
+from huggingface_hub import hf_hub_download
+import os
+model_dir = 'models/generated/bge-small-en-v1.5'
+os.makedirs(model_dir, exist_ok=True)
+for f in ['model.safetensors', 'config.json', 'tokenizer.json']:
+    hf_hub_download('BAAI/bge-small-en-v1.5', f, local_dir=model_dir)
+"
+```
+
+### 4. Create the database
+
+```bash
+pip install sqlite-vec
+python demo/llm_wiki/setup.py
+```
+
+The script loads the `sqlite-vec` extension via the `sqlite_vec` Python
+package  and drops any prior `demo/llm_wiki/wiki.db`. `vec0` requires an
+`INTEGER` rowid, so the human-readable `slug` lives on the base `wiki_pages`
+table (and as an `UNINDEXED` FTS5 column) and the integer `id` carries the
+JOIN. The script also creates `wiki_pages_fts`, `wiki_pages_vec`, the
+`wiki_log` activity table, and `AFTER INSERT` / `AFTER UPDATE` triggers that
+keep both mirrors in sync. See [setup.py](setup.py) for the schema.
+
+### 5. Context file
+
+One source in `catalog` mode auto-discovers every table, loads `sqlite-vec`
+once on the shared connection pool, and registers each table under
+`<catalog>.main.<table>` for both SQL and `sqlite_knn` / `sqlite_fts` lookups.
+
+```yaml
+data_sources:
+  - name: wiki
+    type: sqlite
+    path: demo/llm_wiki/wiki.db
+    access_mode: read_write
+    hierarchy_level: catalog
+    options:
+      extensions_env: SQLITE_VEC_PATH
+```
+
+### 6. `create` — write a new page
+
+```bash
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding)
+  SELECT slug, title, page_type, content,
+         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+  FROM (
+    SELECT 'entity/alan-turing' AS slug, 'Alan Turing' AS title, 'entity' AS page_type,
+           '# Alan Turing\n\nBritish mathematician and logician who formalized the concepts of algorithm and computation with the Turing machine.' AS content
+    UNION ALL
+    SELECT 'concept/turing-machine', 'Turing Machine', 'concept',
+           '# Turing Machine\n\nAn abstract computational model introduced by Alan Turing in 1936.'
+  ) AS t
+"
+```
+
+> Why `UNION ALL` of `SELECT`s instead of `VALUES`? DataFusion's INSERT planner
+> currently propagates the INSERT target schema (here, 5 columns) down into any
+> immediate-child `VALUES` clause and validates row width against it, ignoring
+> the intermediate `SELECT` projection that adds `vec_to_binary(candle(...))`.
+> Wrapping the seed rows as `SELECT … UNION ALL SELECT …` keeps the subquery's
+> own schema in scope and the projection lands the row at full width.
+
+`candle()` produces the embedding inline; `vec_to_binary()` packs it for `vec0`;
+the `AFTER INSERT` trigger atomically mirrors the row to `wiki_pages_fts` and
+`wiki_pages_vec`.
+
+### 7. `update` — edit an existing page (delete + re-insert)
+
+DataFusion's UPDATE planner unparses each `SET` expression back to SQL for the
+underlying SQLite connection to execute, and it can't currently render a Binary
+scalar (the packed-f32 embedding from `vec_to_binary(candle(...))`) as a SQL
+literal. The portable workaround is **delete + re-insert** in two statements —
+the `AFTER DELETE` trigger cleans both mirrors, the `AFTER INSERT` trigger
+repopulates them, and the new row picks up a fresh `updated_at` from the
+column default.
+
+```bash
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  DELETE FROM wiki.main.wiki_pages WHERE slug = 'entity/alan-turing'
+"
+
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding)
+  SELECT slug, title, page_type, content,
+         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+  FROM (
+    SELECT 'entity/alan-turing' AS slug, 'Alan Turing' AS title, 'entity' AS page_type,
+           '# Alan Turing\n\nBritish mathematician, logician, and cryptanalyst who broke the Enigma cipher at Bletchley Park.' AS content
+  ) AS t
+"
+```
+
+If you'd rather edit the row in place from a SQLite client (e.g. `sqlite3`),
+the original `AFTER UPDATE` trigger is still installed and will refresh both
+mirrors when an `UPDATE wiki_pages SET ...` runs against the underlying
+database directly — only the DataFusion path needs the delete-and-reinsert
+dance.
+
+### 8. `get` — fetch one page by slug
+
+```bash
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  SELECT slug, title, page_type, content, updated_at
+  FROM wiki.main.wiki_pages WHERE slug = 'entity/alan-turing'
+"
+```
+
+### 9. `grep` — hybrid search (RRF over FTS + vector)
+
+```bash
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  WITH vec AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+    FROM sqlite_knn('wiki.main.wiki_pages_vec', 'embedding',
+        (SELECT candle('models/generated/bge-small-en-v1.5',
+                       'who invented the theoretical model of a computer?')),
+        80)
+  ),
+  fts AS (
+    SELECT id, slug, title, page_type,
+           ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+    FROM sqlite_fts('wiki.main.wiki_pages_fts', 'content',
+                    'turing machine computation', 60)
+  )
+  SELECT
+    COALESCE(f.slug, p.slug)         AS slug,
+    COALESCE(f.title, p.title)       AS title,
+    COALESCE(f.page_type, p.page_type) AS page_type,
+    COALESCE(0.5 / (60.0 + v.rk), 0)
+      + COALESCE(0.5 / (60.0 + f.rk), 0) AS rrf_score
+  FROM vec v
+  FULL OUTER JOIN fts f ON v.id = f.id
+  LEFT JOIN wiki.main.wiki_pages p ON p.id = COALESCE(v.id, f.id)
+  ORDER BY rrf_score DESC
+  LIMIT 10
+"
+```
+
+### 10. `ls` — browse by type or slug prefix
+
+```bash
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  SELECT slug, title, page_type, updated_at
+  FROM wiki.main.wiki_pages
+  WHERE page_type LIKE 'entity'
+    AND slug      LIKE '%'
+  ORDER BY updated_at DESC
+  LIMIT 100
+"
+```
+
+### 11. `log` — append an activity entry
+
+```bash
+skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "
+  INSERT INTO wiki.main.wiki_log (event_type, slug, message)
+  VALUES ('ingest', 'entity/alan-turing', 'Created from Wikipedia article.')
+"
+```
+
+### Cleanup
+
+```bash
+rm demo/llm_wiki/wiki.db
+```
+
+---
+
+## Server version — `skardi-server` + PostgreSQL + pgvector
+
 A data layer for Karpathy's [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
 idea, built on Skardi. The wiki is stored in a **single PostgreSQL table** that
 holds markdown content + pgvector embedding on the same row, so every page is

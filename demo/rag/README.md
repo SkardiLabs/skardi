@@ -1,5 +1,154 @@
 # Hybrid Search / RAG Demo
 
+This demo has two flavours: a **CLI / SQLite** version that runs entirely through
+`skardi-cli` against a local file (no server, no Docker), and the **server / PostgreSQL** version below.
+
+---
+
+## CLI version — `skardi-cli` + SQLite + `sqlite-vec` + FTS5
+
+The same hybrid search pipeline (vector + FTS + RRF) runs end-to-end through
+`skardi query`. Vectors live in a [`sqlite-vec`](https://github.com/asg017/sqlite-vec)
+`vec0` virtual table, text lives in an FTS5 virtual table, and a regular
+`documents` table with `AFTER INSERT` triggers fans new rows out to both — so a
+single `INSERT` keeps content and embedding in sync. Embeddings are computed
+inline by the `candle()` UDF (same model as the server version).
+
+### 1. Install the CLI with embedding support
+
+```bash
+cargo install --path crates/cli --features candle
+```
+
+### 2. Get the `sqlite-vec` extension
+
+Build or download the `vec0` shared library — see the
+[sqlite-vec install guide](https://alexgarcia.xyz/sqlite-vec/installation.html).
+Then point Skardi at it:
+
+```bash
+export SQLITE_VEC_PATH=/absolute/path/to/vec0.dylib   # or .so / .dll
+
+#    If using the pip package:
+export SQLITE_VEC_PATH=$(python -c "import sqlite_vec; print(sqlite_vec.loadable_path())")
+```
+
+### 3. Download the embedding model
+
+```bash
+pip install huggingface_hub
+python -c "
+from huggingface_hub import hf_hub_download
+import os
+model_dir = 'models/generated/bge-small-en-v1.5'
+os.makedirs(model_dir, exist_ok=True)
+for f in ['model.safetensors', 'config.json', 'tokenizer.json']:
+    hf_hub_download('BAAI/bge-small-en-v1.5', f, local_dir=model_dir)
+"
+```
+
+### 4. Create the database
+
+```bash
+pip install sqlite-vec
+python demo/rag/setup.py
+```
+
+The script loads the `sqlite-vec` extension via the `sqlite_vec` Python
+package (sidestepping the `sqlite3` CLI's missing `enable_load_extension` on
+many systems), drops any prior `demo/rag/rag.db`, and creates the `documents`
+base table, the `documents_fts` FTS5 mirror, the `documents_vec` `vec0`
+mirror, and the `AFTER INSERT` trigger that fans new rows out to both mirrors
+atomically. See [setup.py](setup.py) for the schema.
+
+### 5. Context file
+
+One source in `catalog` mode auto-discovers every table in the database, loads
+the `sqlite-vec` extension once on the shared connection pool, and registers
+each table under `<catalog>.main.<table>` for both SQL and `sqlite_knn` /
+`sqlite_fts` lookups. Save as `demo/rag/cli-ctx.yaml`:
+
+```yaml
+data_sources:
+  - name: rag
+    type: sqlite
+    path: demo/rag/rag.db
+    access_mode: read_write
+    hierarchy_level: catalog
+    options:
+      extensions_env: SQLITE_VEC_PATH
+```
+
+### 6. Ingest — one statement, embedding computed inline
+
+```bash
+skardi query --ctx demo/rag/cli-ctx.yaml --sql "
+  INSERT INTO rag.main.documents (id, content, embedding)
+  SELECT id, content,
+         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+  FROM (
+    SELECT 1 AS id, 'Vector databases store high-dimensional vectors and enable fast similarity search at scale.' AS content
+    UNION ALL
+    SELECT 2, 'Retrieval-Augmented Generation combines retrieval with a language model to ground responses in factual content.'
+    UNION ALL
+    SELECT 3, 'The Transformer architecture introduced multi-head self-attention to replace recurrent networks.'
+  ) AS t
+"
+```
+
+> Why `UNION ALL` of `SELECT`s instead of `VALUES`? DataFusion's INSERT planner
+> currently propagates the INSERT target schema (here, 3 columns) down into any
+> immediate-child `VALUES` clause and validates row width against it, ignoring
+> the intermediate `SELECT` projection that adds `vec_to_binary(candle(...))`.
+> Wrapping the seed rows as `SELECT … UNION ALL SELECT …` keeps the subquery's
+> own schema in scope and the projection lands the row at full width.
+
+`candle()` produces a `List<Float32>`; `vec_to_binary()` packs it to the
+little-endian f32 BLOB that `vec0` expects. The `AFTER INSERT` trigger then
+mirrors the row to `documents_fts` and `documents_vec` atomically.
+
+### 7. Hybrid search (RRF in one DataFusion query)
+
+```bash
+skardi query --ctx demo/rag/cli-ctx.yaml --sql "
+  WITH vec AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+    FROM sqlite_knn('rag.main.documents_vec', 'embedding',
+        (SELECT candle('models/generated/bge-small-en-v1.5',
+                       'how does similarity search work?')),
+        80)
+  ),
+  fts AS (
+    SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+    FROM sqlite_fts('rag.main.documents_fts', 'content', 'vector similarity search', 60)
+  )
+  SELECT
+    COALESCE(v.id, f.id) AS id,
+    COALESCE(f.content, d.content) AS content,
+    COALESCE(0.5 / (60.0 + v.rk), 0)
+      + COALESCE(0.5 / (60.0 + f.rk), 0) AS rrf_score
+  FROM vec v
+  FULL OUTER JOIN fts f ON v.id = f.id
+  LEFT JOIN rag.main.documents d ON d.id = v.id
+  ORDER BY rrf_score DESC
+  LIMIT 10
+"
+```
+
+The structure mirrors the server's `search_hybrid.yaml` exactly — `sqlite_knn`
+and `sqlite_fts` replace `pg_knn` / `pg_fts`, RRF is the same SQL, and `candle()`
+is reused unchanged for the query embedding.
+
+### Cleanup
+
+```bash
+rm demo/rag/rag.db
+```
+
+---
+
+## Server version — `skardi-server` + PostgreSQL + pgvector
+
 This demo shows a complete hybrid search pipeline using Skardi,
 backed by a **single PostgreSQL table** that holds both the raw content and
 the vector embedding:
