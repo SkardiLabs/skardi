@@ -1,0 +1,21 @@
+metadata:
+  name: "sqlite-catalog-cross-table-join"
+  version: "1.0.0"
+  description: >
+    Join users and orders entirely through the catalog, without registering
+    each table individually. Both tables are addressed with the three-part
+    catalog.main.table reference.
+
+# Parameters:
+#   {limit} - Maximum number of rows to return
+
+query: |
+  SELECT
+    u.name      AS user_name,
+    u.email     AS user_email,
+    o.product,
+    o.amount
+  FROM demo_catalog.main.users  u
+  INNER JOIN demo_catalog.main.orders o ON u.id = o.user_id
+  ORDER BY o.id
+  LIMIT {limit}

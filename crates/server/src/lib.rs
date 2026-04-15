@@ -9,7 +9,7 @@ pub mod telemetry;
 
 // Re-export public types for easy access
 pub use config::{
-    load_server_config, register_data_sources, CliArgs, DataSource, DataSourceType, ServerConfig,
+    CliArgs, DataSource, DataSourceType, ServerConfig, load_server_config, register_data_sources,
 };
 
 // Re-export optimizer registry

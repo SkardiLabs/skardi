@@ -207,10 +207,12 @@ mod tests {
         assert!(!schema.field_with_name("id").unwrap().is_nullable());
         assert!(schema.field_with_name("name").unwrap().is_nullable());
         assert!(schema.field_with_name("email").unwrap().is_nullable());
-        assert!(!schema
-            .field_with_name("email_verified")
-            .unwrap()
-            .is_nullable());
+        assert!(
+            !schema
+                .field_with_name("email_verified")
+                .unwrap()
+                .is_nullable()
+        );
         assert!(schema.field_with_name("username").unwrap().is_nullable());
         assert!(schema.field_with_name("role").unwrap().is_nullable());
         assert!(!schema.field_with_name("banned").unwrap().is_nullable());

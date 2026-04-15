@@ -1,0 +1,17 @@
+data_sources:
+  - name: "orders"
+    type: "csv"
+    path: "docs/sample_data/orders.csv"
+    options:
+      has_header: true
+      delimiter: ","
+      schema_infer_max_records: 1000
+    description: "CSV order data with user purchases"
+  - name: "inventory"
+    type: "csv"
+    path: "docs/sample_data/product_inventory.csv"
+    options:
+      has_header: true
+      delimiter: ","
+      schema_infer_max_records: 1000
+    description: "CSV product inventory data with warehouse stock levels"

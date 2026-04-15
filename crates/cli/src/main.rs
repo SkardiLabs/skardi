@@ -16,13 +16,29 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 use serde::Deserialize;
+#[cfg(feature = "candle")]
+use skardi::model::CandleModelRegistry;
+#[cfg(feature = "gguf")]
+use skardi::model::GgufModelRegistry;
+#[cfg(feature = "onnx")]
+use skardi::model::OnnxModelRegistry;
+#[cfg(feature = "remote-embed")]
+use skardi::model::RemoteEmbedRegistry;
+use skardi::sources::HierarchyLevel;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
-use skardi::sources::providers::sqlx::register_pg_knn_udtf;
+use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
-    DatasetRegistry, iceberg::register_iceberg_table, lance::register_lance_table,
-    mongo::register_mongo_tables, mysql::register_mysql_tables, sqlite::register_sqlite_tables,
+    DatasetRegistry,
+    iceberg::register_iceberg_table,
+    lance::register_lance_table,
+    mongo::register_mongo_tables,
+    mysql::register_mysql_tables,
+    sqlite::{
+        register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_sqlite_tables,
+        register_vec_to_binary_udf,
+    },
     sqlx::postgres::register_postgres_tables,
 };
 use std::collections::HashMap;
@@ -80,6 +96,20 @@ struct LocalDataSource {
     path: Option<String>,
     connection_string: Option<String>,
     options: Option<HashMap<String, String>>,
+    #[serde(default)]
+    hierarchy_level: HierarchyLevel,
+    /// "read" (default) or "read_write". Currently honored by the SQLite source.
+    #[serde(default)]
+    access_mode: Option<String>,
+}
+
+impl LocalDataSource {
+    fn is_read_write(&self) -> bool {
+        matches!(
+            self.access_mode.as_deref(),
+            Some("read_write") | Some("readwrite") | Some("rw")
+        )
+    }
 }
 
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -310,7 +340,7 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
     ));
 
     let session_id = base_ctx.session_id().to_string();
-    let ctx: SessionContext = base_ctx
+    let mut ctx: SessionContext = base_ctx
         .into_state_builder()
         .with_session_id(session_id)
         .with_catalog_list(catalog_list)
@@ -319,11 +349,39 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
 
     factory.session_store().with_state(ctx.state_weak_ref());
 
-    // Register table functions (lance_knn, lance_fts, pg_knn, mongo_fts), all sharing one registry
+    // Register table functions (lance_knn, lance_fts, pg_knn, pg_fts,
+    // mongo_fts, sqlite_knn, sqlite_fts) and the vec_to_binary scalar UDF,
+    // all sharing one registry.
     register_lance_knn_udtf(&ctx, Arc::clone(&dataset_registry));
     register_lance_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_pg_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_pg_fts_udtf(&ctx, Arc::clone(&dataset_registry));
     register_mongo_fts_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_sqlite_knn_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_sqlite_fts_udtf(&ctx, Arc::clone(&dataset_registry));
+    register_vec_to_binary_udf(&mut ctx);
+
+    // Embedding UDFs (gated by feature flags, lazy model loading on first call).
+    #[cfg(feature = "onnx")]
+    {
+        let registry = Arc::new(OnnxModelRegistry::new());
+        registry.register_onnx_predict_udf(&mut ctx);
+    }
+    #[cfg(feature = "remote-embed")]
+    {
+        let registry = Arc::new(RemoteEmbedRegistry::new());
+        registry.register_remote_embed_udf(&mut ctx);
+    }
+    #[cfg(feature = "gguf")]
+    {
+        let registry = Arc::new(GgufModelRegistry::new());
+        registry.register_gguf_udf(&mut ctx);
+    }
+    #[cfg(feature = "candle")]
+    {
+        let registry = Arc::new(CandleModelRegistry::new());
+        registry.register_candle_udf(&mut ctx);
+    }
 
     (ctx, dataset_registry)
 }
@@ -508,6 +566,7 @@ async fn register_source(
                 source.options.as_ref(),
                 false,
                 Some(dataset_registry),
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register Postgres '{}'", source.name))?;
@@ -522,6 +581,7 @@ async fn register_source(
                 conn_str,
                 source.options.as_ref(),
                 false,
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register MySQL '{}'", source.name))?;
@@ -574,7 +634,9 @@ async fn register_source(
                 &source.name,
                 &resolved,
                 source.options.as_ref(),
-                false,
+                source.is_read_write(),
+                Some(dataset_registry),
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register SQLite '{}'", source.name))?;

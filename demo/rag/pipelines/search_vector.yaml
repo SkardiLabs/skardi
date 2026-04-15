@@ -1,0 +1,17 @@
+metadata:
+  name: "search-vector"
+  version: "1.0.0"
+  description: >
+    Semantic vector search. Embeds the query with candle and finds nearest
+    neighbours via pg_knn (pgvector cosine distance).
+
+# Parameters:
+#   {query} - Natural language search query
+#   {limit} - Maximum number of results
+
+query: |
+  SELECT id, content, _score
+  FROM pg_knn('documents', 'embedding',
+      candle('models/generated/bge-small-en-v1.5', {query}),
+      '<=>', 10)
+  ORDER BY _score

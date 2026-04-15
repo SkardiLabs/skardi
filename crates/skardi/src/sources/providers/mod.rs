@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use mongo::fts_table_function::MongoFtsEntry;
+use sqlite::knn_table_function::SqliteEntry;
 use sqlx::pg::knn_table_function::PgKnnEntry;
 
 /// A single entry in the unified dataset registry.
@@ -20,8 +21,9 @@ pub enum DatasetEntry {
     Lance(Arc<Dataset>),
     Postgres(PgKnnEntry),
     Mongo(MongoFtsEntry),
+    Sqlite(SqliteEntry),
 }
 
 /// Unified registry mapping table name → dataset entry.
-/// Shared by `lance_knn`, `lance_fts`, `pg_knn`, and `mongo_fts` table functions.
+/// Shared by `lance_knn`, `lance_fts`, `pg_knn`, `pg_fts`, and `mongo_fts` table functions.
 pub type DatasetRegistry = Arc<RwLock<HashMap<String, DatasetEntry>>>;

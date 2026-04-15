@@ -1,0 +1,23 @@
+metadata:
+  name: semantic-search-gguf
+  version: 1.0.0
+  description: >
+    Semantic search over a knowledge-base using a local GGUF Gemma embedding
+    model (EmbeddingGemma-300m-qat-Q8_0). The gguf() UDF loads the GGUF
+    file via llama.cpp and embeds the user query on the fly; lance_knn() finds
+    the nearest documents by cosine similarity.
+  author: Skardi Demo
+
+# Parameters:
+#   {query} - Natural language search query (embedded on the fly)
+#   {k}     - Number of nearest neighbours to return
+
+query: |
+  SELECT id, title, content, _distance
+  FROM lance_knn(
+    'doc_embeddings_gguf',
+    'embedding',
+    gguf('models/generated/embeddinggemma-300m', {query}),
+    {k}
+  )
+  ORDER BY _distance

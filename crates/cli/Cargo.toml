@@ -12,6 +12,14 @@ license.workspace = true
 name = "skardi"
 path = "src/main.rs"
 
+[features]
+default = ["candle", "gguf", "onnx", "remote-embed"]
+candle = ["skardi/candle"]
+gguf = ["skardi/gguf"]
+onnx = ["skardi/onnx"]
+remote-embed = ["skardi/remote-embed"]
+embedding = ["skardi/embedding"]
+
 [dependencies]
 anyhow = { workspace = true }
 arrow = { version = "57.0.1", features = ["prettyprint"] }

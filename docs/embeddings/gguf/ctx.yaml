@@ -1,0 +1,5 @@
+data_sources:
+  - name: "doc_embeddings_gguf"
+    type: "lance"
+    path: "docs/embeddings/gguf/data/generated/doc_embeddings_gguf.lance"
+    description: "Lance dataset with EmbeddingGemma-300m GGUF embeddings for knowledge-base docs. Schema: [id, title, content, embedding(256)]"

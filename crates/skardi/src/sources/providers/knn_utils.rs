@@ -6,12 +6,50 @@
 /// to prevent runaway requests from fetching arbitrarily large result sets.
 pub const MAX_KNN_K: usize = 500;
 
-use arrow::array::{Array, FixedSizeListArray, Float32Array, Float64Array, StringArray};
+use arrow::array::{
+    Array, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, StringArray,
+};
+use datafusion::common::{ScalarValue, plan_err};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use futures::StreamExt;
 use std::sync::Arc;
+
+/// Extract the `k` argument for a KNN table function from a planning-time expression.
+///
+/// Accepts positive integer literals (`Int32`, `Int64`, `UInt64`) and enforces the
+/// global [`MAX_KNN_K`] upper bound. During pipeline schema inference, pipeline
+/// `{param}` placeholders are converted to SQL `?` which reach the table function
+/// as `ScalarValue::Null` — in that case we return a dummy value of `1` so inference
+/// succeeds. The real integer is substituted textually at request time before
+/// re-planning, so the dummy value never runs.
+///
+/// `fn_name` is used as the error-message prefix (e.g. `"sqlite_knn"`).
+pub fn extract_k(expr: &Expr, fn_name: &str) -> DFResult<usize> {
+    let k = match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v @ 1..)), _) => *v as usize,
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            return plan_err!("{fn_name}: k must be a positive integer, got {v}");
+        }
+        Expr::Literal(ScalarValue::Int32(Some(v @ 1..)), _) => *v as usize,
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+            return plan_err!("{fn_name}: k must be a positive integer, got {v}");
+        }
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) if *v > 0 => *v as usize,
+        // Pipeline `{k}` parameter arrives as `?` → Null during schema inference.
+        // Return a dummy value; the real k is substituted textually at execute time.
+        Expr::Literal(ScalarValue::Null, _) => 1,
+        _ => {
+            return plan_err!("{fn_name}: k must be a positive integer literal");
+        }
+    };
+    if k > MAX_KNN_K {
+        return plan_err!("{fn_name}: k must be between 1 and {MAX_KNN_K}, got {k}");
+    }
+    Ok(k)
+}
 
 /// Execute a child plan and extract the first row's first column as `Vec<f32>`.
 ///
@@ -19,7 +57,9 @@ use std::sync::Arc;
 ///
 /// Supported column types:
 /// - `FixedSizeList<Float32>` / `FixedSizeList<Float64>` — standard Arrow vector type
+/// - `List<Float32>` / `List<Float64>` — variable-length list (e.g. from `candle()` UDF)
 /// - `Float32Array` / `Float64Array` — bare float arrays
+/// - `BinaryArray` — packed little-endian f32 bytes (sqlite-vec BLOB format)
 /// - `StringArray` — pgvector text format (`[0.1,0.2,...]`), used when the vector column
 ///   is fetched via a `::text` cast to work around datafusion-table-providers' lack of
 ///   support for the Postgres `vector` OID
@@ -50,11 +90,31 @@ pub async fn extract_query_vector(
             return Ok(Some(arr.values().iter().map(|&v| v as f32).collect()));
         }
     }
+    // List<Float32/Float64> — variable-length list (e.g. from candle() UDF output).
+    if let Some(list) = col.as_any().downcast_ref::<ListArray>() {
+        let values = list.value(0);
+        if let Some(arr) = values.as_any().downcast_ref::<Float32Array>() {
+            return Ok(Some(arr.values().to_vec()));
+        }
+        if let Some(arr) = values.as_any().downcast_ref::<Float64Array>() {
+            return Ok(Some(arr.values().iter().map(|&v| v as f32).collect()));
+        }
+    }
     if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
         return Ok(Some(arr.values().to_vec()));
     }
     if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
         return Ok(Some(arr.values().iter().map(|&v| v as f32).collect()));
+    }
+    // sqlite-vec BLOB: packed little-endian f32 bytes.
+    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+        if arr.is_null(0) {
+            return Ok(None);
+        }
+        let bytes = arr.value(0);
+        return parse_f32_blob(bytes).map(Some).map_err(|e| {
+            DataFusionError::Execution(format!("knn: binary vector parse error: {e}"))
+        });
     }
     // pgvector special case: the column was fetched as `embedding::text` to bypass
     // datafusion-table-providers' inability to decode the `vector` Postgres type.
@@ -69,7 +129,8 @@ pub async fn extract_query_vector(
 
     Err(DataFusionError::Execution(
         "knn: subquery first column must be a vector \
-         (FixedSizeList<Float32>, Float32Array, Float64Array, or pgvector text String)"
+         (FixedSizeList<Float32>, List<Float32>, Float32Array, Float64Array, \
+         Binary (packed f32), or pgvector text String)"
             .to_string(),
     ))
 }
@@ -89,6 +150,20 @@ pub fn parse_pgvector_text(s: &str) -> Result<Vec<f32>, String> {
                 .map_err(|e| format!("failed to parse vector element '{v}': {e}"))
         })
         .collect()
+}
+
+/// Parse a packed little-endian f32 BLOB (sqlite-vec format) into `Vec<f32>`.
+pub fn parse_f32_blob(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "expected packed f32 BLOB with length divisible by 4, got {} bytes",
+            bytes.len()
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -353,5 +428,97 @@ mod tests {
         .unwrap();
         let result = extract_query_vector(plan_from_batch(batch), task_ctx()).await;
         assert!(result.is_err());
+    }
+
+    // ── parse_f32_blob ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_f32_blob_basic() {
+        // Pack [1.0, 2.0, 3.0] as little-endian f32 bytes
+        let blob: Vec<u8> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let v = parse_f32_blob(&blob).unwrap();
+        assert_eq!(v, vec![1.0f32, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_parse_f32_blob_empty() {
+        let v = parse_f32_blob(&[]).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_parse_f32_blob_bad_length() {
+        assert!(parse_f32_blob(&[0, 1, 2]).is_err()); // 3 bytes, not divisible by 4
+    }
+
+    // ── extract_query_vector: List<Float32> ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_extract_list_float32() {
+        use arrow::array::{ArrayRef, Float32Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+
+        let values = Arc::new(Float32Array::from(vec![0.1f32, 0.2, 0.3]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let list = ListArray::new(
+            item_field.clone(),
+            OffsetBuffer::from_lengths([3]),
+            values as ArrayRef,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::List(item_field),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap();
+        let v = extract_query_vector(plan_from_batch(batch), task_ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.len(), 3);
+        assert!((v[0] - 0.1).abs() < 1e-6);
+        assert!((v[1] - 0.2).abs() < 1e-6);
+        assert!((v[2] - 0.3).abs() < 1e-6);
+    }
+
+    // ── extract_query_vector: BinaryArray (packed f32 BLOB) ─────────────
+
+    #[tokio::test]
+    async fn test_extract_binary_packed_f32() {
+        use arrow::array::BinaryArray;
+
+        let blob: Vec<u8> = [0.5f32, 1.5, 2.5]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Binary, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(BinaryArray::from_vec(vec![&blob]))])
+                .unwrap();
+        let v = extract_query_vector(plan_from_batch(batch), task_ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v, vec![0.5f32, 1.5, 2.5]);
+    }
+
+    #[tokio::test]
+    async fn test_extract_binary_null_returns_none() {
+        use arrow::array::BinaryArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Binary, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from_opt_vec(vec![None]))],
+        )
+        .unwrap();
+        let result = extract_query_vector(plan_from_batch(batch), task_ctx())
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }

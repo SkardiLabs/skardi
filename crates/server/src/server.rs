@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
@@ -9,8 +9,8 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::auth::layer::AuthLayer;
 use crate::auth::mode::AuthMode;
+use crate::config::ServerConfig;
 #[cfg(feature = "candle")]
 use crate::config::register_candle_udf;
 #[cfg(feature = "gguf")]
@@ -19,12 +19,12 @@ use crate::config::register_gguf_udf;
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
 use crate::config::register_remote_embed_udf;
-use crate::config::ServerConfig;
 use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
     pipeline_health_check, serve_dashboard,
 };
 use crate::metrics::PipelineMetrics;
+use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
 /// Shared application state containing pipeline and engine
 #[derive(Clone)]
@@ -70,7 +70,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     tracing::info!("Setting up application state");
 
     // Create optimizer registry for conditional optimizer registration
-    let optimizer_registry = Arc::new(crate::OptimizerRegistry::new());
+    let optimizer_registry = Arc::new(OptimizerRegistry::new());
 
     // Create federation-enabled DataFusion SessionState
     let state = datafusion_federation::default_session_state();
@@ -287,6 +287,7 @@ query: |
             options: None,
             access_mode: AccessMode::default(),
             enable_cache: false,
+            hierarchy_level: Default::default(),
         }];
 
         let pipeline = create_test_pipeline().await;

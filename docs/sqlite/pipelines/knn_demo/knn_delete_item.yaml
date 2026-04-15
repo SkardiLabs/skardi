@@ -1,0 +1,12 @@
+metadata:
+  name: "sqlite-knn-delete-item"
+  version: "1.0.0"
+  description: >
+    Delete an item from the data table by ID.
+    Also delete the corresponding vector from the vec0 index.
+
+# Parameters:
+#   {id} - Item ID to delete
+
+query: |
+  DELETE FROM items WHERE id = {id}

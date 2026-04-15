@@ -1,0 +1,15 @@
+metadata:
+  name: "sqlite-catalog-list-users"
+  version: "1.0.0"
+  description: >
+    Scan the users table via a three-part catalog reference.
+    Demonstrates catalog mode: tables are addressed as catalog.main.table.
+
+# Parameters:
+#   {limit} - Maximum number of rows to return
+
+query: |
+  SELECT id, name, email
+  FROM demo_catalog.main.users
+  ORDER BY id
+  LIMIT {limit}

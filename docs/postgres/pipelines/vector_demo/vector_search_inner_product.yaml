@@ -1,0 +1,20 @@
+metadata:
+  name: "vector-search-inner-product"
+  version: "1.0.0"
+  description: >
+    KNN similarity search using negative inner product (<#>).
+    Finds the k documents most similar to the document identified by seed_id.
+    Score is negative — lower (more negative) means more similar.
+
+# Parameters:
+#   {seed_id} - ID of the document whose embedding is used as the query vector
+#   {k}       - Number of candidates pg_knn fetches from the ANN index
+#   {limit}   - Maximum number of results to return (trims the final result set)
+
+query: |
+  SELECT id, content, metadata, _score
+  FROM pg_knn('documents', 'embedding',
+      (SELECT embedding FROM documents WHERE id = {seed_id}),
+      '<#>', {k})
+  ORDER BY _score
+  LIMIT {limit}

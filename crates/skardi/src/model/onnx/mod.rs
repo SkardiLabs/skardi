@@ -289,7 +289,7 @@ pub struct OnnxModelRegistry {
 
 impl std::fmt::Debug for OnnxModelRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let models = self.models.read().unwrap();
+        let models = self.models.read().unwrap_or_else(|p| p.into_inner());
         f.debug_struct("OnnxModelRegistry")
             .field("loaded_models", &models.keys().collect::<Vec<_>>())
             .field(
@@ -312,7 +312,7 @@ impl OnnxModelRegistry {
     pub fn get_or_load(&self, model_path: &str) -> Result<Arc<OnnxModel>> {
         // Fast path: already loaded
         {
-            let models = self.models.read().unwrap();
+            let models = self.models.read().unwrap_or_else(|p| p.into_inner());
             if let Some(model) = models.get(model_path) {
                 return Ok(Arc::clone(model));
             }
@@ -339,7 +339,7 @@ impl OnnxModelRegistry {
             model.outputs.len()
         );
 
-        let mut models = self.models.write().unwrap();
+        let mut models = self.models.write().unwrap_or_else(|p| p.into_inner());
         models.insert(model_path.to_string(), Arc::clone(&model));
 
         Ok(model)

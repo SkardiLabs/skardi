@@ -1,0 +1,10 @@
+data_sources:
+  - name: "movies"
+    type: "csv"
+    path: "docs/sample_data/movies.csv"
+    description: "CSV file with movie_id, title, genres, year, and genres_list"
+
+  - name: "movie_embeddings"
+    type: "lance"
+    path: "data/movie_embeddings.lance"
+    description: "Lance dataset with 128-dimensional embeddings for movies, schema [movie_id, embedding]"

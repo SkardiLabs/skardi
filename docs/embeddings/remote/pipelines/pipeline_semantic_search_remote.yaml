@@ -1,0 +1,22 @@
+metadata:
+  name: semantic-search-remote
+  version: 1.0.0
+  description: >
+    Semantic search over a knowledge-base using OpenAI's text-embedding-3-small
+    via the remote_embed() UDF. The query is embedded on the fly through the
+    OpenAI API; lance_knn() finds the nearest documents by cosine similarity.
+  author: Skardi Demo
+
+# Parameters:
+#   {query} - Natural language search query (embedded on the fly)
+#   {k}     - Number of nearest neighbours to return
+
+query: |
+  SELECT id, title, content, _distance
+  FROM lance_knn(
+    'doc_embeddings_openai',
+    'embedding',
+    remote_embed('openai', 'text-embedding-3-small', {query}),
+    {k}
+  )
+  ORDER BY _distance

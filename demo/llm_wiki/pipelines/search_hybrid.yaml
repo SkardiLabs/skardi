@@ -1,0 +1,38 @@
+metadata:
+  name: "wiki-search-hybrid"
+  version: "1.0.0"
+  description: >
+    Hybrid search over the LLM Wiki combining vector similarity (pg_knn) and
+    full-text keyword search (pg_fts) via Reciprocal Rank Fusion. Both signals
+    come from the same wiki_pages row — the vector from the `embedding` column
+    and the keyword match from the `content` column — so an upsert keeps them
+    in sync. This is the agent's "grep the wiki" primitive.
+
+# Parameters:
+#   {query}          - Natural language query (embedded with candle for pg_knn)
+#   {text_query}     - Keyword query (web-search syntax for pg_fts)
+#   {vector_weight}  - Weight for vector results (e.g. 0.5)
+#   {text_weight}    - Weight for text results (e.g. 0.5)
+#   {limit}          - Maximum number of fused results to return
+
+query: |
+  SELECT
+    COALESCE(v.slug, t.slug)           AS slug,
+    COALESCE(v.title, t.title)         AS title,
+    COALESCE(v.page_type, t.page_type) AS page_type,
+    COALESCE({vector_weight} / (60.0 + v.rk), 0)
+      + COALESCE({text_weight} / (60.0 + t.rk), 0) AS rrf_score
+  FROM (
+    SELECT slug, title, page_type,
+           ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+    FROM pg_knn('wikidb.public.wiki_pages', 'embedding',
+        candle('models/generated/bge-small-en-v1.5', {query}),
+        '<=>', 80)
+  ) v
+  FULL OUTER JOIN (
+    SELECT slug, title, page_type,
+           ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+    FROM pg_fts('wikidb.public.wiki_pages', 'content', {text_query}, 60)
+  ) t ON v.slug = t.slug
+  ORDER BY rrf_score DESC
+  LIMIT {limit}

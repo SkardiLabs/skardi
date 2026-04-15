@@ -580,16 +580,15 @@ impl SqlSchemaInferrer {
 
     /// Check if parameter name follows Rust identifier rules
     fn is_valid_rust_identifier(&self, name: &str) -> bool {
-        if name.is_empty() {
+        let mut chars = name.chars();
+        let Some(first_char) = chars.next() else {
             return false;
-        }
-
-        let first_char = name.chars().next().unwrap();
+        };
         if !first_char.is_alphabetic() && first_char != '_' {
             return false;
         }
 
-        name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        chars.all(|c| c.is_alphanumeric() || c == '_')
     }
 
     /// Parse SQL syntax using sqlparser

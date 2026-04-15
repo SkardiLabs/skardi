@@ -1,0 +1,15 @@
+metadata:
+  name: "wiki-get"
+  version: "1.0.0"
+  description: >
+    Fetch a single LLM Wiki page by slug. This is the agent's "open file"
+    primitive — after a hybrid search returns candidate slugs, the LLM reads
+    each full page body through this endpoint.
+
+# Parameters:
+#   {slug} - Page identifier returned by wiki-search-hybrid or wiki-list
+
+query: |
+  SELECT slug, title, page_type, content
+  FROM wikidb.public.wiki_pages
+  WHERE slug = {slug}

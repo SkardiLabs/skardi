@@ -1,0 +1,20 @@
+metadata:
+  name: "sqlite-catalog-user-order-summary"
+  version: "1.0.0"
+  description: >
+    Aggregate order totals per user using catalog-qualified table references.
+    Shows that aggregation and grouping work the same way in catalog mode.
+
+# Parameters:
+#   {min_orders} - Only return users with at least this many orders
+
+query: |
+  SELECT
+    u.name                  AS user_name,
+    COUNT(o.id)             AS total_orders,
+    SUM(o.amount)           AS total_spent
+  FROM demo_catalog.main.users  u
+  INNER JOIN demo_catalog.main.orders o ON u.id = o.user_id
+  GROUP BY u.id, u.name
+  HAVING COUNT(o.id) >= {min_orders}
+  ORDER BY total_spent DESC

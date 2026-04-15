@@ -13,7 +13,10 @@ use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
-use skardi::sources::providers::sqlx::register_pg_knn_udtf;
+use skardi::sources::providers::sqlite::{
+    register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_vec_to_binary_udf,
+};
+use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{DatasetEntry, DatasetRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -29,7 +32,7 @@ use crate::config::{DataSource, DataSourceType};
 pub struct OptimizerRegistry {
     /// Unified dataset registry indexed by table name.
     /// Stores both Lance datasets and Postgres entries, used by
-    /// lance_knn, lance_fts, and pg_knn table functions.
+    /// lance_knn, lance_fts, pg_knn, and pg_fts table functions.
     dataset_registry: DatasetRegistry,
 }
 
@@ -95,6 +98,11 @@ impl OptimizerRegistry {
             self.register_mongo_functions(ctx)?;
         }
 
+        // Register SQLite-specific table functions
+        if source_types.contains(&DataSourceType::Sqlite) {
+            self.register_sqlite_functions(ctx)?;
+        }
+
         Ok(())
     }
 
@@ -118,6 +126,10 @@ impl OptimizerRegistry {
         tracing::info!("Registering pg_knn table function");
         register_pg_knn_udtf(ctx, self.datasets());
         tracing::info!("✓ Registered pg_knn table function");
+
+        tracing::info!("Registering pg_fts table function");
+        register_pg_fts_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered pg_fts table function");
         Ok(())
     }
 
@@ -129,18 +141,40 @@ impl OptimizerRegistry {
         Ok(())
     }
 
+    /// Register SQLite-specific table functions.
+    fn register_sqlite_functions(&self, ctx: &mut SessionContext) -> Result<()> {
+        tracing::info!("Registering sqlite_knn table function");
+        register_sqlite_knn_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered sqlite_knn table function");
+
+        tracing::info!("Registering sqlite_fts table function");
+        register_sqlite_fts_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered sqlite_fts table function");
+
+        tracing::info!("Registering vec_to_binary scalar UDF");
+        register_vec_to_binary_udf(ctx);
+        tracing::info!("✓ Registered vec_to_binary scalar UDF");
+        Ok(())
+    }
+
     // === Dataset Management ===
 
     /// Store a Lance dataset in the registry
     pub fn register_lance_dataset(&self, table_name: &str, dataset: Arc<Dataset>) {
-        let mut reg = self.dataset_registry.write().unwrap();
+        let mut reg = self
+            .dataset_registry
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         reg.insert(table_name.to_string(), DatasetEntry::Lance(dataset));
         tracing::debug!("Registered Lance dataset '{}' in registry", table_name);
     }
 
     /// Get a Lance dataset by table name
     pub fn get_lance_dataset(&self, table_name: &str) -> Option<Arc<Dataset>> {
-        let reg = self.dataset_registry.read().unwrap();
+        let reg = self
+            .dataset_registry
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         reg.get(table_name).and_then(|e| match e {
             DatasetEntry::Lance(ds) => Some(Arc::clone(ds)),
             _ => None,
@@ -220,6 +254,7 @@ mod tests {
             options: None,
             access_mode: crate::config::AccessMode::default(),
             enable_cache: false,
+            hierarchy_level: Default::default(),
         }];
 
         // Should not register Lance functions for CSV-only data sources

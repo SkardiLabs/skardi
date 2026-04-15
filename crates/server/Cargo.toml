@@ -1,7 +1,12 @@
 [package]
 name = "skardi-server"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+description = "Server for serving pre-defined pipelines"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "skardi-server"
@@ -11,6 +16,7 @@ path = "src/main.rs"
 default = []
 candle = ["skardi/candle"]
 onnx = ["skardi/onnx"]
+embedding = ["skardi/embedding"]
 remote-embed = ["skardi/remote-embed"]
 gguf = ["skardi/gguf"]
 

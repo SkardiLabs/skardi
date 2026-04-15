@@ -1,0 +1,10 @@
+data_sources:
+  - name: "articles"
+    type: "postgres"
+    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+    description: "PostgreSQL table with text content for full-text search"
+    options:
+      table: "articles"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"

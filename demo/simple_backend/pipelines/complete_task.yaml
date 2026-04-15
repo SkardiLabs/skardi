@@ -1,0 +1,10 @@
+metadata:
+  name: "complete-task"
+  version: "1.0.0"
+  description: "Mark a task as completed."
+
+# Parameters:
+#   {id} - Task ID to mark done
+
+query: |
+  UPDATE tasks SET done = 1 WHERE id = {id}

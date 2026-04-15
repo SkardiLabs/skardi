@@ -1,4 +1,4 @@
-use opentelemetry::{global, metrics::Counter, metrics::Histogram, KeyValue};
+use opentelemetry::{KeyValue, global, metrics::Counter, metrics::Histogram};
 
 /// Per-pipeline OTel metrics instruments.
 ///
@@ -16,10 +16,17 @@ use opentelemetry::{global, metrics::Counter, metrics::Histogram, KeyValue};
 ///
 /// `status` is `"success"` or `"error"`.  Error requests are therefore
 /// queryable as:
-///   rate(pipeline_requests_total{status="error"}[5m])
+///
+/// ```text
+/// rate(pipeline_requests_total{status="error"}[5m])
+/// ```
+///
 /// and error rate as:
-///   rate(pipeline_requests_total{status="error"}[5m])
+///
+/// ```text
+/// rate(pipeline_requests_total{status="error"}[5m])
 ///     / rate(pipeline_requests_total[5m])
+/// ```
 #[derive(Clone)]
 pub struct PipelineMetrics {
     /// Total requests per pipeline + outcome

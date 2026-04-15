@@ -260,7 +260,10 @@ impl MongoTableProvider {
                 } else {
                     doc.get(name).cloned()
                 };
-                columns.get_mut(name).unwrap().push(value);
+                columns
+                    .get_mut(name)
+                    .expect("column inserted for every schema field above")
+                    .push(value);
             }
         }
 
@@ -269,7 +272,9 @@ impl MongoTableProvider {
             .fields()
             .iter()
             .map(|field| {
-                let values = columns.get(field.name()).unwrap();
+                let values = columns
+                    .get(field.name())
+                    .expect("column inserted for every schema field above");
                 bson_values_to_arrow_array(values, field.data_type())
             })
             .collect();
@@ -664,23 +669,38 @@ fn arrow_value_to_bson(array: &ArrayRef, row: usize, data_type: &DataType) -> Re
 
     let value = match data_type {
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .with_context(|| "expected StringArray for DataType::Utf8")?;
             Some(Bson::String(arr.value(row).to_string()))
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .with_context(|| "expected Int32Array for DataType::Int32")?;
             Some(Bson::Int32(arr.value(row)))
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .with_context(|| "expected Int64Array for DataType::Int64")?;
             Some(Bson::Int64(arr.value(row)))
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .with_context(|| "expected Float64Array for DataType::Float64")?;
             Some(Bson::Double(arr.value(row)))
         }
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .with_context(|| "expected BooleanArray for DataType::Boolean")?;
             Some(Bson::Boolean(arr.value(row)))
         }
         _ => {
