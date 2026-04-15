@@ -1,0 +1,17 @@
+metadata:
+  name: "search-fulltext-pg"
+  version: "1.0.0"
+  description: >
+    AFTER migration — full-text keyword search via PostgreSQL's
+    websearch_to_tsquery + ts_rank, exposed through pg_fts over the same
+    `content` column that holds the text used to generate the pgvector
+    embedding. Identical to demo/rag/pipelines/search_fulltext.yaml.
+
+# Parameters:
+#   {query} - Search terms (web-search syntax: AND, "phrase", or, -not)
+#   {limit} - Maximum number of results
+
+query: |
+  SELECT id, content, _score
+  FROM pg_fts('documents', 'content', {query}, {limit})
+  ORDER BY _score DESC

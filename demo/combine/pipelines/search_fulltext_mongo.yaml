@@ -1,0 +1,16 @@
+metadata:
+  name: "search-fulltext-mongo"
+  version: "1.0.0"
+  description: >
+    BEFORE migration — full-text keyword search via MongoDB $text index.
+    The query must be pre-tokenized (space-separated) for Chinese text.
+    Identical to demo/fastGPT/pipelines/search_fulltext.yaml.
+
+# Parameters:
+#   {query} - Search terms (space-separated for OR, "quoted" for phrase)
+#   {limit} - Maximum number of results
+
+query: |
+  SELECT doc_id, "fullTextToken", _score
+  FROM mongo_fts('document_texts', {query}, {limit})
+  ORDER BY _score DESC

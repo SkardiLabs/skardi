@@ -1,0 +1,29 @@
+data_sources:
+  # PostgreSQL holds the raw content AND the pgvector embedding in the same row.
+  # Once a GIN index is added on to_tsvector(content), the same `content` column
+  # is also usable by pg_fts — no data migration, no second write.
+  - name: "documents"
+    type: "postgres"
+    access_mode: "read_write"
+    connection_string: "postgresql://localhost:5432/ragdb?sslmode=disable"
+    description: "PostgreSQL table with pgvector embeddings AND full-text search over content"
+    options:
+      table: "documents"
+      schema: "public"
+      user_env: "PG_USER"
+      pass_env: "PG_PASSWORD"
+
+  # MongoDB collection with a pre-tokenized text index. This is the legacy
+  # FTS store we are migrating away from. It stays populated during the
+  # migration window so mongo_fts and pg_fts can run side-by-side.
+  - name: "document_texts"
+    type: "mongo"
+    access_mode: "read_write"
+    connection_string: "mongodb://localhost:27017"
+    description: "Legacy MongoDB $text index — read-compatible during pg_fts cutover"
+    options:
+      database: "ragdb"
+      collection: "document_texts"
+      primary_key: "doc_id"
+      user_env: "MONGO_USER"
+      pass_env: "MONGO_PASS"

@@ -1,0 +1,16 @@
+metadata:
+  name: "ingest-text"
+  version: "1.0.0"
+  description: >
+    Legacy write path: push pre-tokenized text into MongoDB for the $text
+    index. Only needed while mongo_fts is still serving traffic. Once the
+    pg_fts cutover is complete, this pipeline — and its MongoDB source —
+    can be deleted without touching the ingest of content/embedding.
+
+# Parameters:
+#   {doc_id}          - Unique document ID (matches the pgvector document)
+#   {full_text_token} - Space-separated tokenized text (e.g. Jieba output)
+
+query: |
+  INSERT INTO document_texts ("doc_id", "fullTextToken")
+  VALUES ({doc_id}, {full_text_token})
