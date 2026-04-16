@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
 };
 use datafusion::prelude::SessionContext;
+use datafusion_common::ScalarValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::engine::Engine;
@@ -456,6 +457,76 @@ pub async fn get_data_sources(
     })))
 }
 
+/// Convert `{param_name}` placeholders to `$param_name` for DataFusion
+/// parameterized queries. Uses single-pass brace-token parsing to avoid
+/// the prefix-collision bug inherent in iterative `str::replace`.
+fn convert_placeholders_to_params(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    found_close = true;
+                    break;
+                }
+                name.push(inner);
+            }
+            if found_close
+                && !name.is_empty()
+                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                result.push('$');
+                result.push_str(&name);
+            } else {
+                // Not a valid placeholder — preserve original text
+                result.push('{');
+                result.push_str(&name);
+                if found_close {
+                    result.push('}');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Convert a JSON value to a DataFusion `ScalarValue` for parameterized binding.
+fn json_to_scalar(param_name: &str, value: &Value) -> std::result::Result<ScalarValue, String> {
+    match value {
+        Value::String(s) => Ok(ScalarValue::Utf8(Some(s.clone()))),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(ScalarValue::Int64(Some(i)))
+            } else if let Some(f) = n.as_f64() {
+                Ok(ScalarValue::Float64(Some(f)))
+            } else {
+                Err(format!("{}: {:?}", param_name, value))
+            }
+        }
+        Value::Bool(b) => Ok(ScalarValue::Boolean(Some(*b))),
+        Value::Null => Ok(ScalarValue::Utf8(None)),
+        Value::Array(arr) if !arr.is_empty() => {
+            // Convert JSON array to ScalarValue::List (used for vectors in lance_knn)
+            let scalars: std::result::Result<Vec<ScalarValue>, String> =
+                arr.iter().map(|v| json_to_scalar(param_name, v)).collect();
+            let scalars = scalars?;
+            let data_type = scalars[0].data_type();
+            Ok(ScalarValue::List(ScalarValue::new_list(
+                &scalars, &data_type, true,
+            )))
+        }
+        _ => {
+            tracing::error!("Unsupported parameter type for {}: {:?}", param_name, value);
+            Err(format!("{}: {:?}", param_name, value))
+        }
+    }
+}
+
 /// Execute pipeline endpoint - POST /:name/execute
 pub async fn execute_pipeline_by_name(
     State(app_state): State<AppState>,
@@ -517,50 +588,26 @@ pub async fn execute_pipeline_by_name(
         (query_def.sql.clone(), expected_params)
     };
 
-    let mut sql = sql_template;
+    // Convert {param} placeholders to $param for DataFusion parameterized queries.
+    // We parse brace-delimited tokens in a single pass to avoid prefix collisions
+    // (e.g. {user} vs {user_id}) that plagued the old str::replace approach.
+    let sql = convert_placeholders_to_params(&sql_template);
 
-    // Validate that all required parameters are provided
+    // Validate parameters and convert JSON values to DataFusion ScalarValues
     let mut missing_params = Vec::new();
     let mut unsupported_params = Vec::new();
+    let mut param_values: Vec<(String, ScalarValue)> = Vec::new();
 
-    // Replace parameter placeholders with actual values
     for param_name in &expected_params {
-        let placeholder = format!("{{{}}}", param_name);
-
         if let Some(param_value) = request.parameters.get(param_name) {
-            // Convert JSON value to SQL-safe string
-            let sql_value = match param_value {
-                Value::String(s) => format!("'{}'", s.replace("'", "''")), // Escape single quotes
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "NULL".to_string(),
-                Value::Array(arr) if !arr.is_empty() => {
-                    // Convert JSON array to SQL array literal, e.g. [0.1, 0.2, ...]
-                    // Used for passing vectors to lance_knn
-                    let elements: Vec<String> = arr
-                        .iter()
-                        .map(|v| match v {
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
-                            Value::Bool(b) => b.to_string(),
-                            Value::Null => "NULL".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    format!("[{}]", elements.join(", "))
-                }
-                _ => {
-                    tracing::error!(
-                        "Unsupported parameter type for {}: {:?}",
-                        param_name,
-                        param_value
-                    );
-                    unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+            let scalar = match json_to_scalar(param_name, param_value) {
+                Ok(sv) => sv,
+                Err(msg) => {
+                    unsupported_params.push(msg);
                     continue;
                 }
             };
-
-            sql = sql.replace(&placeholder, &sql_value);
+            param_values.push((param_name.clone(), scalar));
         } else {
             tracing::error!("Missing required parameter: {}", param_name);
             missing_params.push(param_name.clone());
@@ -606,8 +653,12 @@ pub async fn execute_pipeline_by_name(
         ));
     }
 
-    // Execute the query using the DataFusion engine
-    let record_batch = match app_state.engine.execute(&sql).await {
+    // Execute the query using DataFusion's native parameterized query support
+    let record_batch = match app_state
+        .engine
+        .execute_with_params(&sql, param_values)
+        .await
+    {
         Ok(batch) => batch,
         Err(e) => {
             tracing::error!("Query execution failed: {}", e);
