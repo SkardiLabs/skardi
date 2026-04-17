@@ -165,3 +165,87 @@ impl Engine for DataFusionEngine {
         Self::collect_batches(schema, batches)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn make_engine_with_users() -> DataFusionEngine {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "carol"])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("users", batch).unwrap();
+        DataFusionEngine::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn execute_with_params_binds_named_parameters() {
+        let engine = make_engine_with_users();
+        let sql = "SELECT name FROM users WHERE id = $user_id";
+        let params = vec![("user_id".to_string(), ScalarValue::Int64(Some(2)))];
+
+        let batch = engine.execute_with_params(sql, params).await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "bob");
+    }
+
+    #[tokio::test]
+    async fn execute_with_params_resists_prefix_collision() {
+        // Regression guard: $user and $user_id must each bind independently,
+        // no matter which order the caller passes them in.
+        let engine = make_engine_with_users();
+        let sql = "SELECT id FROM users WHERE id = $user_id AND name = $user";
+
+        // Pass $user first — this would have corrupted the SQL under the old
+        // str::replace approach (replacing {user} inside {user_id}).
+        let params = vec![
+            (
+                "user".to_string(),
+                ScalarValue::Utf8(Some("bob".to_string())),
+            ),
+            ("user_id".to_string(), ScalarValue::Int64(Some(2))),
+        ];
+
+        let batch = engine.execute_with_params(sql, params).await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_with_params_escapes_sql_injection() {
+        // A value containing a closing quote + OR 1=1 must be treated as a
+        // literal string, not executed as SQL.
+        let engine = make_engine_with_users();
+        let sql = "SELECT id FROM users WHERE name = $name";
+        let params = vec![(
+            "name".to_string(),
+            ScalarValue::Utf8(Some("alice' OR '1'='1".to_string())),
+        )];
+
+        let batch = engine.execute_with_params(sql, params).await.unwrap();
+        // No row matches the literal injection string → empty result
+        assert_eq!(batch.num_rows(), 0);
+    }
+}

@@ -1269,4 +1269,132 @@ query: |
             panic!("Expected second row to be an object");
         }
     }
+
+    // ----- Placeholder conversion tests -----
+
+    #[test]
+    fn convert_placeholders_rewrites_simple_braces() {
+        let sql = "SELECT * FROM t WHERE id = {user_id}";
+        assert_eq!(
+            convert_placeholders_to_params(sql),
+            "SELECT * FROM t WHERE id = $user_id"
+        );
+    }
+
+    #[test]
+    fn convert_placeholders_handles_prefix_collision() {
+        // This is the bug the fix targets: with str::replace, substituting {user}
+        // first would corrupt {user_id}. The single-pass parser must preserve both.
+        let sql = "SELECT * FROM users WHERE id = {user_id} AND name = {user}";
+        assert_eq!(
+            convert_placeholders_to_params(sql),
+            "SELECT * FROM users WHERE id = $user_id AND name = $user"
+        );
+    }
+
+    #[test]
+    fn convert_placeholders_handles_multiple_occurrences() {
+        let sql = "SELECT {x}, {x} + 1 FROM t WHERE a = {x}";
+        assert_eq!(
+            convert_placeholders_to_params(sql),
+            "SELECT $x, $x + 1 FROM t WHERE a = $x"
+        );
+    }
+
+    #[test]
+    fn convert_placeholders_preserves_non_placeholder_braces() {
+        // Braces enclosing non-identifier content (e.g. JSON literals, array syntax)
+        // must be left alone so they can't collide with parameter names.
+        let sql = "SELECT '{\"key\": \"value\"}' FROM t WHERE arr = [1, 2, 3]";
+        assert_eq!(convert_placeholders_to_params(sql), sql);
+    }
+
+    #[test]
+    fn convert_placeholders_preserves_empty_braces() {
+        let sql = "SELECT {} FROM t";
+        assert_eq!(convert_placeholders_to_params(sql), "SELECT {} FROM t");
+    }
+
+    #[test]
+    fn convert_placeholders_preserves_unclosed_brace() {
+        let sql = "SELECT {foo FROM t";
+        assert_eq!(convert_placeholders_to_params(sql), "SELECT {foo FROM t");
+    }
+
+    #[test]
+    fn convert_placeholders_no_placeholders_unchanged() {
+        let sql = "SELECT 1, 2, 3 FROM t";
+        assert_eq!(convert_placeholders_to_params(sql), sql);
+    }
+
+    // ----- JSON → ScalarValue conversion tests -----
+
+    #[test]
+    fn json_to_scalar_converts_string() {
+        let v = Value::String("alice".to_string());
+        assert_eq!(
+            json_to_scalar("name", &v).unwrap(),
+            ScalarValue::Utf8(Some("alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_integer() {
+        let v = Value::Number(serde_json::Number::from(42));
+        assert_eq!(
+            json_to_scalar("id", &v).unwrap(),
+            ScalarValue::Int64(Some(42))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_float() {
+        let v = Value::Number(serde_json::Number::from_f64(3.14).unwrap());
+        assert_eq!(
+            json_to_scalar("ratio", &v).unwrap(),
+            ScalarValue::Float64(Some(3.14))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_bool() {
+        let v = Value::Bool(true);
+        assert_eq!(
+            json_to_scalar("enabled", &v).unwrap(),
+            ScalarValue::Boolean(Some(true))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_null() {
+        let v = Value::Null;
+        assert_eq!(json_to_scalar("x", &v).unwrap(), ScalarValue::Utf8(None));
+    }
+
+    #[test]
+    fn json_to_scalar_converts_float_array() {
+        use arrow::array::Array;
+        let v = serde_json::json!([0.1, 0.2, 0.3]);
+        let result = json_to_scalar("vec", &v).unwrap();
+        match result {
+            ScalarValue::List(arr) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr.value(0).len(), 3);
+            }
+            other => panic!("Expected ScalarValue::List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_scalar_rejects_empty_object() {
+        let v = serde_json::json!({});
+        assert!(json_to_scalar("obj", &v).is_err());
+    }
+
+    #[test]
+    fn json_to_scalar_rejects_empty_array() {
+        let v = serde_json::json!([]);
+        // Empty array falls through to the catch-all error branch
+        assert!(json_to_scalar("arr", &v).is_err());
+    }
 }
