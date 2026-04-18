@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
 };
 use datafusion::prelude::SessionContext;
+use datafusion_common::ScalarValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::engine::Engine;
@@ -456,6 +457,76 @@ pub async fn get_data_sources(
     })))
 }
 
+/// Convert `{param_name}` placeholders to `$param_name` for DataFusion
+/// parameterized queries. Uses single-pass brace-token parsing to avoid
+/// the prefix-collision bug inherent in iterative `str::replace`.
+fn convert_placeholders_to_params(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    found_close = true;
+                    break;
+                }
+                name.push(inner);
+            }
+            if found_close
+                && !name.is_empty()
+                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                result.push('$');
+                result.push_str(&name);
+            } else {
+                // Not a valid placeholder — preserve original text
+                result.push('{');
+                result.push_str(&name);
+                if found_close {
+                    result.push('}');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Convert a JSON value to a DataFusion `ScalarValue` for parameterized binding.
+fn json_to_scalar(param_name: &str, value: &Value) -> std::result::Result<ScalarValue, String> {
+    match value {
+        Value::String(s) => Ok(ScalarValue::Utf8(Some(s.clone()))),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(ScalarValue::Int64(Some(i)))
+            } else if let Some(f) = n.as_f64() {
+                Ok(ScalarValue::Float64(Some(f)))
+            } else {
+                Err(format!("{}: {:?}", param_name, value))
+            }
+        }
+        Value::Bool(b) => Ok(ScalarValue::Boolean(Some(*b))),
+        Value::Null => Ok(ScalarValue::Utf8(None)),
+        Value::Array(arr) if !arr.is_empty() => {
+            // Convert JSON array to ScalarValue::List (used for vectors in lance_knn)
+            let scalars: std::result::Result<Vec<ScalarValue>, String> =
+                arr.iter().map(|v| json_to_scalar(param_name, v)).collect();
+            let scalars = scalars?;
+            let data_type = scalars[0].data_type();
+            Ok(ScalarValue::List(ScalarValue::new_list(
+                &scalars, &data_type, true,
+            )))
+        }
+        _ => {
+            tracing::error!("Unsupported parameter type for {}: {:?}", param_name, value);
+            Err(format!("{}: {:?}", param_name, value))
+        }
+    }
+}
+
 /// Execute pipeline endpoint - POST /:name/execute
 pub async fn execute_pipeline_by_name(
     State(app_state): State<AppState>,
@@ -517,50 +588,26 @@ pub async fn execute_pipeline_by_name(
         (query_def.sql.clone(), expected_params)
     };
 
-    let mut sql = sql_template;
+    // Convert {param} placeholders to $param for DataFusion parameterized queries.
+    // We parse brace-delimited tokens in a single pass to avoid prefix collisions
+    // (e.g. {user} vs {user_id}) that plagued the old str::replace approach.
+    let sql = convert_placeholders_to_params(&sql_template);
 
-    // Validate that all required parameters are provided
+    // Validate parameters and convert JSON values to DataFusion ScalarValues
     let mut missing_params = Vec::new();
     let mut unsupported_params = Vec::new();
+    let mut param_values: Vec<(String, ScalarValue)> = Vec::new();
 
-    // Replace parameter placeholders with actual values
     for param_name in &expected_params {
-        let placeholder = format!("{{{}}}", param_name);
-
         if let Some(param_value) = request.parameters.get(param_name) {
-            // Convert JSON value to SQL-safe string
-            let sql_value = match param_value {
-                Value::String(s) => format!("'{}'", s.replace("'", "''")), // Escape single quotes
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "NULL".to_string(),
-                Value::Array(arr) if !arr.is_empty() => {
-                    // Convert JSON array to SQL array literal, e.g. [0.1, 0.2, ...]
-                    // Used for passing vectors to lance_knn
-                    let elements: Vec<String> = arr
-                        .iter()
-                        .map(|v| match v {
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
-                            Value::Bool(b) => b.to_string(),
-                            Value::Null => "NULL".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    format!("[{}]", elements.join(", "))
-                }
-                _ => {
-                    tracing::error!(
-                        "Unsupported parameter type for {}: {:?}",
-                        param_name,
-                        param_value
-                    );
-                    unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+            let scalar = match json_to_scalar(param_name, param_value) {
+                Ok(sv) => sv,
+                Err(msg) => {
+                    unsupported_params.push(msg);
                     continue;
                 }
             };
-
-            sql = sql.replace(&placeholder, &sql_value);
+            param_values.push((param_name.clone(), scalar));
         } else {
             tracing::error!("Missing required parameter: {}", param_name);
             missing_params.push(param_name.clone());
@@ -606,8 +653,12 @@ pub async fn execute_pipeline_by_name(
         ));
     }
 
-    // Execute the query using the DataFusion engine
-    let record_batch = match app_state.engine.execute(&sql).await {
+    // Execute the query using DataFusion's native parameterized query support
+    let record_batch = match app_state
+        .engine
+        .execute_with_params(&sql, param_values)
+        .await
+    {
         Ok(batch) => batch,
         Err(e) => {
             tracing::error!("Query execution failed: {}", e);
@@ -1217,5 +1268,133 @@ query: |
         } else {
             panic!("Expected second row to be an object");
         }
+    }
+
+    // ----- Placeholder conversion tests -----
+
+    #[test]
+    fn convert_placeholders_rewrites_simple_braces() {
+        let sql = "SELECT * FROM t WHERE id = {user_id}";
+        assert_eq!(
+            convert_placeholders_to_params(sql),
+            "SELECT * FROM t WHERE id = $user_id"
+        );
+    }
+
+    #[test]
+    fn convert_placeholders_handles_prefix_collision() {
+        // This is the bug the fix targets: with str::replace, substituting {user}
+        // first would corrupt {user_id}. The single-pass parser must preserve both.
+        let sql = "SELECT * FROM users WHERE id = {user_id} AND name = {user}";
+        assert_eq!(
+            convert_placeholders_to_params(sql),
+            "SELECT * FROM users WHERE id = $user_id AND name = $user"
+        );
+    }
+
+    #[test]
+    fn convert_placeholders_handles_multiple_occurrences() {
+        let sql = "SELECT {x}, {x} + 1 FROM t WHERE a = {x}";
+        assert_eq!(
+            convert_placeholders_to_params(sql),
+            "SELECT $x, $x + 1 FROM t WHERE a = $x"
+        );
+    }
+
+    #[test]
+    fn convert_placeholders_preserves_non_placeholder_braces() {
+        // Braces enclosing non-identifier content (e.g. JSON literals, array syntax)
+        // must be left alone so they can't collide with parameter names.
+        let sql = "SELECT '{\"key\": \"value\"}' FROM t WHERE arr = [1, 2, 3]";
+        assert_eq!(convert_placeholders_to_params(sql), sql);
+    }
+
+    #[test]
+    fn convert_placeholders_preserves_empty_braces() {
+        let sql = "SELECT {} FROM t";
+        assert_eq!(convert_placeholders_to_params(sql), "SELECT {} FROM t");
+    }
+
+    #[test]
+    fn convert_placeholders_preserves_unclosed_brace() {
+        let sql = "SELECT {foo FROM t";
+        assert_eq!(convert_placeholders_to_params(sql), "SELECT {foo FROM t");
+    }
+
+    #[test]
+    fn convert_placeholders_no_placeholders_unchanged() {
+        let sql = "SELECT 1, 2, 3 FROM t";
+        assert_eq!(convert_placeholders_to_params(sql), sql);
+    }
+
+    // ----- JSON → ScalarValue conversion tests -----
+
+    #[test]
+    fn json_to_scalar_converts_string() {
+        let v = Value::String("alice".to_string());
+        assert_eq!(
+            json_to_scalar("name", &v).unwrap(),
+            ScalarValue::Utf8(Some("alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_integer() {
+        let v = Value::Number(serde_json::Number::from(42));
+        assert_eq!(
+            json_to_scalar("id", &v).unwrap(),
+            ScalarValue::Int64(Some(42))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_float() {
+        let v = Value::Number(serde_json::Number::from_f64(3.14).unwrap());
+        assert_eq!(
+            json_to_scalar("ratio", &v).unwrap(),
+            ScalarValue::Float64(Some(3.14))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_bool() {
+        let v = Value::Bool(true);
+        assert_eq!(
+            json_to_scalar("enabled", &v).unwrap(),
+            ScalarValue::Boolean(Some(true))
+        );
+    }
+
+    #[test]
+    fn json_to_scalar_converts_null() {
+        let v = Value::Null;
+        assert_eq!(json_to_scalar("x", &v).unwrap(), ScalarValue::Utf8(None));
+    }
+
+    #[test]
+    fn json_to_scalar_converts_float_array() {
+        use arrow::array::Array;
+        let v = serde_json::json!([0.1, 0.2, 0.3]);
+        let result = json_to_scalar("vec", &v).unwrap();
+        match result {
+            ScalarValue::List(arr) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr.value(0).len(), 3);
+            }
+            other => panic!("Expected ScalarValue::List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_scalar_rejects_empty_object() {
+        let v = serde_json::json!({});
+        assert!(json_to_scalar("obj", &v).is_err());
+    }
+
+    #[test]
+    fn json_to_scalar_rejects_empty_array() {
+        let v = serde_json::json!([]);
+        // Empty array falls through to the catch-all error branch
+        assert!(json_to_scalar("arr", &v).is_err());
     }
 }

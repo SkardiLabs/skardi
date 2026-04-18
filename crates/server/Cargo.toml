@@ -31,6 +31,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 cookie = { workspace = true }
 datafusion = { workspace = true }
+datafusion-common = { workspace = true }
 datafusion-federation = { workspace = true }
 datafusion-tracing = "52.0.0"
 lance = { workspace = true }
