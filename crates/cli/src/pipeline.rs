@@ -22,13 +22,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct PipelineMetadata {
     pub name: String,
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,49 +71,6 @@ pub fn discover_pipelines(dirs: &[PathBuf]) -> Result<HashMap<String, (PathBuf, 
         }
     }
     Ok(out)
-}
-
-/// Convert `{param_name}` placeholders to DataFusion's `$param_name` markers.
-///
-/// Uses single-pass brace-token parsing so two params with a shared prefix
-/// (`{user}` and `{user_id}`) bind independently. Mirrors
-/// `server::handlers::convert_placeholders_to_params`. Currently unused by
-/// the CLI's execution path (we inline-substitute instead — see
-/// [`render_sql_with_inline_params`]) but retained so the CLI and server
-/// share one placeholder-parsing algorithm.
-#[allow(dead_code)]
-pub fn convert_placeholders_to_params(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            let mut name = String::new();
-            let mut found_close = false;
-            for inner in chars.by_ref() {
-                if inner == '}' {
-                    found_close = true;
-                    break;
-                }
-                name.push(inner);
-            }
-            if found_close
-                && !name.is_empty()
-                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-            {
-                result.push('$');
-                result.push_str(&name);
-            } else {
-                result.push('{');
-                result.push_str(&name);
-                if found_close {
-                    result.push('}');
-                }
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 /// Render a SQL template by substituting `{name}` placeholders with
@@ -310,15 +262,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholders_with_shared_prefix_bind_independently() {
-        let sql = "SELECT {user_id} AS a, {user} AS b";
-        assert_eq!(
-            convert_placeholders_to_params(sql),
-            "SELECT $user_id AS a, $user AS b"
-        );
-    }
-
-    #[test]
     fn extract_param_names_preserves_order_and_dedups() {
         let sql = "SELECT {a}, {b}, {a}, {c_1}";
         let got = extract_param_names(sql);
@@ -350,6 +293,24 @@ mod tests {
     #[test]
     fn parse_param_flag_requires_equals() {
         assert!(parse_param_flag("limit 10").is_err());
+    }
+
+    #[test]
+    fn render_inline_handles_shared_prefix_params_independently() {
+        // Regression guard: {user} and {user_id} must each substitute against
+        // their own binding, not leak into the prefix of a longer name.
+        let mut params: HashMap<String, ScalarValue> = HashMap::new();
+        params.insert(
+            "user".to_string(),
+            ScalarValue::Utf8(Some("bob".to_string())),
+        );
+        params.insert("user_id".to_string(), ScalarValue::Int64(Some(42)));
+        let out = render_sql_with_inline_params(
+            "SELECT * WHERE name = {user} AND id = {user_id}",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT * WHERE name = 'bob' AND id = 42");
     }
 
     #[test]
