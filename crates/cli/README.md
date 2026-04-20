@@ -329,6 +329,161 @@ SELECT * FROM lance_fts('products', 'description', 'premium', 50)
 WHERE category = 'electronics' AND price < 20
 ```
 
+### `run` — Execute a pipeline YAML by name
+
+A **pipeline** is a named SQL template stored in a YAML file:
+
+```yaml
+# demo/llm_wiki/pipelines-cli/list.yaml
+metadata:
+  name: "wiki-list"
+query: |
+  SELECT slug, title, page_type, updated_at
+  FROM wiki.main.wiki_pages
+  WHERE page_type LIKE {page_type_pattern}
+    AND slug      LIKE {slug_prefix}
+  ORDER BY updated_at DESC
+  LIMIT {limit}
+```
+
+`{name}` placeholders are substituted at call time. Each parameter must be
+bound via `--param NAME=VALUE`; values are rendered as SQL-safe literals
+before DataFusion sees the query (strings are single-quoted with `'` → `''`
+escaping, so quotes inside values can't break out).
+
+```bash
+skardi run wiki-list --ctx ./demo/llm_wiki/cli-ctx.yaml \
+  --param 'page_type_pattern=%' \
+  --param 'slug_prefix=concept/%' \
+  --param 'limit=10'
+```
+
+**Pipeline discovery** — the CLI scans a single directory for
+`*.yaml` / `*.yml` files, resolved in this order:
+
+1. `--pipeline-dir <DIR>` flag.
+2. `pipelines_dir:` key in the ctx YAML (relative paths resolve against the
+   ctx file's directory).
+3. Otherwise, no pipelines are registered — only `skardi run` invocations
+   that pass `--pipeline-dir` will find one.
+
+Example ctx addition:
+
+```yaml
+data_sources:
+  - name: wiki
+    type: sqlite
+    path: demo/llm_wiki/wiki.db
+    access_mode: read_write
+    hierarchy_level: catalog
+
+pipelines_dir: pipelines-cli
+```
+
+**Parameter typing** — values pass through a heuristic: bare integers become
+`Int64`, bare floats become `Float64`, `true`/`false` become `Boolean`,
+everything else is `Utf8`. Force a type explicitly with `NAME:TYPE=VALUE`:
+
+```bash
+# Force "42" to be a string even though it parses as an int
+skardi run my-pipeline --param 'query:str=42' --param 'limit:int=10'
+```
+
+Supported types: `str` / `string`, `int` / `i64`, `float` / `f64`, `bool`.
+
+### `alias` — Bind a short verb to a pipeline
+
+Aliases let you replace `skardi run wiki-search-hybrid --query="..." --text_query="..." ...`
+with a one-word verb like `skardi grep "..."`. They are a **CLI-only**
+concept: the server does not read alias files. Any unknown subcommand is
+looked up in the alias store, resolved to a pipeline + params, and
+dispatched to the same code path as `skardi run`.
+
+#### Add an alias
+
+```bash
+skardi alias add grep \
+  --ctx ./demo/llm_wiki/cli-ctx.yaml \
+  --pipeline wiki-search-hybrid \
+  --positional query \
+  --default 'text_query={query}' \
+  --default 'vector_weight=0.5' \
+  --default 'text_weight=0.5' \
+  --default 'limit=10' \
+  --description "Hybrid search over the wiki"
+```
+
+Flags:
+
+- `--pipeline <NAME>` (required) — `metadata.name` of the pipeline to call.
+- `--positional <NAMES>` — comma-separated pipeline-param names to bind to
+  positional CLI args in order (e.g. `--positional query,text_query`).
+- `--default <NAME=VALUE>` (repeatable) — default value for a param. May
+  contain `{other}` tokens that are substituted from an already-bound param
+  (one level), so a single positional can fan out to multiple params.
+- `--description <TEXT>` — optional short help string shown in `alias list`.
+- `--force` — overwrite an existing alias with the same name.
+
+Now `grep` is a first-class verb:
+
+```bash
+skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml
+# → skardi run wiki-search-hybrid \
+#     --param 'query=turing machine' \
+#     --param 'text_query=turing machine' \
+#     --param 'vector_weight=0.5' \
+#     --param 'text_weight=0.5' \
+#     --param 'limit=10'
+
+# Flag overrides beat positional/default bindings
+skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml \
+  --text_query='bletchley OR enigma' --limit=3
+```
+
+Positional args bind in order to `alias.positional`. Extra positional args
+error. `--name=value` / `--name value` flags always win over positional
+binds and defaults.
+
+#### List / show / remove
+
+```bash
+skardi alias list  --ctx ./demo/llm_wiki/cli-ctx.yaml
+skardi alias show  grep --ctx ./demo/llm_wiki/cli-ctx.yaml
+skardi alias remove grep --ctx ./demo/llm_wiki/cli-ctx.yaml
+```
+
+#### Alias file resolution
+
+The aliases YAML is resolved in this order:
+
+1. `--aliases <PATH>` flag.
+2. `SKARDI_ALIASES` env var.
+3. `aliases.yaml` next to the active ctx file (only if it already exists).
+4. `~/.skardi/config/aliases.yaml`.
+
+The file is a simple top-level map keyed by alias name:
+
+```yaml
+# demo/llm_wiki/aliases.yaml
+grep:
+  pipeline: wiki-search-hybrid
+  positional: [query]
+  defaults:
+    text_query: "{query}"
+    vector_weight: "0.5"
+    limit: "10"
+  description: Hybrid search over the wiki
+ls:
+  pipeline: wiki-list
+  defaults:
+    page_type_pattern: "%"
+    slug_prefix: "%"
+    limit: "100"
+```
+
+Hand-editing the file is fine — `skardi alias add` is just a convenience
+that round-trips through serde.
+
 ## Examples
 
 ```bash
@@ -356,4 +511,15 @@ skardi query --ctx ./demo/ctx.yaml --schema -t products
 
 # SQL from file
 skardi query --ctx ./demo/ctx.yaml -f ./queries/report.sql
+
+# Run a pipeline YAML by name, passing named parameters
+skardi run wiki-list --ctx ./demo/llm_wiki/cli-ctx.yaml \
+  --param 'page_type_pattern=entity' --param 'slug_prefix=%' --param 'limit=20'
+
+# Invoke a user-defined alias (dispatches to `skardi run <pipeline>`)
+skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml
+
+# Manage aliases
+skardi alias list --ctx ./demo/llm_wiki/cli-ctx.yaml
+skardi alias show grep --ctx ./demo/llm_wiki/cli-ctx.yaml
 ```
