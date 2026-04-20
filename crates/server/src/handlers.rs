@@ -456,6 +456,62 @@ pub async fn get_data_sources(
     })))
 }
 
+/// Substitute `{param}` placeholders in `sql` with their SQL-safe values.
+///
+/// `expected_params` must be sorted longest-first so that a shorter name (e.g. `user`) cannot
+/// corrupt a longer one that shares it as a prefix (e.g. `user_id`).
+///
+/// Returns `(missing_params, unsupported_params)` — both empty on full success.
+fn substitute_sql_params(
+    sql: &mut String,
+    expected_params: &[String],
+    parameters: &HashMap<String, Value>,
+) -> (Vec<String>, Vec<String>) {
+    let mut missing_params = Vec::new();
+    let mut unsupported_params = Vec::new();
+
+    for param_name in expected_params {
+        let placeholder = format!("{{{}}}", param_name);
+
+        if let Some(param_value) = parameters.get(param_name) {
+            let sql_value = match param_value {
+                Value::String(s) => format!("'{}'", s.replace("'", "''")),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => "NULL".to_string(),
+                Value::Array(arr) if !arr.is_empty() => {
+                    let elements: Vec<String> = arr
+                        .iter()
+                        .map(|v| match v {
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Null => "NULL".to_string(),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    format!("[{}]", elements.join(", "))
+                }
+                _ => {
+                    tracing::error!(
+                        "Unsupported parameter type for {}: {:?}",
+                        param_name,
+                        param_value
+                    );
+                    unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                    continue;
+                }
+            };
+            *sql = sql.replace(&placeholder, &sql_value);
+        } else {
+            tracing::error!("Missing required parameter: {}", param_name);
+            missing_params.push(param_name.clone());
+        }
+    }
+
+    (missing_params, unsupported_params)
+}
+
 /// Execute pipeline endpoint - POST /:name/execute
 pub async fn execute_pipeline_by_name(
     State(app_state): State<AppState>,
@@ -513,59 +569,17 @@ pub async fn execute_pipeline_by_name(
         // Get the SQL query and inferred parameters from the pipeline
         let query_def = pipeline.query_definition();
         let request_schema = pipeline.request_schema();
-        let expected_params: Vec<String> = request_schema.fields.keys().cloned().collect();
+        let mut expected_params: Vec<String> = request_schema.fields.keys().cloned().collect();
+        // Sort longest-first so a shorter name (e.g. `{user}`) cannot corrupt a longer one
+        // (`{user_id}`) during str::replace when both appear in the same SQL template.
+        expected_params.sort_by(|a, b| b.len().cmp(&a.len()));
         (query_def.sql.clone(), expected_params)
     };
 
     let mut sql = sql_template;
 
-    // Validate that all required parameters are provided
-    let mut missing_params = Vec::new();
-    let mut unsupported_params = Vec::new();
-
-    // Replace parameter placeholders with actual values
-    for param_name in &expected_params {
-        let placeholder = format!("{{{}}}", param_name);
-
-        if let Some(param_value) = request.parameters.get(param_name) {
-            // Convert JSON value to SQL-safe string
-            let sql_value = match param_value {
-                Value::String(s) => format!("'{}'", s.replace("'", "''")), // Escape single quotes
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "NULL".to_string(),
-                Value::Array(arr) if !arr.is_empty() => {
-                    // Convert JSON array to SQL array literal, e.g. [0.1, 0.2, ...]
-                    // Used for passing vectors to lance_knn
-                    let elements: Vec<String> = arr
-                        .iter()
-                        .map(|v| match v {
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
-                            Value::Bool(b) => b.to_string(),
-                            Value::Null => "NULL".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    format!("[{}]", elements.join(", "))
-                }
-                _ => {
-                    tracing::error!(
-                        "Unsupported parameter type for {}: {:?}",
-                        param_name,
-                        param_value
-                    );
-                    unsupported_params.push(format!("{}: {:?}", param_name, param_value));
-                    continue;
-                }
-            };
-
-            sql = sql.replace(&placeholder, &sql_value);
-        } else {
-            tracing::error!("Missing required parameter: {}", param_name);
-            missing_params.push(param_name.clone());
-        }
-    }
+    let (missing_params, unsupported_params) =
+        substitute_sql_params(&mut sql, &expected_params, &request.parameters);
 
     // Return detailed error for parameter validation issues
     if !missing_params.is_empty() || !unsupported_params.is_empty() {
@@ -1186,6 +1200,92 @@ query: |
         } else {
             panic!("Expected second row to be an object");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Unit tests for substitute_sql_params
+    // -------------------------------------------------------------------------
+
+    fn params(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn sorted_keys(map: &HashMap<String, Value>) -> Vec<String> {
+        let mut v: Vec<String> = map.keys().cloned().collect();
+        v.sort_by(|a, b| b.len().cmp(&a.len()));
+        v
+    }
+
+    #[test]
+    fn test_substitute_prefix_params_brace_notation_prevents_corruption() {
+        // The bug report claimed that replacing `{user}` before `{user_id}` would corrupt
+        // the longer placeholder. In practice this does NOT happen with `{param}` notation:
+        // `{user}` ends with `}`, so it is never a literal substring of `{user_id}` (whose
+        // 5th character after `{` is `_`, not `}`). Both orderings produce correct SQL.
+        let template = "SELECT * FROM t WHERE id = {user_id} AND name = {user}";
+        let params_map = params(&[
+            ("user_id", Value::Number(42.into())),
+            ("user", Value::String("alice".to_string())),
+        ]);
+
+        // Shorter-name-first ordering — would corrupt `$user_id`-style placeholders but not `{user_id}`.
+        let mut sql = template.to_string();
+        let short_first = vec!["user".to_string(), "user_id".to_string()];
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &short_first, &params_map);
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "SELECT * FROM t WHERE id = 42 AND name = 'alice'");
+
+        // Longer-name-first ordering (the sorted order we enforce) — also correct.
+        let mut sql2 = template.to_string();
+        let long_first = sorted_keys(&params_map);
+        let (missing2, unsupported2) = substitute_sql_params(&mut sql2, &long_first, &params_map);
+        assert!(missing2.is_empty());
+        assert!(unsupported2.is_empty());
+        assert_eq!(sql2, "SELECT * FROM t WHERE id = 42 AND name = 'alice'");
+    }
+
+    #[test]
+    fn test_substitute_no_prefix_conflict() {
+        // Unrelated parameter names — any ordering is safe.
+        let mut sql = "SELECT * FROM t WHERE id = {id} AND cat = {category}".to_string();
+        let params_map = params(&[
+            ("id", Value::Number(7.into())),
+            ("category", Value::String("premium".to_string())),
+        ]);
+        let expected_params = sorted_keys(&params_map);
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected_params, &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "SELECT * FROM t WHERE id = 7 AND cat = 'premium'");
+    }
+
+    #[test]
+    fn test_substitute_missing_param() {
+        let mut sql = "SELECT {a} AND {b}".to_string();
+        let params_map = params(&[("a", Value::Number(1.into()))]);
+        let expected_params = vec!["a".to_string(), "b".to_string()];
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected_params, &params_map);
+
+        assert_eq!(missing, vec!["b"]);
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "SELECT 1 AND {b}"); // {b} left untouched
+    }
+
+    #[test]
+    fn test_substitute_quote_escaping() {
+        let mut sql = "SELECT * FROM t WHERE name = {name}".to_string();
+        let params_map = params(&[("name", Value::String("o'brien".to_string()))]);
+        let expected_params = sorted_keys(&params_map);
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected_params, &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "SELECT * FROM t WHERE name = 'o''brien'");
     }
 
     #[test]
