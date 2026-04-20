@@ -171,6 +171,7 @@ For full server documentation — context files, pipeline files, access mode, ca
 | SQLite | Full | Tables, catalog mode, sqlite-vec KNN, FTS | [docs/sqlite/](docs/sqlite/) |
 | MongoDB | Full | Collections with point lookups | [docs/mongo/](docs/mongo/) |
 | Redis | Full | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
+| SeekDB | Full | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
 | Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | Lance | Read | KNN vector search, BM25 full-text search | [docs/lance/](docs/lance/) |
 | S3 | Read | CSV, Parquet, and Lance from S3/GCS/Azure | [docs/S3_USAGE.md](docs/S3_USAGE.md) |

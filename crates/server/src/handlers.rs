@@ -392,6 +392,7 @@ pub async fn get_data_sources(
             DataSourceType::Sqlite => "sqlite",
             DataSourceType::Lance => "lance",
             DataSourceType::Redis => "redis",
+            DataSourceType::Seekdb => "seekdb",
         };
 
         // Determine path or URL based on source type
@@ -404,14 +405,16 @@ pub async fn get_data_sources(
             DataSourceType::Postgres
             | DataSourceType::Mysql
             | DataSourceType::Mongo
-            | DataSourceType::Redis => None,
+            | DataSourceType::Redis
+            | DataSourceType::Seekdb => None,
         };
 
         let url = match data_source.source_type {
             DataSourceType::Postgres
             | DataSourceType::Mysql
             | DataSourceType::Mongo
-            | DataSourceType::Redis => {
+            | DataSourceType::Redis
+            | DataSourceType::Seekdb => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()

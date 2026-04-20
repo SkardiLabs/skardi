@@ -9,6 +9,7 @@ use skardi::sources::providers::lance::register_lance_table;
 use skardi::sources::providers::mongo::register_mongo_tables;
 use skardi::sources::providers::mysql::register_mysql_tables;
 use skardi::sources::providers::redis::datasource::register_redis_tables;
+use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
 use std::collections::HashMap;
@@ -135,6 +136,9 @@ pub enum ConfigError {
     #[error("SQLite connection failed: {name} - {error}")]
     SQLiteConnectionFailed { name: String, error: String },
 
+    #[error("SeekDB connection failed: {name} - {error}")]
+    SeekDbConnectionFailed { name: String, error: String },
+
     #[error("S3 path must start with 's3://' prefix: {path}")]
     InvalidS3Path { path: String },
 
@@ -145,7 +149,7 @@ pub enum ConfigError {
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
     #[error(
-        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', and 'redis' sources support read_write mode."
+        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', 'redis', and 'seekdb' sources support read_write mode."
     )]
     UnsupportedWriteMode {
         name: String,
@@ -511,6 +515,7 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Postgres,
     DataSourceType::Mysql,
     DataSourceType::Sqlite,
+    DataSourceType::Seekdb,
 ];
 
 /// Data source types that support read_write access mode
@@ -520,6 +525,7 @@ const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Sqlite,
     DataSourceType::Mongo,
     DataSourceType::Redis,
+    DataSourceType::Seekdb,
 ];
 
 /// Validate data source configurations
@@ -597,7 +603,8 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 DataSourceType::Postgres
                 | DataSourceType::Mysql
                 | DataSourceType::Mongo
-                | DataSourceType::Redis,
+                | DataSourceType::Redis
+                | DataSourceType::Seekdb,
                 false,
             ) => {
                 // For database connections, ensure connection string is provided
@@ -767,7 +774,8 @@ async fn register_data_source(
             DataSourceType::Postgres
             | DataSourceType::Mysql
             | DataSourceType::Mongo
-            | DataSourceType::Redis,
+            | DataSourceType::Redis
+            | DataSourceType::Seekdb,
             _,
         ) => {
             // Database sources don't need file path validation
@@ -927,6 +935,38 @@ async fn register_data_source(
             .map_err(|e| {
                 tracing::error!("MySQL registration failed for '{}': {:?}", source.name, e);
                 ConfigError::MySQLConnectionFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Seekdb => {
+            tracing::info!(
+                "Registering SeekDB table: {} (access_mode: {:?})",
+                source.name,
+                source.access_mode
+            );
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            let seekdb_registry = optimizer_registry.map(|r| r.datasets());
+            register_seekdb_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+                source.access_mode.is_read_write(),
+                seekdb_registry.as_ref(),
+                source.hierarchy_level,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("SeekDB registration failed for '{}': {:?}", source.name, e);
+                ConfigError::SeekDbConnectionFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
                 }

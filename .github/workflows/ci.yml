@@ -88,6 +88,19 @@ jobs:
           --health-timeout=5s
           --health-retries=5
 
+      seekdb:
+        image: oceanbase/seekdb:latest
+        env:
+          OB_TENANT_PASSWORD: skardi_pass
+        ports:
+          - 2881:2881
+          - 2886:2886
+        options: >-
+          --health-cmd="obclient -h 127.0.0.1 -P 2881 -u root@sys -e 'SELECT 1' || mysql -h 127.0.0.1 -P 2881 -u root@sys -e 'SELECT 1'"
+          --health-interval=30s
+          --health-timeout=10s
+          --health-retries=20
+
     env:
       MYSQL_USER: skardi_user
       MYSQL_PASSWORD: skardi_pass
@@ -95,6 +108,8 @@ jobs:
       PG_PASSWORD: skardi_pass
       MONGO_USER: root
       MONGO_PASS: rootpass
+      SEEKDB_USER: "root@sys"
+      SEEKDB_PASSWORD: ""
 
     steps:
       - name: Checkout code
@@ -278,6 +293,69 @@ jobs:
           HSET mydb:products:PROD003 name "Monitor" category "Electronics" price "299.99" in_stock "false"
           HSET mydb:products:PROD004 name "Mouse" category "Electronics" price "29.99" in_stock "true"
           HSET mydb:products:PROD005 name "Desk Chair" category "Furniture" price "199.99" in_stock "true"
+          EOF
+
+      - name: Wait for SeekDB to accept connections
+        run: |
+          for i in $(seq 1 60); do
+            if mysql -h 127.0.0.1 -P 2881 -u "root@sys" -e "SELECT 1" >/dev/null 2>&1; then
+              echo "SeekDB is ready"
+              break
+            fi
+            echo "Waiting for SeekDB... (attempt $i/60)"
+            sleep 5
+          done
+
+      - name: Seed SeekDB data
+        run: |
+          mysql -h 127.0.0.1 -P 2881 -u "root@sys" <<'EOF'
+          CREATE DATABASE IF NOT EXISTS mydb;
+          USE mydb;
+          CREATE TABLE IF NOT EXISTS users (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              name VARCHAR(100) NOT NULL,
+              email VARCHAR(100) UNIQUE NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS orders (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              user_id INT NOT NULL,
+              product VARCHAR(100) NOT NULL,
+              amount DECIMAL(10, 2) NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS articles (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              title VARCHAR(200) NOT NULL,
+              body TEXT NOT NULL,
+              category VARCHAR(50) NOT NULL,
+              FULLTEXT INDEX ft_body (body) WITH PARSER IK
+          );
+          CREATE TABLE IF NOT EXISTS docs (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              title VARCHAR(200) NOT NULL,
+              category VARCHAR(50) NOT NULL,
+              embedding VECTOR(4),
+              VECTOR INDEX idx_embedding (embedding) WITH (TYPE = HNSW, DISTANCE = L2)
+          );
+          INSERT INTO users (name, email) VALUES
+              ('Alice Smith', 'alice@example.com'),
+              ('Bob Johnson', 'bob@example.com'),
+              ('Carol Williams', 'carol@example.com');
+          INSERT INTO orders (user_id, product, amount) VALUES
+              (1, 'Laptop', 999.99),
+              (2, 'Keyboard', 79.99),
+              (3, 'Monitor', 299.99);
+          INSERT INTO articles (title, body, category) VALUES
+              ('Intro to Machine Learning', 'machine learning model training deep neural network supervised algorithms', 'ai'),
+              ('Natural Language Processing', 'natural language processing text classification sentiment analysis', 'ai'),
+              ('Database Query Optimization', 'database query optimization indexing performance tuning relational', 'database'),
+              ('Deep Learning Advances', 'machine learning classification supervised training model convolutional neural', 'research'),
+              ('Neural Network Architectures', 'deep learning neural network convolutional image recognition transformer', 'ai');
+          INSERT INTO docs (title, category, embedding) VALUES
+              ('doc-a', 'electronics', '[1.0, 0.0, 0.0, 0.0]'),
+              ('doc-b', 'electronics', '[0.0, 1.0, 0.0, 0.0]'),
+              ('doc-c', 'books',       '[0.0, 0.0, 1.0, 0.0]'),
+              ('doc-d', 'electronics', '[1.0, 1.0, 0.0, 0.0]'),
+              ('doc-e', 'books',       '[0.5, 0.5, 0.5, 0.5]');
           EOF
 
       - name: Execute Integration tests

@@ -1,0 +1,16 @@
+metadata:
+  name: "seekdb-knn-search"
+  version: "1.0.0"
+  description: >
+    KNN vector search on SeekDB via the seekdb_knn table function.
+    Uses the native VECTOR column and HNSW index. `_score` is the raw
+    distance — lower means more similar.
+
+# Parameters:
+#   {query_vec} - Query embedding as a literal array (e.g. [1.0, 0.0, 0.0, 0.0])
+#   {k}         - Number of nearest neighbours to return
+
+query: |
+  SELECT id, title, category, _score
+  FROM seekdb_knn('docs', 'embedding', {query_vec}, 'l2', {k})
+  ORDER BY _score ASC
