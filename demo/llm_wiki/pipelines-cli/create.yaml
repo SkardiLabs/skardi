@@ -1,0 +1,25 @@
+metadata:
+  name: "wiki-create"
+  version: "1.0.0"
+  description: >
+    INSERT a new wiki page and re-embed its content inline with candle().
+    The AFTER INSERT trigger fans the row out to wiki_pages_fts and
+    wiki_pages_vec, so the page is visible to both sqlite_fts and
+    sqlite_knn in the same transaction.
+    The seed row is wrapped as SELECT ... AS t (not VALUES) so DataFusion's
+    INSERT planner does not collapse the projection and drop the
+    vec_to_binary(candle(...)) column — see demo/llm_wiki/README.md.
+
+# Parameters:
+#   {slug}       - Canonical slug, e.g. 'entity/alan-turing'
+#   {title}      - Display title
+#   {page_type}  - One of entity | concept | summary | index | schema
+#   {content}    - Markdown body (also the source for the embedding)
+
+query: |
+  INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding)
+  SELECT slug, title, page_type, content,
+         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+  FROM (
+    SELECT {slug} AS slug, {title} AS title, {page_type} AS page_type, {content} AS content
+  ) AS t

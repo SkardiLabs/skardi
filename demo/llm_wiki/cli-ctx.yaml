@@ -6,3 +6,8 @@ data_sources:
     hierarchy_level: catalog
     options:
       extensions_env: SQLITE_VEC_PATH
+
+# Pipelines the `skardi run` (and alias) subcommand discovers. Relative paths
+# resolve against this ctx file's directory, so the same config works whether
+# invoked from the repo root or from inside demo/llm_wiki/.
+pipelines_dir: pipelines-cli

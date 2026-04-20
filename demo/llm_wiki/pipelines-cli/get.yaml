@@ -1,0 +1,12 @@
+metadata:
+  name: "wiki-get"
+  version: "1.0.0"
+  description: "Fetch a single wiki page by slug (agent `open` primitive)."
+
+# Parameters:
+#   {slug}  - Canonical slug, e.g. 'entity/alan-turing'
+
+query: |
+  SELECT slug, title, page_type, content, updated_at
+  FROM wiki.main.wiki_pages
+  WHERE slug = {slug}
