@@ -3,7 +3,6 @@
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion_common::ScalarValue;
 
 pub mod datafusion;
 
@@ -39,20 +38,4 @@ pub trait Engine: Send + Sync {
     /// }
     /// ```
     async fn execute(&self, sql: &str) -> Result<RecordBatch>;
-
-    /// Execute a SQL query with named parameter values
-    ///
-    /// Uses DataFusion's native parameterised query support (`$param_name`
-    /// placeholders) instead of string interpolation, which avoids
-    /// ordering-dependent placeholder corruption and SQL injection.
-    ///
-    /// # Arguments
-    ///
-    /// * `sql` - SQL query with `$name` placeholders
-    /// * `params` - Named parameter values to bind
-    async fn execute_with_params(
-        &self,
-        sql: &str,
-        params: Vec<(String, ScalarValue)>,
-    ) -> Result<RecordBatch>;
 }
