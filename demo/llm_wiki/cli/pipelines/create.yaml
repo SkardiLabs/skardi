@@ -9,6 +9,10 @@ metadata:
     The seed row is wrapped as SELECT ... AS t (not VALUES) so DataFusion's
     INSERT planner does not collapse the projection and drop the
     vec_to_binary(candle(...)) column — see demo/llm_wiki/README.md.
+    `updated_at` is populated explicitly from DataFusion's `now()` rather
+    than relying on SQLite's column default, because the DataFusion INSERT
+    path binds NULL for any column not in the target list, which overrides
+    the default.
 
 # Parameters:
 #   {slug}       - Canonical slug, e.g. 'entity/alan-turing'
@@ -17,9 +21,10 @@ metadata:
 #   {content}    - Markdown body (also the source for the embedding)
 
 query: |
-  INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding)
+  INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding, updated_at)
   SELECT slug, title, page_type, content,
-         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content)),
+         CAST(now() AS VARCHAR)
   FROM (
     SELECT {slug} AS slug, {title} AS title, {page_type} AS page_type, {content} AS content
   ) AS t

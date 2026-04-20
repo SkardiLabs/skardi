@@ -1,0 +1,16 @@
+metadata:
+  name: "search-fulltext"
+  version: "1.0.0"
+  description: >
+    Full-text keyword search via SQLite FTS5, exposed through the
+    sqlite_fts table function. Returns id + content from the FTS5
+    mirror plus a _score column.
+
+# Parameters:
+#   {query}  - FTS5 query (term, "phrase", +must -mustnot, fuzzy~1)
+#   {limit}  - Maximum number of results
+
+query: |
+  SELECT id, content, _score
+  FROM sqlite_fts('rag.main.documents_fts', 'content', {query}, {limit})
+  ORDER BY _score DESC

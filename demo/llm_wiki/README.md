@@ -118,8 +118,8 @@ export PG_USER="skardi_user"
 export PG_PASSWORD="skardi_pass"
 
 cargo run --bin skardi-server --features candle -- \
-  --ctx demo/llm_wiki/ctx.yaml \
-  --pipeline demo/llm_wiki/pipelines/ \
+  --ctx demo/llm_wiki/server/ctx.yaml \
+  --pipeline demo/llm_wiki/server/pipelines/ \
   --port 8080
 ```
 
@@ -129,16 +129,16 @@ cargo run --bin skardi-server --features candle -- \
 
 The wiki exposes five HTTP endpoints that mirror the verbs an LLM agent needs
 to maintain a compounding knowledge base. Each one corresponds to one pipeline
-file under [pipelines/](pipelines/).
+file under [server/pipelines/](server/pipelines/).
 
 | Endpoint | Verb | Pipeline |
 |---|---|---|
-| `/wiki-create/execute`        | `write` (new)  | [pipelines/create.yaml](pipelines/create.yaml) |
-| `/wiki-update/execute`        | `write` (edit) | [pipelines/update.yaml](pipelines/update.yaml) |
-| `/wiki-get/execute`           | `open`         | [pipelines/get.yaml](pipelines/get.yaml) |
-| `/wiki-search-hybrid/execute` | `grep`         | [pipelines/search_hybrid.yaml](pipelines/search_hybrid.yaml) |
-| `/wiki-list/execute`          | `ls`           | [pipelines/list.yaml](pipelines/list.yaml) |
-| `/wiki-log-append/execute`    | `log`          | [pipelines/log_append.yaml](pipelines/log_append.yaml) |
+| `/wiki-create/execute`        | `write` (new)  | [server/pipelines/create.yaml](server/pipelines/create.yaml) |
+| `/wiki-update/execute`        | `write` (edit) | [server/pipelines/update.yaml](server/pipelines/update.yaml) |
+| `/wiki-get/execute`           | `open`         | [server/pipelines/get.yaml](server/pipelines/get.yaml) |
+| `/wiki-search-hybrid/execute` | `grep`         | [server/pipelines/search_hybrid.yaml](server/pipelines/search_hybrid.yaml) |
+| `/wiki-list/execute`          | `ls`           | [server/pipelines/list.yaml](server/pipelines/list.yaml) |
+| `/wiki-log-append/execute`    | `log`          | [server/pipelines/log_append.yaml](server/pipelines/log_append.yaml) |
 
 > DataFusion's SQL planner does not support `INSERT ... ON CONFLICT`, so
 > create and edit are exposed as two explicit endpoints. The agent's pattern
@@ -309,12 +309,12 @@ curl -X POST http://localhost:8080/wiki-log-append/execute \
 
 | Pipeline | Endpoint | Description |
 |---|---|---|
-| [create.yaml](pipelines/create.yaml) | `/wiki-create/execute` | INSERT a new page; re-embeds with `candle()` inline |
-| [update.yaml](pipelines/update.yaml) | `/wiki-update/execute` | UPDATE an existing page by slug; re-embeds with `candle()` inline |
-| [get.yaml](pipelines/get.yaml) | `/wiki-get/execute` | Fetch one page by slug |
-| [search_hybrid.yaml](pipelines/search_hybrid.yaml) | `/wiki-search-hybrid/execute` | RRF hybrid search over `pg_knn` + `pg_fts` |
-| [list.yaml](pipelines/list.yaml) | `/wiki-list/execute` | Filter pages by `page_type` + slug prefix, newest first |
-| [log_append.yaml](pipelines/log_append.yaml) | `/wiki-log-append/execute` | Append to the `wiki_log` activity log |
+| [server/pipelines/create.yaml](server/pipelines/create.yaml) | `/wiki-create/execute` | INSERT a new page; re-embeds with `candle()` inline |
+| [server/pipelines/update.yaml](server/pipelines/update.yaml) | `/wiki-update/execute` | UPDATE an existing page by slug; re-embeds with `candle()` inline |
+| [server/pipelines/get.yaml](server/pipelines/get.yaml) | `/wiki-get/execute` | Fetch one page by slug |
+| [server/pipelines/search_hybrid.yaml](server/pipelines/search_hybrid.yaml) | `/wiki-search-hybrid/execute` | RRF hybrid search over `pg_knn` + `pg_fts` |
+| [server/pipelines/list.yaml](server/pipelines/list.yaml) | `/wiki-list/execute` | Filter pages by `page_type` + slug prefix, newest first |
+| [server/pipelines/log_append.yaml](server/pipelines/log_append.yaml) | `/wiki-log-append/execute` | Append to the `wiki_log` activity log |
 
 ---
 
@@ -342,9 +342,9 @@ pkill -f skardi-server
 
 The same wiki primitives (`create`, `update`, `get`, `grep`, `ls`) run end-to-end
 through `skardi` — **no server, no Docker, no HTTP**. Each primitive is a
-pipeline YAML under [pipelines-cli/](pipelines-cli/) (same format as the server
+pipeline YAML under [cli/pipelines/](cli/pipelines/) (same format as the server
 pipelines) and is invoked through a short verb alias defined in
-[aliases.yaml](aliases.yaml): `skardi grep "..."`, `skardi ls`,
+[cli/aliases.yaml](cli/aliases.yaml): `skardi grep "..."`, `skardi ls`,
 `skardi open <slug>`, `skardi write --slug=... --title=...`, etc.
 
 A regular `wiki_pages` table holds canonical state (slug, title, page_type,
@@ -358,8 +358,12 @@ version).
 ### 1. Install the CLI with embedding support
 
 ```bash
-cargo install --path crates/cli --features candle
+cargo install --locked --path crates/cli --features candle
 ```
+
+`--locked` makes cargo honor the checked-in `Cargo.lock` instead of
+re-resolving transitive deps, which can otherwise pull a newer crate whose
+MSRV is higher than your toolchain.
 
 ### 2. Get the `sqlite-vec` extension
 
@@ -403,13 +407,21 @@ JOIN. The script also creates `wiki_pages_fts`, `wiki_pages_vec`, the
 `wiki_log` activity table, and `AFTER INSERT` / `AFTER UPDATE` triggers that
 keep both mirrors in sync. See [setup.py](setup.py) for the schema.
 
-### 5. Context and pipeline files
+### 5. Config layout
 
-The CLI context YAML ([cli-ctx.yaml](cli-ctx.yaml)) registers one SQLite
-source in `catalog` mode (which auto-discovers every table, loads
-`sqlite-vec` once on the shared connection pool, and exposes each table under
-`<catalog>.main.<table>` for both SQL and `sqlite_knn` / `sqlite_fts` lookups)
-and points at the pipeline directory that `skardi run` reads from:
+Everything the CLI needs for the demo lives under [cli/](cli/):
+
+```
+demo/llm_wiki/cli/
+  ctx.yaml        # registers wiki.db as a SQLite catalog data source
+  aliases.yaml    # short verbs → pipeline bindings
+  pipelines/      # pipeline YAMLs (one per verb)
+```
+
+[cli/ctx.yaml](cli/ctx.yaml) registers one SQLite source in `catalog` mode,
+which auto-discovers every table, loads `sqlite-vec` once on the shared
+connection pool, and exposes each table under `<catalog>.main.<table>` for
+both SQL and `sqlite_knn` / `sqlite_fts` lookups:
 
 ```yaml
 data_sources:
@@ -420,45 +432,52 @@ data_sources:
     hierarchy_level: catalog
     options:
       extensions_env: SQLITE_VEC_PATH
-
-pipelines_dir: pipelines-cli
 ```
 
-The pipeline YAMLs in [pipelines-cli/](pipelines-cli/) use the same
+The pipeline YAMLs in [cli/pipelines/](cli/pipelines/) use the same
 `metadata` + `query` shape as the server pipelines, with `{param}`
 placeholders for named parameters — just targeting the SQLite stack
 (`sqlite_knn` / `sqlite_fts` / `vec_to_binary(candle(...))`) instead of
-`pg_knn` / `pg_fts`. Pairs of verb → pipeline are wired up in
-[aliases.yaml](aliases.yaml).
+`pg_knn` / `pg_fts`. Verb → pipeline bindings live in
+[cli/aliases.yaml](cli/aliases.yaml).
+
+**Export the config dir once** so the verbs below don't need `--ctx` on
+every line. `SKARDICONFIG` accepts either a config directory (which the CLI
+looks inside for `ctx.yaml`, `aliases.yaml`, and `pipelines/`) or an
+individual ctx file. `--ctx PATH` still works and takes precedence:
+
+```bash
+export SKARDICONFIG=demo/llm_wiki/cli
+```
 
 ### 6. Set up aliases (bundled for this demo)
 
-The demo ships with [aliases.yaml](aliases.yaml) pre-populated so the verbs
-below just work. You can add more aliases yourself — each alias maps a short
-verb to a pipeline plus positional/default param bindings:
+The demo ships with [cli/aliases.yaml](cli/aliases.yaml) pre-populated so
+the verbs below just work. You can add more aliases yourself — each alias
+maps a short verb to a pipeline plus positional/default param bindings:
 
 ```bash
 # Example: a `today` alias that lists only today's pages
 skardi alias add today \
-  --ctx demo/llm_wiki/cli-ctx.yaml \
   --pipeline wiki-list \
   --default 'page_type_pattern=%' \
   --default 'slug_prefix=%' \
   --default 'limit=20' \
   --description "List the 20 most recently-touched pages"
 
-skardi alias list  --ctx demo/llm_wiki/cli-ctx.yaml
-skardi alias show grep --ctx demo/llm_wiki/cli-ctx.yaml
-skardi alias remove today --ctx demo/llm_wiki/cli-ctx.yaml
+skardi alias list
+skardi alias show grep
+skardi alias remove today
 ```
 
-Alias files resolve in this order: `--aliases <path>` → `SKARDI_ALIASES` env
-→ `aliases.yaml` next to `--ctx` → `~/.skardi/config/aliases.yaml`.
+Alias files resolve in this order: `--aliases <path>` → `SKARDI_ALIASES`
+env → `aliases.yaml` next to the active ctx file →
+`~/.skardi/config/aliases.yaml`.
 
 ### 7. `write` — create a new page
 
 ```bash
-skardi write --ctx demo/llm_wiki/cli-ctx.yaml \
+skardi write \
   --slug=entity/alan-turing \
   --title="Alan Turing" \
   --page_type=entity \
@@ -467,12 +486,12 @@ skardi write --ctx demo/llm_wiki/cli-ctx.yaml \
 British mathematician and logician who formalized the concepts of algorithm and computation with the Turing machine.'
 ```
 
-The `write` alias invokes [pipelines-cli/create.yaml](pipelines-cli/create.yaml),
+The `write` alias invokes [cli/pipelines/create.yaml](cli/pipelines/create.yaml),
 which computes the embedding inline with `candle()`, packs it with
 `vec_to_binary()`, and INSERTs the row. The `AFTER INSERT` trigger then
 mirrors the row to `wiki_pages_fts` and `wiki_pages_vec` atomically.
 
-> Why does [create.yaml](pipelines-cli/create.yaml) wrap the seed row as
+> Why does [create.yaml](cli/pipelines/create.yaml) wrap the seed row as
 > `SELECT {slug} AS slug, ... FROM (...)` instead of using `VALUES`?
 > DataFusion's INSERT planner currently propagates the INSERT target schema
 > (5 columns) down into any immediate-child `VALUES` clause and validates row
@@ -490,9 +509,9 @@ as a SQL literal. The portable workaround is **delete + re-insert** — the
 repopulates them, and the new row picks up a fresh `updated_at`.
 
 ```bash
-skardi rm entity/alan-turing --ctx demo/llm_wiki/cli-ctx.yaml
+skardi rm entity/alan-turing
 
-skardi write --ctx demo/llm_wiki/cli-ctx.yaml \
+skardi write \
   --slug=entity/alan-turing \
   --title="Alan Turing" \
   --page_type=entity \
@@ -510,16 +529,16 @@ dance.
 ### 9. `open` — fetch one page by slug
 
 ```bash
-skardi open entity/alan-turing --ctx demo/llm_wiki/cli-ctx.yaml
+skardi open entity/alan-turing
 ```
 
-Under the hood this runs [pipelines-cli/get.yaml](pipelines-cli/get.yaml):
+Under the hood this runs [cli/pipelines/get.yaml](cli/pipelines/get.yaml):
 `SELECT slug, title, page_type, content, updated_at FROM wiki.main.wiki_pages WHERE slug = {slug}`.
 
 ### 10. `grep` — hybrid search (RRF over FTS + vector)
 
 ```bash
-skardi grep "turing machine computation" --ctx demo/llm_wiki/cli-ctx.yaml --limit=10
+skardi grep "turing machine computation" --limit=10
 ```
 
 One positional arg binds to both `{query}` (embedded with `candle()` for
@@ -527,30 +546,31 @@ One positional arg binds to both `{query}` (embedded with `candle()` for
 the alias). Override either independently:
 
 ```bash
-skardi grep "turing machine" --ctx demo/llm_wiki/cli-ctx.yaml \
+skardi grep "turing machine" \
   --text_query="bletchley OR enigma" \
   --vector_weight=0.3 --text_weight=0.7 --limit=5
 ```
 
-See [pipelines-cli/search_hybrid.yaml](pipelines-cli/search_hybrid.yaml) for
-the full RRF merge.
+See [cli/pipelines/search_hybrid.yaml](cli/pipelines/search_hybrid.yaml) for
+the full RRF merge. Run `skardi grep --help` to see every param the alias
+exposes and where each value comes from.
 
 ### 11. `ls` — browse by type or slug prefix
 
 ```bash
-skardi ls --ctx demo/llm_wiki/cli-ctx.yaml
+skardi ls
 
 # Entity pages only
-skardi ls --ctx demo/llm_wiki/cli-ctx.yaml --page_type_pattern=entity
+skardi ls --page_type_pattern=entity
 
 # Everything under concept/
-skardi ls --ctx demo/llm_wiki/cli-ctx.yaml --slug_prefix='concept/%'
+skardi ls --slug_prefix='concept/%'
 ```
 
 ### 12. `log` — append an activity entry
 
 ```bash
-skardi log --ctx demo/llm_wiki/cli-ctx.yaml \
+skardi log \
   --event_type=ingest \
   --slug=entity/alan-turing \
   --message="Created from Wikipedia article."
@@ -560,8 +580,8 @@ skardi log --ctx demo/llm_wiki/cli-ctx.yaml \
 
 `skardi run` and the aliases above are a thin layer over the pipeline YAMLs.
 The underlying queries are still plain SQL — if you want to experiment
-ad-hoc, `skardi query --ctx demo/llm_wiki/cli-ctx.yaml --sql "..."` works
-just as before.
+ad-hoc, `skardi query --sql "..."` works just as before (same exported
+`SKARDICONFIG`).
 
 ### Cleanup
 

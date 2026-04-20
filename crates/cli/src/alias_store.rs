@@ -17,7 +17,11 @@
 //! The file path is resolved in this order:
 //! 1. Explicit `--aliases <path>` flag.
 //! 2. `SKARDI_ALIASES` env var.
-//! 3. Next to the active ctx file: `<ctx_dir>/aliases.yaml`.
+//! 3. Inside the active "skardi home" directory: `<home>/aliases.yaml`.
+//!    Home is derived from the `--ctx` argument or the `SKARDICONFIG` env
+//!    var: a directory is used directly, a file uses its parent dir. So
+//!    `export SKARDICONFIG=./demo/llm_wiki/cli` (or an equivalent `--ctx`)
+//!    is enough to locate the sibling `aliases.yaml`.
 //! 4. `~/.skardi/config/aliases.yaml`.
 
 use anyhow::{Context, Result};
@@ -28,9 +32,16 @@ use crate::alias::AliasDef;
 
 pub type AliasMap = BTreeMap<String, AliasDef>;
 
-/// Resolve the aliases file path. Returns `None` when no explicit override and
-/// no default location exists yet (so a fresh install can still run `skardi run`
-/// against pipelines without requiring an aliases file).
+/// Resolve the aliases file path. Returns `None` when neither an explicit
+/// override nor a default home is available.
+///
+/// Resolution order:
+/// 1. `override_path` (the `--aliases` CLI flag).
+/// 2. `SKARDI_ALIASES` env var.
+/// 3. `<home>/aliases.yaml`, where home is derived from `ctx_path` if given
+///    or `SKARDICONFIG` otherwise — a directory is used directly; a file
+///    uses its parent. The file must already exist to match here.
+/// 4. `~/.skardi/config/aliases.yaml` (default).
 pub fn resolve_aliases_path(
     override_path: Option<&Path>,
     ctx_path: Option<&Path>,
@@ -41,14 +52,26 @@ pub fn resolve_aliases_path(
     if let Ok(env_path) = std::env::var("SKARDI_ALIASES") {
         return Some(PathBuf::from(env_path));
     }
-    if let Some(ctx) = ctx_path {
-        if let Some(parent) = ctx.parent() {
-            let candidate = parent.join("aliases.yaml");
+
+    // Prefer the active ctx's home. `ctx_path` (the CLI arg) wins over
+    // `SKARDICONFIG` env so an explicit `--ctx` is never silently overridden.
+    let source: Option<PathBuf> = ctx_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("SKARDICONFIG").ok().map(PathBuf::from));
+    if let Some(p) = source {
+        let home = if p.is_dir() {
+            Some(p)
+        } else {
+            p.parent().map(|parent| parent.to_path_buf())
+        };
+        if let Some(home) = home {
+            let candidate = home.join("aliases.yaml");
             if candidate.exists() {
                 return Some(candidate);
             }
         }
     }
+
     let home_default = dirs::home_dir()?
         .join(".skardi")
         .join("config")

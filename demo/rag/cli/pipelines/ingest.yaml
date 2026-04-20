@@ -1,0 +1,23 @@
+metadata:
+  name: "ingest"
+  version: "1.0.0"
+  description: >
+    Ingest a document into the RAG corpus. A single INSERT writes both the
+    raw content and the candle-generated embedding; the AFTER INSERT trigger
+    fans the row out to documents_fts and documents_vec, so the row is
+    searchable by sqlite_fts and sqlite_knn in the same transaction.
+    The seed row is wrapped as SELECT ... AS t (not VALUES) so DataFusion's
+    INSERT planner does not collapse the projection and drop the
+    vec_to_binary(candle(...)) column.
+
+# Parameters:
+#   {doc_id}   - Integer primary key for the documents table
+#   {content}  - Document text (also the source for the embedding)
+
+query: |
+  INSERT INTO rag.main.documents (id, content, embedding)
+  SELECT id, content,
+         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+  FROM (
+    SELECT {doc_id} AS id, {content} AS content
+  ) AS t

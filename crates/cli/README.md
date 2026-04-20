@@ -7,10 +7,15 @@ CLI for running SQL queries against local files, remote object stores, datalake 
 From the repo root:
 
 ```bash
-cargo install --path crates/cli
+cargo install --locked --path crates/cli
 ```
 
 Then run `skardi` from anywhere.
+
+> `--locked` tells cargo to respect the checked-in `Cargo.lock` instead of
+> re-resolving transitive dependencies. Without it, cargo may pull a newer
+> version of a transitive crate whose MSRV is higher than yours. If that happens, add
+> `--locked` or upgrade your toolchain.
 
 ## Run without installing
 
@@ -78,13 +83,17 @@ skardi query --ctx <path-to-ctx.yaml> --sql "SELECT * FROM my_table LIMIT 10"
 skardi query --ctx <path-to-ctx.yaml> --file query.sql
 skardi query -f ./queries/report.sql
 
-# With default ctx (SKARDICONFIG env or ~/.skardi/config/ctx.yaml)
+# With default ctx — SKARDICONFIG accepts a directory (preferred) or a
+# single ctx file. When it's a directory, the CLI also looks inside it for
+# `aliases.yaml` and `pipelines/`.
+export SKARDICONFIG=/path/to/config-dir
+# or point at a single file
 export SKARDICONFIG=/path/to/ctx.yaml
 skardi query --sql "SELECT * FROM my_table"
 skardi query --file report.sql
 ```
 
-**Context file resolution** (when `--ctx` is omitted): `SKARDICONFIG` env, then `~/.skardi/config/ctx.yaml`. If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
+**Context resolution** (when `--ctx` is omitted): `SKARDICONFIG` env, then `~/.skardi/config/`. Both `--ctx` and `SKARDICONFIG` accept either a file (used directly) or a directory (the CLI appends `ctx.yaml` by convention). If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
 
 #### Schema inspection
 
@@ -334,7 +343,7 @@ WHERE category = 'electronics' AND price < 20
 A **pipeline** is a named SQL template stored in a YAML file:
 
 ```yaml
-# demo/llm_wiki/pipelines-cli/list.yaml
+# demo/llm_wiki/cli/pipelines/list.yaml
 metadata:
   name: "wiki-list"
 query: |
@@ -351,8 +360,14 @@ bound via `--param NAME=VALUE`; values are rendered as SQL-safe literals
 before DataFusion sees the query (strings are single-quoted with `'` → `''`
 escaping, so quotes inside values can't break out).
 
+The examples below use `SKARDICONFIG` so `--ctx` doesn't have to be repeated
+on every line. `--ctx PATH` still works and takes precedence over the env
+var, per the resolution order at the top of this README.
+
 ```bash
-skardi run wiki-list --ctx ./demo/llm_wiki/cli-ctx.yaml \
+export SKARDICONFIG=./demo/llm_wiki/cli
+
+skardi run wiki-list \
   --param 'page_type_pattern=%' \
   --param 'slug_prefix=concept/%' \
   --param 'limit=10'
@@ -364,21 +379,27 @@ skardi run wiki-list --ctx ./demo/llm_wiki/cli-ctx.yaml \
 1. `--pipeline-dir <DIR>` flag.
 2. `pipelines_dir:` key in the ctx YAML (relative paths resolve against the
    ctx file's directory).
-3. Otherwise, no pipelines are registered — only `skardi run` invocations
-   that pass `--pipeline-dir` will find one.
+3. `<config-dir>/pipelines/` by convention, where `<config-dir>` is the dir
+   `SKARDICONFIG` (or `--ctx`) points at (or the parent of the ctx file if
+   it's given as a file path). Only used when the directory exists.
+4. Otherwise, no pipelines are registered.
 
-Example ctx addition:
+Most projects just drop a `pipelines/` directory next to `ctx.yaml` and get
+discovery for free; set `pipelines_dir:` if you want them somewhere else.
 
-```yaml
-data_sources:
-  - name: wiki
-    type: sqlite
-    path: demo/llm_wiki/wiki.db
-    access_mode: read_write
-    hierarchy_level: catalog
+Minimal layout:
 
-pipelines_dir: pipelines-cli
 ```
+my-project/
+  ctx.yaml
+  aliases.yaml      # optional
+  pipelines/
+    search.yaml
+    ...
+```
+
+Then `export SKARDICONFIG=./my-project` makes every `skardi run` and alias
+invocation pick up the ctx, the aliases, and the pipelines automatically.
 
 **Parameter typing** — values pass through a heuristic: bare integers become
 `Int64`, bare floats become `Float64`, `true`/`false` become `Boolean`,
@@ -402,8 +423,9 @@ dispatched to the same code path as `skardi run`.
 #### Add an alias
 
 ```bash
+export SKARDICONFIG=./demo/llm_wiki/cli
+
 skardi alias add grep \
-  --ctx ./demo/llm_wiki/cli-ctx.yaml \
   --pipeline wiki-search-hybrid \
   --positional query \
   --default 'text_query={query}' \
@@ -423,35 +445,38 @@ Flags:
   (one level), so a single positional can fan out to multiple params.
 - `--description <TEXT>` — optional short help string shown in `alias list`.
 - `--force` — overwrite an existing alias with the same name.
-- `--pipeline-dir <DIR>` — override where the CLI looks up the pipeline YAML
-  for validation (else uses `pipelines_dir:` from the ctx file).
-- `--no-validate` — skip the pipeline lookup entirely. Useful when the
-  target pipeline hasn't been authored yet.
 
-When the pipeline YAML can be located (via `--pipeline-dir` or
-`pipelines_dir:` in ctx), the CLI parses the YAML's `{name}` placeholders
-and:
+The bare form is also useful — `skardi alias add grep --ctx ... --pipeline wiki-search-hybrid`
+saves an alias with no positional/default bindings. Callers then pass every
+pipeline param as a `--name=value` flag at call time; `skardi grep --help`
+will list them.
+
+When the pipeline YAML can be located via the ctx's `pipelines_dir:`, the
+CLI parses its `{name}` placeholders and:
 
 - rejects `--positional` / `--default` names that don't match a real
   parameter (so `--default txt_query=...` fails fast with the known-params
   list instead of silently creating a broken alias), and
 - prints which params are covered by this alias and which remain unbound
-  — those will either need `--default`s now or flag overrides at call time.
+  — those either need `--default`s now or flag overrides at call time.
 
 Example output:
 
 ```
-$ skardi alias add grep --ctx ./demo/llm_wiki/cli-ctx.yaml \
-    --pipeline wiki-search-hybrid --positional query
+$ skardi alias add grep --pipeline wiki-search-hybrid --positional query
 Pipeline 'wiki-search-hybrid' has 5 parameter(s): query, text_query, vector_weight, text_weight, limit
   Unbound by this alias: text_query, vector_weight, text_weight, limit (pass at call time with --name=value, or re-run `alias add --force` with --default/--positional)
 Alias 'grep' → pipeline 'wiki-search-hybrid' saved to ./demo/llm_wiki/aliases.yaml
 ```
 
+If the pipeline can't be located (e.g. the alias is being authored before
+the pipeline is), validation is skipped with a `note:` — the alias is still
+saved.
+
 Now `grep` is a first-class verb:
 
 ```bash
-skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml
+skardi grep "turing machine"
 # → skardi run wiki-search-hybrid \
 #     --param 'query=turing machine' \
 #     --param 'text_query=turing machine' \
@@ -460,20 +485,52 @@ skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml
 #     --param 'limit=10'
 
 # Flag overrides beat positional/default bindings
-skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml \
-  --text_query='bletchley OR enigma' --limit=3
+skardi grep "turing machine" --text_query='bletchley OR enigma' --limit=3
 ```
 
 Positional args bind in order to `alias.positional`. Extra positional args
 error. `--name=value` / `--name value` flags always win over positional
 binds and defaults.
 
-#### List / show / remove
+#### Inspect an alias — `skardi <alias> --help` or `alias show`
+
+Both commands print the alias's bindings and the target pipeline's full
+parameter list, annotated with where each param gets its value. Use
+`--help` when invoking an alias to discover its interface; use `alias show`
+for the underlying YAML plus the same annotations.
 
 ```bash
-skardi alias list  --ctx ./demo/llm_wiki/cli-ctx.yaml
-skardi alias show  grep --ctx ./demo/llm_wiki/cli-ctx.yaml
-skardi alias remove grep --ctx ./demo/llm_wiki/cli-ctx.yaml
+$ skardi grep --help
+skardi grep — runs pipeline `wiki-search-hybrid`
+
+Hybrid search over the wiki
+
+Positional args:
+  <query>   binds pipeline param `query` (positional[0])
+
+Pipeline params (override at call time with --name=VALUE):
+  --query          bound positionally (positional[0])
+  --text_query     default: "{query}"
+  --vector_weight  default: "0.5"
+  --text_weight    default: "0.5"
+  --limit          default: "10"
+
+Control flags:
+  --ctx <PATH>       Context YAML (SKARDICONFIG env / ~/.skardi/config/ctx.yaml)
+  --aliases <PATH>   Override aliases file
+  --pipeline-dir <DIR>  Override pipeline discovery directory
+
+Example: skardi grep <query>
+```
+
+`skardi alias show grep` prints the same information with the alias YAML
+on top.
+
+#### List / remove
+
+```bash
+skardi alias list
+skardi alias remove grep
 ```
 
 #### Alias file resolution
@@ -482,13 +539,15 @@ The aliases YAML is resolved in this order:
 
 1. `--aliases <PATH>` flag.
 2. `SKARDI_ALIASES` env var.
-3. `aliases.yaml` next to the active ctx file (only if it already exists).
+3. `<config-dir>/aliases.yaml` (only if it already exists). The config dir
+   is whatever `--ctx` or `SKARDICONFIG` points at — a directory is used
+   directly, a file uses its parent.
 4. `~/.skardi/config/aliases.yaml`.
 
 The file is a simple top-level map keyed by alias name:
 
 ```yaml
-# demo/llm_wiki/aliases.yaml
+# demo/llm_wiki/cli/aliases.yaml
 grep:
   pipeline: wiki-search-hybrid
   positional: [query]
@@ -526,24 +585,27 @@ skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
 # Query a SQLite table directly
 skardi query --sql "SELECT * FROM './data/app.db.users' LIMIT 10"
 
-# With context file
-cargo run -p skardi-cli -- query --ctx ./demo/ctx.yaml --sql "SELECT * FROM products LIMIT 5"
+# With context file (set once; --ctx PATH also works and takes precedence)
+export SKARDICONFIG=./demo/llm_wiki/cli
+
+# Query against the exported ctx
+skardi query --sql "SELECT * FROM wiki.main.wiki_pages LIMIT 5"
 
 # Show schema
-skardi query --ctx ./demo/ctx.yaml --schema --all
-skardi query --ctx ./demo/ctx.yaml --schema -t products
+skardi query --schema --all
+skardi query --schema -t wiki_pages
 
 # SQL from file
-skardi query --ctx ./demo/ctx.yaml -f ./queries/report.sql
+skardi query -f ./queries/report.sql
 
 # Run a pipeline YAML by name, passing named parameters
-skardi run wiki-list --ctx ./demo/llm_wiki/cli-ctx.yaml \
+skardi run wiki-list \
   --param 'page_type_pattern=entity' --param 'slug_prefix=%' --param 'limit=20'
 
 # Invoke a user-defined alias (dispatches to `skardi run <pipeline>`)
-skardi grep "turing machine" --ctx ./demo/llm_wiki/cli-ctx.yaml
+skardi grep "turing machine"
 
 # Manage aliases
-skardi alias list --ctx ./demo/llm_wiki/cli-ctx.yaml
-skardi alias show grep --ctx ./demo/llm_wiki/cli-ctx.yaml
+skardi alias list
+skardi alias show grep
 ```

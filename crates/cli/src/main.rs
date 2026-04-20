@@ -141,19 +141,10 @@ enum AliasCmd {
         /// Override aliases file path
         #[arg(long)]
         aliases: Option<PathBuf>,
-        /// Ctx file used to derive default aliases file location
+        /// Ctx file used to derive default aliases file location (and to
+        /// locate the pipeline YAML for param validation).
         #[arg(long)]
         ctx: Option<PathBuf>,
-        /// Pipeline discovery dir (else uses ctx `pipelines_dir`). Used to
-        /// validate positional/default names against the pipeline's real
-        /// `{param}` placeholders.
-        #[arg(long = "pipeline-dir", value_name = "DIR")]
-        pipeline_dir: Option<PathBuf>,
-        /// Skip pipeline lookup — save the alias without validating
-        /// positional/default names against the pipeline YAML. Useful when
-        /// the target pipeline is not yet on disk.
-        #[arg(long)]
-        no_validate: bool,
     },
     /// List all known aliases
     List {
@@ -214,12 +205,18 @@ impl LocalDataSource {
     }
 }
 
+/// Resolve the ctx YAML file path.
+///
+/// `override_path` (`--ctx`) and `SKARDICONFIG` both accept either a file
+/// (used directly) or a directory (we append `ctx.yaml` by convention). The
+/// default when neither is given is `~/.skardi/config/ctx.yaml`.
 fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_path {
-        return Ok(p);
+        return Ok(if p.is_dir() { p.join("ctx.yaml") } else { p });
     }
     if let Ok(env_path) = std::env::var("SKARDICONFIG") {
-        return Ok(PathBuf::from(env_path));
+        let p = PathBuf::from(env_path);
+        return Ok(if p.is_dir() { p.join("ctx.yaml") } else { p });
     }
     let home = dirs::home_dir().ok_or_else(|| {
         anyhow::anyhow!("Could not determine home directory for default ctx path")
@@ -579,6 +576,16 @@ async fn main() -> Result<()> {
                 )
             })?;
 
+            // `skardi <alias> --help|-h` short-circuits to a usage view that
+            // lists the alias's positional slots, the pipeline's params, and
+            // each param's binding source.
+            if alias_args.iter().any(|a| a == "--help" || a == "-h") {
+                let pipeline_params =
+                    try_load_pipeline_params(&alias_def.pipeline, ctx_override.as_deref())?;
+                print_alias_help(&alias_name, alias_def, pipeline_params.as_deref());
+                return Ok(());
+            }
+
             let resolved = resolve_alias(alias_def, &alias_args)?;
             run_pipeline_with_params(
                 ctx_override,
@@ -657,9 +664,11 @@ fn split_control_flags(
 
 /// Resolve the ctx path using the same defaults as [`resolve_ctx_path`], but
 /// returning None (instead of an error) when no home directory is available.
+/// Honours the file-or-directory auto-detect on `SKARDICONFIG`.
 fn resolve_ctx_path_opt() -> Option<PathBuf> {
     if let Ok(env_path) = std::env::var("SKARDICONFIG") {
-        return Some(PathBuf::from(env_path));
+        let p = PathBuf::from(env_path);
+        return Some(if p.is_dir() { p.join("ctx.yaml") } else { p });
     }
     dirs::home_dir().map(|h| h.join(".skardi").join("config").join("ctx.yaml"))
 }
@@ -1122,7 +1131,8 @@ async fn run_pipeline_with_params(
 /// Priority:
 /// 1. Explicit `--pipeline-dir` flag.
 /// 2. `pipelines_dir` from ctx.yaml (relative paths resolved against ctx dir).
-/// 3. No default — returns empty vec.
+/// 3. `<ctx_dir>/pipelines/` convention — used when it exists on disk.
+/// 4. No default — returns empty vec.
 fn resolve_pipeline_dirs(
     override_dir: Option<&PathBuf>,
     ctx_cfg: Option<&LocalContextConfig>,
@@ -1131,16 +1141,24 @@ fn resolve_pipeline_dirs(
     if let Some(d) = override_dir {
         return vec![d.clone()];
     }
+    let ctx_dir: Option<PathBuf> = ctx_path.and_then(|p| p.parent().map(|x| x.to_path_buf()));
     if let Some(cfg) = ctx_cfg {
         if let Some(rel) = &cfg.pipelines_dir {
             let resolved = if rel.is_absolute() {
                 rel.clone()
-            } else if let Some(ctx_dir) = ctx_path.and_then(|p| p.parent()) {
+            } else if let Some(ctx_dir) = &ctx_dir {
                 ctx_dir.join(rel)
             } else {
                 rel.clone()
             };
             return vec![resolved];
+        }
+    }
+    // Convention fallback: `<ctx_dir>/pipelines/`.
+    if let Some(d) = ctx_dir {
+        let conv = d.join("pipelines");
+        if conv.is_dir() {
+            return vec![conv];
         }
     }
     Vec::new()
@@ -1161,8 +1179,6 @@ async fn handle_alias_cmd(cmd: AliasCmd) -> Result<()> {
             force,
             aliases,
             ctx,
-            pipeline_dir,
-            no_validate,
         } => alias_add(
             name,
             pipeline,
@@ -1172,8 +1188,6 @@ async fn handle_alias_cmd(cmd: AliasCmd) -> Result<()> {
             force,
             aliases,
             ctx,
-            pipeline_dir,
-            no_validate,
         ),
         AliasCmd::List { aliases, ctx } => alias_list(aliases, ctx),
         AliasCmd::Show { name, aliases, ctx } => alias_show(name, aliases, ctx),
@@ -1191,8 +1205,6 @@ fn alias_add(
     force: bool,
     aliases: Option<PathBuf>,
     ctx: Option<PathBuf>,
-    pipeline_dir: Option<PathBuf>,
-    no_validate: bool,
 ) -> Result<()> {
     let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
@@ -1227,13 +1239,10 @@ fn alias_add(
     }
 
     // Validate positional/default names against the pipeline's real `{param}`
-    // placeholders (unless the user opted out via --no-validate). Missing
-    // pipeline → we only warn, since the alias file is allowed to exist
-    // before its target pipeline is authored.
-    if !no_validate {
-        if let Some(pipeline_params) =
-            try_load_pipeline_params(&pipeline, ctx.as_deref(), pipeline_dir.as_deref())?
-        {
+    // placeholders when we can find the pipeline. A missing pipeline is a
+    // non-fatal warning so aliases can be authored before their target.
+    match try_load_pipeline_params(&pipeline, ctx.as_deref())? {
+        Some(pipeline_params) => {
             validate_alias_against_pipeline(
                 &pipeline,
                 &pipeline_params,
@@ -1241,11 +1250,12 @@ fn alias_add(
                 &defaults_map,
             )?;
             report_alias_coverage(&pipeline, &pipeline_params, &positional_vec, &defaults_map);
-        } else {
+        }
+        None => {
             eprintln!(
-                "warning: pipeline '{pipeline}' not found in the configured pipelines dir — \
-                 skipping param validation. Pass --no-validate to silence this, or set \
-                 `pipelines_dir:` in ctx / pass --pipeline-dir."
+                "note: pipeline '{pipeline}' not found in `pipelines_dir` — saving alias without \
+                 param validation. Once the pipeline is on disk, re-run `alias show {name}` to \
+                 confirm bindings."
             );
         }
     }
@@ -1270,13 +1280,12 @@ fn alias_add(
 }
 
 /// Load the named pipeline's `{name}` placeholder list, or `None` if the
-/// pipeline file cannot be located via the caller's ctx / pipeline-dir.
+/// pipeline file cannot be located via the caller's ctx.
 fn try_load_pipeline_params(
     pipeline: &str,
     ctx_override: Option<&Path>,
-    pipeline_dir_override: Option<&Path>,
 ) -> Result<Option<Vec<String>>> {
-    // Parse ctx if provided so `pipelines_dir` can act as the default.
+    // Parse ctx if provided so `pipelines_dir` can point us at the pipelines.
     let ctx_path = ctx_override
         .map(|p| p.to_path_buf())
         .or_else(resolve_ctx_path_opt)
@@ -1290,11 +1299,7 @@ fn try_load_pipeline_params(
         None => None,
     };
 
-    let pipeline_dirs = resolve_pipeline_dirs(
-        pipeline_dir_override.map(|p| p.to_path_buf()).as_ref(),
-        ctx_cfg.as_ref(),
-        ctx_path.as_deref(),
-    );
+    let pipeline_dirs = resolve_pipeline_dirs(None, ctx_cfg.as_ref(), ctx_path.as_deref());
     if pipeline_dirs.is_empty() {
         return Ok(None);
     }
@@ -1395,11 +1400,111 @@ fn alias_show(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> R
     let def = map
         .get(&name)
         .ok_or_else(|| anyhow::anyhow!("Alias '{name}' not found in {}", path.display()))?;
+
+    // Print the stored alias YAML verbatim.
     let mut single = AliasMap::new();
-    single.insert(name, def.clone());
+    single.insert(name.clone(), def.clone());
     let yaml = serde_yaml::to_string(&single).context("Failed to render alias to YAML")?;
     print!("{yaml}");
+
+    // If we can find the target pipeline, print an annotated view of each
+    // `{param}` showing where it gets bound from (positional slot, default
+    // value, or "flag-only at call time").
+    if let Some(pipeline_params) = try_load_pipeline_params(&def.pipeline, ctx.as_deref())? {
+        let annotations = annotate_alias_bindings(def, &pipeline_params);
+        println!();
+        println!(
+            "Pipeline '{}' has {} parameter(s):",
+            def.pipeline,
+            pipeline_params.len()
+        );
+        let width = pipeline_params.iter().map(|s| s.len()).max().unwrap_or(0);
+        for (param, note) in annotations {
+            println!("  {param:<width$}  {note}");
+        }
+    }
     Ok(())
+}
+
+/// For each pipeline param, produce a short note describing how this alias
+/// binds it: by positional slot, by default value, or "unbound" (the user
+/// must pass it as a flag at call time). Extra positional/default entries in
+/// the alias that do NOT match a real pipeline param are ignored here — they
+/// are already rejected up front by [`validate_alias_against_pipeline`].
+fn annotate_alias_bindings<'a>(
+    alias: &'a AliasDef,
+    pipeline_params: &'a [String],
+) -> Vec<(&'a str, String)> {
+    pipeline_params
+        .iter()
+        .map(|p| {
+            let note = if let Some(idx) = alias.positional.iter().position(|n| n == p) {
+                format!("positional[{idx}]")
+            } else if let Some(v) = alias.defaults.get(p) {
+                format!("default: {v:?}")
+            } else {
+                "flag-only (pass --{name}=VALUE at call time)".replace("{name}", p)
+            };
+            (p.as_str(), note)
+        })
+        .collect()
+}
+
+/// Print a `skardi <alias> --help`–style usage message: short description,
+/// positional slots, flag-callable params (with defaults if any), control
+/// flags, and a one-line example.
+fn print_alias_help(alias_name: &str, def: &AliasDef, pipeline_params: Option<&[String]>) {
+    println!("skardi {alias_name} — runs pipeline `{}`", def.pipeline);
+    if let Some(desc) = &def.description {
+        println!();
+        println!("{desc}");
+    }
+
+    println!();
+    if def.positional.is_empty() {
+        println!("Positional args: (none)");
+    } else {
+        println!("Positional args:");
+        for (i, p) in def.positional.iter().enumerate() {
+            println!("  <{p}>   binds pipeline param `{p}` (positional[{i}])");
+        }
+    }
+
+    if let Some(params) = pipeline_params {
+        println!();
+        println!("Pipeline params (override at call time with --name=VALUE):");
+        let width = params.iter().map(|s| s.len()).max().unwrap_or(0);
+        for p in params {
+            let note = if let Some(idx) = def.positional.iter().position(|n| n == p) {
+                format!("bound positionally (positional[{idx}])")
+            } else if let Some(v) = def.defaults.get(p) {
+                format!("default: {v:?}")
+            } else {
+                "required at call time".to_string()
+            };
+            println!("  --{p:<width$}  {note}");
+        }
+    }
+
+    println!();
+    println!("Control flags:");
+    println!("  --ctx <PATH>       Context YAML (SKARDICONFIG env / ~/.skardi/config/ctx.yaml)");
+    println!("  --aliases <PATH>   Override aliases file");
+    println!("  --pipeline-dir <DIR>  Override pipeline discovery directory");
+
+    println!();
+    print!("Example: skardi {alias_name}");
+    for p in &def.positional {
+        print!(" <{p}>");
+    }
+    for p in pipeline_params.unwrap_or(&[]).iter() {
+        let handled_positionally = def.positional.iter().any(|n| n == p);
+        let has_default = def.defaults.contains_key(p);
+        if !handled_positionally && !has_default {
+            print!(" --{p}=...");
+        }
+    }
+    println!();
 }
 
 fn alias_remove(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
@@ -1455,5 +1560,33 @@ mod tests {
         defaults.insert("limit".to_string(), "10".to_string());
         let positional = vec!["query".to_string()];
         validate_alias_against_pipeline("p", &params, &positional, &defaults).unwrap();
+    }
+
+    #[test]
+    fn annotate_bindings_labels_positional_default_and_unbound() {
+        let mut defaults = HashMap::new();
+        defaults.insert("limit".to_string(), "10".to_string());
+        let alias = AliasDef {
+            pipeline: "p".to_string(),
+            positional: vec!["query".to_string()],
+            defaults,
+            description: None,
+        };
+        let params = vec![
+            "query".to_string(),
+            "limit".to_string(),
+            "text_query".to_string(),
+        ];
+        let got: Vec<(String, String)> = annotate_alias_bindings(&alias, &params)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(got[0], ("query".to_string(), "positional[0]".to_string()));
+        assert_eq!(got[1].0, "limit");
+        assert!(got[1].1.contains("default"));
+        assert!(got[1].1.contains("10"));
+        assert_eq!(got[2].0, "text_query");
+        assert!(got[2].1.contains("flag-only"));
+        assert!(got[2].1.contains("--text_query"));
     }
 }

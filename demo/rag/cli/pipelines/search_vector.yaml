@@ -1,0 +1,19 @@
+metadata:
+  name: "search-vector"
+  version: "1.0.0"
+  description: >
+    Semantic vector search via sqlite-vec. Embeds the query inline with
+    candle and runs KNN over the documents_vec mirror; content comes from
+    the canonical documents table by LEFT JOIN on id.
+
+# Parameters:
+#   {query}  - Natural-language query (embedded with candle for sqlite_knn)
+#   {limit}  - Maximum number of results
+
+query: |
+  SELECT d.id, d.content, v._score
+  FROM sqlite_knn('rag.main.documents_vec', 'embedding',
+      (SELECT candle('models/generated/bge-small-en-v1.5', {query})),
+      {limit}) v
+  LEFT JOIN rag.main.documents d ON d.id = v.id
+  ORDER BY v._score
