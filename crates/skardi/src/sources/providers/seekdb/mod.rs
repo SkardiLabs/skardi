@@ -35,7 +35,7 @@ use crate::sources::hierarchy::{
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
@@ -53,10 +53,12 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::MySqlDialect;
-use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::mysql::write::MySQLTableWriter;
+use datafusion_table_providers::mysql::{DynMySQLConnectionPool, MySQL};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use futures::stream;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Params, Row, Value};
@@ -408,35 +410,44 @@ async fn list_seekdb_tables_in_catalog(
 
 /// Build a [`TableProvider`] for a single SeekDB table, wrapping read-write providers in
 /// [`SeekDbDmlProvider`] to expose `DELETE` and `UPDATE` support.
+///
+/// Unlike the vanilla MySQL provider, we resolve the table's Arrow schema
+/// ourselves via [`resolve_seekdb_schema`] and inject it into
+/// [`SqlTable::new_with_schema`]. That skips the upstream factory's auto
+/// schema resolution, which chokes on SeekDB's native `VECTOR(N)` columns
+/// because datafusion-table-providers has no MySQL-type mapping for them.
+/// The VECTOR column stays queryable through `seekdb_knn`.
 async fn build_seekdb_table_provider(
     pool: Arc<MySQLConnectionPool>,
     table_reference: TableReference,
     read_write: bool,
 ) -> Result<Arc<dyn TableProvider>> {
-    let factory = MySQLTableFactory::new(Arc::clone(&pool));
+    let filtered_schema = resolve_seekdb_schema(&pool, &table_reference)
+        .await
+        .with_context(|| format!("Failed to resolve SeekDB schema for '{}'", table_reference))?;
 
-    let inner = if read_write {
-        factory
-            .read_write_table_provider(table_reference.clone())
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create read-write SeekDB table provider for '{:?}': {}",
-                    table_reference,
-                    e
-                )
-            })?
+    let dyn_pool: Arc<DynMySQLConnectionPool> = Arc::clone(&pool) as Arc<DynMySQLConnectionPool>;
+
+    let read_provider: Arc<dyn TableProvider> = Arc::new(
+        SqlTable::new_with_schema(
+            "seekdb",
+            &dyn_pool,
+            Arc::clone(&filtered_schema),
+            table_reference.clone(),
+        )
+        .with_dialect(Arc::new(MySqlDialect {})),
+    );
+
+    let inner: Arc<dyn TableProvider> = if read_write {
+        let mysql_write = MySQL::new(
+            table_reference.to_string(),
+            Arc::clone(&pool),
+            Arc::clone(&filtered_schema),
+            Constraints::default(),
+        );
+        MySQLTableWriter::create(read_provider, mysql_write, None)
     } else {
-        factory
-            .table_provider(table_reference.clone())
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create read-only SeekDB table provider for '{:?}': {}",
-                    table_reference,
-                    e
-                )
-            })?
+        read_provider
     };
 
     let result: Arc<dyn TableProvider> = if read_write {
@@ -450,6 +461,167 @@ async fn build_seekdb_table_provider(
     };
 
     Ok(result)
+}
+
+/// Introspect a SeekDB table's columns via `SHOW COLUMNS` and return an Arrow
+/// [`SchemaRef`] that excludes columns we cannot map: the native `VECTOR(N)`
+/// type (surfaced only via `seekdb_knn`) and any novel MySQL types outside
+/// [`mysql_type_to_arrow`]'s coverage.
+async fn resolve_seekdb_schema(
+    pool: &MySQLConnectionPool,
+    table_reference: &TableReference,
+) -> Result<SchemaRef> {
+    let db_conn = pool
+        .connect()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to SeekDB for schema resolution: {e}"))?;
+
+    let mysql_conn = db_conn
+        .as_any()
+        .downcast_ref::<MySQLConnection>()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unexpected MySQL connection type during SeekDB schema resolution")
+        })?;
+
+    let mut conn = mysql_conn.conn.lock().await;
+
+    let qualified = quote_seekdb_table(table_reference);
+    let query = format!("SHOW COLUMNS FROM {qualified}");
+    let rows: Vec<(String, String)> = conn
+        .query_map(query.as_str(), |row: Row| {
+            let field: String = row.get("Field").unwrap_or_default();
+            let ty: String = row.get("Type").unwrap_or_default();
+            (field, ty)
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to introspect SeekDB columns for '{}'",
+                table_reference
+            )
+        })?;
+
+    let mut fields: Vec<Field> = Vec::with_capacity(rows.len());
+    for (name, ty) in rows {
+        let ty_lc = ty.to_lowercase();
+        // SeekDB's native `VECTOR(N)` has no Arrow mapping in
+        // datafusion-table-providers, but dropping the column entirely breaks
+        // scalar-subquery references like
+        // `(SELECT embedding FROM docs WHERE id = {seed_id})` used by the KNN
+        // by-seed pipeline: the SQL planner cannot resolve `embedding` against
+        // a schema where it doesn't exist, `sql_expr_to_logical_expr` errors,
+        // and DataFusion silently drops the offending table-function argument
+        // (see datafusion-sql/src/relation/mod.rs `flat_map` over args).
+        // Match pg_knn's pgvector handling: surface VECTOR as Utf8. SeekDB
+        // serialises vectors as pgvector-style string literals
+        // (`'[1.0, 0.0, 0.0, 0.0]'`), so a plain `SELECT embedding` decodes
+        // cleanly; real distance queries go through `seekdb_knn`.
+        let arrow_ty = if ty_lc.starts_with("vector") {
+            DataType::Utf8
+        } else if let Some(ty) = mysql_type_to_arrow(&ty_lc) {
+            ty
+        } else {
+            tracing::warn!(
+                "SeekDB table '{}': skipping column '{}' with unmapped MySQL type '{}'",
+                table_reference,
+                name,
+                ty
+            );
+            continue;
+        };
+        // Declare every column nullable, matching datafusion-table-providers'
+        // MySQL backend. An AUTO_INCREMENT / DEFAULT column is omitted from
+        // INSERT column lists, so DataFusion materialises NULL into the
+        // corresponding Arrow column before handing the batch to the MySQL
+        // writer. If we narrowed nullability to the DB's NOT NULL hint, that
+        // INSERT batch would fail schema validation even though MySQL itself
+        // would supply the default on the server side.
+        fields.push(Field::new(&name, arrow_ty, true));
+    }
+
+    if fields.is_empty() {
+        anyhow::bail!(
+            "SeekDB table '{}' has no Arrow-mappable columns (VECTOR and unsupported types excluded)",
+            table_reference
+        );
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Map a MySQL-compatible column-type string (as returned by `SHOW COLUMNS`:
+/// e.g. `int(11)`, `varchar(100)`, `bigint unsigned`, `decimal(10,2)`) to an
+/// Arrow [`DataType`]. Returns `None` for types outside our coverage so the
+/// caller can log + skip rather than panic.
+fn mysql_type_to_arrow(type_lc: &str) -> Option<DataType> {
+    let unsigned = type_lc.contains("unsigned");
+    let head = type_lc
+        .split_once('(')
+        .map(|(h, _)| h)
+        .unwrap_or(type_lc)
+        .split_whitespace()
+        .next()?
+        .trim();
+    match head {
+        "bool" | "boolean" => Some(DataType::Boolean),
+        "bit" => {
+            if type_lc.starts_with("bit(1)") || type_lc == "bit" {
+                Some(DataType::Boolean)
+            } else {
+                Some(DataType::Binary)
+            }
+        }
+        // MySQL convention: tinyint(1) is a boolean.
+        "tinyint" if type_lc.starts_with("tinyint(1)") => Some(DataType::Boolean),
+        "tinyint" => Some(if unsigned {
+            DataType::UInt8
+        } else {
+            DataType::Int8
+        }),
+        "smallint" => Some(if unsigned {
+            DataType::UInt16
+        } else {
+            DataType::Int16
+        }),
+        "mediumint" | "int" | "integer" => Some(if unsigned {
+            DataType::UInt32
+        } else {
+            DataType::Int32
+        }),
+        "bigint" => Some(if unsigned {
+            DataType::UInt64
+        } else {
+            DataType::Int64
+        }),
+        "float" => Some(DataType::Float32),
+        "double" | "real" => Some(DataType::Float64),
+        "decimal" | "numeric" | "newdecimal" => {
+            let (p, s) = parse_decimal_args(type_lc).unwrap_or((10, 0));
+            Some(DataType::Decimal128(p, s))
+        }
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum" | "set"
+        | "json" => Some(DataType::Utf8),
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => {
+            Some(DataType::Binary)
+        }
+        "date" | "newdate" => Some(DataType::Date32),
+        "datetime" | "timestamp" => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        "time" => Some(DataType::Time64(TimeUnit::Microsecond)),
+        "year" => Some(DataType::Int16),
+        _ => None,
+    }
+}
+
+/// Parse `(P,S)` out of a MySQL decimal-like declaration. Clamps precision
+/// into Arrow's `Decimal128` range (1..=38) and keeps scale within `[0, p]`.
+fn parse_decimal_args(type_lc: &str) -> Option<(u8, i8)> {
+    let args = type_lc.split_once('(')?.1.split_once(')')?.0;
+    let mut it = args.split(',').map(|s| s.trim().parse::<u32>().ok());
+    let p = it.next()??;
+    let s = it.next().unwrap_or(Some(0))?;
+    let p = p.clamp(1, 38) as u8;
+    let s = (s as i8).clamp(0, p as i8);
+    Some((p, s))
 }
 
 // ─── DML support wrapper ────────────────────────────────────────────────────
@@ -1097,5 +1269,93 @@ mod tests {
             .collect()
             .await
             .unwrap();
+    }
+
+    // ─── mysql_type_to_arrow / resolve_seekdb_schema tests ───────────────────
+
+    #[test]
+    fn mysql_type_to_arrow_integers() {
+        assert_eq!(mysql_type_to_arrow("int(11)"), Some(DataType::Int32));
+        assert_eq!(
+            mysql_type_to_arrow("int(11) unsigned"),
+            Some(DataType::UInt32)
+        );
+        assert_eq!(mysql_type_to_arrow("bigint"), Some(DataType::Int64));
+        assert_eq!(
+            mysql_type_to_arrow("bigint unsigned"),
+            Some(DataType::UInt64)
+        );
+        assert_eq!(mysql_type_to_arrow("smallint"), Some(DataType::Int16));
+        assert_eq!(mysql_type_to_arrow("tinyint(4)"), Some(DataType::Int8));
+    }
+
+    #[test]
+    fn mysql_type_to_arrow_boolean_flavors() {
+        // MySQL convention: tinyint(1) is a boolean even though SHOW COLUMNS
+        // reports it as tinyint.
+        assert_eq!(mysql_type_to_arrow("tinyint(1)"), Some(DataType::Boolean));
+        assert_eq!(mysql_type_to_arrow("boolean"), Some(DataType::Boolean));
+        assert_eq!(mysql_type_to_arrow("bit(1)"), Some(DataType::Boolean));
+        assert_eq!(mysql_type_to_arrow("bit(8)"), Some(DataType::Binary));
+    }
+
+    #[test]
+    fn mysql_type_to_arrow_text_and_binary() {
+        assert_eq!(mysql_type_to_arrow("varchar(100)"), Some(DataType::Utf8));
+        assert_eq!(mysql_type_to_arrow("text"), Some(DataType::Utf8));
+        assert_eq!(mysql_type_to_arrow("longtext"), Some(DataType::Utf8));
+        assert_eq!(mysql_type_to_arrow("json"), Some(DataType::Utf8));
+        assert_eq!(mysql_type_to_arrow("varbinary(16)"), Some(DataType::Binary));
+        assert_eq!(mysql_type_to_arrow("blob"), Some(DataType::Binary));
+    }
+
+    #[test]
+    fn mysql_type_to_arrow_decimal_parses_precision_scale() {
+        assert_eq!(
+            mysql_type_to_arrow("decimal(10,2)"),
+            Some(DataType::Decimal128(10, 2))
+        );
+        // No args → MySQL default (10, 0).
+        assert_eq!(
+            mysql_type_to_arrow("decimal"),
+            Some(DataType::Decimal128(10, 0))
+        );
+        // Only precision.
+        assert_eq!(
+            mysql_type_to_arrow("decimal(7)"),
+            Some(DataType::Decimal128(7, 0))
+        );
+        // Clamp precision to Arrow's 1..=38 window.
+        assert_eq!(
+            mysql_type_to_arrow("decimal(65,10)"),
+            Some(DataType::Decimal128(38, 10))
+        );
+    }
+
+    #[test]
+    fn mysql_type_to_arrow_dates_and_times() {
+        assert_eq!(mysql_type_to_arrow("date"), Some(DataType::Date32));
+        assert_eq!(
+            mysql_type_to_arrow("datetime"),
+            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
+        );
+        assert_eq!(
+            mysql_type_to_arrow("timestamp"),
+            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
+        );
+        assert_eq!(
+            mysql_type_to_arrow("time"),
+            Some(DataType::Time64(TimeUnit::Microsecond))
+        );
+    }
+
+    #[test]
+    fn mysql_type_to_arrow_rejects_vector_and_unknown() {
+        // VECTOR is filtered out at the caller (resolve_seekdb_schema), but
+        // mysql_type_to_arrow itself returns None for it — callers log + skip.
+        assert_eq!(mysql_type_to_arrow("vector(4)"), None);
+        assert_eq!(mysql_type_to_arrow("vector(1536)"), None);
+        assert_eq!(mysql_type_to_arrow("geometry"), None);
+        assert_eq!(mysql_type_to_arrow("some_oddball_type"), None);
     }
 }
