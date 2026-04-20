@@ -423,6 +423,30 @@ Flags:
   (one level), so a single positional can fan out to multiple params.
 - `--description <TEXT>` — optional short help string shown in `alias list`.
 - `--force` — overwrite an existing alias with the same name.
+- `--pipeline-dir <DIR>` — override where the CLI looks up the pipeline YAML
+  for validation (else uses `pipelines_dir:` from the ctx file).
+- `--no-validate` — skip the pipeline lookup entirely. Useful when the
+  target pipeline hasn't been authored yet.
+
+When the pipeline YAML can be located (via `--pipeline-dir` or
+`pipelines_dir:` in ctx), the CLI parses the YAML's `{name}` placeholders
+and:
+
+- rejects `--positional` / `--default` names that don't match a real
+  parameter (so `--default txt_query=...` fails fast with the known-params
+  list instead of silently creating a broken alias), and
+- prints which params are covered by this alias and which remain unbound
+  — those will either need `--default`s now or flag overrides at call time.
+
+Example output:
+
+```
+$ skardi alias add grep --ctx ./demo/llm_wiki/cli-ctx.yaml \
+    --pipeline wiki-search-hybrid --positional query
+Pipeline 'wiki-search-hybrid' has 5 parameter(s): query, text_query, vector_weight, text_weight, limit
+  Unbound by this alias: text_query, vector_weight, text_weight, limit (pass at call time with --name=value, or re-run `alias add --force` with --default/--positional)
+Alias 'grep' → pipeline 'wiki-search-hybrid' saved to ./demo/llm_wiki/aliases.yaml
+```
 
 Now `grep` is a first-class verb:
 

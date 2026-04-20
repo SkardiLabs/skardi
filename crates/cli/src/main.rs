@@ -144,6 +144,16 @@ enum AliasCmd {
         /// Ctx file used to derive default aliases file location
         #[arg(long)]
         ctx: Option<PathBuf>,
+        /// Pipeline discovery dir (else uses ctx `pipelines_dir`). Used to
+        /// validate positional/default names against the pipeline's real
+        /// `{param}` placeholders.
+        #[arg(long = "pipeline-dir", value_name = "DIR")]
+        pipeline_dir: Option<PathBuf>,
+        /// Skip pipeline lookup — save the alias without validating
+        /// positional/default names against the pipeline YAML. Useful when
+        /// the target pipeline is not yet on disk.
+        #[arg(long)]
+        no_validate: bool,
     },
     /// List all known aliases
     List {
@@ -1151,6 +1161,8 @@ async fn handle_alias_cmd(cmd: AliasCmd) -> Result<()> {
             force,
             aliases,
             ctx,
+            pipeline_dir,
+            no_validate,
         } => alias_add(
             name,
             pipeline,
@@ -1160,6 +1172,8 @@ async fn handle_alias_cmd(cmd: AliasCmd) -> Result<()> {
             force,
             aliases,
             ctx,
+            pipeline_dir,
+            no_validate,
         ),
         AliasCmd::List { aliases, ctx } => alias_list(aliases, ctx),
         AliasCmd::Show { name, aliases, ctx } => alias_show(name, aliases, ctx),
@@ -1177,6 +1191,8 @@ fn alias_add(
     force: bool,
     aliases: Option<PathBuf>,
     ctx: Option<PathBuf>,
+    pipeline_dir: Option<PathBuf>,
+    no_validate: bool,
 ) -> Result<()> {
     let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
@@ -1210,6 +1226,30 @@ fn alias_add(
         defaults_map.insert(k.to_string(), v.to_string());
     }
 
+    // Validate positional/default names against the pipeline's real `{param}`
+    // placeholders (unless the user opted out via --no-validate). Missing
+    // pipeline → we only warn, since the alias file is allowed to exist
+    // before its target pipeline is authored.
+    if !no_validate {
+        if let Some(pipeline_params) =
+            try_load_pipeline_params(&pipeline, ctx.as_deref(), pipeline_dir.as_deref())?
+        {
+            validate_alias_against_pipeline(
+                &pipeline,
+                &pipeline_params,
+                &positional_vec,
+                &defaults_map,
+            )?;
+            report_alias_coverage(&pipeline, &pipeline_params, &positional_vec, &defaults_map);
+        } else {
+            eprintln!(
+                "warning: pipeline '{pipeline}' not found in the configured pipelines dir — \
+                 skipping param validation. Pass --no-validate to silence this, or set \
+                 `pipelines_dir:` in ctx / pass --pipeline-dir."
+            );
+        }
+    }
+
     map.insert(
         name.clone(),
         AliasDef {
@@ -1227,6 +1267,103 @@ fn alias_add(
         path.display()
     );
     Ok(())
+}
+
+/// Load the named pipeline's `{name}` placeholder list, or `None` if the
+/// pipeline file cannot be located via the caller's ctx / pipeline-dir.
+fn try_load_pipeline_params(
+    pipeline: &str,
+    ctx_override: Option<&Path>,
+    pipeline_dir_override: Option<&Path>,
+) -> Result<Option<Vec<String>>> {
+    // Parse ctx if provided so `pipelines_dir` can act as the default.
+    let ctx_path = ctx_override
+        .map(|p| p.to_path_buf())
+        .or_else(resolve_ctx_path_opt)
+        .filter(|p| p.exists());
+    let ctx_cfg: Option<LocalContextConfig> = match &ctx_path {
+        Some(p) => {
+            let content = std::fs::read_to_string(p)
+                .with_context(|| format!("Failed to read context file: {}", p.display()))?;
+            Some(serde_yaml::from_str(&content).context("Failed to parse context YAML")?)
+        }
+        None => None,
+    };
+
+    let pipeline_dirs = resolve_pipeline_dirs(
+        pipeline_dir_override.map(|p| p.to_path_buf()).as_ref(),
+        ctx_cfg.as_ref(),
+        ctx_path.as_deref(),
+    );
+    if pipeline_dirs.is_empty() {
+        return Ok(None);
+    }
+    let pipelines = discover_pipelines(&pipeline_dirs)?;
+    Ok(pipelines
+        .get(pipeline)
+        .map(|(_, file)| extract_param_names(&file.query)))
+}
+
+/// Fail fast if any `--positional` / `--default` name refers to a param the
+/// pipeline does not actually have (almost always a typo).
+fn validate_alias_against_pipeline(
+    pipeline: &str,
+    pipeline_params: &[String],
+    positional: &[String],
+    defaults: &HashMap<String, String>,
+) -> Result<()> {
+    let known: std::collections::HashSet<&str> =
+        pipeline_params.iter().map(|s| s.as_str()).collect();
+    for p in positional {
+        if !known.contains(p.as_str()) {
+            anyhow::bail!(
+                "Pipeline '{pipeline}' has no parameter '{p}'. Known parameters: {}",
+                pipeline_params.join(", ")
+            );
+        }
+    }
+    for k in defaults.keys() {
+        if !known.contains(k.as_str()) {
+            anyhow::bail!(
+                "Pipeline '{pipeline}' has no parameter '{k}'. Known parameters: {}",
+                pipeline_params.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Print which of the pipeline's params are covered by this alias and which
+/// the user will still need to pass at call time (or add via --default now).
+fn report_alias_coverage(
+    pipeline: &str,
+    pipeline_params: &[String],
+    positional: &[String],
+    defaults: &HashMap<String, String>,
+) {
+    let positional_set: std::collections::HashSet<&str> =
+        positional.iter().map(|s| s.as_str()).collect();
+    let default_set: std::collections::HashSet<&str> =
+        defaults.keys().map(|s| s.as_str()).collect();
+    let unbound: Vec<&str> = pipeline_params
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|p| !positional_set.contains(p) && !default_set.contains(p))
+        .collect();
+
+    println!(
+        "Pipeline '{}' has {} parameter(s): {}",
+        pipeline,
+        pipeline_params.len(),
+        pipeline_params.join(", ")
+    );
+    if !unbound.is_empty() {
+        println!(
+            "  Unbound by this alias: {} (pass at call time with --name=value, \
+             or re-run `alias add --force` with --default/--positional)",
+            unbound.join(", ")
+        );
+    }
 }
 
 fn alias_list(aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
@@ -1275,4 +1412,48 @@ fn alias_remove(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) ->
     alias_store::save(&path, &map)?;
     println!("Alias '{}' removed from {}", name, path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_alias_rejects_unknown_positional() {
+        let params = vec!["query".to_string(), "limit".to_string()];
+        let defaults = HashMap::new();
+        let positional = vec!["qeury".to_string()]; // typo
+        let err = validate_alias_against_pipeline("p", &params, &positional, &defaults)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no parameter 'qeury'"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("query"), "error must list known params: {err}");
+    }
+
+    #[test]
+    fn validate_alias_rejects_unknown_default() {
+        let params = vec!["query".to_string(), "limit".to_string()];
+        let mut defaults = HashMap::new();
+        defaults.insert("limmit".to_string(), "10".to_string()); // typo
+        let positional: Vec<String> = Vec::new();
+        let err = validate_alias_against_pipeline("p", &params, &positional, &defaults)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no parameter 'limmit'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_alias_accepts_fully_known_names() {
+        let params = vec!["query".to_string(), "limit".to_string()];
+        let mut defaults = HashMap::new();
+        defaults.insert("limit".to_string(), "10".to_string());
+        let positional = vec!["query".to_string()];
+        validate_alias_against_pipeline("p", &params, &positional, &defaults).unwrap();
+    }
 }
