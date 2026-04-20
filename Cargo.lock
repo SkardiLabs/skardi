@@ -8091,7 +8091,6 @@ dependencies = [
  "clap",
  "cookie",
  "datafusion",
- "datafusion-common",
  "datafusion-federation",
  "datafusion-tracing",
  "lance",
