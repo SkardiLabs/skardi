@@ -401,16 +401,32 @@ my-project/
 Then `export SKARDICONFIG=./my-project` makes every `skardi run` and alias
 invocation pick up the ctx, the aliases, and the pipelines automatically.
 
-**Parameter typing** — values pass through a heuristic: bare integers become
-`Int64`, bare floats become `Float64`, `true`/`false` become `Boolean`,
-everything else is `Utf8`. Force a type explicitly with `NAME:TYPE=VALUE`:
+**Parameter typing** — `--param NAME=VALUE` is parsed with `serde_json`,
+so the resulting `ScalarValue` matches what the server would bind if the
+same value appeared in a JSON request body. This keeps pipeline YAMLs
+portable between `skardi run` and an HTTP `/pipeline/execute` call:
+
+| CLI                        | Server JSON equivalent | Bound type |
+|----------------------------|------------------------|------------|
+| `--param foo=42`           | `{"foo": 42}`          | `Int64`    |
+| `--param foo=3.5`          | `{"foo": 3.5}`         | `Float64`  |
+| `--param foo=true`         | `{"foo": true}`        | `Boolean`  |
+| `--param foo=null`         | `{"foo": null}`        | `Utf8(NULL)` |
+| `--param foo=hello`        | `{"foo": "hello"}`     | `Utf8`     |
+| `--param 'foo:str=42'`     | `{"foo": "42"}`        | `Utf8`     |
+
+Force a specific type explicitly with `NAME:TYPE=VALUE` when the JSON
+form is ambiguous (e.g. a string that happens to look like a number):
 
 ```bash
 # Force "42" to be a string even though it parses as an int
 skardi run my-pipeline --param 'query:str=42' --param 'limit:int=10'
 ```
 
-Supported types: `str` / `string`, `int` / `i64`, `float` / `f64`, `bool`.
+Supported explicit types: `str` / `string`, `int` / `i64`, `float` / `f64`,
+`bool`. Because parsing is strict JSON, `TRUE` / `True` are **not**
+booleans (only lowercase `true` / `false` are), and numbers must have a
+leading digit (`0.5`, not `.5`) — both matching what the server accepts.
 
 ### `alias` — Bind a short verb to a pipeline
 

@@ -24,9 +24,9 @@
 use anyhow::Result;
 use datafusion::common::ScalarValue;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::pipeline::{parse_param_flag, string_to_scalar};
+use crate::pipeline::{Segment, parse_param_flag, scan_segments, string_to_scalar};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasDef {
@@ -37,8 +37,12 @@ pub struct AliasDef {
     pub positional: Vec<String>,
     /// Default values for pipeline params. A value of the form `{other_param}`
     /// is resolved against already-bound params at invocation time.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub defaults: HashMap<String, String>,
+    ///
+    /// `BTreeMap` (not `HashMap`) so YAML serialization is stable — repeated
+    /// `alias add --force` runs produce byte-identical output, keeping
+    /// `aliases.yaml` diffs clean.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -87,7 +91,8 @@ pub fn resolve_alias(alias: &AliasDef, raw_args: &[String]) -> Result<ResolvedAl
         string_params.insert(name.clone(), resolved);
     }
 
-    // Merge: heuristically type string params; flag-typed params win.
+    // Merge: JSON-parse untyped string params (same rules as the server's
+    // `json_to_scalar`); flag-typed params win.
     let mut merged: HashMap<String, ScalarValue> = HashMap::new();
     for (name, value) in string_params {
         merged.insert(name, string_to_scalar(&value));
@@ -139,39 +144,23 @@ fn substitute_template(
     typed_params: &HashMap<String, ScalarValue>,
 ) -> String {
     let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            let mut name = String::new();
-            let mut found_close = false;
-            for inner in chars.by_ref() {
-                if inner == '}' {
-                    found_close = true;
-                    break;
-                }
-                name.push(inner);
-            }
-            let is_ident =
-                !name.is_empty() && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_');
-            if found_close && is_ident {
-                if let Some(v) = string_params.get(&name) {
+    for seg in scan_segments(template) {
+        match seg {
+            Segment::Literal(s) => out.push_str(s),
+            Segment::Placeholder(name) => {
+                if let Some(v) = string_params.get(name) {
                     out.push_str(v);
-                } else if let Some(sv) = typed_params.get(&name) {
+                } else if let Some(sv) = typed_params.get(name) {
                     out.push_str(&scalar_display(sv));
                 } else {
+                    // Unknown name — leave the placeholder verbatim so
+                    // downstream layers (e.g. `render_sql_with_inline_params`)
+                    // can still report a clear "missing value for {name}".
                     out.push('{');
-                    out.push_str(&name);
-                    out.push('}');
-                }
-            } else {
-                out.push('{');
-                out.push_str(&name);
-                if found_close {
+                    out.push_str(name);
                     out.push('}');
                 }
             }
-        } else {
-            out.push(c);
         }
     }
     out

@@ -73,6 +73,65 @@ pub fn discover_pipelines(dirs: &[PathBuf]) -> Result<HashMap<String, (PathBuf, 
     Ok(out)
 }
 
+/// A segment yielded by [`scan_segments`]: either literal text passed
+/// through verbatim, or a recognised `{ident}` placeholder.
+pub(crate) enum Segment<'a> {
+    Literal(&'a str),
+    Placeholder(&'a str),
+}
+
+/// Scan a template string into literal and `{ident}` placeholder segments.
+///
+/// An "ident" is a non-empty run of `{ch | ch.is_alphanumeric() || ch == '_'}`
+/// followed immediately by `}`. Anything else (bare `{`, `{}`,
+/// `{name with space}`, unterminated `{foo`) is emitted as `Literal`.
+///
+/// This is the single source of truth for placeholder scanning — callers
+/// that need param names, inline SQL substitution, or alias template
+/// expansion all drive off these segments so they agree on what counts as a
+/// placeholder.
+pub(crate) fn scan_segments(s: &str) -> Vec<Segment<'_>> {
+    let mut out: Vec<Segment<'_>> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut literal_start = 0usize;
+    let mut i = 0usize;
+
+    while let Some(rel) = bytes[i..].iter().position(|&b| b == b'{') {
+        let brace_at = i + rel;
+        let body_start = brace_at + 1;
+
+        // Consume the longest ident-char run starting at body_start.
+        let mut cursor = body_start;
+        for (rel, ch) in s[body_start..].char_indices() {
+            if ch.is_alphanumeric() || ch == '_' {
+                cursor = body_start + rel + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        let is_placeholder = cursor > body_start && cursor < bytes.len() && bytes[cursor] == b'}';
+        if is_placeholder {
+            if brace_at > literal_start {
+                out.push(Segment::Literal(&s[literal_start..brace_at]));
+            }
+            out.push(Segment::Placeholder(&s[body_start..cursor]));
+            literal_start = cursor + 1;
+            i = literal_start;
+        } else {
+            // Leave the '{' as part of the surrounding literal; keep scanning
+            // after it so a later valid placeholder on the same line is still
+            // recognised (e.g. `{not a param} then {real}`).
+            i = brace_at + 1;
+        }
+    }
+
+    if literal_start < bytes.len() {
+        out.push(Segment::Literal(&s[literal_start..]));
+    }
+    out
+}
+
 /// Render a SQL template by substituting `{name}` placeholders with
 /// SQL-safe literal syntax for the bound parameter values.
 ///
@@ -89,39 +148,33 @@ pub fn render_sql_with_inline_params(
     sql: &str,
     params: &HashMap<String, ScalarValue>,
 ) -> Result<String> {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            let mut name = String::new();
-            let mut found_close = false;
-            for inner in chars.by_ref() {
-                if inner == '}' {
-                    found_close = true;
-                    break;
-                }
-                name.push(inner);
-            }
-            if found_close
-                && !name.is_empty()
-                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-            {
+    let mut out = String::with_capacity(sql.len());
+    for seg in scan_segments(sql) {
+        match seg {
+            Segment::Literal(s) => out.push_str(s),
+            Segment::Placeholder(name) => {
                 let value = params
-                    .get(&name)
+                    .get(name)
                     .ok_or_else(|| anyhow::anyhow!("Missing value for parameter {{{name}}}"))?;
-                result.push_str(&scalar_to_sql_literal(value)?);
-            } else {
-                result.push('{');
-                result.push_str(&name);
-                if found_close {
-                    result.push('}');
-                }
+                out.push_str(&scalar_to_sql_literal(value)?);
             }
-        } else {
-            result.push(c);
         }
     }
-    Ok(result)
+    Ok(out)
+}
+
+/// Render a finite float as a SQL literal. Integers get a `.0` suffix so the
+/// result always parses as a float; non-finite floats (NaN, ±Inf) are
+/// rejected since `NaN` / `inf` are not valid SQL literals.
+fn render_float(f: f64) -> Result<String> {
+    if !f.is_finite() {
+        anyhow::bail!("Non-finite float ({f}) cannot be rendered as a SQL literal");
+    }
+    Ok(if f.fract() == 0.0 {
+        format!("{f:.1}")
+    } else {
+        f.to_string()
+    })
 }
 
 /// Format a `ScalarValue` as a SQL literal. Strings are single-quoted with
@@ -137,20 +190,8 @@ pub fn scalar_to_sql_literal(value: &ScalarValue) -> Result<String> {
         }
         ScalarValue::Int64(Some(i)) => i.to_string(),
         ScalarValue::Int32(Some(i)) => i.to_string(),
-        ScalarValue::Float64(Some(f)) => {
-            if f.fract() == 0.0 && f.is_finite() {
-                format!("{f:.1}")
-            } else {
-                f.to_string()
-            }
-        }
-        ScalarValue::Float32(Some(f)) => {
-            if f.fract() == 0.0 && f.is_finite() {
-                format!("{f:.1}")
-            } else {
-                f.to_string()
-            }
-        }
+        ScalarValue::Float64(Some(f)) => render_float(*f)?,
+        ScalarValue::Float32(Some(f)) => render_float(*f as f64)?,
         ScalarValue::Boolean(Some(b)) => {
             if *b {
                 "TRUE".to_string()
@@ -171,47 +212,57 @@ pub fn scalar_to_sql_literal(value: &ScalarValue) -> Result<String> {
 /// first-seen order. Used to validate that every placeholder has a bound value.
 pub fn extract_param_names(sql: &str) -> Vec<String> {
     let mut params: Vec<String> = Vec::new();
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            let mut name = String::new();
-            let mut found = false;
-            for inner in chars.by_ref() {
-                if inner == '}' {
-                    found = true;
-                    break;
-                }
-                name.push(inner);
-            }
-            if found
-                && !name.is_empty()
-                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-                && !params.contains(&name)
-            {
-                params.push(name);
-            }
+    for seg in scan_segments(sql) {
+        if let Segment::Placeholder(name) = seg
+            && !params.iter().any(|p| p == name)
+        {
+            params.push(name.to_string());
         }
     }
     params
 }
 
-/// Convert a CLI string value into a `ScalarValue` using a simple heuristic:
-/// bool → Boolean, integer → Int64, float → Float64, otherwise Utf8.
+/// Infer a `ScalarValue` for a raw CLI parameter string by parsing it with
+/// `serde_json`. This deliberately mirrors the server's JSON-typed parameter
+/// binding (see `crates/server/src/handlers.rs::json_to_scalar`), so an
+/// invocation of
 ///
-/// Users who need to force a string for a numeric-looking value should wrap it
-/// as a raw `str:` prefix (see `parse_param_flag`).
+/// | CLI                                | Server JSON equivalent |
+/// |------------------------------------|------------------------|
+/// | `--param foo=42`                   | `{"foo": 42}`          |
+/// | `--param foo=3.14`                 | `{"foo": 3.14}`        |
+/// | `--param foo=true`                 | `{"foo": true}`        |
+/// | `--param foo=null`                 | `{"foo": null}`        |
+/// | `--param foo=hello`                | `{"foo": "hello"}`     |
+/// | `--param 'foo:str=42'`             | `{"foo": "42"}`        |
+///
+/// produces the same `ScalarValue` on both sides. For anything that does not
+/// parse as a JSON primitive (objects, arrays, or just plain free text that
+/// isn't a JSON value) we fall back to treating the raw input as `Utf8`,
+/// which is the only reasonable default for an arbitrary shell argument.
+///
+/// Callers that want to pin a type unambiguously can still use
+/// `NAME:TYPE=VALUE` (see [`parse_param_flag`]).
 pub fn string_to_scalar(value: &str) -> ScalarValue {
-    if value.eq_ignore_ascii_case("true") {
-        return ScalarValue::Boolean(Some(true));
-    }
-    if value.eq_ignore_ascii_case("false") {
-        return ScalarValue::Boolean(Some(false));
-    }
-    if let Ok(i) = value.parse::<i64>() {
-        return ScalarValue::Int64(Some(i));
-    }
-    if let Ok(f) = value.parse::<f64>() {
-        return ScalarValue::Float64(Some(f));
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) {
+        match parsed {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    return ScalarValue::Int64(Some(i));
+                }
+                if let Some(f) = n.as_f64() {
+                    return ScalarValue::Float64(Some(f));
+                }
+            }
+            serde_json::Value::Bool(b) => return ScalarValue::Boolean(Some(b)),
+            serde_json::Value::Null => return ScalarValue::Utf8(None),
+            serde_json::Value::String(s) => return ScalarValue::Utf8(Some(s)),
+            // Objects / arrays: fall through to the raw-string path. The CLI
+            // can't render a List as a SQL literal anyway (see
+            // `scalar_to_sql_literal`), and objects aren't a supported
+            // pipeline-param shape on either CLI or server.
+            _ => {}
+        }
     }
     ScalarValue::Utf8(Some(value.to_string()))
 }
@@ -269,13 +320,41 @@ mod tests {
     }
 
     #[test]
-    fn string_to_scalar_heuristic_covers_common_cases() {
+    fn string_to_scalar_mirrors_server_json_typing() {
+        // Primitives that have a natural JSON form should produce the same
+        // ScalarValue that the server's `json_to_scalar` would produce for
+        // `{"x": <same value>}`.
         assert_eq!(string_to_scalar("42"), ScalarValue::Int64(Some(42)));
-        assert_eq!(string_to_scalar("3.14"), ScalarValue::Float64(Some(3.14)));
+        assert_eq!(string_to_scalar("-7"), ScalarValue::Int64(Some(-7)));
+        assert_eq!(string_to_scalar("0.5"), ScalarValue::Float64(Some(0.5)));
+        assert_eq!(string_to_scalar("1e3"), ScalarValue::Float64(Some(1e3)));
         assert_eq!(string_to_scalar("true"), ScalarValue::Boolean(Some(true)));
+        assert_eq!(string_to_scalar("false"), ScalarValue::Boolean(Some(false)));
+        // JSON null → Utf8(None), matching `json_to_scalar`'s handling of
+        // `Value::Null`. This is the only way to pass SQL NULL via --param.
+        assert_eq!(string_to_scalar("null"), ScalarValue::Utf8(None));
+        // A JSON-quoted string strips the quotes and becomes Utf8.
+        assert_eq!(
+            string_to_scalar("\"hello\""),
+            ScalarValue::Utf8(Some("hello".to_string()))
+        );
+        // Anything that isn't a JSON primitive is just a string.
         assert_eq!(
             string_to_scalar("hello"),
             ScalarValue::Utf8(Some("hello".to_string()))
+        );
+        // Strict JSON rules mean `TRUE` / `True` are NOT recognised as
+        // booleans — matching the server, which only honours JSON's lowercase
+        // `true`/`false`. This also eliminates the case-insensitive quirk of
+        // the old heuristic.
+        assert_eq!(
+            string_to_scalar("TRUE"),
+            ScalarValue::Utf8(Some("TRUE".to_string()))
+        );
+        // Strict JSON also means `.5` (no leading zero) is not a number.
+        assert_eq!(
+            string_to_scalar(".5"),
+            ScalarValue::Utf8(Some(".5".to_string()))
         );
     }
 
@@ -361,5 +440,18 @@ mod tests {
             scalar_to_sql_literal(&ScalarValue::Utf8(None)).unwrap(),
             "NULL"
         );
+    }
+
+    #[test]
+    fn scalar_to_sql_literal_rejects_non_finite_floats() {
+        // NaN / ±Inf have no valid SQL literal form; silently emitting
+        // `NaN` / `inf` would let a malformed pipeline run and fail later
+        // inside DataFusion with a confusing SQL parse error.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(scalar_to_sql_literal(&ScalarValue::Float64(Some(bad))).is_err());
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(scalar_to_sql_literal(&ScalarValue::Float32(Some(bad))).is_err());
+        }
     }
 }

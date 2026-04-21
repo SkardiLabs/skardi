@@ -113,11 +113,10 @@ pub fn save(path: &Path, map: &AliasMap) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn sample_alias() -> AliasDef {
-        let mut defaults = HashMap::new();
+        let mut defaults = BTreeMap::new();
         defaults.insert("text_query".to_string(), "{query}".to_string());
         defaults.insert("limit".to_string(), "10".to_string());
         AliasDef {
@@ -150,5 +149,42 @@ mod tests {
         let path = dir.path().join("does-not-exist.yaml");
         let loaded = load(&path).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    /// Regression guard: the bundled demo alias files should continue to load
+    /// under the `BTreeMap<String, String>` defaults shape. They were
+    /// hand-written before the HashMap→BTreeMap switch, so this catches any
+    /// deserialization drift (e.g. a key type mismatch, rename, …).
+    #[test]
+    fn demo_alias_files_still_load() {
+        // Walk up from `crates/cli/src/` to the repo root so the test works
+        // regardless of how cargo invokes it.
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("cli crate lives under <repo>/crates/cli")
+            .to_path_buf();
+
+        for rel in [
+            "demo/llm_wiki/cli/aliases.yaml",
+            "demo/rag/cli/aliases.yaml",
+        ] {
+            let path = repo_root.join(rel);
+            let loaded =
+                load(&path).unwrap_or_else(|e| panic!("failed to load {}: {e:?}", path.display()));
+            assert!(
+                !loaded.is_empty(),
+                "{} parsed but produced no aliases",
+                path.display()
+            );
+            // Every entry must have a non-empty pipeline target.
+            for (name, def) in &loaded {
+                assert!(
+                    !def.pipeline.is_empty(),
+                    "alias {name} in {} has empty pipeline",
+                    path.display()
+                );
+            }
+        }
     }
 }

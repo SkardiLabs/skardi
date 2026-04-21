@@ -51,7 +51,7 @@ use skardi::sources::providers::{
     },
     sqlx::postgres::register_postgres_tables,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -210,18 +210,25 @@ impl LocalDataSource {
 /// `override_path` (`--ctx`) and `SKARDICONFIG` both accept either a file
 /// (used directly) or a directory (we append `ctx.yaml` by convention). The
 /// default when neither is given is `~/.skardi/config/ctx.yaml`.
-fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(p) = override_path {
-        return Ok(if p.is_dir() { p.join("ctx.yaml") } else { p });
+///
+/// Returns `None` only when no override / env is set and the platform has no
+/// home directory — the rare case where we have no path to fall back to.
+/// Callers that need to fail on that can use `.ok_or_else(...)`; callers
+/// that can tolerate no ctx (e.g. alias dispatch, `skardi run` with a
+/// pipeline that needs no data sources) can use `.ok()`.
+fn resolve_ctx_path(override_path: Option<&Path>) -> Option<PathBuf> {
+    let source = override_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("SKARDICONFIG").ok().map(PathBuf::from));
+    if let Some(p) = source {
+        return Some(if p.is_dir() { p.join("ctx.yaml") } else { p });
     }
-    if let Ok(env_path) = std::env::var("SKARDICONFIG") {
-        let p = PathBuf::from(env_path);
-        return Ok(if p.is_dir() { p.join("ctx.yaml") } else { p });
-    }
-    let home = dirs::home_dir().ok_or_else(|| {
-        anyhow::anyhow!("Could not determine home directory for default ctx path")
-    })?;
-    Ok(home.join(".skardi").join("config").join("ctx.yaml"))
+    Some(
+        dirs::home_dir()?
+            .join(".skardi")
+            .join("config")
+            .join("ctx.yaml"),
+    )
 }
 
 /// Check if a path string refers to a remote object store location.
@@ -523,7 +530,8 @@ async fn main() -> Result<()> {
                 if !all && table.is_none() {
                     anyhow::bail!("With --schema, provide --all or -t TABLE");
                 }
-                let ctx_path = resolve_ctx_path(ctx)?;
+                let ctx_path = resolve_ctx_path(ctx.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("Could not resolve a ctx path (no --ctx, no SKARDICONFIG, no home directory)"))?;
                 let table_filter = if all { None } else { table.as_deref() };
                 show_schema(&ctx_path, table_filter).await
             } else {
@@ -559,7 +567,7 @@ async fn main() -> Result<()> {
             let (ctx_override, pipeline_dir_override, aliases_override, alias_args) =
                 split_control_flags(rest)?;
 
-            let default_ctx = resolve_ctx_path_opt();
+            let default_ctx = resolve_ctx_path(None);
             let aliases_path = resolve_aliases_path(
                 aliases_override.as_deref(),
                 ctx_override.as_deref().or_else(|| default_ctx.as_deref()),
@@ -660,17 +668,6 @@ fn split_control_flags(
     }
 
     Ok((ctx, pipeline_dir, aliases, rest))
-}
-
-/// Resolve the ctx path using the same defaults as [`resolve_ctx_path`], but
-/// returning None (instead of an error) when no home directory is available.
-/// Honours the file-or-directory auto-detect on `SKARDICONFIG`.
-fn resolve_ctx_path_opt() -> Option<PathBuf> {
-    if let Ok(env_path) = std::env::var("SKARDICONFIG") {
-        let p = PathBuf::from(env_path);
-        return Some(if p.is_dir() { p.join("ctx.yaml") } else { p });
-    }
-    dirs::home_dir().map(|h| h.join(".skardi").join("config").join("ctx.yaml"))
 }
 
 /// Load a context YAML and register all data sources (local files, remote files, databases).
@@ -941,14 +938,12 @@ async fn run_query(ctx_override: Option<PathBuf>, sql: &str) -> Result<()> {
     let (mut session_ctx, dataset_registry) = new_session_context();
 
     // Try to load context file, but don't fail if not found when no explicit --ctx was given
-    let ctx_path_result = resolve_ctx_path(ctx_override.clone());
-    match ctx_path_result {
-        Ok(ctx_path) if ctx_path.exists() => {
+    match resolve_ctx_path(ctx_override.as_deref()) {
+        Some(ctx_path) if ctx_path.exists() => {
             load_and_register_all(&ctx_path, &mut session_ctx, &dataset_registry).await?;
         }
-        Ok(_) if ctx_override.is_some() => {
-            let path = resolve_ctx_path(ctx_override)?;
-            anyhow::bail!("Context file not found: {}", path.display());
+        Some(ctx_path) if ctx_override.is_some() => {
+            anyhow::bail!("Context file not found: {}", ctx_path.display());
         }
         _ => {
             // No context file found via defaults — that's fine, run without
@@ -1023,7 +1018,7 @@ async fn run_pipeline_with_params(
     // 1. Resolve ctx path: if a --ctx was given, it must exist; otherwise
     //    default to whatever `resolve_ctx_path` returns (may be missing, and
     //    that's fine — pipelines that need no data sources can still run).
-    let ctx_path = resolve_ctx_path(ctx_override.clone()).ok();
+    let ctx_path = resolve_ctx_path(ctx_override.as_deref());
     let ctx_path_for_load: Option<PathBuf> = match &ctx_path {
         Some(p) if p.exists() => Some(p.clone()),
         Some(p) if ctx_override.is_some() => {
@@ -1227,7 +1222,7 @@ fn alias_add(
         })
         .unwrap_or_default();
 
-    let mut defaults_map: HashMap<String, String> = HashMap::new();
+    let mut defaults_map: BTreeMap<String, String> = BTreeMap::new();
     for raw in &defaults {
         let (k, v) = raw
             .split_once('=')
@@ -1286,10 +1281,7 @@ fn try_load_pipeline_params(
     ctx_override: Option<&Path>,
 ) -> Result<Option<Vec<String>>> {
     // Parse ctx if provided so `pipelines_dir` can point us at the pipelines.
-    let ctx_path = ctx_override
-        .map(|p| p.to_path_buf())
-        .or_else(resolve_ctx_path_opt)
-        .filter(|p| p.exists());
+    let ctx_path = resolve_ctx_path(ctx_override).filter(|p| p.exists());
     let ctx_cfg: Option<LocalContextConfig> = match &ctx_path {
         Some(p) => {
             let content = std::fs::read_to_string(p)
@@ -1315,7 +1307,7 @@ fn validate_alias_against_pipeline(
     pipeline: &str,
     pipeline_params: &[String],
     positional: &[String],
-    defaults: &HashMap<String, String>,
+    defaults: &BTreeMap<String, String>,
 ) -> Result<()> {
     let known: std::collections::HashSet<&str> =
         pipeline_params.iter().map(|s| s.as_str()).collect();
@@ -1344,7 +1336,7 @@ fn report_alias_coverage(
     pipeline: &str,
     pipeline_params: &[String],
     positional: &[String],
-    defaults: &HashMap<String, String>,
+    defaults: &BTreeMap<String, String>,
 ) {
     let positional_set: std::collections::HashSet<&str> =
         positional.iter().map(|s| s.as_str()).collect();
@@ -1526,7 +1518,7 @@ mod tests {
     #[test]
     fn validate_alias_rejects_unknown_positional() {
         let params = vec!["query".to_string(), "limit".to_string()];
-        let defaults = HashMap::new();
+        let defaults = BTreeMap::new();
         let positional = vec!["qeury".to_string()]; // typo
         let err = validate_alias_against_pipeline("p", &params, &positional, &defaults)
             .unwrap_err()
@@ -1541,7 +1533,7 @@ mod tests {
     #[test]
     fn validate_alias_rejects_unknown_default() {
         let params = vec!["query".to_string(), "limit".to_string()];
-        let mut defaults = HashMap::new();
+        let mut defaults = BTreeMap::new();
         defaults.insert("limmit".to_string(), "10".to_string()); // typo
         let positional: Vec<String> = Vec::new();
         let err = validate_alias_against_pipeline("p", &params, &positional, &defaults)
@@ -1556,7 +1548,7 @@ mod tests {
     #[test]
     fn validate_alias_accepts_fully_known_names() {
         let params = vec!["query".to_string(), "limit".to_string()];
-        let mut defaults = HashMap::new();
+        let mut defaults = BTreeMap::new();
         defaults.insert("limit".to_string(), "10".to_string());
         let positional = vec!["query".to_string()];
         validate_alias_against_pipeline("p", &params, &positional, &defaults).unwrap();
@@ -1564,7 +1556,7 @@ mod tests {
 
     #[test]
     fn annotate_bindings_labels_positional_default_and_unbound() {
-        let mut defaults = HashMap::new();
+        let mut defaults = BTreeMap::new();
         defaults.insert("limit".to_string(), "10".to_string());
         let alias = AliasDef {
             pipeline: "p".to_string(),
@@ -1588,5 +1580,101 @@ mod tests {
         assert_eq!(got[2].0, "text_query");
         assert!(got[2].1.contains("flag-only"));
         assert!(got[2].1.contains("--text_query"));
+    }
+
+    // End-to-end guards for `skardi run` — drive `run_pipeline_with_params`
+    // with a tempdir of pipeline YAMLs, no ctx, and assert we actually make
+    // it through discovery → param validation → inline render → DataFusion
+    // execution. These close the gap that existed when only the pure helpers
+    // (extract_param_names, render_sql_with_inline_params, …) were
+    // individually unit-tested.
+    mod run_pipeline_e2e {
+        use super::*;
+        use tempfile::TempDir;
+
+        fn write_pipeline(dir: &Path, filename: &str, yaml: &str) {
+            std::fs::write(dir.join(filename), yaml).unwrap();
+        }
+
+        #[tokio::test]
+        async fn runs_pipeline_with_inline_params() {
+            let tmp = TempDir::new().unwrap();
+            write_pipeline(
+                tmp.path(),
+                "echo.yaml",
+                r#"metadata:
+  name: "echo"
+query: |
+  SELECT {x} AS val, {msg} AS note
+"#,
+            );
+
+            let params = vec![
+                ("x".to_string(), ScalarValue::Int64(Some(42))),
+                (
+                    "msg".to_string(),
+                    ScalarValue::Utf8(Some("hi there".to_string())),
+                ),
+            ];
+
+            run_pipeline_with_params(None, Some(tmp.path().to_path_buf()), "echo", params)
+                .await
+                .expect("pipeline should execute cleanly");
+        }
+
+        #[tokio::test]
+        async fn errors_when_required_param_missing() {
+            let tmp = TempDir::new().unwrap();
+            write_pipeline(
+                tmp.path(),
+                "needs.yaml",
+                r#"metadata:
+  name: "needs"
+query: |
+  SELECT {required} AS val
+"#,
+            );
+
+            let err =
+                run_pipeline_with_params(None, Some(tmp.path().to_path_buf()), "needs", vec![])
+                    .await
+                    .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("required"),
+                "error should name the missing param: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_when_pipeline_name_unknown() {
+            let tmp = TempDir::new().unwrap();
+            write_pipeline(
+                tmp.path(),
+                "only_this_one.yaml",
+                r#"metadata:
+  name: "only-this-one"
+query: "SELECT 1"
+"#,
+            );
+
+            let err = run_pipeline_with_params(
+                None,
+                Some(tmp.path().to_path_buf()),
+                "does-not-exist",
+                vec![],
+            )
+            .await
+            .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("does-not-exist"),
+                "error should name the missing pipeline: {msg}"
+            );
+            assert!(
+                msg.contains("only-this-one"),
+                "error should list known pipelines: {msg}"
+            );
+        }
     }
 }
