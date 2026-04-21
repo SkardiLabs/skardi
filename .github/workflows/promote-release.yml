@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   promote-release:
@@ -46,8 +47,82 @@ jobs:
           echo "official=$OFFICIAL" >> $GITHUB_OUTPUT
           echo "Promoting $RC_TAG -> $OFFICIAL"
 
-      - name: Create and push tag
+      - name: Install Rust
+        run: rustup toolchain install stable
+
+      - name: Bump version in Cargo.toml and open PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          OFFICIAL="${{ steps.version.outputs.official }}"
+          VERSION="${OFFICIAL#v}"
+          BRANCH="release/bump-${OFFICIAL}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clean up any leftover remote branch from a previous run
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
+          git checkout -b "$BRANCH"
+
+          # Replace the version line in the workspace Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          cargo update -p skardi --precise "${VERSION}"
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${VERSION}"
+          git push --force origin "$BRANCH"
+
+          PR_URL=$(gh pr create \
+            --title "chore: bump version to ${VERSION}" \
+            --body "Automated version bump to \`${VERSION}\` promoting \`${{ inputs.rc_tag }}\` to \`${OFFICIAL}\`." \
+            --base main \
+            --head "$BRANCH")
+
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "PR created: $PR_URL"
+
+      - name: Wait for PR to be merged (1 hour timeout)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_URL="${{ steps.pr.outputs.pr_url }}"
+          TIMEOUT=3600
+          INTERVAL=30
+          ELAPSED=0
+
+          echo "Waiting for PR to be merged: $PR_URL"
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATE=$(gh pr view "$PR_URL" --json state --jq '.state')
+
+            if [ "$STATE" = "MERGED" ]; then
+              echo "PR merged successfully."
+              break
+            elif [ "$STATE" = "CLOSED" ]; then
+              echo "Error: PR was closed without merging."
+              exit 1
+            fi
+
+            echo "PR state: $STATE — waiting ${INTERVAL}s (elapsed: ${ELAPSED}s / ${TIMEOUT}s)"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "Error: Timed out after ${TIMEOUT}s waiting for PR to be merged."
+            exit 1
+          fi
+
+      - name: Fetch merged main and create tag
+        run: |
+          git fetch origin main
+          git checkout main
+          git pull origin main
+
           OFFICIAL="${{ steps.version.outputs.official }}"
           git tag "$OFFICIAL"
           git push origin "$OFFICIAL"
+          echo "Tagged: $OFFICIAL"
