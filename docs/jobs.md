@@ -10,6 +10,17 @@ SQLite ledger, and is polled by run id.
 **In one sentence:** a pipeline answers a query; a job commits the answer
 somewhere you can query again later.
 
+### Why this is a first-class primitive, not just "a long-running pipeline"
+
+Jobs are the write path for agent autonomy. An agent that can only answer
+queries is a search engine; an agent that can commit durable, queryable
+results to the lake is a data engineer. The part that separates the two —
+atomic commits, run ledger, submit-time schema diff, crash recovery,
+cancellation — is exactly what makes agent-initiated writes *safe* without
+requiring a human in the approval loop. See
+[docs/spark_for_agents.md § Trust the agent, but make writes safe](spark_for_agents.md#4-trust-the-agent-but-make-writes-safe)
+for the design rationale.
+
 ---
 
 ## When to use a job
