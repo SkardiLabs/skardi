@@ -8071,6 +8071,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "skardi",
+ "tempfile",
  "tokio",
  "url",
 ]

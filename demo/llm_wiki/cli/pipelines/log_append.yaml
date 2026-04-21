@@ -1,0 +1,20 @@
+metadata:
+  name: "wiki-log-append"
+  version: "1.0.0"
+  description: >
+    Append an activity entry to wiki_log (agent `log` primitive).
+    `created_at` is populated explicitly from DataFusion's `now()` rather
+    than relying on SQLite's column default, because the DataFusion INSERT
+    path binds NULL for any column not in the target list.
+
+# Parameters:
+#   {event_type}  - ingest | query | lint | note
+#   {slug}        - Related page slug, or "" if not page-specific
+#   {message}     - Free-form human-readable message
+
+query: |
+  INSERT INTO wiki.main.wiki_log (event_type, slug, message, created_at)
+  SELECT event_type, slug, message, CAST(now() AS VARCHAR)
+  FROM (
+    SELECT {event_type} AS event_type, {slug} AS slug, {message} AS message
+  ) AS t

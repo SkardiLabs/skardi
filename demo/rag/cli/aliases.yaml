@@ -1,0 +1,30 @@
+ingest:
+  pipeline: ingest
+  positional:
+    - doc_id
+    - content
+  description: Insert one document (id, content) — computes embedding inline
+grep:
+  pipeline: search-hybrid
+  positional:
+    - query
+  defaults:
+    text_query: "{query}"
+    vector_weight: "0.5"
+    text_weight: "0.5"
+    limit: "10"
+  description: Hybrid search (RRF of sqlite_knn + sqlite_fts)
+vec:
+  pipeline: search-vector
+  positional:
+    - query
+  defaults:
+    limit: "10"
+  description: Vector-only KNN via sqlite_knn
+fts:
+  pipeline: search-fulltext
+  positional:
+    - query
+  defaults:
+    limit: "10"
+  description: Full-text-only search via sqlite_fts

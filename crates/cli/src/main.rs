@@ -1,8 +1,15 @@
+mod alias;
+mod alias_store;
+mod pipeline;
+
+use alias::{AliasDef, resolve_alias};
+use alias_store::{AliasMap, resolve_aliases_path};
 use anyhow::{Context, Result};
 use arrow::util::pretty::pretty_format_batches;
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use datafusion::catalog::UrlTableFactory;
+use datafusion::common::ScalarValue;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::dynamic_file::DynamicListTableFactory;
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -15,6 +22,9 @@ use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
+use pipeline::{
+    discover_pipelines, extract_param_names, parse_param_flag, render_sql_with_inline_params,
+};
 use serde::Deserialize;
 #[cfg(feature = "candle")]
 use skardi::model::CandleModelRegistry;
@@ -41,7 +51,7 @@ use skardi::sources::providers::{
     },
     sqlx::postgres::register_postgres_tables,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -80,11 +90,94 @@ enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
     },
+    /// Execute a pipeline YAML by name with named parameters
+    #[command(name = "run")]
+    Run {
+        /// Pipeline name (from `metadata.name` in the YAML)
+        pipeline: String,
+        /// Bind a parameter: NAME=VALUE or NAME:TYPE=VALUE (types: str, int, float, bool)
+        #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
+        /// Path to context YAML (default: SKARDICONFIG env or ~/.skardi/config/ctx.yaml)
+        #[arg(long)]
+        ctx: Option<PathBuf>,
+        /// Override pipeline discovery directory (else uses ctx `pipelines_dir` or CWD)
+        #[arg(long = "pipeline-dir", value_name = "DIR")]
+        pipeline_dir: Option<PathBuf>,
+    },
+    /// Manage CLI aliases (alias a short verb → `run <pipeline>`)
+    #[command(name = "alias")]
+    Alias {
+        #[command(subcommand)]
+        cmd: AliasCmd,
+    },
+    /// Any unknown subcommand is looked up as a user-defined alias and
+    /// dispatched to `run <pipeline>` with the alias's parameter bindings.
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum AliasCmd {
+    /// Add a new alias (or overwrite an existing one with --force)
+    Add {
+        /// Short verb, e.g. `grep`
+        name: String,
+        /// Pipeline name this alias invokes
+        #[arg(long)]
+        pipeline: String,
+        /// Positional pipeline-param names (comma-separated), e.g. `query` or `query,text_query`
+        #[arg(long, value_name = "NAME[,NAME...]")]
+        positional: Option<String>,
+        /// Default param value: NAME=VALUE (may contain `{other_param}` references)
+        #[arg(short = 'd', long = "default", value_name = "NAME=VALUE")]
+        defaults: Vec<String>,
+        /// Optional short description
+        #[arg(long)]
+        description: Option<String>,
+        /// Overwrite if the alias already exists
+        #[arg(long)]
+        force: bool,
+        /// Override aliases file path
+        #[arg(long)]
+        aliases: Option<PathBuf>,
+        /// Ctx file used to derive default aliases file location (and to
+        /// locate the pipeline YAML for param validation).
+        #[arg(long)]
+        ctx: Option<PathBuf>,
+    },
+    /// List all known aliases
+    List {
+        #[arg(long)]
+        aliases: Option<PathBuf>,
+        #[arg(long)]
+        ctx: Option<PathBuf>,
+    },
+    /// Show one alias in YAML form
+    Show {
+        name: String,
+        #[arg(long)]
+        aliases: Option<PathBuf>,
+        #[arg(long)]
+        ctx: Option<PathBuf>,
+    },
+    /// Remove an alias
+    Remove {
+        name: String,
+        #[arg(long)]
+        aliases: Option<PathBuf>,
+        #[arg(long)]
+        ctx: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 struct LocalContextConfig {
     data_sources: Vec<LocalDataSource>,
+    /// Directory containing pipeline YAMLs for `skardi run`. Relative paths
+    /// are resolved against the ctx file's parent directory.
+    #[serde(default)]
+    pipelines_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,17 +205,30 @@ impl LocalDataSource {
     }
 }
 
-fn resolve_ctx_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(p) = override_path {
-        return Ok(p);
+/// Resolve the ctx YAML file path.
+///
+/// `override_path` (`--ctx`) and `SKARDICONFIG` both accept either a file
+/// (used directly) or a directory (we append `ctx.yaml` by convention). The
+/// default when neither is given is `~/.skardi/config/ctx.yaml`.
+///
+/// Returns `None` only when no override / env is set and the platform has no
+/// home directory — the rare case where we have no path to fall back to.
+/// Callers that need to fail on that can use `.ok_or_else(...)`; callers
+/// that can tolerate no ctx (e.g. alias dispatch, `skardi run` with a
+/// pipeline that needs no data sources) can use `.ok()`.
+fn resolve_ctx_path(override_path: Option<&Path>) -> Option<PathBuf> {
+    let source = override_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("SKARDICONFIG").ok().map(PathBuf::from));
+    if let Some(p) = source {
+        return Some(if p.is_dir() { p.join("ctx.yaml") } else { p });
     }
-    if let Ok(env_path) = std::env::var("SKARDICONFIG") {
-        return Ok(PathBuf::from(env_path));
-    }
-    let home = dirs::home_dir().ok_or_else(|| {
-        anyhow::anyhow!("Could not determine home directory for default ctx path")
-    })?;
-    Ok(home.join(".skardi").join("config").join("ctx.yaml"))
+    Some(
+        dirs::home_dir()?
+            .join(".skardi")
+            .join("config")
+            .join("ctx.yaml"),
+    )
 }
 
 /// Check if a path string refers to a remote object store location.
@@ -424,7 +530,8 @@ async fn main() -> Result<()> {
                 if !all && table.is_none() {
                     anyhow::bail!("With --schema, provide --all or -t TABLE");
                 }
-                let ctx_path = resolve_ctx_path(ctx)?;
+                let ctx_path = resolve_ctx_path(ctx.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("Could not resolve a ctx path (no --ctx, no SKARDICONFIG, no home directory)"))?;
                 let table_filter = if all { None } else { table.as_deref() };
                 show_schema(&ctx_path, table_filter).await
             } else {
@@ -439,7 +546,128 @@ async fn main() -> Result<()> {
                 run_query(ctx, &sql_content).await
             }
         }
+        Commands::Run {
+            pipeline,
+            params,
+            ctx,
+            pipeline_dir,
+        } => {
+            let param_bindings = parse_param_flags(&params)?;
+            run_pipeline_by_name(ctx, pipeline_dir, &pipeline, param_bindings).await
+        }
+        Commands::Alias { cmd } => handle_alias_cmd(cmd).await,
+        Commands::External(args) => {
+            // The first token is the alias name; the rest are the alias's args
+            // (plus any control flags we strip out before resolution).
+            if args.is_empty() {
+                anyhow::bail!("No subcommand provided");
+            }
+            let alias_name = args[0].clone();
+            let rest = &args[1..];
+            let (ctx_override, pipeline_dir_override, aliases_override, alias_args) =
+                split_control_flags(rest)?;
+
+            let default_ctx = resolve_ctx_path(None);
+            let aliases_path = resolve_aliases_path(
+                aliases_override.as_deref(),
+                ctx_override.as_deref().or_else(|| default_ctx.as_deref()),
+            );
+            let alias_map = match &aliases_path {
+                Some(p) => alias_store::load(p)?,
+                None => AliasMap::new(),
+            };
+
+            let alias_def = alias_map.get(&alias_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown command or alias '{}'. Run `skardi alias list` to see available aliases.",
+                    alias_name
+                )
+            })?;
+
+            // `skardi <alias> --help|-h` short-circuits to a usage view that
+            // lists the alias's positional slots, the pipeline's params, and
+            // each param's binding source.
+            if alias_args.iter().any(|a| a == "--help" || a == "-h") {
+                let pipeline_params =
+                    try_load_pipeline_params(&alias_def.pipeline, ctx_override.as_deref())?;
+                print_alias_help(&alias_name, alias_def, pipeline_params.as_deref());
+                return Ok(());
+            }
+
+            let resolved = resolve_alias(alias_def, &alias_args)?;
+            run_pipeline_with_params(
+                ctx_override,
+                pipeline_dir_override,
+                &resolved.pipeline,
+                resolved.params,
+            )
+            .await
+        }
     }
+}
+
+/// Parse a list of `NAME=VALUE` / `NAME:TYPE=VALUE` strings into typed pairs.
+fn parse_param_flags(raw: &[String]) -> Result<Vec<(String, ScalarValue)>> {
+    raw.iter()
+        .map(|s| parse_param_flag(s))
+        .collect::<Result<Vec<_>>>()
+}
+
+/// Strip control flags (`--ctx`, `--pipeline-dir`, `--aliases`) out of a raw
+/// alias-argument vector so they aren't forwarded to the alias resolver. These
+/// three flags are the CLI's "global" concerns; everything else is left
+/// verbatim and passed to the alias as a pipeline-param binding.
+fn split_control_flags(
+    args: &[String],
+) -> Result<(
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Vec<String>,
+)> {
+    let mut ctx: Option<PathBuf> = None;
+    let mut pipeline_dir: Option<PathBuf> = None;
+    let mut aliases: Option<PathBuf> = None;
+    let mut rest: Vec<String> = Vec::new();
+
+    let take = |target: &mut Option<PathBuf>, value: &str| {
+        *target = Some(PathBuf::from(value));
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let maybe_take = |name: &str, target: &mut Option<PathBuf>| -> Option<usize> {
+            let eq = format!("--{name}=");
+            if let Some(v) = a.strip_prefix(&eq) {
+                take(target, v);
+                return Some(1);
+            }
+            if a == &format!("--{name}") {
+                let next = args.get(i + 1)?;
+                take(target, next);
+                return Some(2);
+            }
+            None
+        };
+
+        if let Some(n) = maybe_take("ctx", &mut ctx) {
+            i += n;
+            continue;
+        }
+        if let Some(n) = maybe_take("pipeline-dir", &mut pipeline_dir) {
+            i += n;
+            continue;
+        }
+        if let Some(n) = maybe_take("aliases", &mut aliases) {
+            i += n;
+            continue;
+        }
+        rest.push(a.clone());
+        i += 1;
+    }
+
+    Ok((ctx, pipeline_dir, aliases, rest))
 }
 
 /// Load a context YAML and register all data sources (local files, remote files, databases).
@@ -710,14 +938,12 @@ async fn run_query(ctx_override: Option<PathBuf>, sql: &str) -> Result<()> {
     let (mut session_ctx, dataset_registry) = new_session_context();
 
     // Try to load context file, but don't fail if not found when no explicit --ctx was given
-    let ctx_path_result = resolve_ctx_path(ctx_override.clone());
-    match ctx_path_result {
-        Ok(ctx_path) if ctx_path.exists() => {
+    match resolve_ctx_path(ctx_override.as_deref()) {
+        Some(ctx_path) if ctx_path.exists() => {
             load_and_register_all(&ctx_path, &mut session_ctx, &dataset_registry).await?;
         }
-        Ok(_) if ctx_override.is_some() => {
-            let path = resolve_ctx_path(ctx_override)?;
-            anyhow::bail!("Context file not found: {}", path.display());
+        Some(ctx_path) if ctx_override.is_some() => {
+            anyhow::bail!("Context file not found: {}", ctx_path.display());
         }
         _ => {
             // No context file found via defaults — that's fine, run without
@@ -765,4 +991,690 @@ fn auto_register_object_stores_from_sql(ctx: &SessionContext, sql: &str) -> Resu
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline execution
+// ---------------------------------------------------------------------------
+
+/// `skardi run <name>` entrypoint — parse `--param` flags, resolve the pipeline
+/// from the discovery dir, substitute `{name}` → `$name`, and execute.
+async fn run_pipeline_by_name(
+    ctx_override: Option<PathBuf>,
+    pipeline_dir_override: Option<PathBuf>,
+    pipeline_name: &str,
+    params: Vec<(String, ScalarValue)>,
+) -> Result<()> {
+    run_pipeline_with_params(ctx_override, pipeline_dir_override, pipeline_name, params).await
+}
+
+/// Shared execution path used by both `skardi run` and alias dispatch.
+async fn run_pipeline_with_params(
+    ctx_override: Option<PathBuf>,
+    pipeline_dir_override: Option<PathBuf>,
+    pipeline_name: &str,
+    params: Vec<(String, ScalarValue)>,
+) -> Result<()> {
+    // 1. Resolve ctx path: if a --ctx was given, it must exist; otherwise
+    //    default to whatever `resolve_ctx_path` returns (may be missing, and
+    //    that's fine — pipelines that need no data sources can still run).
+    let ctx_path = resolve_ctx_path(ctx_override.as_deref());
+    let ctx_path_for_load: Option<PathBuf> = match &ctx_path {
+        Some(p) if p.exists() => Some(p.clone()),
+        Some(p) if ctx_override.is_some() => {
+            anyhow::bail!("Context file not found: {}", p.display());
+        }
+        _ => None,
+    };
+
+    // Read ctx (if present) up front so we can discover pipelines before
+    // registering data sources — errors on the pipeline side should surface
+    // before we pay the cost of connecting to Postgres/Mongo/etc.
+    let ctx_cfg: Option<LocalContextConfig> = match &ctx_path_for_load {
+        Some(p) => {
+            let content = std::fs::read_to_string(p)
+                .with_context(|| format!("Failed to read context file: {}", p.display()))?;
+            Some(serde_yaml::from_str(&content).context("Failed to parse context YAML")?)
+        }
+        None => None,
+    };
+
+    let pipeline_dirs = resolve_pipeline_dirs(
+        pipeline_dir_override.as_ref(),
+        ctx_cfg.as_ref(),
+        ctx_path_for_load.as_deref(),
+    );
+
+    let pipelines = discover_pipelines(&pipeline_dirs).with_context(|| {
+        format!(
+            "Failed to discover pipelines in {:?}",
+            pipeline_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        )
+    })?;
+
+    let (pipeline_path, pipeline_file) = pipelines.get(pipeline_name).ok_or_else(|| {
+        let mut names: Vec<&String> = pipelines.keys().collect();
+        names.sort();
+        anyhow::anyhow!(
+            "Pipeline '{}' not found. Searched: {:?}. Known pipelines: {:?}",
+            pipeline_name,
+            pipeline_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            names
+        )
+    })?;
+
+    // 2. Validate every placeholder has a bound value, then inline-substitute
+    //    values as SQL literals. We inline rather than use DataFusion's `$name`
+    //    binding because some UDTFs (e.g. `sqlite_fts`) require a string
+    //    literal at plan time — they run before `with_param_values` can
+    //    substitute Placeholder exprs. See `render_sql_with_inline_params`.
+    let expected = extract_param_names(&pipeline_file.query);
+    let params_map: HashMap<String, ScalarValue> = params.into_iter().collect();
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|n| !params_map.contains_key(n.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Pipeline '{}' (from {}) is missing required parameter(s): {}",
+            pipeline_name,
+            pipeline_path.display(),
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let sql = render_sql_with_inline_params(&pipeline_file.query, &params_map)
+        .with_context(|| format!("Failed to render SQL for pipeline '{}'", pipeline_name))?;
+
+    // 3. Build a SessionContext with ctx data sources registered, then execute.
+    let (mut session_ctx, dataset_registry) = new_session_context();
+    if let Some(p) = &ctx_path_for_load {
+        load_and_register_all(p, &mut session_ctx, &dataset_registry).await?;
+    }
+
+    auto_register_object_stores_from_sql(&session_ctx, &sql)?;
+
+    let df = session_ctx
+        .sql(&sql)
+        .await
+        .with_context(|| format!("Failed to plan pipeline '{}'", pipeline_name))?;
+    let batches = df
+        .collect()
+        .await
+        .context("Failed to collect pipeline results")?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    if total_rows > 0 {
+        let formatted = pretty_format_batches(&batches).context("Failed to format results")?;
+        println!("{formatted}");
+    }
+    println!("\n{total_rows} row(s) returned");
+    Ok(())
+}
+
+/// Resolve the list of directories to scan for pipeline YAMLs.
+///
+/// Priority:
+/// 1. Explicit `--pipeline-dir` flag.
+/// 2. `pipelines_dir` from ctx.yaml (relative paths resolved against ctx dir).
+/// 3. `<ctx_dir>/pipelines/` convention — used when it exists on disk.
+/// 4. No default — returns empty vec.
+fn resolve_pipeline_dirs(
+    override_dir: Option<&PathBuf>,
+    ctx_cfg: Option<&LocalContextConfig>,
+    ctx_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    if let Some(d) = override_dir {
+        return vec![d.clone()];
+    }
+    let ctx_dir: Option<PathBuf> = ctx_path.and_then(|p| p.parent().map(|x| x.to_path_buf()));
+    if let Some(cfg) = ctx_cfg {
+        if let Some(rel) = &cfg.pipelines_dir {
+            let resolved = if rel.is_absolute() {
+                rel.clone()
+            } else if let Some(ctx_dir) = &ctx_dir {
+                ctx_dir.join(rel)
+            } else {
+                rel.clone()
+            };
+            return vec![resolved];
+        }
+    }
+    // Convention fallback: `<ctx_dir>/pipelines/`.
+    if let Some(d) = ctx_dir {
+        let conv = d.join("pipelines");
+        if conv.is_dir() {
+            return vec![conv];
+        }
+    }
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Alias management (`skardi alias add/list/show/remove`)
+// ---------------------------------------------------------------------------
+
+async fn handle_alias_cmd(cmd: AliasCmd) -> Result<()> {
+    match cmd {
+        AliasCmd::Add {
+            name,
+            pipeline,
+            positional,
+            defaults,
+            description,
+            force,
+            aliases,
+            ctx,
+        } => alias_add(
+            name,
+            pipeline,
+            positional,
+            defaults,
+            description,
+            force,
+            aliases,
+            ctx,
+        ),
+        AliasCmd::List { aliases, ctx } => alias_list(aliases, ctx),
+        AliasCmd::Show { name, aliases, ctx } => alias_show(name, aliases, ctx),
+        AliasCmd::Remove { name, aliases, ctx } => alias_remove(name, aliases, ctx),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alias_add(
+    name: String,
+    pipeline: String,
+    positional: Option<String>,
+    defaults: Vec<String>,
+    description: Option<String>,
+    force: bool,
+    aliases: Option<PathBuf>,
+    ctx: Option<PathBuf>,
+) -> Result<()> {
+    let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
+    let mut map = alias_store::load(&path)?;
+    if map.contains_key(&name) && !force {
+        anyhow::bail!(
+            "Alias '{name}' already exists. Use --force to overwrite. \
+             Current target: {}",
+            map[&name].pipeline
+        );
+    }
+
+    let positional_vec: Vec<String> = positional
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut defaults_map: BTreeMap<String, String> = BTreeMap::new();
+    for raw in &defaults {
+        let (k, v) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--default must be NAME=VALUE, got: {raw}"))?;
+        if k.is_empty() {
+            anyhow::bail!("--default NAME must not be empty: {raw}");
+        }
+        defaults_map.insert(k.to_string(), v.to_string());
+    }
+
+    // Validate positional/default names against the pipeline's real `{param}`
+    // placeholders when we can find the pipeline. A missing pipeline is a
+    // non-fatal warning so aliases can be authored before their target.
+    match try_load_pipeline_params(&pipeline, ctx.as_deref())? {
+        Some(pipeline_params) => {
+            validate_alias_against_pipeline(
+                &pipeline,
+                &pipeline_params,
+                &positional_vec,
+                &defaults_map,
+            )?;
+            report_alias_coverage(&pipeline, &pipeline_params, &positional_vec, &defaults_map);
+        }
+        None => {
+            eprintln!(
+                "note: pipeline '{pipeline}' not found in `pipelines_dir` — saving alias without \
+                 param validation. Once the pipeline is on disk, re-run `alias show {name}` to \
+                 confirm bindings."
+            );
+        }
+    }
+
+    map.insert(
+        name.clone(),
+        AliasDef {
+            pipeline: pipeline.clone(),
+            positional: positional_vec,
+            defaults: defaults_map,
+            description,
+        },
+    );
+    alias_store::save(&path, &map)?;
+    println!(
+        "Alias '{}' → pipeline '{}' saved to {}",
+        name,
+        pipeline,
+        path.display()
+    );
+    Ok(())
+}
+
+/// Load the named pipeline's `{name}` placeholder list, or `None` if the
+/// pipeline file cannot be located via the caller's ctx.
+fn try_load_pipeline_params(
+    pipeline: &str,
+    ctx_override: Option<&Path>,
+) -> Result<Option<Vec<String>>> {
+    // Parse ctx if provided so `pipelines_dir` can point us at the pipelines.
+    let ctx_path = resolve_ctx_path(ctx_override).filter(|p| p.exists());
+    let ctx_cfg: Option<LocalContextConfig> = match &ctx_path {
+        Some(p) => {
+            let content = std::fs::read_to_string(p)
+                .with_context(|| format!("Failed to read context file: {}", p.display()))?;
+            Some(serde_yaml::from_str(&content).context("Failed to parse context YAML")?)
+        }
+        None => None,
+    };
+
+    let pipeline_dirs = resolve_pipeline_dirs(None, ctx_cfg.as_ref(), ctx_path.as_deref());
+    if pipeline_dirs.is_empty() {
+        return Ok(None);
+    }
+    let pipelines = discover_pipelines(&pipeline_dirs)?;
+    Ok(pipelines
+        .get(pipeline)
+        .map(|(_, file)| extract_param_names(&file.query)))
+}
+
+/// Fail fast if any `--positional` / `--default` name refers to a param the
+/// pipeline does not actually have (almost always a typo).
+fn validate_alias_against_pipeline(
+    pipeline: &str,
+    pipeline_params: &[String],
+    positional: &[String],
+    defaults: &BTreeMap<String, String>,
+) -> Result<()> {
+    let known: std::collections::HashSet<&str> =
+        pipeline_params.iter().map(|s| s.as_str()).collect();
+    for p in positional {
+        if !known.contains(p.as_str()) {
+            anyhow::bail!(
+                "Pipeline '{pipeline}' has no parameter '{p}'. Known parameters: {}",
+                pipeline_params.join(", ")
+            );
+        }
+    }
+    for k in defaults.keys() {
+        if !known.contains(k.as_str()) {
+            anyhow::bail!(
+                "Pipeline '{pipeline}' has no parameter '{k}'. Known parameters: {}",
+                pipeline_params.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Print which of the pipeline's params are covered by this alias and which
+/// the user will still need to pass at call time (or add via --default now).
+fn report_alias_coverage(
+    pipeline: &str,
+    pipeline_params: &[String],
+    positional: &[String],
+    defaults: &BTreeMap<String, String>,
+) {
+    let positional_set: std::collections::HashSet<&str> =
+        positional.iter().map(|s| s.as_str()).collect();
+    let default_set: std::collections::HashSet<&str> =
+        defaults.keys().map(|s| s.as_str()).collect();
+    let unbound: Vec<&str> = pipeline_params
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|p| !positional_set.contains(p) && !default_set.contains(p))
+        .collect();
+
+    println!(
+        "Pipeline '{}' has {} parameter(s): {}",
+        pipeline,
+        pipeline_params.len(),
+        pipeline_params.join(", ")
+    );
+    if !unbound.is_empty() {
+        println!(
+            "  Unbound by this alias: {} (pass at call time with --name=value, \
+             or re-run `alias add --force` with --default/--positional)",
+            unbound.join(", ")
+        );
+    }
+}
+
+fn alias_list(aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
+    let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
+    let map = alias_store::load(&path)?;
+    if map.is_empty() {
+        println!("No aliases defined (file: {})", path.display());
+        return Ok(());
+    }
+    println!("Aliases from {}:", path.display());
+    for (name, def) in &map {
+        let desc = def.description.as_deref().unwrap_or("");
+        println!(
+            "  {:<12} → run {}{}{}",
+            name,
+            def.pipeline,
+            if desc.is_empty() { "" } else { "  — " },
+            desc
+        );
+    }
+    Ok(())
+}
+
+fn alias_show(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
+    let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
+    let map = alias_store::load(&path)?;
+    let def = map
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("Alias '{name}' not found in {}", path.display()))?;
+
+    // Print the stored alias YAML verbatim.
+    let mut single = AliasMap::new();
+    single.insert(name.clone(), def.clone());
+    let yaml = serde_yaml::to_string(&single).context("Failed to render alias to YAML")?;
+    print!("{yaml}");
+
+    // If we can find the target pipeline, print an annotated view of each
+    // `{param}` showing where it gets bound from (positional slot, default
+    // value, or "flag-only at call time").
+    if let Some(pipeline_params) = try_load_pipeline_params(&def.pipeline, ctx.as_deref())? {
+        let annotations = annotate_alias_bindings(def, &pipeline_params);
+        println!();
+        println!(
+            "Pipeline '{}' has {} parameter(s):",
+            def.pipeline,
+            pipeline_params.len()
+        );
+        let width = pipeline_params.iter().map(|s| s.len()).max().unwrap_or(0);
+        for (param, note) in annotations {
+            println!("  {param:<width$}  {note}");
+        }
+    }
+    Ok(())
+}
+
+/// For each pipeline param, produce a short note describing how this alias
+/// binds it: by positional slot, by default value, or "unbound" (the user
+/// must pass it as a flag at call time). Extra positional/default entries in
+/// the alias that do NOT match a real pipeline param are ignored here — they
+/// are already rejected up front by [`validate_alias_against_pipeline`].
+fn annotate_alias_bindings<'a>(
+    alias: &'a AliasDef,
+    pipeline_params: &'a [String],
+) -> Vec<(&'a str, String)> {
+    pipeline_params
+        .iter()
+        .map(|p| {
+            let note = if let Some(idx) = alias.positional.iter().position(|n| n == p) {
+                format!("positional[{idx}]")
+            } else if let Some(v) = alias.defaults.get(p) {
+                format!("default: {v:?}")
+            } else {
+                "flag-only (pass --{name}=VALUE at call time)".replace("{name}", p)
+            };
+            (p.as_str(), note)
+        })
+        .collect()
+}
+
+/// Print a `skardi <alias> --help`–style usage message: short description,
+/// positional slots, flag-callable params (with defaults if any), control
+/// flags, and a one-line example.
+fn print_alias_help(alias_name: &str, def: &AliasDef, pipeline_params: Option<&[String]>) {
+    println!("skardi {alias_name} — runs pipeline `{}`", def.pipeline);
+    if let Some(desc) = &def.description {
+        println!();
+        println!("{desc}");
+    }
+
+    println!();
+    if def.positional.is_empty() {
+        println!("Positional args: (none)");
+    } else {
+        println!("Positional args:");
+        for (i, p) in def.positional.iter().enumerate() {
+            println!("  <{p}>   binds pipeline param `{p}` (positional[{i}])");
+        }
+    }
+
+    if let Some(params) = pipeline_params {
+        println!();
+        println!("Pipeline params (override at call time with --name=VALUE):");
+        let width = params.iter().map(|s| s.len()).max().unwrap_or(0);
+        for p in params {
+            let note = if let Some(idx) = def.positional.iter().position(|n| n == p) {
+                format!("bound positionally (positional[{idx}])")
+            } else if let Some(v) = def.defaults.get(p) {
+                format!("default: {v:?}")
+            } else {
+                "required at call time".to_string()
+            };
+            println!("  --{p:<width$}  {note}");
+        }
+    }
+
+    println!();
+    println!("Control flags:");
+    println!("  --ctx <PATH>       Context YAML (SKARDICONFIG env / ~/.skardi/config/ctx.yaml)");
+    println!("  --aliases <PATH>   Override aliases file");
+    println!("  --pipeline-dir <DIR>  Override pipeline discovery directory");
+
+    println!();
+    print!("Example: skardi {alias_name}");
+    for p in &def.positional {
+        print!(" <{p}>");
+    }
+    for p in pipeline_params.unwrap_or(&[]).iter() {
+        let handled_positionally = def.positional.iter().any(|n| n == p);
+        let has_default = def.defaults.contains_key(p);
+        if !handled_positionally && !has_default {
+            print!(" --{p}=...");
+        }
+    }
+    println!();
+}
+
+fn alias_remove(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
+    let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
+    let mut map = alias_store::load(&path)?;
+    if map.remove(&name).is_none() {
+        anyhow::bail!("Alias '{name}' not found in {}", path.display());
+    }
+    alias_store::save(&path, &map)?;
+    println!("Alias '{}' removed from {}", name, path.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_alias_rejects_unknown_positional() {
+        let params = vec!["query".to_string(), "limit".to_string()];
+        let defaults = BTreeMap::new();
+        let positional = vec!["qeury".to_string()]; // typo
+        let err = validate_alias_against_pipeline("p", &params, &positional, &defaults)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no parameter 'qeury'"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("query"), "error must list known params: {err}");
+    }
+
+    #[test]
+    fn validate_alias_rejects_unknown_default() {
+        let params = vec!["query".to_string(), "limit".to_string()];
+        let mut defaults = BTreeMap::new();
+        defaults.insert("limmit".to_string(), "10".to_string()); // typo
+        let positional: Vec<String> = Vec::new();
+        let err = validate_alias_against_pipeline("p", &params, &positional, &defaults)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no parameter 'limmit'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_alias_accepts_fully_known_names() {
+        let params = vec!["query".to_string(), "limit".to_string()];
+        let mut defaults = BTreeMap::new();
+        defaults.insert("limit".to_string(), "10".to_string());
+        let positional = vec!["query".to_string()];
+        validate_alias_against_pipeline("p", &params, &positional, &defaults).unwrap();
+    }
+
+    #[test]
+    fn annotate_bindings_labels_positional_default_and_unbound() {
+        let mut defaults = BTreeMap::new();
+        defaults.insert("limit".to_string(), "10".to_string());
+        let alias = AliasDef {
+            pipeline: "p".to_string(),
+            positional: vec!["query".to_string()],
+            defaults,
+            description: None,
+        };
+        let params = vec![
+            "query".to_string(),
+            "limit".to_string(),
+            "text_query".to_string(),
+        ];
+        let got: Vec<(String, String)> = annotate_alias_bindings(&alias, &params)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(got[0], ("query".to_string(), "positional[0]".to_string()));
+        assert_eq!(got[1].0, "limit");
+        assert!(got[1].1.contains("default"));
+        assert!(got[1].1.contains("10"));
+        assert_eq!(got[2].0, "text_query");
+        assert!(got[2].1.contains("flag-only"));
+        assert!(got[2].1.contains("--text_query"));
+    }
+
+    // End-to-end guards for `skardi run` — drive `run_pipeline_with_params`
+    // with a tempdir of pipeline YAMLs, no ctx, and assert we actually make
+    // it through discovery → param validation → inline render → DataFusion
+    // execution. These close the gap that existed when only the pure helpers
+    // (extract_param_names, render_sql_with_inline_params, …) were
+    // individually unit-tested.
+    mod run_pipeline_e2e {
+        use super::*;
+        use tempfile::TempDir;
+
+        fn write_pipeline(dir: &Path, filename: &str, yaml: &str) {
+            std::fs::write(dir.join(filename), yaml).unwrap();
+        }
+
+        #[tokio::test]
+        async fn runs_pipeline_with_inline_params() {
+            let tmp = TempDir::new().unwrap();
+            write_pipeline(
+                tmp.path(),
+                "echo.yaml",
+                r#"metadata:
+  name: "echo"
+query: |
+  SELECT {x} AS val, {msg} AS note
+"#,
+            );
+
+            let params = vec![
+                ("x".to_string(), ScalarValue::Int64(Some(42))),
+                (
+                    "msg".to_string(),
+                    ScalarValue::Utf8(Some("hi there".to_string())),
+                ),
+            ];
+
+            run_pipeline_with_params(None, Some(tmp.path().to_path_buf()), "echo", params)
+                .await
+                .expect("pipeline should execute cleanly");
+        }
+
+        #[tokio::test]
+        async fn errors_when_required_param_missing() {
+            let tmp = TempDir::new().unwrap();
+            write_pipeline(
+                tmp.path(),
+                "needs.yaml",
+                r#"metadata:
+  name: "needs"
+query: |
+  SELECT {required} AS val
+"#,
+            );
+
+            let err =
+                run_pipeline_with_params(None, Some(tmp.path().to_path_buf()), "needs", vec![])
+                    .await
+                    .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("required"),
+                "error should name the missing param: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_when_pipeline_name_unknown() {
+            let tmp = TempDir::new().unwrap();
+            write_pipeline(
+                tmp.path(),
+                "only_this_one.yaml",
+                r#"metadata:
+  name: "only-this-one"
+query: "SELECT 1"
+"#,
+            );
+
+            let err = run_pipeline_with_params(
+                None,
+                Some(tmp.path().to_path_buf()),
+                "does-not-exist",
+                vec![],
+            )
+            .await
+            .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("does-not-exist"),
+                "error should name the missing pipeline: {msg}"
+            );
+            assert!(
+                msg.contains("only-this-one"),
+                "error should list known pipelines: {msg}"
+            );
+        }
+    }
 }

@@ -1,0 +1,15 @@
+metadata:
+  name: "wiki-delete"
+  version: "1.0.0"
+  description: >
+    Delete a wiki page by slug. Used as the first half of the edit-in-place
+    workflow: DataFusion cannot render a Binary scalar (the packed-f32
+    embedding) back to SQL during an UPDATE SET, so the portable pattern is
+    DELETE + INSERT. The AFTER DELETE trigger cleans wiki_pages_fts and
+    wiki_pages_vec; re-running wiki-create then repopulates them.
+
+# Parameters:
+#   {slug}  - Canonical slug to delete
+
+query: |
+  DELETE FROM wiki.main.wiki_pages WHERE slug = {slug}

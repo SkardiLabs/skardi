@@ -101,8 +101,8 @@ export PG_USER="skardi_user"
 export PG_PASSWORD="skardi_pass"
 
 cargo run --bin skardi-server --features candle -- \
-  --ctx demo/rag/ctx.yaml \
-  --pipeline demo/rag/pipelines/ \
+  --ctx demo/rag/server/ctx.yaml \
+  --pipeline demo/rag/server/pipelines/ \
   --port 8080
 ```
 
@@ -245,10 +245,10 @@ lookup, no id-type conversion.
 
 | Pipeline | Endpoint | Description |
 |---|---|---|
-| `ingest.yaml` | `/ingest/execute` | Single INSERT writes content + candle embedding into `documents` |
-| `search_vector.yaml` | `/search-vector/execute` | Semantic search via `pg_knn` |
-| `search_fulltext.yaml` | `/search-fulltext/execute` | Keyword search via `pg_fts` over `documents.content` |
-| `search_hybrid.yaml` | `/search-hybrid/execute` | RRF hybrid search combining `pg_knn` + `pg_fts` |
+| [server/pipelines/ingest.yaml](server/pipelines/ingest.yaml) | `/ingest/execute` | Single INSERT writes content + candle embedding into `documents` |
+| [server/pipelines/search_vector.yaml](server/pipelines/search_vector.yaml) | `/search-vector/execute` | Semantic search via `pg_knn` |
+| [server/pipelines/search_fulltext.yaml](server/pipelines/search_fulltext.yaml) | `/search-fulltext/execute` | Keyword search via `pg_fts` over `documents.content` |
+| [server/pipelines/search_hybrid.yaml](server/pipelines/search_hybrid.yaml) | `/search-hybrid/execute` | RRF hybrid search combining `pg_knn` + `pg_fts` |
 
 ---
 
@@ -263,17 +263,24 @@ pkill -f skardi-server
 ## CLI version — `skardi-cli` + SQLite + `sqlite-vec` + FTS5
 
 The same hybrid search pipeline (vector + FTS + RRF) runs end-to-end through
-`skardi query`. Vectors live in a [`sqlite-vec`](https://github.com/asg017/sqlite-vec)
-`vec0` virtual table, text lives in an FTS5 virtual table, and a regular
-`documents` table with `AFTER INSERT` triggers fans new rows out to both — so a
-single `INSERT` keeps content and embedding in sync. Embeddings are computed
-inline by the `candle()` UDF (same model as the server version).
+`skardi` — **no server, no Docker, no HTTP**. Vectors live in a
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) `vec0` virtual table,
+text lives in an FTS5 virtual table, and a regular `documents` table with an
+`AFTER INSERT` trigger fans new rows out to both. Each pipeline YAML under
+[cli/pipelines/](cli/pipelines/) is exposed through a short verb alias
+defined in [cli/aliases.yaml](cli/aliases.yaml): `skardi ingest <id> "..."`,
+`skardi grep "..."`, `skardi vec "..."`, `skardi fts "..."`.
 
 ### 1. Install the CLI with embedding support
 
 ```bash
-cargo install --path crates/cli --features candle
+cargo install --locked --path crates/cli --features candle
 ```
+
+`--locked` makes cargo honor the checked-in `Cargo.lock` instead of
+re-resolving transitive deps, which can otherwise pull a newer crate whose
+MSRV is higher than your toolchain (e.g. `constant_time_eq@0.4.3 requires
+rustc 1.95.0`).
 
 ### 2. Get the `sqlite-vec` extension
 
@@ -316,12 +323,21 @@ base table, the `documents_fts` FTS5 mirror, the `documents_vec` `vec0`
 mirror, and the `AFTER INSERT` trigger that fans new rows out to both mirrors
 atomically. See [setup.py](setup.py) for the schema.
 
-### 5. Context file
+### 5. Config layout
 
-One source in `catalog` mode auto-discovers every table in the database, loads
-the `sqlite-vec` extension once on the shared connection pool, and registers
-each table under `<catalog>.main.<table>` for both SQL and `sqlite_knn` /
-`sqlite_fts` lookups. Save as `demo/rag/cli-ctx.yaml`:
+Everything the CLI needs for the demo lives under [cli/](cli/):
+
+```
+demo/rag/cli/
+  ctx.yaml        # registers rag.db as a SQLite catalog data source
+  aliases.yaml    # short verbs → pipeline bindings
+  pipelines/      # pipeline YAMLs (one per verb)
+```
+
+[cli/ctx.yaml](cli/ctx.yaml) registers one SQLite source in `catalog` mode,
+which auto-discovers every table, loads `sqlite-vec` once on the shared
+connection pool, and exposes each table under `<catalog>.main.<table>` for
+both SQL and `sqlite_knn` / `sqlite_fts` lookups:
 
 ```yaml
 data_sources:
@@ -334,65 +350,88 @@ data_sources:
       extensions_env: SQLITE_VEC_PATH
 ```
 
-### 6. Ingest — one statement, embedding computed inline
+The pipeline YAMLs in [cli/pipelines/](cli/pipelines/) use the same
+`metadata` + `query` shape as the server pipelines, with `{param}`
+placeholders — just targeting the SQLite stack (`sqlite_knn` / `sqlite_fts`
+/ `vec_to_binary(candle(...))`) instead of `pg_knn` / `pg_fts`. Verb →
+pipeline bindings live in [cli/aliases.yaml](cli/aliases.yaml).
+
+**Export the config dir once** so the verbs below don't need `--ctx` on
+every line. `SKARDICONFIG` accepts either a config directory (which the CLI
+looks inside for `ctx.yaml`, `aliases.yaml`, and `pipelines/`) or an
+individual ctx file. `--ctx PATH` still works and takes precedence:
 
 ```bash
-skardi query --ctx demo/rag/cli-ctx.yaml --sql "
-  INSERT INTO rag.main.documents (id, content, embedding)
-  SELECT id, content,
-         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
-  FROM (
-    SELECT 1 AS id, 'Vector databases store high-dimensional vectors and enable fast similarity search at scale.' AS content
-    UNION ALL
-    SELECT 2, 'Retrieval-Augmented Generation combines retrieval with a language model to ground responses in factual content.'
-    UNION ALL
-    SELECT 3, 'The Transformer architecture introduced multi-head self-attention to replace recurrent networks.'
-  ) AS t
-"
+export SKARDICONFIG=demo/rag/cli
 ```
 
-> Why `UNION ALL` of `SELECT`s instead of `VALUES`? DataFusion's INSERT planner
-> currently propagates the INSERT target schema (here, 3 columns) down into any
-> immediate-child `VALUES` clause and validates row width against it, ignoring
-> the intermediate `SELECT` projection that adds `vec_to_binary(candle(...))`.
-> Wrapping the seed rows as `SELECT … UNION ALL SELECT …` keeps the subquery's
-> own schema in scope and the projection lands the row at full width.
-
-`candle()` produces a `List<Float32>`; `vec_to_binary()` packs it to the
-little-endian f32 BLOB that `vec0` expects. The `AFTER INSERT` trigger then
-mirrors the row to `documents_fts` and `documents_vec` atomically.
-
-### 7. Hybrid search (RRF in one DataFusion query)
+### 6. `ingest` — write one document
 
 ```bash
-skardi query --ctx demo/rag/cli-ctx.yaml --sql "
-  WITH vec AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
-    FROM sqlite_knn('rag.main.documents_vec', 'embedding',
-        (SELECT candle('models/generated/bge-small-en-v1.5',
-                       'how does similarity search work?')),
-        80)
-  ),
-  fts AS (
-    SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
-    FROM sqlite_fts('rag.main.documents_fts', 'content', 'vector similarity search', 60)
-  )
-  SELECT
-    COALESCE(v.id, f.id) AS id,
-    COALESCE(f.content, d.content) AS content,
-    COALESCE(0.5 / (60.0 + v.rk), 0)
-      + COALESCE(0.5 / (60.0 + f.rk), 0) AS rrf_score
-  FROM vec v
-  FULL OUTER JOIN fts f ON v.id = f.id
-  LEFT JOIN rag.main.documents d ON d.id = v.id
-  ORDER BY rrf_score DESC
-  LIMIT 10
-"
+skardi ingest 1 "Vector databases store high-dimensional vectors and enable fast similarity search at scale."
+skardi ingest 2 "Retrieval-Augmented Generation combines retrieval with a language model to ground responses in factual content."
+skardi ingest 3 "The Transformer architecture introduced multi-head self-attention to replace recurrent networks."
 ```
 
-The structure mirrors the server's `search_hybrid.yaml` exactly — `sqlite_knn`
-and `sqlite_fts` replace `pg_knn` / `pg_fts`, RRF is the same SQL, and `candle()`
-is reused unchanged for the query embedding.
+The `ingest` alias invokes [cli/pipelines/ingest.yaml](cli/pipelines/ingest.yaml),
+which INSERTs the row and computes the embedding inline with
+`vec_to_binary(candle(...))`. The `AFTER INSERT` trigger atomically mirrors
+the row to `documents_fts` and `documents_vec`, so a single call makes the
+document searchable by both `sqlite_fts` and `sqlite_knn`.
+
+> Why does [cli/pipelines/ingest.yaml](cli/pipelines/ingest.yaml) wrap the
+> seed row as `SELECT {doc_id} AS id, {content} AS content FROM (...)`
+> instead of using `VALUES`? DataFusion's INSERT planner currently
+> propagates the INSERT target schema (3 columns) down into any
+> immediate-child `VALUES` clause and validates row width against it,
+> ignoring the intermediate projection that adds
+> `vec_to_binary(candle(...))`. The SELECT-wrapper keeps the subquery's own
+> schema in scope so the projection lands the row at full width.
+
+### 7. `grep` — hybrid search (RRF over FTS + vector)
+
+```bash
+skardi grep "similarity search at scale"
+```
+
+One positional arg binds to both `{query}` (embedded with `candle()` for
+`sqlite_knn`) and `{text_query}` (via the `text_query: "{query}"` default in
+the alias). Override either independently:
+
+```bash
+skardi grep "similarity search" \
+  --text_query="vector similarity search" \
+  --vector_weight=0.3 --text_weight=0.7 --limit=5
+```
+
+> FTS5 reserves `?`, `"`, `+`, `-`, `~`, `^`, and parentheses as query
+> syntax. A bare `?` in the text query will fail with an `fts5: syntax
+> error` — phrase-quote or strip it out for natural-language queries.
+
+The structure mirrors the server's `search_hybrid.yaml` exactly —
+`sqlite_knn` and `sqlite_fts` replace `pg_knn` / `pg_fts`, RRF is the same
+SQL, and `candle()` is reused unchanged for the query embedding. Run
+`skardi grep --help` to see every param the alias exposes and where each
+value comes from.
+
+### 8. `vec` / `fts` — single-signal search
+
+If you want just one side of hybrid, the alias pair avoids the RRF wrapper:
+
+```bash
+# Vector-only KNN via sqlite_knn (+ JOIN back to documents for content)
+skardi vec "similarity search" --limit=5
+
+# Full-text-only via sqlite_fts
+skardi fts "vector similarity search" --limit=5
+```
+
+### 9. Fall back to raw SQL
+
+`skardi run` and the aliases above are a thin layer over the pipeline YAMLs.
+The underlying queries are still plain SQL — if you want to experiment
+ad-hoc, `skardi query --sql "..."` works just as before (same exported
+`SKARDICONFIG`).
 
 ### Cleanup
 
