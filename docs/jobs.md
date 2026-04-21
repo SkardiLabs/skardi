@@ -1,0 +1,356 @@
+# Batch Jobs (`kind: job`)
+
+Batch jobs in Skardi are parameterized SQL queries whose rows are written to
+a durable destination — a Lance dataset on disk, or a read-write database
+table your pipelines already know how to read from. They're the "async
+sibling" of pipelines: where a pipeline is a synchronous HTTP
+request/response, a job runs in the background, persists a run row to a
+SQLite ledger, and is polled by run id.
+
+**In one sentence:** a pipeline answers a query; a job commits the answer
+somewhere you can query again later.
+
+---
+
+## When to use a job
+
+- **Backfilling a lake from a federated source.** Your wiki lives in
+  Postgres; you want a queryable snapshot in Lance for BI.
+- **Nightly ingest.** Pull the last 24h of rows into a destination table.
+- **Rebuild a derived table.** `mode: overwrite` atomically replaces a
+  table with the output of a fresh SELECT.
+- **Long-running transforms.** Anything whose wall-clock time makes an
+  HTTP request/response awkward.
+
+Use a pipeline (not a job) when the caller needs the rows back in the same
+HTTP response.
+
+---
+
+## Writing a job YAML
+
+A job YAML has the same `metadata:` + `query:` blocks as a pipeline, plus
+two new sections and a `kind: job` discriminator at the root:
+
+```yaml
+kind: job
+
+metadata:
+  name: "backfill-wiki-range"
+  version: "1.0.0"
+  description: "Backfill wiki_pages into the lake for a given date range."
+
+# {placeholder} tokens are inferred as typed scalar params, exactly the
+# way pipelines work. No separate `parameters:` block.
+query: |
+  SELECT slug, title, page_type, content, updated_at
+  FROM wiki.main.wiki_pages
+  WHERE updated_at >= {from_date}
+    AND updated_at <  {to_date}
+
+destination:
+  table: "wiki_lake"          # DataFusion table identifier — bare or dotted
+  mode: append                # append | overwrite
+  create_if_missing: true     # lake destinations only (see below)
+
+execution:
+  timeout_ms: 3600000         # optional wall-clock cap; default = no timeout
+```
+
+### `kind:`
+
+`kind: job` tells the loader to treat the file as a job. Plain pipeline
+YAMLs either omit this field or set it to `pipeline`. A server started
+with `--jobs <dir>` scans every `.yaml` / `.yml` file in the directory
+and silently skips files that are not `kind: job`, so it's safe to
+intermix pipelines and jobs on disk.
+
+### `destination.table`
+
+Any DataFusion table identifier. Bare names (`wiki_lake`) resolve the
+same way as a `FROM` clause does; dotted names (`wikidb.public.wiki_log`)
+reach into catalog-registered sources. The **first dotted segment** is
+taken as the data source name — the executor uses it to decide whether
+the destination is a lake (Lance) or a DB (Postgres / MySQL / SQLite /
+SeekDB / Mongo / Redis).
+
+### `destination.mode`
+
+- `append` (default) — add rows to the destination.
+  - *Lake:* the dataset is created if `create_if_missing: true` and it
+    does not yet exist, else appended to.
+  - *DB:* rows are added with `INSERT INTO <table> SELECT ...`.
+- `overwrite` — replace contents of the destination.
+  - *Lake:* Lance `WriteMode::Overwrite` — new schema + data, atomic.
+  - *DB:* `DELETE FROM <table>` followed by `INSERT INTO <table> SELECT
+    ...` in the same transaction where the provider supports it.
+
+Upserts / merge are not in MVP.
+
+### `destination.create_if_missing`
+
+- **Lake destinations** (Lance today, Iceberg / Delta later) — first run
+  creates the dataset with the query's output schema. Defaults to `true`.
+  Set `false` when you want a submit to fail if the dataset is missing —
+  useful for guarded production jobs.
+- **DB destinations** — always ignored. DDL for federated DB engines is
+  its own subsystem and permanently out of scope for jobs; create the
+  table out-of-band with your DB's own DDL tooling.
+
+### `execution.timeout_ms`
+
+Wall-clock cap. If the query + write together exceed this, the task is
+aborted and the row is marked `failed` with a timeout message. On lake
+destinations the commit never lands; on DB destinations whatever made it
+into the transaction is rolled back (where the provider supports it).
+
+### Parameter placeholders
+
+Same rules as pipelines: `{name}` binds to a typed scalar value at submit
+time. Values substitute as SQL literals (strings are single-quoted and
+escaped, numbers/booleans/null emit raw). `{name}` never substitutes into
+identifier positions — the query shape is fixed at load time, only values
+move.
+
+`${name}` (dollar-brace) is reserved for v1.1 executor-resolved variables
+like `${watermark}` and `${last_successful_run.finished_at}`.
+
+---
+
+## Running the server with jobs enabled
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/llm_wiki/cli/ctx.yaml \
+  --pipeline demo/llm_wiki/cli/pipelines \
+  --jobs demo/llm_wiki/cli/jobs \
+  --port 8080
+```
+
+| Flag | Description |
+|------|-------------|
+| `--jobs <path>` | File or directory of job YAMLs. When omitted, `/jobs/*` endpoints return `503`. |
+| `--jobs-db <path>` | SQLite run ledger. Default: `~/.skardi/jobs.db` (parent dirs created on first use). |
+
+On startup the server:
+
+1. Opens (creating if needed) the SQLite ledger.
+2. **Reconciles orphans** — any row left in `pending` or `running` by a
+   previous crash is rewritten to `failed` with the message `"server
+   restarted before run completed"`. This is the only time the server
+   touches a run row it didn't create this process.
+3. Loads `--jobs` and registers the destination types.
+
+### HTTP endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/jobs` | GET | List every registered job with its destination |
+| `/jobs/:name/run` | POST | Submit a new run; body is the param map |
+| `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N` |
+| `/jobs/runs/:run_id` | GET | Current state of one run |
+| `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation |
+
+When the server was started without `--jobs`, every endpoint above
+returns `503 Service Unavailable` with `error_type: jobs_disabled`.
+
+---
+
+## Submitting a run from the CLI
+
+The CLI ships a matching `skardi job` subcommand that POSTs to the
+server. The server URL defaults to `http://127.0.0.1:8080`; override with
+`$SKARDI_SERVER_URL` or the `--server` flag.
+
+```bash
+# Submit — returns the run_id
+skardi job run wiki-backfill-to-lake \
+    --param slug_prefix='entity/%' \
+    --param limit:int=1000
+
+# Poll the run
+skardi job status <run_id>
+
+# List recent runs
+skardi job list --job wiki-backfill-to-lake --limit 20
+
+# Cancel an in-flight run (best effort — the task checks the flag
+# before committing; runs that already committed report cancelled: false)
+skardi job cancel <run_id>
+
+# Discover all registered jobs and their destinations
+skardi job show
+```
+
+`--param` uses the exact same typing rules as `skardi run`:
+
+- `name=42` → int
+- `name=3.14` → float
+- `name=true` → bool
+- `name=null` → SQL NULL
+- `name=hello` → string (no quotes needed)
+- `name:str=42` → force string (useful for numeric-looking strings)
+
+Jobs run **only inside the server** — there is no in-process fallback
+and no `--ctx` flag on the CLI-side job commands. If the server isn't
+running you'll get a connection-refused error.
+
+---
+
+## Submit-time validation (the "pre-flight")
+
+Every submit runs three checks *before* creating a run row, so a
+malformed submit never pollutes the ledger:
+
+1. **Parameter presence** — every `{placeholder}` in the SQL must have a
+   bound value. Unmapped params → 400 with the list of missing names.
+2. **Parameter type** — only strings, numbers, booleans, and null are
+   accepted (same as the pipeline handler). Arrays and objects → 400.
+3. **Destination diff** — the executor plans the SELECT, takes its
+   output schema, and compares it against the destination:
+   - *Destination exists* → order-insensitive column diff. Extra columns
+     in the query, mismatched Arrow types, or non-nullable destination
+     columns not produced by the query all reject the submit.
+   - *Destination missing, DB* → always reject with
+     `"destination table '<name>' does not exist; create it with your
+     DB's DDL before running the job"`.
+   - *Destination missing, lake, `create_if_missing: true`* → accept;
+     schema is realized on first write.
+   - *Destination missing, lake, `create_if_missing: false`* → reject.
+
+On rejection the HTTP response is `400` with an `error_type` suitable
+for agent handling:
+
+| `error_type` | Meaning |
+|--------------|---------|
+| `unknown_job` | `/jobs/:name/run` targets a name the server doesn't know |
+| `missing_parameters` | One or more `{placeholders}` not bound |
+| `unsupported_parameter` | Bound value is an array / object |
+| `destination_missing` | DB table doesn't exist; or lake + `create_if_missing: false` |
+| `schema_mismatch` | Column diff — `details.diff` carries a human-readable string |
+| `sql_plan_failure` | DataFusion rejected the rendered SQL |
+
+---
+
+## The run ledger
+
+SQLite file (default `~/.skardi/jobs.db`) with a single `job_runs`
+table. Every submit appends a row; every lifecycle transition updates it.
+One process writes (the server); reads and writes are serialized through
+a single connection, so lookups from the CLI are always consistent with
+what the background task last persisted.
+
+Row fields, matching the CLI `status` response:
+
+| Field | Notes |
+|-------|-------|
+| `run_id` | UUID v4, hex-only (no dashes) — the id in the HTTP response and the CLI |
+| `job` | Job name from `metadata.name` |
+| `status` | `pending` → `running` → terminal (`succeeded` \| `failed` \| `cancelled`) |
+| `parameters` | JSON of the bound values |
+| `created_at` / `started_at` / `finished_at` | ISO-8601 timestamps |
+| `rows_written` | Set on `succeeded`; also set on post-commit cancels |
+| `snapshot_id` | For Lance: the version the commit landed on, as a string |
+| `error` | Non-null on failures / cancels; free-form message |
+
+---
+
+## Atomicity and failure modes
+
+| Scenario | What the user sees |
+|----------|--------------------|
+| Query errors mid-stream | Row → `failed`, `error` carries the SQL / planner message. Lake: no commit, destination unchanged. DB: whatever the provider's transaction guarantees — Postgres / SQLite roll back, MySQL / Mongo may partially land. |
+| Timeout (`execution.timeout_ms`) | Row → `failed` with `"job timed out after <N>ms before commit"`. Same destination guarantees as the error case. |
+| `skardi job cancel` before commit | Row → `cancelled`. Destination unchanged. |
+| `skardi job cancel` after commit | Row → `cancelled` with `rows_written` + `snapshot_id` populated and `error: "cancelled after commit"`. The commit has landed; cancel is reported truthfully but cannot roll it back. |
+| Server crash or SIGKILL mid-run | Lake: no commit, dataset at the previous version. On restart, the orphaned row is rewritten to `failed` with `"server restarted before run completed"`. DB: depends on provider transaction semantics. |
+
+Bare Parquet destinations are deliberately **not** supported — a crashed
+writer would leave partial `.parquet` files visible to readers with no
+rollback. Lance (today) and Iceberg (v1.1) both solve this by layering a
+versioned manifest on top of columnar files.
+
+---
+
+## A complete worked example
+
+The [llm_wiki demo](../demo/llm_wiki/cli/) ships a
+[backfill job](../demo/llm_wiki/cli/jobs/backfill_to_lake.yaml) that
+copies a slug-prefix slice of `wiki_pages` from the demo's SQLite into a
+Lance dataset:
+
+```yaml
+# demo/llm_wiki/cli/jobs/backfill_to_lake.yaml (excerpt)
+kind: job
+metadata:
+  name: "wiki-backfill-to-lake"
+  version: "1.0.0"
+query: |
+  SELECT slug, title, page_type, content, updated_at
+  FROM wiki.main.wiki_pages
+  WHERE slug LIKE {slug_prefix}
+  ORDER BY updated_at DESC
+  LIMIT {limit}
+destination:
+  table: "wiki_lake"
+  mode: append
+  create_if_missing: true
+```
+
+To run it end-to-end, boot the server with `--jobs` pointing at the
+demo's job directory and with a Lance data source named `wiki_lake` in
+your ctx:
+
+```yaml
+# ctx.yaml (add this to the demo's ctx.yaml)
+  - name: wiki_lake
+    type: lance
+    path: demo/llm_wiki/wiki_lake.lance
+```
+
+Then:
+
+```bash
+cargo run --bin skardi-server -- \
+  --ctx demo/llm_wiki/cli/ctx.yaml \
+  --pipeline demo/llm_wiki/cli/pipelines \
+  --jobs demo/llm_wiki/cli/jobs \
+  --port 8080
+```
+
+In another terminal:
+
+```bash
+skardi job run wiki-backfill-to-lake \
+    --param slug_prefix:str='entity/%' \
+    --param limit:int=500
+```
+
+The CLI prints `submitted: <run_id> (pending)`. Follow it with
+`skardi job status <run_id>` until you see `"status": "succeeded"` and a
+non-null `snapshot_id` (the Lance dataset version).
+
+Re-running the same command appends; switching the YAML to
+`mode: overwrite` replaces atomically.
+
+---
+
+## What's not in MVP
+
+- **Iceberg destination** — read-only today. Deferred to v1.1.
+- **Delta Lake destination** — same shape as Lance; lands when a demand
+  case appears.
+- **Upsert / merge.**
+- **Watermark / incremental templating** (`${last_successful_run.finished_at}`).
+- **Cron / event triggers.**
+- **Streaming / CDC.**
+- **Partitioned / parallel batch execution** — one spawned task per run.
+- **Hot-reload of job YAMLs from disk** — the server currently requires
+  a restart to pick up new jobs.
+- **HTTP-submitted job definitions** — agents *invoke* jobs, not *define*
+  them. Permanently out of scope.
+- **DDL for DB destinations** — permanently out of scope. Create DB
+  tables with your DB's own DDL.
+
+The design doc at `.claude/plans/pipelines_as_jobs.md` has the long-form
+rationale for each of these.

@@ -899,12 +899,15 @@ query: |
         let data_sources = vec![];
         let args = CliArgs {
             pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: None,
             port: 8080,
         };
 
         let config = ServerConfig {
             pipelines,
+            jobs: HashMap::new(),
             data_sources,
             args,
         };
@@ -919,6 +922,7 @@ query: |
             session_ctx,
             metrics: PipelineMetrics::new(),
             auth_layer: crate::auth::layer::AuthLayer::None,
+            jobs: None,
         }
     }
 
@@ -976,12 +980,15 @@ query: |
 
         let args = CliArgs {
             pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: None,
             port: 8080,
         };
 
         let config = ServerConfig {
             pipelines,
+            jobs: HashMap::new(),
             data_sources: vec![data_source],
             args,
         };
@@ -1001,6 +1008,7 @@ query: |
             session_ctx: session_ctx_arc,
             metrics: PipelineMetrics::new(),
             auth_layer: crate::auth::layer::AuthLayer::None,
+            jobs: None,
         };
 
         let request = ExecuteRequest {

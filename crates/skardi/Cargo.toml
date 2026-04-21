@@ -25,6 +25,7 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 # engine
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 serde = { workspace = true }

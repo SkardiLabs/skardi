@@ -5,6 +5,9 @@ use axum::{
 };
 use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
+use skardi::jobs::executor::{DataSourceInfo, JobExecutorBundle, lance_paths_from_sources};
+use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
@@ -23,6 +26,7 @@ use crate::handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
     pipeline_health_check, serve_dashboard,
 };
+use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
 use crate::metrics::PipelineMetrics;
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
@@ -37,6 +41,9 @@ pub struct AppState {
     pub metrics: PipelineMetrics,
     /// Active authentication layer (NoAuth by default)
     pub auth_layer: AuthLayer,
+    /// Jobs executor + run ledger bundle. `None` when the server was
+    /// started without `--jobs`, which disables every `/jobs/*` endpoint.
+    pub jobs: Option<Arc<JobExecutorBundle>>,
 }
 
 /// Main server creation function - Primary public interface
@@ -150,6 +157,51 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Create DataFusion engine with the shared Arc<SessionContext>
     let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx_arc.clone()));
 
+    // Build the jobs executor + run ledger bundle if --jobs was given.
+    // Runs this *after* the SessionContext is populated so destinations
+    // resolve against the real table registry.
+    let jobs_bundle = if !config.jobs.is_empty() {
+        let jobs_db_path = resolve_jobs_db_path(config.args.jobs_db_path.as_ref())
+            .map_err(|e| anyhow::anyhow!("Failed to resolve jobs.db path: {e}"))?;
+        tracing::info!("Opening jobs ledger at {}", jobs_db_path.display());
+        let store = Arc::new(SqliteJobStore::open(&jobs_db_path).await?);
+        let reconciled = store
+            .reconcile_orphaned("server restarted before run completed")
+            .await?;
+        if reconciled > 0 {
+            tracing::warn!(
+                "Reconciled {} orphaned job run(s) from a previous server crash",
+                reconciled
+            );
+        }
+
+        let sources: Vec<DataSourceInfo> = config
+            .data_sources
+            .iter()
+            .map(|ds| DataSourceInfo {
+                name: ds.name.clone(),
+                source_type: ds.source_type.clone(),
+                path: ds.path.to_str().map(|s| s.to_string()),
+            })
+            .collect();
+        let lance_paths = lance_paths_from_sources(&sources);
+        let data_source_types = config
+            .data_sources
+            .iter()
+            .map(|ds| (ds.name.clone(), ds.source_type.clone()))
+            .collect();
+
+        let executor = Arc::new(JobExecutor::new(
+            config.jobs.clone(),
+            store as Arc<dyn skardi::jobs::JobStore>,
+            session_ctx_arc.clone(),
+            data_source_types,
+        ));
+        Some(Arc::new(JobExecutorBundle::new(executor, lance_paths)))
+    } else {
+        None
+    };
+
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState {
         config: Arc::new(RwLock::new(config)),
@@ -157,11 +209,25 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         session_ctx: session_ctx_arc,
         metrics: PipelineMetrics::new(),
         auth_layer,
+        jobs: jobs_bundle,
     };
 
     tracing::info!("Application state setup completed successfully");
 
     Ok(app_state)
+}
+
+/// Resolve where the SQLite run ledger should live. Explicit `--jobs-db`
+/// beats `$HOME/.skardi/jobs.db`; if neither is available we error out
+/// rather than silently falling back to the cwd.
+fn resolve_jobs_db_path(explicit: Option<&PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.clone());
+    }
+    let home = dirs::home_dir().ok_or_else(|| {
+        anyhow::anyhow!("Could not locate a home directory; pass --jobs-db explicitly")
+    })?;
+    Ok(home.join(".skardi").join("jobs.db"))
 }
 
 /// Configure all application routes
@@ -176,6 +242,16 @@ pub fn configure_routes(state: AppState) -> Router {
         .route("/pipeline/:name", get(get_pipelines_info))
         .route("/data_source", get(get_data_sources))
         .route("/:name/execute", post(execute_pipeline_by_name));
+
+    // Jobs endpoints — mounted unconditionally so the CLI can discover
+    // "jobs disabled" via a 503 rather than a 404 when the server was
+    // started without --jobs. Handlers short-circuit on `state.jobs = None`.
+    router = router
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/:name/run", post(submit_job_run))
+        .route("/jobs/runs", get(list_job_runs))
+        .route("/jobs/runs/:run_id", get(get_job_run))
+        .route("/jobs/runs/:run_id/cancel", post(cancel_job_run));
 
     if state.auth_layer.is_enabled() {
         tracing::info!("Auth enabled: mounting /api/auth/* routes");
@@ -296,9 +372,12 @@ query: |
 
         let config = ServerConfig {
             pipelines,
+            jobs: std::collections::HashMap::new(),
             data_sources,
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
+                jobs_path: None,
+                jobs_db_path: None,
                 ctx_file: None,
                 port: 8080,
             },
@@ -314,9 +393,12 @@ query: |
 
         ServerConfig {
             pipelines,
+            jobs: std::collections::HashMap::new(),
             data_sources: vec![],
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
+                jobs_path: None,
+                jobs_db_path: None,
                 ctx_file: None,
                 port: 8080,
             },

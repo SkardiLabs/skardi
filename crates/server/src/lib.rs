@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod handlers;
+pub mod jobs_handlers;
 pub mod metrics;
 pub mod optimizer_registry;
 pub mod remote_storage;

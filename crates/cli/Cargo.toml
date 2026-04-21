@@ -31,6 +31,7 @@ datafusion-session = { version = "52.1.0" }
 dirs = "5.0"
 lance = { workspace = true }
 object_store = { workspace = true, features = ["aws", "gcp", "azure", "http"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

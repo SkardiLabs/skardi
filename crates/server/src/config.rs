@@ -3,6 +3,7 @@ use clap::Parser;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
+use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::lance::register_lance_table;
@@ -25,7 +26,7 @@ pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
 
 /// CLI arguments for the Skardi server
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(name = "skardi-server")]
 #[command(about = "Skardi Online Serving Pipeline Server")]
 pub struct CliArgs {
@@ -36,6 +37,24 @@ pub struct CliArgs {
         help = "Path to pipeline YAML file or directory containing pipeline files"
     )]
     pub pipeline_path: Option<PathBuf>,
+
+    /// Path to job YAML file or directory containing job files
+    /// (files must have `kind: job` at the root). If a directory is
+    /// provided, every .yaml / .yml file in it is scanned; files that
+    /// are not `kind: job` are ignored.
+    #[arg(
+        long = "jobs",
+        help = "Path to job YAML file or directory containing job files"
+    )]
+    pub jobs_path: Option<PathBuf>,
+
+    /// Path to the SQLite job run ledger. Defaults to
+    /// `~/.skardi/jobs.db`. Ignored when --jobs is not provided.
+    #[arg(
+        long = "jobs-db",
+        help = "Path to the SQLite job run ledger (default: ~/.skardi/jobs.db)"
+    )]
+    pub jobs_db_path: Option<PathBuf>,
 
     /// Path to context YAML configuration file (optional)
     #[arg(
@@ -54,6 +73,9 @@ pub struct CliArgs {
 pub struct ServerConfig {
     /// Loaded pipeline definitions keyed by name (can be registered later via API)
     pub pipelines: HashMap<String, StandardPipeline>,
+    /// Loaded job definitions keyed by name. `kind: job` YAMLs populate
+    /// this map; plain pipeline YAMLs do not.
+    pub jobs: HashMap<String, JobDefinition>,
     /// Data sources to register with DataFusion
     pub data_sources: Vec<DataSource>,
     /// CLI arguments
@@ -377,14 +399,61 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         );
     }
 
+    // Load jobs (if a --jobs path was specified). The jobs directory can
+    // also contain plain pipelines — those are silently skipped here and
+    // belong in --pipeline instead. `resolve_pipeline_files` is reused
+    // because the directory discovery rules are identical.
+    let job_files = resolve_pipeline_files(args.jobs_path.as_ref())
+        .with_context(|| "Failed to resolve job files")?;
+    let mut jobs: HashMap<String, JobDefinition> = HashMap::new();
+    for job_file in &job_files {
+        match JobDefinition::load_from_file(job_file, ctx.clone()).await {
+            Ok(Some(job)) => {
+                let name = job.name().to_string();
+                if pipelines.contains_key(&name) {
+                    return Err(anyhow::anyhow!(
+                        "Job name '{name}' collides with an existing pipeline name; \
+                         both primitives share the same namespace in this server"
+                    ));
+                }
+                if jobs.contains_key(&name) {
+                    return Err(anyhow::anyhow!(
+                        "Duplicate job name '{name}' found. Each job must have a unique name."
+                    ));
+                }
+                tracing::info!(
+                    "Job loaded: {} → destination `{}`",
+                    name,
+                    job.destination.table
+                );
+                jobs.insert(name, job);
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "Skipping {:?}: no `kind: job` at root (plain pipeline)",
+                    job_file
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to load job from {:?}: {}",
+                    job_file,
+                    e
+                ));
+            }
+        }
+    }
+
     tracing::info!(
-        "Configuration loaded successfully: pipelines={}, data_sources={}",
+        "Configuration loaded successfully: pipelines={}, jobs={}, data_sources={}",
         pipelines.len(),
+        jobs.len(),
         data_sources.len()
     );
 
     Ok(ServerConfig {
         pipelines,
+        jobs,
         data_sources,
         args,
     })
@@ -746,13 +815,7 @@ async fn register_data_source(
 
     // Validate data source configuration based on path type
     match (&source.source_type, s3_storage.is_remote_path(&source.path)) {
-        (
-            DataSourceType::Csv
-            | DataSourceType::Parquet
-            | DataSourceType::Lance
-            | DataSourceType::Sqlite,
-            false,
-        ) => {
+        (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Sqlite, false) => {
             // For local files, verify the file exists
             if !source.path.exists() {
                 return Err(ConfigError::DataSourceFileNotFound {
@@ -761,6 +824,13 @@ async fn register_data_source(
                 }
                 .into());
             }
+        }
+        (DataSourceType::Lance, false) => {
+            // Lance paths may legitimately not exist yet — a job with
+            // `create_if_missing: true` will create the dataset on its
+            // first successful run. Deferred registration is logged
+            // further down; the missing-path check is deliberately
+            // omitted here.
         }
         (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, true) => {
             // For S3 files, validate S3 configuration and setup object store
@@ -1120,6 +1190,24 @@ async fn register_data_source(
                     path: source.path.clone(),
                 })?;
 
+            // Jobs may declare a Lance destination whose dataset doesn't
+            // exist yet (first run will create it). Registering would fail;
+            // instead, log and defer — the jobs executor has its own
+            // lance_paths map and doesn't need the source registered as a
+            // table. A plain SELECT against the name will still error,
+            // which is the right UX for "this dataset hasn't been written
+            // to yet".
+            if !skardi::sources::providers::lance::lance_dataset_exists(path_str) {
+                tracing::warn!(
+                    "Lance dataset '{}' at {} does not exist yet — skipping table \
+                     registration. A job with `create_if_missing: true` will create it \
+                     on its first successful run.",
+                    source.name,
+                    path_str
+                );
+                return Ok(());
+            }
+
             // Register Lance dataset using the providers module
             register_lance_table(
                 session_ctx,
@@ -1415,6 +1503,8 @@ data_sources:
 
         let args = CliArgs {
             pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: Some(context_path),
             port: 8080,
         };
@@ -1437,6 +1527,8 @@ data_sources:
 
         let args = CliArgs {
             pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: None,
             port: 3000,
         };
@@ -1486,6 +1578,8 @@ query: |
 
         let args = CliArgs {
             pipeline_path: Some(pipelines_dir),
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: None,
             port: 3000,
         };
@@ -1511,6 +1605,8 @@ query: |
 
         let args = CliArgs {
             pipeline_path: Some(missing_pipeline),
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: None,
             port: 8080,
         };
@@ -1532,6 +1628,8 @@ query: |
     async fn test_load_server_config_no_pipelines() {
         let args = CliArgs {
             pipeline_path: None,
+            jobs_path: None,
+            jobs_db_path: None,
             ctx_file: None,
             port: 8080,
         };

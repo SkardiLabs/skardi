@@ -1,0 +1,37 @@
+kind: job
+
+metadata:
+  name: "wiki-backfill-to-lake"
+  version: "1.0.0"
+  description: >
+    Batch-copy a slug-prefix slice of wiki_pages from SQLite into a Lance
+    dataset. First run creates the dataset (schema = query output); later
+    runs with `mode: append` accumulate, and `mode: overwrite` replaces
+    it atomically.
+
+    Runnable against the CLI ctx (demo/llm_wiki/cli/ctx.yaml) once the
+    server is started with this file as a --jobs path and a Lance data
+    source named `wiki_lake` is registered.
+
+# Parameters (inferred from `{placeholders}` below):
+#   {slug_prefix}  — LIKE pattern, e.g. "entity/%" or "%"
+#   {limit}        — hard cap so a bad pattern can't rewrite everything
+
+query: |
+  SELECT slug, title, page_type, content, updated_at
+  FROM wiki.main.wiki_pages
+  WHERE slug LIKE {slug_prefix}
+  ORDER BY updated_at DESC
+  LIMIT {limit}
+
+destination:
+  # `wiki_lake` must be registered as a Lance data source in the server's
+  # ctx.yaml (see docs/jobs.md for the ctx stanza). The first submit will
+  # create the dataset with the query's output schema.
+  table: "wiki_lake"
+  mode: append
+  create_if_missing: true
+
+execution:
+  # 10 minute wall-clock cap; bumps for production backfills.
+  timeout_ms: 600000

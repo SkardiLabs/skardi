@@ -1,5 +1,6 @@
 mod alias;
 mod alias_store;
+mod jobs_cli;
 mod pipeline;
 
 use alias::{AliasDef, resolve_alias};
@@ -110,6 +111,13 @@ enum Commands {
     Alias {
         #[command(subcommand)]
         cmd: AliasCmd,
+    },
+    /// Submit, poll, list, and cancel batch jobs against `skardi-server`.
+    /// Jobs run in the server (no in-process fallback).
+    #[command(name = "job")]
+    Job {
+        #[command(subcommand)]
+        cmd: jobs_cli::JobCmd,
     },
     /// Any unknown subcommand is looked up as a user-defined alias and
     /// dispatched to `run <pipeline>` with the alias's parameter bindings.
@@ -556,6 +564,7 @@ async fn main() -> Result<()> {
             run_pipeline_by_name(ctx, pipeline_dir, &pipeline, param_bindings).await
         }
         Commands::Alias { cmd } => handle_alias_cmd(cmd).await,
+        Commands::Job { cmd } => jobs_cli::handle_job_cmd(cmd).await,
         Commands::External(args) => {
             // The first token is the alias name; the rest are the alias's args
             // (plus any control flags we strip out before resolution).
