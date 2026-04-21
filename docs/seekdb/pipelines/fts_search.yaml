@@ -1,0 +1,16 @@
+metadata:
+  name: "seekdb-fts-search"
+  version: "1.0.0"
+  description: >
+    Native full-text search on SeekDB via the seekdb_fts table function.
+    Ranks matches by the MATCH/AGAINST natural language score — higher is
+    more relevant.
+
+# Parameters:
+#   {query} - Search terms (space-separated — passed straight to MATCH/AGAINST)
+#   {limit} - Maximum number of results to return
+
+query: |
+  SELECT title, body, category, _score
+  FROM seekdb_fts('articles', 'body', {query}, {limit})
+  ORDER BY _score DESC

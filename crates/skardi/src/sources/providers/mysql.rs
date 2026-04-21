@@ -2,6 +2,7 @@ use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
     HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
 };
+use crate::sources::providers::mysql_wire::parse_mysql_wire_connection_params;
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -600,90 +601,7 @@ fn parse_connection_params(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<HashMap<String, SecretString>> {
-    let url = url::Url::parse(connection_string)
-        .with_context(|| format!("Invalid MySQL connection string: {}", connection_string))?;
-
-    let mut params: HashMap<String, SecretString> = HashMap::new();
-
-    if let Some(host) = url.host_str() {
-        params.insert(
-            "host".to_string(),
-            SecretString::new(host.to_string().into_boxed_str()),
-        );
-    }
-
-    if let Some(port) = url.port() {
-        params.insert(
-            "tcp_port".to_string(),
-            SecretString::new(port.to_string().into_boxed_str()),
-        );
-    } else {
-        params.insert(
-            "tcp_port".to_string(),
-            SecretString::new("3306".to_string().into_boxed_str()),
-        );
-    }
-
-    let db_name = url
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
-
-    if !db_name.is_empty() {
-        params.insert(
-            "db".to_string(),
-            SecretString::new(db_name.to_string().into_boxed_str()),
-        );
-    }
-
-    if let Some(opts) = options {
-        if let Some(user_env) = opts.get("user_env") {
-            let username = std::env::var(user_env).with_context(|| {
-                format!(
-                    "Environment variable '{}' not found for MySQL user",
-                    user_env
-                )
-            })?;
-            params.insert(
-                "user".to_string(),
-                SecretString::new(username.into_boxed_str()),
-            );
-        }
-
-        if let Some(pass_env) = opts.get("pass_env") {
-            let password = std::env::var(pass_env).with_context(|| {
-                format!(
-                    "Environment variable '{}' not found for MySQL password",
-                    pass_env
-                )
-            })?;
-            params.insert(
-                "pass".to_string(),
-                SecretString::new(password.into_boxed_str()),
-            );
-        }
-    }
-
-    let ssl_mode = options
-        .and_then(|opts| opts.get("ssl_mode"))
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| {
-            tracing::debug!(
-                "SSL mode not specified, defaulting to 'disabled' for local development"
-            );
-            "disabled".to_string()
-        });
-
-    tracing::debug!("Setting SSL mode to: {}", ssl_mode);
-
-    params.insert(
-        "sslmode".to_string(),
-        SecretString::new(ssl_mode.into_boxed_str()),
-    );
-
-    Ok(params)
+    parse_mysql_wire_connection_params(connection_string, options, 3306, "MySQL")
 }
 
 #[cfg(test)]

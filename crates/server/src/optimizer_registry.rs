@@ -13,6 +13,7 @@ use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
+use skardi::sources::providers::seekdb::{register_seekdb_fts_udtf, register_seekdb_knn_udtf};
 use skardi::sources::providers::sqlite::{
     register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_vec_to_binary_udf,
 };
@@ -103,6 +104,11 @@ impl OptimizerRegistry {
             self.register_sqlite_functions(ctx)?;
         }
 
+        // Register SeekDB-specific table functions
+        if source_types.contains(&DataSourceType::Seekdb) {
+            self.register_seekdb_functions(ctx)?;
+        }
+
         Ok(())
     }
 
@@ -154,6 +160,18 @@ impl OptimizerRegistry {
         tracing::info!("Registering vec_to_binary scalar UDF");
         register_vec_to_binary_udf(ctx);
         tracing::info!("✓ Registered vec_to_binary scalar UDF");
+        Ok(())
+    }
+
+    /// Register SeekDB-specific table functions.
+    fn register_seekdb_functions(&self, ctx: &mut SessionContext) -> Result<()> {
+        tracing::info!("Registering seekdb_knn table function");
+        register_seekdb_knn_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered seekdb_knn table function");
+
+        tracing::info!("Registering seekdb_fts table function");
+        register_seekdb_fts_udtf(ctx, self.datasets());
+        tracing::info!("✓ Registered seekdb_fts table function");
         Ok(())
     }
 

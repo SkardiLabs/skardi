@@ -20,11 +20,10 @@
 //! Returns all non-vector columns from the table plus `_score Float64`.
 //! The score is the raw distance value — lower means more similar.
 
-use arrow::array::{Array, Float32Array, Float64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{Result as DFResult, ScalarValue, plan_err};
+use datafusion::common::{Result as DFResult, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -36,7 +35,7 @@ use tokio_rusqlite::Connection;
 
 use super::knn_exec::SqliteKnnExec;
 use super::{expr_to_sqlite_sql, extract_string};
-use crate::sources::providers::knn_utils::extract_k;
+use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered SQLite table.
@@ -79,7 +78,7 @@ impl TableFunctionImpl for SqliteKnnTableFunction {
         let k = extract_k(&exprs[3], "sqlite_knn")?;
 
         // Try to extract a literal vector.
-        let literal_vector = extract_vector(&exprs[2]).ok();
+        let literal_vector = extract_literal_vector(&exprs[2], "sqlite_knn").ok();
 
         // Look up connection + columns from registry.
         let entry = {
@@ -257,44 +256,12 @@ pub fn register_sqlite_knn_udtf(ctx: &SessionContext, registry: DatasetRegistry)
     );
 }
 
-// ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
-    let values: Arc<dyn arrow::array::Array> = match expr {
-        Expr::Literal(ScalarValue::List(arr), _) => {
-            if arr.is_empty() {
-                return plan_err!("sqlite_knn: query_vec must not be empty");
-            }
-            arr.value(0)
-        }
-        Expr::Literal(ScalarValue::FixedSizeList(arr), _) => {
-            if arr.is_empty() {
-                return plan_err!("sqlite_knn: query_vec must not be empty");
-            }
-            arr.value(0)
-        }
-        _ => {
-            return plan_err!(
-                "sqlite_knn: query_vec must be a literal array (e.g. [0.1, 0.2, ...])"
-            );
-        }
-    };
-
-    if let Some(f32_arr) = values.as_any().downcast_ref::<Float32Array>() {
-        return Ok(f32_arr.values().to_vec());
-    }
-    if let Some(f64_arr) = values.as_any().downcast_ref::<Float64Array>() {
-        return Ok(f64_arr.values().iter().map(|&v| v as f32).collect());
-    }
-
-    plan_err!("sqlite_knn: query_vec elements must be Float32 or Float64")
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::ScalarValue;
     use std::collections::HashMap;
     use std::sync::RwLock;
 

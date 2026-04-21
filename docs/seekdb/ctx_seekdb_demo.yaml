@@ -1,0 +1,66 @@
+data_sources:
+  # Relational tables
+  - name: "users"
+    type: "seekdb"
+    access_mode: "read_write"
+    connection_string: "mysql://127.0.0.1:2881/mydb"
+    description: "SeekDB users table"
+    options:
+      table: "users"
+      user_env: "SEEKDB_USER"
+      pass_env: "SEEKDB_PASSWORD"
+      ssl_mode: "disabled"
+
+  - name: "orders"
+    type: "seekdb"
+    access_mode: "read_write"
+    connection_string: "mysql://127.0.0.1:2881/mydb"
+    description: "SeekDB orders table"
+    options:
+      table: "orders"
+      user_env: "SEEKDB_USER"
+      pass_env: "SEEKDB_PASSWORD"
+      ssl_mode: "disabled"
+
+  # FTS-enabled table (FULLTEXT index on body with the IK parser)
+  - name: "articles"
+    type: "seekdb"
+    access_mode: "read_write"
+    connection_string: "mysql://127.0.0.1:2881/mydb"
+    description: "Articles with a FULLTEXT index used by seekdb_fts"
+    options:
+      table: "articles"
+      user_env: "SEEKDB_USER"
+      pass_env: "SEEKDB_PASSWORD"
+      ssl_mode: "disabled"
+
+  # KNN-enabled table (VECTOR column with HNSW index)
+  - name: "docs"
+    type: "seekdb"
+    access_mode: "read_write"
+    connection_string: "mysql://127.0.0.1:2881/mydb"
+    description: "Docs with a VECTOR/HNSW column used by seekdb_knn"
+    options:
+      table: "docs"
+      user_env: "SEEKDB_USER"
+      pass_env: "SEEKDB_PASSWORD"
+      ssl_mode: "disabled"
+
+  # 384-dim KNN table for the embedding-UDF demo (bge-small-en-v1.5 output).
+  - name: "docs_embed"
+    type: "seekdb"
+    access_mode: "read_write"
+    connection_string: "mysql://127.0.0.1:2881/mydb"
+    description: "Docs with a 384-dim VECTOR column, embedded by candle() at query/write time"
+    options:
+      table: "docs_embed"
+      user_env: "SEEKDB_USER"
+      pass_env: "SEEKDB_PASSWORD"
+      ssl_mode: "disabled"
+
+  # A CSV source for the federated-join demo.
+  - name: "csv_orders"
+    type: "csv"
+    access_mode: "read_only"
+    path: "docs/sample_data/orders.csv"
+    description: "CSV file containing order data for federated queries"

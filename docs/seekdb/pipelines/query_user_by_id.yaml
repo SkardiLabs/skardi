@@ -1,0 +1,6 @@
+metadata:
+  name: "seekdb-query-user-by-id"
+  version: "1.0"
+  description: "Point lookup on the SeekDB users table."
+
+query: "SELECT id, name, email FROM users WHERE id = {user_id}"

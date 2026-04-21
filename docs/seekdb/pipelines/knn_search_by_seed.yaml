@@ -1,0 +1,17 @@
+metadata:
+  name: "seekdb-knn-search-by-seed"
+  version: "1.0.0"
+  description: >
+    Find docs similar to a given seed doc. The seed's embedding is supplied
+    via a scalar subquery — seekdb_knn fetches it at execution time.
+
+# Parameters:
+#   {seed_id} - id of the seed row in docs
+#   {k}       - Number of nearest neighbours to return
+
+query: |
+  SELECT id, title, category, _score
+  FROM seekdb_knn('docs', 'embedding',
+      (SELECT embedding FROM docs WHERE id = {seed_id}),
+      'cosine', {k})
+  ORDER BY _score ASC
