@@ -8,11 +8,17 @@
 //! -- With WHERE clause filter pushdown.
 //! SELECT * FROM seekdb_fts('articles', 'body', 'search terms', 10)
 //! WHERE category = 'news'
+//!
+//! -- Catalog-mode data sources: the first arg is the three-part key
+//! -- `<catalog>.<schema>.<table>` exactly as it was registered.
+//! SELECT * FROM seekdb_fts('seekdb_cat.mydb.articles', 'body', 'ml', 10)
 //! ```
 //!
 //! The first argument must be a registered SeekDB table whose `text_col`
 //! column has a `FULLTEXT` index (optionally declared with `WITH PARSER IK`
-//! for Chinese tokenisation).
+//! for Chinese tokenisation). In catalog mode the key is
+//! `<catalog>.<schema>.<table>` (unquoted, case-sensitive); in table mode it
+//! is the bare name the data source was registered under.
 //!
 //! Returns all table columns plus `_score Float64` (MySQL's MATCH-AGAINST
 //! natural language score). Higher is more relevant.
@@ -30,8 +36,8 @@ use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnect
 use std::any::Any;
 use std::sync::Arc;
 
-use super::expr_to_seekdb_sql;
 use super::fts_exec::SeekDbFtsExec;
+use super::{expr_to_seekdb_sql, extract_string_arg};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit.
@@ -60,9 +66,9 @@ impl TableFunctionImpl for SeekDbFtsTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let text_col = extract_string(&exprs[1], "text_col")?;
-        let query = extract_string(&exprs[2], "query")?;
+        let table_name = extract_string_arg(&exprs[0], "seekdb_fts", "table")?;
+        let text_col = extract_string_arg(&exprs[1], "seekdb_fts", "text_col")?;
+        let query = extract_string_arg(&exprs[2], "seekdb_fts", "query")?;
         let limit = match extract_int(&exprs[3], "limit")? {
             None => 1,
             Some(v) if v > MAX_FTS_LIMIT => {
@@ -210,16 +216,6 @@ impl TableProvider for SeekDbFtsProvider {
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
-
-pub(super) fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        // Accept NULL as placeholder during pipeline validation / schema inference.
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!("seekdb_fts: '{}' must be a string literal", name),
-    }
-}
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<Option<usize>> {
     match expr {

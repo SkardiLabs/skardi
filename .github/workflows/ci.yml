@@ -336,6 +336,14 @@ jobs:
               embedding VECTOR(4),
               VECTOR INDEX idx_embedding (embedding) WITH (TYPE = HNSW, DISTANCE = L2)
           );
+          -- Inner-product variant to verify NEGATIVE_INNER_PRODUCT() + HNSW
+          -- actually work end-to-end; L2/COSINE are exercised via the docs table.
+          CREATE TABLE IF NOT EXISTS docs_ip (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              title VARCHAR(200) NOT NULL,
+              embedding VECTOR(4),
+              VECTOR INDEX idx_embedding_ip (embedding) WITH (TYPE = HNSW, DISTANCE = INNER_PRODUCT)
+          );
           INSERT INTO users (name, email) VALUES
               ('Alice Smith', 'alice@example.com'),
               ('Bob Johnson', 'bob@example.com'),
@@ -356,6 +364,11 @@ jobs:
               ('doc-c', 'books',       '[0.0, 0.0, 1.0, 0.0]'),
               ('doc-d', 'electronics', '[1.0, 1.0, 0.0, 0.0]'),
               ('doc-e', 'books',       '[0.5, 0.5, 0.5, 0.5]');
+          INSERT INTO docs_ip (title, embedding) VALUES
+              ('ip-a', '[1.0, 0.0, 0.0, 0.0]'),
+              ('ip-b', '[0.0, 1.0, 0.0, 0.0]'),
+              ('ip-c', '[1.0, 1.0, 0.0, 0.0]'),
+              ('ip-d', '[0.5, 0.5, 0.5, 0.5]');
           EOF
 
       - name: Execute Integration tests

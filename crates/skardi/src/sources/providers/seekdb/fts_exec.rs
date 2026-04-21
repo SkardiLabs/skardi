@@ -322,10 +322,16 @@ fn build_column(rows: &[Row], col: &str, dtype: &DataType) -> DFResult<ArrayRef>
             Arc::new(b.finish())
         }
         DataType::Decimal128(_, scale) => {
+            // SeekDB returns DECIMAL as a string via the text protocol. We
+            // parse through f64 for simplicity, which loses precision beyond
+            // ~15-17 significant digits — acceptable for typical money /
+            // ratio columns but wrong for decimal(38, N) values carrying more
+            // than ~17 digits of payload. Switch to a string-based decimal
+            // parser (e.g. rust_decimal or manual digit shifting) if a
+            // high-precision use case surfaces.
             let scale_factor = 10i128.pow(*scale as u32);
             let mut b = Decimal128Builder::new().with_data_type(dtype.clone());
             for row in rows {
-                // SeekDB returns DECIMAL as a string via text protocol.
                 let v: Option<String> = row.get(col).ok_or_else(|| {
                     decode_err(col, "Decimal128 (via string)", "column not present")
                 })?;
@@ -345,7 +351,9 @@ fn build_column(rows: &[Row], col: &str, dtype: &DataType) -> DFResult<ArrayRef>
         _ => {
             let mut b = StringBuilder::new();
             for row in rows {
-                let v: Option<String> = row.get(col).unwrap_or(None);
+                let v: Option<String> = row.get(col).ok_or_else(|| {
+                    decode_err(col, "Utf8", "column not present or null encoding invalid")
+                })?;
                 match v {
                     Some(s) => b.append_value(&s),
                     None => b.append_null(),

@@ -68,6 +68,21 @@ pub enum DistanceMetric {
 
 impl DistanceMetric {
     /// The SeekDB distance function name for this metric.
+    ///
+    /// The inner-product case returns `NEGATIVE_INNER_PRODUCT` rather than
+    /// `INNER_PRODUCT` (the name emphasised in the public docs at
+    /// <https://github.com/oceanbase/seekdb>) because OceanBase's HNSW
+    /// implementation stores the *negated* dot product so that the index
+    /// orders candidates ascending (smaller = more similar), uniformly with
+    /// L2 and cosine. A query against a `DISTANCE = INNER_PRODUCT` HNSW
+    /// index only matches — and therefore only uses the index — when the
+    /// ORDER BY expression is `NEGATIVE_INNER_PRODUCT(...)`; using a bare
+    /// `INNER_PRODUCT(...)` silently degrades to a full scan.
+    ///
+    /// The `test_knn_inner_product_metric` integration test in
+    /// `knn_table_function.rs` executes this path end-to-end against the
+    /// `docs_ip` CI table so a rename in a future SeekDB version surfaces
+    /// as a failing CI run rather than as a runtime error in prod.
     pub fn function(self) -> &'static str {
         match self {
             DistanceMetric::L2 => "L2_DISTANCE",

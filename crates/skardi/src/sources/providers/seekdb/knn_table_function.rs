@@ -16,10 +16,20 @@
 //! -- Embedding UDF: any scalar function returning List<Float32> works directly.
 //! SELECT * FROM seekdb_knn('docs', 'embedding',
 //!   candle('models/bge-small-en-v1.5', 'how do I tune HNSW?'), 'cosine', 10)
+//!
+//! -- Catalog-mode data sources: the first arg is the three-part key
+//! -- `<catalog>.<schema>.<table>` exactly as it was registered.
+//! SELECT * FROM seekdb_knn('seekdb_cat.mydb.docs', 'embedding',
+//!   [0.1, 0.2, 0.3], 'l2', 10)
 //! ```
 //!
 //! Returns all non-vector columns plus `_score Float64`. Lower `_score` means
 //! more similar — matching `pg_knn` and `sqlite_knn`.
+//!
+//! **Table-name arg.** In table mode the first argument is the bare name the
+//! data source was registered under. In catalog mode it is
+//! `<catalog>.<schema>.<table>` (unquoted, case-sensitive) — the same three-
+//! part reference DataFusion uses to route SQL against the registered catalog.
 //!
 //! **HNSW (approximate) search.** The generated SQL uses SeekDB's
 //! `APPROXIMATE` keyword on the `ORDER BY`, which is what steers the planner
@@ -42,9 +52,8 @@ use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnect
 use std::any::Any;
 use std::sync::Arc;
 
-use super::expr_to_seekdb_sql;
-use super::fts_table_function::extract_string;
 use super::knn_exec::{DistanceMetric, SeekDbKnnExec};
+use super::{expr_to_seekdb_sql, extract_string_arg};
 use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
@@ -83,10 +92,10 @@ impl TableFunctionImpl for SeekDbKnnTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let vector_col = extract_string(&exprs[1], "vector_col")?;
+        let table_name = extract_string_arg(&exprs[0], "seekdb_knn", "table")?;
+        let vector_col = extract_string_arg(&exprs[1], "seekdb_knn", "vector_col")?;
 
-        let metric_str = extract_string(&exprs[3], "metric")?;
+        let metric_str = extract_string_arg(&exprs[3], "seekdb_knn", "metric")?;
         let metric = if metric_str.is_empty() {
             // NULL placeholder during schema inference — default to L2.
             DistanceMetric::default()
@@ -749,6 +758,44 @@ mod tests {
         .await;
 
         assert_eq!(total_rows(&batches), 2, "k=2 must cap the result");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_knn_inner_product_metric() {
+        // Guards against silent regressions in the InnerProduct → SeekDB
+        // function-name mapping. CI seeds `docs_ip` with a matching
+        // `DISTANCE = INNER_PRODUCT` HNSW index; the query here only succeeds
+        // if `NEGATIVE_INNER_PRODUCT()` is a real SeekDB function AND the
+        // planner accepts it with APPROXIMATE. If either assumption breaks we
+        // get a clear runtime error instead of silent performance loss.
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_knn(&mut ctx, "docs_ip").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title, _score \
+             FROM seekdb_knn('docs_ip', 'embedding', [1.0, 0.0, 0.0, 0.0], 'inner_product', 4) \
+             ORDER BY _score ASC",
+        )
+        .await;
+
+        assert!(total_rows(&batches) >= 2, "expected rows from IP search");
+
+        // NEGATIVE_INNER_PRODUCT means lower = more similar; `ip-a` has dot
+        // product 1.0 with the query, so its `_score` should be the most
+        // negative (or smallest) of the set.
+        let titles = batches[0]
+            .column_by_name("title")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title is Utf8");
+        assert_eq!(
+            titles.value(0),
+            "ip-a",
+            "inner-product: most-similar vector must rank first"
+        );
     }
 
     #[tokio::test]

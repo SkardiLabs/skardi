@@ -3,6 +3,7 @@ pub mod knn_utils;
 pub mod lance;
 pub mod mongo;
 pub mod mysql;
+pub mod mysql_wire;
 pub mod redis;
 pub mod seekdb;
 pub mod sqlite;

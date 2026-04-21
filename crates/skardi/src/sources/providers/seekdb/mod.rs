@@ -32,13 +32,14 @@ use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
     HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
 };
+use crate::sources::providers::mysql_wire::parse_mysql_wire_connection_params;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Constraints;
+use datafusion::common::{Constraints, ScalarValue, plan_err};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -69,7 +70,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Default SeekDB port (OceanBase MySQL-compatible endpoint).
-const DEFAULT_SEEKDB_PORT: &str = "2881";
+const DEFAULT_SEEKDB_PORT: u16 = 2881;
 
 /// Register SeekDB tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
@@ -307,7 +308,13 @@ async fn register_seekdb_catalog(
             let schema_c = schema.clone();
             let table_c = table_name.clone();
             async move {
-                let table_reference = TableReference::bare(table_c.as_str());
+                // The pool is bound to a single default database, but catalog
+                // enumeration spans every non-system schema — so the qualified
+                // reference must carry the schema explicitly, otherwise SHOW
+                // COLUMNS and SqlTable's generated SQL fall back to the
+                // connection's default DB and either fail or hit the wrong
+                // table.
+                let table_reference = TableReference::partial(schema_c.as_str(), table_c.as_str());
                 let provider = build_seekdb_table_provider(
                     Arc::clone(&pool),
                     table_reference.clone(),
@@ -324,9 +331,7 @@ async fn register_seekdb_catalog(
                         .collect();
                     let entry = SeekDbKnnEntry {
                         pool: Arc::clone(&pool),
-                        qualified_table: quote_seekdb_ident(&schema_c)
-                            + "."
-                            + &quote_seekdb_ident(&table_c),
+                        qualified_table: quote_seekdb_table(&table_reference),
                         columns,
                     };
                     // Key matches the three-part SQL reference so that UDTF
@@ -487,10 +492,10 @@ async fn resolve_seekdb_schema(
 
     let qualified = quote_seekdb_table(table_reference);
     let query = format!("SHOW COLUMNS FROM {qualified}");
-    let rows: Vec<(String, String)> = conn
+    let rows: Vec<(Option<String>, Option<String>)> = conn
         .query_map(query.as_str(), |row: Row| {
-            let field: String = row.get("Field").unwrap_or_default();
-            let ty: String = row.get("Type").unwrap_or_default();
+            let field: Option<String> = row.get("Field");
+            let ty: Option<String> = row.get("Type");
             (field, ty)
         })
         .await
@@ -501,8 +506,35 @@ async fn resolve_seekdb_schema(
             )
         })?;
 
+    build_schema_from_columns(table_reference, rows)
+}
+
+/// Build a filtered Arrow [`SchemaRef`] from a `SHOW COLUMNS` result.
+///
+/// Pure helper (no I/O) so the VECTOR-to-Utf8 coercion and unsupported-type
+/// skipping can be unit-tested without a live SeekDB. Returns an error if any
+/// row is missing a `Field` or `Type` — those columns are `NOT NULL` on MySQL-
+/// compatible servers, so empty values indicate a protocol-level mismatch we
+/// want to surface loudly rather than swallow into a bogus schema.
+fn build_schema_from_columns(
+    table_reference: &TableReference,
+    rows: Vec<(Option<String>, Option<String>)>,
+) -> Result<SchemaRef> {
     let mut fields: Vec<Field> = Vec::with_capacity(rows.len());
     for (name, ty) in rows {
+        let name = name.filter(|s| !s.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SeekDB SHOW COLUMNS returned a row with empty 'Field' for table '{}'",
+                table_reference
+            )
+        })?;
+        let ty = ty
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!(
+                "SeekDB SHOW COLUMNS returned a row with empty 'Type' for column '{}' in table '{}'",
+                name,
+                table_reference
+            ))?;
         let ty_lc = ty.to_lowercase();
         // SeekDB's native `VECTOR(N)` has no Arrow mapping in
         // datafusion-table-providers, but dropping the column entirely breaks
@@ -761,6 +793,23 @@ pub(crate) fn expr_to_seekdb_sql(expr: &Expr) -> Option<String> {
     unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
 }
 
+/// Extract a string-literal argument from a table-function `Expr`. Shared by
+/// `seekdb_fts` and `seekdb_knn` so they can emit consistent error messages
+/// prefixed with the caller's UDTF name (`fn_name`). NULL is accepted as a
+/// placeholder during pipeline schema inference and returns the empty string.
+pub(crate) fn extract_string_arg(
+    expr: &Expr,
+    fn_name: &str,
+    arg: &str,
+) -> DataFusionResult<String> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
+        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
+        _ => plan_err!("{fn_name}: '{arg}' must be a string literal"),
+    }
+}
+
 // ─── Execution plan for DELETE / UPDATE results ─────────────────────────────
 
 /// A leaf [`ExecutionPlan`] that executes a pre-built SeekDB DML statement
@@ -844,10 +893,23 @@ impl ExecutionPlan for SeekDbDmlExec {
         let schema = Arc::clone(&self.schema);
 
         let future = async move {
-            let conn_obj = pool.connect_direct().await.map_err(|e| {
+            // Go through the pool (not `connect_direct`) so DELETE / UPDATE
+            // statements return their connection for reuse. `connect_direct`
+            // opens a fresh MySQL connection per call and never releases it,
+            // which leaks FDs under any write-heavy workload. FTS and KNN use
+            // the same pooled path.
+            let conn_obj = pool.connect().await.map_err(|e| {
                 DataFusionError::Execution(format!("SeekDB DML connect error: {e}"))
             })?;
-            let mut conn = conn_obj.conn.lock().await;
+            let mysql_conn = conn_obj
+                .as_any()
+                .downcast_ref::<MySQLConnection>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "SeekDB DML: unexpected connection type from pool".to_string(),
+                    )
+                })?;
+            let mut conn = mysql_conn.conn.lock().await;
             let conn = &mut *conn;
             let _: Vec<Row> = conn.exec(&sql, Params::Empty).await.map_err(|e| {
                 DataFusionError::Execution(format!("SeekDB DML execute error: {e}"))
@@ -868,94 +930,13 @@ impl ExecutionPlan for SeekDbDmlExec {
 // ─── Connection-string parser ────────────────────────────────────────────────
 
 /// Parse a SeekDB connection string into the parameter map expected by
-/// [`MySQLConnectionPool`]. Identical to MySQL's parser except that the
-/// default port is 2881 (OceanBase / SeekDB) instead of 3306.
+/// [`MySQLConnectionPool`]. Delegates to the shared MySQL wire-protocol
+/// parser with SeekDB's default port (2881).
 pub(crate) fn parse_connection_params(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<HashMap<String, SecretString>> {
-    let url = url::Url::parse(connection_string)
-        .with_context(|| format!("Invalid SeekDB connection string: {}", connection_string))?;
-
-    let mut params: HashMap<String, SecretString> = HashMap::new();
-
-    if let Some(host) = url.host_str() {
-        params.insert(
-            "host".to_string(),
-            SecretString::new(host.to_string().into_boxed_str()),
-        );
-    }
-
-    if let Some(port) = url.port() {
-        params.insert(
-            "tcp_port".to_string(),
-            SecretString::new(port.to_string().into_boxed_str()),
-        );
-    } else {
-        params.insert(
-            "tcp_port".to_string(),
-            SecretString::new(DEFAULT_SEEKDB_PORT.to_string().into_boxed_str()),
-        );
-    }
-
-    let db_name = url
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
-
-    if !db_name.is_empty() {
-        params.insert(
-            "db".to_string(),
-            SecretString::new(db_name.to_string().into_boxed_str()),
-        );
-    }
-
-    if let Some(opts) = options {
-        if let Some(user_env) = opts.get("user_env") {
-            let username = std::env::var(user_env).with_context(|| {
-                format!(
-                    "Environment variable '{}' not found for SeekDB user",
-                    user_env
-                )
-            })?;
-            params.insert(
-                "user".to_string(),
-                SecretString::new(username.into_boxed_str()),
-            );
-        }
-
-        if let Some(pass_env) = opts.get("pass_env") {
-            let password = std::env::var(pass_env).with_context(|| {
-                format!(
-                    "Environment variable '{}' not found for SeekDB password",
-                    pass_env
-                )
-            })?;
-            params.insert(
-                "pass".to_string(),
-                SecretString::new(password.into_boxed_str()),
-            );
-        }
-    }
-
-    let ssl_mode = options
-        .and_then(|opts| opts.get("ssl_mode"))
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| {
-            tracing::debug!(
-                "SSL mode not specified, defaulting to 'disabled' for local development"
-            );
-            "disabled".to_string()
-        });
-
-    params.insert(
-        "sslmode".to_string(),
-        SecretString::new(ssl_mode.into_boxed_str()),
-    );
-
-    Ok(params)
+    parse_mysql_wire_connection_params(connection_string, options, DEFAULT_SEEKDB_PORT, "SeekDB")
 }
 
 // ─── Unit tests ─────────────────────────────────────────────────────────────
@@ -983,7 +964,7 @@ mod tests {
 
         assert_eq!(
             params.get("tcp_port").unwrap().expose_secret(),
-            DEFAULT_SEEKDB_PORT,
+            DEFAULT_SEEKDB_PORT.to_string(),
             "SeekDB should default to 2881, not MySQL's 3306"
         );
     }
@@ -1357,5 +1338,81 @@ mod tests {
         assert_eq!(mysql_type_to_arrow("vector(1536)"), None);
         assert_eq!(mysql_type_to_arrow("geometry"), None);
         assert_eq!(mysql_type_to_arrow("some_oddball_type"), None);
+    }
+
+    // ─── build_schema_from_columns ───────────────────────────────────────────
+
+    fn col(name: &str, ty: &str) -> (Option<String>, Option<String>) {
+        (Some(name.to_string()), Some(ty.to_string()))
+    }
+
+    #[test]
+    fn build_schema_maps_vector_to_utf8() {
+        let tr = TableReference::bare("docs");
+        let rows = vec![
+            col("id", "int(11)"),
+            col("title", "varchar(200)"),
+            col("embedding", "VECTOR(1536)"),
+        ];
+        let schema = build_schema_from_columns(&tr, rows).unwrap();
+        let embedding = schema.field_with_name("embedding").unwrap();
+        assert_eq!(
+            embedding.data_type(),
+            &DataType::Utf8,
+            "VECTOR(N) must surface as Utf8 so subquery references resolve"
+        );
+        assert!(embedding.is_nullable());
+    }
+
+    #[test]
+    fn build_schema_skips_unmapped_types() {
+        let tr = TableReference::bare("t");
+        let rows = vec![col("id", "int(11)"), col("geom", "geometry")];
+        let schema = build_schema_from_columns(&tr, rows).unwrap();
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(
+            schema.field_with_name("geom").is_err(),
+            "unmapped MySQL type should be dropped with a warning"
+        );
+    }
+
+    #[test]
+    fn build_schema_all_columns_nullable() {
+        let tr = TableReference::bare("t");
+        let rows = vec![col("id", "int(11)"), col("name", "varchar(100)")];
+        let schema = build_schema_from_columns(&tr, rows).unwrap();
+        for f in schema.fields() {
+            assert!(f.is_nullable(), "field {} should be nullable", f.name());
+        }
+    }
+
+    #[test]
+    fn build_schema_bails_on_empty_field() {
+        let tr = TableReference::bare("t");
+        let rows = vec![(Some(String::new()), Some("int(11)".into()))];
+        let err = build_schema_from_columns(&tr, rows)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty 'Field'"), "got: {err}");
+    }
+
+    #[test]
+    fn build_schema_bails_on_missing_type() {
+        let tr = TableReference::bare("t");
+        let rows = vec![(Some("id".into()), None)];
+        let err = build_schema_from_columns(&tr, rows)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty 'Type'"), "got: {err}");
+    }
+
+    #[test]
+    fn build_schema_bails_when_every_column_is_unmapped() {
+        let tr = TableReference::bare("t");
+        let rows = vec![col("g", "geometry"), col("p", "polygon")];
+        let err = build_schema_from_columns(&tr, rows)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Arrow-mappable columns"), "got: {err}");
     }
 }
