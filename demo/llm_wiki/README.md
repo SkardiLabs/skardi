@@ -1,6 +1,29 @@
 # LLM Wiki Demo
 
-This demo has two flavours: the **server / PostgreSQL** version and a **CLI / SQLite** version that runs entirely through `skardi-cli` against a local file (no server, no Docker).
+A durable, editable wiki for an LLM agent, built entirely on Skardi
+primitives: every agent verb (`write`, `open`, `grep`, `ls`, `log`) is one
+pipeline YAML plus a CLI alias, and the whole thing runs on `candle()`
+inline embeddings, `pg_knn` / `sqlite_knn`, `pg_fts` / `sqlite_fts`, and RRF
+hybrid search — all in the same SQL. The demo shows what **full data
+autonomy** looks like for an agent: it curates a compounding knowledge base
+itself, with no external orchestration code.
+
+Two flavours ship side by side:
+
+- **Server / PostgreSQL + pgvector** — the "production" shape: each verb is
+  a REST pipeline, invoked over HTTP. Useful when the agent is running
+  somewhere else (Claude Desktop, a web backend, a managed runtime) and
+  talks to skardi across the wire.
+- **CLI / SQLite + `sqlite-vec` + FTS5** — the "drop into any agent" shape:
+  same pipeline YAMLs, but invoked as `skardi <verb>` shell commands with
+  no server, no Docker, no HTTP. This is the MVP story — any agent with a
+  Bash tool (Claude Code, Cursor, custom loops) gets the full wiki loop
+  locally in a few minutes.
+
+Both flavours use the **same pipeline YAML format**, because the whole point
+of the Skardi design is that one declaration is every agent-facing surface:
+REST today, shell today, skills soon, MCP soon after. For the thinking
+behind that, read [`docs/spark_for_agents.md`](../../docs/spark_for_agents.md).
 
 ---
 

@@ -1,6 +1,8 @@
 # Skardi Server
 
-`skardi-server` is an HTTP server that loads data sources from a **context file**, registers SQL pipelines, and serves them as REST endpoints.
+`skardi-server` is the HTTP side of Skardi's **Spark-for-Agents** surface: it loads data sources from a **context file**, registers SQL pipelines, and serves them as parameterized REST endpoints that agents (or any HTTP client) can call as tools. The same pipeline YAML also drives the `skardi run` CLI, so every pipeline is usable from a shell out of the box and, in the v1.1 roadmap, becomes a Claude skill and an MCP tool automatically. Pipeline YAML is the single source of truth — this file is about the HTTP binding on top of it.
+
+For the broader story and how the server fits the agent picture, see [spark_for_agents.md](spark_for_agents.md).
 
 ## Running the Server
 
