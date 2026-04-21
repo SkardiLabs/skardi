@@ -46,6 +46,18 @@ data_sources:
       pass_env: "SEEKDB_PASSWORD"
       ssl_mode: "disabled"
 
+  # 384-dim KNN table for the embedding-UDF demo (bge-small-en-v1.5 output).
+  - name: "docs_embed"
+    type: "seekdb"
+    access_mode: "read_write"
+    connection_string: "mysql://127.0.0.1:2881/mydb"
+    description: "Docs with a 384-dim VECTOR column, embedded by candle() at query/write time"
+    options:
+      table: "docs_embed"
+      user_env: "SEEKDB_USER"
+      pass_env: "SEEKDB_PASSWORD"
+      ssl_mode: "disabled"
+
   # A CSV source for the federated-join demo.
   - name: "csv_orders"
     type: "csv"

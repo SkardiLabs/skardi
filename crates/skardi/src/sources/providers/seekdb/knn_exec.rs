@@ -7,7 +7,7 @@
 //! SELECT <cols>, <dist_fn>(`<vector_col>`, ?) AS `_score`
 //! FROM <qualified_table>
 //! [WHERE <filter>]
-//! ORDER BY <dist_fn>(`<vector_col>`, ?)
+//! ORDER BY <dist_fn>(`<vector_col>`, ?) APPROXIMATE
 //! LIMIT <k>
 //! ```
 //!
@@ -15,9 +15,16 @@
 //! `INNER_PRODUCT`, and the query vector is bound as a JSON-encoded array
 //! (SeekDB accepts the `[x,y,z]` textual form for `VECTOR` values).
 //!
-//! The raw distance expression is duplicated in SELECT and ORDER BY so that
-//! SeekDB's HNSW index can be used — a subquery alias or `_score` reference
-//! in ORDER BY would prevent the optimiser from matching the index expression.
+//! The `APPROXIMATE` keyword is what actually steers SeekDB's planner to the
+//! HNSW index (`VECTOR INDEX SCAN`); without it the planner silently falls
+//! back to a `TABLE FULL SCAN + TOP-N SORT` — correct but O(n). The raw
+//! distance expression is also duplicated in SELECT and ORDER BY because a
+//! subquery alias or `_score` reference in ORDER BY would prevent the
+//! optimiser from matching the index expression at all.
+//!
+//! HNSW only kicks in when the query metric matches the index's declared
+//! `DISTANCE`. If they disagree (e.g. cosine query on an L2 index), SeekDB
+//! falls back to a full scan and the result stays correct, just slow.
 //!
 //! Lower `_score` means more similar, matching `pg_knn` and `sqlite_knn`.
 
@@ -195,6 +202,14 @@ impl SeekDbKnnExec {
     /// Build the parameterised KNN SELECT query. Two `?` placeholders bind the
     /// same query vector — once in the SELECT list (score), once in the
     /// ORDER BY (so the HNSW index can match the exact expression).
+    ///
+    /// The `APPROXIMATE` keyword after the ORDER BY distance is what actually
+    /// makes SeekDB's planner pick the HNSW index (`VECTOR INDEX SCAN`) — its
+    /// absence degrades silently to `TABLE FULL SCAN + TOP-N SORT`
+    /// (brute-force). The HNSW index must have been created with a matching
+    /// `DISTANCE = <metric>`; if the declared metric and the query's metric
+    /// disagree, SeekDB falls back to full scan even with APPROXIMATE — the
+    /// query still returns correct rows, just slowly.
     pub(crate) fn build_query(&self) -> String {
         let cols = self.select_columns();
         let vec_col = quote_seekdb_ident(&self.vector_col);
@@ -215,7 +230,7 @@ impl SeekDbKnnExec {
         format!(
             "SELECT {select_list} \
              FROM {table}{where_clause} \
-             ORDER BY {dist_expr} \
+             ORDER BY {dist_expr} APPROXIMATE \
              LIMIT {k}",
             table = self.qualified_table,
             k = self.k,
@@ -401,7 +416,7 @@ impl QueryBuilder {
         format!(
             "SELECT {select_list} \
              FROM {table}{where_clause} \
-             ORDER BY {dist_expr} \
+             ORDER BY {dist_expr} APPROXIMATE \
              LIMIT {k}",
             table = self.qualified_table,
             k = self.k,
@@ -529,6 +544,34 @@ mod tests {
             sql.contains("ORDER BY L2_DISTANCE(`embedding`, ?)"),
             "ORDER BY must use the raw distance expression for index use; sql={sql}"
         );
+    }
+
+    #[test]
+    fn test_build_query_order_by_is_approximate() {
+        // The APPROXIMATE keyword is what makes SeekDB's planner pick the
+        // HNSW index — without it, it falls back to TABLE FULL SCAN + TOP-N
+        // SORT. Guard this against an accidental revert since it only shows
+        // up as silent performance degradation at runtime.
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+        ] {
+            let b = make_builder(vec![("id", DataType::Int64)], metric, None, 10);
+            let sql = b.build_query();
+            assert!(
+                sql.contains("APPROXIMATE"),
+                "metric {metric:?} is missing APPROXIMATE; sql={sql}"
+            );
+            // And it must come after the distance expression, before LIMIT.
+            let dist_idx = sql.find(metric.function()).expect("has distance fn");
+            let approx_idx = sql.find("APPROXIMATE").expect("has APPROXIMATE");
+            let limit_idx = sql.find("LIMIT").expect("has LIMIT");
+            assert!(
+                dist_idx < approx_idx && approx_idx < limit_idx,
+                "APPROXIMATE must sit between the distance expr and LIMIT; sql={sql}"
+            );
+        }
     }
 
     #[test]

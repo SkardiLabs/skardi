@@ -24,7 +24,6 @@
 //! The score is the raw pgvector distance value for the chosen metric — lower is more similar
 //! (for `inner_product` the score is negative).
 
-use arrow::array::{Array, Float32Array, Float64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -41,7 +40,7 @@ use std::sync::Arc;
 
 use super::knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
-use crate::sources::providers::knn_utils::extract_k;
+use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered Postgres table.
@@ -121,7 +120,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
         // Try to extract a literal vector. If arg[2] is a scalar subquery, unparse it
         // to SQL so the vector can be fetched directly via sqlx at execution time
         // (bypassing datafusion-table-providers, which can't decode the `vector` type).
-        let literal_vector = extract_vector(&exprs[2]).ok();
+        let literal_vector = extract_literal_vector(&exprs[2], "pg_knn").ok();
         let query_vector_sql = if literal_vector.is_none() {
             build_vector_fetch_sql(&exprs[2]).ok()
         } else {
@@ -473,31 +472,4 @@ fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
         Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
         _ => plan_err!("pg_knn: '{}' must be a string literal", name),
     }
-}
-
-fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
-    let values: Arc<dyn arrow::array::Array> = match expr {
-        Expr::Literal(ScalarValue::List(arr), _) => {
-            if arr.is_empty() {
-                return plan_err!("pg_knn: query_vec must not be empty");
-            }
-            arr.value(0)
-        }
-        Expr::Literal(ScalarValue::FixedSizeList(arr), _) => {
-            if arr.is_empty() {
-                return plan_err!("pg_knn: query_vec must not be empty");
-            }
-            arr.value(0)
-        }
-        _ => return plan_err!("pg_knn: query_vec must be a literal array (e.g. [0.1, 0.2, ...])"),
-    };
-
-    if let Some(f32_arr) = values.as_any().downcast_ref::<Float32Array>() {
-        return Ok(f32_arr.values().to_vec());
-    }
-    if let Some(f64_arr) = values.as_any().downcast_ref::<Float64Array>() {
-        return Ok(f64_arr.values().iter().map(|&v| v as f32).collect());
-    }
-
-    plan_err!("pg_knn: query_vec elements must be Float32 or Float64")
 }

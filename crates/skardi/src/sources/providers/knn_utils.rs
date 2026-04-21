@@ -135,6 +135,55 @@ pub async fn extract_query_vector(
     ))
 }
 
+/// Extract a literal query vector from a KNN table-function argument.
+///
+/// Accepts `Expr::Literal(ScalarValue::List)` and `Expr::Literal(ScalarValue::FixedSizeList)`
+/// with `Float32` or `Float64` elements (the latter is cast to `f32`). Empty vectors and
+/// unsupported element types are rejected at planning time.
+///
+/// `fn_name` is used as the error-message prefix (e.g. `"sqlite_knn"`, `"pg_knn"`,
+/// `"seekdb_knn"`) so the caller's UDTF name shows up in planning errors.
+///
+/// Non-literal expressions — `Expr::ScalarSubquery`, `Expr::ScalarFunction`, column
+/// references — return an error; each provider handles those in its `scan()` path.
+///
+/// Note: a `Volatility::Immutable` UDF called with literal args (e.g.
+/// `candle('model', 'text')`) is const-folded by DataFusion before the UDTF's
+/// `call()` receives its args, so it arrives here as a plain literal list.
+pub fn extract_literal_vector(expr: &Expr, fn_name: &str) -> DFResult<Vec<f32>> {
+    let values: Arc<dyn Array> = match expr {
+        Expr::Literal(ScalarValue::List(arr), _) => {
+            if arr.is_empty() {
+                return plan_err!("{fn_name}: query_vec must not be empty");
+            }
+            arr.value(0)
+        }
+        Expr::Literal(ScalarValue::FixedSizeList(arr), _) => {
+            if arr.is_empty() {
+                return plan_err!("{fn_name}: query_vec must not be empty");
+            }
+            arr.value(0)
+        }
+        _ => {
+            return plan_err!(
+                "{fn_name}: query_vec must be a literal array (e.g. [0.1, 0.2, ...])"
+            );
+        }
+    };
+
+    if values.is_empty() {
+        return plan_err!("{fn_name}: query_vec must not be empty");
+    }
+    if let Some(f32_arr) = values.as_any().downcast_ref::<Float32Array>() {
+        return Ok(f32_arr.values().to_vec());
+    }
+    if let Some(f64_arr) = values.as_any().downcast_ref::<Float64Array>() {
+        return Ok(f64_arr.values().iter().map(|&v| v as f32).collect());
+    }
+
+    plan_err!("{fn_name}: query_vec elements must be Float32 or Float64")
+}
+
 /// Parse a pgvector text literal (`[0.1, 0.2, 0.3]`) into `Vec<f32>`.
 pub fn parse_pgvector_text(s: &str) -> Result<Vec<f32>, String> {
     let inner = s
@@ -297,6 +346,143 @@ mod tests {
     #[test]
     fn test_parse_invalid_element_errors() {
         assert!(parse_pgvector_text("[0.1,not_a_float,0.3]").is_err());
+    }
+
+    // ── extract_literal_vector ────────────────────────────────────────────
+    //
+    // These tests lock in the behavior that sqlite/pg/seekdb previously each
+    // duplicated in a local `extract_vector`. All three provider-level tests
+    // for that helper should keep passing after the delegation.
+
+    fn lit_list_f32(values: &[f32]) -> Expr {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field;
+        let inner = Float32Array::from(values.to_vec());
+        let list = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Float32, true)),
+            OffsetBuffer::from_lengths([values.len()]),
+            Arc::new(inner) as Arc<dyn Array>,
+            None,
+        );
+        Expr::Literal(ScalarValue::List(Arc::new(list)), None)
+    }
+
+    fn lit_list_f64(values: &[f64]) -> Expr {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field;
+        let inner = Float64Array::from(values.to_vec());
+        let list = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Float64, true)),
+            OffsetBuffer::from_lengths([values.len()]),
+            Arc::new(inner) as Arc<dyn Array>,
+            None,
+        );
+        Expr::Literal(ScalarValue::List(Arc::new(list)), None)
+    }
+
+    fn lit_fixed_size_list_f32(values: &[f32]) -> Expr {
+        use arrow::datatypes::Field;
+        let inner = Float32Array::from(values.to_vec());
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new_list_field(DataType::Float32, true)),
+            values.len() as i32,
+            Arc::new(inner) as Arc<dyn Array>,
+            None,
+        );
+        Expr::Literal(ScalarValue::FixedSizeList(Arc::new(fsl)), None)
+    }
+
+    fn lit_list_str(values: &[&str]) -> Expr {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field;
+        let inner = StringArray::from(values.to_vec());
+        let list = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Utf8, true)),
+            OffsetBuffer::from_lengths([values.len()]),
+            Arc::new(inner) as Arc<dyn Array>,
+            None,
+        );
+        Expr::Literal(ScalarValue::List(Arc::new(list)), None)
+    }
+
+    #[test]
+    fn test_extract_literal_vector_list_f32() {
+        let v = extract_literal_vector(&lit_list_f32(&[0.1, 0.2, 0.3]), "sqlite_knn").unwrap();
+        assert_eq!(v.len(), 3);
+        assert!((v[0] - 0.1).abs() < 1e-6);
+        assert!((v[1] - 0.2).abs() < 1e-6);
+        assert!((v[2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extract_literal_vector_list_f64_casts_to_f32() {
+        let v = extract_literal_vector(&lit_list_f64(&[0.1, 0.2, 0.3]), "pg_knn").unwrap();
+        assert_eq!(v.len(), 3);
+        assert!((v[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extract_literal_vector_fixed_size_list_f32() {
+        let v = extract_literal_vector(
+            &lit_fixed_size_list_f32(&[1.0, 0.0, 0.0, 0.0]),
+            "seekdb_knn",
+        )
+        .unwrap();
+        assert_eq!(v, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_extract_literal_vector_empty_list_rejected() {
+        let err = extract_literal_vector(&lit_list_f32(&[]), "sqlite_knn")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sqlite_knn") && err.contains("must not be empty"),
+            "expected empty-vector error with fn_name, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_literal_vector_wrong_element_type_rejected() {
+        let err = extract_literal_vector(&lit_list_str(&["a", "b"]), "pg_knn")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pg_knn") && err.contains("Float32 or Float64"),
+            "expected wrong-type error with fn_name, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_literal_vector_non_literal_rejected() {
+        // A column reference is neither a literal nor what the helper accepts;
+        // the non-literal dispatch happens in each provider's scan() path.
+        let col_expr = datafusion::logical_expr::col("embedding");
+        let err = extract_literal_vector(&col_expr, "seekdb_knn")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("seekdb_knn") && err.contains("literal array"),
+            "expected non-literal error with fn_name, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_literal_vector_fn_name_is_threaded() {
+        // Every error path must carry the caller's fn_name so users can tell
+        // which UDTF rejected their query.
+        for fn_name in &["sqlite_knn", "pg_knn", "seekdb_knn", "custom_knn"] {
+            let err = extract_literal_vector(&lit_list_f32(&[]), fn_name)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(fn_name),
+                "missing fn_name '{fn_name}' in: {err}"
+            );
+        }
     }
 
     // ── extract_query_vector ──────────────────────────────────────────────

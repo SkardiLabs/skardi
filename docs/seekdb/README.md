@@ -129,8 +129,10 @@ SeekDB presents as a MySQL-compatible relational database. In Skardi:
 | `pipelines/federated_join_and_insert.yaml` | Join with a CSV source, then `INSERT` the aggregate into SeekDB |
 | `pipelines/fts_search.yaml` | Native FTS via `seekdb_fts` |
 | `pipelines/fts_search_with_filter.yaml` | FTS + WHERE pushdown |
-| `pipelines/knn_search.yaml` | KNN vector search via `seekdb_knn` |
-| `pipelines/knn_search_by_seed.yaml` | KNN using an existing row's embedding as the query vector |
+| `pipelines/knn_search.yaml` | KNN vector search via `seekdb_knn` (literal vector) |
+| `pipelines/knn_search_by_seed.yaml` | KNN using an existing row's embedding as the query vector (scalar subquery) |
+| `pipelines/seed_doc_embed.yaml` | INSERT a row into `docs_embed`, embedding content inline via `candle()` |
+| `pipelines/knn_search_by_text.yaml` | KNN driven by a text query, embedded inline via `candle()` (embedding UDF) |
 
 ## Detailed Examples
 
@@ -198,6 +200,104 @@ Expected response:
 
 `_score` is the raw L2 distance — **lower is more similar**, matching
 `pg_knn` / `sqlite_knn`.
+
+### KNN search with an embedding UDF (text → vector inline)
+
+`seekdb_knn` accepts three shapes for its query-vector argument:
+
+1. **Literal array** — `[1.0, 0.0, 0.0, 0.0]` (see `knn_search.yaml`).
+2. **Scalar subquery** — `(SELECT embedding FROM docs WHERE id = {seed_id})`
+   (see `knn_search_by_seed.yaml`).
+3. **Scalar function call** — any UDF returning `List<Float32>`, including
+   Skardi's `candle()` / `remote_embed()` embedding UDFs. The UDF is
+   evaluated once at execution time and the resulting vector is fed into
+   SeekDB's HNSW probe.
+
+The walk-through below demonstrates the third shape end-to-end using
+[bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) (384-dim)
+via the `candle()` UDF.
+
+**1. Create the 384-dim companion table.** From a SQL client
+(`docker exec -i seekdb mysql -h 127.0.0.1 -P 2881 -u "root@sys"` works
+if you don't have `mysql` on the host):
+
+```sql
+USE mydb;
+CREATE TABLE docs_embed (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    title VARCHAR(200) NOT NULL,
+    category VARCHAR(50) NOT NULL,
+    content TEXT NOT NULL,
+    embedding VECTOR(384),
+    VECTOR INDEX idx_docs_embed (embedding) WITH (TYPE = HNSW, DISTANCE = COSINE)
+);
+```
+
+**2. Download the embedding model** (single-directory layout the `candle()`
+UDF expects):
+
+```bash
+pip install huggingface_hub
+python -c "
+from huggingface_hub import hf_hub_download
+import os
+model_dir = 'models/generated/bge-small-en-v1.5'
+os.makedirs(model_dir, exist_ok=True)
+for f in ['model.safetensors', 'config.json', 'tokenizer.json']:
+    hf_hub_download('BAAI/bge-small-en-v1.5', f, local_dir=model_dir)
+"
+```
+
+**3. Start the server with `--features candle`** so the `candle` UDF is
+registered alongside the SeekDB provider:
+
+```bash
+export SEEKDB_USER="root@sys"
+export SEEKDB_PASSWORD=""
+
+cargo run --bin skardi-server --features candle -- \
+  --ctx docs/seekdb/ctx_seekdb_demo.yaml \
+  --pipeline docs/seekdb/pipelines/ \
+  --port 8080
+```
+
+**4. Seed rows via `seed_doc_embed.yaml`.** The INSERT calls `candle()`
+inline and formats the resulting `List<Float32>` as a pgvector-style
+string so SeekDB's `VECTOR` column can parse it:
+
+```bash
+for payload in \
+  '{"title":"Neural Networks","category":"ai","content":"deep learning with backpropagation and gradient descent"}' \
+  '{"title":"Quantum Computing","category":"physics","content":"qubits superposition and quantum entanglement"}' \
+  '{"title":"Espresso Brewing","category":"coffee","content":"pulling a shot grinding beans and steaming milk"}'
+do
+  curl -sS -X POST http://localhost:8080/seekdb-seed-doc-embed/execute \
+    -H "Content-Type: application/json" -d "$payload"
+done
+```
+
+**5. Query by text via `knn_search_by_text.yaml`.** `seekdb_knn` receives
+`candle(...)` as its third argument, plans it as a scalar-function
+expression, and embeds the query at execution time:
+
+```bash
+curl -sS -X POST http://localhost:8080/seekdb-knn-search-by-text/execute \
+  -H "Content-Type: application/json" \
+  -d '{"text": "training deep learning models", "k": 3}'
+```
+
+The top hit is the "Neural Networks" row (smallest cosine distance); the
+quantum and coffee rows rank further out.
+
+The pipeline body is:
+
+```sql
+SELECT id, title, category, _score
+FROM seekdb_knn('docs_embed', 'embedding',
+    candle('models/generated/bge-small-en-v1.5', {text}),
+    'cosine', {k})
+ORDER BY _score ASC
+```
 
 ## Connection Options
 

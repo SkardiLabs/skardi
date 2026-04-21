@@ -12,19 +12,30 @@
 //! -- Scalar-subquery query vector (find similar to a stored item)
 //! SELECT * FROM seekdb_knn('docs', 'embedding',
 //!   (SELECT embedding FROM docs WHERE id = 1), 'l2', 10)
+//!
+//! -- Embedding UDF: any scalar function returning List<Float32> works directly.
+//! SELECT * FROM seekdb_knn('docs', 'embedding',
+//!   candle('models/bge-small-en-v1.5', 'how do I tune HNSW?'), 'cosine', 10)
 //! ```
 //!
 //! Returns all non-vector columns plus `_score Float64`. Lower `_score` means
 //! more similar — matching `pg_knn` and `sqlite_knn`.
+//!
+//! **HNSW (approximate) search.** The generated SQL uses SeekDB's
+//! `APPROXIMATE` keyword on the `ORDER BY`, which is what steers the planner
+//! to the `VECTOR INDEX SCAN` (HNSW) path. Without it, SeekDB silently
+//! degrades to a `TABLE FULL SCAN + TOP-N SORT` — correct but O(n). HNSW
+//! only kicks in when the target table has a `VECTOR INDEX ... WITH (TYPE
+//! = HNSW, DISTANCE = <m>)` whose declared `<m>` matches the metric arg to
+//! `seekdb_knn`; mismatched-metric queries fall back to a full scan.
 
-use arrow::array::{Array, Float32Array, Float64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{Result as DFResult, ScalarValue, plan_err};
+use datafusion::common::{Result as DFResult, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
@@ -34,7 +45,7 @@ use std::sync::Arc;
 use super::expr_to_seekdb_sql;
 use super::fts_table_function::extract_string;
 use super::knn_exec::{DistanceMetric, SeekDbKnnExec};
-use crate::sources::providers::knn_utils::extract_k;
+use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered SeekDB table.
@@ -87,7 +98,7 @@ impl TableFunctionImpl for SeekDbKnnTableFunction {
 
         let k = extract_k(&exprs[4], "seekdb_knn")?;
 
-        let literal_vector = extract_vector(&exprs[2]).ok();
+        let literal_vector = extract_literal_vector(&exprs[2], "seekdb_knn").ok();
 
         let entry = {
             let reg = self.registry.read().map_err(|e| {
@@ -222,10 +233,9 @@ impl TableProvider for SeekDbKnnProvider {
                 self.metric,
                 self.k,
             )
-        } else if let Expr::ScalarSubquery(subquery) = &self.query_vector_expr {
-            let physical_plan = state
-                .create_physical_plan(subquery.subquery.as_ref())
-                .await?;
+        } else if let Some(physical_plan) =
+            resolve_query_vector_plan(&self.query_vector_expr, state).await?
+        {
             SeekDbKnnExec::new_with_subquery(
                 Arc::clone(&self.pool),
                 self.qualified_table.clone(),
@@ -238,8 +248,9 @@ impl TableProvider for SeekDbKnnProvider {
             )
         } else {
             return plan_err!(
-                "seekdb_knn: query_vec must be a literal array or a scalar subquery, \
-                 e.g. [0.1, 0.2, ...] or (SELECT embedding FROM t WHERE id = 1)"
+                "seekdb_knn: query_vec must be a literal array, a scalar subquery, \
+                 or a scalar function call — e.g. [0.1, 0.2, ...], \
+                 (SELECT embedding FROM t WHERE id = 1), or candle('model', 'text')"
             );
         };
 
@@ -263,38 +274,37 @@ pub fn register_seekdb_knn_udtf(ctx: &SessionContext, registry: DatasetRegistry)
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
 
-fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
-    let values: Arc<dyn arrow::array::Array> = match expr {
-        Expr::Literal(ScalarValue::List(arr), _) => {
-            if arr.is_empty() {
-                return plan_err!("seekdb_knn: query_vec must not be empty");
-            }
-            arr.value(0)
+/// Resolve a non-literal `query_vec` argument to a one-row `ExecutionPlan`
+/// whose first column is the query vector.
+///
+/// Returns `Ok(None)` for expressions that are neither a scalar subquery nor a
+/// scalar function — the caller emits the appropriate user-facing error.
+///
+/// For `Expr::ScalarFunction` (e.g. `candle('model', 'text')` or any UDF that
+/// returns `List<Float32>`), the expression is wrapped in a trivial
+/// `Projection` over a single-row empty relation so DataFusion can plan and
+/// evaluate it at execution time. This is pool-free and async-friendly —
+/// factored out so it can be tested independently of the MySQL connection.
+pub(super) async fn resolve_query_vector_plan(
+    expr: &Expr,
+    state: &dyn Session,
+) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    match expr {
+        Expr::ScalarSubquery(subquery) => {
+            let plan = state
+                .create_physical_plan(subquery.subquery.as_ref())
+                .await?;
+            Ok(Some(plan))
         }
-        Expr::Literal(ScalarValue::FixedSizeList(arr), _) => {
-            if arr.is_empty() {
-                return plan_err!("seekdb_knn: query_vec must not be empty");
-            }
-            arr.value(0)
+        Expr::ScalarFunction(_) => {
+            let logical_plan = LogicalPlanBuilder::empty(true)
+                .project(vec![expr.clone()])?
+                .build()?;
+            let physical_plan = state.create_physical_plan(&logical_plan).await?;
+            Ok(Some(physical_plan))
         }
-        _ => {
-            return plan_err!(
-                "seekdb_knn: query_vec must be a literal array (e.g. [0.1, 0.2, ...])"
-            );
-        }
-    };
-
-    if values.is_empty() {
-        return plan_err!("seekdb_knn: query_vec must not be empty");
+        _ => Ok(None),
     }
-    if let Some(f32_arr) = values.as_any().downcast_ref::<Float32Array>() {
-        return Ok(f32_arr.values().to_vec());
-    }
-    if let Some(f64_arr) = values.as_any().downcast_ref::<Float64Array>() {
-        return Ok(f64_arr.values().iter().map(|&v| v as f32).collect());
-    }
-
-    plan_err!("seekdb_knn: query_vec elements must be Float32 or Float64")
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -302,6 +312,7 @@ fn extract_vector(expr: &Expr) -> DFResult<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::ScalarValue;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
@@ -433,17 +444,366 @@ mod tests {
 
     #[test]
     fn test_empty_vector_rejected() {
-        // `extract_vector` errors but `call` only propagates the error when the
-        // registry lookup has already failed; here we confirm the helper rejects empty.
+        // Delegation smoke test: the shared `extract_literal_vector` rejects an
+        // empty list and tags the error with the caller's fn_name.
         let empty = lit_vec(&[]);
-        assert!(extract_vector(&empty).is_err());
+        let err = extract_literal_vector(&empty, "seekdb_knn")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("seekdb_knn") && err.contains("must not be empty"));
     }
 
     #[test]
     fn test_extract_vector_f32_literal() {
+        // Delegation smoke test: the shared helper handles the common Float32 case.
         let v = lit_vec(&[0.1, 0.2, 0.3]);
-        let out = extract_vector(&v).unwrap();
+        let out = extract_literal_vector(&v, "seekdb_knn").unwrap();
         assert_eq!(out.len(), 3);
         assert!((out[0] - 0.1).abs() < 1e-6);
+    }
+
+    // ─── ScalarFunction (embedding UDF) support ─────────────────────────────
+    //
+    // The following tests exercise `query_vec = embed_udf('text')`. `call()` must
+    // accept the expression (deferring resolution), and `resolve_query_vector_plan`
+    // must turn it into an `ExecutionPlan` whose first column is `List<Float32>`.
+
+    use arrow::array::{Float32Builder, ListBuilder};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    };
+
+    /// Minimal UDF that mimics an embedding model: `fake_embed(text) -> List<Float32>`
+    /// returning `[0.1, 0.2, 0.3]` for every input row. Used to verify the
+    /// ScalarFunction arg path without pulling in an actual embedding backend.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct FakeEmbedUDF {
+        signature: Signature,
+    }
+
+    impl FakeEmbedUDF {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for FakeEmbedUDF {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "fake_embed"
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+        fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+            Ok(DataType::List(Arc::new(Field::new_list_field(
+                DataType::Float32,
+                true,
+            ))))
+        }
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+            let mut builder = ListBuilder::new(Float32Builder::new());
+            for _ in 0..args.number_rows {
+                builder.values().append_slice(&[0.1f32, 0.2, 0.3]);
+                builder.append(true);
+            }
+            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        }
+    }
+
+    fn embed_call(text: &str) -> (ScalarUDF, Expr) {
+        let udf = ScalarUDF::new_from_impl(FakeEmbedUDF::new());
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(udf.clone()),
+            vec![lit_str(text)],
+        ));
+        (udf, expr)
+    }
+
+    #[test]
+    fn test_scalar_function_arg_deferred_to_scan() {
+        // `call()` must accept a ScalarFunction query_vec and defer resolution.
+        // With an empty registry, we expect the registry-not-found error rather
+        // than an "must be literal" arg-type error.
+        let func = make_knn_function();
+        let (_udf, embed_expr) = embed_call("hello");
+        let result = func.call(&[
+            lit_str("t"),
+            lit_str("col"),
+            embed_expr,
+            lit_str("cosine"),
+            lit_int(5),
+        ]);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found in registry"),
+            "ScalarFunction query_vec should reach registry lookup, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_query_vector_plan_scalar_function() {
+        use crate::sources::providers::knn_utils::extract_query_vector;
+
+        let ctx = SessionContext::new();
+        let (udf, embed_expr) = embed_call("hello world");
+        ctx.register_udf(udf);
+
+        let state = ctx.state();
+        let plan = resolve_query_vector_plan(&embed_expr, &state)
+            .await
+            .expect("resolver should succeed")
+            .expect("ScalarFunction should produce a plan");
+
+        let vec = extract_query_vector(plan, ctx.task_ctx())
+            .await
+            .expect("plan should execute");
+        assert_eq!(vec, Some(vec![0.1f32, 0.2, 0.3]));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_query_vector_plan_rejects_column_ref() {
+        // Bare column references and other non-literal/non-function exprs should
+        // return None so the caller emits the user-facing error.
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let col_expr = datafusion::logical_expr::col("embedding");
+        let plan = resolve_query_vector_plan(&col_expr, &state)
+            .await
+            .expect("resolver should not error for unsupported exprs");
+        assert!(plan.is_none());
+    }
+
+    // ─── Integration tests ──────────────────────────────────────────────────
+    //
+    // Require a live SeekDB instance on localhost:2881 with the README
+    // quick-start schema seeded (docs/seekdb/README.md):
+    //
+    //     docker run -d --name seekdb -p 2881:2881 -p 2886:2886 oceanbase/seekdb:latest
+    //     # then apply the quick-start CREATE TABLE + INSERT block
+    //
+    // Expected `docs` rows (the seed's 5 vectors):
+    //     doc-a electronics [1,0,0,0]
+    //     doc-b electronics [0,1,0,0]
+    //     doc-c books       [0,0,1,0]
+    //     doc-d electronics [1,1,0,0]
+    //     doc-e books       [0.5,0.5,0.5,0.5]
+    //
+    // Run with: `cargo test -p skardi -- --ignored seekdb`
+
+    use arrow::array::{Float64Array, Int32Array, RecordBatch, StringArray};
+
+    use super::super::register_seekdb_tables;
+    use crate::sources::hierarchy::HierarchyLevel;
+
+    async fn register_ci_knn(ctx: &mut SessionContext, table: &str) -> DatasetRegistry {
+        let registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), table.to_string());
+        options.insert("user_env".to_string(), "SEEKDB_USER".to_string());
+        options.insert("pass_env".to_string(), "SEEKDB_PASSWORD".to_string());
+        options.insert("ssl_mode".to_string(), "disabled".to_string());
+
+        register_seekdb_tables(
+            ctx,
+            table,
+            "mysql://127.0.0.1:2881/mydb",
+            Some(&options),
+            true,
+            Some(&registry),
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
+
+        register_seekdb_knn_udtf(ctx, Arc::clone(&registry));
+        registry
+    }
+
+    async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        let df = ctx.sql(sql).await.expect("parse sql");
+        df.collect().await.expect("collect results")
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_knn_basic_search() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_knn(&mut ctx, "docs").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title, _score \
+             FROM seekdb_knn('docs', 'embedding', [1.0, 0.0, 0.0, 0.0], 'l2', 3) \
+             ORDER BY _score ASC",
+        )
+        .await;
+
+        assert_eq!(total_rows(&batches), 3, "k=3 must return exactly 3 rows");
+
+        let titles = batches[0]
+            .column_by_name("title")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title is Utf8");
+        assert_eq!(
+            titles.value(0),
+            "doc-a",
+            "[1,0,0,0] is an exact match for doc-a"
+        );
+
+        let scores = batches[0]
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("_score is Float64");
+        assert!(
+            scores.value(0).abs() < 1e-6,
+            "exact match should score ~0, got {}",
+            scores.value(0)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_knn_distance_ordering() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_knn(&mut ctx, "docs").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT _score \
+             FROM seekdb_knn('docs', 'embedding', [1.0, 0.0, 0.0, 0.0], 'l2', 5) \
+             ORDER BY _score ASC",
+        )
+        .await;
+
+        let scores = batches[0]
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        for i in 1..scores.len() {
+            assert!(
+                scores.value(i - 1) <= scores.value(i),
+                "_score must be ascending: scores[{}]={} > scores[{}]={}",
+                i - 1,
+                scores.value(i - 1),
+                i,
+                scores.value(i),
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_knn_excludes_vector_column() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_knn(&mut ctx, "docs").await;
+
+        // SELECT *: the output schema surfaces every non-vector column and
+        // `_score`, but must not expose the raw VECTOR column.
+        let batches = query_all(
+            &ctx,
+            "SELECT * FROM seekdb_knn('docs', 'embedding', [1.0, 0.0, 0.0, 0.0], 'l2', 1)",
+        )
+        .await;
+
+        assert_eq!(total_rows(&batches), 1);
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            names.contains(&"id") && names.contains(&"title") && names.contains(&"_score"),
+            "expected id/title/_score in output schema, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"embedding"),
+            "VECTOR column must be hidden from seekdb_knn output, got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_knn_respects_k() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_knn(&mut ctx, "docs").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id FROM seekdb_knn('docs', 'embedding', [0.5, 0.5, 0.5, 0.5], 'l2', 2)",
+        )
+        .await;
+
+        assert_eq!(total_rows(&batches), 2, "k=2 must cap the result");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_knn_subquery_find_similar() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_knn(&mut ctx, "docs").await;
+
+        // Scalar-subquery query vector: the seed row's own embedding must be
+        // returned first with _score ~0 (exact self-match).
+        let batches = query_all(
+            &ctx,
+            "SELECT id, title, _score \
+             FROM seekdb_knn('docs', 'embedding', \
+                  (SELECT embedding FROM docs WHERE title = 'doc-a'), \
+                  'cosine', 3) \
+             ORDER BY _score ASC",
+        )
+        .await;
+
+        assert_eq!(total_rows(&batches), 3);
+
+        let titles = batches[0]
+            .column_by_name("title")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            titles.value(0),
+            "doc-a",
+            "self-match should rank first, got {:?}",
+            titles.value(0)
+        );
+
+        let scores = batches[0]
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            scores.value(0).abs() < 1e-6,
+            "self-match should score ~0, got {}",
+            scores.value(0)
+        );
+
+        // id column is Int32 on this schema — smoke-check typing too so a
+        // future schema drift surfaces loudly.
+        let ids = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id is Int32");
+        assert!(ids.value(0) >= 1);
     }
 }

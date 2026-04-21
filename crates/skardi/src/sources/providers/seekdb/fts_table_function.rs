@@ -393,4 +393,169 @@ mod tests {
             "expected positive-integer error, got: {err}"
         );
     }
+
+    // ─── Integration tests ──────────────────────────────────────────────────
+    //
+    // Require a live SeekDB instance on localhost:2881 with the README
+    // quick-start schema seeded (docs/seekdb/README.md):
+    //
+    //     docker run -d --name seekdb -p 2881:2881 -p 2886:2886 oceanbase/seekdb:latest
+    //     # then apply the quick-start CREATE TABLE + INSERT block
+    //
+    // Credentials are read from SEEKDB_USER / SEEKDB_PASSWORD via the
+    // `user_env` / `pass_env` options (same as the CRUD tests in mod.rs). They
+    // default to `root@sys` / empty on stock SeekDB.
+    //
+    // Run with: `cargo test -p skardi -- --ignored seekdb`
+
+    use arrow::array::{Array, Float64Array, RecordBatch};
+
+    use super::super::register_seekdb_tables;
+    use crate::sources::hierarchy::HierarchyLevel;
+
+    async fn register_ci_fts(ctx: &mut SessionContext, table: &str) -> DatasetRegistry {
+        let registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), table.to_string());
+        options.insert("user_env".to_string(), "SEEKDB_USER".to_string());
+        options.insert("pass_env".to_string(), "SEEKDB_PASSWORD".to_string());
+        options.insert("ssl_mode".to_string(), "disabled".to_string());
+
+        register_seekdb_tables(
+            ctx,
+            table,
+            "mysql://127.0.0.1:2881/mydb",
+            Some(&options),
+            true,
+            Some(&registry),
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
+
+        register_seekdb_fts_udtf(ctx, Arc::clone(&registry));
+        registry
+    }
+
+    async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        let df = ctx.sql(sql).await.expect("parse sql");
+        df.collect().await.expect("collect results")
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn first_score(batches: &[RecordBatch]) -> f64 {
+        batches[0]
+            .column_by_name("_score")
+            .expect("_score column")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("_score is Float64")
+            .value(0)
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_basic_search() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_fts(&mut ctx, "articles").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title, category, _score \
+             FROM seekdb_fts('articles', 'body', 'machine learning', 10) \
+             ORDER BY _score DESC",
+        )
+        .await;
+
+        let rows = total_rows(&batches);
+        assert!(
+            rows >= 2,
+            "expected at least 2 rows matching 'machine learning', got {rows}"
+        );
+        // MySQL's MATCH(...) AGAINST(...) score is strictly positive for a hit.
+        assert!(
+            first_score(&batches) > 0.0,
+            "top _score should be positive, got {}",
+            first_score(&batches)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_with_where_filter() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_fts(&mut ctx, "articles").await;
+
+        // WHERE pushdown: only the three 'ai' articles are eligible; of those
+        // at least two mention 'machine' or 'neural' in the body.
+        let batches = query_all(
+            &ctx,
+            "SELECT title, category \
+             FROM seekdb_fts('articles', 'body', 'neural network', 10) \
+             WHERE category = 'ai'",
+        )
+        .await;
+
+        assert!(
+            total_rows(&batches) >= 1,
+            "expected at least one ai-category match"
+        );
+        // Every surviving row must carry the filtered category.
+        for batch in &batches {
+            let cats = batch
+                .column_by_name("category")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("category is Utf8");
+            for i in 0..cats.len() {
+                assert_eq!(cats.value(i), "ai", "row {i} escaped the WHERE filter");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_no_results() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_fts(&mut ctx, "articles").await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM seekdb_fts('articles', 'body', \
+             'xyzzyquuxplughfrobnicate', 10)",
+        )
+        .await;
+
+        assert_eq!(
+            total_rows(&batches),
+            0,
+            "nonsense query should return zero rows"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_respects_limit() {
+        let mut ctx = SessionContext::new();
+        let _reg = register_ci_fts(&mut ctx, "articles").await;
+
+        // The seed has 5 articles; cap at 2 and ensure the table function
+        // honours the k-arg bound (not just a post-hoc LIMIT).
+        let batches = query_all(
+            &ctx,
+            "SELECT id FROM seekdb_fts('articles', 'body', 'learning network', 2)",
+        )
+        .await;
+
+        assert!(
+            total_rows(&batches) <= 2,
+            "limit=2 must cap the result, got {}",
+            total_rows(&batches)
+        );
+    }
 }

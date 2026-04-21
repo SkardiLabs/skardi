@@ -1,0 +1,22 @@
+metadata:
+  name: "seekdb-seed-doc-embed"
+  version: "1.0.0"
+  description: >
+    INSERT a row into docs_embed. The embedding is computed inline by the
+    `candle()` UDF, then formatted as a pgvector-style string
+    (`[v1,v2,...]`) so SeekDB's VECTOR column can parse it. Each row's
+    content and embedding are written atomically.
+
+# Parameters:
+#   {title}    - page title
+#   {category} - coarse page category
+#   {content}  - free-text body; embedded inline
+
+query: |
+  INSERT INTO docs_embed (title, category, content, embedding)
+  SELECT {title},
+         {category},
+         {content},
+         '[' || array_to_string(
+                  candle('models/generated/bge-small-en-v1.5', {content}),
+                  ',') || ']'
