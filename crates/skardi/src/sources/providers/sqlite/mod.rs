@@ -11,7 +11,7 @@ pub use vec_to_binary::register_vec_to_binary_udf;
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
-    Int64Array, ListArray, RecordBatch, StringArray, UInt64Array,
+    Int64Array, ListArray, RecordBatch, RecordBatchOptions, StringArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -877,9 +877,18 @@ impl SqliteScanExec {
             .map(|n| format!(" LIMIT {n}"))
             .unwrap_or_default();
 
-        Ok(format!(
-            "SELECT {} FROM {table}{where_clause}{limit_clause}",
+        // DataFusion pushes down an empty projection for queries like `count(*)`
+        // where only the row count is needed. SQLite rejects `SELECT  FROM t`, so
+        // emit a constant projection that preserves row count (`SELECT 1 FROM t`)
+        // and let `execute` return a zero-column batch with the correct row count.
+        let projection_clause = if columns.is_empty() {
+            "1".to_string()
+        } else {
             columns.join(", ")
+        };
+
+        Ok(format!(
+            "SELECT {projection_clause} FROM {table}{where_clause}{limit_clause}"
         ))
     }
 }
@@ -940,12 +949,13 @@ impl ExecutionPlan for SqliteScanExec {
             .collect();
 
         let future = async move {
-            let batch: Vec<Vec<tokio_rusqlite::rusqlite::types::Value>> = conn
-                .call(
+            let (batch, row_count): (Vec<Vec<tokio_rusqlite::rusqlite::types::Value>>, usize) =
+                conn.call(
                     move |conn| -> std::result::Result<_, tokio_rusqlite::rusqlite::Error> {
                         let mut stmt = conn.prepare(&sql)?;
                         let mut col_values: Vec<Vec<tokio_rusqlite::rusqlite::types::Value>> =
                             (0..num_cols).map(|_| Vec::new()).collect();
+                        let mut row_count: usize = 0;
 
                         let mut rows = stmt.query([])?;
                         while let Some(row) = rows.next()? {
@@ -954,9 +964,10 @@ impl ExecutionPlan for SqliteScanExec {
                                     row.get(col_idx)?;
                                 col_values[col_idx].push(val);
                             }
+                            row_count += 1;
                         }
 
-                        Ok(col_values)
+                        Ok((col_values, row_count))
                     },
                 )
                 .await
@@ -969,7 +980,16 @@ impl ExecutionPlan for SqliteScanExec {
                 .map(|(values, data_type)| sqlite_values_to_arrow(&values, data_type))
                 .collect();
 
-            RecordBatch::try_new(output_schema, arrays).map_err(DataFusionError::from)
+            if num_cols == 0 {
+                // Zero-column batch (e.g. from `count(*)` projection pushdown).
+                // RecordBatch::try_new would return a 0-row batch; pass the row
+                // count explicitly so aggregates see the real input cardinality.
+                let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+                RecordBatch::try_new_with_options(output_schema, arrays, &options)
+                    .map_err(DataFusionError::from)
+            } else {
+                RecordBatch::try_new(output_schema, arrays).map_err(DataFusionError::from)
+            }
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -1730,6 +1750,75 @@ mod tests {
 
         let batches = query_all(&ctx, "SELECT id FROM test_items LIMIT 2").await;
         assert_eq!(total_rows(&batches), 2);
+    }
+
+    /// Regression test for #97: `count(*)` was rewritten to an empty projection
+    /// (`SELECT  FROM "t"`), which SQLite rejects with a syntax error.
+    #[tokio::test]
+    #[ignore]
+    async fn test_count_star_pushdown() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        let batches = query_all(&ctx, "SELECT count(*) FROM test_items").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 3);
+    }
+
+    /// `count(*)` combined with a WHERE clause still needs the projection pushdown
+    /// to produce the correct row count after filtering.
+    #[tokio::test]
+    #[ignore]
+    async fn test_count_star_with_filter() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        let batches = query_all(&ctx, "SELECT count(*) FROM test_items WHERE id > 1").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 2);
+    }
+
+    /// `count(*)` over an empty table must return 0, not a SQLite syntax error.
+    #[tokio::test]
+    #[ignore]
+    async fn test_count_star_empty_table() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        ctx.sql("DELETE FROM test_items")
+            .await
+            .expect("parse delete")
+            .collect()
+            .await
+            .expect("execute delete");
+
+        let batches = query_all(&ctx, "SELECT count(*) FROM test_items").await;
+        assert_eq!(total_rows(&batches), 1);
+
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 0);
     }
 
     // ─── Insert test ────────────────────────────────────────────────────
