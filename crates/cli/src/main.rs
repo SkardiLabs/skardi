@@ -892,38 +892,204 @@ async fn register_source(
     Ok(())
 }
 
-async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> {
-    let (mut session_ctx, dataset_registry) = new_session_context();
-    let config = load_and_register_all(ctx_path, &mut session_ctx, &dataset_registry).await?;
+/// A `(catalog, schema, table)` triple discovered by walking the DataFusion
+/// catalog tree. Used by `--schema` to render every registered table — including
+/// those nested under a catalog-mode source like SQLite (`wiki.main.wiki_pages`),
+/// which the old `data_sources[].name` iteration could not see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableEntry {
+    catalog: String,
+    schema: String,
+    table: String,
+}
 
-    let all_names: Vec<String> = config.data_sources.iter().map(|s| s.name.clone()).collect();
+/// Default catalog/schema names read from the active `SessionConfig`. Used to
+/// decide whether a `TableEntry` renders bare or fully-qualified — rather than
+/// hard-coding DataFusion's `datafusion`/`public` literals.
+#[derive(Debug, Clone)]
+struct CatalogDefaults {
+    catalog: String,
+    schema: String,
+}
 
-    let table_names: Vec<String> = match table_filter {
-        Some(t) => {
-            if all_names.contains(&t.to_string()) {
-                vec![t.to_string()]
-            } else {
-                anyhow::bail!(
-                    "Table '{}' not found in context. Available tables: {}",
-                    t,
-                    all_names.join(", ")
-                );
+impl CatalogDefaults {
+    fn from_ctx(ctx: &SessionContext) -> Self {
+        let config = ctx.copied_config();
+        let opts = &config.options().catalog;
+        Self {
+            catalog: opts.default_catalog.clone(),
+            schema: opts.default_schema.clone(),
+        }
+    }
+}
+
+impl TableEntry {
+    /// Render for display: bare table name when in the session's default
+    /// catalog/schema (where table-mode sources land), otherwise the
+    /// fully-qualified `catalog.schema.table` form.
+    fn display_name(&self, defaults: &CatalogDefaults) -> String {
+        if self.catalog == defaults.catalog && self.schema == defaults.schema {
+            self.table.clone()
+        } else {
+            self.qualified_name()
+        }
+    }
+
+    /// Same form the user would type to `--schema -t`.
+    fn qualified_name(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.schema, self.table)
+    }
+}
+
+/// Schemas populated automatically by DataFusion (or by some providers) that
+/// we don't want `--schema --all` to surface. Treating these as a blocklist
+/// keeps catalog walks focused on user-registered tables even if
+/// `datafusion.catalog.information_schema` is ever enabled upstream.
+const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog"];
+
+/// Walk every catalog → schema → table registered on `ctx` and collect them.
+/// Skips well-known system schemas (see `SYSTEM_SCHEMAS`). Sorted for
+/// deterministic output.
+fn enumerate_tables(ctx: &SessionContext) -> Vec<TableEntry> {
+    let mut entries = Vec::new();
+    for catalog_name in ctx.catalog_names() {
+        let Some(catalog) = ctx.catalog(&catalog_name) else {
+            continue;
+        };
+        for schema_name in catalog.schema_names() {
+            if SYSTEM_SCHEMAS.contains(&schema_name.as_str()) {
+                continue;
+            }
+            let Some(schema) = catalog.schema(&schema_name) else {
+                continue;
+            };
+            for table_name in schema.table_names() {
+                entries.push(TableEntry {
+                    catalog: catalog_name.clone(),
+                    schema: schema_name.clone(),
+                    table: table_name,
+                });
             }
         }
-        None => all_names,
+    }
+    entries.sort_by(|a, b| {
+        (a.catalog.as_str(), a.schema.as_str(), a.table.as_str()).cmp(&(
+            b.catalog.as_str(),
+            b.schema.as_str(),
+            b.table.as_str(),
+        ))
+    });
+    entries
+}
+
+/// Resolve a `--schema -t TABLE` filter against the discovered tables.
+///
+/// Accepted forms (exact part count — anything else is rejected up front with
+/// a hint, so a user typing `-t mydb.table` doesn't get a confusing
+/// "not found"):
+/// - **Fully qualified** `catalog.schema.table` — must match exactly.
+/// - **Unqualified bare name** — must match exactly one table across all
+///   catalogs/schemas. If the same table name appears in multiple places we
+///   refuse rather than guess, and tell the user to disambiguate.
+fn select_tables(
+    all: &[TableEntry],
+    filter: &str,
+    defaults: &CatalogDefaults,
+) -> Result<Vec<TableEntry>> {
+    let parts: Vec<&str> = filter.split('.').collect();
+    match parts.len() {
+        3 => {
+            let (catalog, schema, table) = (parts[0], parts[1], parts[2]);
+            let hit = all
+                .iter()
+                .find(|e| e.catalog == catalog && e.schema == schema && e.table == table);
+            match hit {
+                Some(e) => Ok(vec![e.clone()]),
+                None => anyhow::bail!(
+                    "Table '{}' not found. Available tables: {}",
+                    filter,
+                    available_list(all, defaults)
+                ),
+            }
+        }
+        1 => {
+            let matches: Vec<&TableEntry> = all.iter().filter(|e| e.table == filter).collect();
+            match matches.as_slice() {
+                [] => anyhow::bail!(
+                    "Table '{}' not found. Available tables: {}",
+                    filter,
+                    available_list(all, defaults)
+                ),
+                [only] => Ok(vec![(*only).clone()]),
+                many => anyhow::bail!(
+                    "Table name '{}' is ambiguous — matches: {}. Re-run with the fully-qualified form (catalog.schema.table).",
+                    filter,
+                    many.iter()
+                        .map(|e| e.qualified_name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+        _ => anyhow::bail!(
+            "Table filter '{}' must be either a bare name or fully-qualified `catalog.schema.table` (got {} part{}).",
+            filter,
+            parts.len(),
+            if parts.len() == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+fn available_list(all: &[TableEntry], defaults: &CatalogDefaults) -> String {
+    if all.is_empty() {
+        return "(none)".to_string();
+    }
+    all.iter()
+        .map(|e| e.display_name(defaults))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> {
+    let (mut session_ctx, dataset_registry) = new_session_context();
+    load_and_register_all(ctx_path, &mut session_ctx, &dataset_registry).await?;
+
+    let defaults = CatalogDefaults::from_ctx(&session_ctx);
+    let all_tables = enumerate_tables(&session_ctx);
+    let selected = match table_filter {
+        Some(t) => select_tables(&all_tables, t, &defaults)?,
+        None => all_tables,
     };
 
-    for name in &table_names {
-        let df = session_ctx
-            .sql(&format!(
-                "SELECT * FROM \"{}\" LIMIT 0",
-                name.replace('"', "\"\"")
-            ))
+    if selected.is_empty() {
+        println!("No tables registered.");
+        return Ok(());
+    }
+
+    for entry in &selected {
+        let catalog = session_ctx.catalog(&entry.catalog).ok_or_else(|| {
+            anyhow::anyhow!("Catalog '{}' disappeared during enumeration", entry.catalog)
+        })?;
+        let schema = catalog.schema(&entry.schema).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Schema '{}.{}' disappeared during enumeration",
+                entry.catalog,
+                entry.schema
+            )
+        })?;
+        let provider = schema
+            .table(&entry.table)
             .await
-            .with_context(|| format!("Failed to read table '{}'", name))?;
-        let schema = df.schema().inner();
-        println!("table: {name}");
-        for field in schema.fields() {
+            .with_context(|| format!("Failed to load table '{}'", entry.qualified_name()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Table '{}' disappeared during enumeration",
+                    entry.qualified_name()
+                )
+            })?;
+        let table_schema = provider.schema();
+        println!("table: {}", entry.display_name(&defaults));
+        for field in table_schema.fields() {
             println!("  {}: {:?}", field.name(), field.data_type());
         }
         println!();
@@ -1514,6 +1680,236 @@ fn alias_remove(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::catalog::{
+        CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+    };
+    use datafusion::datasource::MemTable;
+
+    fn entry(catalog: &str, schema: &str, table: &str) -> TableEntry {
+        TableEntry {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+        }
+    }
+
+    fn defaults(catalog: &str, schema: &str) -> CatalogDefaults {
+        CatalogDefaults {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+        }
+    }
+
+    fn df_defaults() -> CatalogDefaults {
+        defaults("datafusion", "public")
+    }
+
+    #[test]
+    fn display_name_uses_bare_for_default_catalog() {
+        assert_eq!(
+            entry("datafusion", "public", "users").display_name(&df_defaults()),
+            "users"
+        );
+    }
+
+    #[test]
+    fn display_name_qualifies_non_default_catalog() {
+        assert_eq!(
+            entry("wiki", "main", "wiki_pages").display_name(&df_defaults()),
+            "wiki.main.wiki_pages"
+        );
+    }
+
+    #[test]
+    fn display_name_honors_custom_defaults() {
+        // If the session config names a non-`datafusion`/`public` default, the
+        // rendering should follow it rather than hard-coded literals.
+        let custom = defaults("my_app", "core");
+        assert_eq!(
+            entry("my_app", "core", "events").display_name(&custom),
+            "events"
+        );
+        assert_eq!(
+            entry("datafusion", "public", "events").display_name(&custom),
+            "datafusion.public.events"
+        );
+    }
+
+    #[test]
+    fn select_tables_unqualified_unique_match() {
+        let all = vec![
+            entry("datafusion", "public", "users"),
+            entry("wiki", "main", "wiki_pages"),
+        ];
+        let got = select_tables(&all, "wiki_pages", &df_defaults()).unwrap();
+        assert_eq!(got, vec![entry("wiki", "main", "wiki_pages")]);
+    }
+
+    #[test]
+    fn select_tables_unqualified_unknown_lists_available() {
+        let all = vec![entry("datafusion", "public", "users")];
+        let err = select_tables(&all, "ghost", &df_defaults())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'ghost' not found"), "msg: {err}");
+        assert!(err.contains("users"), "should list available: {err}");
+    }
+
+    #[test]
+    fn select_tables_unqualified_ambiguous_requires_qualified_form() {
+        // Same bare name in two different catalogs.
+        let all = vec![entry("a", "main", "events"), entry("b", "main", "events")];
+        let err = select_tables(&all, "events", &df_defaults())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "msg: {err}");
+        assert!(err.contains("a.main.events"), "msg: {err}");
+        assert!(err.contains("b.main.events"), "msg: {err}");
+    }
+
+    #[test]
+    fn select_tables_qualified_exact_match() {
+        let all = vec![
+            entry("wiki", "main", "wiki_pages"),
+            entry("wiki", "main", "wiki_pages_fts"),
+        ];
+        let got = select_tables(&all, "wiki.main.wiki_pages_fts", &df_defaults()).unwrap();
+        assert_eq!(got, vec![entry("wiki", "main", "wiki_pages_fts")]);
+    }
+
+    #[test]
+    fn select_tables_qualified_unknown_errors() {
+        let all = vec![entry("wiki", "main", "wiki_pages")];
+        let err = select_tables(&all, "wiki.main.ghost", &df_defaults())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'wiki.main.ghost' not found"), "msg: {err}");
+    }
+
+    #[test]
+    fn select_tables_partial_qualification_is_rejected_with_hint() {
+        // `a.b` has a dot but isn't fully qualified — make sure the error tells
+        // the user what form is expected rather than the old silent
+        // fall-through to a confusing "not found".
+        let all = vec![entry("wiki", "main", "wiki_pages")];
+        let err = select_tables(&all, "wiki.wiki_pages", &df_defaults())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bare name or fully-qualified"),
+            "error should hint at expected form: {err}"
+        );
+        assert!(err.contains("2 parts"), "should count the parts: {err}");
+    }
+
+    #[test]
+    fn select_tables_four_part_filter_is_rejected() {
+        let all = vec![entry("wiki", "main", "wiki_pages")];
+        let err = select_tables(&all, "a.b.c.d", &df_defaults())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bare name or fully-qualified"),
+            "error should hint at expected form: {err}"
+        );
+    }
+
+    fn make_int_provider() -> Arc<MemTable> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        Arc::new(MemTable::try_new(arrow_schema, vec![vec![batch]]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn enumerate_tables_walks_catalogs_schemas_and_default_table() {
+        let ctx = SessionContext::new();
+        // Table-mode source: lands in datafusion.public.
+        ctx.register_table("flat", make_int_provider()).unwrap();
+
+        // Catalog-mode source: simulate what register_sqlite_catalog produces.
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("wiki_pages".to_string(), make_int_provider())
+            .unwrap();
+        schema
+            .register_table("wiki_pages_fts".to_string(), make_int_provider())
+            .unwrap();
+        catalog.register_schema("main", schema).unwrap();
+        ctx.register_catalog("wiki", catalog);
+
+        let got = enumerate_tables(&ctx);
+        assert_eq!(
+            got,
+            vec![
+                entry("datafusion", "public", "flat"),
+                entry("wiki", "main", "wiki_pages"),
+                entry("wiki", "main", "wiki_pages_fts"),
+            ],
+            "should surface tables under both default catalog and named catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn enumerate_tables_skips_system_schemas() {
+        // A catalog that exposes an `information_schema` (as DataFusion does
+        // when `datafusion.catalog.information_schema` is enabled, or as some
+        // providers surface verbatim) should not leak those entries into
+        // `--schema --all` output.
+        let ctx = SessionContext::new();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+
+        let user_schema = Arc::new(MemorySchemaProvider::new());
+        user_schema
+            .register_table("wiki_pages".to_string(), make_int_provider())
+            .unwrap();
+        catalog.register_schema("main", user_schema).unwrap();
+
+        let info_schema = Arc::new(MemorySchemaProvider::new());
+        info_schema
+            .register_table("tables".to_string(), make_int_provider())
+            .unwrap();
+        catalog
+            .register_schema("information_schema", info_schema)
+            .unwrap();
+
+        let pg_schema = Arc::new(MemorySchemaProvider::new());
+        pg_schema
+            .register_table("pg_class".to_string(), make_int_provider())
+            .unwrap();
+        catalog.register_schema("pg_catalog", pg_schema).unwrap();
+
+        ctx.register_catalog("wiki", catalog);
+
+        let got = enumerate_tables(&ctx);
+        assert_eq!(
+            got,
+            vec![entry("wiki", "main", "wiki_pages")],
+            "system schemas should be filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_defaults_from_ctx_matches_datafusion_defaults() {
+        // Guards against the hard-coded `datafusion`/`public` literals we used
+        // to rely on: if a future DataFusion version changes them, this test
+        // will start failing and flag the rendering logic.
+        let ctx = SessionContext::new();
+        let defs = CatalogDefaults::from_ctx(&ctx);
+        assert_eq!(defs.catalog, "datafusion");
+        assert_eq!(defs.schema, "public");
+    }
 
     #[test]
     fn validate_alias_rejects_unknown_positional() {
