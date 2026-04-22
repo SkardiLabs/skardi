@@ -71,19 +71,29 @@ Any DataFusion table identifier. Bare names (`wiki_lake`) resolve the
 same way as a `FROM` clause does; dotted names (`wikidb.public.wiki_log`)
 reach into catalog-registered sources. The **first dotted segment** is
 taken as the data source name — the executor uses it to decide whether
-the destination is a lake (Lance) or a DB (Postgres / MySQL / SQLite /
-SeekDB / Mongo / Redis).
+the destination is a lake (Lance) or a transactional SQL DB
+(**Postgres / MySQL / SQLite**).
+
+Non-transactional backends (Redis, MongoDB, SeekDB) are **rejected at
+submit time** with `error_type: non_transactional_destination`. Those
+providers' write paths do not wrap an INSERT in a transaction, so a
+mid-run failure could leave partial rows visible — which violates the
+atomicity contract every other destination honors. They remain fine as
+data *sources* in pipelines and jobs; they just cannot be the
+destination of a job.
 
 ### `destination.mode`
 
 - `append` (default) — add rows to the destination.
   - *Lake:* the dataset is created if `create_if_missing: true` and it
     does not yet exist, else appended to.
-  - *DB:* rows are added with `INSERT INTO <table> SELECT ...`.
+  - *DB:* rows are added with `INSERT INTO <table> SELECT ...`, wrapped
+    in one transaction per run.
 - `overwrite` — replace contents of the destination.
   - *Lake:* Lance `WriteMode::Overwrite` — new schema + data, atomic.
   - *DB:* `DELETE FROM <table>` followed by `INSERT INTO <table> SELECT
-    ...` in the same transaction where the provider supports it.
+    ...` inside the same wrapping transaction, so mid-run failures
+    leave the old rows intact.
 
 Upserts / merge are not in MVP.
 
@@ -101,8 +111,9 @@ Upserts / merge are not in MVP.
 
 Wall-clock cap. If the query + write together exceed this, the task is
 aborted and the row is marked `failed` with a timeout message. On lake
-destinations the commit never lands; on DB destinations whatever made it
-into the transaction is rolled back (where the provider supports it).
+destinations the Lance manifest is never committed; on DB destinations
+the wrapping transaction is rolled back. Either way, the destination is
+left at its pre-job state.
 
 ### Parameter placeholders
 
@@ -174,8 +185,11 @@ skardi job status <run_id>
 # List recent runs
 skardi job list --job wiki-backfill-to-lake --limit 20
 
-# Cancel an in-flight run (best effort — the task checks the flag
-# before committing; runs that already committed report cancelled: false)
+# Cancel an in-flight run — the executor's cancel flag is read by a
+# stream adapter wrapping the query output, so the next batch poll
+# errors out and the destination's in-flight transaction / Lance
+# manifest commit unwinds cleanly with no rows visible. Runs that
+# already committed before cancel was observed report cancelled: false.
 skardi job cancel <run_id>
 
 # Discover all registered jobs and their destinations
@@ -227,8 +241,43 @@ for agent handling:
 | `missing_parameters` | One or more `{placeholders}` not bound |
 | `unsupported_parameter` | Bound value is an array / object |
 | `destination_missing` | DB table doesn't exist; or lake + `create_if_missing: false` |
+| `non_transactional_destination` | Destination source type is Redis / MongoDB / SeekDB — rejected because its write path cannot guarantee atomicity |
 | `schema_mismatch` | Column diff — `details.diff` carries a human-readable string |
 | `sql_plan_failure` | DataFusion rejected the rendered SQL |
+
+---
+
+## Execution and sizing
+
+Jobs stream the query output through the destination rather than
+buffering it in the server process. The DataFusion result is consumed
+batch-by-batch; peak memory is proportional to the in-flight batches
+(~2 at a time on the skardi side), not the total row count. This means
+the server itself is not a bottleneck for job size.
+
+What *is* a bottleneck depends on the destination:
+
+- **Lance destinations** have no practical size limit. Lance is the
+  scale-out storage format; multi-TB datasets are routine. Commit
+  semantics are the same regardless of size: data files are written
+  as the stream flows, the manifest is committed once at the end, and
+  a mid-run failure leaves no visible trace.
+
+- **SQL DML destinations** write inside one wrapping transaction. This
+  gives you atomicity, but the destination database pays for it: a
+  huge INSERT holds write locks for the whole run, grows the WAL /
+  undo log in proportion to the insert size, and can lag replication.
+  As a soft guideline, keep SQL DML jobs to roughly **10M rows or
+  10GB**. The sink logs a `tracing::warn!` the first time a run
+  crosses that threshold — not an error, just a signpost.
+
+  For larger one-shot ingests, use your database's native bulk
+  loader (`COPY FROM` on Postgres, `LOAD DATA LOCAL INFILE` on MySQL)
+  from outside skardi. For continuous replication, use a CDC tool
+  (Debezium, Fivetran, Airbyte). Both are future integration points
+  that live outside the jobs primitive — jobs are for the sweet spot
+  of "too big for a synchronous pipeline, small enough that one
+  atomic transaction is still sane."
 
 ---
 
@@ -257,18 +306,28 @@ Row fields, matching the CLI `status` response:
 
 ## Atomicity and failure modes
 
+Every supported destination — Lance, Postgres, MySQL, SQLite — provides
+end-to-end atomicity: either the whole run lands or nothing does. The
+streaming implementation preserves this because the atomic unit
+(Lance manifest commit, SQL wrapping transaction) is the last step,
+applied only after the stream drains successfully.
+
 | Scenario | What the user sees |
 |----------|--------------------|
-| Query errors mid-stream | Row → `failed`, `error` carries the SQL / planner message. Lake: no commit, destination unchanged. DB: whatever the provider's transaction guarantees — Postgres / SQLite roll back, MySQL / Mongo may partially land. |
+| Query errors mid-stream | Row → `failed`, `error` carries the SQL / planner message. Lake: no manifest commit, destination unchanged. DB: the wrapping transaction aborts, no rows visible. |
 | Timeout (`execution.timeout_ms`) | Row → `failed` with `"job timed out after <N>ms before commit"`. Same destination guarantees as the error case. |
-| `skardi job cancel` before commit | Row → `cancelled`. Destination unchanged. |
-| `skardi job cancel` after commit | Row → `cancelled` with `rows_written` + `snapshot_id` populated and `error: "cancelled after commit"`. The commit has landed; cancel is reported truthfully but cannot roll it back. |
-| Server crash or SIGKILL mid-run | Lake: no commit, dataset at the previous version. On restart, the orphaned row is rewritten to `failed` with `"server restarted before run completed"`. DB: depends on provider transaction semantics. |
+| `skardi job cancel` before commit | The shared cancel flag flips; the stream adapter errors out of its next `poll_next`; the destination's in-flight transaction / manifest unwinds. Row → `cancelled`, destination unchanged. |
+| `skardi job cancel` after commit | Race: the commit landed before the cancel flag was observed. Row → `cancelled` with `rows_written` + `snapshot_id` populated and `error: "cancelled after commit"`. Cancel is reported truthfully but cannot roll the commit back. |
+| Server crash or SIGKILL mid-run | Lake: no manifest commit, dataset at the previous version. DB: the transaction aborts on connection drop, no rows visible. On restart, the orphaned run row is rewritten to `failed` with `"server restarted before run completed"`. |
 
 Bare Parquet destinations are deliberately **not** supported — a crashed
 writer would leave partial `.parquet` files visible to readers with no
 rollback. Lance (today) and Iceberg (v1.1) both solve this by layering a
 versioned manifest on top of columnar files.
+
+Non-transactional SQL-ish backends (Redis, MongoDB, SeekDB) are rejected
+at submit time for the same reason: without a wrapping transaction there
+is no way to roll back a mid-run failure.
 
 ---
 
