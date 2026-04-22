@@ -562,3 +562,67 @@ destination:
         .value(0);
     assert_eq!(n, 3);
 }
+
+// ---------------------------------------------------------------------------
+// Non-transactional SQL-ish backends (Redis, Mongo, Seekdb) are rejected at
+// submit time: their upstream providers don't wrap an INSERT in a
+// transaction, so a mid-stream failure would leave partial rows visible.
+// The job destination contract requires atomicity, so these sources are
+// refused up front with a dedicated error variant.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn submit_rejects_non_transactional_destination() {
+    let tmp = TempDir::new().unwrap();
+    let yaml_path = tmp.path().join("nontx.yaml");
+    write_yaml(
+        &yaml_path,
+        r#"
+kind: job
+metadata:
+  name: "nontx"
+  version: "1.0.0"
+query: |
+  SELECT id FROM src
+destination:
+  table: "redis_cache"
+  mode: append
+"#,
+    );
+
+    let ctx = Arc::new(SessionContext::new());
+    ctx.register_batch("src", source_batch(1)).unwrap();
+    let job = JobDefinition::load_from_file(&yaml_path, Arc::clone(&ctx))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut jobs = HashMap::new();
+    jobs.insert(job.name().to_string(), job);
+    let mut data_source_types = HashMap::new();
+    data_source_types.insert("redis_cache".to_string(), DataSourceType::Redis);
+    let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
+    let exec = JobExecutor::new(
+        jobs,
+        store as Arc<dyn skardi::jobs::JobStore>,
+        ctx,
+        data_source_types,
+        HashMap::new(),
+    );
+
+    let err = exec.submit("nontx", HashMap::new()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            skardi::jobs::JobSubmitError::NonTransactionalDestination { .. }
+        ),
+        "expected NonTransactionalDestination, got {err}"
+    );
+
+    // No ledger row should have been created either.
+    let runs = exec.store().list_runs(None, 100).await.unwrap();
+    assert!(
+        runs.is_empty(),
+        "rejected submit must not persist a run row"
+    );
+}

@@ -5,17 +5,37 @@
 //! * [`lance::LanceDestination`] — writes to a Lance dataset on disk; commit-at-end
 //!   atomicity.
 //! * [`sql_dml::SqlDmlDestination`] — `INSERT INTO <table> SELECT ...` (or
-//!   `DELETE FROM`+`INSERT` for `overwrite`) against a federated DB table.
+//!   `DELETE FROM`+`INSERT` for `overwrite`) against a federated DB table. The
+//!   underlying datafusion-table-providers sinks wrap the full INSERT in a
+//!   single transaction, so partial writes are not visible on crash. We
+//!   therefore restrict this destination to transactional source kinds
+//!   (Postgres/MySQL/SQLite) — non-transactional backends (Redis, Mongo,
+//!   Seekdb) are rejected at submit time.
 //!
 //! A third "kind" — Iceberg — is reserved for v1.1; when it lands it will be
 //! its own submodule here.
+//!
+//! Both backends consume a [`SendableRecordBatchStream`] so the executor can
+//! stream the query output batch-by-batch rather than materializing the whole
+//! result. Cancel happens via [`CancellableStream`], which errors out of
+//! `poll_next` as soon as the run's [`CancelFlag`] flips — the destination's
+//! in-flight transaction / manifest commit then unwinds cleanly with no rows
+//! visible.
 
 use anyhow::Result;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion::prelude::SessionContext;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::RecordBatchStream;
+use futures::Stream;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+
+use datafusion::prelude::SessionContext;
 
 use super::definition::DestinationMode;
 
@@ -42,12 +62,13 @@ pub enum JobDestinationKind {
     Db,
 }
 
-/// A sink that accepts a fully-materialized batch set and commits it.
+/// A sink that commits a streaming query result.
 ///
-/// Jobs are batch-only in the MVP, so the writer takes a `Vec<RecordBatch>`
-/// rather than a stream. The executor collects the DataFusion output
-/// in-memory (first shipable version) and hands it to the destination.
-/// Streaming is a v1.1 concern.
+/// Both implementations consume the stream batch-by-batch, so memory stays
+/// proportional to the in-flight batch size rather than the full result.
+/// Atomicity is preserved end-to-end: Lance commits one manifest version at
+/// the end, SQL DML runs inside one wrapping transaction. If the stream
+/// errors or is cancelled mid-flight, nothing is visible to readers.
 #[async_trait]
 pub trait JobDestination: Send + Sync {
     /// Classification used by the pre-flight resolver.
@@ -60,9 +81,52 @@ pub trait JobDestination: Send + Sync {
     /// submit-time pre-flight to diff against the query's output schema).
     async fn schema(&self) -> Result<Option<Arc<Schema>>>;
 
-    /// Commit a batch of rows with the chosen mode.
-    async fn write(&self, batches: Vec<RecordBatch>, mode: DestinationMode)
-    -> Result<WriteOutcome>;
+    /// Consume `stream` and commit the rows with the chosen mode.
+    async fn write(
+        &self,
+        stream: SendableRecordBatchStream,
+        mode: DestinationMode,
+    ) -> Result<WriteOutcome>;
+}
+
+/// Stream adapter that errors out of `poll_next` as soon as `cancelled` flips.
+/// Wrapping the executor's query stream with this is how cancel reaches the
+/// destination: the next `data.next().await` in the provider's sink loop
+/// returns `Err`, its transaction aborts, and nothing lands.
+pub struct CancellableStream {
+    inner: SendableRecordBatchStream,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellableStream {
+    pub fn new(inner: SendableRecordBatchStream, cancelled: Arc<AtomicBool>) -> Self {
+        Self { inner, cancelled }
+    }
+
+    /// Box + pin to hand to any `SendableRecordBatchStream` consumer.
+    pub fn boxed(self) -> SendableRecordBatchStream {
+        Box::pin(self)
+    }
+}
+
+impl Stream for CancellableStream {
+    type Item = std::result::Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.cancelled.load(Ordering::SeqCst) {
+            return Poll::Ready(Some(Err(DataFusionError::Execution(
+                "job cancelled before commit".to_string(),
+            ))));
+        }
+        Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
+impl RecordBatchStream for CancellableStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
 }
 
 /// Quote a DataFusion table reference so dotted identifiers survive parsing
@@ -111,8 +175,31 @@ pub(crate) async fn lookup_table_schema(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_util {
     use super::*;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    /// Wrap a `Vec<RecordBatch>` as a `SendableRecordBatchStream` so unit
+    /// tests can drive the new streaming `JobDestination::write` surface.
+    pub fn vec_to_stream(
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+    ) -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches.into_iter().map(Ok)),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::vec_to_stream;
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use futures::StreamExt;
 
     #[test]
     fn quote_table_ref_handles_dotted_idents_and_quotes() {
@@ -122,5 +209,40 @@ mod tests {
             "\"cat\".\"schema\".\"tbl\""
         );
         assert_eq!(quote_table_ref("has\"quote"), "\"has\"\"quote\"");
+    }
+
+    #[tokio::test]
+    async fn cancellable_stream_errors_when_flag_is_set_before_first_poll() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
+        let inner = vec_to_stream(vec![batch], schema);
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut s = CancellableStream::new(inner, flag).boxed();
+        let item = s.next().await.expect("one item");
+        assert!(item.is_err(), "expected Err, got {:?}", item);
+        assert!(s.next().await.is_none() || true); // doesn't matter what comes after
+    }
+
+    #[tokio::test]
+    async fn cancellable_stream_passes_through_when_not_cancelled() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let inner = vec_to_stream(vec![batch], schema);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut s = CancellableStream::new(inner, flag).boxed();
+        let b = s.next().await.unwrap().unwrap();
+        assert_eq!(b.num_rows(), 2);
+        assert!(s.next().await.is_none());
     }
 }

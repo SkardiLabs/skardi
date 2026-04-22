@@ -1,9 +1,15 @@
 use anyhow::{Context, Result};
+use arrow::array::RecordBatchReader;
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use futures::StreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
@@ -137,6 +143,126 @@ pub async fn write_lance_dataset(
         version: written.version().version,
         rows_written,
     })
+}
+
+/// Stream a DataFusion batch source into a Lance dataset. Memory stays
+/// proportional to the bounded channel (~2 batches) rather than the full
+/// result size — this is the path the jobs primitive uses.
+///
+/// Atomicity matches [`write_lance_dataset`]: Lance writes data files as it
+/// consumes batches and commits a single manifest version at the end. If the
+/// stream errors partway (e.g. job cancelled), no manifest is committed and
+/// the previous dataset version remains visible to readers.
+///
+/// Refuses to commit an empty stream, same as the batch variant.
+///
+/// ## Bridge threading
+///
+/// Lance wants a sync `RecordBatchReader`, our input is an async
+/// `SendableRecordBatchStream`. We bridge with a bounded `tokio::sync::mpsc`
+/// channel:
+///
+/// * **Producer** (tokio task) uses cooperative `send().await`, so the
+///   runtime can interleave other tasks — critical for single-worker
+///   runtimes (`#[tokio::test]` defaults to `current_thread`).
+/// * **Consumer** (`RecordBatchReader::next`) calls `blocking_recv()`.
+///   Lance internally consumes a sync reader from a `spawn_blocking`
+///   context, so the blocking call does not stall any tokio worker.
+///
+/// An earlier implementation used `std::sync::mpsc::sync_channel` whose
+/// `SyncSender::send` is blocking; that deadlocked on single-worker
+/// runtimes when the producer task was scheduled on the same thread Lance
+/// was trying to make progress on.
+pub async fn write_lance_stream(
+    path: &str,
+    stream: SendableRecordBatchStream,
+    mode: WriteMode,
+) -> Result<LanceWriteOutcome> {
+    let schema = stream.schema();
+
+    // Small bound so peak memory is ~2 batches; the producer yields as soon
+    // as the channel fills.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, ArrowError>>(2);
+    let rows_seen = Arc::new(AtomicU64::new(0));
+    let reader = ChannelRecordBatchReader {
+        rx,
+        schema: schema.clone(),
+        rows_seen: Arc::clone(&rows_seen),
+    };
+
+    spawn_stream_pump(stream, tx);
+
+    let params = WriteParams {
+        mode,
+        ..Default::default()
+    };
+    let written = Dataset::write(reader, path, Some(params))
+        .await
+        .with_context(|| format!("Failed to write Lance dataset at path: {}", path))?;
+
+    let rows_written = rows_seen.load(Ordering::SeqCst);
+    if rows_written == 0 {
+        anyhow::bail!(
+            "refusing to write an empty stream to Lance dataset at {path}: \
+             the job produced zero rows, so there is nothing to commit"
+        );
+    }
+
+    Ok(LanceWriteOutcome {
+        version: written.version().version,
+        rows_written,
+    })
+}
+
+/// Sync `RecordBatchReader` fed by a `tokio::sync::mpsc` channel. Lance
+/// consumes a sync reader from a `spawn_blocking` context, so the
+/// `blocking_recv()` call does not stall any tokio worker.
+struct ChannelRecordBatchReader {
+    rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, ArrowError>>,
+    schema: SchemaRef,
+    rows_seen: Arc<AtomicU64>,
+}
+
+impl Iterator for ChannelRecordBatchReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.rx.blocking_recv() {
+            Some(Ok(batch)) => {
+                self.rows_seen
+                    .fetch_add(batch.num_rows() as u64, Ordering::SeqCst);
+                Some(Ok(batch))
+            }
+            Some(Err(e)) => Some(Err(e)),
+            // Sender dropped with no error → clean end-of-stream.
+            None => None,
+        }
+    }
+}
+
+impl RecordBatchReader for ChannelRecordBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// Pump the async source into the channel. DataFusion errors are wrapped
+/// as `ArrowError::ExternalError` so the reader can propagate them to
+/// Lance, which will then abort the write and skip the manifest commit.
+fn spawn_stream_pump(
+    mut stream: SendableRecordBatchStream,
+    tx: tokio::sync::mpsc::Sender<Result<RecordBatch, ArrowError>>,
+) {
+    tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            let mapped = item.map_err(|e| ArrowError::ExternalError(Box::new(e)));
+            if tx.send(mapped).await.is_err() {
+                // Consumer closed the channel (Lance already failed). Drop
+                // the rest of the stream and exit quietly.
+                break;
+            }
+        }
+    });
 }
 
 #[cfg(test)]

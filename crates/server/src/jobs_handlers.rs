@@ -68,7 +68,8 @@ fn submit_error_status(err: &JobSubmitError) -> StatusCode {
         | JobSubmitError::LakeDestinationMissing { .. }
         | JobSubmitError::SchemaMismatch { .. }
         | JobSubmitError::SqlPlanFailure { .. }
-        | JobSubmitError::DestinationResolutionFailed { .. } => StatusCode::BAD_REQUEST,
+        | JobSubmitError::DestinationResolutionFailed { .. }
+        | JobSubmitError::NonTransactionalDestination { .. } => StatusCode::BAD_REQUEST,
         JobSubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

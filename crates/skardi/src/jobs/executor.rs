@@ -33,7 +33,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::definition::{Destination, DestinationMode, JobDefinition};
-use super::destination::{JobDestination, JobDestinationKind, LanceDestination, SqlDmlDestination};
+use super::destination::{
+    CancellableStream, JobDestination, JobDestinationKind, LanceDestination, SqlDmlDestination,
+};
 use super::store::{JobRun, JobRunStatus, JobStore};
 use crate::pipeline::pipeline::Pipeline;
 use crate::sources::DataSourceType;
@@ -74,6 +76,16 @@ pub enum JobSubmitError {
     #[error("Unknown destination table '{table}' — could not resolve against the session context")]
     DestinationResolutionFailed { table: String },
 
+    #[error(
+        "Destination source type '{source_type:?}' for table '{table}' does not support \
+         transactional writes; job destinations must be Lance or a transactional SQL backend \
+         (Postgres, MySQL, SQLite)"
+    )]
+    NonTransactionalDestination {
+        table: String,
+        source_type: DataSourceType,
+    },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -90,6 +102,7 @@ impl JobSubmitError {
             Self::SchemaMismatch { .. } => "schema_mismatch",
             Self::SqlPlanFailure { .. } => "sql_plan_failure",
             Self::DestinationResolutionFailed { .. } => "destination_resolution_failed",
+            Self::NonTransactionalDestination { .. } => "non_transactional_destination",
             Self::Internal(_) => "internal_error",
         }
     }
@@ -97,10 +110,11 @@ impl JobSubmitError {
 
 /// Shared between submit-time and runtime halves — lets an explicit
 /// `cancel` call reach the spawned task before it commits to the
-/// destination.
-#[derive(Debug, Default)]
+/// destination. Wraps `Arc<AtomicBool>` so the inner flag can be handed to
+/// the destination's stream adapter without cloning the whole struct.
+#[derive(Debug, Default, Clone)]
 struct CancelFlag {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl CancelFlag {
@@ -110,6 +124,12 @@ impl CancelFlag {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Shared reference to the underlying atomic, suitable for handing to a
+    /// `CancellableStream` so cancel propagates into the destination write.
+    fn shared(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
     }
 }
 
@@ -311,13 +331,21 @@ impl JobExecutor {
             }
             Some(DataSourceType::Postgres)
             | Some(DataSourceType::Mysql)
-            | Some(DataSourceType::Sqlite)
-            | Some(DataSourceType::Mongo)
-            | Some(DataSourceType::Redis)
-            | Some(DataSourceType::Seekdb) => Ok(Arc::new(SqlDmlDestination::new(
+            | Some(DataSourceType::Sqlite) => Ok(Arc::new(SqlDmlDestination::new(
                 Arc::clone(&self.session_ctx),
                 dest.table.clone(),
             ))),
+            // Non-transactional SQL-ish backends — the underlying providers
+            // don't wrap an INSERT in a transaction, so a mid-stream failure
+            // would leave partial rows visible. Reject at submit time.
+            Some(source_type @ DataSourceType::Mongo)
+            | Some(source_type @ DataSourceType::Redis)
+            | Some(source_type @ DataSourceType::Seekdb) => {
+                Err(JobSubmitError::NonTransactionalDestination {
+                    table: dest.table.clone(),
+                    source_type: source_type.clone(),
+                })
+            }
             Some(DataSourceType::Iceberg) => Err(JobSubmitError::Internal(anyhow::anyhow!(
                 "Iceberg destinations are not supported in MVP — deferred to v1.1"
             ))),
@@ -503,12 +531,17 @@ async fn run_job_task(
             .sql(&rendered_sql)
             .await
             .context("Failed to plan rendered SQL")?;
-        let batches = df.collect().await.context("Failed to collect job output")?;
-        if cancel.is_cancelled() {
-            return Err(anyhow::anyhow!("cancelled before commit"));
-        }
+        // Stream the query result straight to the destination. The
+        // CancellableStream wrapper errors out of `poll_next` when the flag
+        // flips, which unwinds the destination's in-flight transaction /
+        // Lance manifest cleanly with nothing visible to readers.
+        let raw_stream = df
+            .execute_stream()
+            .await
+            .context("Failed to start streaming job output")?;
+        let stream = CancellableStream::new(raw_stream, cancel.shared()).boxed();
         destination
-            .write(batches, mode)
+            .write(stream, mode)
             .await
             .context("Destination write failed")
     };
