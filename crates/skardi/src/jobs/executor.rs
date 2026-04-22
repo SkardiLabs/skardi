@@ -327,14 +327,14 @@ impl JobExecutor {
                         table: dest.table.clone(),
                     },
                 )?;
-                Ok(Arc::new(LanceDestination::new(path)))
+                Ok(Arc::new(LanceDestination::new(path)) as Arc<dyn JobDestination>)
             }
             Some(DataSourceType::Postgres)
             | Some(DataSourceType::Mysql)
             | Some(DataSourceType::Sqlite) => Ok(Arc::new(SqlDmlDestination::new(
                 Arc::clone(&self.session_ctx),
                 dest.table.clone(),
-            ))),
+            )) as Arc<dyn JobDestination>),
             // Non-transactional SQL-ish backends — the underlying providers
             // don't wrap an INSERT in a transaction, so a mid-stream failure
             // would leave partial rows visible. Reject at submit time.
@@ -360,7 +360,7 @@ impl JobExecutor {
                 Ok(Arc::new(SqlDmlDestination::new(
                     Arc::clone(&self.session_ctx),
                     dest.table.clone(),
-                )))
+                )) as Arc<dyn JobDestination>)
             }
         }
     }
