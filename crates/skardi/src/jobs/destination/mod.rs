@@ -18,7 +18,7 @@
 //! Both backends consume a [`SendableRecordBatchStream`] so the executor can
 //! stream the query output batch-by-batch rather than materializing the whole
 //! result. Cancel happens via [`CancellableStream`], which errors out of
-//! `poll_next` as soon as the run's [`CancelFlag`] flips — the destination's
+//! `poll_next` as soon as the run's cancel flag flips — the destination's
 //! in-flight transaction / manifest commit then unwinds cleanly with no rows
 //! visible.
 
