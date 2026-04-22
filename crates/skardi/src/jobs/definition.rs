@@ -16,7 +16,7 @@
 //!     AND updated_at <  {to_date}
 //! destination:
 //!   table: "wiki_lake"          # DataFusion table ident (or dotted path)
-//!   mode: append                # append | overwrite
+//!   mode: append                # append (overwrite is deferred — see below)
 //!   create_if_missing: true     # lake destinations only
 //! execution:
 //!   timeout_ms: 3600000         # optional; default = no timeout
@@ -54,17 +54,19 @@ impl Default for JobKind {
 }
 
 /// Write mode for the destination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// MVP supports `append` only. `overwrite` is deferred because the
+/// DataFusion SQL interface we drive DB destinations through cannot wrap
+/// a `DELETE FROM` + `INSERT INTO` pair in a single transaction, so an
+/// overwrite whose INSERT failed after a successful DELETE would silently
+/// leave the destination empty — violating the job atomicity contract.
+/// Re-enable alongside provider-native transactional DML or a staging-swap
+/// strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DestinationMode {
+    #[default]
     Append,
-    Overwrite,
-}
-
-impl Default for DestinationMode {
-    fn default() -> Self {
-        Self::Append
-    }
 }
 
 fn default_create_if_missing() -> bool {
@@ -242,13 +244,36 @@ metadata:
 query: "SELECT 1 AS id"
 destination:
   table: "target_table"
-  mode: overwrite
 "#;
         let ctx = Arc::new(SessionContext::new());
         let res = write_and_load(yaml, ctx).await.unwrap().unwrap();
-        assert_eq!(res.destination.mode, DestinationMode::Overwrite);
+        // `mode:` omitted → defaults to Append.
+        assert_eq!(res.destination.mode, DestinationMode::Append);
         assert!(res.destination.create_if_missing);
         assert!(res.execution.timeout_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn job_yaml_rejects_overwrite_mode() {
+        let yaml = r#"
+kind: job
+metadata:
+  name: "bad"
+  version: "1.0.0"
+query: "SELECT 1"
+destination:
+  table: "t"
+  mode: overwrite
+"#;
+        let ctx = Arc::new(SessionContext::new());
+        // Format with the alternate Display so the full anyhow cause chain
+        // — which is where serde's "unknown variant" message lives — shows
+        // up for the assertion.
+        let err = format!("{:#}", write_and_load(yaml, ctx).await.unwrap_err());
+        assert!(
+            err.contains("overwrite") || err.contains("unknown variant"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

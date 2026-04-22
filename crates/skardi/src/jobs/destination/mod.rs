@@ -4,13 +4,13 @@
 //!
 //! * [`lance::LanceDestination`] — writes to a Lance dataset on disk; commit-at-end
 //!   atomicity.
-//! * [`sql_dml::SqlDmlDestination`] — `INSERT INTO <table> SELECT ...` (or
-//!   `DELETE FROM`+`INSERT` for `overwrite`) against a federated DB table. The
-//!   underlying datafusion-table-providers sinks wrap the full INSERT in a
-//!   single transaction, so partial writes are not visible on crash. We
-//!   therefore restrict this destination to transactional source kinds
-//!   (Postgres/MySQL/SQLite) — non-transactional backends (Redis, Mongo,
-//!   Seekdb) are rejected at submit time.
+//! * [`sql_dml::SqlDmlDestination`] — `INSERT INTO <table> SELECT ...` against
+//!   a federated DB table. The underlying datafusion-table-providers sinks
+//!   wrap the full INSERT in a single transaction, so partial writes are not
+//!   visible on crash. We therefore restrict this destination to transactional
+//!   source kinds (Postgres/MySQL/SQLite) — non-transactional backends
+//!   (Redis, Mongo, Seekdb) are rejected at submit time. Overwrite mode is
+//!   not supported (see `sql_dml`).
 //!
 //! A third "kind" — Iceberg — is reserved for v1.1; when it lands it will be
 //! its own submodule here.

@@ -444,6 +444,16 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         }
     }
 
+    if args.jobs_path.is_some() && !job_files.is_empty() && jobs.is_empty() {
+        tracing::warn!(
+            "--jobs {:?} scanned {} YAML file(s) but none had `kind: job` at the root; \
+             /jobs/* endpoints will return 503 until at least one job definition loads. \
+             Did you forget the `kind: job` discriminator?",
+            args.jobs_path.as_ref().expect("just checked is_some above"),
+            job_files.len(),
+        );
+    }
+
     tracing::info!(
         "Configuration loaded successfully: pipelines={}, jobs={}, data_sources={}",
         pipelines.len(),

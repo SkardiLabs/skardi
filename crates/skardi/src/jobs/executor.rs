@@ -322,11 +322,11 @@ impl JobExecutor {
         match self.data_source_types.get(root) {
             Some(DataSourceType::Lance) => {
                 // Lake destinations expect the resolver to know the path.
-                let path = self.lance_path_for(root).ok_or(
+                let path = self.lance_path_for(root).ok_or_else(|| {
                     JobSubmitError::DestinationResolutionFailed {
                         table: dest.table.clone(),
-                    },
-                )?;
+                    }
+                })?;
                 Ok(Arc::new(LanceDestination::new(path)) as Arc<dyn JobDestination>)
             }
             Some(DataSourceType::Postgres)
@@ -355,8 +355,18 @@ impl JobExecutor {
                 )))
             }
             None => {
-                // The table may be a bare name registered directly (e.g. a
-                // MemTable in tests). Treat as DB so the pre-flight runs.
+                // A dotted identifier whose root is not a known source is
+                // almost certainly a typo — a real catalog-registered source
+                // would have populated `data_source_types`. Surface the
+                // resolution failure directly so the error message doesn't
+                // misleadingly suggest the user run DB DDL.
+                if dest.table.contains('.') {
+                    return Err(JobSubmitError::DestinationResolutionFailed {
+                        table: dest.table.clone(),
+                    });
+                }
+                // Bare names may still be directly-registered tables
+                // (e.g. a MemTable in tests). Let the pre-flight classify.
                 Ok(Arc::new(SqlDmlDestination::new(
                     Arc::clone(&self.session_ctx),
                     dest.table.clone(),
@@ -444,11 +454,14 @@ fn sorted_json(params: &HashMap<String, Value>) -> String {
     serde_json::to_string(&sorted).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Order-insensitive schema diff: checks that every column in `produced`
-/// has a same-named field in `expected` with the same Arrow DataType.
-/// Nullability is allowed to widen (`produced.nullable = true` into a
-/// `nullable = false` destination still passes, consistent with how Lance
-/// and INSERT INTO handle nulls).
+/// Order-insensitive schema diff: every column in `produced` must have a
+/// same-named field in `expected` with the same Arrow DataType, and every
+/// non-nullable column in `expected` must exist in `produced` (otherwise
+/// INSERT INTO would fail with an opaque error). Nullability of matching
+/// columns is intentionally NOT checked here — a nullable-produced value
+/// landing in a non-null destination column is left for the sink's own
+/// constraint error at write time, so pre-flight doesn't reject writes
+/// that would in practice succeed for null-free batches.
 fn diff_schemas(table: &str, produced: &Schema, expected: &Schema) -> Result<(), String> {
     let expected_by_name: HashMap<&str, &arrow::datatypes::Field> = expected
         .fields()
@@ -609,7 +622,7 @@ async fn run_job_task(
                     Some(finished),
                     None,
                     None,
-                    Some(format!("{err:?}")),
+                    Some(format!("{err:#}")),
                 )
                 .await
             {

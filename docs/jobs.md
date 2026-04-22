@@ -17,8 +17,6 @@ somewhere you can query again later.
 - **Backfilling a lake from a federated source.** Your wiki lives in
   Postgres; you want a queryable snapshot in Lance for BI.
 - **Nightly ingest.** Pull the last 24h of rows into a destination table.
-- **Rebuild a derived table.** `mode: overwrite` atomically replaces a
-  table with the output of a fresh SELECT.
 - **Long-running transforms.** Anything whose wall-clock time makes an
   HTTP request/response awkward.
 
@@ -50,7 +48,7 @@ query: |
 
 destination:
   table: "wiki_lake"          # DataFusion table identifier — bare or dotted
-  mode: append                # append | overwrite
+  mode: append                # append is the only supported mode in MVP
   create_if_missing: true     # lake destinations only (see below)
 
 execution:
@@ -84,18 +82,27 @@ destination of a job.
 
 ### `destination.mode`
 
-- `append` (default) — add rows to the destination.
+- `append` (default, and the only mode in MVP) — add rows to the destination.
   - *Lake:* the dataset is created if `create_if_missing: true` and it
     does not yet exist, else appended to.
   - *DB:* rows are added with `INSERT INTO <table> SELECT ...`, wrapped
     in one transaction per run.
-- `overwrite` — replace contents of the destination.
-  - *Lake:* Lance `WriteMode::Overwrite` — new schema + data, atomic.
-  - *DB:* `DELETE FROM <table>` followed by `INSERT INTO <table> SELECT
-    ...` inside the same wrapping transaction, so mid-run failures
-    leave the old rows intact.
 
-Upserts / merge are not in MVP.
+**Overwrite is deliberately not supported.** Overwriting a DB destination
+would need `DELETE FROM` + `INSERT` to share one transaction, and the
+DataFusion SQL surface we drive DB writes through does not expose a
+multi-statement transaction handle — so a mid-run INSERT failure after a
+successful DELETE would silently leave the table empty. Rather than ship
+a version of overwrite that is atomic for Lance but not for DB
+destinations, MVP rejects overwrite at YAML load time across the board.
+Upserts / merge are out of scope for the same reason.
+
+Workarounds while overwrite is out:
+
+- *Lake:* delete the dataset directory and re-run `append` with
+  `create_if_missing: true`.
+- *DB:* write to a staging table with `append`, then swap with your
+  database's native `RENAME TABLE` (or equivalent) in one DDL statement.
 
 ### `destination.create_if_missing`
 
@@ -389,8 +396,7 @@ The CLI prints `submitted: <run_id> (pending)`. Follow it with
 `skardi job status <run_id>` until you see `"status": "succeeded"` and a
 non-null `snapshot_id` (the Lance dataset version).
 
-Re-running the same command appends; switching the YAML to
-`mode: overwrite` replaces atomically.
+Re-running the same command appends more rows to the same dataset.
 
 ---
 
@@ -399,6 +405,9 @@ Re-running the same command appends; switching the YAML to
 - **Iceberg destination** — read-only today. Deferred to v1.1.
 - **Delta Lake destination** — same shape as Lance; lands when a demand
   case appears.
+- **`mode: overwrite`** — deferred pending provider-native transactional
+  DML (see the `destination.mode` section above for the atomicity
+  reasoning).
 - **Upsert / merge.**
 - **Watermark / incremental templating** (`${last_successful_run.finished_at}`).
 - **Cron / event triggers.**

@@ -60,17 +60,13 @@ impl JobDestination for LanceDestination {
     async fn write(
         &self,
         stream: SendableRecordBatchStream,
-        mode: DestinationMode,
+        _mode: DestinationMode,
     ) -> Result<WriteOutcome> {
-        let write_mode = match mode {
-            DestinationMode::Append => {
-                if lance_dataset_exists(&self.path) {
-                    WriteMode::Append
-                } else {
-                    WriteMode::Create
-                }
-            }
-            DestinationMode::Overwrite => WriteMode::Overwrite,
+        // MVP supports append only — overwrite is rejected at YAML load.
+        let write_mode = if lance_dataset_exists(&self.path) {
+            WriteMode::Append
+        } else {
+            WriteMode::Create
         };
         let outcome = write_lance_stream(&self.path, stream, write_mode).await?;
         Ok(WriteOutcome {

@@ -171,40 +171,25 @@ destination:
 }
 
 // ---------------------------------------------------------------------------
-// Overwrite replaces rows atomically.
+// Overwrite mode is rejected at YAML load time in MVP.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn job_overwrite_replaces_lance_dataset() {
+async fn overwrite_mode_is_rejected_at_load() {
+    // Rejection fires inside `serde_yaml::from_value::<Destination>(...)` —
+    // before the query is parsed or the session context is consulted — so
+    // the YAML only needs a valid `destination:` block with `mode: overwrite`.
     let tmp = TempDir::new().unwrap();
-    let lake_path = tmp.path().join("ow.lance");
-
-    // Seed the dataset with a first `append` run.
-    let append_yaml = tmp.path().join("append.yaml");
+    let yaml_path = tmp.path().join("overwrite.yaml");
     write_yaml(
-        &append_yaml,
-        r#"
-kind: job
-metadata:
-  name: "seed"
-  version: "1.0.0"
-query: |
-  SELECT id, name FROM src
-destination:
-  table: "t"
-  mode: append
-"#,
-    );
-    let overwrite_yaml = tmp.path().join("overwrite.yaml");
-    write_yaml(
-        &overwrite_yaml,
+        &yaml_path,
         r#"
 kind: job
 metadata:
   name: "replace"
   version: "1.0.0"
 query: |
-  SELECT id, name FROM src WHERE id > {cutoff}
+  SELECT 1 AS id
 destination:
   table: "t"
   mode: overwrite
@@ -212,71 +197,16 @@ destination:
     );
 
     let ctx = Arc::new(SessionContext::new());
-    ctx.register_batch("src", source_batch(10)).unwrap();
-
-    let seed_job = JobDefinition::load_from_file(&append_yaml, Arc::clone(&ctx))
-        .await
-        .unwrap()
-        .unwrap();
-    let replace_job = JobDefinition::load_from_file(&overwrite_yaml, Arc::clone(&ctx))
-        .await
-        .unwrap()
-        .unwrap();
-
-    let mut data_source_types = HashMap::new();
-    data_source_types.insert("t".to_string(), DataSourceType::Lance);
-    let mut source_paths = HashMap::new();
-    source_paths.insert("t".to_string(), lake_path.to_str().unwrap().to_string());
-    let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
-    let mut jobs = HashMap::new();
-    jobs.insert(seed_job.name().to_string(), seed_job);
-    jobs.insert(replace_job.name().to_string(), replace_job);
-    let exec = Arc::new(JobExecutor::new(
-        jobs,
-        store as Arc<dyn skardi::jobs::JobStore>,
-        Arc::clone(&ctx),
-        data_source_types,
-        source_paths,
-    ));
-
-    // Seed with 10 rows.
-    let run_id = exec.submit("seed", HashMap::new()).await.unwrap();
-    let run = wait_for_terminal(&exec, &run_id).await;
-    assert_eq!(run.status, JobRunStatus::Succeeded);
-    assert_eq!(run.rows_written, Some(10));
-
-    // Overwrite keeping only id > 7 — should result in exactly 3 rows.
-    let mut params = HashMap::new();
-    params.insert(
-        "cutoff".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(7)),
+    let err = format!(
+        "{:#}",
+        JobDefinition::load_from_file(&yaml_path, ctx)
+            .await
+            .unwrap_err()
     );
-    let run_id = exec.submit("replace", params).await.unwrap();
-    let run = wait_for_terminal(&exec, &run_id).await;
-    assert_eq!(
-        run.status,
-        JobRunStatus::Succeeded,
-        "error: {:?}",
-        run.error
+    assert!(
+        err.contains("overwrite") || err.contains("unknown variant"),
+        "expected the loader to reject overwrite, got: {err}"
     );
-
-    let mut ctx2 = SessionContext::new();
-    register_lance_table(&mut ctx2, "t", lake_path.to_str().unwrap(), None)
-        .await
-        .unwrap();
-    let count = ctx2
-        .sql("SELECT COUNT(id) AS n FROM t")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap()[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(count, 3, "overwrite must replace — not accumulate");
 }
 
 // ---------------------------------------------------------------------------

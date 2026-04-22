@@ -10,6 +10,11 @@
 //! end-to-end for Postgres / MySQL / SQLite; the executor rejects
 //! non-transactional source kinds (Redis, Mongo, Seekdb) at submit time.
 //!
+//! Overwrite mode is not supported — `DELETE FROM` and `INSERT INTO` would
+//! need to share a single transaction, and DataFusion's SQL surface does not
+//! expose a multi-statement transaction handle. See `DestinationMode` for
+//! the full rationale.
+//!
 //! Guideline: SQL DML jobs should be bounded in size (~10M rows / ~10GB). The
 //! sink warns in the run logs when crossing those thresholds — a single huge
 //! INSERT holds write locks, bloats WAL / undo log, and can lag replicas.
@@ -83,8 +88,9 @@ impl JobDestination for SqlDmlDestination {
     async fn write(
         &self,
         stream: SendableRecordBatchStream,
-        mode: DestinationMode,
+        _mode: DestinationMode,
     ) -> Result<WriteOutcome> {
+        // MVP supports append only — overwrite is rejected at YAML load.
         let schema = stream.schema();
 
         // Tally rows as the stream flows through the counting adapter so we
@@ -118,20 +124,6 @@ impl JobDestination for SqlDmlDestination {
         let staging_sql = format!("\"{}\"", staging_name);
 
         let result: Result<()> = (async {
-            if matches!(mode, DestinationMode::Overwrite) {
-                let delete_sql = format!("DELETE FROM {destination_sql}");
-                self.ctx
-                    .sql(&delete_sql)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to plan overwrite DELETE for '{}'", self.table)
-                    })?
-                    .collect()
-                    .await
-                    .with_context(|| {
-                        format!("Failed to execute overwrite DELETE for '{}'", self.table)
-                    })?;
-            }
             let insert_sql = format!("INSERT INTO {destination_sql} SELECT * FROM {staging_sql}");
             self.ctx
                 .sql(&insert_sql)
