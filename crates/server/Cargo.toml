@@ -30,6 +30,7 @@ axum = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 cookie = { workspace = true }
+dirs = "5.0"
 datafusion = { workspace = true }
 datafusion-federation = { workspace = true }
 datafusion-tracing = "52.0.0"
@@ -55,4 +56,10 @@ opentelemetry-semantic-conventions = "0.27"
 url = { workspace = true }
 
 [dev-dependencies]
+arrow = { workspace = true }
+datafusion = { workspace = true }
+http-body-util = "0.1"
+skardi = { path = "../skardi" }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true }

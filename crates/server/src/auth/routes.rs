@@ -349,9 +349,12 @@ mod tests {
 
         let config = ServerConfig {
             pipelines: Default::default(),
+            jobs: Default::default(),
             data_sources: vec![],
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
+                jobs_path: None,
+                jobs_db_path: None,
                 ctx_file: None,
                 port: 8080,
             },
@@ -364,6 +367,7 @@ mod tests {
             session_ctx,
             metrics: PipelineMetrics::new(),
             auth_layer: AuthLayer::None,
+            jobs: None,
         }
     }
 
@@ -396,9 +400,12 @@ mod tests {
 
         let config = ServerConfig {
             pipelines: Default::default(),
+            jobs: Default::default(),
             data_sources: vec![],
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
+                jobs_path: None,
+                jobs_db_path: None,
                 ctx_file: None,
                 port: 8080,
             },
@@ -411,6 +418,7 @@ mod tests {
             session_ctx,
             metrics: PipelineMetrics::new(),
             auth_layer: layer,
+            jobs: None,
         }
     }
 

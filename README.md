@@ -43,6 +43,7 @@ Skardi runs federated SQL across files, databases, object stores, and vector sto
 
 - **CLI for local agents & queries** — Run SQL against local files, remote object stores (S3, GCS, Azure), databases, and datalake formats — ideal for local AI agents like [OpenClaw](https://github.com/openclaw/openclaw)
 - **Declarative pipelines** — Define SQL queries in YAML, get REST APIs automatically
+- **Batch jobs (`kind: job`)** — The async sibling of pipelines: a parameterized SELECT whose output rows are committed to a Lance dataset or a read-write DB table, with a SQLite run ledger and submit / poll / cancel endpoints. See [docs/jobs.md](docs/jobs.md).
 - **Automatic parameter inference** — Request parameters, types, and response schemas are inferred from your SQL
 - **Multi-source federation** — JOIN across CSV, Parquet, PostgreSQL, MySQL, SQLite, MongoDB, Redis, Iceberg, and Lance in a single query
 - **Full CRUD** — SELECT, INSERT, UPDATE, and DELETE operations on supported databases
@@ -160,6 +161,47 @@ cargo run --bin skardi-server -- \
 
 For full server documentation — context files, pipeline files, access mode, caching, API endpoints, and response format — see [docs/server.md](docs/server.md).
 
+## Batch Jobs
+
+Pipelines answer a query; **jobs** commit the answer somewhere you can query again later. A `kind: job` YAML is a parameterized SELECT plus a destination — Lance for lake targets, or any read-write DB source (Postgres, MySQL, SQLite, SeekDB, MongoDB, Redis) for table-shaped targets. Runs execute in the background on `skardi-server`; the CLI submits and polls.
+
+```yaml
+# jobs/backfill.yaml
+kind: job
+metadata:
+  name: "backfill-to-lake"
+  version: "1.0.0"
+query: |
+  SELECT id, title, content, updated_at
+  FROM wiki.public.wiki_pages
+  WHERE updated_at >= {from_date}
+destination:
+  table: "wiki_lake"          # Lance (lake) or a read-write DB table
+  mode: append                # append | overwrite
+  create_if_missing: true     # lake only — first run creates the dataset
+```
+
+```bash
+# Start the server with a jobs directory (opens ~/.skardi/jobs.db by default)
+cargo run --bin skardi-server -- \
+  --ctx ctx.yaml \
+  --pipeline pipelines/ \
+  --jobs jobs/ \
+  --port 8080
+
+# Submit — returns the run_id
+skardi job run backfill-to-lake --param from_date='2026-01-01'
+
+# Poll
+skardi job status <run_id>
+skardi job list --job backfill-to-lake --limit 20
+
+# Best-effort cancel
+skardi job cancel <run_id>
+```
+
+A submit-time pre-flight (parameter + schema diff) rejects malformed submits before creating a run row; lake destinations commit atomically (crashed writes never land); DB destinations rely on provider-native transactions. Crash-killed runs are reconciled to `failed` on server restart. See [docs/jobs.md](docs/jobs.md) for the full reference.
+
 ## Supported Data Sources
 
 | Type | CRUD | Description | Docs |
@@ -178,6 +220,7 @@ For full server documentation — context files, pipeline files, access mode, ca
 
 ## Additional Features
 
+- **Batch jobs** — Async `kind: job` primitive that writes SQL results to Lance or a DB destination, with a SQLite run ledger and submit / poll / cancel endpoints. See [docs/jobs.md](docs/jobs.md).
 - **Catalog mode** — Load an entire database as a DataFusion catalog; no per-table registration needed. See [docs/catalog.md](docs/catalog.md).
 - **Federated queries** — JOIN across different source types in a single SQL query. See [docs/federated-queries.md](docs/federated-queries.md).
 - **Authentication** — Drop-in session-based auth via better-auth with SQLite. See [docs/auth/](docs/auth/).

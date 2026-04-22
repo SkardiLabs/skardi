@@ -1,0 +1,248 @@
+//! Axum handlers for the jobs primitive.
+//!
+//! Four endpoints:
+//!
+//! * `POST /jobs/:name/run`         — submit a new run
+//! * `GET  /jobs/runs/:run_id`      — poll a single run
+//! * `GET  /jobs/runs`              — list recent runs (optional `?job=name`, `?limit=N`)
+//! * `POST /jobs/runs/:run_id/cancel` — best-effort cancel
+//!
+//! The submit handler validates parameters + destination synchronously and
+//! returns `{ run_id, status: "pending" }` immediately; the actual query
+//! runs in a background Tokio task managed by [`skardi::jobs::JobExecutor`].
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use skardi::jobs::{JobRun, JobSubmitError};
+use std::collections::HashMap;
+
+use crate::server::AppState;
+
+#[derive(Debug, Deserialize)]
+pub struct SubmitRunRequest {
+    /// Dynamic JSON parameters that match the job's request schema.
+    /// Same shape as the pipeline-execute endpoint's request body.
+    #[serde(default, flatten)]
+    pub parameters: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubmitRunResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+/// Error body for every job endpoint. Mirrors the pipeline handler's
+/// `{ success, error, error_type, details, timestamp }` shape so client
+/// code can share parsing.
+#[derive(Debug, Serialize)]
+pub struct JobErrorResponse {
+    pub success: bool,
+    pub error: String,
+    pub error_type: String,
+    pub details: Option<Value>,
+    pub timestamp: String,
+}
+
+fn error_json(msg: &str, kind: &str, details: Option<Value>) -> Json<JobErrorResponse> {
+    Json(JobErrorResponse {
+        success: false,
+        error: msg.to_string(),
+        error_type: kind.to_string(),
+        details,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+fn submit_error_status(err: &JobSubmitError) -> StatusCode {
+    match err {
+        JobSubmitError::UnknownJob(_) => StatusCode::NOT_FOUND,
+        JobSubmitError::MissingParameters(_)
+        | JobSubmitError::UnsupportedParameter(_)
+        | JobSubmitError::DbDestinationMissing { .. }
+        | JobSubmitError::LakeDestinationMissing { .. }
+        | JobSubmitError::SchemaMismatch { .. }
+        | JobSubmitError::SqlPlanFailure { .. }
+        | JobSubmitError::DestinationResolutionFailed { .. }
+        | JobSubmitError::NonTransactionalDestination { .. } => StatusCode::BAD_REQUEST,
+        JobSubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn job_run_to_json(run: &JobRun) -> Value {
+    serde_json::json!({
+        "run_id": run.id,
+        "job": run.job_name,
+        "status": run.status.as_str(),
+        "parameters": serde_json::from_str::<Value>(&run.parameters).unwrap_or(Value::Null),
+        "created_at": run.created_at,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "rows_written": run.rows_written,
+        "snapshot_id": run.snapshot_id,
+        "error": run.error,
+    })
+}
+
+/// `POST /jobs/:name/run`
+pub async fn submit_job_run(
+    State(app_state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SubmitRunRequest>,
+) -> Result<Json<SubmitRunResponse>, (StatusCode, Json<JobErrorResponse>)> {
+    let Some(executor) = app_state.jobs.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_json(
+                "Jobs subsystem is not enabled on this server",
+                "jobs_disabled",
+                None,
+            ),
+        ));
+    };
+
+    match executor.submit(&name, req.parameters).await {
+        Ok(run_id) => Ok(Json(SubmitRunResponse {
+            run_id,
+            status: "pending".to_string(),
+        })),
+        Err(err) => {
+            let status = submit_error_status(&err);
+            let kind = err.category().to_string();
+            let msg = err.to_string();
+            let details = match &err {
+                JobSubmitError::SchemaMismatch { table, details } => Some(serde_json::json!({
+                    "table": table,
+                    "diff": details,
+                })),
+                JobSubmitError::UnknownJob(job) => Some(serde_json::json!({ "job": job })),
+                _ => None,
+            };
+            Err((status, error_json(&msg, &kind, details)))
+        }
+    }
+}
+
+/// `GET /jobs/runs/:run_id`
+pub async fn get_job_run(
+    State(app_state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    let Some(executor) = app_state.jobs.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
+        ));
+    };
+    match executor.store().get_run(&run_id).await {
+        Ok(Some(run)) => Ok(Json(job_run_to_json(&run))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            error_json(&format!("Run '{run_id}' not found"), "unknown_run", None),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&e.to_string(), "internal_error", None),
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListRunsQuery {
+    pub job: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /jobs/runs?job=...&limit=...`
+pub async fn list_job_runs(
+    State(app_state): State<AppState>,
+    Query(q): Query<ListRunsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    let Some(executor) = app_state.jobs.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
+        ));
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    match executor.store().list_runs(q.job.as_deref(), limit).await {
+        Ok(runs) => {
+            let body: Vec<Value> = runs.iter().map(job_run_to_json).collect();
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "runs": body,
+                "count": runs.len(),
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&e.to_string(), "internal_error", None),
+        )),
+    }
+}
+
+/// `POST /jobs/runs/:run_id/cancel` — returns `cancelled: true` when the
+/// flag was set, `false` when the run is already terminal or unknown to
+/// the executor.
+pub async fn cancel_job_run(
+    State(app_state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    let Some(executor) = app_state.jobs.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
+        ));
+    };
+    let cancelled = executor.cancel(&run_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&e.to_string(), "internal_error", None),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "run_id": run_id,
+        "cancelled": cancelled,
+    })))
+}
+
+/// `GET /jobs` — list registered job names with their destinations. Useful
+/// for CLI discovery.
+pub async fn list_jobs(
+    State(app_state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    let Some(executor) = app_state.jobs.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
+        ));
+    };
+    let names = executor.list_jobs().await;
+    let mut items = Vec::with_capacity(names.len());
+    for name in &names {
+        if let Some(def) = executor.get_job(name).await {
+            let params: Vec<String> = def.pipeline.request_schema.fields.keys().cloned().collect();
+            items.push(serde_json::json!({
+                "name": def.name(),
+                "version": def.version(),
+                "destination": {
+                    "table": def.destination.table,
+                    "mode": format!("{:?}", def.destination.mode).to_lowercase(),
+                    "create_if_missing": def.destination.create_if_missing,
+                },
+                "parameters": params,
+            }));
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "jobs": items,
+        "count": items.len(),
+    })))
+}
