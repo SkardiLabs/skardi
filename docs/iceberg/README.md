@@ -90,18 +90,25 @@ deactivate
 Create a context file (`ctx_iceberg_demo.yaml`):
 
 ```yaml
-data_sources:
-  - name: "nyc_taxi"
-    type: "iceberg"
-    path: "/tmp/iceberg-warehouse"
-    description: "NYC taxi trips Iceberg catalog"
-    options:
-      namespace: "nyc"
-      table: "trips"
-  - name: "zones"
-    type: "csv"
-    path: "docs/sample_data/taxi_zones.csv"
-    description: "NYC taxi zone lookup"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "nyc_taxi"
+      type: "iceberg"
+      path: "/tmp/iceberg-warehouse"
+      description: "NYC taxi trips Iceberg catalog"
+      options:
+        namespace: "nyc"
+        table: "trips"
+    - name: "zones"
+      type: "csv"
+      path: "docs/sample_data/taxi_zones.csv"
+      description: "NYC taxi zone lookup"
 ```
 
 ### 3. Start Skardi Server
@@ -182,41 +189,47 @@ SELECT * FROM nyc_taxi t JOIN zones z ON t.pickup_location_id = z.location_id
 ### Query Trips by Date
 
 ```yaml
+kind: pipeline
+
 metadata:
   name: "query-trips-by-date"
   version: "1.0.0"
 
-query: |
-  SELECT
-    trip_id,
-    pickup_datetime,
-    passenger_count,
-    trip_distance,
-    total_amount
-  FROM nyc_taxi
-  WHERE pickup_datetime >= {start_date}
-    AND pickup_datetime < {end_date}
-  ORDER BY pickup_datetime
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT
+      trip_id,
+      pickup_datetime,
+      passenger_count,
+      trip_distance,
+      total_amount
+    FROM nyc_taxi
+    WHERE pickup_datetime >= {start_date}
+      AND pickup_datetime < {end_date}
+    ORDER BY pickup_datetime
+    LIMIT {limit}
 ```
 
 ### Trip Statistics by Location
 
 ```yaml
+kind: pipeline
+
 metadata:
   name: "trip-statistics"
   version: "1.0.0"
 
-query: |
-  SELECT
-    pickup_location_id,
-    COUNT(*) as total_trips,
-    AVG(trip_distance) as avg_distance,
-    AVG(fare_amount) as avg_fare,
-    SUM(total_amount) as total_revenue
-  FROM nyc_taxi
-  WHERE pickup_location_id = {location_id}
-  GROUP BY pickup_location_id
+spec:
+  query: |
+    SELECT
+      pickup_location_id,
+      COUNT(*) as total_trips,
+      AVG(trip_distance) as avg_distance,
+      AVG(fare_amount) as avg_fare,
+      SUM(total_amount) as total_revenue
+    FROM nyc_taxi
+    WHERE pickup_location_id = {location_id}
+    GROUP BY pickup_location_id
 ```
 
 ### Federated Query: Join with CSV
@@ -224,21 +237,24 @@ query: |
 Join Iceberg trip data with a CSV zone lookup file:
 
 ```yaml
+kind: pipeline
+
 metadata:
   name: "federated-join-zones"
   version: "1.0.0"
 
-query: |
-  SELECT
-    t.trip_id,
-    t.pickup_datetime,
-    z.zone_name as pickup_zone,
-    z.borough as pickup_borough,
-    t.total_amount
-  FROM nyc_taxi t
-  INNER JOIN zones z ON t.pickup_location_id = z.location_id
-  WHERE z.borough = {borough}
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT
+      t.trip_id,
+      t.pickup_datetime,
+      z.zone_name as pickup_zone,
+      z.borough as pickup_borough,
+      t.total_amount
+    FROM nyc_taxi t
+    INNER JOIN zones z ON t.pickup_location_id = z.location_id
+    WHERE z.borough = {borough}
+    LIMIT {limit}
 ```
 
 ```bash
@@ -252,16 +268,23 @@ curl -X POST http://localhost:8080/federated-join-zones/execute \
 For Iceberg tables stored on S3:
 
 ```yaml
-data_sources:
-  - name: "s3_iceberg"
-    type: "iceberg"
-    path: "s3://my-bucket/iceberg-warehouse"
-    options:
-      namespace: "production"
-      table: "events"
-      aws_region: "us-east-1"
-      aws_access_key_id_env: "AWS_ACCESS_KEY_ID"
-      aws_secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "s3_iceberg"
+      type: "iceberg"
+      path: "s3://my-bucket/iceberg-warehouse"
+      options:
+        namespace: "production"
+        table: "events"
+        aws_region: "us-east-1"
+        aws_access_key_id_env: "AWS_ACCESS_KEY_ID"
+        aws_secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
 ```
 
 ```bash

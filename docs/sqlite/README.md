@@ -259,12 +259,20 @@ is always `main`).
 
 ```yaml
 # docs/sqlite/ctx_sqlite_catalog_demo.yaml
-data_sources:
-  - name: "demo_catalog"
-    type: "sqlite"
-    hierarchy_level: "catalog"
-    path: "docs/sqlite/demo.db"
-    description: "Entire demo.db SQLite database registered as a DataFusion catalog"
+
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "demo_catalog"
+      type: "sqlite"
+      hierarchy_level: "catalog"
+      path: "docs/sqlite/demo.db"
+      description: "Entire demo.db SQLite database registered as a DataFusion catalog"
 ```
 
 ### Start the server

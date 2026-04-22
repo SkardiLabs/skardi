@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "fts-search"
   version: "1.0.0"
@@ -9,7 +11,8 @@ metadata:
 #   {query} - Search terms (space-separated, "quoted" for phrase, OR for disjunction, -term for negation)
 #   {limit} - Maximum number of results to return
 
-query: |
-  SELECT id, title, category, _score
-  FROM pg_fts('articles', 'body', {query}, {limit})
-  ORDER BY _score DESC
+spec:
+  query: |
+    SELECT id, title, category, _score
+    FROM pg_fts('articles', 'body', {query}, {limit})
+    ORDER BY _score DESC

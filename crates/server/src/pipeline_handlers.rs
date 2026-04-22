@@ -738,15 +738,16 @@ mod tests {
     async fn create_test_pipeline_with_params() -> StandardPipeline {
         let temp_dir = TempDir::new().unwrap();
         let pipeline_content = r#"
+kind: pipeline
 metadata:
   name: "test-pipeline"
   version: "1.0.0"
   description: "Test pipeline for handler testing"
-
-query: |
-  SELECT user_id, name, category
-  FROM test_data
-  WHERE user_id = {user_id} AND category = {category}
+spec:
+  query: |
+    SELECT user_id, name, category
+    FROM test_data
+    WHERE user_id = {user_id} AND category = {category}
 "#;
 
         let pipeline_path = temp_dir.path().join("test-pipeline.yaml");

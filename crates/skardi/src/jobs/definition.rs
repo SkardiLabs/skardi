@@ -1,25 +1,27 @@
 //! `kind: job` YAML loader.
 //!
-//! A job YAML has the same `metadata` + `query` shape as a pipeline, with
-//! two additional sections:
+//! A job YAML uses the same `{ kind, metadata, spec }` envelope as pipelines,
+//! contexts, and aliases. The `spec:` block holds the query plus the
+//! job-specific destination and execution sections:
 //!
 //! ```yaml
-//! kind: job                    # discriminator — pipelines default to `pipeline`
+//! kind: job
 //! metadata:
 //!   name: "backfill-wiki"
 //!   version: "1.0.0"
 //!   description: "Backfill wiki pages into the lake."
-//! query: |
-//!   SELECT id, title, content
-//!   FROM wiki.public.wiki_pages
-//!   WHERE updated_at >= {from_date}
-//!     AND updated_at <  {to_date}
-//! destination:
-//!   table: "wiki_lake"          # DataFusion table ident (or dotted path)
-//!   mode: append                # append (overwrite is deferred — see below)
-//!   create_if_missing: true     # lake destinations only
-//! execution:
-//!   timeout_ms: 3600000         # optional; default = no timeout
+//! spec:
+//!   query: |
+//!     SELECT id, title, content
+//!     FROM wiki.public.wiki_pages
+//!     WHERE updated_at >= {from_date}
+//!       AND updated_at <  {to_date}
+//!   destination:
+//!     table: "wiki_lake"          # DataFusion table ident (or dotted path)
+//!     mode: append                # append (overwrite is deferred — see below)
+//!     create_if_missing: true     # lake destinations only
+//!   execution:
+//!     timeout_ms: 3600000         # optional; default = no timeout
 //! ```
 //!
 //! `{placeholder}` tokens in the SQL are inferred as typed scalar params by
@@ -35,9 +37,10 @@ use std::sync::Arc;
 
 use crate::pipeline::pipeline::{Pipeline, StandardPipeline};
 
-/// Discriminator at the YAML root that tells the loader whether the file is
-/// a pipeline or a job. The default is `Pipeline` so existing pipeline
-/// YAMLs — which do not set `kind:` — continue to load unchanged.
+/// Root-level `kind:` values the job loader recognizes. Any other value —
+/// or a missing `kind:` — is an error. `Pipeline` is accepted so that
+/// `JobDefinition::load_from_file` can short-circuit with `Ok(None)` when
+/// the caller accidentally points it at a pipeline YAML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobKind {
@@ -45,12 +48,6 @@ pub enum JobKind {
     Pipeline,
     #[serde(rename = "job")]
     Job,
-}
-
-impl Default for JobKind {
-    fn default() -> Self {
-        Self::Pipeline
-    }
 }
 
 /// Write mode for the destination.
@@ -140,23 +137,36 @@ impl JobDefinition {
         let root: serde_yaml::Value = serde_yaml::from_str(&content)
             .with_context(|| format!("Failed to parse job YAML: {}", path.display()))?;
 
-        let kind: JobKind = match root.get("kind") {
-            Some(v) => serde_yaml::from_value(v.clone())
-                .with_context(|| format!("Invalid `kind:` in {}", path.display()))?,
-            None => JobKind::Pipeline,
-        };
+        let kind_value = root.get("kind").ok_or_else(|| {
+            anyhow!(
+                "Missing `kind:` at root of {} — expected `kind: job` or `kind: pipeline`",
+                path.display()
+            )
+        })?;
+        let kind: JobKind = serde_yaml::from_value(kind_value.clone())
+            .with_context(|| format!("Invalid `kind:` in {}", path.display()))?;
 
         if kind != JobKind::Job {
             return Ok(None);
         }
 
-        let destination_value = root
-            .get("destination")
-            .ok_or_else(|| anyhow!("`kind: job` YAML missing `destination:` block"))?;
+        let spec = root.get("spec").ok_or_else(|| {
+            anyhow!(
+                "`kind: job` YAML {} is missing a `spec:` block",
+                path.display()
+            )
+        })?;
+
+        let destination_value = spec.get("destination").ok_or_else(|| {
+            anyhow!(
+                "`kind: job` YAML {} is missing `spec.destination`",
+                path.display()
+            )
+        })?;
         let destination: Destination = serde_yaml::from_value(destination_value.clone())
             .with_context(|| format!("Failed to parse destination block in {}", path.display()))?;
 
-        let execution: Execution = match root.get("execution") {
+        let execution: Execution = match spec.get("execution") {
             Some(v) => serde_yaml::from_value(v.clone()).with_context(|| {
                 format!("Failed to parse execution block in {}", path.display())
             })?,
@@ -164,9 +174,9 @@ impl JobDefinition {
         };
 
         // Reuse the pipeline loader for metadata + query + schema inference.
-        // `StandardPipeline::load_from_file` reads the file itself, so it
-        // happily ignores extra top-level keys like `kind`, `destination`,
-        // and `execution`.
+        // `StandardPipeline::load_from_file` reads the file itself and
+        // accepts both `kind: pipeline` and `kind: job` at the root; it
+        // pulls the SQL out of `spec.query` either way.
         let pipeline = StandardPipeline::load_from_file(path, ctx)
             .await
             .with_context(|| format!("Failed to load pipeline section of {}", path.display()))?;
@@ -197,11 +207,13 @@ mod tests {
     #[tokio::test]
     async fn pipeline_yaml_loads_as_none() {
         let yaml = r#"
+kind: pipeline
 metadata:
   name: "p1"
   version: "1.0.0"
-query: |
-  SELECT 1 AS v
+spec:
+  query: |
+    SELECT 1 AS v
 "#;
         let ctx = Arc::new(SessionContext::new());
         let res = write_and_load(yaml, ctx).await.unwrap();
@@ -216,14 +228,15 @@ metadata:
   name: "ingest-j1"
   version: "1.0.0"
   description: "Ingest job"
-query: |
-  SELECT 1 AS id, 'a' AS name
-destination:
-  table: "target_table"
-  mode: append
-  create_if_missing: true
-execution:
-  timeout_ms: 60000
+spec:
+  query: |
+    SELECT 1 AS id, 'a' AS name
+  destination:
+    table: "target_table"
+    mode: append
+    create_if_missing: true
+  execution:
+    timeout_ms: 60000
 "#;
         let ctx = Arc::new(SessionContext::new());
         let res = write_and_load(yaml, ctx).await.unwrap().unwrap();
@@ -241,9 +254,10 @@ kind: job
 metadata:
   name: "ingest-j2"
   version: "1.0.0"
-query: "SELECT 1 AS id"
-destination:
-  table: "target_table"
+spec:
+  query: "SELECT 1 AS id"
+  destination:
+    table: "target_table"
 "#;
         let ctx = Arc::new(SessionContext::new());
         let res = write_and_load(yaml, ctx).await.unwrap().unwrap();
@@ -260,10 +274,11 @@ kind: job
 metadata:
   name: "bad"
   version: "1.0.0"
-query: "SELECT 1"
-destination:
-  table: "t"
-  mode: overwrite
+spec:
+  query: "SELECT 1"
+  destination:
+    table: "t"
+    mode: overwrite
 "#;
         let ctx = Arc::new(SessionContext::new());
         // Format with the alternate Display so the full anyhow cause chain
@@ -283,7 +298,8 @@ kind: job
 metadata:
   name: "bad-job"
   version: "1.0.0"
-query: "SELECT 1"
+spec:
+  query: "SELECT 1"
 "#;
         let ctx = Arc::new(SessionContext::new());
         let err = write_and_load(yaml, ctx).await.unwrap_err().to_string();
@@ -297,7 +313,8 @@ kind: stream
 metadata:
   name: "bad"
   version: "1.0.0"
-query: "SELECT 1"
+spec:
+  query: "SELECT 1"
 "#;
         let ctx = Arc::new(SessionContext::new());
         let err = write_and_load(yaml, ctx).await.unwrap_err().to_string();

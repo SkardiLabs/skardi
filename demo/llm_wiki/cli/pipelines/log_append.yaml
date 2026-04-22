@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-log-append"
   version: "1.0.0"
@@ -12,9 +14,10 @@ metadata:
 #   {slug}        - Related page slug, or "" if not page-specific
 #   {message}     - Free-form human-readable message
 
-query: |
-  INSERT INTO wiki.main.wiki_log (event_type, slug, message, created_at)
-  SELECT event_type, slug, message, CAST(now() AS VARCHAR)
-  FROM (
-    SELECT {event_type} AS event_type, {slug} AS slug, {message} AS message
-  ) AS t
+spec:
+  query: |
+    INSERT INTO wiki.main.wiki_log (event_type, slug, message, created_at)
+    SELECT event_type, slug, message, CAST(now() AS VARCHAR)
+    FROM (
+      SELECT {event_type} AS event_type, {slug} AS slug, {message} AS message
+    ) AS t

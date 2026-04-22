@@ -253,25 +253,28 @@ CSV File (orders.csv)         MySQL (users table)
 Create `federated_join.yaml`:
 
 ```yaml
+kind: pipeline
+
 metadata:
   name: "federated_join_and_insert"
   version: "1.0"
   description: "Join CSV orders with MySQL users (filtered by name) and write aggregated results to MySQL"
 
-query: |
-  INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
-  SELECT
-    u.id as user_id,
-    u.name as user_name,
-    u.email as user_email,
-    COUNT(o.order_id) as total_orders,
-    SUM(o.amount) as total_spent,
-    MAX(o.order_date) as last_order_date
-  FROM users u                    -- MySQL table
-  INNER JOIN csv_orders o         -- CSV file
-    ON u.id = o.user_id
-  WHERE u.name = {name}           -- Filter by user name (HTTP parameter)
-  GROUP BY u.id, u.name, u.email
+spec:
+  query: |
+    INSERT INTO user_order_stats (user_id, user_name, user_email, total_orders, total_spent, last_order_date)
+    SELECT
+      u.id as user_id,
+      u.name as user_name,
+      u.email as user_email,
+      COUNT(o.order_id) as total_orders,
+      SUM(o.amount) as total_spent,
+      MAX(o.order_date) as last_order_date
+    FROM users u                    -- MySQL table
+    INNER JOIN csv_orders o         -- CSV file
+      ON u.id = o.user_id
+    WHERE u.name = {name}           -- Filter by user name (HTTP parameter)
+    GROUP BY u.id, u.name, u.email
 ```
 
 ### Execute
@@ -338,18 +341,26 @@ automatically, and you query them with the three-part `catalog.schema.table` syn
 
 ```yaml
 # docs/mysql/ctx_mysql_catalog_demo.yaml
-data_sources:
-  - name: "mydb_catalog"
-    type: "mysql"
-    hierarchy_level: "catalog"
-    connection_string: "mysql://localhost:3306/mydb"
-    description: "Entire mydb database registered as a DataFusion catalog"
-    options:
-      user_env: "MYSQL_USER"
-      pass_env: "MYSQL_PASSWORD"
-      ssl_mode: "disabled"
-      # Optionally restrict to specific schemas:
-      # allowed_schemas: "mydb,analytics"
+
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "mydb_catalog"
+      type: "mysql"
+      hierarchy_level: "catalog"
+      connection_string: "mysql://localhost:3306/mydb"
+      description: "Entire mydb database registered as a DataFusion catalog"
+      options:
+        user_env: "MYSQL_USER"
+        pass_env: "MYSQL_PASSWORD"
+        ssl_mode: "disabled"
+        # Optionally restrict to specific schemas:
+        # allowed_schemas: "mydb,analytics"
 ```
 
 ### Start the server
@@ -481,20 +492,27 @@ docker run --name mysql-skardi \
 ### Multiple Databases
 
 ```yaml
-data_sources:
-  - name: "prod_users"
-    type: "mysql"
-    connection_string: "mysql://prod-server:3306/production"
-    options:
-      table: "users"
-      user_env: "PROD_MYSQL_USER"
-      pass_env: "PROD_MYSQL_PASSWORD"
+kind: context
 
-  - name: "staging_users"
-    type: "mysql"
-    connection_string: "mysql://staging-server:3306/staging"
-    options:
-      table: "users"
-      user_env: "STAGING_MYSQL_USER"
-      pass_env: "STAGING_MYSQL_PASSWORD"
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "prod_users"
+      type: "mysql"
+      connection_string: "mysql://prod-server:3306/production"
+      options:
+        table: "users"
+        user_env: "PROD_MYSQL_USER"
+        pass_env: "PROD_MYSQL_PASSWORD"
+
+    - name: "staging_users"
+      type: "mysql"
+      connection_string: "mysql://staging-server:3306/staging"
+      options:
+        table: "users"
+        user_env: "STAGING_MYSQL_USER"
+        pass_env: "STAGING_MYSQL_PASSWORD"
 ```

@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-update"
   version: "1.0.0"
@@ -13,11 +15,12 @@ metadata:
 #   {page_type} - New page_type
 #   {content}   - New markdown body (re-embedded inline)
 
-query: |
-  UPDATE wikidb.public.wiki_pages
-  SET title      = {title},
-      page_type  = {page_type},
-      content    = {content},
-      embedding  = candle('models/generated/bge-small-en-v1.5', {content}),
-      updated_at = now()
-  WHERE slug = {slug}
+spec:
+  query: |
+    UPDATE wikidb.public.wiki_pages
+    SET title      = {title},
+        page_type  = {page_type},
+        content    = {content},
+        embedding  = candle('models/generated/bge-small-en-v1.5', {content}),
+        updated_at = now()
+    WHERE slug = {slug}

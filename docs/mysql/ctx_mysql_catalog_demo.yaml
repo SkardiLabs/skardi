@@ -1,15 +1,22 @@
-data_sources:
-  # Expose the entire mydb database as a DataFusion catalog.
-  # Every table and view in non-system schemas is registered automatically.
-  # Query tables with the three-part reference: mydb_catalog.mydb.<table>
-  - name: "mydb_catalog"
-    type: "mysql"
-    hierarchy_level: "catalog"
-    connection_string: "mysql://localhost:3306/mydb"
-    description: "Entire mydb MySQL database registered as a named DataFusion catalog"
-    options:
-      user_env: "MYSQL_USER"
-      pass_env: "MYSQL_PASSWORD"
-      ssl_mode: "disabled"
-      # Restrict to specific schemas (optional — omit to include all user schemas):
-      # allowed_schemas: "mydb,analytics"
+kind: context
+
+metadata:
+  name: ctx_mysql_catalog_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # Expose the entire mydb database as a DataFusion catalog.
+    # Every table and view in non-system schemas is registered automatically.
+    # Query tables with the three-part reference: mydb_catalog.mydb.<table>
+    - name: "mydb_catalog"
+      type: "mysql"
+      hierarchy_level: "catalog"
+      connection_string: "mysql://localhost:3306/mydb"
+      description: "Entire mydb MySQL database registered as a named DataFusion catalog"
+      options:
+        user_env: "MYSQL_USER"
+        pass_env: "MYSQL_PASSWORD"
+        ssl_mode: "disabled"
+        # Restrict to specific schemas (optional — omit to include all user schemas):
+        # allowed_schemas: "mydb,analytics"

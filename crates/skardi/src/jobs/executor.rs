@@ -741,11 +741,12 @@ kind: job
 metadata:
   name: "ingest"
   version: "1.0.0"
-query: |
-  SELECT id FROM src WHERE id >= {min_id}
-destination:
-  table: "dest"
-  mode: append
+spec:
+  query: |
+    SELECT id FROM src WHERE id >= {min_id}
+  destination:
+    table: "dest"
+    mode: append
 "#;
         let mut f = std::fs::File::create(&yaml_path).unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
@@ -831,12 +832,13 @@ kind: job
 metadata:
   name: "ingest"
   version: "1.0.0"
-query: |
-  SELECT id FROM src
-destination:
-  table: "missing_table"
-  mode: append
-  create_if_missing: false
+spec:
+  query: |
+    SELECT id FROM src
+  destination:
+    table: "missing_table"
+    mode: append
+    create_if_missing: false
 "#;
         std::fs::File::create(&yaml_path)
             .unwrap()

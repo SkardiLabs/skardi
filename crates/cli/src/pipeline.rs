@@ -3,12 +3,14 @@
 //! The CLI reuses the server's pipeline YAML format:
 //!
 //! ```yaml
+//! kind: pipeline
 //! metadata:
 //!   name: "wiki-search-hybrid"
 //!   version: "1.0.0"
 //!   description: "..."
-//! query: |
-//!   SELECT ... WHERE slug = {slug} LIMIT {limit}
+//! spec:
+//!   query: |
+//!     SELECT ... WHERE slug = {slug} LIMIT {limit}
 //! ```
 //!
 //! Placeholders of the form `{name}` in the SQL are converted to DataFusion's
@@ -27,23 +29,54 @@ pub struct PipelineMetadata {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PipelineSpec {
+    pub query: String,
+}
+
+/// On-disk envelope for a pipeline YAML.
+#[derive(Debug, Deserialize)]
+struct PipelineEnvelope {
+    kind: String,
+    metadata: PipelineMetadata,
+    spec: PipelineSpec,
+}
+
+#[derive(Debug)]
 pub struct PipelineFile {
     pub metadata: PipelineMetadata,
     pub query: String,
 }
 
 /// Load a single pipeline YAML from disk.
+///
+/// Returns an error if the file is not a `kind: pipeline` document —
+/// `kind: job` files have their own loader path (`JobDefinition`), and
+/// any other kind is unsupported here.
 pub fn load_pipeline_from_path(path: &Path) -> Result<PipelineFile> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read pipeline file: {}", path.display()))?;
-    let pipeline: PipelineFile = serde_yaml::from_str(&content)
+    let env: PipelineEnvelope = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse pipeline YAML: {}", path.display()))?;
-    Ok(pipeline)
+    if env.kind != "pipeline" {
+        anyhow::bail!(
+            "Expected `kind: pipeline` in {}, got `kind: {}`",
+            path.display(),
+            env.kind
+        );
+    }
+    Ok(PipelineFile {
+        metadata: env.metadata,
+        query: env.spec.query,
+    })
 }
 
 /// Scan a set of directories for `*.yaml` / `*.yml` pipeline files and
 /// return a map keyed by `metadata.name`. Later directories shadow earlier
 /// ones on name collision so per-project dirs can override shared ones.
+///
+/// Files whose root `kind:` is anything other than `pipeline` (e.g.
+/// `kind: job`) are skipped silently — a pipelines dir is expected to
+/// hold a mixed bag of resource YAMLs.
 pub fn discover_pipelines(dirs: &[PathBuf]) -> Result<HashMap<String, (PathBuf, PipelineFile)>> {
     let mut out: HashMap<String, (PathBuf, PipelineFile)> = HashMap::new();
     for dir in dirs {
@@ -66,6 +99,19 @@ pub fn discover_pipelines(dirs: &[PathBuf]) -> Result<HashMap<String, (PathBuf, 
             if ext != "yaml" && ext != "yml" {
                 continue;
             }
+            // Peek at `kind:` so non-pipeline files (jobs, contexts, etc.)
+            // that happen to sit in the pipelines dir are skipped rather
+            // than erroring out the whole discovery pass.
+            let raw = std::fs::read_to_string(&p)
+                .with_context(|| format!("Failed to read pipeline file: {}", p.display()))?;
+            let peek: serde_yaml::Value = match serde_yaml::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if peek.get("kind").and_then(|v| v.as_str()) != Some("pipeline") {
+                continue;
+            }
+
             let pipeline = load_pipeline_from_path(&p)?;
             out.insert(pipeline.metadata.name.clone(), (p, pipeline));
         }

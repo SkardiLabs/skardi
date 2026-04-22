@@ -489,17 +489,35 @@ impl Pipeline for StandardPipeline {
     {
         let file_content = fs::read_to_string(file_path)?;
 
-        // Parse the optimized pipeline YAML file into a generic structure
+        // Parse the pipeline YAML file into a generic structure. The expected
+        // shape is the uniform `{ kind, metadata, spec }` envelope shared
+        // with aliases, contexts, and jobs. The job loader also calls into
+        // here to reuse the metadata + query parsing, which is why `kind: job`
+        // is accepted alongside `kind: pipeline`.
         let pipeline_yaml: serde_yaml::Value = serde_yaml::from_str(&file_content)
             .map_err(|e| anyhow!("Failed to parse pipeline YAML file: {}", e))?;
 
-        // Extract only metadata and query sections - request/response are inferred
+        let kind = pipeline_yaml
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow!("Missing 'kind' at root of pipeline YAML (expected `kind: pipeline`)")
+            })?;
+        if kind != "pipeline" && kind != "job" {
+            return Err(anyhow!(
+                "Unexpected `kind: {kind}` — expected `kind: pipeline` or `kind: job`"
+            ));
+        }
+
         let metadata_section = pipeline_yaml
             .get("metadata")
             .ok_or_else(|| anyhow!("Missing 'metadata' section in pipeline YAML"))?;
-        let query_section = pipeline_yaml
+        let spec_section = pipeline_yaml
+            .get("spec")
+            .ok_or_else(|| anyhow!("Missing 'spec' section in pipeline YAML"))?;
+        let query_section = spec_section
             .get("query")
-            .ok_or_else(|| anyhow!("Missing 'query' section in pipeline YAML"))?;
+            .ok_or_else(|| anyhow!("Missing 'spec.query' in pipeline YAML"))?;
 
         // Parse metadata directly
         let metadata: ComponentMetadata = serde_yaml::from_value(metadata_section.clone())
@@ -934,30 +952,31 @@ mod tests {
 
         // Create a temporary YAML file with pipeline definition
         let yaml_content = r#"
+kind: pipeline
 metadata:
   name: "product_search_pipeline"
   version: "1.2.0"
   description: "Advanced product search with filtering and pagination"
   created_at: "2025-01-15T10:00:00.000+00:00"
   updated_at: "2025-01-15T12:30:00.000+00:00"
-
-query: |
-  SELECT
-    product_id,
-    name as product_name,
-    brand,
-    price,
-    category,
-    stock
-  FROM products
-  WHERE 1=1
-    AND ({brand} IS NULL OR brand = {brand})
-    AND ({min_price} IS NULL OR price >= {min_price})
-    AND ({max_price} IS NULL OR price <= {max_price})
-    AND ({category} IS NULL OR category = {category})
-    AND ({min_stock} IS NULL OR stock >= {min_stock})
-  ORDER BY price DESC
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT
+      product_id,
+      name as product_name,
+      brand,
+      price,
+      category,
+      stock
+    FROM products
+    WHERE 1=1
+      AND ({brand} IS NULL OR brand = {brand})
+      AND ({min_price} IS NULL OR price >= {min_price})
+      AND ({max_price} IS NULL OR price <= {max_price})
+      AND ({category} IS NULL OR category = {category})
+      AND ({min_stock} IS NULL OR stock >= {min_stock})
+    ORDER BY price DESC
+    LIMIT {limit}
 "#;
 
         // Write YAML content to temporary file

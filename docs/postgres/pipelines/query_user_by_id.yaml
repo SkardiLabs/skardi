@@ -1,7 +1,10 @@
+kind: pipeline
+
 metadata:
   name: "query_user_by_id"
   version: "1.0"
   description: "Query a user by their ID"
 
-query: |
-  SELECT * FROM users WHERE id = {user_id}
+spec:
+  query: |
+    SELECT * FROM users WHERE id = {user_id}

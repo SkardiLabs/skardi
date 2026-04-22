@@ -1,6 +1,9 @@
+kind: pipeline
+
 metadata:
   name: "seekdb-search-users-by-email"
   version: "1.0"
   description: "LIKE-based search on the users table, pushed down to SeekDB."
 
-query: "SELECT id, name, email FROM users WHERE email LIKE {email_pattern} ORDER BY id"
+spec:
+  query: "SELECT id, name, email FROM users WHERE email LIKE {email_pattern} ORDER BY id"

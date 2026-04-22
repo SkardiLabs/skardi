@@ -59,11 +59,12 @@ kind: job
 metadata:
   name: "ingest-all"
   version: "1.0.0"
-query: |
-  SELECT id FROM src
-destination:
-  table: "dest"
-  mode: append
+spec:
+  query: |
+    SELECT id FROM src
+  destination:
+    table: "dest"
+    mode: append
 "#,
         );
         let job = JobDefinition::load_from_file(&yaml_path, Arc::clone(&ctx))

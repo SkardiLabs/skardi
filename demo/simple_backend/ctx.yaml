@@ -1,16 +1,23 @@
-data_sources:
-  - name: "tasks"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "demo/simple_backend/backend.db"
-    description: "Tasks table"
-    options:
-      table: "tasks"
+kind: context
 
-  - name: "users"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "demo/simple_backend/backend.db"
-    description: "Users table"
-    options:
-      table: "users"
+metadata:
+  name: simple_backend-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "tasks"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "demo/simple_backend/backend.db"
+      description: "Tasks table"
+      options:
+        table: "tasks"
+
+    - name: "users"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "demo/simple_backend/backend.db"
+      description: "Users table"
+      options:
+        table: "users"

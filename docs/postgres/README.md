@@ -338,15 +338,23 @@ Add `documents` as a regular Postgres data source — `pg_knn` discovers the vec
 
 ```yaml
 # ctx_pgvector_demo.yaml
-data_sources:
-  - name: "documents"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-    options:
-      table: "documents"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
+
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "documents"
+      type: "postgres"
+      connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+      options:
+        table: "documents"
+        schema: "public"
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"
 ```
 
 ### Pipelines
@@ -472,18 +480,26 @@ WHERE _score < -0.5
 
 ```yaml
 # Add to ctx_pgvector_demo.yaml
-data_sources:
-  - name: "documents"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-    options:
-      table: "documents"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
-  - name: "csv_orders"
-    type: "csv"
-    path: "docs/sample_data/orders.csv"
+
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "documents"
+      type: "postgres"
+      connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+      options:
+        table: "documents"
+        schema: "public"
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"
+    - name: "csv_orders"
+      type: "csv"
+      path: "docs/sample_data/orders.csv"
 ```
 
 ```sql
@@ -539,15 +555,23 @@ Add `articles` as a regular Postgres data source — `pg_fts` discovers text col
 
 ```yaml
 # ctx_pgfts_demo.yaml
-data_sources:
-  - name: "articles"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-    options:
-      table: "articles"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
+
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "articles"
+      type: "postgres"
+      connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+      options:
+        table: "articles"
+        schema: "public"
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"
 ```
 
 ### Pipelines
@@ -726,18 +750,25 @@ automatically. This is called *catalog mode*.
 ### Context file (`ctx_postgres_catalog_demo.yaml`)
 
 ```yaml
-data_sources:
-  # One entry loads both schemas from the same DB.
-  # Tables are accessible as mydb.public.users, mydb.analytics.monthly_revenue, …
-  - name: "mydb"
-    type: "postgres"
-    hierarchy_level: "catalog"        # required to enable catalog mode
-    access_mode: "read_write"
-    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-    options:
-      allowed_schemas: "public,analytics"  # comma-separated; omit to load all schemas
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # One entry loads both schemas from the same DB.
+    # Tables are accessible as mydb.public.users, mydb.analytics.monthly_revenue, …
+    - name: "mydb"
+      type: "postgres"
+      hierarchy_level: "catalog"        # required to enable catalog mode
+      access_mode: "read_write"
+      connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+      options:
+        allowed_schemas: "public,analytics"  # comma-separated; omit to load all schemas
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"
 ```
 
 > **Notes:**
@@ -936,15 +967,22 @@ values to expose several schemas from one database.
 ### ctx_postgres_demo.yaml
 
 ```yaml
-data_sources:
-  - name: "users"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-    options:
-      table: "users"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "users"
+      type: "postgres"
+      connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+      options:
+        table: "users"
+        schema: "public"
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"
 ```
 
 ### Options — table mode (`hierarchy_level: table`, default)

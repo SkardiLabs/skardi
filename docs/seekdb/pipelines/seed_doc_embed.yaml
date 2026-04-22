@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "seekdb-seed-doc-embed"
   version: "1.0.0"
@@ -12,11 +14,12 @@ metadata:
 #   {category} - coarse page category
 #   {content}  - free-text body; embedded inline
 
-query: |
-  INSERT INTO docs_embed (title, category, content, embedding)
-  SELECT {title},
-         {category},
-         {content},
-         '[' || array_to_string(
-                  candle('models/generated/bge-small-en-v1.5', {content}),
-                  ',') || ']'
+spec:
+  query: |
+    INSERT INTO docs_embed (title, category, content, embedding)
+    SELECT {title},
+           {category},
+           {content},
+           '[' || array_to_string(
+                    candle('models/generated/bge-small-en-v1.5', {content}),
+                    ',') || ']'

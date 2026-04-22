@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-list"
   version: "1.0.0"
@@ -10,10 +12,11 @@ metadata:
 #   {slug_prefix}        - SQL LIKE pattern for slug (e.g. 'concept/%', '%')
 #   {limit}              - Maximum number of pages to return
 
-query: |
-  SELECT slug, title, page_type, updated_at
-  FROM wiki.main.wiki_pages
-  WHERE page_type LIKE {page_type_pattern}
-    AND slug      LIKE {slug_prefix}
-  ORDER BY updated_at DESC
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT slug, title, page_type, updated_at
+    FROM wiki.main.wiki_pages
+    WHERE page_type LIKE {page_type_pattern}
+      AND slug      LIKE {slug_prefix}
+    ORDER BY updated_at DESC
+    LIMIT {limit}

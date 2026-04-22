@@ -1,16 +1,19 @@
+kind: pipeline
+
 metadata:
   name: "list_all_users_and_orders"
   version: "1.0"
   description: "List all users with their orders using fully qualified catalog.schema.table paths"
 
-query: |
-  SELECT
-    u.id AS user_id,
-    u.name AS user_name,
-    u.email,
-    o.id AS order_id,
-    o.product,
-    o.amount
-  FROM mydb.public.users u
-  LEFT JOIN mydb.public.orders o ON u.id = o.user_id
-  ORDER BY u.id, o.id
+spec:
+  query: |
+    SELECT
+      u.id AS user_id,
+      u.name AS user_name,
+      u.email,
+      o.id AS order_id,
+      o.product,
+      o.amount
+    FROM mydb.public.users u
+    LEFT JOIN mydb.public.orders o ON u.id = o.user_id
+    ORDER BY u.id, o.id

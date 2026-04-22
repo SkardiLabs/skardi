@@ -439,32 +439,42 @@ Verify the INVERTED index was created with `with_position=True`. Without positio
 ### 1. Create Context Configuration
 
 ```yaml
-data_sources:
-  - name: "my_vectors"
-    type: "lance"
-    path: "data/my_vectors.lance/"
-    description: "My vector embeddings"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "my_vectors"
+      type: "lance"
+      path: "data/my_vectors.lance/"
+      description: "My vector embeddings"
 ```
 
 ### 2. Create Pipeline Configuration
 
 ```yaml
+kind: pipeline
+
 metadata:
   name: my-vector-search
   version: 1.0.0
 
-query: |
-  SELECT
-    knn.id,
-    knn.item_id,
-    knn._distance as similarity
-  FROM lance_knn(
-    'my_vectors',
-    'vector',
-    (SELECT vector FROM my_vectors WHERE id = {query_id}),
-    {k}
-  ) knn
-  WHERE knn.id != {query_id}
+spec:
+  query: |
+    SELECT
+      knn.id,
+      knn.item_id,
+      knn._distance as similarity
+    FROM lance_knn(
+      'my_vectors',
+      'vector',
+      (SELECT vector FROM my_vectors WHERE id = {query_id}),
+      {k}
+    ) knn
+    WHERE knn.id != {query_id}
 ```
 
 ### 3. Run Your Pipeline

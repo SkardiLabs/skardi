@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-delete-vector"
   version: "1.0.0"
@@ -8,5 +10,6 @@ metadata:
 # Parameters:
 #   {id} - Item ID whose vector to delete
 
-query: |
-  DELETE FROM vec_items WHERE item_id = {id}
+spec:
+  query: |
+    DELETE FROM vec_items WHERE item_id = {id}

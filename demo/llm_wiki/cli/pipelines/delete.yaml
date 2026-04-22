@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-delete"
   version: "1.0.0"
@@ -11,5 +13,6 @@ metadata:
 # Parameters:
 #   {slug}  - Canonical slug to delete
 
-query: |
-  DELETE FROM wiki.main.wiki_pages WHERE slug = {slug}
+spec:
+  query: |
+    DELETE FROM wiki.main.wiki_pages WHERE slug = {slug}

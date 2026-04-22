@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-get"
   version: "1.0.0"
@@ -9,7 +11,8 @@ metadata:
 # Parameters:
 #   {slug} - Page identifier returned by wiki-search-hybrid or wiki-list
 
-query: |
-  SELECT slug, title, page_type, content
-  FROM wikidb.public.wiki_pages
-  WHERE slug = {slug}
+spec:
+  query: |
+    SELECT slug, title, page_type, content
+    FROM wikidb.public.wiki_pages
+    WHERE slug = {slug}
