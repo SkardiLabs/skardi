@@ -18,9 +18,10 @@ use anyhow::{Context, Result};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion::prelude::SessionContext;
-use lance::dataset::WriteMode;
+use datafusion::{catalog::MemTable, prelude::SessionContext};
+use lance::{Dataset, dataset::WriteMode};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use super::definition::DestinationMode;
 use crate::sources::providers::lance::{
@@ -103,7 +104,7 @@ impl JobDestination for LanceDestination {
         if !lance_dataset_exists(&self.path) {
             return Ok(None);
         }
-        let dataset = lance::dataset::Dataset::open(&self.path)
+        let dataset = Dataset::open(&self.path)
             .await
             .with_context(|| format!("Failed to open Lance dataset at {}", self.path))?;
         Ok(Some(Arc::new(dataset.schema().into())))
@@ -234,9 +235,9 @@ impl JobDestination for SqlDmlDestination {
         // Register a transient in-memory table that `INSERT INTO ... SELECT
         // * FROM <staging>` can read from. Random name so concurrent jobs
         // don't clobber each other's staging tables.
-        let staging_name = format!("__skardi_jobs_staging_{}", uuid::Uuid::new_v4().simple());
+        let staging_name = format!("__skardi_jobs_staging_{}", Uuid::new_v4().simple());
         let schema = batches[0].schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
+        let mem_table = MemTable::try_new(schema, vec![batches])
             .context("Failed to build in-memory staging table")?;
         self.ctx
             .register_table(&staging_name, Arc::new(mem_table))

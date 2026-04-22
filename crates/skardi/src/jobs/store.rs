@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio_rusqlite::Connection;
+use tokio_rusqlite::{Connection, Row, rusqlite};
 
 /// Lifecycle status of a single job run.
 ///
@@ -160,10 +160,9 @@ impl SqliteJobStore {
 
     async fn ensure_schema(&self) -> Result<()> {
         self.conn
-            .call(
-                |conn| -> std::result::Result<(), tokio_rusqlite::rusqlite::Error> {
-                    conn.execute_batch(
-                        "CREATE TABLE IF NOT EXISTS job_runs (
+            .call(|conn| -> std::result::Result<(), rusqlite::Error> {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS job_runs (
                          id            TEXT PRIMARY KEY,
                          job_name      TEXT NOT NULL,
                          parameters    TEXT NOT NULL,
@@ -179,24 +178,21 @@ impl SqliteJobStore {
                          ON job_runs (job_name, created_at DESC);
                      CREATE INDEX IF NOT EXISTS idx_job_runs_status
                          ON job_runs (status);",
-                    )?;
-                    Ok(())
-                },
-            )
+                )?;
+                Ok(())
+            })
             .await
             .map_err(|e| anyhow::anyhow!("Failed to initialize jobs.db schema: {e}"))?;
         Ok(())
     }
 }
 
-fn row_to_job_run(
-    row: &tokio_rusqlite::rusqlite::Row<'_>,
-) -> tokio_rusqlite::rusqlite::Result<JobRun> {
+fn row_to_job_run(row: &Row<'_>) -> rusqlite::Result<JobRun> {
     let status_str: String = row.get("status")?;
     let status = JobRunStatus::from_str(&status_str).map_err(|e| {
-        tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+        rusqlite::Error::FromSqlConversionFailure(
             3,
-            tokio_rusqlite::rusqlite::types::Type::Text,
+            rusqlite::types::Type::Text,
             Box::new(std::io::Error::other(e.to_string())),
         )
     })?;
@@ -219,29 +215,27 @@ impl JobStore for SqliteJobStore {
     async fn create_run(&self, run: &JobRun) -> Result<()> {
         let run = run.clone();
         self.conn
-            .call(
-                move |conn| -> std::result::Result<(), tokio_rusqlite::rusqlite::Error> {
-                    conn.execute(
-                        "INSERT INTO job_runs
+            .call(move |conn| -> std::result::Result<(), rusqlite::Error> {
+                conn.execute(
+                    "INSERT INTO job_runs
                          (id, job_name, parameters, status, created_at, started_at,
                           finished_at, rows_written, snapshot_id, error)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                        tokio_rusqlite::rusqlite::params![
-                            run.id,
-                            run.job_name,
-                            run.parameters,
-                            run.status.as_str(),
-                            run.created_at,
-                            run.started_at,
-                            run.finished_at,
-                            run.rows_written.map(|v| v as i64),
-                            run.snapshot_id,
-                            run.error,
-                        ],
-                    )?;
-                    Ok(())
-                },
-            )
+                    rusqlite::params![
+                        run.id,
+                        run.job_name,
+                        run.parameters,
+                        run.status.as_str(),
+                        run.created_at,
+                        run.started_at,
+                        run.finished_at,
+                        run.rows_written.map(|v| v as i64),
+                        run.snapshot_id,
+                        run.error,
+                    ],
+                )?;
+                Ok(())
+            })
             .await
             .map_err(|e| anyhow::anyhow!("create_run failed: {e}"))?;
         Ok(())
@@ -249,28 +243,25 @@ impl JobStore for SqliteJobStore {
 
     async fn get_run(&self, run_id: &str) -> Result<Option<JobRun>> {
         let run_id = run_id.to_string();
-        let row =
-            self.conn
-                .call(
-                    move |conn| -> std::result::Result<
-                        Option<JobRun>,
-                        tokio_rusqlite::rusqlite::Error,
-                    > {
-                        let mut stmt = conn.prepare(
-                            "SELECT id, job_name, parameters, status, created_at, started_at,
+        let row = self
+            .conn
+            .call(
+                move |conn| -> std::result::Result<Option<JobRun>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, job_name, parameters, status, created_at, started_at,
                             finished_at, rows_written, snapshot_id, error
                      FROM job_runs
                      WHERE id = ?1",
-                        )?;
-                        let mut rows = stmt.query(tokio_rusqlite::rusqlite::params![run_id])?;
-                        match rows.next()? {
-                            Some(row) => Ok(Some(row_to_job_run(row)?)),
-                            None => Ok(None),
-                        }
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("get_run failed: {e}"))?;
+                    )?;
+                    let mut rows = stmt.query(rusqlite::params![run_id])?;
+                    match rows.next()? {
+                        Some(row) => Ok(Some(row_to_job_run(row)?)),
+                        None => Ok(None),
+                    }
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("get_run failed: {e}"))?;
         Ok(row)
     }
 
@@ -280,36 +271,35 @@ impl JobStore for SqliteJobStore {
         let rows = self
             .conn
             .call(
-                move |conn| -> std::result::Result<Vec<JobRun>, tokio_rusqlite::rusqlite::Error> {
-                    let (sql, params): (&str, Vec<tokio_rusqlite::rusqlite::types::Value>) =
-                        match &job_name {
-                            Some(name) => (
-                                "SELECT id, job_name, parameters, status, created_at, started_at,
+                move |conn| -> std::result::Result<Vec<JobRun>, rusqlite::Error> {
+                    let (sql, params): (&str, Vec<rusqlite::types::Value>) = match &job_name {
+                        Some(name) => (
+                            "SELECT id, job_name, parameters, status, created_at, started_at,
                                     finished_at, rows_written, snapshot_id, error
                              FROM job_runs
                              WHERE job_name = ?1
                              ORDER BY created_at DESC
                              LIMIT ?2",
-                                vec![
-                                    tokio_rusqlite::rusqlite::types::Value::Text(name.clone()),
-                                    tokio_rusqlite::rusqlite::types::Value::Integer(limit),
-                                ],
-                            ),
-                            None => (
-                                "SELECT id, job_name, parameters, status, created_at, started_at,
+                            vec![
+                                rusqlite::types::Value::Text(name.clone()),
+                                rusqlite::types::Value::Integer(limit),
+                            ],
+                        ),
+                        None => (
+                            "SELECT id, job_name, parameters, status, created_at, started_at,
                                     finished_at, rows_written, snapshot_id, error
                              FROM job_runs
                              ORDER BY created_at DESC
                              LIMIT ?1",
-                                vec![tokio_rusqlite::rusqlite::types::Value::Integer(limit)],
-                            ),
-                        };
+                            vec![rusqlite::types::Value::Integer(limit)],
+                        ),
+                    };
                     let mut stmt = conn.prepare(sql)?;
                     let rows = stmt
-                        .query_map(tokio_rusqlite::rusqlite::params_from_iter(params), |row| {
+                        .query_map(rusqlite::params_from_iter(params), |row| {
                             row_to_job_run(row)
                         })?
-                        .collect::<tokio_rusqlite::rusqlite::Result<Vec<_>>>()?;
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
                     Ok(rows)
                 },
             )
@@ -331,10 +321,9 @@ impl JobStore for SqliteJobStore {
         let run_id = run_id.to_string();
         let status_str = status.as_str().to_string();
         self.conn
-            .call(
-                move |conn| -> std::result::Result<(), tokio_rusqlite::rusqlite::Error> {
-                    conn.execute(
-                        "UPDATE job_runs
+            .call(move |conn| -> std::result::Result<(), rusqlite::Error> {
+                conn.execute(
+                    "UPDATE job_runs
                      SET status       = ?2,
                          started_at   = COALESCE(?3, started_at),
                          finished_at  = COALESCE(?4, finished_at),
@@ -342,19 +331,18 @@ impl JobStore for SqliteJobStore {
                          snapshot_id  = COALESCE(?6, snapshot_id),
                          error        = COALESCE(?7, error)
                      WHERE id = ?1",
-                        tokio_rusqlite::rusqlite::params![
-                            run_id,
-                            status_str,
-                            started_at,
-                            finished_at,
-                            rows_written.map(|v| v as i64),
-                            snapshot_id,
-                            error,
-                        ],
-                    )?;
-                    Ok(())
-                },
-            )
+                    rusqlite::params![
+                        run_id,
+                        status_str,
+                        started_at,
+                        finished_at,
+                        rows_written.map(|v| v as i64),
+                        snapshot_id,
+                        error,
+                    ],
+                )?;
+                Ok(())
+            })
             .await
             .map_err(|e| anyhow::anyhow!("update_status failed: {e}"))?;
         Ok(())
@@ -364,20 +352,18 @@ impl JobStore for SqliteJobStore {
         let reason = reason.to_string();
         let updated = self
             .conn
-            .call(
-                move |conn| -> std::result::Result<usize, tokio_rusqlite::rusqlite::Error> {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let n = conn.execute(
-                        "UPDATE job_runs
+            .call(move |conn| -> std::result::Result<usize, rusqlite::Error> {
+                let now = chrono::Utc::now().to_rfc3339();
+                let n = conn.execute(
+                    "UPDATE job_runs
                      SET status = 'failed',
                          finished_at = ?1,
                          error = ?2
                      WHERE status IN ('pending', 'running')",
-                        tokio_rusqlite::rusqlite::params![now, reason],
-                    )?;
-                    Ok(n)
-                },
-            )
+                    rusqlite::params![now, reason],
+                )?;
+                Ok(n)
+            })
             .await
             .map_err(|e| anyhow::anyhow!("reconcile_orphaned failed: {e}"))?;
         Ok(updated)

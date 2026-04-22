@@ -20,12 +20,14 @@
 
 use anyhow::{Context, Result};
 use arrow::datatypes::Schema;
+use chrono::Utc;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::definition::{Destination, DestinationMode, JobDefinition};
 use super::destination::{JobDestination, JobDestinationKind, LanceDestination, SqlDmlDestination};
@@ -472,7 +474,7 @@ async fn run_job_task(
     cancel: Arc<CancelFlag>,
     flags_map: Arc<Mutex<HashMap<String, Arc<CancelFlag>>>>,
 ) {
-    let started = chrono::Utc::now().to_rfc3339();
+    let started = Utc::now().to_rfc3339();
     if let Err(e) = store
         .update_status(
             &run_id,
@@ -517,7 +519,7 @@ async fn run_job_task(
         _ => result.await,
     };
 
-    let finished = chrono::Utc::now().to_rfc3339();
+    let finished = Utc::now().to_rfc3339();
     match outcome {
         Ok(w) if cancel.is_cancelled() => {
             // Race: task finished successfully but cancel flag flipped
@@ -726,9 +728,9 @@ async fn submit_with_lance_path_override(
     exec.preflight(destination.as_ref(), &job.destination, &query_schema)
         .await?;
 
-    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let run_id = Uuid::new_v4().simple().to_string();
     let params_json = sorted_json(&params);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = Utc::now().to_rfc3339();
     let run = JobRun {
         id: run_id.clone(),
         job_name: job_name.to_string(),
