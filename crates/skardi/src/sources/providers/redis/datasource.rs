@@ -8,8 +8,8 @@ use std::{
 use anyhow::Result;
 use arrow::{
     array::{
-        ArrayRef, RecordBatch, StringBuilder, UInt64Array, as_boolean_array, as_largestring_array,
-        as_string_array,
+        ArrayRef, RecordBatch, RecordBatchOptions, StringBuilder, UInt64Array, as_boolean_array,
+        as_largestring_array, as_string_array,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
@@ -822,8 +822,21 @@ where
             .map(|mut b| Arc::new(b.finish()) as ArrayRef)
             .collect();
 
-        RecordBatch::try_new(self.projected_schema.clone(), arrays)
-            .map_err(|e| DataFusionError::Execution(format!("Error building RecordBatch: {}", e)))
+        if arrays.is_empty() {
+            // DataFusion pushes an empty projection for `count(*)`-style queries
+            // where only the row count matters. `RecordBatch::try_new` rejects a
+            // zero-column batch unless we supply the row count explicitly, so
+            // pass `count` through so aggregates see the real input cardinality.
+            let options = RecordBatchOptions::new().with_row_count(Some(count));
+            RecordBatch::try_new_with_options(self.projected_schema.clone(), arrays, &options)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Error building RecordBatch: {}", e))
+                })
+        } else {
+            RecordBatch::try_new(self.projected_schema.clone(), arrays).map_err(|e| {
+                DataFusionError::Execution(format!("Error building RecordBatch: {}", e))
+            })
+        }
     }
 }
 
@@ -2100,6 +2113,45 @@ mod tests {
         )
         .await;
         assert!(ci_total_rows(&batches) >= 2); // at least Electronics and Furniture
+    }
+
+    /// Regression test for #97 (Redis half): projection pushdown emits
+    /// `Some([])` for `count(*)`, and `fetch_partition` previously built a
+    /// zero-column batch via `RecordBatch::try_new`, which Arrow rejects with
+    /// "must either specify a row count or at least one column". Uses a
+    /// dedicated table so the bare `count(*)` has a known value regardless of
+    /// what other parallel tests do to `products`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_count_star_pushdown_live() {
+        let table_name = "count_star_scratch_live";
+        clear_ci_table(table_name);
+
+        let mut ctx = SessionContext::new();
+        let mut extra_options = HashMap::new();
+        extra_options.insert("columns".to_string(), "product_id,name,price".to_string());
+        register_ci_table_with_options(&mut ctx, table_name, Some(&extra_options));
+
+        ctx.sql(&format!(
+            "INSERT INTO {table_name} (product_id, name, price)
+             VALUES ('A', 'a', '1.0'), ('B', 'b', '2.0'), ('C', 'c', '3.0')"
+        ))
+        .await
+        .expect("parse insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+        let batches = ci_query_all(&ctx, &format!("SELECT count(*) FROM {table_name}")).await;
+        assert_eq!(ci_total_rows(&batches), 1);
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 3);
+
+        clear_ci_table(table_name);
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@ pub mod fts_table_function;
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
+    StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -423,7 +424,17 @@ impl TableProvider for MongoTableProvider {
         let batch = if let Some(proj) = projection {
             let projected_schema = Arc::new(self.schema.project(proj)?);
             let columns: Vec<ArrayRef> = proj.iter().map(|&i| batch.column(i).clone()).collect();
-            RecordBatch::try_new(projected_schema, columns)?
+            if proj.is_empty() {
+                // DataFusion pushes an empty projection for `count(*)`-style
+                // queries where only the row count matters. `RecordBatch::try_new`
+                // rejects a zero-column batch unless we supply the row count
+                // explicitly, so pass it through so aggregates see the real
+                // input cardinality.
+                let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                RecordBatch::try_new_with_options(projected_schema, columns, &options)?
+            } else {
+                RecordBatch::try_new(projected_schema, columns)?
+            }
         } else {
             batch
         };
@@ -1987,6 +1998,49 @@ mod tests {
         )
         .await;
         assert!(total_rows(&batches) >= 2); // at least Electronics and Furniture
+    }
+
+    /// Regression test for #97 (Mongo half): projection pushdown emits
+    /// `Some([])` for `count(*)` without a filter, and the Mongo provider
+    /// previously built a zero-column batch with `RecordBatch::try_new`, which
+    /// Arrow rejects with "must either specify a row count or at least one
+    /// column". Needs a dedicated collection so a bare `count(*)` has a known
+    /// value regardless of what other parallel tests do to `products`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_count_star_pushdown() {
+        // Seed a scratch collection with a known row count, registering it
+        // *after* seeding so the provider's PRAGMA-equivalent picks up the rows.
+        let raw_uri = "mongodb://root:rootpass@127.0.0.1:27017";
+        let seed_client = Client::with_uri_str(raw_uri)
+            .await
+            .expect("connect to mongo");
+        let scratch = seed_client
+            .database("mydb")
+            .collection::<Document>("count_star_scratch");
+        scratch.drop().await.expect("drop scratch");
+        scratch
+            .insert_many(vec![
+                doc! { "_id": "A", "product_id": "A", "name": "a", "price": 1.0 },
+                doc! { "_id": "B", "product_id": "B", "name": "b", "price": 2.0 },
+                doc! { "_id": "C", "product_id": "C", "name": "c", "price": 3.0 },
+            ])
+            .await
+            .expect("seed scratch");
+
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "count_star_scratch", "product_id").await;
+
+        let batches = query_all(&ctx, "SELECT count(*) FROM count_star_scratch").await;
+        assert_eq!(total_rows(&batches), 1);
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 3);
+
+        scratch.drop().await.expect("drop scratch");
     }
 
     // ─── Filter pushdown tests (integration) ────────────────────────────
