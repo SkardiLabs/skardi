@@ -13,6 +13,9 @@ use serde_json::{Map, Value};
 
 use crate::pipeline::parse_param_flag;
 
+/// Default server base URL when neither `--server` nor `$SKARDI_SERVER_URL` is set.
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8080";
+
 #[derive(Subcommand)]
 pub enum JobCmd {
     /// Submit a new run of the named job. Returns the run_id immediately;
@@ -63,7 +66,7 @@ fn server_base_url(override_url: Option<&str>) -> String {
     override_url
         .map(|s| s.to_string())
         .or_else(|| std::env::var("SKARDI_SERVER_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
 }
 
 /// Convert CLI `--param NAME=VALUE` tokens into the JSON object the

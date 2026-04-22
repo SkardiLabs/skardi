@@ -16,6 +16,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_rusqlite::{Connection, Row, rusqlite};
 
+/// DDL for the run ledger. Idempotent — run on every `open` via
+/// `ensure_schema`. When a new column or index is needed, add it here and
+/// rely on `CREATE ... IF NOT EXISTS`; rusqlite will no-op on existing
+/// objects. A real migration system is a v1.1 concern.
+const INIT_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS job_runs (
+    id            TEXT PRIMARY KEY,
+    job_name      TEXT NOT NULL,
+    parameters    TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    started_at    TEXT,
+    finished_at   TEXT,
+    rows_written  INTEGER,
+    snapshot_id   TEXT,
+    error         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_name_created
+    ON job_runs (job_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_job_runs_status
+    ON job_runs (status);";
+
 /// Lifecycle status of a single job run.
 ///
 /// `Pending` — row has been created, background task has not started yet.
@@ -161,24 +182,7 @@ impl SqliteJobStore {
     async fn ensure_schema(&self) -> Result<()> {
         self.conn
             .call(|conn| -> std::result::Result<(), rusqlite::Error> {
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS job_runs (
-                         id            TEXT PRIMARY KEY,
-                         job_name      TEXT NOT NULL,
-                         parameters    TEXT NOT NULL,
-                         status        TEXT NOT NULL,
-                         created_at    TEXT NOT NULL,
-                         started_at    TEXT,
-                         finished_at   TEXT,
-                         rows_written  INTEGER,
-                         snapshot_id   TEXT,
-                         error         TEXT
-                     );
-                     CREATE INDEX IF NOT EXISTS idx_job_runs_name_created
-                         ON job_runs (job_name, created_at DESC);
-                     CREATE INDEX IF NOT EXISTS idx_job_runs_status
-                         ON job_runs (status);",
-                )?;
+                conn.execute_batch(INIT_SCHEMA_SQL)?;
                 Ok(())
             })
             .await

@@ -24,7 +24,10 @@ use chrono::Utc;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
@@ -97,16 +100,16 @@ impl JobSubmitError {
 /// destination.
 #[derive(Debug, Default)]
 struct CancelFlag {
-    cancelled: Mutex<bool>,
+    cancelled: AtomicBool,
 }
 
 impl CancelFlag {
     fn cancel(&self) {
-        *self.cancelled.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     fn is_cancelled(&self) -> bool {
-        *self.cancelled.lock().unwrap_or_else(|p| p.into_inner())
+        self.cancelled.load(Ordering::SeqCst)
     }
 }
 
