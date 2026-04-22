@@ -259,7 +259,6 @@ jobs:
     name: "Publish to crates.io (${{ inputs.version }})"
     needs: validate
     runs-on: ubuntu-latest
-    if: ${{ !inputs.dry_run }}
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
@@ -279,7 +278,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Publish skardi
-        run: cargo publish -p skardi
+        run: cargo publish -p skardi ${{ inputs.dry_run && '--dry-run' || '' }}
 
       # skardi-sources is not published yet: it depends on lance via git which crates.io disallows.
       # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml, add it to
