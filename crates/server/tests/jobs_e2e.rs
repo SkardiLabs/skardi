@@ -11,7 +11,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-use skardi::jobs::executor::JobExecutorExt;
 use skardi::jobs::{JobDefinition, JobExecutor, JobRunStatus, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
 use skardi::sources::providers::lance::{lance_dataset_exists, register_lance_table};
@@ -61,8 +60,8 @@ async fn build_executor_for_lance(
     ctx: Arc<SessionContext>,
     job: JobDefinition,
     lance_name: &str,
-    _lance_path: &str,
-) -> (Arc<JobExecutor>, HashMap<String, String>) {
+    lance_path: &str,
+) -> Arc<JobExecutor> {
     let mut map = HashMap::new();
     map.insert(job.name().to_string(), job);
     let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
@@ -70,15 +69,16 @@ async fn build_executor_for_lance(
     let mut data_source_types = HashMap::new();
     data_source_types.insert(lance_name.to_string(), DataSourceType::Lance);
 
-    let exec = Arc::new(JobExecutor::new(
+    let mut source_paths = HashMap::new();
+    source_paths.insert(lance_name.to_string(), lance_path.to_string());
+
+    Arc::new(JobExecutor::new(
         map,
         store as Arc<dyn skardi::jobs::JobStore>,
         ctx,
         data_source_types,
-    ));
-    let mut paths = HashMap::new();
-    paths.insert(lance_name.to_string(), _lance_path.to_string());
-    (exec, paths)
+        source_paths,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ destination:
         .unwrap()
         .unwrap();
 
-    let (exec, paths) = build_executor_for_lance(
+    let exec = build_executor_for_lance(
         Arc::clone(&ctx),
         job,
         "wiki_lake",
@@ -128,10 +128,7 @@ destination:
         "min_id".to_string(),
         serde_json::Value::Number(serde_json::Number::from(0)),
     );
-    let run_id = exec
-        .submit_with_lance_paths("ingest-lake", params.clone(), &paths)
-        .await
-        .unwrap();
+    let run_id = exec.submit("ingest-lake", params.clone()).await.unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(
         run.status,
@@ -143,10 +140,7 @@ destination:
     assert!(lance_dataset_exists(lake_path.to_str().unwrap()));
 
     // Submit #2 — append mode should double the row count.
-    let run_id = exec
-        .submit_with_lance_paths("ingest-lake", params, &paths)
-        .await
-        .unwrap();
+    let run_id = exec.submit("ingest-lake", params).await.unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(
         run.status,
@@ -231,6 +225,8 @@ destination:
 
     let mut data_source_types = HashMap::new();
     data_source_types.insert("t".to_string(), DataSourceType::Lance);
+    let mut source_paths = HashMap::new();
+    source_paths.insert("t".to_string(), lake_path.to_str().unwrap().to_string());
     let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
     let mut jobs = HashMap::new();
     jobs.insert(seed_job.name().to_string(), seed_job);
@@ -240,15 +236,11 @@ destination:
         store as Arc<dyn skardi::jobs::JobStore>,
         Arc::clone(&ctx),
         data_source_types,
+        source_paths,
     ));
-    let mut paths = HashMap::new();
-    paths.insert("t".to_string(), lake_path.to_str().unwrap().to_string());
 
     // Seed with 10 rows.
-    let run_id = exec
-        .submit_with_lance_paths("seed", HashMap::new(), &paths)
-        .await
-        .unwrap();
+    let run_id = exec.submit("seed", HashMap::new()).await.unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(run.status, JobRunStatus::Succeeded);
     assert_eq!(run.rows_written, Some(10));
@@ -259,10 +251,7 @@ destination:
         "cutoff".to_string(),
         serde_json::Value::Number(serde_json::Number::from(7)),
     );
-    let run_id = exec
-        .submit_with_lance_paths("replace", params, &paths)
-        .await
-        .unwrap();
+    let run_id = exec.submit("replace", params).await.unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(
         run.status,
@@ -334,17 +323,14 @@ destination:
         .unwrap()
         .unwrap();
 
-    let (exec, paths) = build_executor_for_lance(
+    let exec = build_executor_for_lance(
         Arc::clone(&ctx),
         job,
         "wiki_lake",
         lake_path.to_str().unwrap(),
     )
     .await;
-    let err = exec
-        .submit_with_lance_paths("mismatch", HashMap::new(), &paths)
-        .await
-        .unwrap_err();
+    let err = exec.submit("mismatch", HashMap::new()).await.unwrap_err();
     let err_str = err.to_string();
     assert!(
         err_str.contains("schema mismatch") || err_str.contains("Destination schema mismatch"),
@@ -403,6 +389,7 @@ destination:
         store as Arc<dyn skardi::jobs::JobStore>,
         ctx,
         data_source_types,
+        HashMap::new(),
     );
 
     let err = exec.submit("db-ingest", HashMap::new()).await.unwrap_err();
@@ -447,12 +434,9 @@ destination:
         .unwrap()
         .unwrap();
 
-    let (exec, paths) =
+    let exec =
         build_executor_for_lance(Arc::clone(&ctx), job, "lake", lake_path.to_str().unwrap()).await;
-    let err = exec
-        .submit_with_lance_paths("strict", HashMap::new(), &paths)
-        .await
-        .unwrap_err();
+    let err = exec.submit("strict", HashMap::new()).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -545,6 +529,7 @@ destination:
         jobs,
         store as Arc<dyn skardi::jobs::JobStore>,
         Arc::clone(&ctx),
+        HashMap::new(),
         HashMap::new(),
     );
 

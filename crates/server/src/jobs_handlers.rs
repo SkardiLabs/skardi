@@ -18,7 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use skardi::jobs::{JobRun, JobSubmitError, executor::JobExecutorExt};
+use skardi::jobs::{JobRun, JobSubmitError};
 use std::collections::HashMap;
 
 use crate::server::AppState;
@@ -94,7 +94,7 @@ pub async fn submit_job_run(
     Path(name): Path<String>,
     Json(req): Json<SubmitRunRequest>,
 ) -> Result<Json<SubmitRunResponse>, (StatusCode, Json<JobErrorResponse>)> {
-    let Some(bundle) = app_state.jobs.clone() else {
+    let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             error_json(
@@ -105,11 +105,7 @@ pub async fn submit_job_run(
         ));
     };
 
-    match bundle
-        .executor
-        .submit_with_lance_paths(&name, req.parameters, &bundle.lance_paths)
-        .await
-    {
+    match executor.submit(&name, req.parameters).await {
         Ok(run_id) => Ok(Json(SubmitRunResponse {
             run_id,
             status: "pending".to_string(),
@@ -136,13 +132,13 @@ pub async fn get_job_run(
     State(app_state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
-    let Some(bundle) = app_state.jobs.clone() else {
+    let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
-    match bundle.executor.store().get_run(&run_id).await {
+    match executor.store().get_run(&run_id).await {
         Ok(Some(run)) => Ok(Json(job_run_to_json(&run))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -166,19 +162,14 @@ pub async fn list_job_runs(
     State(app_state): State<AppState>,
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
-    let Some(bundle) = app_state.jobs.clone() else {
+    let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    match bundle
-        .executor
-        .store()
-        .list_runs(q.job.as_deref(), limit)
-        .await
-    {
+    match executor.store().list_runs(q.job.as_deref(), limit).await {
         Ok(runs) => {
             let body: Vec<Value> = runs.iter().map(job_run_to_json).collect();
             Ok(Json(serde_json::json!({
@@ -201,13 +192,13 @@ pub async fn cancel_job_run(
     State(app_state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
-    let Some(bundle) = app_state.jobs.clone() else {
+    let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
-    let cancelled = bundle.executor.cancel(&run_id).await.map_err(|e| {
+    let cancelled = executor.cancel(&run_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json(&e.to_string(), "internal_error", None),
@@ -225,16 +216,16 @@ pub async fn cancel_job_run(
 pub async fn list_jobs(
     State(app_state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
-    let Some(bundle) = app_state.jobs.clone() else {
+    let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
-    let names = bundle.executor.list_jobs().await;
+    let names = executor.list_jobs().await;
     let mut items = Vec::with_capacity(names.len());
     for name in &names {
-        if let Some(def) = bundle.executor.get_job(name).await {
+        if let Some(def) = executor.get_job(name).await {
             let params: Vec<String> = def.pipeline.request_schema.fields.keys().cloned().collect();
             items.push(serde_json::json!({
                 "name": def.name(),

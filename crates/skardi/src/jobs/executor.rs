@@ -123,6 +123,10 @@ pub struct JobExecutor {
     /// Map of source name → its configured DataSourceType, so the executor
     /// can decide whether a destination is a lake (Lance) or a DB target.
     data_source_types: Arc<HashMap<String, DataSourceType>>,
+    /// Map of source name → on-disk path, used by lake destinations whose
+    /// writer needs the physical path (currently only Lance). Built by the
+    /// caller at construction time from the `DataSource` list.
+    source_paths: Arc<HashMap<String, String>>,
     cancel_flags: Arc<Mutex<HashMap<String, Arc<CancelFlag>>>>,
 }
 
@@ -132,12 +136,14 @@ impl JobExecutor {
         store: Arc<dyn JobStore>,
         session_ctx: Arc<SessionContext>,
         data_source_types: HashMap<String, DataSourceType>,
+        source_paths: HashMap<String, String>,
     ) -> Self {
         Self {
             jobs: Arc::new(tokio::sync::RwLock::new(jobs)),
             store,
             session_ctx,
             data_source_types: Arc::new(data_source_types),
+            source_paths: Arc::new(source_paths),
             cancel_flags: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -220,7 +226,7 @@ impl JobExecutor {
             .await?;
 
         // Persist the pending row.
-        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        let run_id = Uuid::new_v4().simple().to_string();
         let params_json = sorted_json(&params);
         let now = chrono::Utc::now().to_rfc3339();
         let run = JobRun {
@@ -331,12 +337,8 @@ impl JobExecutor {
         }
     }
 
-    fn lance_path_for(&self, _name: &str) -> Option<String> {
-        // The DataSourceType map does not carry paths, so the executor
-        // relies on the path-resolver callback installed by the caller.
-        // In the MVP this is only set via the server, which knows the
-        // full DataSource list. Tests register LanceDestination directly.
-        None
+    fn lance_path_for(&self, name: &str) -> Option<String> {
+        self.source_paths.get(name).cloned()
     }
 
     async fn preflight(
@@ -588,199 +590,6 @@ async fn run_job_task(
     flags.remove(&run_id);
 }
 
-// ---------------------------------------------------------------------------
-// Server-facing helpers to wire `DataSource` → the executor's destination
-// resolver. These live here (rather than in the server crate) so the
-// runner binary can reuse them unchanged.
-// ---------------------------------------------------------------------------
-
-/// A tiny struct describing one data source, just what the executor needs
-/// for its destination lookup. The server populates it from its
-/// `Vec<DataSource>`.
-#[derive(Debug, Clone)]
-pub struct DataSourceInfo {
-    pub name: String,
-    pub source_type: DataSourceType,
-    pub path: Option<String>,
-}
-
-/// Build the path-resolver map the executor uses for Lance destinations.
-/// For a table named `foo` backed by a Lance source, the first dotted
-/// segment of `destination.table` is `foo` and the path comes from the
-/// source's `path`.
-pub fn lance_paths_from_sources(sources: &[DataSourceInfo]) -> HashMap<String, String> {
-    sources
-        .iter()
-        .filter(|s| matches!(s.source_type, DataSourceType::Lance))
-        .filter_map(|s| s.path.as_ref().map(|p| (s.name.clone(), p.clone())))
-        .collect()
-}
-
-/// Convenience wrapper that combines a full `JobExecutor` with a
-/// name→path map for Lance destinations. The server constructs this once
-/// at startup and hands it to handlers via `AppState`.
-pub struct JobExecutorBundle {
-    pub executor: Arc<JobExecutor>,
-    pub lance_paths: Arc<HashMap<String, String>>,
-}
-
-impl JobExecutorBundle {
-    pub fn new(executor: Arc<JobExecutor>, lance_paths: HashMap<String, String>) -> Self {
-        Self {
-            executor,
-            lance_paths: Arc::new(lance_paths),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// A more complete executor impl that honours lance paths provided externally.
-// ---------------------------------------------------------------------------
-
-/// Extension trait so callers that have a `lance_paths: HashMap<String,
-/// String>` can submit jobs whose Lance destinations resolve against
-/// those paths. Used by the server.
-#[async_trait::async_trait]
-pub trait JobExecutorExt {
-    async fn submit_with_lance_paths(
-        &self,
-        job_name: &str,
-        params: HashMap<String, Value>,
-        lance_paths: &HashMap<String, String>,
-    ) -> Result<String, JobSubmitError>;
-}
-
-#[async_trait::async_trait]
-impl JobExecutorExt for JobExecutor {
-    async fn submit_with_lance_paths(
-        &self,
-        job_name: &str,
-        params: HashMap<String, Value>,
-        lance_paths: &HashMap<String, String>,
-    ) -> Result<String, JobSubmitError> {
-        // Peek the destination so we can build the right resolver without
-        // loading the job twice. If the job is unknown, surface that up
-        // front.
-        let job = {
-            let jobs = self.jobs.read().await;
-            jobs.get(job_name)
-                .cloned()
-                .ok_or_else(|| JobSubmitError::UnknownJob(job_name.to_string()))?
-        };
-
-        // For Lance destinations, plug the path into a one-shot executor
-        // wrapper via a captured closure.
-        let root = job
-            .destination
-            .table
-            .split('.')
-            .next()
-            .unwrap_or(&job.destination.table);
-        if let Some(path) = lance_paths.get(root) {
-            return submit_with_lance_path_override(self, &job, job_name, params, path.clone())
-                .await;
-        }
-        // Non-Lance: defer to the default resolver.
-        self.submit(job_name, params).await
-    }
-}
-
-async fn submit_with_lance_path_override(
-    exec: &JobExecutor,
-    job: &JobDefinition,
-    job_name: &str,
-    params: HashMap<String, Value>,
-    lance_path: String,
-) -> Result<String, JobSubmitError> {
-    // Param validation — same as `submit`.
-    let expected: Vec<String> = job
-        .pipeline
-        .request_schema()
-        .fields
-        .keys()
-        .cloned()
-        .collect();
-    let missing: Vec<&str> = expected
-        .iter()
-        .filter(|n: &&String| !params.contains_key(n.as_str()))
-        .map(|s: &String| s.as_str())
-        .collect();
-    if !missing.is_empty() {
-        return Err(JobSubmitError::MissingParameters(missing.join(", ")));
-    }
-
-    let mut expected_sorted: Vec<String> = expected.clone();
-    expected_sorted.sort_by_key(|s: &String| std::cmp::Reverse(s.len()));
-    let (rendered_sql, bad_types) = substitute_sql_params(job.sql(), &expected_sorted, &params);
-    if let Some(name) = bad_types {
-        return Err(JobSubmitError::UnsupportedParameter(name));
-    }
-
-    let destination: Arc<dyn JobDestination> = Arc::new(LanceDestination::new(lance_path));
-
-    let query_schema = exec
-        .session_ctx
-        .sql(&rendered_sql)
-        .await
-        .map(|df| df.schema().as_arrow().clone())
-        .map_err(|e| JobSubmitError::SqlPlanFailure {
-            job: job_name.to_string(),
-            source: anyhow::anyhow!("{e}"),
-        })?;
-
-    exec.preflight(destination.as_ref(), &job.destination, &query_schema)
-        .await?;
-
-    let run_id = Uuid::new_v4().simple().to_string();
-    let params_json = sorted_json(&params);
-    let now = Utc::now().to_rfc3339();
-    let run = JobRun {
-        id: run_id.clone(),
-        job_name: job_name.to_string(),
-        parameters: params_json,
-        status: JobRunStatus::Pending,
-        created_at: now,
-        started_at: None,
-        finished_at: None,
-        rows_written: None,
-        snapshot_id: None,
-        error: None,
-    };
-    exec.store
-        .create_run(&run)
-        .await
-        .map_err(JobSubmitError::Internal)?;
-
-    let cancel_flag = Arc::new(CancelFlag::default());
-    {
-        let mut flags = exec.cancel_flags.lock().unwrap_or_else(|p| p.into_inner());
-        flags.insert(run_id.clone(), Arc::clone(&cancel_flag));
-    }
-
-    let store = Arc::clone(&exec.store);
-    let session_ctx = Arc::clone(&exec.session_ctx);
-    let flags_map = Arc::clone(&exec.cancel_flags);
-    let run_id_for_task = run_id.clone();
-    let mode = job.destination.mode;
-    let timeout_ms = job.execution.timeout_ms;
-    tokio::spawn(async move {
-        run_job_task(
-            run_id_for_task,
-            store,
-            session_ctx,
-            destination,
-            rendered_sql,
-            mode,
-            timeout_ms,
-            cancel_flag,
-            flags_map,
-        )
-        .await;
-    });
-
-    Ok(run_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,7 +715,13 @@ destination:
                 .await
                 .unwrap(),
         );
-        let exec = Arc::new(JobExecutor::new(map, store, ctx, HashMap::new()));
+        let exec = Arc::new(JobExecutor::new(
+            map,
+            store,
+            ctx,
+            HashMap::new(),
+            HashMap::new(),
+        ));
         (exec, tmp)
     }
 
@@ -993,7 +808,7 @@ destination:
                 .await
                 .unwrap(),
         );
-        let exec = JobExecutor::new(map, store, ctx, HashMap::new());
+        let exec = JobExecutor::new(map, store, ctx, HashMap::new(), HashMap::new());
 
         // A non-Lance destination that doesn't exist should be rejected.
         let err = exec.submit("ingest", HashMap::new()).await.unwrap_err();

@@ -5,8 +5,9 @@ use axum::{
 };
 use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
-use skardi::jobs::executor::{DataSourceInfo, JobExecutorBundle, lance_paths_from_sources};
 use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
+use skardi::sources::DataSourceType;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
@@ -22,12 +23,13 @@ use crate::config::register_gguf_udf;
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
 use crate::config::register_remote_embed_udf;
-use crate::handlers::{
-    execute_pipeline_by_name, get_data_sources, get_pipelines_info, health_check, list_pipelines,
-    pipeline_health_check, serve_dashboard,
-};
+use crate::handlers::{health_check, serve_dashboard};
 use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
 use crate::metrics::PipelineMetrics;
+use crate::pipeline_handlers::{
+    execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
+    pipeline_health_check,
+};
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
 /// Shared application state containing pipeline and engine
@@ -41,9 +43,9 @@ pub struct AppState {
     pub metrics: PipelineMetrics,
     /// Active authentication layer (NoAuth by default)
     pub auth_layer: AuthLayer,
-    /// Jobs executor + run ledger bundle. `None` when the server was
-    /// started without `--jobs`, which disables every `/jobs/*` endpoint.
-    pub jobs: Option<Arc<JobExecutorBundle>>,
+    /// Jobs executor + run ledger. `None` when the server was started
+    /// without `--jobs`, which disables every `/jobs/*` endpoint.
+    pub jobs: Option<Arc<JobExecutor>>,
 }
 
 /// Main server creation function - Primary public interface
@@ -175,29 +177,27 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
             );
         }
 
-        let sources: Vec<DataSourceInfo> = config
-            .data_sources
-            .iter()
-            .map(|ds| DataSourceInfo {
-                name: ds.name.clone(),
-                source_type: ds.source_type.clone(),
-                path: ds.path.to_str().map(|s| s.to_string()),
-            })
-            .collect();
-        let lance_paths = lance_paths_from_sources(&sources);
         let data_source_types = config
             .data_sources
             .iter()
             .map(|ds| (ds.name.clone(), ds.source_type.clone()))
             .collect();
+        // Only Lance destinations care about a physical path today; other
+        // source kinds can opt in later by adding their own entries here.
+        let source_paths: HashMap<String, String> = config
+            .data_sources
+            .iter()
+            .filter(|ds| matches!(ds.source_type, DataSourceType::Lance))
+            .filter_map(|ds| ds.path.to_str().map(|p| (ds.name.clone(), p.to_string())))
+            .collect();
 
-        let executor = Arc::new(JobExecutor::new(
+        Some(Arc::new(JobExecutor::new(
             config.jobs.clone(),
             store as Arc<dyn skardi::jobs::JobStore>,
             session_ctx_arc.clone(),
             data_source_types,
-        ));
-        Some(Arc::new(JobExecutorBundle::new(executor, lance_paths)))
+            source_paths,
+        )))
     } else {
         None
     };

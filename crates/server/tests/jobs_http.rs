@@ -11,7 +11,6 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use http_body_util::BodyExt;
 use serde_json::Value;
-use skardi::jobs::executor::{DataSourceInfo, JobExecutorBundle, lance_paths_from_sources};
 use skardi::jobs::{JobDefinition, JobExecutor, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
 use std::collections::HashMap;
@@ -74,18 +73,16 @@ destination:
         jobs_map.insert(job.name().to_string(), job);
     }
 
-    let bundle = if enable_jobs {
+    let executor = if enable_jobs {
         let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
-        let sources: Vec<DataSourceInfo> = Vec::new();
-        let lance_paths = lance_paths_from_sources(&sources);
         let data_source_types: HashMap<String, DataSourceType> = HashMap::new();
-        let exec = Arc::new(JobExecutor::new(
+        Some(Arc::new(JobExecutor::new(
             jobs_map.clone(),
             store as Arc<dyn JobStore>,
             Arc::clone(&ctx),
             data_source_types,
-        ));
-        Some(Arc::new(JobExecutorBundle::new(exec, lance_paths)))
+            HashMap::new(),
+        )))
     } else {
         None
     };
@@ -111,7 +108,7 @@ destination:
         session_ctx: Arc::clone(&ctx),
         metrics: PipelineMetrics::new(),
         auth_layer: AuthLayer::None,
-        jobs: bundle,
+        jobs: executor,
     };
     (state, tmp)
 }

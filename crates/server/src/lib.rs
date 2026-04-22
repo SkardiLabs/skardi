@@ -4,6 +4,7 @@ pub mod handlers;
 pub mod jobs_handlers;
 pub mod metrics;
 pub mod optimizer_registry;
+pub mod pipeline_handlers;
 pub mod remote_storage;
 pub mod server;
 pub mod telemetry;
