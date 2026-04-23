@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-search-by-seed"
   version: "1.0.0"
@@ -10,13 +12,14 @@ metadata:
 #   {seed_id} - ID of the item whose embedding is used as the query vector
 #   {k}       - Number of nearest neighbours to return
 
-query: |
-  SELECT i.id, i.name, i.category, knn._score
-  FROM sqlite_knn(
-    'vec_items',
-    'embedding',
-    (SELECT embedding FROM vec_items WHERE item_id = {seed_id}),
-    {k}
-  ) knn
-  JOIN items i ON i.id = knn.item_id
-  ORDER BY knn._score
+spec:
+  query: |
+    SELECT i.id, i.name, i.category, knn._score
+    FROM sqlite_knn(
+      'vec_items',
+      'embedding',
+      (SELECT embedding FROM vec_items WHERE item_id = {seed_id}),
+      {k}
+    ) knn
+    JOIN items i ON i.id = knn.item_id
+    ORDER BY knn._score

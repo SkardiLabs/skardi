@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-fts-insert-article"
   version: "1.0.0"
@@ -10,6 +12,7 @@ metadata:
 #   {body}     - Article body text (indexed for full-text search)
 #   {category} - Article category
 
-query: |
-  INSERT INTO articles_fts (title, body, category)
-  VALUES ({title}, {body}, {category})
+spec:
+  query: |
+    INSERT INTO articles_fts (title, body, category)
+    VALUES ({title}, {body}, {category})

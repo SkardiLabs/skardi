@@ -1,7 +1,10 @@
+kind: pipeline
+
 metadata:
   name: "update_stock_by_category"
   version: "1.0"
   description: "Update in_stock status for all products in a category"
 
-query: |
-  UPDATE products SET in_stock = {in_stock} WHERE category = {category}
+spec:
+  query: |
+    UPDATE products SET in_stock = {in_stock} WHERE category = {category}

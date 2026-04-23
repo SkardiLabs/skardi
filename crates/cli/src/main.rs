@@ -161,7 +161,7 @@ enum AliasCmd {
         #[arg(long)]
         ctx: Option<PathBuf>,
     },
-    /// Show one alias in YAML form
+    /// Show one alias as a YAML fragment (not a loadable aliases file)
     Show {
         name: String,
         #[arg(long)]
@@ -177,6 +177,24 @@ enum AliasCmd {
         #[arg(long)]
         ctx: Option<PathBuf>,
     },
+}
+
+/// Top-level envelope for context YAML files. Shares the
+/// `{ kind, metadata, spec }` shape with pipelines, jobs, and aliases.
+///
+/// `kind` is `Option` rather than required so a missing discriminator
+/// produces the same "Missing `kind: context`" diagnostic as the server,
+/// instead of serde's generic "missing field `kind`" message. `metadata`
+/// is required — a missing or typo'd key (e.g. `metdata:`) surfaces at
+/// parse time; the value is retained as an opaque `serde_yaml::Value`
+/// because nothing at runtime reads inside it.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LocalContextFile {
+    #[serde(default)]
+    kind: Option<String>,
+    metadata: serde_yaml::Value,
+    spec: LocalContextConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,8 +599,8 @@ async fn main() -> Result<()> {
                 aliases_override.as_deref(),
                 ctx_override.as_deref().or_else(|| default_ctx.as_deref()),
             );
-            let alias_map = match &aliases_path {
-                Some(p) => alias_store::load(p)?,
+            let alias_map: AliasMap = match &aliases_path {
+                Some(p) => alias_store::load(p)?.spec,
                 None => AliasMap::new(),
             };
 
@@ -685,10 +703,7 @@ async fn load_and_register_all(
     session_ctx: &mut SessionContext,
     dataset_registry: &DatasetRegistry,
 ) -> Result<LocalContextConfig> {
-    let content = std::fs::read_to_string(ctx_path)
-        .with_context(|| format!("Failed to read context file: {}", ctx_path.display()))?;
-    let config: LocalContextConfig =
-        serde_yaml::from_str(&content).context("Failed to parse context YAML")?;
+    let config = read_context_file(ctx_path)?;
 
     for source in &config.data_sources {
         register_source(session_ctx, source, dataset_registry)
@@ -697,6 +712,30 @@ async fn load_and_register_all(
     }
 
     Ok(config)
+}
+
+/// Parse a context YAML file into its `spec:` body, rejecting anything that
+/// isn't a `kind: context` document. All three CLI entry points that load a
+/// ctx (startup, `alias add` parameter preview, alias `show` annotation) go
+/// through this helper so the envelope is enforced consistently.
+fn read_context_file(ctx_path: &Path) -> Result<LocalContextConfig> {
+    let content = std::fs::read_to_string(ctx_path)
+        .with_context(|| format!("Failed to read context file: {}", ctx_path.display()))?;
+    let file: LocalContextFile =
+        serde_yaml::from_str(&content).context("Failed to parse context YAML")?;
+    match file.kind.as_deref() {
+        Some("context") => {}
+        Some(other) => anyhow::bail!(
+            "Expected `kind: context` in {}, got `kind: {}`",
+            ctx_path.display(),
+            other,
+        ),
+        None => anyhow::bail!(
+            "Missing `kind: context` at the root of {}",
+            ctx_path.display(),
+        ),
+    }
+    Ok(file.spec)
 }
 
 /// Register a single data source into the session context.
@@ -1206,11 +1245,7 @@ async fn run_pipeline_with_params(
     // registering data sources — errors on the pipeline side should surface
     // before we pay the cost of connecting to Postgres/Mongo/etc.
     let ctx_cfg: Option<LocalContextConfig> = match &ctx_path_for_load {
-        Some(p) => {
-            let content = std::fs::read_to_string(p)
-                .with_context(|| format!("Failed to read context file: {}", p.display()))?;
-            Some(serde_yaml::from_str(&content).context("Failed to parse context YAML")?)
-        }
+        Some(p) => Some(read_context_file(p)?),
         None => None,
     };
 
@@ -1378,12 +1413,12 @@ fn alias_add(
 ) -> Result<()> {
     let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
-    let mut map = alias_store::load(&path)?;
-    if map.contains_key(&name) && !force {
+    let mut file = alias_store::load(&path)?;
+    if file.spec.contains_key(&name) && !force {
         anyhow::bail!(
             "Alias '{name}' already exists. Use --force to overwrite. \
              Current target: {}",
-            map[&name].pipeline
+            file.spec[&name].pipeline
         );
     }
 
@@ -1430,7 +1465,7 @@ fn alias_add(
         }
     }
 
-    map.insert(
+    file.spec.insert(
         name.clone(),
         AliasDef {
             pipeline: pipeline.clone(),
@@ -1439,7 +1474,7 @@ fn alias_add(
             description,
         },
     );
-    alias_store::save(&path, &map)?;
+    alias_store::save(&path, &file)?;
     println!(
         "Alias '{}' → pipeline '{}' saved to {}",
         name,
@@ -1458,11 +1493,7 @@ fn try_load_pipeline_params(
     // Parse ctx if provided so `pipelines_dir` can point us at the pipelines.
     let ctx_path = resolve_ctx_path(ctx_override).filter(|p| p.exists());
     let ctx_cfg: Option<LocalContextConfig> = match &ctx_path {
-        Some(p) => {
-            let content = std::fs::read_to_string(p)
-                .with_context(|| format!("Failed to read context file: {}", p.display()))?;
-            Some(serde_yaml::from_str(&content).context("Failed to parse context YAML")?)
-        }
+        Some(p) => Some(read_context_file(p)?),
         None => None,
     };
 
@@ -1541,13 +1572,13 @@ fn report_alias_coverage(
 fn alias_list(aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
     let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
-    let map = alias_store::load(&path)?;
-    if map.is_empty() {
+    let file = alias_store::load(&path)?;
+    if file.spec.is_empty() {
         println!("No aliases defined (file: {})", path.display());
         return Ok(());
     }
     println!("Aliases from {}:", path.display());
-    for (name, def) in &map {
+    for (name, def) in &file.spec {
         let desc = def.description.as_deref().unwrap_or("");
         println!(
             "  {:<12} → run {}{}{}",
@@ -1563,12 +1594,17 @@ fn alias_list(aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
 fn alias_show(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
     let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
-    let map = alias_store::load(&path)?;
-    let def = map
+    let file = alias_store::load(&path)?;
+    let def = file
+        .spec
         .get(&name)
         .ok_or_else(|| anyhow::anyhow!("Alias '{name}' not found in {}", path.display()))?;
 
-    // Print the stored alias YAML verbatim.
+    // Print just the `<name>: <def>` entry, not the full `{ kind, metadata,
+    // spec }` envelope — the envelope is noise when the user asked for a
+    // single alias. The output is deliberately a fragment, not a loadable
+    // aliases file; `alias show`'s contract is human inspection, not
+    // round-tripping through `alias_store::load`.
     let mut single = AliasMap::new();
     single.insert(name.clone(), def.clone());
     let yaml = serde_yaml::to_string(&single).context("Failed to render alias to YAML")?;
@@ -1677,11 +1713,11 @@ fn print_alias_help(alias_name: &str, def: &AliasDef, pipeline_params: Option<&[
 fn alias_remove(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> Result<()> {
     let path = resolve_aliases_path(aliases.as_deref(), ctx.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Could not resolve aliases file path"))?;
-    let mut map = alias_store::load(&path)?;
-    if map.remove(&name).is_none() {
+    let mut file = alias_store::load(&path)?;
+    if file.spec.remove(&name).is_none() {
         anyhow::bail!("Alias '{name}' not found in {}", path.display());
     }
-    alias_store::save(&path, &map)?;
+    alias_store::save(&path, &file)?;
     println!("Alias '{}' removed from {}", name, path.display());
     Ok(())
 }
@@ -2007,10 +2043,13 @@ mod tests {
             write_pipeline(
                 tmp.path(),
                 "echo.yaml",
-                r#"metadata:
+                r#"kind: pipeline
+metadata:
   name: "echo"
-query: |
-  SELECT {x} AS val, {msg} AS note
+  version: "1.0.0"
+spec:
+  query: |
+    SELECT {x} AS val, {msg} AS note
 "#,
             );
 
@@ -2033,10 +2072,13 @@ query: |
             write_pipeline(
                 tmp.path(),
                 "needs.yaml",
-                r#"metadata:
+                r#"kind: pipeline
+metadata:
   name: "needs"
-query: |
-  SELECT {required} AS val
+  version: "1.0.0"
+spec:
+  query: |
+    SELECT {required} AS val
 "#,
             );
 
@@ -2057,9 +2099,12 @@ query: |
             write_pipeline(
                 tmp.path(),
                 "only_this_one.yaml",
-                r#"metadata:
+                r#"kind: pipeline
+metadata:
   name: "only-this-one"
-query: "SELECT 1"
+  version: "1.0.0"
+spec:
+  query: "SELECT 1"
 "#,
             );
 

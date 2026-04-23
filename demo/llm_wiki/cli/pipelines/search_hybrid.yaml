@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-search-hybrid"
   version: "1.0.0"
@@ -15,26 +17,27 @@ metadata:
 #   {text_weight}    - RRF weight for text results (e.g. 0.5)
 #   {limit}          - Maximum number of fused results to return
 
-query: |
-  WITH vec AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
-    FROM sqlite_knn('wiki.main.wiki_pages_vec', 'embedding',
-        (SELECT candle('models/generated/bge-small-en-v1.5', {query})),
-        80)
-  ),
-  fts AS (
-    SELECT id, slug, title, page_type,
-           ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
-    FROM sqlite_fts('wiki.main.wiki_pages_fts', 'content', {text_query}, 60)
-  )
-  SELECT
-    COALESCE(f.slug, p.slug)           AS slug,
-    COALESCE(f.title, p.title)         AS title,
-    COALESCE(f.page_type, p.page_type) AS page_type,
-    COALESCE({vector_weight} / (60.0 + v.rk), 0)
-      + COALESCE({text_weight} / (60.0 + f.rk), 0) AS rrf_score
-  FROM vec v
-  FULL OUTER JOIN fts f ON v.id = f.id
-  LEFT JOIN wiki.main.wiki_pages p ON p.id = COALESCE(v.id, f.id)
-  ORDER BY rrf_score DESC
-  LIMIT {limit}
+spec:
+  query: |
+    WITH vec AS (
+      SELECT id, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+      FROM sqlite_knn('wiki.main.wiki_pages_vec', 'embedding',
+          (SELECT candle('models/generated/bge-small-en-v1.5', {query})),
+          80)
+    ),
+    fts AS (
+      SELECT id, slug, title, page_type,
+             ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+      FROM sqlite_fts('wiki.main.wiki_pages_fts', 'content', {text_query}, 60)
+    )
+    SELECT
+      COALESCE(f.slug, p.slug)           AS slug,
+      COALESCE(f.title, p.title)         AS title,
+      COALESCE(f.page_type, p.page_type) AS page_type,
+      COALESCE({vector_weight} / (60.0 + v.rk), 0)
+        + COALESCE({text_weight} / (60.0 + f.rk), 0) AS rrf_score
+    FROM vec v
+    FULL OUTER JOIN fts f ON v.id = f.id
+    LEFT JOIN wiki.main.wiki_pages p ON p.id = COALESCE(v.id, f.id)
+    ORDER BY rrf_score DESC
+    LIMIT {limit}

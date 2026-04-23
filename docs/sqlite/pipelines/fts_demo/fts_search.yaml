@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-fts-search"
   version: "1.0.0"
@@ -9,7 +11,8 @@ metadata:
 #   {query} - Search terms (space-separated, "quoted" for phrase, NOT for negation)
 #   {limit} - Maximum number of results to return
 
-query: |
-  SELECT title, body, category, _score
-  FROM sqlite_fts('articles_fts', 'body', {query}, {limit})
-  ORDER BY _score DESC
+spec:
+  query: |
+    SELECT title, body, category, _score
+    FROM sqlite_fts('articles_fts', 'body', {query}, {limit})
+    ORDER BY _score DESC

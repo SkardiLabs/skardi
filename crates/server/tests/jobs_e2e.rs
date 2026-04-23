@@ -97,12 +97,13 @@ kind: job
 metadata:
   name: "ingest-lake"
   version: "1.0.0"
-query: |
-  SELECT id, name FROM src WHERE id >= {min_id}
-destination:
-  table: "wiki_lake"
-  mode: append
-  create_if_missing: true
+spec:
+  query: |
+    SELECT id, name FROM src WHERE id >= {min_id}
+  destination:
+    table: "wiki_lake"
+    mode: append
+    create_if_missing: true
 "#,
     );
 
@@ -188,11 +189,12 @@ kind: job
 metadata:
   name: "replace"
   version: "1.0.0"
-query: |
-  SELECT 1 AS id
-destination:
-  table: "t"
-  mode: overwrite
+spec:
+  query: |
+    SELECT 1 AS id
+  destination:
+    table: "t"
+    mode: overwrite
 "#,
     );
 
@@ -238,11 +240,12 @@ kind: job
 metadata:
   name: "mismatch"
   version: "1.0.0"
-query: |
-  SELECT id AS id_wrong, name FROM src
-destination:
-  table: "wiki_lake"
-  mode: append
+spec:
+  query: |
+    SELECT id AS id_wrong, name FROM src
+  destination:
+    table: "wiki_lake"
+    mode: append
 "#,
     );
 
@@ -293,12 +296,13 @@ kind: job
 metadata:
   name: "db-ingest"
   version: "1.0.0"
-query: |
-  SELECT id FROM src
-destination:
-  table: "missing.public.never_exists"
-  mode: append
-  create_if_missing: true
+spec:
+  query: |
+    SELECT id FROM src
+  destination:
+    table: "missing.public.never_exists"
+    mode: append
+    create_if_missing: true
 "#,
     );
 
@@ -348,12 +352,13 @@ kind: job
 metadata:
   name: "strict"
   version: "1.0.0"
-query: |
-  SELECT id FROM src
-destination:
-  table: "lake"
-  mode: append
-  create_if_missing: false
+spec:
+  query: |
+    SELECT id FROM src
+  destination:
+    table: "lake"
+    mode: append
+    create_if_missing: false
 "#,
     );
 
@@ -432,11 +437,12 @@ kind: job
 metadata:
   name: "db-ingest"
   version: "1.0.0"
-query: |
-  SELECT id FROM src WHERE id >= {min_id}
-destination:
-  table: "dest"
-  mode: append
+spec:
+  query: |
+    SELECT id FROM src WHERE id >= {min_id}
+  destination:
+    table: "dest"
+    mode: append
 "#,
     );
 
@@ -512,11 +518,12 @@ kind: job
 metadata:
   name: "nontx"
   version: "1.0.0"
-query: |
-  SELECT id FROM src
-destination:
-  table: "redis_cache"
-  mode: append
+spec:
+  query: |
+    SELECT id FROM src
+  destination:
+    table: "redis_cache"
+    mode: append
 "#,
     );
 

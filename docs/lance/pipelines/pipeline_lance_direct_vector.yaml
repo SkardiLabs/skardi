@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: lance-direct-vector-search
   version: 1.0.0
@@ -16,38 +18,39 @@ metadata:
 #   {query_vector}: The embedding vector as a literal array, e.g. [0.1, 0.2, ...]
 #   {k}:            Number of nearest neighbours to return
 
-query: |
-  SELECT
-    knn.id,
-    knn.item_id,
-    knn.revenue,
-    knn._distance as distance
-  FROM lance_knn(
-    'sift_items',
-    'vector',
-    {query_vector},
-    {k}
-  ) knn
+spec:
+  query: |
+    SELECT
+      knn.id,
+      knn.item_id,
+      knn.revenue,
+      knn._distance as distance
+    FROM lance_knn(
+      'sift_items',
+      'vector',
+      {query_vector},
+      {k}
+    ) knn
 
-# Example API Call:
-#
-# POST /lance-direct-vector-search/execute
-# {
-#   "query_vector": [0.1, 0.2, 0.3, ...],  (128 floats for the demo dataset)
-#   "k": 10
-# }
-#
-# Response:
-# {
-#   "data": [
-#     {
-#       "id": 42,
-#       "item_id": 1337,
-#       "revenue": 2500.50,
-#       "distance": 0.125
-#     },
-#     ...
-#   ],
-#   "rows_affected": 10,
-#   "execution_time_ms": 15
-# }
+  # Example API Call:
+  #
+  # POST /lance-direct-vector-search/execute
+  # {
+  #   "query_vector": [0.1, 0.2, 0.3, ...],  (128 floats for the demo dataset)
+  #   "k": 10
+  # }
+  #
+  # Response:
+  # {
+  #   "data": [
+  #     {
+  #       "id": 42,
+  #       "item_id": 1337,
+  #       "revenue": 2500.50,
+  #       "distance": 0.125
+  #     },
+  #     ...
+  #   ],
+  #   "rows_affected": 10,
+  #   "execution_time_ms": 15
+  # }

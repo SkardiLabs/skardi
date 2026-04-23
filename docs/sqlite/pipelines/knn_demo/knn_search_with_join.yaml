@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-search-with-join"
   version: "1.0.0"
@@ -12,13 +14,14 @@ metadata:
 
 # Requires: --features candle
 
-query: |
-  SELECT i.id, i.name, i.category, knn._score
-  FROM sqlite_knn(
-    'vec_items',
-    'embedding',
-    candle('models/generated/bge-small-en-v1.5', {query}),
-    {k}
-  ) knn
-  JOIN items i ON i.id = knn.item_id
-  ORDER BY knn._score
+spec:
+  query: |
+    SELECT i.id, i.name, i.category, knn._score
+    FROM sqlite_knn(
+      'vec_items',
+      'embedding',
+      candle('models/generated/bge-small-en-v1.5', {query}),
+      {k}
+    ) knn
+    JOIN items i ON i.id = knn.item_id
+    ORDER BY knn._score

@@ -312,15 +312,16 @@ mod tests {
     async fn create_test_pipeline() -> StandardPipeline {
         let temp_dir = TempDir::new().unwrap();
         let pipeline_content = r#"
+kind: pipeline
 metadata:
   name: "test-pipeline"
   version: "1.0.0"
   description: "Test pipeline for server testing"
-
-query: |
-  SELECT date
-  FROM test_data
-  WHERE date >= {date_filter}
+spec:
+  query: |
+    SELECT date
+    FROM test_data
+    WHERE date >= {date_filter}
 "#;
 
         let pipeline_path = temp_dir.path().join("test-pipeline.yaml");

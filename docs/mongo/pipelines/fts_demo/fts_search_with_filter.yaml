@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "fts-search-with-filter"
   version: "1.0.0"
@@ -10,8 +12,9 @@ metadata:
 #   {team_id} - Team ID to filter by
 #   {limit}   - Maximum number of results to return
 
-query: |
-  SELECT "dataId", "teamId", "datasetId", "collectionId", "fullTextToken", _score
-  FROM mongo_fts('dataset_data_texts', {query}, {limit})
-  WHERE "teamId" = {team_id}
-  ORDER BY _score DESC
+spec:
+  query: |
+    SELECT "dataId", "teamId", "datasetId", "collectionId", "fullTextToken", _score
+    FROM mongo_fts('dataset_data_texts', {query}, {limit})
+    WHERE "teamId" = {team_id}
+    ORDER BY _score DESC

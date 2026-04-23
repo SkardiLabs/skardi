@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-search"
   version: "1.0.0"
@@ -14,11 +16,12 @@ metadata:
 # Requires: --features candle
 # Model: BAAI/bge-small-en-v1.5 (384 dims) — download with setup.py
 
-query: |
-  SELECT item_id, _score
-  FROM sqlite_knn(
-    'vec_items',
-    'embedding',
-    candle('models/generated/bge-small-en-v1.5', {query}),
-    {k}
-  )
+spec:
+  query: |
+    SELECT item_id, _score
+    FROM sqlite_knn(
+      'vec_items',
+      'embedding',
+      candle('models/generated/bge-small-en-v1.5', {query}),
+      {k}
+    )

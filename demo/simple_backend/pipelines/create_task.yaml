@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "create-task"
   version: "1.0.0"
@@ -7,6 +9,7 @@ metadata:
 #   {user_id} - Owner user ID
 #   {title}   - Task title
 
-query: |
-  INSERT INTO tasks (user_id, title)
-  VALUES ({user_id}, {title})
+spec:
+  query: |
+    INSERT INTO tasks (user_id, title)
+    VALUES ({user_id}, {title})

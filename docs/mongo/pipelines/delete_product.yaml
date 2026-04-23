@@ -1,7 +1,10 @@
+kind: pipeline
+
 metadata:
   name: "delete_product"
   version: "1.0"
   description: "Delete a product from the MongoDB products collection by product ID"
 
-query: |
-  DELETE FROM products WHERE product_id = {product_id}
+spec:
+  query: |
+    DELETE FROM products WHERE product_id = {product_id}

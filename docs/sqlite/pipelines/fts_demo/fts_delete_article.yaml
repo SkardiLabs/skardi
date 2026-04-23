@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-fts-delete-article"
   version: "1.0.0"
@@ -8,5 +10,6 @@ metadata:
 # Parameters:
 #   {title} - Title of the article to delete
 
-query: |
-  DELETE FROM articles_fts WHERE title = {title}
+spec:
+  query: |
+    DELETE FROM articles_fts WHERE title = {title}

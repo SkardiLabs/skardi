@@ -1,31 +1,38 @@
-data_sources:
-  # SQLite data sources
-  - name: "users"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "docs/sqlite/demo.db"
-    description: "SQLite users table"
-    options:
-      table: "users"
+kind: context
 
-  - name: "orders"
-    type: "sqlite"
-    path: "docs/sqlite/demo.db"
-    description: "SQLite orders table"
-    options:
-      table: "orders"
+metadata:
+  name: ctx_sqlite_demo
+  version: 1.0.0
 
-  - name: "user_order_stats"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "docs/sqlite/demo.db"
-    description: "SQLite table for aggregated user order statistics"
-    options:
-      table: "user_order_stats"
+spec:
+  data_sources:
+    # SQLite data sources
+    - name: "users"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "docs/sqlite/demo.db"
+      description: "SQLite users table"
+      options:
+        table: "users"
 
-  # CSV data source (for federated query demo)
-  - name: "csv_orders"
-    type: "csv"
-    access_mode: "read_only"
-    path: "docs/sample_data/orders.csv"
-    description: "CSV file containing order data"
+    - name: "orders"
+      type: "sqlite"
+      path: "docs/sqlite/demo.db"
+      description: "SQLite orders table"
+      options:
+        table: "orders"
+
+    - name: "user_order_stats"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "docs/sqlite/demo.db"
+      description: "SQLite table for aggregated user order statistics"
+      options:
+        table: "user_order_stats"
+
+    # CSV data source (for federated query demo)
+    - name: "csv_orders"
+      type: "csv"
+      access_mode: "read_only"
+      path: "docs/sample_data/orders.csv"
+      description: "CSV file containing order data"

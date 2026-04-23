@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "mysql-catalog-user-order-summary"
   version: "1.0.0"
@@ -8,13 +10,14 @@ metadata:
 # Parameters:
 #   {min_orders} - Only return users with at least this many orders
 
-query: |
-  SELECT
-    u.name                  AS user_name,
-    COUNT(o.id)             AS total_orders,
-    SUM(o.amount)           AS total_spent
-  FROM mydb_catalog.mydb.users  u
-  INNER JOIN mydb_catalog.mydb.orders o ON u.id = o.user_id
-  GROUP BY u.id, u.name
-  HAVING COUNT(o.id) >= {min_orders}
-  ORDER BY total_spent DESC
+spec:
+  query: |
+    SELECT
+      u.name                  AS user_name,
+      COUNT(o.id)             AS total_orders,
+      SUM(o.amount)           AS total_spent
+    FROM mydb_catalog.mydb.users  u
+    INNER JOIN mydb_catalog.mydb.orders o ON u.id = o.user_id
+    GROUP BY u.id, u.name
+    HAVING COUNT(o.id) >= {min_orders}
+    ORDER BY total_spent DESC

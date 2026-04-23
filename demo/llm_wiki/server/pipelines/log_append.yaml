@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-log-append"
   version: "1.0.0"
@@ -12,11 +14,12 @@ metadata:
 #   {slug}       - Related wiki page slug, or "" if not page-specific
 #   {message}    - Free-form markdown message describing the event
 
-query: |
-  INSERT INTO wikidb.public.wiki_log (event_type, slug, message, created_at)
-  VALUES (
-    {event_type},
-    {slug},
-    {message},
-    now()
-  )
+spec:
+  query: |
+    INSERT INTO wikidb.public.wiki_log (event_type, slug, message, created_at)
+    VALUES (
+      {event_type},
+      {slug},
+      {message},
+      now()
+    )

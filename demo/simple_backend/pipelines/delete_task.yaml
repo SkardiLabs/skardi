@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "delete-task"
   version: "1.0.0"
@@ -6,5 +8,6 @@ metadata:
 # Parameters:
 #   {id} - Task ID to delete
 
-query: |
-  DELETE FROM tasks WHERE id = {id}
+spec:
+  query: |
+    DELETE FROM tasks WHERE id = {id}

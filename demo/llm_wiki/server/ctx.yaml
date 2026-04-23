@@ -1,16 +1,23 @@
-data_sources:
-  # Catalog mode: this Postgres database is dedicated to the LLM Wiki demo,
-  # so we register the entire `public` schema in one entry instead of listing
-  # `wiki_pages` and `wiki_log` individually. Skardi introspects
-  # information_schema and exposes every BASE TABLE as
-  #   wikidb.<schema>.<table>, e.g. wikidb.public.wiki_pages
-  - name: "wikidb"
-    type: "postgres"
-    hierarchy_level: "catalog"
-    access_mode: "read_write"
-    connection_string: "postgresql://localhost:5432/wikidb?sslmode=disable"
-    description: "LLM Wiki catalog — wiki_pages (content + pgvector + FTS) and wiki_log"
-    options:
-      allowed_schemas: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
+kind: context
+
+metadata:
+  name: server-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # Catalog mode: this Postgres database is dedicated to the LLM Wiki demo,
+    # so we register the entire `public` schema in one entry instead of listing
+    # `wiki_pages` and `wiki_log` individually. Skardi introspects
+    # information_schema and exposes every BASE TABLE as
+    #   wikidb.<schema>.<table>, e.g. wikidb.public.wiki_pages
+    - name: "wikidb"
+      type: "postgres"
+      hierarchy_level: "catalog"
+      access_mode: "read_write"
+      connection_string: "postgresql://localhost:5432/wikidb?sslmode=disable"
+      description: "LLM Wiki catalog — wiki_pages (content + pgvector + FTS) and wiki_log"
+      options:
+        allowed_schemas: "public"
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"

@@ -1,13 +1,16 @@
+kind: pipeline
+
 metadata:
   name: order-inventory-join-demo
   version: 1.0.0
   description: Demonstrates federated SQL join across two CSV data sources
 
-query: |
-    SELECT o.order_id, o.product, o.amount, o.order_date, i.warehouse, i.quantity as stock_quantity
-    FROM orders AS o
-    JOIN inventory AS i
-    ON o.product = i.product
-    WHERE ({product} IS NULL OR o.product = {product}) AND ({warehouse} IS NULL OR i.warehouse = {warehouse})
-    ORDER BY o.order_date
-    LIMIT {limit}
+spec:
+  query: |
+      SELECT o.order_id, o.product, o.amount, o.order_date, i.warehouse, i.quantity as stock_quantity
+      FROM orders AS o
+      JOIN inventory AS i
+      ON o.product = i.product
+      WHERE ({product} IS NULL OR o.product = {product}) AND ({warehouse} IS NULL OR i.warehouse = {warehouse})
+      ORDER BY o.order_date
+      LIMIT {limit}

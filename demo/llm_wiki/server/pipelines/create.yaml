@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-create"
   version: "1.0.0"
@@ -14,13 +16,14 @@ metadata:
 #   {page_type} - entity | concept | summary | index | schema
 #   {content}   - Markdown body (used for both FTS and vector embedding)
 
-query: |
-  INSERT INTO wikidb.public.wiki_pages (slug, title, page_type, content, embedding, updated_at)
-  VALUES (
-    {slug},
-    {title},
-    {page_type},
-    {content},
-    candle('models/generated/bge-small-en-v1.5', {content}),
-    now()
-  )
+spec:
+  query: |
+    INSERT INTO wikidb.public.wiki_pages (slug, title, page_type, content, embedding, updated_at)
+    VALUES (
+      {slug},
+      {title},
+      {page_type},
+      {content},
+      candle('models/generated/bge-small-en-v1.5', {content}),
+      now()
+    )

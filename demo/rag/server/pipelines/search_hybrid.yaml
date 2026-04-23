@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "search-hybrid"
   version: "1.0.0"
@@ -15,21 +17,22 @@ metadata:
 #   {text_weight}    - Weight for text results (e.g. 0.5)
 #   {limit}          - Maximum number of results
 
-query: |
-  SELECT
-    COALESCE(v.id, t.id) AS id,
-    COALESCE(v.content, t.content) AS content,
-    COALESCE({vector_weight} / (60.0 + v.rk), 0)
-      + COALESCE({text_weight} / (60.0 + t.rk), 0) AS rrf_score
-  FROM (
-    SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
-    FROM pg_knn('documents', 'embedding',
-        candle('models/generated/bge-small-en-v1.5', {query}),
-        '<=>', 80)
-  ) v
-  FULL OUTER JOIN (
-    SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
-    FROM pg_fts('documents', 'content', {text_query}, 60)
-  ) t ON v.id = t.id
-  ORDER BY rrf_score DESC
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT
+      COALESCE(v.id, t.id) AS id,
+      COALESCE(v.content, t.content) AS content,
+      COALESCE({vector_weight} / (60.0 + v.rk), 0)
+        + COALESCE({text_weight} / (60.0 + t.rk), 0) AS rrf_score
+    FROM (
+      SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+      FROM pg_knn('documents', 'embedding',
+          candle('models/generated/bge-small-en-v1.5', {query}),
+          '<=>', 80)
+    ) v
+    FULL OUTER JOIN (
+      SELECT id, content, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+      FROM pg_fts('documents', 'content', {text_query}, 60)
+    ) t ON v.id = t.id
+    ORDER BY rrf_score DESC
+    LIMIT {limit}

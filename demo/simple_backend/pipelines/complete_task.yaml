@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "complete-task"
   version: "1.0.0"
@@ -6,5 +8,6 @@ metadata:
 # Parameters:
 #   {id} - Task ID to mark done
 
-query: |
-  UPDATE tasks SET done = 1 WHERE id = {id}
+spec:
+  query: |
+    UPDATE tasks SET done = 1 WHERE id = {id}

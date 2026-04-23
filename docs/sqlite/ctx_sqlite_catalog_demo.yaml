@@ -1,13 +1,20 @@
-data_sources:
-  # Expose the entire demo.db SQLite database as a DataFusion catalog.
-  # Every non-system table and view is registered automatically.
-  # Query tables with the three-part reference: demo_catalog.main.<table>
-  - name: "demo_catalog"
-    type: "sqlite"
-    hierarchy_level: "catalog"
-    path: "docs/sqlite/demo.db"
-    description: "Entire demo.db SQLite database registered as a named DataFusion catalog"
-    # options:
-    #   Restrict to specific schemas (optional — SQLite schema is always "main"):
-    #   allowed_schemas: "main"
-    #   busy_timeout_ms: "5000"
+kind: context
+
+metadata:
+  name: ctx_sqlite_catalog_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # Expose the entire demo.db SQLite database as a DataFusion catalog.
+    # Every non-system table and view is registered automatically.
+    # Query tables with the three-part reference: demo_catalog.main.<table>
+    - name: "demo_catalog"
+      type: "sqlite"
+      hierarchy_level: "catalog"
+      path: "docs/sqlite/demo.db"
+      description: "Entire demo.db SQLite database registered as a named DataFusion catalog"
+      # options:
+      #   Restrict to specific schemas (optional — SQLite schema is always "main"):
+      #   allowed_schemas: "main"
+      #   busy_timeout_ms: "5000"

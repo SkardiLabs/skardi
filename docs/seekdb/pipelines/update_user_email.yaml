@@ -1,6 +1,9 @@
+kind: pipeline
+
 metadata:
   name: "seekdb-update-user-email"
   version: "1.0"
   description: "Update a user's email address in SeekDB."
 
-query: "UPDATE users SET email = {email} WHERE name = {name}"
+spec:
+  query: "UPDATE users SET email = {email} WHERE name = {name}"

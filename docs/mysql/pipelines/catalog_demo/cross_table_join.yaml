@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "mysql-catalog-cross-table-join"
   version: "1.0.0"
@@ -9,13 +11,14 @@ metadata:
 # Parameters:
 #   {limit} - Maximum number of rows to return
 
-query: |
-  SELECT
-    u.name      AS user_name,
-    u.email     AS user_email,
-    o.product,
-    o.amount
-  FROM mydb_catalog.mydb.users  u
-  INNER JOIN mydb_catalog.mydb.orders o ON u.id = o.user_id
-  ORDER BY o.id
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT
+      u.name      AS user_name,
+      u.email     AS user_email,
+      o.product,
+      o.amount
+    FROM mydb_catalog.mydb.users  u
+    INNER JOIN mydb_catalog.mydb.orders o ON u.id = o.user_id
+    ORDER BY o.id
+    LIMIT {limit}
