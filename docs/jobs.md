@@ -1,11 +1,12 @@
-# Batch Jobs (`kind: job`)
+# Offline Jobs (`kind: job`)
 
-Batch jobs in Skardi are parameterized SQL queries whose rows are written to
-a durable destination — a Lance dataset on disk, or a read-write database
-table your pipelines already know how to read from. They're the "async
-sibling" of pipelines: where a pipeline is a synchronous HTTP
-request/response, a job runs in the background, persists a run row to a
-SQLite ledger, and is polled by run id.
+Offline jobs in Skardi are parameterized SQL queries whose rows are written
+to a durable destination — a Lance dataset on disk, or a read-write database
+table your pipelines already know how to read from. They're the offline,
+async peer of online-serving pipelines: where a pipeline is a synchronous
+HTTP request / response (the read path agents hit at tool-call time), a job
+runs in the background, persists a run row to a SQLite ledger, and is
+polled by run id (the write path agents use to commit durable results).
 
 **In one sentence:** a pipeline answers a query; a job commits the answer
 somewhere you can query again later.

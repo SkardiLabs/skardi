@@ -6,8 +6,7 @@
 **Spark for Agents — a data platform that gives AI agents full data autonomy so every dataset in your stack becomes something an agent can actually use.**
 
 <a href="https://skardilabs.github.io/skardi-docs/">Documentation</a> •
-<a href="docs/spark_for_agents.md">"Spark for Agents" narrative</a> •
-<a href="#public-roadmap">Public roadmap</a> •
+<a href="#roadmap">Roadmap</a> •
 <a href="https://discord.gg/S5YQQPEV2m">Discord</a>
 
 [License]: https://opensource.org/licenses/Apache-2.0
@@ -41,7 +40,7 @@ Skardi is an **open-source data platform for AI agents** — Pick any data in yo
 Skardi is **Spark for Agents**. Spark gave data teams a single engine over every storage format; the agent era needs the same, shaped for how agents actually work — schemas agents can *read*, outputs agents can *parse*, tools agents can *discover*, and writes agents can *trust*.
 
 - **`skardi` CLI** — federated SQL + parameterized pipelines as shell commands. Drop it into any agent that has a Bash tool (Claude Code, Cursor, custom loops) and it's wired.
-- **`skardi-server`** — declarative SQL pipelines served as REST endpoints, plus async batch writes into Lance or any read-write DB. The place long-running agent work lives.
+- **`skardi-server`** — two peer surfaces on one engine: **online serving** (declarative SQL pipelines as parameterized REST endpoints) and **offline jobs** (async batch writes into Lance or any read-write DB, with atomic commit + run ledger).
 - **Soon** — skills generation for auto-discovery, MCP binding for non-Claude hosts, a first-class **memory primitive** (structured + vector + FTS + provenance + TTL), lineage, and agent-scoped governance.
 
 > **Beta.** Skardi is under active development. APIs may move. Hit us on [Discord](https://discord.gg/S5YQQPEV2m) if you want to co-design a POC.
@@ -55,35 +54,57 @@ Agents don't lack intelligence — they lack **data autonomy**. Hand an LLM a ra
 Skardi closes that gap with three deliberate choices:
 
 1. **One engine over every source.** DataFusion-based single-node federation. An agent can `JOIN` a CSV against Postgres against a Lance dataset in one query.
-2. **Online serving and offline jobs, one declarative shape.** Pipelines serve parameterized SQL synchronously; jobs run the same SQL asynchronously into a durable destination (Lance or a read-write DB) with a run ledger and atomic commit — both share every binding (REST, shell, soon Claude skills + MCP).
+2. **Online serving.** Parameterized SQL served synchronously as REST endpoints; the low-latency read path every agent tool call hits.
+3. **Offline jobs.** The same SQL shape run asynchronously into a durable destination (Lance or a read-write DB), with a run ledger, atomic commit, and submit / poll / cancel; the write path that makes agent-initiated lake mutations safe. Online and offline share every binding (REST, shell, soon Claude skills + MCP), so adding a new surface is one codegen over both.
 
 Read the full narrative in [docs/spark_for_agents.md](docs/spark_for_agents.md).
 
 ---
 
-## Public Roadmap
+## Roadmap
 
-We're **building in public**, so you can see exactly where we are and what's next. The list below covers everything — foundations that already ship, work currently in flight, and the "Spark for Agents" primitives we're still building out. Help wanted on anything unchecked; open an issue or hop into Discord.
+We're **building in public**. `[x]` means shipped today, `[ ]` means open for contribution. Foundations, current work, and the "Spark for Agents" primitives we're still building out all live in one list — open an issue or hop into [Discord](https://discord.gg/S5YQQPEV2m) on anything unchecked.
 
-Status: ✅ shipped · 🚧 in progress · ⬜ planned
+`1` Federated SQL engine
+   - [x] DataFusion single-node federation across CSV, Parquet, JSON, S3 / GCS / Azure, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, SeekDB — all joinable in one query
+   - [x] Register by table, or load an entire DB (Postgres / MySQL / SQLite) as a DataFusion catalog — one config line either way
 
-| Status | Task |
-|:---:|---|
-| ✅ | **Federated SQL engine** — DataFusion single-node federation across CSV, Parquet, JSON, S3 / GCS / Azure, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, SeekDB — all joinable in a single query. |
-| ✅ | **Vector search** — `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), Lance KNN, SeekDB HNSW. |
-| ✅ | **Full-text search** — `pg_fts`, `sqlite_fts`, Lance BM25 inverted indexes, SeekDB FULLTEXT; RRF hybrid search in plain SQL. |
-| ✅ | **Inline embeddings** — `candle()` UDF (GGUF / Candle / remote embed APIs) runs directly inside SQL, so content + vector stay on the same row atomically. |
-| ✅ | **Online serving** — `skardi-server` turns pipeline YAML into parameterized REST endpoints with inferred request / response schemas and a built-in dashboard. |
-| ✅ | **CLI federated SQL** — `skardi query` against local files, remote object stores, datalake formats, and databases with no server required. |
-| ✅ | **CLI pipeline binding + aliases** — `skardi run <pipeline> --param=…` and user-defined verb aliases; pipeline YAML as the single source of truth. ([#90](https://github.com/SkardiLabs/skardi/pull/90)) |
-| ✅ | **Session auth** — drop-in user auth via [better-auth](https://www.better-auth.com/) backed by SQLite. |
-| ✅ | **Observability** — OpenTelemetry traces / metrics / logs with a pre-configured Grafana stack. |
-| 🚧 | **Pipelines-as-jobs** — async `kind: job` batch execution, status, submit/poll/cancel; Lance + SQL-DML destinations. ([#98](https://github.com/SkardiLabs/skardi/pull/98), in review) |
-| ⬜ | **Skills generator** — `skardi skills generate --ctx <ctx.yaml> --out .claude/skills/` emits a skill Markdown per pipeline for Claude Code / Desktop auto-discovery. |
-| ⬜ | **Catalog with semantics** — NL `description` field on catalog / table / column; an agent-callable `describe` pipeline. |
-| ⬜ | **Basic lineage capture** — `agent_id`, `session_id`, `tool_call_id`, `timestamp` on writes; queryable from metadata tables. |
-| ⬜ | **Agent identity passthrough** — any binding injects client identity into a SQL context var pipelines can read. |
-| ⬜ | **Snapshot-as-branch / agent checkpoints** — Iceberg / Lance-backed; `git checkout`-like semantics for destructive agent experiments. |
+`2` Retrieval primitives
+   - [x] Vector search — `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), Lance KNN, SeekDB HNSW
+   - [x] Full-text search — `pg_fts`, `sqlite_fts`, Lance BM25 inverted indexes, SeekDB FULLTEXT
+   - [x] Hybrid search — RRF merge of FTS + KNN in plain SQL
+   - [x] Inline embeddings — `candle()` UDF (GGUF / Candle / remote embed APIs) runs directly inside SQL; content + vector stay on the same row atomically
+   - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
+   - [ ] Memory primitive — hybrid access + TTL + provenance + consolidation collapsed into one declarative macro
+
+`3` Online serving (pipelines)
+   - [x] Declarative YAML → parameterized REST endpoint with inferred request / response schema
+   - [x] Built-in pipeline dashboard
+   - [x] CLI pipeline binding + aliases — `skardi run <pipeline> --param=…` and user-defined verb aliases ([#90](https://github.com/SkardiLabs/skardi/pull/90))
+   - [x] CLI federated SQL — `skardi query` against files, object stores, datalake formats, and databases with no server required
+
+`4` Offline jobs
+   - [x] Async batch execution with submit / poll / cancel ([#98](https://github.com/SkardiLabs/skardi/pull/98))
+   - [x] Lance dataset destinations with atomic commit + crash recovery
+   - [x] SQL-DML destinations (Postgres / MySQL / SQLite)
+   - [x] SQLite-backed run ledger with submit-time schema diff
+
+`5` Agent-facing bindings
+   - [x] REST — every pipeline served as a parameterized HTTP endpoint
+   - [x] Shell — every pipeline runnable as a `skardi` command; works in Claude Code, Cursor, and any agent with a Bash tool
+   - [ ] Skills generator — `skardi skills generate --ctx <ctx.yaml> --out .claude/skills/` emits a skill Markdown per pipeline for Claude Code / Desktop auto-discovery
+   - [ ] MCP binding — same pipeline YAML projected to MCP tools for non-Claude hosts
+
+`6` Governance & lineage
+   - [ ] Catalog with semantics — NL `description` on catalog / table / column; an agent-callable `describe` pipeline
+   - [ ] Lineage capture — `agent_id`, `session_id`, `tool_call_id`, `timestamp` on writes; queryable from metadata tables
+   - [ ] Agent identity passthrough — any binding injects client identity into a SQL context var pipelines can read
+   - [ ] Snapshot-as-branch / agent checkpoints — Iceberg / Lance-backed; `git checkout`-like semantics for destructive agent experiments
+
+`7` Ops
+   - [x] Session auth — drop-in user auth via [better-auth](https://www.better-auth.com/) backed by SQLite
+   - [x] Observability — OpenTelemetry traces / metrics / logs with a pre-configured Grafana stack
+   - [x] Docker + pre-built binaries — Linux x86_64 / ARM64, macOS ARM64
 
 ---
 
@@ -101,8 +122,8 @@ Status: ✅ shipped · 🚧 in progress · ⬜ planned
 ### Agent-facing surfaces
 - **CLI `skardi run <pipeline>`** — parameterized pipeline invocation from any shell; works in Claude Code / Cursor / any agent with a Bash tool.
 - **User-defined aliases** — `skardi grep "…"` → `run wiki-search-hybrid`. Collapses multi-line SQL into agent-ergonomic verbs.
-- **Declarative REST pipelines** — YAML → parameterized HTTP endpoint, with an inferred request / response schema and a built-in dashboard.
-- **Batch Jobs** (in review, [#98](https://github.com/SkardiLabs/skardi/pull/98)) — async pipeline that commits to Lance or a DB destination, with a SQLite run ledger and submit / poll / cancel.
+- **Online serving** — YAML → parameterized HTTP endpoint, with an inferred request / response schema and a built-in dashboard.
+- **Offline jobs** — async pipeline that commits to Lance or a DB destination, with a SQLite run ledger and submit / poll / cancel. ([#98](https://github.com/SkardiLabs/skardi/pull/98))
 
 ### Ops
 - **Session auth** — drop-in user auth via [better-auth](https://www.better-auth.com/) backed by SQLite.
@@ -154,7 +175,7 @@ skardi grep "turing machine computation" --limit=10
 
 Drop `skardi` into a Claude Code or Cursor session and the agent can already use any pipeline you've declared as a tool via its Bash integration. No MCP config, no separate server — that's the MVP design intent.
 
-### Skardi Server — pipelines as REST, plus batch jobs
+### Skardi Server — online serving + offline jobs
 
 ```bash
 cargo run --bin skardi-server -- \
@@ -178,7 +199,8 @@ skardi job status <run_id>
 Full reference:
 - **CLI** — [crates/cli/README.md](crates/cli/README.md)
 - **Server** — [docs/server.md](docs/server.md)
-- **Jobs** — [docs/jobs.md](docs/jobs.md)
+- **Pipelines (online serving)** — [docs/pipelines.md](docs/pipelines.md)
+- **Jobs (offline batch)** — [docs/jobs.md](docs/jobs.md)
 - **Spark for Agents narrative** — [docs/spark_for_agents.md](docs/spark_for_agents.md)
 
 ---

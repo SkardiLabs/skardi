@@ -11,7 +11,7 @@ Today's data stack was built for humans writing queries and ops teams maintainin
 The fix isn't another agent framework. It's a **data platform designed for agents from the first line of code**. That's what Skardi is, and that's why we frame it as "Spark for Agents":
 
 - **Spark** gave data teams a single execution engine that worked over every storage format — HDFS, Parquet, Hive, JDBC, Iceberg — with one DataFrame API. Before Spark, every source had its own SDK and every join was a multi-day project.
-- **Skardi** gives agents the same thing, shaped for the agent era: one DataFusion-based engine that federates CSV, Parquet, S3, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, and SeekDB; one pipeline YAML format that projects out to REST, shell, skills, and MCP; one set of primitives (`candle()`, `pg_knn`, `pg_fts`, `kind: job`) that agents actually need.
+- **Skardi** gives agents the same thing, shaped for the agent era: one DataFusion-based engine that federates CSV, Parquet, S3, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, and SeekDB; one declarative YAML format covering both online serving and offline jobs, projecting out to REST, shell, skills, and MCP; one set of SQL primitives (`candle()`, `pg_knn`, `pg_fts`) that agents actually need.
 
 ---
 
@@ -24,7 +24,7 @@ The hard problem lives underneath. It's the data layer.
 - **An agent cannot be autonomous if every new dataset requires a human to wire up an embedding pipeline, an index, and a query API.** Skardi's `candle()` UDF puts embedding inference directly inside SQL; `pg_knn` / `sqlite_knn` / Lance vector columns put retrieval in the same plan. One statement embeds, stores, and indexes.
 - **An agent cannot reason across data if every source has its own dialect and SDK.** Skardi is one SQL over eleven source types, with real `JOIN`s across them. That includes joining a Lance vector table against a Postgres reference table against a CSV of new inputs — in one query, in one process.
 - **An agent cannot discover tools if every endpoint is a hand-crafted one-off.** Skardi's pipeline YAML is the single source of truth — one file becomes a REST endpoint today, a `skardi run` shell command today, a Claude skill tomorrow, and an MCP tool shortly after. All surfaces stay in lockstep because they derive from the same spec.
-- **An agent cannot do durable work if every write is a fire-and-forget HTTP call.** Skardi's `kind: job` primitive commits async writes to Lance or a DB with a run ledger, submit/poll/cancel, crash recovery, and atomic failure semantics.
+- **An agent cannot do durable work if every write is a fire-and-forget HTTP call.** Skardi's offline jobs primitive commits async writes to Lance or a DB with a run ledger, submit / poll / cancel, crash recovery, and atomic failure semantics.
 
 None of the above is a model-level capability. All of it is data-platform plumbing. It's what Databricks built for humans and what nobody has built for agents yet. That's the gap.
 
@@ -48,7 +48,7 @@ So we ship shape-shifting primitives:
 
 - **`candle()` UDF** — embedding inference inline in SQL. Agents don't wire an embedding service; they write `candle('model-path', content)` and move on.
 - **`pg_knn` / `sqlite_knn` / `pg_fts` / `sqlite_fts`** — vector and text retrieval as SQL functions, joinable like any other relation. Hybrid search (RRF) is a JOIN, not a separate system.
-- **`kind: job`** — durable writes are a YAML declaration, not an orchestration framework.
+- **Online serving and offline jobs, one YAML shape** — the same parameterized SQL either answers synchronously over REST or commits asynchronously to a durable destination. Durable agent writes are a YAML declaration, not an orchestration framework.
 - **Memory primitive** (roadmap, v1.1) — hybrid access + TTL + provenance + consolidation collapsed into one declarative macro that expands to the right tables and pipelines.
 
 The test for "should this be a primitive" is: *would an agent need to hand-assemble three-to-five SQL statements to do this?* If yes, it's a primitive candidate. If no, it's application code.
@@ -104,7 +104,8 @@ We're building in public. If the thesis above resonates — or if it doesn't —
 
 The rest of this doc tree walks the concrete pieces:
 
-- [Server](server.md) — pipelines as REST.
-- [Jobs](jobs.md) — `kind: job` batch writes.
+- [Server](server.md) — the HTTP process that hosts both peer surfaces.
+- [Pipelines](pipelines.md) — online serving (parameterized SQL as REST).
+- [Jobs](jobs.md) — offline jobs (async batch writes to Lance or a DB).
 - [CLI](../crates/cli/README.md) — `skardi run`, aliases, federated SQL from the shell.
 - [llm_wiki demo](../demo/llm_wiki/) — the fullest end-to-end demonstration of agent autonomy on Skardi.

@@ -84,5 +84,5 @@ docs/embeddings/
 ## See Also
 
 - [docs/lance/](../lance/) — `lance_knn()` reference and indexing options for the vector store side of the pipeline.
-- [docs/server.md](../server.md) — pipeline file format, parameter inference, and the HTTP endpoint contract.
+- [docs/pipelines.md](../pipelines.md) — pipeline YAML shape, parameter inference, and the HTTP endpoint contract.
 - [demo/rag/](../../demo/rag/) — full RAG pipeline that uses one of these embedding backends end-to-end.
