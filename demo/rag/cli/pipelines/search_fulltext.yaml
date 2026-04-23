@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "search-fulltext"
   version: "1.0.0"
@@ -10,7 +12,8 @@ metadata:
 #   {query}  - FTS5 query (term, "phrase", +must -mustnot, fuzzy~1)
 #   {limit}  - Maximum number of results
 
-query: |
-  SELECT id, content, _score
-  FROM sqlite_fts('rag.main.documents_fts', 'content', {query}, {limit})
-  ORDER BY _score DESC
+spec:
+  query: |
+    SELECT id, content, _score
+    FROM sqlite_fts('rag.main.documents_fts', 'content', {query}, {limit})
+    ORDER BY _score DESC

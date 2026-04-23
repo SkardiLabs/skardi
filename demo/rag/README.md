@@ -340,14 +340,21 @@ connection pool, and exposes each table under `<catalog>.main.<table>` for
 both SQL and `sqlite_knn` / `sqlite_fts` lookups:
 
 ```yaml
-data_sources:
-  - name: rag
-    type: sqlite
-    path: demo/rag/rag.db
-    access_mode: read_write
-    hierarchy_level: catalog
-    options:
-      extensions_env: SQLITE_VEC_PATH
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: rag
+      type: sqlite
+      path: demo/rag/rag.db
+      access_mode: read_write
+      hierarchy_level: catalog
+      options:
+        extensions_env: SQLITE_VEC_PATH
 ```
 
 The pipeline YAMLs in [cli/pipelines/](cli/pipelines/) use the same

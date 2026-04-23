@@ -1,6 +1,9 @@
+kind: pipeline
+
 metadata:
   name: "seekdb-delete-user"
   version: "1.0"
   description: "Delete a user by name in SeekDB."
 
-query: "DELETE FROM users WHERE name = {name}"
+spec:
+  query: "DELETE FROM users WHERE name = {name}"

@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-insert-item"
   version: "1.0.0"
@@ -10,6 +12,7 @@ metadata:
 #   {name}     - Item name
 #   {category} - Item category
 
-query: |
-  INSERT INTO items (id, name, category)
-  VALUES ({id}, {name}, {category})
+spec:
+  query: |
+    INSERT INTO items (id, name, category)
+    VALUES ({id}, {name}, {category})

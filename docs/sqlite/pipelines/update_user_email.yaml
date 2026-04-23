@@ -1,7 +1,10 @@
+kind: pipeline
+
 metadata:
   name: "update_user_email"
   version: "1.0"
   description: "Update a user's email address by name"
 
-query: |
-  UPDATE users SET email = {new_email} WHERE name = {name}
+spec:
+  query: |
+    UPDATE users SET email = {new_email} WHERE name = {name}

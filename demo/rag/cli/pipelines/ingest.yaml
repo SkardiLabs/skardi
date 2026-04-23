@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "ingest"
   version: "1.0.0"
@@ -14,10 +16,11 @@ metadata:
 #   {doc_id}   - Integer primary key for the documents table
 #   {content}  - Document text (also the source for the embedding)
 
-query: |
-  INSERT INTO rag.main.documents (id, content, embedding)
-  SELECT id, content,
-         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
-  FROM (
-    SELECT {doc_id} AS id, {content} AS content
-  ) AS t
+spec:
+  query: |
+    INSERT INTO rag.main.documents (id, content, embedding)
+    SELECT id, content,
+           vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+    FROM (
+      SELECT {doc_id} AS id, {content} AS content
+    ) AS t

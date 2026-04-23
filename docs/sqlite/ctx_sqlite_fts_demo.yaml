@@ -1,8 +1,15 @@
-data_sources:
-  - name: "articles_fts"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "docs/sqlite/fts_demo.db"
-    description: "SQLite FTS5 virtual table for full-text search"
-    options:
-      table: "articles_fts"
+kind: context
+
+metadata:
+  name: ctx_sqlite_fts_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "articles_fts"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "docs/sqlite/fts_demo.db"
+      description: "SQLite FTS5 virtual table for full-text search"
+      options:
+        table: "articles_fts"

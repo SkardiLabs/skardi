@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "seekdb-fts-search-with-filter"
   version: "1.0.0"
@@ -10,8 +12,9 @@ metadata:
 #   {category} - Category to filter by
 #   {limit}    - Maximum number of results to return
 
-query: |
-  SELECT title, body, category, _score
-  FROM seekdb_fts('articles', 'body', {query}, {limit})
-  WHERE category = {category}
-  ORDER BY _score DESC
+spec:
+  query: |
+    SELECT title, body, category, _score
+    FROM seekdb_fts('articles', 'body', {query}, {limit})
+    WHERE category = {category}
+    ORDER BY _score DESC

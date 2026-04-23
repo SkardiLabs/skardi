@@ -30,14 +30,21 @@ Top-N personalized recommendations
 ## Data Sources
 
 ```yaml
-data_sources:
-  - name: "movies"
-    type: "csv"
-    path: "docs/sample_data/movies.csv"
+kind: context
 
-  - name: "movie_embeddings"
-    type: "lance"
-    path: "data/movie_embeddings.lance"
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "movies"
+      type: "csv"
+      path: "docs/sample_data/movies.csv"
+
+    - name: "movie_embeddings"
+      type: "lance"
+      path: "data/movie_embeddings.lance"
 ```
 
 ## Pipeline

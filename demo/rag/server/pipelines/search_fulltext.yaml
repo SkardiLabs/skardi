@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "search-fulltext"
   version: "1.0.0"
@@ -12,7 +14,8 @@ metadata:
 #   {query} - Search terms (web-search syntax: AND, "phrase", or, -not)
 #   {limit} - Maximum number of results
 
-query: |
-  SELECT id, content, _score
-  FROM pg_fts('documents', 'content', {query}, {limit})
-  ORDER BY _score DESC
+spec:
+  query: |
+    SELECT id, content, _score
+    FROM pg_fts('documents', 'content', {query}, {limit})
+    ORDER BY _score DESC

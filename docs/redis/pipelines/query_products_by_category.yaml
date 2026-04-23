@@ -1,6 +1,9 @@
+kind: pipeline
+
 metadata:
   name: "query_products_by_category"
   version: "1.0"
   description: "Query products by category (non-key column filter, full scan)"
 
-query: "SELECT * FROM products WHERE category = {category}"
+spec:
+  query: "SELECT * FROM products WHERE category = {category}"

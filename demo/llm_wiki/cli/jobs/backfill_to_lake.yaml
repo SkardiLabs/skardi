@@ -17,21 +17,20 @@ metadata:
 #   {slug_prefix}  — LIKE pattern, e.g. "entity/%" or "%"
 #   {limit}        — hard cap so a bad pattern can't rewrite everything
 
-query: |
-  SELECT slug, title, page_type, content, updated_at
-  FROM wiki.main.wiki_pages
-  WHERE slug LIKE {slug_prefix}
-  ORDER BY updated_at DESC
-  LIMIT {limit}
-
-destination:
-  # `wiki_lake` must be registered as a Lance data source in the server's
-  # ctx.yaml (see docs/jobs.md for the ctx stanza). The first submit will
-  # create the dataset with the query's output schema.
-  table: "wiki_lake"
-  mode: append
-  create_if_missing: true
-
-execution:
-  # 10 minute wall-clock cap; bumps for production backfills.
-  timeout_ms: 600000
+spec:
+  query: |
+    SELECT slug, title, page_type, content, updated_at
+    FROM wiki.main.wiki_pages
+    WHERE slug LIKE {slug_prefix}
+    ORDER BY updated_at DESC
+    LIMIT {limit}
+  destination:
+    # `wiki_lake` must be registered as a Lance data source in the server's
+    # ctx.yaml (see docs/jobs.md for the ctx stanza). The first submit will
+    # create the dataset with the query's output schema.
+    table: "wiki_lake"
+    mode: append
+    create_if_missing: true
+  execution:
+    # 10 minute wall-clock cap; bumps for production backfills.
+    timeout_ms: 600000

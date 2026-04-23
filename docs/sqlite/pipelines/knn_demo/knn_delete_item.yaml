@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-delete-item"
   version: "1.0.0"
@@ -8,5 +10,6 @@ metadata:
 # Parameters:
 #   {id} - Item ID to delete
 
-query: |
-  DELETE FROM items WHERE id = {id}
+spec:
+  query: |
+    DELETE FROM items WHERE id = {id}

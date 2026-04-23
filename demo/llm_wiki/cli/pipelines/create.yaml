@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "wiki-create"
   version: "1.0.0"
@@ -20,11 +22,12 @@ metadata:
 #   {page_type}  - One of entity | concept | summary | index | schema
 #   {content}    - Markdown body (also the source for the embedding)
 
-query: |
-  INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding, updated_at)
-  SELECT slug, title, page_type, content,
-         vec_to_binary(candle('models/generated/bge-small-en-v1.5', content)),
-         CAST(now() AS VARCHAR)
-  FROM (
-    SELECT {slug} AS slug, {title} AS title, {page_type} AS page_type, {content} AS content
-  ) AS t
+spec:
+  query: |
+    INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding, updated_at)
+    SELECT slug, title, page_type, content,
+           vec_to_binary(candle('models/generated/bge-small-en-v1.5', content)),
+           CAST(now() AS VARCHAR)
+    FROM (
+      SELECT {slug} AS slug, {title} AS title, {page_type} AS page_type, {content} AS content
+    ) AS t

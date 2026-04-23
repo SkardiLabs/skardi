@@ -21,15 +21,19 @@ The example uses a `products.csv` dataset with 10,000+ product records containin
 ### Schema Structure
 ```yaml
 # Simple, minimal schema - everything else is inferred automatically
+
+kind: pipeline
+
 metadata:
   name: "product-search-demo"
   version: "1.0.0"
   description: "Demonstrates SQL serving pipeline"
 
-query: |
-  SELECT columns FROM table
-  WHERE condition = {parameter}
-  LIMIT {limit}
+spec:
+  query: |
+    SELECT columns FROM table
+    WHERE condition = {parameter}
+    LIMIT {limit}
 ```
 
 ### What's Automatically Inferred

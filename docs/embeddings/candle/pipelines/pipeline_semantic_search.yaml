@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: semantic-search
   version: 1.0.0
@@ -11,12 +13,13 @@ metadata:
 #   {query} - Natural language search query (embedded on the fly)
 #   {k}     - Number of nearest neighbours to return
 
-query: |
-  SELECT id, title, content, _distance
-  FROM lance_knn(
-    'doc_embeddings',
-    'embedding',
-    candle('models/generated/bge-small-en-v1.5', {query}),
-    {k}
-  )
-  ORDER BY _distance
+spec:
+  query: |
+    SELECT id, title, content, _distance
+    FROM lance_knn(
+      'doc_embeddings',
+      'embedding',
+      candle('models/generated/bge-small-en-v1.5', {query}),
+      {k}
+    )
+    ORDER BY _distance

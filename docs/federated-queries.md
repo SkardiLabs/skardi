@@ -7,22 +7,25 @@ One of Skardi's most powerful features is the ability to JOIN data across differ
 Join a CSV file with a PostgreSQL table and write results back to PostgreSQL:
 
 ```yaml
+kind: pipeline
+
 metadata:
   name: "federated_join_and_insert"
   version: "1.0"
 
-query: |
-  INSERT INTO user_order_stats (user_id, user_name, total_orders, total_spent)
-  SELECT
-    u.id as user_id,
-    u.name as user_name,
-    COUNT(o.order_id) as total_orders,
-    SUM(o.amount) as total_spent
-  FROM users u                    -- PostgreSQL table
-  INNER JOIN csv_orders o         -- CSV file
-    ON u.id = o.user_id
-  WHERE u.name = {name}
-  GROUP BY u.id, u.name
+spec:
+  query: |
+    INSERT INTO user_order_stats (user_id, user_name, total_orders, total_spent)
+    SELECT
+      u.id as user_id,
+      u.name as user_name,
+      COUNT(o.order_id) as total_orders,
+      SUM(o.amount) as total_spent
+    FROM users u                    -- PostgreSQL table
+    INNER JOIN csv_orders o         -- CSV file
+      ON u.id = o.user_id
+    WHERE u.name = {name}
+    GROUP BY u.id, u.name
 ```
 
 ## More Examples

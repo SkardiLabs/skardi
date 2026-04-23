@@ -1,20 +1,27 @@
-data_sources:
-  - name: "vec_items"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "docs/sqlite/knn_demo.db"
-    description: "SQLite vec0 virtual table for vector similarity search"
-    options:
-      table: "vec_items"
-      # Path to the sqlite-vec shared library.
-      # Find it with: python -c "import sqlite_vec; print(sqlite_vec.loadable_path())"
-      extensions_env: "VEC0_PATH"
+kind: context
 
-  - name: "items"
-    type: "sqlite"
-    access_mode: "read_write"
-    path: "docs/sqlite/knn_demo.db"
-    description: "SQLite data table with item metadata"
-    options:
-      table: "items"
-      extensions_env: "VEC0_PATH"
+metadata:
+  name: ctx_sqlite_knn_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "vec_items"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "docs/sqlite/knn_demo.db"
+      description: "SQLite vec0 virtual table for vector similarity search"
+      options:
+        table: "vec_items"
+        # Path to the sqlite-vec shared library.
+        # Find it with: python -c "import sqlite_vec; print(sqlite_vec.loadable_path())"
+        extensions_env: "VEC0_PATH"
+
+    - name: "items"
+      type: "sqlite"
+      access_mode: "read_write"
+      path: "docs/sqlite/knn_demo.db"
+      description: "SQLite data table with item metadata"
+      options:
+        table: "items"
+        extensions_env: "VEC0_PATH"

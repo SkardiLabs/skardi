@@ -1,12 +1,19 @@
-data_sources:
-  - name: wiki
-    type: sqlite
-    path: demo/llm_wiki/wiki.db
-    access_mode: read_write
-    hierarchy_level: catalog
-    options:
-      extensions_env: SQLITE_VEC_PATH
+kind: context
 
-# `skardi run` and the alias dispatch look inside `pipelines/` (sibling of
-# this file) by convention, so no explicit `pipelines_dir:` is needed. Set
-# one to override if the pipelines live elsewhere.
+metadata:
+  name: cli-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: wiki
+      type: sqlite
+      path: demo/llm_wiki/wiki.db
+      access_mode: read_write
+      hierarchy_level: catalog
+      options:
+        extensions_env: SQLITE_VEC_PATH
+
+  # `skardi run` and the alias dispatch look inside `pipelines/` (sibling of
+  # this file) by convention, so no explicit `pipelines_dir:` is needed. Set
+  # one to override if the pipelines live elsewhere.

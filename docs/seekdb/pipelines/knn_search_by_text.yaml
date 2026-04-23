@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "seekdb-knn-search-by-text"
   version: "1.0.0"
@@ -11,9 +13,10 @@ metadata:
 #   {text} - free-text query; embedded inline
 #   {k}    - number of nearest neighbours to return
 
-query: |
-  SELECT id, title, category, _score
-  FROM seekdb_knn('docs_embed', 'embedding',
-      candle('models/generated/bge-small-en-v1.5', {text}),
-      'cosine', {k})
-  ORDER BY _score ASC
+spec:
+  query: |
+    SELECT id, title, category, _score
+    FROM seekdb_knn('docs_embed', 'embedding',
+        candle('models/generated/bge-small-en-v1.5', {text}),
+        'cosine', {k})
+    ORDER BY _score ASC

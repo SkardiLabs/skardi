@@ -110,9 +110,27 @@ pub struct DataSource {
     pub enable_cache: bool,
 }
 
-/// Context configuration file structure
+/// Top-level envelope for context YAML files:
+/// `{ kind: context, metadata: {...}, spec: { data_sources: [...] } }`.
+///
+/// `kind` is an `Option` so the loader can distinguish "missing kind" from
+/// "wrong kind" and produce a targeted error for each. `metadata` is
+/// required — making it mandatory means a missing or typo'd key (e.g.
+/// `metdata:`) surfaces at parse time rather than being silently dropped.
+/// The value is kept as an opaque `serde_yaml::Value` because nothing at
+/// runtime reads inside it.
 #[derive(Debug, Deserialize)]
-struct ContextConfig {
+#[allow(dead_code)]
+struct ContextFile {
+    #[serde(default)]
+    kind: Option<String>,
+    metadata: serde_yaml::Value,
+    spec: ContextSpec,
+}
+
+/// Context configuration file structure (`spec:` block).
+#[derive(Debug, Deserialize)]
+struct ContextSpec {
     data_sources: Vec<DataSource>,
 }
 
@@ -480,9 +498,14 @@ fn extract_pipeline_sql(path: &Path) -> Result<(String, String)> {
     }
 
     #[derive(Deserialize)]
+    struct MinimalSpec {
+        query: String,
+    }
+
+    #[derive(Deserialize)]
     struct MinimalPipeline {
         metadata: PipelineMetadata,
-        query: String,
+        spec: MinimalSpec,
     }
 
     let content = std::fs::read_to_string(path)
@@ -491,7 +514,7 @@ fn extract_pipeline_sql(path: &Path) -> Result<(String, String)> {
     let pipeline: MinimalPipeline = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse pipeline YAML: {:?}", path))?;
 
-    Ok((pipeline.metadata.name, pipeline.query))
+    Ok((pipeline.metadata.name, pipeline.spec.query))
 }
 
 /// Load pipeline configuration from YAML file
@@ -573,20 +596,40 @@ fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read context file: {:?}", path))?;
 
-    let context_config: ContextConfig =
+    let context_file: ContextFile =
         serde_yaml::from_str(&content).map_err(|e| ConfigError::InvalidContextYaml {
             error: e.to_string(),
         })?;
 
+    // The envelope is uniform with pipelines/jobs/aliases: `kind: context`,
+    // then `metadata:` and `spec:`. The kind check is strict — unknown or
+    // missing values are rejected so a misfiled pipeline/job does not get
+    // silently partially-loaded as a context.
+    match context_file.kind.as_deref() {
+        Some("context") => {}
+        Some(other) => {
+            return Err(ConfigError::InvalidContextYaml {
+                error: format!("Expected `kind: context`, got `kind: {other}`"),
+            }
+            .into());
+        }
+        None => {
+            return Err(ConfigError::InvalidContextYaml {
+                error: "Missing `kind: context` at the root of the context file".to_string(),
+            }
+            .into());
+        }
+    }
+
     // Validate data sources
-    validate_data_sources(&context_config.data_sources)?;
+    validate_data_sources(&context_file.spec.data_sources)?;
 
     tracing::info!(
         "Loaded {} data sources from context",
-        context_config.data_sources.len()
+        context_file.spec.data_sources.len()
     );
 
-    Ok(context_config.data_sources)
+    Ok(context_file.spec.data_sources)
 }
 
 /// Data source types that support catalog (whole-database) registration mode.
@@ -1315,16 +1358,17 @@ mod tests {
 
     fn create_test_pipeline_file(dir: &TempDir) -> PathBuf {
         let pipeline_content = r#"
+kind: pipeline
 metadata:
   name: "test-pipeline"
   version: "1.0.0"
   description: "Test pipeline for configuration testing"
-
-query: |
-  SELECT date, category, value
-  FROM sample_data
-  WHERE date >= {date_filter}
-    AND ({category_filter} IS NULL OR category = {category_filter})
+spec:
+  query: |
+    SELECT date, category, value
+    FROM sample_data
+    WHERE date >= {date_filter}
+      AND ({category_filter} IS NULL OR category = {category_filter})
 "#;
 
         let pipeline_path = dir.path().join("test-pipeline.yaml");
@@ -1334,13 +1378,14 @@ query: |
 
     fn create_test_simple_pipeline_file(dir: &TempDir) -> PathBuf {
         let pipeline_content = r#"
+kind: pipeline
 metadata:
   name: "test-pipeline"
   version: "1.0.0"
   description: "Simple test pipeline without external table dependencies"
-
-query: |
-  SELECT 1 as id, 'test' as name
+spec:
+  query: |
+    SELECT 1 as id, 'test' as name
 "#;
 
         let pipeline_path = dir.path().join("simple-pipeline.yaml");
@@ -1365,23 +1410,28 @@ query: |
         // Create context content with correct paths (both CSV for simplicity)
         let context_content = format!(
             r#"
-data_sources:
-  - name: "sample_data"
-    type: "csv"
-    path: "{}"
-    schema:
-      date: "timestamp"
-      value: "float64"
-      category: "string"
-    options:
-      has_header: true
-      delimiter: ","
-  - name: "reference_data"
-    type: "csv"
-    path: "{}"
-    options:
-      has_header: true
-      delimiter: ","
+kind: context
+metadata:
+  name: test-context
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: "sample_data"
+      type: "csv"
+      path: "{}"
+      schema:
+        date: "timestamp"
+        value: "float64"
+        category: "string"
+      options:
+        has_header: true
+        delimiter: ","
+    - name: "reference_data"
+      type: "csv"
+      path: "{}"
+      options:
+        has_header: true
+        delimiter: ","
 "#,
             csv_path.display(),
             csv2_path.display()
@@ -1564,25 +1614,27 @@ data_sources:
 
         // Create first pipeline
         let pipeline1_content = r#"
+kind: pipeline
 metadata:
   name: "test-pipeline"
   version: "1.0.0"
   description: "First test pipeline"
-
-query: |
-  SELECT 1 as id, 'test' as name
+spec:
+  query: |
+    SELECT 1 as id, 'test' as name
 "#;
         fs::write(pipelines_dir.join("first-pipeline.yaml"), pipeline1_content).unwrap();
 
         // Create second pipeline with different name
         let pipeline2_content = r#"
+kind: pipeline
 metadata:
   name: "second-pipeline"
   version: "2.0.0"
   description: "Second test pipeline"
-
-query: |
-  SELECT 2 as id, 'test2' as name
+spec:
+  query: |
+    SELECT 2 as id, 'test2' as name
 "#;
         fs::write(pipelines_dir.join("second-pipeline.yml"), pipeline2_content).unwrap();
 

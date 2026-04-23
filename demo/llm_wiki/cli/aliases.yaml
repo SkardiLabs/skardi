@@ -1,38 +1,46 @@
-grep:
-  pipeline: wiki-search-hybrid
-  positional:
-  - query
-  defaults:
-    text_query: '{query}'
-    vector_weight: '0.5'
-    limit: '10'
-    text_weight: '0.5'
-  description: Hybrid search over the wiki (RRF of sqlite_knn + sqlite_fts)
-log:
-  pipeline: wiki-log-append
-  defaults:
-    slug: ''
-    event_type: note
-  description: Append an activity entry to wiki_log; override --event_type --slug --message
-ls:
-  pipeline: wiki-list
-  defaults:
-    limit: '100'
-    page_type_pattern: '%'
-    slug_prefix: '%'
-  description: List wiki pages, newest first (filter with --page_type_pattern / --slug_prefix)
-open:
-  pipeline: wiki-get
-  positional:
-  - slug
-  description: Open a single wiki page by slug
-rm:
-  pipeline: wiki-delete
-  positional:
-  - slug
-  description: Delete a wiki page by slug (also clears fts + vec mirrors via trigger)
-write:
-  pipeline: wiki-create
-  defaults:
-    page_type: entity
-  description: Create a new wiki page (re-embeds content inline); use --slug --title --content
+kind: aliases
+
+metadata:
+  name: llm-wiki-cli-aliases
+  version: 1.0.0
+  description: Short-verb shortcuts for the llm_wiki demo CLI
+
+spec:
+  grep:
+    pipeline: wiki-search-hybrid
+    positional:
+      - query
+    defaults:
+      text_query: '{query}'
+      vector_weight: '0.5'
+      text_weight: '0.5'
+      limit: '10'
+    description: Hybrid search over the wiki (RRF of sqlite_knn + sqlite_fts)
+  log:
+    pipeline: wiki-log-append
+    defaults:
+      slug: ''
+      event_type: note
+    description: Append an activity entry to wiki_log; override --event_type --slug --message
+  ls:
+    pipeline: wiki-list
+    defaults:
+      limit: '100'
+      page_type_pattern: '%'
+      slug_prefix: '%'
+    description: List wiki pages, newest first (filter with --page_type_pattern / --slug_prefix)
+  open:
+    pipeline: wiki-get
+    positional:
+      - slug
+    description: Open a single wiki page by slug
+  rm:
+    pipeline: wiki-delete
+    positional:
+      - slug
+    description: Delete a wiki page by slug (also clears fts + vec mirrors via trigger)
+  write:
+    pipeline: wiki-create
+    defaults:
+      page_type: entity
+    description: Create a new wiki page (re-embeds content inline); use --slug --title --content

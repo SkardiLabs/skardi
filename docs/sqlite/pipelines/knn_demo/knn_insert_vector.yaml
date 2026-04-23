@@ -1,3 +1,5 @@
+kind: pipeline
+
 metadata:
   name: "sqlite-knn-insert-vector"
   version: "1.0.0"
@@ -12,6 +14,7 @@ metadata:
 
 # Requires: --features candle
 
-query: |
-  INSERT INTO vec_items (item_id, embedding)
-  SELECT {id}, vec_to_binary(candle('models/generated/bge-small-en-v1.5', {text}))
+spec:
+  query: |
+    INSERT INTO vec_items (item_id, embedding)
+    SELECT {id}, vec_to_binary(candle('models/generated/bge-small-en-v1.5', {text}))

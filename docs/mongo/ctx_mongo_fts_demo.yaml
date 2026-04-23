@@ -1,12 +1,19 @@
-data_sources:
-  - name: "dataset_data_texts"
-    type: "mongo"
-    access_mode: "read_write"
-    connection_string: "mongodb://localhost:27017"
-    description: "MongoDB collection with text index for full-text search"
-    options:
-      database: "mydb"
-      collection: "dataset_data_texts"
-      primary_key: "dataId"
-      user_env: "MONGO_USER"
-      pass_env: "MONGO_PASS"
+kind: context
+
+metadata:
+  name: ctx_mongo_fts_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "dataset_data_texts"
+      type: "mongo"
+      access_mode: "read_write"
+      connection_string: "mongodb://localhost:27017"
+      description: "MongoDB collection with text index for full-text search"
+      options:
+        database: "mydb"
+        collection: "dataset_data_texts"
+        primary_key: "dataId"
+        user_env: "MONGO_USER"
+        pass_env: "MONGO_PASS"

@@ -1,10 +1,17 @@
-data_sources:
-  - name: "documents"
-    type: "postgres"
-    connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-    description: "PostgreSQL table with pgvector embeddings"
-    options:
-      table: "documents"
-      schema: "public"
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
+kind: context
+
+metadata:
+  name: ctx_pgvector_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "documents"
+      type: "postgres"
+      connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
+      description: "PostgreSQL table with pgvector embeddings"
+      options:
+        table: "documents"
+        schema: "public"
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"

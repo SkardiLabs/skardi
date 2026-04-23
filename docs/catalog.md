@@ -7,16 +7,23 @@ Supported for **PostgreSQL**, **MySQL**, and **SQLite**.
 ## Configuration
 
 ```yaml
-data_sources:
-  - name: "mydb_catalog"
-    type: "postgres"          # or mysql / sqlite
-    hierarchy_level: "catalog"
-    connection_string: "postgres://localhost:5432/mydb"
-    options:
-      user_env: "PG_USER"
-      pass_env: "PG_PASSWORD"
-      # Optionally restrict to specific schemas:
-      # allowed_schemas: "public,analytics"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "mydb_catalog"
+      type: "postgres"          # or mysql / sqlite
+      hierarchy_level: "catalog"
+      connection_string: "postgres://localhost:5432/mydb"
+      options:
+        user_env: "PG_USER"
+        pass_env: "PG_PASSWORD"
+        # Optionally restrict to specific schemas:
+        # allowed_schemas: "public,analytics"
 ```
 
 ## Querying

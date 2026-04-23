@@ -1,17 +1,25 @@
 //! Load/save the CLI aliases file.
 //!
-//! Aliases are stored as a top-level YAML map keyed by alias name:
+//! Aliases are stored as a Kubernetes-style manifest: a `kind: aliases`
+//! discriminator at the root, a `metadata:` block, and the actual alias
+//! entries under `spec:`:
 //!
 //! ```yaml
-//! grep:
-//!   pipeline: wiki-search-hybrid
-//!   positional: [query]
-//!   defaults:
-//!     text_query: "{query}"
-//!     limit: "10"
-//! ls:
-//!   pipeline: wiki-list
-//!   ...
+//! kind: aliases
+//! metadata:
+//!   name: wiki-cli-aliases
+//!   version: 1.0.0
+//!   description: Shortcuts for the llm_wiki CLI
+//! spec:
+//!   grep:
+//!     pipeline: wiki-search-hybrid
+//!     positional: [query]
+//!     defaults:
+//!       text_query: "{query}"
+//!       limit: "10"
+//!   ls:
+//!     pipeline: wiki-list
+//!     ...
 //! ```
 //!
 //! The file path is resolved in this order:
@@ -24,13 +32,75 @@
 //!    is enough to locate the sibling `aliases.yaml`.
 //! 4. `~/.skardi/config/aliases.yaml`.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::alias::AliasDef;
 
 pub type AliasMap = BTreeMap<String, AliasDef>;
+
+/// Required value of the root `kind:` key. Aliases files only accept this
+/// one discriminator; [`load`] enforces it via a pre-parse peek so the
+/// error message can include the file path and the actual offending
+/// value, which serde's native "unknown variant" diagnostic does not.
+pub const ALIASES_KIND: &str = "aliases";
+
+fn default_kind() -> String {
+    ALIASES_KIND.to_string()
+}
+
+fn default_version() -> String {
+    "1.0.0".to_string()
+}
+
+fn default_metadata_name() -> String {
+    "aliases".to_string()
+}
+
+/// `metadata:` block. `name` and `version` are required on load; `save`
+/// fills in sensible defaults for freshly-created files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasMetadata {
+    #[serde(default = "default_metadata_name")]
+    pub name: String,
+    #[serde(default = "default_version")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl Default for AliasMetadata {
+    fn default() -> Self {
+        Self {
+            name: default_metadata_name(),
+            version: default_version(),
+            description: None,
+        }
+    }
+}
+
+/// Full on-disk shape of an aliases YAML file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasFile {
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub metadata: AliasMetadata,
+    #[serde(default)]
+    pub spec: AliasMap,
+}
+
+impl Default for AliasFile {
+    fn default() -> Self {
+        Self {
+            kind: default_kind(),
+            metadata: AliasMetadata::default(),
+            spec: AliasMap::new(),
+        }
+    }
+}
 
 /// Resolve the aliases file path. Returns `None` when neither an explicit
 /// override nor a default home is available.
@@ -79,24 +149,48 @@ pub fn resolve_aliases_path(
     Some(home_default)
 }
 
-/// Load aliases from disk. A missing file is not an error — it yields an
-/// empty map, which is the correct starting state for a brand-new project.
-pub fn load(path: &Path) -> Result<AliasMap> {
+/// Load the aliases file. A missing or empty file is not an error — it
+/// yields a default `AliasFile` with an empty `spec`, which is the correct
+/// starting state for a brand-new project. The file's `kind:` must be
+/// `aliases` when present.
+pub fn load(path: &Path) -> Result<AliasFile> {
     if !path.exists() {
-        return Ok(AliasMap::new());
+        return Ok(AliasFile::default());
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read aliases file: {}", path.display()))?;
     if content.trim().is_empty() {
-        return Ok(AliasMap::new());
+        return Ok(AliasFile::default());
     }
-    let map: AliasMap = serde_yaml::from_str(&content)
+
+    // Peek at `kind:` first so we can give a clear error when someone points
+    // us at the wrong type of YAML (e.g. a pipeline) rather than a confusing
+    // serde mismatch.
+    let root: serde_yaml::Value = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse aliases YAML: {}", path.display()))?;
-    Ok(map)
+    if let Some(kind) = root.get("kind") {
+        let kind_str = kind.as_str().unwrap_or("");
+        if kind_str != ALIASES_KIND {
+            return Err(anyhow!(
+                "Expected `kind: aliases` in {}, got `kind: {kind_str}`",
+                path.display()
+            ));
+        }
+    } else {
+        return Err(anyhow!(
+            "Aliases file {} is missing `kind: aliases` at the root. \
+             The file format now requires a `kind`, `metadata`, and `spec` envelope.",
+            path.display()
+        ));
+    }
+
+    let file: AliasFile = serde_yaml::from_value(root)
+        .with_context(|| format!("Failed to parse aliases YAML: {}", path.display()))?;
+    Ok(file)
 }
 
-/// Save aliases to disk, creating parent directories as needed.
-pub fn save(path: &Path, map: &AliasMap) -> Result<()> {
+/// Save the aliases file to disk, creating parent directories as needed.
+pub fn save(path: &Path, file: &AliasFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -104,7 +198,7 @@ pub fn save(path: &Path, map: &AliasMap) -> Result<()> {
             })?;
         }
     }
-    let yaml = serde_yaml::to_string(map).context("Failed to serialize aliases map to YAML")?;
+    let yaml = serde_yaml::to_string(file).context("Failed to serialize aliases file to YAML")?;
     std::fs::write(path, yaml)
         .with_context(|| format!("Failed to write aliases file: {}", path.display()))?;
     Ok(())
@@ -127,34 +221,64 @@ mod tests {
         }
     }
 
+    fn sample_file() -> AliasFile {
+        let mut file = AliasFile::default();
+        file.metadata.name = "test-aliases".to_string();
+        file.metadata.description = Some("Unit test fixture".to_string());
+        file.spec.insert("grep".to_string(), sample_alias());
+        file
+    }
+
     #[test]
     fn save_then_load_roundtrip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("aliases.yaml");
-        let mut map = AliasMap::new();
-        map.insert("grep".to_string(), sample_alias());
-        save(&path, &map).unwrap();
+        save(&path, &sample_file()).unwrap();
 
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-        let grep = &loaded["grep"];
+        assert_eq!(loaded.kind, ALIASES_KIND);
+        assert_eq!(loaded.metadata.name, "test-aliases");
+        assert_eq!(loaded.metadata.version, "1.0.0");
+        assert_eq!(loaded.spec.len(), 1);
+        let grep = &loaded.spec["grep"];
         assert_eq!(grep.pipeline, "wiki-search-hybrid");
         assert_eq!(grep.positional, vec!["query".to_string()]);
         assert_eq!(grep.defaults["limit"], "10");
     }
 
     #[test]
-    fn load_missing_file_returns_empty_map() {
+    fn load_missing_file_returns_empty_default() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.yaml");
         let loaded = load(&path).unwrap();
-        assert!(loaded.is_empty());
+        assert!(loaded.spec.is_empty());
+        assert_eq!(loaded.kind, ALIASES_KIND);
+    }
+
+    #[test]
+    fn load_legacy_flat_map_errors_with_clear_message() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aliases.yaml");
+        std::fs::write(
+            &path,
+            "grep:\n  pipeline: wiki-search-hybrid\n  positional: [query]\n",
+        )
+        .unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(err.contains("kind: aliases"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_wrong_kind_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aliases.yaml");
+        std::fs::write(&path, "kind: pipeline\nmetadata:\n  name: p\n").unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(err.contains("kind: aliases"), "unexpected error: {err}");
     }
 
     /// Regression guard: the bundled demo alias files should continue to load
-    /// under the `BTreeMap<String, String>` defaults shape. They were
-    /// hand-written before the HashMap→BTreeMap switch, so this catches any
-    /// deserialization drift (e.g. a key type mismatch, rename, …).
+    /// under the new envelope shape.
     #[test]
     fn demo_alias_files_still_load() {
         // Walk up from `crates/cli/src/` to the repo root so the test works
@@ -172,13 +296,14 @@ mod tests {
             let path = repo_root.join(rel);
             let loaded =
                 load(&path).unwrap_or_else(|e| panic!("failed to load {}: {e:?}", path.display()));
+            assert_eq!(loaded.kind, ALIASES_KIND);
             assert!(
-                !loaded.is_empty(),
+                !loaded.spec.is_empty(),
                 "{} parsed but produced no aliases",
                 path.display()
             );
             // Every entry must have a non-empty pipeline target.
-            for (name, def) in &loaded {
+            for (name, def) in &loaded.spec {
                 assert!(
                     !def.pipeline.is_empty(),
                     "alias {name} in {} has empty pipeline",

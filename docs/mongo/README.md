@@ -323,17 +323,25 @@ export MONGO_PASS=rootpass
 
 ```yaml
 # ctx_mongo_fts_demo.yaml
-data_sources:
-  - name: "dataset_data_texts"
-    type: "mongo"
-    access_mode: "read_write"
-    connection_string: "mongodb://localhost:27017"
-    options:
-      database: "mydb"
-      collection: "dataset_data_texts"
-      primary_key: "dataId"
-      user_env: "MONGO_USER"
-      pass_env: "MONGO_PASS"
+
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "dataset_data_texts"
+      type: "mongo"
+      access_mode: "read_write"
+      connection_string: "mongodb://localhost:27017"
+      options:
+        database: "mydb"
+        collection: "dataset_data_texts"
+        primary_key: "dataId"
+        user_env: "MONGO_USER"
+        pass_env: "MONGO_PASS"
 ```
 
 ### Pipelines
@@ -466,16 +474,23 @@ pkill -f skardi-server
 MongoDB credentials are read from environment variables for security. Do not embed credentials in the connection string.
 
 ```yaml
-data_sources:
-  - name: "products"
-    type: "mongo"
-    connection_string: "mongodb://localhost:27017"
-    options:
-      database: "mydb"
-      collection: "products"
-      primary_key: "product_id"
-      user_env: "MONGO_USER"      # Environment variable for username
-      pass_env: "MONGO_PASS"      # Environment variable for password
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "products"
+      type: "mongo"
+      connection_string: "mongodb://localhost:27017"
+      options:
+        database: "mydb"
+        collection: "products"
+        primary_key: "product_id"
+        user_env: "MONGO_USER"      # Environment variable for username
+        pass_env: "MONGO_PASS"      # Environment variable for password
 ```
 
 ```bash
@@ -487,26 +502,33 @@ export MONGO_PASS=mypassword
 ### Multiple Databases
 
 ```yaml
-data_sources:
-  - name: "prod_products"
-    type: "mongo"
-    connection_string: "mongodb://prod-server:27017"
-    options:
-      database: "production"
-      collection: "products"
-      primary_key: "product_id"
-      user_env: "PROD_MONGO_USER"
-      pass_env: "PROD_MONGO_PASS"
+kind: context
 
-  - name: "staging_products"
-    type: "mongo"
-    connection_string: "mongodb://staging-server:27017"
-    options:
-      database: "staging"
-      collection: "products"
-      primary_key: "product_id"
-      user_env: "STAGING_MONGO_USER"
-      pass_env: "STAGING_MONGO_PASS"
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "prod_products"
+      type: "mongo"
+      connection_string: "mongodb://prod-server:27017"
+      options:
+        database: "production"
+        collection: "products"
+        primary_key: "product_id"
+        user_env: "PROD_MONGO_USER"
+        pass_env: "PROD_MONGO_PASS"
+
+    - name: "staging_products"
+      type: "mongo"
+      connection_string: "mongodb://staging-server:27017"
+      options:
+        database: "staging"
+        collection: "products"
+        primary_key: "product_id"
+        user_env: "STAGING_MONGO_USER"
+        pass_env: "STAGING_MONGO_PASS"
 ```
 
 ### Schema Inference
@@ -538,14 +560,21 @@ This is especially important for write-first workflows (e.g. RAG ingestion) wher
 ### MongoDB Atlas
 
 ```yaml
-data_sources:
-  - name: "products"
-    type: "mongo"
-    connection_string: "mongodb+srv://cluster0.xxxxx.mongodb.net"
-    options:
-      database: "mydb"
-      collection: "products"
-      primary_key: "product_id"
-      user_env: "ATLAS_USER"
-      pass_env: "ATLAS_PASS"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "products"
+      type: "mongo"
+      connection_string: "mongodb+srv://cluster0.xxxxx.mongodb.net"
+      options:
+        database: "mydb"
+        collection: "products"
+        primary_key: "product_id"
+        user_env: "ATLAS_USER"
+        pass_env: "ATLAS_PASS"
 ```

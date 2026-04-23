@@ -25,21 +25,28 @@ export AWS_PROFILE="your_profile_name"
 Create a context YAML file with only the AWS region:
 
 ```yaml
-data_sources:
-  - name: "sales_data"
-    type: "parquet"
-    location: "remote_s3"
-    path: "s3://my-bucket/sales/2024/sales.parquet"
-    description: "Sales data in S3"
+kind: context
 
-  - name: "customer_events"
-    type: "csv"
-    location: "remote_s3"
-    path: "s3://analytics-bucket/events/events.csv"
-    options:
-      has_header: true
-      delimiter: ","
-    description: "Customer events CSV in S3"
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "sales_data"
+      type: "parquet"
+      location: "remote_s3"
+      path: "s3://my-bucket/sales/2024/sales.parquet"
+      description: "Sales data in S3"
+
+    - name: "customer_events"
+      type: "csv"
+      location: "remote_s3"
+      path: "s3://analytics-bucket/events/events.csv"
+      options:
+        has_header: true
+        delimiter: ","
+      description: "Customer events CSV in S3"
 ```
 
 ### 3. Run the Server

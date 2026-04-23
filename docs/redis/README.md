@@ -276,29 +276,43 @@ pkill -f skardi-server
 ### Basic Configuration
 
 ```yaml
-data_sources:
-  - name: "products"
-    type: "redis"
-    access_mode: "read_write"
-    connection_string: "redis://localhost:6379"
-    description: "Redis hash table for products"
-    options:
-      key_space: "mydb"           # Namespace prefix for Redis keys
-      table: "products"           # Table name (keys become {key_space}:{table}:{id})
-      key_column: "product_id"    # Column derived from the key suffix (optional)
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "products"
+      type: "redis"
+      access_mode: "read_write"
+      connection_string: "redis://localhost:6379"
+      description: "Redis hash table for products"
+      options:
+        key_space: "mydb"           # Namespace prefix for Redis keys
+        table: "products"           # Table name (keys become {key_space}:{table}:{id})
+        key_column: "product_id"    # Column derived from the key suffix (optional)
 ```
 
 ### Redis with Authentication
 
 ```yaml
-data_sources:
-  - name: "products"
-    type: "redis"
-    connection_string: "redis://:mypassword@localhost:6379"
-    options:
-      key_space: "mydb"
-      table: "products"
-      key_column: "product_id"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "products"
+      type: "redis"
+      connection_string: "redis://:mypassword@localhost:6379"
+      options:
+        key_space: "mydb"
+        table: "products"
+        key_column: "product_id"
 ```
 
 ### Empty Tables with Declared Schema
@@ -306,16 +320,23 @@ data_sources:
 If a Redis table has no data yet, you can declare the columns upfront so that INSERT operations work immediately:
 
 ```yaml
-data_sources:
-  - name: "product_stats"
-    type: "redis"
-    access_mode: "read_write"
-    connection_string: "redis://localhost:6379"
-    options:
-      key_space: "mydb"
-      table: "product_stats"
-      key_column: "stat_id"
-      columns: "stat_id, category, total_products, total_value, avg_price"
+kind: context
+
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "product_stats"
+      type: "redis"
+      access_mode: "read_write"
+      connection_string: "redis://localhost:6379"
+      options:
+        key_space: "mydb"
+        table: "product_stats"
+        key_column: "stat_id"
+        columns: "stat_id, category, total_products, total_value, avg_price"
 ```
 
 The `columns` option is only used when the table is empty — once data exists in Redis, the schema is inferred from the data automatically.
@@ -323,19 +344,26 @@ The `columns` option is only used when the table is empty — once data exists i
 ### Multiple Redis Databases
 
 ```yaml
-data_sources:
-  - name: "cache_products"
-    type: "redis"
-    connection_string: "redis://localhost:6379/0"
-    options:
-      key_space: "app"
-      table: "products"
-      key_column: "product_id"
+kind: context
 
-  - name: "analytics"
-    type: "redis"
-    connection_string: "redis://localhost:6379/1"
-    options:
-      key_space: "analytics"
-      table: "events"
+metadata:
+  name: example-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "cache_products"
+      type: "redis"
+      connection_string: "redis://localhost:6379/0"
+      options:
+        key_space: "app"
+        table: "products"
+        key_column: "product_id"
+
+    - name: "analytics"
+      type: "redis"
+      connection_string: "redis://localhost:6379/1"
+      options:
+        key_space: "analytics"
+        table: "events"
 ```

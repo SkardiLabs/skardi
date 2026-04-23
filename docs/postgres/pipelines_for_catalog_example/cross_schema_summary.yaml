@@ -1,14 +1,17 @@
+kind: pipeline
+
 metadata:
   name: "cross_schema_summary"
   version: "1.0"
   description: "Join public-schema users with analytics-schema monthly_revenue — both in the same catalog entry"
 
-query: |
-  SELECT
-    u.id AS user_id,
-    u.name AS user_name,
-    r.month,
-    r.revenue
-  FROM mydb.public.users u
-  INNER JOIN mydb.analytics.monthly_revenue r ON u.id = r.user_id
-  ORDER BY r.month, u.id
+spec:
+  query: |
+    SELECT
+      u.id AS user_id,
+      u.name AS user_name,
+      r.month,
+      r.revenue
+    FROM mydb.public.users u
+    INNER JOIN mydb.analytics.monthly_revenue r ON u.id = r.user_id
+    ORDER BY r.month, u.id

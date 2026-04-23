@@ -52,28 +52,29 @@ metadata:
 
 # {placeholder} tokens are inferred as typed scalar params, exactly the
 # way pipelines work. No separate `parameters:` block.
-query: |
-  SELECT slug, title, page_type, content, updated_at
-  FROM wiki.main.wiki_pages
-  WHERE updated_at >= {from_date}
-    AND updated_at <  {to_date}
 
-destination:
-  table: "wiki_lake"          # DataFusion table identifier — bare or dotted
-  mode: append                # append is the only supported mode in MVP
-  create_if_missing: true     # lake destinations only (see below)
-
-execution:
-  timeout_ms: 3600000         # optional wall-clock cap; default = no timeout
+spec:
+  query: |
+    SELECT slug, title, page_type, content, updated_at
+    FROM wiki.main.wiki_pages
+    WHERE updated_at >= {from_date}
+      AND updated_at <  {to_date}
+  destination:
+    table: "wiki_lake"          # DataFusion table identifier — bare or dotted
+    mode: append                # append is the only supported mode in MVP
+    create_if_missing: true     # lake destinations only (see below)
+  execution:
+    timeout_ms: 3600000         # optional wall-clock cap; default = no timeout
 ```
 
 ### `kind:`
 
-`kind: job` tells the loader to treat the file as a job. Plain pipeline
-YAMLs either omit this field or set it to `pipeline`. A server started
-with `--jobs <dir>` scans every `.yaml` / `.yml` file in the directory
-and silently skips files that are not `kind: job`, so it's safe to
-intermix pipelines and jobs on disk.
+Every resource YAML carries a `kind:` discriminator at the root. `kind: job`
+tells the loader to treat the file as a job; pipeline YAMLs set
+`kind: pipeline`, contexts set `kind: context`, and alias files set
+`kind: aliases`. A server started with `--jobs <dir>` scans every
+`.yaml` / `.yml` file in the directory and silently skips files that are
+not `kind: job`, so it's safe to intermix pipelines and jobs on disk.
 
 ### `destination.table`
 
@@ -359,20 +360,24 @@ Lance dataset:
 
 ```yaml
 # demo/llm_wiki/cli/jobs/backfill_to_lake.yaml (excerpt)
+
 kind: job
+
 metadata:
   name: "wiki-backfill-to-lake"
   version: "1.0.0"
-query: |
-  SELECT slug, title, page_type, content, updated_at
-  FROM wiki.main.wiki_pages
-  WHERE slug LIKE {slug_prefix}
-  ORDER BY updated_at DESC
-  LIMIT {limit}
-destination:
-  table: "wiki_lake"
-  mode: append
-  create_if_missing: true
+
+spec:
+  query: |
+    SELECT slug, title, page_type, content, updated_at
+    FROM wiki.main.wiki_pages
+    WHERE slug LIKE {slug_prefix}
+    ORDER BY updated_at DESC
+    LIMIT {limit}
+  destination:
+    table: "wiki_lake"
+    mode: append
+    create_if_missing: true
 ```
 
 To run it end-to-end, boot the server with `--jobs` pointing at the
@@ -380,10 +385,10 @@ demo's job directory and with a Lance data source named `wiki_lake` in
 your ctx:
 
 ```yaml
-# ctx.yaml (add this to the demo's ctx.yaml)
-  - name: wiki_lake
-    type: lance
-    path: demo/llm_wiki/wiki_lake.lance
+# ctx.yaml — add this entry under `spec.data_sources:`
+    - name: wiki_lake
+      type: lance
+      path: demo/llm_wiki/wiki_lake.lance
 ```
 
 Then:
