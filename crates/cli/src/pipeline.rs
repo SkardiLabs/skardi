@@ -55,7 +55,16 @@ pub struct PipelineFile {
 pub fn load_pipeline_from_path(path: &Path) -> Result<PipelineFile> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read pipeline file: {}", path.display()))?;
-    let env: PipelineEnvelope = serde_yaml::from_str(&content)
+    let value: serde_yaml::Value = serde_yaml::from_str(&content)
+        .with_context(|| format!("Failed to parse pipeline YAML: {}", path.display()))?;
+    pipeline_from_value(path, value)
+}
+
+/// Build a `PipelineFile` from an already-parsed YAML root, enforcing the
+/// `kind: pipeline` discriminator. Shared between the single-file loader
+/// and directory discovery so each file is read and parsed only once.
+fn pipeline_from_value(path: &Path, value: serde_yaml::Value) -> Result<PipelineFile> {
+    let env: PipelineEnvelope = serde_yaml::from_value(value)
         .with_context(|| format!("Failed to parse pipeline YAML: {}", path.display()))?;
     if env.kind != "pipeline" {
         anyhow::bail!(
@@ -76,7 +85,9 @@ pub fn load_pipeline_from_path(path: &Path) -> Result<PipelineFile> {
 ///
 /// Files whose root `kind:` is anything other than `pipeline` (e.g.
 /// `kind: job`) are skipped silently — a pipelines dir is expected to
-/// hold a mixed bag of resource YAMLs.
+/// hold a mixed bag of resource YAMLs. Files that fail to parse as YAML,
+/// however, are a hard error: staying silent on those would hide typos in
+/// bundled pipelines behind a confusing "pipeline not found" later.
 pub fn discover_pipelines(dirs: &[PathBuf]) -> Result<HashMap<String, (PathBuf, PipelineFile)>> {
     let mut out: HashMap<String, (PathBuf, PipelineFile)> = HashMap::new();
     for dir in dirs {
@@ -99,20 +110,14 @@ pub fn discover_pipelines(dirs: &[PathBuf]) -> Result<HashMap<String, (PathBuf, 
             if ext != "yaml" && ext != "yml" {
                 continue;
             }
-            // Peek at `kind:` so non-pipeline files (jobs, contexts, etc.)
-            // that happen to sit in the pipelines dir are skipped rather
-            // than erroring out the whole discovery pass.
             let raw = std::fs::read_to_string(&p)
                 .with_context(|| format!("Failed to read pipeline file: {}", p.display()))?;
-            let peek: serde_yaml::Value = match serde_yaml::from_str(&raw) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if peek.get("kind").and_then(|v| v.as_str()) != Some("pipeline") {
+            let value: serde_yaml::Value = serde_yaml::from_str(&raw)
+                .with_context(|| format!("Failed to parse pipeline YAML: {}", p.display()))?;
+            if value.get("kind").and_then(|v| v.as_str()) != Some("pipeline") {
                 continue;
             }
-
-            let pipeline = load_pipeline_from_path(&p)?;
+            let pipeline = pipeline_from_value(&p, value)?;
             out.insert(pipeline.metadata.name.clone(), (p, pipeline));
         }
     }
@@ -357,6 +362,66 @@ pub fn parse_param_flag(raw: &str) -> Result<(String, ScalarValue)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn write(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn discover_pipelines_skips_non_pipeline_kinds() {
+        // A pipelines directory can hold other resource YAMLs (jobs,
+        // contexts) side-by-side; discovery must skip those silently while
+        // still registering real pipelines.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write(
+            dir,
+            "real.yaml",
+            "kind: pipeline\nmetadata:\n  name: real\nspec:\n  query: SELECT 1\n",
+        );
+        write(
+            dir,
+            "a_job.yaml",
+            "kind: job\nmetadata:\n  name: j\nspec:\n  query: SELECT 1\n  destination:\n    table: t\n",
+        );
+        write(
+            dir,
+            "a_ctx.yaml",
+            "kind: context\nmetadata:\n  name: c\nspec:\n  data_sources: []\n",
+        );
+        // Non-YAML extensions should be ignored outright.
+        write(dir, "README.md", "# not yaml\n");
+
+        let out = discover_pipelines(&[dir.to_path_buf()]).unwrap();
+        assert_eq!(out.len(), 1, "only the real pipeline should register");
+        assert!(out.contains_key("real"));
+    }
+
+    #[test]
+    fn discover_pipelines_errors_on_malformed_yaml() {
+        // A file that cannot be parsed as YAML used to be silently
+        // swallowed. That hid typos in bundled pipelines — the caller only
+        // saw "pipeline not found" later. Discovery now surfaces the parse
+        // error with file context.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write(
+            dir,
+            "good.yaml",
+            "kind: pipeline\nmetadata:\n  name: g\nspec:\n  query: SELECT 1\n",
+        );
+        // Valid pipeline kind, but the YAML itself is malformed
+        // (unterminated flow mapping).
+        write(dir, "broken.yaml", "kind: pipeline\nmetadata: { name: ");
+
+        let err = discover_pipelines(&[dir.to_path_buf()]).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("broken.yaml"),
+            "error should name the offending file, got: {chain}"
+        );
+    }
 
     #[test]
     fn extract_param_names_preserves_order_and_dedups() {

@@ -173,11 +173,12 @@ impl JobDefinition {
             None => Execution::default(),
         };
 
-        // Reuse the pipeline loader for metadata + query + schema inference.
-        // `StandardPipeline::load_from_file` reads the file itself and
-        // accepts both `kind: pipeline` and `kind: job` at the root; it
-        // pulls the SQL out of `spec.query` either way.
-        let pipeline = StandardPipeline::load_from_file(path, ctx)
+        // Reuse the pipeline builder for metadata + query + schema inference.
+        // We've already parsed `root` and validated `kind: job`, so we hand
+        // the parsed value straight to the shared builder rather than
+        // re-reading and re-parsing the file through the pipeline loader
+        // (which is now strict to `kind: pipeline`).
+        let pipeline = StandardPipeline::build_from_parsed(root, ctx)
             .await
             .with_context(|| format!("Failed to load pipeline section of {}", path.display()))?;
 

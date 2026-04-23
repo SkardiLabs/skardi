@@ -161,7 +161,7 @@ enum AliasCmd {
         #[arg(long)]
         ctx: Option<PathBuf>,
     },
-    /// Show one alias in YAML form
+    /// Show one alias as a YAML fragment (not a loadable aliases file)
     Show {
         name: String,
         #[arg(long)]
@@ -181,11 +181,19 @@ enum AliasCmd {
 
 /// Top-level envelope for context YAML files. Shares the
 /// `{ kind, metadata, spec }` shape with pipelines, jobs, and aliases.
+///
+/// `kind` is `Option` rather than required so a missing discriminator
+/// produces the same "Missing `kind: context`" diagnostic as the server,
+/// instead of serde's generic "missing field `kind`" message. `metadata`
+/// is required — a missing or typo'd key (e.g. `metdata:`) surfaces at
+/// parse time; the value is retained as an opaque `serde_yaml::Value`
+/// because nothing at runtime reads inside it.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct LocalContextFile {
-    kind: String,
     #[serde(default)]
-    metadata: Option<serde_yaml::Value>,
+    kind: Option<String>,
+    metadata: serde_yaml::Value,
     spec: LocalContextConfig,
 }
 
@@ -715,15 +723,18 @@ fn read_context_file(ctx_path: &Path) -> Result<LocalContextConfig> {
         .with_context(|| format!("Failed to read context file: {}", ctx_path.display()))?;
     let file: LocalContextFile =
         serde_yaml::from_str(&content).context("Failed to parse context YAML")?;
-    if file.kind != "context" {
-        anyhow::bail!(
+    match file.kind.as_deref() {
+        Some("context") => {}
+        Some(other) => anyhow::bail!(
             "Expected `kind: context` in {}, got `kind: {}`",
             ctx_path.display(),
-            file.kind
-        );
+            other,
+        ),
+        None => anyhow::bail!(
+            "Missing `kind: context` at the root of {}",
+            ctx_path.display(),
+        ),
     }
-    // `metadata` is read for shape validation but otherwise unused at runtime.
-    let _ = file.metadata;
     Ok(file.spec)
 }
 
@@ -1589,8 +1600,11 @@ fn alias_show(name: String, aliases: Option<PathBuf>, ctx: Option<PathBuf>) -> R
         .get(&name)
         .ok_or_else(|| anyhow::anyhow!("Alias '{name}' not found in {}", path.display()))?;
 
-    // Print just the `<name>: <def>` entry, not the full file envelope —
-    // the envelope is noise when the user asked for a single alias.
+    // Print just the `<name>: <def>` entry, not the full `{ kind, metadata,
+    // spec }` envelope — the envelope is noise when the user asked for a
+    // single alias. The output is deliberately a fragment, not a loadable
+    // aliases file; `alias show`'s contract is human inspection, not
+    // round-tripping through `alias_store::load`.
     let mut single = AliasMap::new();
     single.insert(name.clone(), def.clone());
     let yaml = serde_yaml::to_string(&single).context("Failed to render alias to YAML")?;

@@ -41,17 +41,14 @@ use crate::alias::AliasDef;
 
 pub type AliasMap = BTreeMap<String, AliasDef>;
 
-/// Root-level `kind:` discriminator. Only `aliases` is accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AliasFileKind {
-    Aliases,
-}
+/// Required value of the root `kind:` key. Aliases files only accept this
+/// one discriminator; [`load`] enforces it via a pre-parse peek so the
+/// error message can include the file path and the actual offending
+/// value, which serde's native "unknown variant" diagnostic does not.
+pub const ALIASES_KIND: &str = "aliases";
 
-impl Default for AliasFileKind {
-    fn default() -> Self {
-        Self::Aliases
-    }
+fn default_kind() -> String {
+    ALIASES_KIND.to_string()
 }
 
 fn default_version() -> String {
@@ -87,8 +84,8 @@ impl Default for AliasMetadata {
 /// Full on-disk shape of an aliases YAML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasFile {
-    #[serde(default)]
-    pub kind: AliasFileKind,
+    #[serde(default = "default_kind")]
+    pub kind: String,
     #[serde(default)]
     pub metadata: AliasMetadata,
     #[serde(default)]
@@ -98,7 +95,7 @@ pub struct AliasFile {
 impl Default for AliasFile {
     fn default() -> Self {
         Self {
-            kind: AliasFileKind::default(),
+            kind: default_kind(),
             metadata: AliasMetadata::default(),
             spec: AliasMap::new(),
         }
@@ -173,7 +170,7 @@ pub fn load(path: &Path) -> Result<AliasFile> {
         .with_context(|| format!("Failed to parse aliases YAML: {}", path.display()))?;
     if let Some(kind) = root.get("kind") {
         let kind_str = kind.as_str().unwrap_or("");
-        if kind_str != "aliases" {
+        if kind_str != ALIASES_KIND {
             return Err(anyhow!(
                 "Expected `kind: aliases` in {}, got `kind: {kind_str}`",
                 path.display()
@@ -239,7 +236,7 @@ mod tests {
         save(&path, &sample_file()).unwrap();
 
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.kind, AliasFileKind::Aliases);
+        assert_eq!(loaded.kind, ALIASES_KIND);
         assert_eq!(loaded.metadata.name, "test-aliases");
         assert_eq!(loaded.metadata.version, "1.0.0");
         assert_eq!(loaded.spec.len(), 1);
@@ -255,7 +252,7 @@ mod tests {
         let path = dir.path().join("does-not-exist.yaml");
         let loaded = load(&path).unwrap();
         assert!(loaded.spec.is_empty());
-        assert_eq!(loaded.kind, AliasFileKind::Aliases);
+        assert_eq!(loaded.kind, ALIASES_KIND);
     }
 
     #[test]
@@ -299,7 +296,7 @@ mod tests {
             let path = repo_root.join(rel);
             let loaded =
                 load(&path).unwrap_or_else(|e| panic!("failed to load {}: {e:?}", path.display()));
-            assert_eq!(loaded.kind, AliasFileKind::Aliases);
+            assert_eq!(loaded.kind, ALIASES_KIND);
             assert!(
                 !loaded.spec.is_empty(),
                 "{} parsed but produced no aliases",

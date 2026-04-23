@@ -112,12 +112,19 @@ pub struct DataSource {
 
 /// Top-level envelope for context YAML files:
 /// `{ kind: context, metadata: {...}, spec: { data_sources: [...] } }`.
+///
+/// `kind` is an `Option` so the loader can distinguish "missing kind" from
+/// "wrong kind" and produce a targeted error for each. `metadata` is
+/// required — making it mandatory means a missing or typo'd key (e.g.
+/// `metdata:`) surfaces at parse time rather than being silently dropped.
+/// The value is kept as an opaque `serde_yaml::Value` because nothing at
+/// runtime reads inside it.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ContextFile {
     #[serde(default)]
     kind: Option<String>,
-    #[serde(default)]
-    metadata: Option<serde_yaml::Value>,
+    metadata: serde_yaml::Value,
     spec: ContextSpec,
 }
 
@@ -613,9 +620,6 @@ fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
             .into());
         }
     }
-    // `metadata` is read but otherwise unused at runtime — kept so misshapen
-    // files fail at parse time rather than silently dropping keys.
-    let _ = context_file.metadata;
 
     // Validate data sources
     validate_data_sources(&context_file.spec.data_sources)?;

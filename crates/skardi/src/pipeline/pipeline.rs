@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
@@ -449,6 +449,54 @@ impl StandardPipeline {
     fn get_inferencer(&self) -> &SqlSchemaInferrer {
         self.inferencer.as_ref()
     }
+
+    /// Build a `StandardPipeline` from an already-parsed YAML root.
+    ///
+    /// Pulls `metadata` + `spec.query` out of the value and infers request
+    /// and response schemas against `ctx`. Does not inspect the `kind:`
+    /// discriminator — callers are expected to have already validated it.
+    /// Used by both the pipeline loader (`kind: pipeline`) and the job
+    /// loader (`kind: job`), which share the same metadata + query body.
+    pub(crate) async fn build_from_parsed(
+        root: serde_yaml::Value,
+        ctx: Arc<SessionContext>,
+    ) -> Result<Self> {
+        let metadata_section = root
+            .get("metadata")
+            .ok_or_else(|| anyhow!("Missing 'metadata' section in pipeline YAML"))?;
+        let spec_section = root
+            .get("spec")
+            .ok_or_else(|| anyhow!("Missing 'spec' section in pipeline YAML"))?;
+        let query_section = spec_section
+            .get("query")
+            .ok_or_else(|| anyhow!("Missing 'spec.query' in pipeline YAML"))?;
+
+        let metadata: ComponentMetadata = serde_yaml::from_value(metadata_section.clone())
+            .map_err(|e| anyhow!("Failed to parse metadata section: {}", e))?;
+
+        let sql_query: String = serde_yaml::from_value(query_section.clone())
+            .map_err(|e| anyhow!("Failed to parse query section: {}", e))?;
+        let query_definition = QueryDefinition {
+            sql: sql_query,
+            parameters: Vec::new(),
+        };
+
+        let inferencer = SqlSchemaInferrer::new(ctx.clone())?;
+        let request_schema = inferencer
+            .extract_request_schema(&query_definition.sql)
+            .await?;
+        let response_schema = inferencer
+            .extract_response_schema(&query_definition.sql)
+            .await?;
+
+        StandardPipeline::new(
+            metadata,
+            request_schema,
+            query_definition,
+            response_schema,
+            ctx,
+        )
+    }
 }
 
 #[async_trait]
@@ -487,69 +535,31 @@ impl Pipeline for StandardPipeline {
     where
         Self: Sized,
     {
-        let file_content = fs::read_to_string(file_path)?;
+        let path = file_path.as_ref();
+        let file_content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read pipeline file: {}", path.display()))?;
 
-        // Parse the pipeline YAML file into a generic structure. The expected
-        // shape is the uniform `{ kind, metadata, spec }` envelope shared
-        // with aliases, contexts, and jobs. The job loader also calls into
-        // here to reuse the metadata + query parsing, which is why `kind: job`
-        // is accepted alongside `kind: pipeline`.
         let pipeline_yaml: serde_yaml::Value = serde_yaml::from_str(&file_content)
-            .map_err(|e| anyhow!("Failed to parse pipeline YAML file: {}", e))?;
+            .with_context(|| format!("Failed to parse pipeline YAML: {}", path.display()))?;
 
         let kind = pipeline_yaml
             .get("kind")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                anyhow!("Missing 'kind' at root of pipeline YAML (expected `kind: pipeline`)")
+                anyhow!(
+                    "Missing `kind:` at root of {} (expected `kind: pipeline`)",
+                    path.display()
+                )
             })?;
-        if kind != "pipeline" && kind != "job" {
+        if kind != "pipeline" {
             return Err(anyhow!(
-                "Unexpected `kind: {kind}` — expected `kind: pipeline` or `kind: job`"
+                "Expected `kind: pipeline` in {}, got `kind: {}`",
+                path.display(),
+                kind,
             ));
         }
 
-        let metadata_section = pipeline_yaml
-            .get("metadata")
-            .ok_or_else(|| anyhow!("Missing 'metadata' section in pipeline YAML"))?;
-        let spec_section = pipeline_yaml
-            .get("spec")
-            .ok_or_else(|| anyhow!("Missing 'spec' section in pipeline YAML"))?;
-        let query_section = spec_section
-            .get("query")
-            .ok_or_else(|| anyhow!("Missing 'spec.query' in pipeline YAML"))?;
-
-        // Parse metadata directly
-        let metadata: ComponentMetadata = serde_yaml::from_value(metadata_section.clone())
-            .map_err(|e| anyhow!("Failed to parse metadata section: {}", e))?;
-
-        // Parse query as string and create QueryDefinition with empty parameters (will be inferred)
-        let sql_query: String = serde_yaml::from_value(query_section.clone())
-            .map_err(|e| anyhow!("Failed to parse query section: {}", e))?;
-        let query_definition = QueryDefinition {
-            sql: sql_query,
-            parameters: Vec::new(), // Parameters will be inferred from SQL
-        };
-
-        // Create inferencer with the provided Arc<SessionContext>
-        let inferencer = SqlSchemaInferrer::new(ctx.clone())?;
-
-        // Infer request and response schemas from SQL query
-        let request_schema = inferencer
-            .extract_request_schema(&query_definition.sql)
-            .await?;
-        let response_schema = inferencer
-            .extract_response_schema(&query_definition.sql)
-            .await?;
-
-        // Construct the pipeline with inferred schemas
-        StandardPipeline::new(
-            metadata,
-            request_schema,
-            query_definition,
-            response_schema,
-            ctx,
-        )
+        StandardPipeline::build_from_parsed(pipeline_yaml, ctx).await
     }
 
     /// Validate the complete pipeline for internal consistency and business rules
