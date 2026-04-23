@@ -139,6 +139,12 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 
 ---
 
+## Local knowledge base for local agents
+
+The **[`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** turns a directory of documents into a queryable RAG with one command — chunking, embedding, indexing, and hybrid search exposed as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code or Cursor session gets a grounded, citable local knowledge base.
+
+---
+
 ## Supported Data Sources
 
 | Type | CRUD | Description | Docs |
@@ -241,6 +247,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 `1` Federated SQL engine
    - [x] DataFusion single-node federation across CSV, Parquet, JSON, S3 / GCS / Azure, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, SeekDB — all joinable in one query
    - [x] Register by table, or load an entire DB (Postgres / MySQL / SQLite) as a DataFusion catalog — one config line either way
+   - [ ] Graph database sources (Neo4j / Kuzu) — native federation to unlock graphRAG patterns alongside vector / FTS retrieval
 
 `2` Retrieval primitives
    - [x] Vector search — `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), Lance KNN, SeekDB HNSW
@@ -248,6 +255,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [x] Hybrid search — RRF merge of FTS + KNN in plain SQL
    - [x] Inline embeddings — `candle()` UDF (GGUF / Candle / remote embed APIs) runs directly inside SQL; content + vector stay on the same row atomically
    - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
+   - [ ] Chunking UDF — character / token / markdown / code splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL
    - [ ] Memory primitive — hybrid access + TTL + provenance + consolidation collapsed into one declarative macro
 
 `3` Online serving (pipelines)
