@@ -1,4 +1,4 @@
-# Pipelines (`kind: pipeline`)
+# Pipelines
 
 Pipelines are Skardi's **online-serving** primitive: a parameterized SQL
 query declared in YAML, exposed synchronously as a REST endpoint and
@@ -102,7 +102,7 @@ skardi run product-search-demo \
 
 The CLI resolves the pipeline YAML directly from disk — no running server
 required — so any agent with a Bash tool can invoke any pipeline as a
-verb. Define a [user alias](../crates/cli/README.md) and
+verb. Define a [user alias](cli.md) and
 `skardi search "…"` becomes a one-word tool call.
 
 ---

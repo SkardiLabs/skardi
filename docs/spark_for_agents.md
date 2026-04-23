@@ -21,7 +21,7 @@ Agent frameworks sit above the model and below the UX. They orchestrate tool cal
 
 The hard problem lives underneath. It's the data layer.
 
-- **An agent cannot be autonomous if every new dataset requires a human to wire up an embedding pipeline, an index, and a query API.** Skardi's `candle()` UDF puts embedding inference directly inside SQL; `pg_knn` / `sqlite_knn` / Lance vector columns put retrieval in the same plan. One statement embeds, stores, and indexes.
+- **An agent cannot be autonomous if every new dataset requires a human to wire up an embedding pipeline, an index, and a query API.** Skardi's embedding UDF puts embedding inference directly inside SQL; `pg_knn` / `sqlite_knn` / Lance vector columns put retrieval in the same plan. One statement embeds, stores, and indexes.
 - **An agent cannot reason across data if every source has its own dialect and SDK.** Skardi is one SQL over eleven source types, with real `JOIN`s across them. That includes joining a Lance vector table against a Postgres reference table against a CSV of new inputs — in one query, in one process.
 - **An agent cannot discover tools if every endpoint is a hand-crafted one-off.** Skardi's pipeline YAML is the single source of truth — one file becomes a REST endpoint today, a `skardi run` shell command today, a Claude skill tomorrow, and an MCP tool shortly after. All surfaces stay in lockstep because they derive from the same spec.
 - **An agent cannot do durable work if every write is a fire-and-forget HTTP call.** Skardi's offline jobs primitive commits async writes to Lance or a DB with a run ledger, submit / poll / cancel, crash recovery, and atomic failure semantics.
@@ -46,7 +46,7 @@ Humans tolerate 20-line RRF queries; they write them once and reuse them. Agents
 
 So we ship shape-shifting primitives:
 
-- **`candle()` UDF** — embedding inference inline in SQL. Agents don't wire an embedding service; they write `candle('model-path', content)` and move on.
+- **embedding UDFs** — embedding inference inline in SQL. Agents don't wire an embedding service; they write something like `gguf('model-path', content)` and move on.
 - **`pg_knn` / `sqlite_knn` / `pg_fts` / `sqlite_fts`** — vector and text retrieval as SQL functions, joinable like any other relation. Hybrid search (RRF) is a JOIN, not a separate system.
 - **Online serving and offline jobs, one YAML shape** — the same parameterized SQL either answers synchronously over REST or commits asynchronously to a durable destination. Durable agent writes are a YAML declaration, not an orchestration framework.
 - **Memory primitive** (roadmap, v1.1) — hybrid access + TTL + provenance + consolidation collapsed into one declarative macro that expands to the right tables and pipelines.
@@ -88,9 +88,8 @@ A few comparisons that sound similar but are deliberately off-mission:
 
 - **Not "MCP server framework."** MCP is a binding we ship (v1.1); it is not the product. Pipeline YAML is the product. If MCP gets replaced by a better protocol tomorrow, our YAMLs still describe the right tools.
 - **Not "another vector DB."** We integrate with pgvector, sqlite-vec, Lance, SeekDB HNSW — we don't ship a new vector store. The primitive is "hybrid retrieval in SQL," not "yet another ANN index."
-- **Not "a distributed SQL engine."** DataFusion single-node is a feature, not a limitation. Agent workloads are small-to-medium, and install simplicity matters more than Spark-scale throughput. Distributed execution is an explicit non-goal.
 - **Not "an agent framework."** We have zero opinions about tool loops, planners, or routers. Bring your own agent. We just make the data layer work.
-- **Not "an LLM gateway."** `llm()` as a UDF is on the v1.2 roadmap, but the MVP deliberately stays out of provider / key / cost / caching decisions. Inline embeddings via `candle()` cover UDF coverage for now.
+- **Not "an LLM gateway."** `llm()` as a UDF is on the v1.2 roadmap, but the MVP deliberately stays out of provider / key / cost / caching decisions.
 
 ---
 
@@ -100,12 +99,12 @@ We're building in public. If the thesis above resonates — or if it doesn't —
 
 - **[Discord](https://discord.gg/S5YQQPEV2m)** — ongoing conversation, POC help, roadmap feedback.
 - **[GitHub issues](https://github.com/SkardiLabs/skardi/issues)** — file against any unchecked roadmap item; we'll pair on design and review.
-- **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — ready-to-deploy templates for Sealos, the fastest way to get a running server.
+- **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — a growing library of ready-to-use Skardi setups.
 
 The rest of this doc tree walks the concrete pieces:
 
 - [Server](server.md) — the HTTP process that hosts both peer surfaces.
 - [Pipelines](pipelines.md) — online serving (parameterized SQL as REST).
 - [Jobs](jobs.md) — offline jobs (async batch writes to Lance or a DB).
-- [CLI](../crates/cli/README.md) — `skardi run`, aliases, federated SQL from the shell.
+- [CLI](cli.md) — `skardi run`, aliases, federated SQL from the shell.
 - [llm_wiki demo](../demo/llm_wiki/) — the fullest end-to-end demonstration of agent autonomy on Skardi.

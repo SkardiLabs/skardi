@@ -4,15 +4,13 @@
 engine:
 
 - **Online serving — [pipelines](pipelines.md).** Parameterized SQL
-  served synchronously as REST endpoints; the read path agents hit at
-  tool-call time.
+  served synchronously as REST endpoints
 - **Offline [jobs](jobs.md).** The same SQL shape run asynchronously into
-  a durable destination (Lance or a read-write DB), with a run ledger and
-  atomic commit; the write path for agent-initiated lake mutations.
+  a durable destination , with a run ledger and
+  atomic commit.
 
 Both surfaces share the same context file (data sources + access mode +
-caching), the same YAML envelope (`kind: pipeline` / `kind: job`,
-`metadata`, `spec`), and the same HTTP listener. This page covers the
+caching), the same YAML envelope, and the same HTTP listener. This page covers the
 shared server concerns; the per-surface reference lives in
 [pipelines.md](pipelines.md) and [jobs.md](jobs.md). For the broader
 story, see [spark_for_agents.md](spark_for_agents.md).
@@ -208,5 +206,5 @@ on that source, from pipelines and jobs alike.
 
 - **[Pipelines](pipelines.md)** — YAML shape, parameters, invocation, and response format for the online-serving side.
 - **[Jobs](jobs.md)** — YAML shape, destinations, run ledger, and cancellation for the offline-batch side.
-- **[CLI](../crates/cli/README.md)** — `skardi run`, aliases, federated SQL from the shell.
+- **[CLI](cli.md)** — `skardi run`, aliases, federated SQL from the shell.
 - **[Spark for Agents](spark_for_agents.md)** — why the platform is shaped this way.

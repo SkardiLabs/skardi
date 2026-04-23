@@ -1,4 +1,4 @@
-# Offline Jobs (`kind: job`)
+# Offline Jobs
 
 Offline jobs in Skardi are parameterized SQL queries whose rows are written
 to a durable destination — a Lance dataset on disk, or a read-write database
@@ -11,14 +11,7 @@ polled by run id (the write path agents use to commit durable results).
 **In one sentence:** a pipeline answers a query; a job commits the answer
 somewhere you can query again later.
 
-### Why this is a first-class primitive, not just "a long-running pipeline"
 
-Jobs are the write path for agent autonomy. An agent that can only answer
-queries is a search engine; an agent that can commit durable, queryable
-results to the lake is a data engineer. The part that separates the two —
-atomic commits, run ledger, submit-time schema diff, crash recovery,
-cancellation — is exactly what makes agent-initiated writes *safe* without
-requiring a human in the approval loop. See
 [docs/spark_for_agents.md § Trust the agent, but make writes safe](spark_for_agents.md#4-trust-the-agent-but-make-writes-safe)
 for the design rationale.
 
@@ -414,28 +407,3 @@ The CLI prints `submitted: <run_id> (pending)`. Follow it with
 non-null `snapshot_id` (the Lance dataset version).
 
 Re-running the same command appends more rows to the same dataset.
-
----
-
-## What's not in MVP
-
-- **Iceberg destination** — read-only today. Deferred to v1.1.
-- **Delta Lake destination** — same shape as Lance; lands when a demand
-  case appears.
-- **`mode: overwrite`** — deferred pending provider-native transactional
-  DML (see the `destination.mode` section above for the atomicity
-  reasoning).
-- **Upsert / merge.**
-- **Watermark / incremental templating** (`${last_successful_run.finished_at}`).
-- **Cron / event triggers.**
-- **Streaming / CDC.**
-- **Partitioned / parallel batch execution** — one spawned task per run.
-- **Hot-reload of job YAMLs from disk** — the server currently requires
-  a restart to pick up new jobs.
-- **HTTP-submitted job definitions** — agents *invoke* jobs, not *define*
-  them. Permanently out of scope.
-- **DDL for DB destinations** — permanently out of scope. Create DB
-  tables with your DB's own DDL.
-
-The design doc at `.claude/plans/pipelines_as_jobs.md` has the long-form
-rationale for each of these.
