@@ -1,56 +1,109 @@
 # Skardi Server
 
-`skardi-server` is an HTTP server that loads data sources from a **context file**, registers SQL pipelines, and serves them as REST endpoints.
+`skardi-server` is the HTTP process that hosts two peer surfaces on one
+engine:
 
-## Running the Server
+- **Online serving — [pipelines](pipelines.md).** Parameterized SQL
+  served synchronously as REST endpoints
+- **Offline [jobs](jobs.md).** The same SQL shape run asynchronously into
+  a durable destination , with a run ledger and
+  atomic commit.
+
+Both surfaces share the same context file (data sources + access mode +
+caching), the same YAML envelope, and the same HTTP listener. This page covers the
+shared server concerns; the per-surface reference lives in
+[pipelines.md](pipelines.md) and [jobs.md](jobs.md). For the broader
+story, see [spark_for_agents.md](spark_for_agents.md).
+
+---
+
+## Running the server
 
 ```bash
 cargo run --bin skardi-server -- \
   --ctx <path-to-ctx.yaml> \
-  --pipeline <path-to-pipeline.yaml-or-directory> \
+  --pipeline <pipeline-file-or-directory> \
+  --jobs <job-file-or-directory> \
+  --jobs-db <path-to-jobs.db> \
   --port 8080
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--ctx` | Path to the context YAML file that defines data sources |
-| `--pipeline` | Path to a pipeline YAML file or a directory of pipeline files |
-| `--port` | Port to listen on (default: 8080) |
+| `--ctx` | Context YAML defining data sources (required). |
+| `--pipeline` | Pipeline YAML file or directory of pipeline files. When omitted, `POST /:name/execute` and `/pipelines` return empty. |
+| `--jobs` | Job YAML file or directory. When omitted, every `/jobs/*` endpoint returns `503` with `error_type: jobs_disabled`. |
+| `--jobs-db` | SQLite run ledger for jobs. Default: `~/.skardi/jobs.db` (parent dirs created on first use). |
+| `--port` | Port to listen on. Default: `8080`. |
+
+On startup the server:
+
+1. Loads the context file and registers every data source.
+2. Loads pipeline and job files; rejects any YAML missing the correct
+   `kind:` at the root.
+3. Opens (creating if needed) the SQLite jobs ledger and reconciles
+   orphan runs — any row left in `pending` or `running` by a previous
+   crash is rewritten to `failed` with the message `"server restarted
+   before run completed"`.
+4. Binds the HTTP listener.
+
+---
 
 ## Dashboard
 
-Once the server is running, open `http://localhost:8080` in your browser to access the pipeline dashboard.
+Once the server is running, open `http://localhost:8080` in a browser to
+access the built-in dashboard. Today it covers pipelines — each
+registered pipeline is shown as a card with:
 
-The dashboard lists every registered pipeline as a card showing:
-- **Endpoint URL** — the `POST` path to call, with a one-click copy button
-- **Parameters** — inferred parameter names and types from the pipeline SQL
-- **Example request** — a ready-to-run `curl` command for the pipeline
-- **Try It** — an interactive panel where you can edit the JSON body and execute the pipeline directly from the browser
+- **Endpoint URL** — the `POST` path to call, with a one-click copy button.
+- **Parameters** — names and inferred types extracted from the pipeline SQL.
+- **Example request** — a ready-to-run `curl` command.
+- **Try It** — an interactive panel to edit the JSON body and execute the
+  pipeline from the browser.
 
-No configuration required — the dashboard is built into `skardi-server` and updates automatically when pipelines are loaded.
+No configuration required — the dashboard is built into `skardi-server`
+and updates automatically when pipelines reload. A job-side dashboard
+view (recent runs, submit / poll / cancel) is on the roadmap.
 
-## API Endpoints
+---
+
+## API endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Pipeline dashboard UI |
-| `/health` | GET | Service health check |
-| `/health/:name` | GET | Per-pipeline health check (includes data source status) |
-| `/pipelines` | GET | List all registered pipelines |
-| `/pipeline/:name` | GET | Get specific pipeline info |
-| `/data_source` | GET | List all data sources |
-| `/:name/execute` | POST | Execute a pipeline by name |
+| `/` | GET | Pipeline dashboard UI. |
+| `/health` | GET | Service health check. |
+| `/data_source` | GET | List all registered data sources. |
+| `/pipelines` | GET | List all registered pipelines. |
+| `/pipeline/:name` | GET | Metadata for one pipeline. |
+| `/health/:name` | GET | Per-pipeline health check (includes upstream data-source status). |
+| `/:name/execute` | POST | Execute a pipeline by name. Body is the JSON param map. See [pipelines.md](pipelines.md). |
+| `/jobs` | GET | List all registered jobs with destinations. |
+| `/jobs/:name/run` | POST | Submit a new job run. Body is the JSON param map. See [jobs.md](jobs.md). |
+| `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
+| `/jobs/runs/:run_id` | GET | Current state of one run. |
+| `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation. |
 
-## Context Files
+Request / response bodies for pipeline execution are documented in
+[pipelines.md § Response format](pipelines.md#response-format); job run
+submission and the run lifecycle are documented in
+[jobs.md § HTTP endpoints](jobs.md#http-endpoints).
 
-A context file (`ctx.yaml`) defines the data sources available to your pipelines. Each data source is registered as a table in the query engine.
+---
+
+## Context files
+
+A context file (`ctx.yaml`) defines the data sources available to both
+pipelines and jobs. Each data source is registered as a table (or
+catalog) in the query engine, and the same registration serves both
+surfaces — a pipeline's `SELECT` and a job's `INSERT` target the same
+logical names.
 
 ```yaml
 kind: context
 
 metadata:
-  name: example-context
-  version: 1.0.0
+  name: products-ctx
 
 spec:
   data_sources:
@@ -64,14 +117,13 @@ spec:
       description: "Product catalog"
 ```
 
-You can define multiple data sources of different types in a single context file:
+A single context can mix source types:
 
 ```yaml
 kind: context
 
 metadata:
-  name: example-context
-  version: 1.0.0
+  name: mixed-ctx
 
 spec:
   data_sources:
@@ -92,23 +144,23 @@ spec:
         delimiter: ","
 ```
 
-## Access Mode
+### Access mode
 
-By default, all data sources are **read-only** — only `SELECT` queries are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE`), set `access_mode: read_write` on the data source. Only `postgres`, `mysql`, `sqlite`, `mongo`, and `redis` sources support `read_write` mode; setting it on other types will produce an error at startup.
+By default, every data source is **read-only** — only `SELECT` queries
+are allowed. To enable write operations (`INSERT`, `UPDATE`, `DELETE` —
+used by job destinations with `kind: sql` and by write-through
+pipelines), set `access_mode: read_write` on the data source.
+
+Only `postgres`, `mysql`, `sqlite`, `mongo`, and `redis` sources support
+`read_write`; setting it on other types fails at startup.
 
 ```yaml
-kind: context
-
-metadata:
-  name: example-context
-  version: 1.0.0
-
 spec:
   data_sources:
     - name: "users"
       type: "postgres"
       connection_string: "postgresql://localhost:5432/mydb?sslmode=disable"
-      access_mode: read_write    # Enable INSERT/UPDATE/DELETE
+      access_mode: read_write    # Enable INSERT / UPDATE / DELETE
       options:
         table: "users"
         user_env: "PG_USER"
@@ -117,25 +169,24 @@ spec:
     - name: "products"
       type: "csv"
       path: "data/products.csv"
-      # access_mode defaults to read_only (CSV doesn't support writes)
+      # access_mode defaults to read_only (CSV has no write path)
 ```
 
-If a pipeline attempts a write operation on a `read_only` source, the server returns an error:
+A pipeline or job that attempts a write on a `read_only` source is
+rejected before execution:
+
 ```
-Write operation not allowed on data source 'products'. The data source is configured with 'read_only' access mode.
+Write operation not allowed on data source 'products'. The data source is
+configured with 'read_only' access mode.
 ```
 
-## In-Memory Caching
+### In-memory caching
 
-For file-based sources (`csv`, `parquet`, `iceberg`), you can set `enable_cache: true` to load the entire dataset into memory at startup. This gives significantly faster query performance at the cost of memory usage.
+For file-based sources (`csv`, `parquet`, `iceberg`), set
+`enable_cache: true` to load the entire dataset into memory at startup —
+significantly faster repeated queries at the cost of RSS.
 
 ```yaml
-kind: context
-
-metadata:
-  name: example-context
-  version: 1.0.0
-
 spec:
   data_sources:
     - name: "products"
@@ -146,63 +197,14 @@ spec:
         has_header: true
 ```
 
-This is useful for datasets that are queried frequently and fit in memory. The cache is created once at startup and used for all subsequent queries.
+The cache is built once at startup and reused for every subsequent query
+on that source, from pipelines and jobs alike.
 
-## Pipeline Files
+---
 
-A pipeline file defines a SQL query with parameter placeholders. Parameters are enclosed in `{braces}` and automatically extracted. Types and response schemas are inferred from the SQL and table schemas.
+## Next
 
-```yaml
-kind: pipeline
-
-metadata:
-  name: product-search-demo
-  version: 1.0.0
-  description: "Product search and filtering"
-
-spec:
-  query: |
-    SELECT
-      "Name" as product_name,
-      "Brand" as brand,
-      "Price" as price
-    FROM products
-    WHERE ({brand} IS NULL OR "Brand" = {brand})
-      AND ({max_price} IS NULL OR "Price" < {max_price})
-    ORDER BY "Price" ASC
-    LIMIT {limit}
-```
-
-Execute with:
-
-```bash
-curl -X POST http://localhost:8080/product-search-demo/execute \
-  -H "Content-Type: application/json" \
-  -d '{"brand": "Apple", "max_price": 500.0, "limit": 10}'
-```
-
-Use the `{param} IS NULL OR ...` pattern for optional filters — pass `null` to skip a filter.
-
-## Response Format
-
-**Success:**
-```json
-{
-  "success": true,
-  "data": [{"product_name": "Laptop", "price": 999.99}],
-  "rows": 1,
-  "execution_time_ms": 15,
-  "timestamp": "2025-01-15T12:00:00.000Z"
-}
-```
-
-**Error:**
-```json
-{
-  "success": false,
-  "error": "Missing required parameters: limit",
-  "error_type": "parameter_validation_error",
-  "details": {"missing_parameters": ["limit"]},
-  "timestamp": "2025-01-15T12:00:00.000Z"
-}
-```
+- **[Pipelines](pipelines.md)** — YAML shape, parameters, invocation, and response format for the online-serving side.
+- **[Jobs](jobs.md)** — YAML shape, destinations, run ledger, and cancellation for the offline-batch side.
+- **[CLI](cli.md)** — `skardi run`, aliases, federated SQL from the shell.
+- **[Spark for Agents](spark_for_agents.md)** — why the platform is shaped this way.
