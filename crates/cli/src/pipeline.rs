@@ -47,22 +47,8 @@ pub struct PipelineFile {
     pub query: String,
 }
 
-/// Load a single pipeline YAML from disk.
-///
-/// Returns an error if the file is not a `kind: pipeline` document —
-/// `kind: job` files have their own loader path (`JobDefinition`), and
-/// any other kind is unsupported here.
-pub fn load_pipeline_from_path(path: &Path) -> Result<PipelineFile> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read pipeline file: {}", path.display()))?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&content)
-        .with_context(|| format!("Failed to parse pipeline YAML: {}", path.display()))?;
-    pipeline_from_value(path, value)
-}
-
 /// Build a `PipelineFile` from an already-parsed YAML root, enforcing the
-/// `kind: pipeline` discriminator. Shared between the single-file loader
-/// and directory discovery so each file is read and parsed only once.
+/// `kind: pipeline` discriminator.
 fn pipeline_from_value(path: &Path, value: serde_yaml::Value) -> Result<PipelineFile> {
     let env: PipelineEnvelope = serde_yaml::from_value(value)
         .with_context(|| format!("Failed to parse pipeline YAML: {}", path.display()))?;
