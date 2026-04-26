@@ -12,7 +12,7 @@ polled by run id (the write path agents use to commit durable results).
 somewhere you can query again later.
 
 
-[docs/spark_for_agents.md § Trust the agent, but make writes safe](spark_for_agents.md#4-trust-the-agent-but-make-writes-safe)
+[docs/agent_data_engine.md § Trust the agent, but make writes safe](agent_data_engine.md#4-trust-the-agent-but-make-writes-safe)
 for the design rationale.
 
 ---
