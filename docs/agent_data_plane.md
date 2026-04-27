@@ -1,6 +1,6 @@
-# Why an Agent Data Engine
+# Why an Agent Data Plane
 
-> Skardi is an agent data engine that gives AI agents data autonomy. One execution engine over every data source — build RAG, hybrid search, memory, and data APIs in plain SQL.
+> Skardi is an agent data plane that gives AI agents data autonomy. One execution engine over every data source — build RAG, hybrid search, memory, and data APIs in plain SQL.
 
 ## The thesis in one page
 
@@ -8,16 +8,40 @@ Agents are not bottlenecked by intelligence. They're bottlenecked by **data auto
 
 Today's data stack was built for humans writing queries and ops teams maintaining pipelines. Hand an LLM a raw schema dump and it hallucinates column names. Hand it a bag of bespoke REST endpoints and it can't compose them. Hand it a vector store and it still can't `JOIN` the result against a Postgres table. Every agent framework patches around this with brittle, app-specific glue.
 
-The fix isn't another agent framework. It's an **agent data engine** — a data layer designed for agents from the first line of code. The shape of that answer is best understood by analogy:
+The fix isn't another agent framework. It's an **agent data plane** — the request path every agent tool call traverses. Your agent and your pipeline YAMLs are the *control plane*: they decide what to ask for. Skardi is the *data plane* that serves it: federated SQL over every source you already have, exposed as REST and shell, with retrieval primitives built in.
+
+```mermaid
+flowchart TB
+    subgraph cp["Control plane"]
+        agent["Agent (LLM)<br/>decides what to call"]
+        yaml["Pipeline YAMLs<br/>declare what's callable"]
+    end
+
+    subgraph dp["Data plane — Skardi"]
+        skardi["Federated SQL engine<br/>+ retrieval primitives<br/>(DataFusion)"]
+    end
+
+    subgraph sources["Sources (federated, joinable in one query)"]
+        direction LR
+        dbs[("Postgres · MySQL · SQLite<br/>MongoDB · Redis · SeekDB")]
+        files[("CSV · JSON · Parquet<br/>S3 / GCS / Azure")]
+        lakes[("Lance · Iceberg")]
+    end
+
+    cp -->|"tool call · REST · shell · MCP"| skardi
+    skardi --> sources
+```
+
+Or, by analogy:
 
 - **Spark** gave data teams a single execution engine that worked over every storage format — HDFS, Parquet, Hive, JDBC, Iceberg — with one DataFrame API. Before Spark, every source had its own SDK and every join was a multi-day project.
-- **Skardi** gives agents the same thing, shaped for the agent era: one DataFusion-based engine that federates CSV, Parquet, S3, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, and SeekDB; one declarative YAML format covering both online serving and offline jobs, projecting out to REST, shell, skills, and MCP; one set of SQL primitives (`candle()`, `pg_knn`, `pg_fts`) that agents actually need.
+- **Skardi** gives agents the same shape, but tuned for the request path: one DataFusion-based engine that federates CSV, Parquet, S3, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, and SeekDB; one declarative YAML format covering both online serving and offline jobs, projecting out to REST, shell, skills, and MCP; one set of SQL primitives (`candle()`, `pg_knn`, `pg_fts`) agents actually need.
 
-That's what we mean by "Spark for Agents" — an analogy for what the engine does and who it's for, not a literal claim of equivalence.
+That's what we mean by "Spark for Agents" — borrowing the *shape* (one engine over every source) but not the workload. Spark targets large-scale analytics; Skardi targets the request path of agent tool calls.
 
 ---
 
-## Why an agent data engine is the right primitive, not "another agent framework"
+## Why an agent data plane is the right primitive, not "another agent framework"
 
 Agent frameworks sit above the model and below the UX. They orchestrate tool calls. That's valuable, but it's not where the hard problem is — every framework has the same "how do I give my agent real data" chapter, and they all handle it by gluing together a vector DB, a SQL DB, and a pile of REST wrappers.
 
@@ -28,7 +52,7 @@ The hard problem lives underneath. It's the data layer.
 - **An agent cannot discover tools if every endpoint is a hand-crafted one-off.** Skardi's pipeline YAML is the single source of truth — one file becomes a REST endpoint today, a `skardi run` shell command today, a Claude skill tomorrow, and an MCP tool shortly after. All surfaces stay in lockstep because they derive from the same spec.
 - **An agent cannot do durable work if every write is a fire-and-forget HTTP call.** Skardi's offline jobs primitive commits async writes to Lance or a DB with a run ledger, submit / poll / cancel, crash recovery, and atomic failure semantics.
 
-None of the above is a model-level capability. All of it is data-engine plumbing. It's what Databricks built for humans and what nobody has built for agents yet. That's the gap.
+None of the above is a model-level capability. All of it is data-plane plumbing. It's what Databricks built for humans and what nobody has built for agents yet. That's the gap.
 
 ---
 
@@ -84,7 +108,7 @@ The full public roadmap, with live checkboxes for what's shipped vs in flight vs
 
 ---
 
-## What an agent data engine is not
+## What an agent data plane is not
 
 A few comparisons that sound similar but are deliberately off-mission:
 

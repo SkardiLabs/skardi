@@ -3,7 +3,7 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**Skardi is an agent data engine that gives AI agents data autonomy.**
+**Skardi is an agent data plane that gives AI agents data autonomy.**
 
 <a href="https://skardilabs.github.io/skardi-docs/">Documentation</a> •
 <a href="#roadmap">Roadmap</a> •
@@ -35,9 +35,9 @@
 
 ## What is Skardi?
 
-Skardi is an open-source **agent data engine**. Build RAG, hybrid search, memory, and data APIs across databases, files, data lakes, and vector stores — with SQL.
+Skardi is an open-source **data plane for AI agents** — every tool call your agent makes hits a Skardi pipeline: declarative SQL, served over REST or shell, with retrieval primitives built in. Build RAG, hybrid search, memory, and data APIs across databases, files, data lakes, and vector stores.
 
-Think of it as **Spark for Agents**: one execution engine over every data source, shaped for how agents actually use data — schemas agents can *read*, outputs agents can *parse*, tools agents can *discover*, and writes agents can *trust*.
+Borrowing Spark's shape — one engine over every data source — but tilted for online serving, not analytics. Your agent and your pipeline YAMLs are the *control plane*; Skardi is the *data plane* every tool call traverses, designed for how agents actually use data: schemas they can *read*, outputs they can *parse*, tools they can *discover*, writes they can *trust*.
 
 - **`skardi` CLI** — federated SQL + parameterized pipelines as shell commands. Drop it into any agent that has a Bash tool (Claude Code, Cursor, custom loops) and it's wired.
 - **`skardi-server`** — two peer surfaces on one engine: **online serving** (declarative SQL pipelines as parameterized REST endpoints) and **offline jobs** (async batch writes into Lance or any read-write DB, with atomic commit + run ledger).
@@ -47,7 +47,7 @@ Think of it as **Spark for Agents**: one execution engine over every data source
 
 ---
 
-## Why an agent data engine?
+## Why an agent data plane?
 
 Agents don't lack intelligence — they lack **data autonomy**. Hand an LLM a raw schema dump and it hallucinates; hand it a bag of bespoke REST endpoints and it gets lost; hand it a vector store and it still can't JOIN. The gap isn't the model. The gap is that today's data stack was designed for humans writing queries, not agents calling tools.
 
@@ -57,7 +57,7 @@ Skardi closes that gap with three deliberate choices:
 2. **Online serving.** Parameterized SQL served synchronously as REST endpoints; the low-latency path every agent tool call hits.
 3. **Offline jobs.** The same SQL shape run asynchronously into a durable destination, with a run ledger, atomic commit, and submit / poll / cancel.
 
-Read the full narrative in [docs/agent_data_engine.md](docs/agent_data_engine.md).
+Read the full narrative in [docs/agent_data_plane.md](docs/agent_data_plane.md).
 
 ---
 ## Quick Start
@@ -129,7 +129,7 @@ Full reference:
 - **Server** — [docs/server.md](docs/server.md)
 - **Pipelines (online serving)** — [docs/pipelines.md](docs/pipelines.md)
 - **Jobs (offline batch)** — [docs/jobs.md](docs/jobs.md)
-- **Why an agent data engine** — [docs/agent_data_engine.md](docs/agent_data_engine.md)
+- **Why an agent data plane** — [docs/agent_data_plane.md](docs/agent_data_plane.md)
 
 ---
 
