@@ -21,6 +21,7 @@ use thiserror::Error;
 
 use crate::OptimizerRegistry;
 use crate::remote_storage::{RemoteStorage, S3Storage};
+use crate::semantics::SemanticsRegistry;
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -63,6 +64,15 @@ pub struct CliArgs {
     )]
     pub ctx_file: Option<PathBuf>,
 
+    /// Path to a `kind: semantics` YAML file or directory of them.
+    /// Files in a directory whose root `kind:` is not `semantics` are
+    /// silently skipped, mirroring `--jobs`.
+    #[arg(
+        long = "semantics",
+        help = "Path to semantics YAML file or directory containing semantics overlays"
+    )]
+    pub semantics_path: Option<PathBuf>,
+
     /// Server port number
     #[arg(long, default_value = "8080", help = "Server port number")]
     pub port: u16,
@@ -78,6 +88,10 @@ pub struct ServerConfig {
     pub jobs: HashMap<String, JobDefinition>,
     /// Data sources to register with DataFusion
     pub data_sources: Vec<DataSource>,
+    /// Natural-language descriptions overlaid on top of the catalog,
+    /// merged from all `kind: semantics` files plus any inline `description`
+    /// fields on `data_sources[]` in the ctx (the latter is the fallback).
+    pub semantics: SemanticsRegistry,
     /// CLI arguments
     pub args: CliArgs,
 }
@@ -108,6 +122,11 @@ pub struct DataSource {
     /// If true, load the entire table into memory at startup (only for Csv, Parquet, Iceberg)
     #[serde(default)]
     pub enable_cache: bool,
+    /// Optional natural-language description of the table this data source exposes.
+    /// Used as a fallback table-level description on the catalog endpoint when no
+    /// matching entry is present in a loaded `kind: semantics` file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Top-level envelope for context YAML files:
@@ -472,6 +491,11 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         );
     }
 
+    // Load semantics overlays (if --semantics was passed) and seed the
+    // registry with the ctx-inline descriptions as a fallback.
+    let semantics = SemanticsRegistry::build(args.semantics_path.as_deref(), &data_sources)
+        .with_context(|| "Failed to load semantics")?;
+
     tracing::info!(
         "Configuration loaded successfully: pipelines={}, jobs={}, data_sources={}",
         pipelines.len(),
@@ -483,6 +507,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         pipelines,
         jobs,
         data_sources,
+        semantics,
         args,
     })
 }
@@ -1566,6 +1591,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: Some(context_path),
+            semantics_path: None,
             port: 8080,
         };
 
@@ -1590,6 +1616,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 3000,
         };
 
@@ -1643,6 +1670,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 3000,
         };
 
@@ -1670,6 +1698,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 8080,
         };
 
@@ -1693,6 +1722,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 8080,
         };
 
