@@ -13,6 +13,8 @@
 [License Badge]: https://img.shields.io/badge/License-Apache%202.0-orange.svg
 [CI]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml
 [CI Badge]: https://github.com/SkardiLabs/skardi/actions/workflows/ci.yml/badge.svg
+[Codecov]: https://codecov.io/gh/SkardiLabs/skardi
+[Codecov Badge]: https://codecov.io/gh/SkardiLabs/skardi/branch/main/graph/badge.svg
 [crates.io]: https://crates.io/crates/skardi
 [crates.io Badge]: https://img.shields.io/crates/v/skardi.svg
 [Docs]: https://docs.rs/skardi
@@ -22,6 +24,7 @@
 
 [![License Badge]][License]
 [![CI Badge]][CI]
+[![Codecov Badge]][Codecov]
 [![crates.io Badge]][crates.io]
 [![Docs Badge]][Docs]
 [![Discord Badge]][Discord]
