@@ -372,7 +372,7 @@ jobs:
           EOF
 
       - name: Execute Integration tests
-        run: cargo llvm-cov --no-report --no-clean nextest --all-features -- --ignored
+        run: cargo llvm-cov --no-report nextest --all-features -- --ignored
 
       - name: Generate coverage report (lcov)
         run: cargo llvm-cov report --lcov --output-path lcov.info
