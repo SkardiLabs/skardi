@@ -138,7 +138,7 @@ jobs:
       - name: Check the package for errors
         run: cargo check --all
       - name: Execute rust tests
-        run: cargo nextest run --all-features
+        run: cargo llvm-cov --no-report nextest --all-features
 
       - name: Install integration test dependencies
         run: |
@@ -372,4 +372,13 @@ jobs:
           EOF
 
       - name: Execute Integration tests
-        run: cargo nextest run --all-features -- --ignored
+        run: cargo llvm-cov --no-report nextest --all-features -- --ignored
+
+      - name: Generate coverage report (lcov)
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
