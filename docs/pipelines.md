@@ -66,6 +66,65 @@ Each `POST /<name>/execute` body is a JSON object keyed by placeholder
 name; the CLI takes `--param name=value` flags with optional typed
 suffixes (`--param limit:int=10`).
 
+### Parameter shapes
+
+The `{name}` token is replaced with a SQL-safe literal at execution time.
+The supported JSON value → SQL literal mapping is:
+
+| JSON shape | Renders as | Example use |
+|---|---|---|
+| `"abc"` | `'abc'` (escaped, single-quoted) | `WHERE name = {name}` |
+| `123` | `123` | `LIMIT {top_k}` |
+| `true` / `false` | `true` / `false` | `WHERE active = {active}` |
+| `null` | `NULL` | `WHERE {brand} IS NULL OR brand = {brand}` |
+| `[1, 2, 3]` (array of scalars) | `[1, 2, 3]` | pgvector / SeekDB VECTOR literal |
+| `[[…], […]]` (array of arrays) | `(c1, c2, …), (c1, c2, …)` | `INSERT … VALUES {rows}` |
+
+The array-of-arrays shape lets one parameter carry a multi-row VALUES
+clause whose batch size is set by the caller, not baked into the YAML:
+
+```yaml
+spec:
+  query: |
+    INSERT INTO docs (id, title, embedding) VALUES {rows}
+```
+
+```bash
+curl -X POST http://localhost:8080/batch_insert/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rows": [
+      ["d1", "doc-a", [1.0, 0.0, 0.0, 0.0]],
+      ["d2", "doc-b", [0.0, 1.0, 0.0, 0.0]],
+      ["d3", "doc-c", [0.0, 0.0, 1.0, 0.0]]
+    ]
+  }'
+```
+
+renders as:
+
+```sql
+INSERT INTO docs (id, title, embedding) VALUES
+  ('d1', 'doc-a', [1.0, 0.0, 0.0, 0.0]),
+  ('d2', 'doc-b', [0.0, 1.0, 0.0, 0.0]),
+  ('d3', 'doc-c', [0.0, 0.0, 1.0, 0.0])
+```
+
+A nested array inside a row tuple (e.g. an `embedding` cell) renders as
+the bracketed scalar form `[v1, v2, v3]` — the same text shape pgvector
+and SeekDB's `VECTOR` columns accept for a single-row insert.
+
+**Reject case.** Mixed-shape arrays — where some elements of `{rows}` are
+themselves arrays and others are scalars — return
+`parameter_validation_error: Unsupported parameter type` rather than
+silently emitting malformed SQL. Callers must pass *every* element of a
+row-list parameter as an array, even for batch size 1.
+
+Runnable examples:
+- `docs/postgres/pipelines/batch_insert_users.yaml`
+- `docs/seekdb/pipelines/batch_insert_users.yaml`
+- `docs/seekdb/pipelines/batch_insert_docs_with_embeddings.yaml`
+
 ### Optional filter pattern
 
 Use `{param} IS NULL OR …` to make a filter optional — callers pass `null`

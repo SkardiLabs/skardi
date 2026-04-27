@@ -1,0 +1,29 @@
+kind: pipeline
+
+metadata:
+  name: "seekdb-batch-insert-docs-with-embeddings"
+  version: "1.0"
+  description: >
+    Demonstrates the multi-row VALUES tuple-list parameter when one of
+    the columns is a VECTOR. Each element of {rows} is `[id, title,
+    category, embedding]`, where `embedding` is itself a JSON array of
+    numbers. The renderer emits the embedding as the bracketed scalar
+    form `[v1, v2, …]` inside the row tuple, which SeekDB's VECTOR column
+    parses as a text literal — same shape used by single-row inserts.
+
+    Example request body:
+      {"rows": [
+        ["d1", "doc-a", "books", [1.0, 0.0, 0.0, 0.0]],
+        ["d2", "doc-b", "music", [0.0, 1.0, 0.0, 0.0]],
+        ["d3", "doc-c", "books", [0.0, 0.0, 1.0, 0.0]]
+      ]}
+
+    Renders to:
+      INSERT INTO docs (id, title, category, embedding) VALUES
+        ('d1', 'doc-a', 'books', [1.0, 0.0, 0.0, 0.0]),
+        ('d2', 'doc-b', 'music', [0.0, 1.0, 0.0, 0.0]),
+        ('d3', 'doc-c', 'books', [0.0, 0.0, 1.0, 0.0])
+
+spec:
+  query: |
+    INSERT INTO docs (id, title, category, embedding) VALUES {rows}

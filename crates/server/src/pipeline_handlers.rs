@@ -458,10 +458,52 @@ pub async fn get_data_sources(
     })))
 }
 
+/// Render a single scalar JSON value as the SQL literal form used inside an
+/// array placeholder or a row tuple cell.
+///
+/// Number/Bool/Null render verbatim; String is single-quoted and escaped.
+/// Anything else falls back to `Value::to_string()`, matching the previous
+/// behaviour for unexpected nested shapes.
+fn scalar_to_sql(v: &Value) -> String {
+    match v {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", s.replace("'", "''")),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "NULL".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Render one cell of a row tuple. Scalars use `scalar_to_sql`; a nested
+/// array is rendered as the bracketed scalar form `[a, b, c]` so VECTOR /
+/// pgvector columns accept the literal as a row-cell value (the same shape
+/// `Value::Array` of scalars produces at the top level).
+fn row_cell_to_sql(v: &Value) -> String {
+    match v {
+        Value::Array(inner) => {
+            let elements: Vec<String> = inner.iter().map(scalar_to_sql).collect();
+            format!("[{}]", elements.join(", "))
+        }
+        _ => scalar_to_sql(v),
+    }
+}
+
 /// Substitute `{param}` placeholders in `sql` with their SQL-safe values.
 ///
 /// `expected_params` must be sorted longest-first so that a shorter name (e.g. `user`) cannot
 /// corrupt a longer one that shares it as a prefix (e.g. `user_id`).
+///
+/// Supported JSON parameter shapes:
+/// - String / Number / Bool / Null → the obvious literal.
+/// - `Array` of scalars → `[a, b, c]` (vector / pgvector text literal form).
+/// - `Array` whose every element is itself an `Array` → a multi-row tuple
+///   list `(c1, c2, …), (c1, c2, …)` for `INSERT … VALUES {rows}` shapes.
+///   Inner arrays inside a tuple cell render as the scalar bracket form
+///   so a vector column can sit alongside scalar columns in the same row.
+///
+/// Mixed-shape arrays (some elements scalar, some array) are rejected as
+/// `Unsupported` so a caller can't accidentally emit malformed SQL by
+/// passing an array-of-arrays with a stray scalar.
 ///
 /// Returns `(missing_params, unsupported_params)` — both empty on full success.
 fn substitute_sql_params(
@@ -482,17 +524,36 @@ fn substitute_sql_params(
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "NULL".to_string(),
                 Value::Array(arr) if !arr.is_empty() => {
-                    let elements: Vec<String> = arr
-                        .iter()
-                        .map(|v| match v {
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => format!("'{}'", s.replace("'", "''")),
-                            Value::Bool(b) => b.to_string(),
-                            Value::Null => "NULL".to_string(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    format!("[{}]", elements.join(", "))
+                    if arr.iter().all(|v| v.is_array()) {
+                        // Multi-row tuple list — `(c1, c2, …), (c1, c2, …)`.
+                        let rows: Vec<String> = arr
+                            .iter()
+                            .map(|row| {
+                                let cells: Vec<String> = row
+                                    .as_array()
+                                    .expect("checked above")
+                                    .iter()
+                                    .map(row_cell_to_sql)
+                                    .collect();
+                                format!("({})", cells.join(", "))
+                            })
+                            .collect();
+                        rows.join(", ")
+                    } else if arr.iter().any(|v| v.is_array()) {
+                        tracing::error!(
+                            "Mixed-shape array for {} (some elements are arrays, \
+                             some are scalars). Pass either an all-scalar array \
+                             (vector literal) or an all-array array (VALUES tuple \
+                             list).",
+                            param_name
+                        );
+                        unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                        continue;
+                    } else {
+                        // Flat scalar array — the original vector-literal form.
+                        let elements: Vec<String> = arr.iter().map(scalar_to_sql).collect();
+                        format!("[{}]", elements.join(", "))
+                    }
                 }
                 _ => {
                     tracing::error!(
@@ -1169,6 +1230,156 @@ spec:
         assert!(missing.is_empty());
         assert!(unsupported.is_empty());
         assert_eq!(sql, "SELECT * FROM t WHERE name = 'o''brien'");
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-row VALUES tuple list (array-of-arrays) tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_substitute_tuple_list_scalar_only() {
+        let mut sql = "INSERT INTO t (a, b) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![
+                Value::Array(vec![
+                    Value::Number(1.into()),
+                    Value::String("x".to_string()),
+                ]),
+                Value::Array(vec![
+                    Value::Number(2.into()),
+                    Value::String("y".to_string()),
+                ]),
+            ]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')");
+    }
+
+    #[test]
+    fn test_substitute_tuple_list_with_nested_vector() {
+        // A row tuple with a nested array cell (the vector column) renders
+        // as `(scalar, [v1, v2, v3], scalar)` — VECTOR / pgvector text form
+        // sits inside the row exactly as it does at the top level.
+        let mut sql = "INSERT INTO docs (id, embedding, title) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![
+                Value::Array(vec![
+                    Value::String("a".to_string()),
+                    Value::Array(vec![
+                        Value::Number(serde_json::Number::from_f64(0.1).unwrap()),
+                        Value::Number(serde_json::Number::from_f64(0.2).unwrap()),
+                    ]),
+                    Value::String("alpha".to_string()),
+                ]),
+                Value::Array(vec![
+                    Value::String("b".to_string()),
+                    Value::Array(vec![
+                        Value::Number(serde_json::Number::from_f64(0.3).unwrap()),
+                        Value::Number(serde_json::Number::from_f64(0.4).unwrap()),
+                    ]),
+                    Value::String("beta".to_string()),
+                ]),
+            ]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(
+            sql,
+            "INSERT INTO docs (id, embedding, title) VALUES \
+             ('a', [0.1, 0.2], 'alpha'), ('b', [0.3, 0.4], 'beta')"
+        );
+    }
+
+    #[test]
+    fn test_substitute_tuple_list_single_row_batch() {
+        // Batch size of 1 still goes through the tuple-list path and emits a
+        // single `(…)` clause — a multi-row pipeline with `VALUES {rows}`
+        // therefore handles edge-of-batch and steady-state uniformly.
+        let mut sql = "INSERT INTO t (a, b) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![Value::Array(vec![
+                Value::Number(42.into()),
+                Value::String("solo".to_string()),
+            ])]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "INSERT INTO t (a, b) VALUES (42, 'solo')");
+    }
+
+    #[test]
+    fn test_substitute_tuple_list_quote_escaping() {
+        let mut sql = "INSERT INTO t (a) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![Value::Array(vec![Value::String(
+                "o'brien".to_string(),
+            )])]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "INSERT INTO t (a) VALUES ('o''brien')");
+    }
+
+    #[test]
+    fn test_substitute_flat_array_still_renders_as_vector_literal() {
+        // Pre-existing behaviour for a flat scalar array (e.g. a single
+        // vector parameter) is preserved — the tuple-list path only fires
+        // when *every* element is itself an array.
+        let mut sql = "SELECT vector_to_text({embedding})".to_string();
+        let params_map = params(&[(
+            "embedding",
+            Value::Array(vec![
+                Value::Number(serde_json::Number::from_f64(0.1).unwrap()),
+                Value::Number(serde_json::Number::from_f64(0.2).unwrap()),
+                Value::Number(serde_json::Number::from_f64(0.3).unwrap()),
+            ]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(sql, "SELECT vector_to_text([0.1, 0.2, 0.3])");
+    }
+
+    #[test]
+    fn test_substitute_mixed_array_is_unsupported() {
+        // An array with both scalar and array elements is ambiguous (vector
+        // literal? broken tuple list?) and must be rejected rather than
+        // silently dropped into the scalar-fallback branch.
+        let mut sql = "INSERT INTO t (a) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![
+                Value::Array(vec![Value::Number(1.into())]),
+                Value::Number(2.into()),
+            ]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].starts_with("rows: "));
+        // Placeholder left untouched on rejection.
+        assert_eq!(sql, "INSERT INTO t (a) VALUES {rows}");
     }
 
     #[test]
