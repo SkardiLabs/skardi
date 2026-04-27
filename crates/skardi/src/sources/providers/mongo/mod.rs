@@ -2081,13 +2081,44 @@ mod tests {
         let mut ctx = SessionContext::new();
         register_ci_collection(&mut ctx, "products", "product_id").await;
 
-        // category != 'Electronics' should match only Desk Chair (Furniture)
+        // Other parallel tests (test_insert_into, test_delete_with_filter,
+        // test_update_multiple_columns, test_insert_update_delete_round_trip)
+        // transiently insert non-Electronics rows into `products`, so we can't
+        // assert on an exact count. Instead, verify the `!=` pushdown keeps
+        // every Electronics row out and lets the seeded Furniture row through.
         let batches = query_all(
             &ctx,
-            "SELECT product_id FROM products WHERE category != 'Electronics'",
+            "SELECT product_id, category FROM products WHERE category != 'Electronics'",
         )
         .await;
-        assert_eq!(total_rows(&batches), 1);
+        assert!(total_rows(&batches) >= 1);
+
+        let mut saw_furniture_seed = false;
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let cats = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert_ne!(
+                    cats.value(i),
+                    "Electronics",
+                    "row {} ({}) leaked through != filter",
+                    i,
+                    ids.value(i),
+                );
+                if ids.value(i) == "PROD005" {
+                    saw_furniture_seed = true;
+                }
+            }
+        }
+        assert!(saw_furniture_seed, "expected seeded Furniture row PROD005");
     }
 
     #[tokio::test]
