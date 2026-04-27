@@ -1360,6 +1360,39 @@ spec:
     }
 
     #[test]
+    fn test_substitute_tuple_list_covers_bool_null_and_fallback_cells() {
+        // Locks down the three less-common scalar_to_sql arms that the other
+        // tuple-list tests don't reach: Bool, Null, and the fallback for an
+        // unexpected JSON shape (Object). All three flow through
+        // row_cell_to_sql's `_ => scalar_to_sql(v)` branch.
+        let mut sql = "INSERT INTO t (active, last_login, raw) VALUES {rows}".to_string();
+        let mut obj = serde_json::Map::new();
+        obj.insert("k".to_string(), Value::String("v".to_string()));
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![Value::Array(vec![
+                Value::Bool(true),
+                Value::Null,
+                Value::Object(obj),
+            ])]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        // Bool → `true`, Null → `NULL`, Object falls through to
+        // `Value::to_string()` which emits the JSON form `{"k":"v"}`.
+        // The Object case isn't useful SQL on most engines, but it's the
+        // pre-existing behaviour for "any other JSON shape" — locking it
+        // here means a future change has to be deliberate.
+        assert_eq!(
+            sql,
+            "INSERT INTO t (active, last_login, raw) VALUES (true, NULL, {\"k\":\"v\"})"
+        );
+    }
+
+    #[test]
     fn test_substitute_mixed_array_is_unsupported() {
         // An array with both scalar and array elements is ambiguous (vector
         // literal? broken tuple list?) and must be rejected rather than
