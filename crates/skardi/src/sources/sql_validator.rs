@@ -65,6 +65,13 @@ pub fn validate_sql(sql: &str, config: &SqlValidatorConfig) -> Result<(), SqlVal
 }
 
 fn preprocess_parameters(sql: &str) -> String {
+    // `(NULL)` parses both as a scalar expression (e.g. `WHERE x = (NULL)`)
+    // and as a single-row VALUES tuple (e.g. `INSERT … VALUES (NULL)`),
+    // so the same substitution covers both `{scalar}` and `VALUES {rows}`
+    // pipeline shapes. The runtime renderer is responsible for emitting
+    // shape-correct SQL; this stand-in only needs to be parseable.
+    const REPLACEMENT: &str = "(NULL)";
+
     let mut result = sql.to_string();
     let mut start = 0;
 
@@ -72,14 +79,13 @@ fn preprocess_parameters(sql: &str) -> String {
         let open = start + open;
         if let Some(close) = result[open..].find('}') {
             let close = open + close;
-            // Replace {param_name} with a placeholder string
             result = format!(
-                "{}'{}'{}",
+                "{}{}{}",
                 &result[..open],
-                "__PARAM__",
+                REPLACEMENT,
                 &result[close + 1..]
             );
-            start = open + "'__PARAM__'".len();
+            start = open + REPLACEMENT.len();
         } else {
             break;
         }
@@ -386,5 +392,48 @@ mod tests {
             &config,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parameterized_values_tuple_list() {
+        // The runtime renderer expands `{rows}` into a multi-row tuple list
+        // (`(c1, c2), (c1, c2)`) for batched inserts. The validator must accept
+        // this shape — replacing `{rows}` with a quoted scalar literal would
+        // produce `VALUES '__PARAM__'`, which fails SQL parsing and previously
+        // crashed config load.
+        let config = test_config();
+
+        let result = validate_sql(
+            "INSERT INTO orders (id, amount) VALUES {rows}",
+            &config,
+        );
+        assert!(
+            result.is_ok(),
+            "VALUES {{rows}} (multi-row tuple list shape) should validate, got: {:?}",
+            result
+        );
+
+        let result = validate_sql(
+            "INSERT INTO orders (id, embedding) VALUES {rows} ON CONFLICT (id) DO NOTHING",
+            &config,
+        );
+        assert!(
+            result.is_ok(),
+            "VALUES {{rows}} with ON CONFLICT clause should validate, got: {:?}",
+            result
+        );
+
+        // Access-mode enforcement must still apply to the tuple-list shape.
+        let result = validate_sql(
+            "INSERT INTO users (id, name) VALUES {rows}",
+            &config,
+        );
+        match result {
+            Err(SqlValidationError::WriteNotAllowed { operation, table }) => {
+                assert_eq!(operation, "INSERT");
+                assert_eq!(table, "users");
+            }
+            other => panic!("Expected WriteNotAllowed for read-only table, got: {:?}", other),
+        }
     }
 }
