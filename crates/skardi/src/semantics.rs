@@ -1,11 +1,14 @@
 //! Natural-language semantics overlays for the catalog.
 //!
-//! Semantics files are a separate Kubernetes-style YAML kind (`kind: semantics`)
-//! that attach human-readable descriptions to tables and columns already
-//! registered through a `kind: context` file. They are loaded at server
-//! startup alongside pipelines, jobs, and the context, and the catalog
-//! endpoint (`GET /data_source`) emits the descriptions on its response so
-//! agents can read them when picking a tool.
+//! Semantics files are a Kubernetes-style YAML kind (`kind: semantics`) that
+//! attach human-readable descriptions to tables and columns already
+//! registered through a `kind: context` file. They are loaded at startup
+//! alongside pipelines, jobs, and the context, and consumed by:
+//!
+//! * `skardi-server`'s `GET /data_source` response, so agents can read the
+//!   descriptions when picking a tool.
+//! * `skardi query --schema`, which renders the descriptions inline next to
+//!   each table and column.
 //!
 //! ```yaml
 //! kind: semantics
@@ -22,23 +25,28 @@
 //! ```
 //!
 //! Composition rules:
-//! - Multiple files may be loaded by pointing `--semantics` at a directory.
-//!   Files in that directory whose root `kind:` is not `semantics` are
-//!   silently skipped, mirroring how `--jobs` tolerates plain pipelines.
+//! - Multiple files may be loaded by pointing at a directory. Files in that
+//!   directory whose root `kind:` is not `semantics` are silently skipped,
+//!   mirroring how `--jobs` tolerates plain pipelines.
 //! - Two entries (across all files) for the same source — or two column
 //!   entries on the same source/column — are a hard error. Auto-generated
 //!   overlays must produce non-overlapping files.
 //! - References to sources or columns that do not exist on the loaded ctx
 //!   are warned about (not failed) so a stale overlay does not brick a
 //!   server boot.
+//!
+//! Auto-discovery (see [`resolve_semantics_source`]):
+//! - Both `skardi-server` and `skardi query --schema` look for an overlay
+//!   next to the ctx file when no explicit path is supplied:
+//!   `<ctx_dir>/semantics/` (directory) or `<ctx_dir>/semantics.yaml`
+//!   (single file). Defining both is a hard error to prevent silent
+//!   shadowing.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-
-use crate::config::DataSource;
 
 /// Required value of the root `kind:` discriminator.
 pub const SEMANTICS_KIND: &str = "semantics";
@@ -124,17 +132,23 @@ pub enum SemanticsError {
         first: PathBuf,
         second: PathBuf,
     },
+
+    #[error(
+        "Ambiguous semantics auto-discovery: both {dir:?} and {file:?} exist next to the ctx file. \
+         Remove one (or pass --semantics explicitly) so the loader knows which to use."
+    )]
+    AmbiguousAutoDiscovery { dir: PathBuf, file: PathBuf },
 }
 
-/// In-memory lookup attached to `ServerConfig` and consumed by the catalog
-/// HTTP handler. Indexed by source name; per-column descriptions live in a
-/// nested map.
+/// In-memory lookup attached to `ServerConfig` (server side) or built
+/// on-demand by `skardi query --schema` (CLI side). Indexed by source
+/// name; per-column descriptions live in a nested map.
 ///
-/// The registry merges *all* semantics files passed to `--semantics`, plus
-/// the ctx-inline `description` field, into a single view. Lookups in the
-/// HTTP handler should read from this struct only, not from the raw
-/// `DataSource` list, so that auto-generated overlays and hand-written
-/// ones flow through the same path.
+/// The registry merges *all* semantics files passed in, plus the
+/// ctx-inline `description` field, into a single view. Lookups should
+/// read from this struct only, not from the raw data source list, so
+/// that auto-generated overlays and hand-written ones flow through the
+/// same path.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticsRegistry {
     sources: HashMap<String, SourceEntry>,
@@ -146,34 +160,39 @@ struct SourceEntry {
     /// `column name → description`. Only columns with a non-empty description live here.
     columns: HashMap<String, String>,
     /// Origin file for the source-level description, used to render a
-    /// helpful "redefined here" error if a second file collides.
+    /// helpful "redefined here" error if a second file collides. `None`
+    /// when the description came from the ctx-inline seed (which is
+    /// always allowed to be overwritten by a semantics file).
     description_origin: Option<PathBuf>,
     /// Origin file per column, same purpose.
     column_origins: HashMap<String, PathBuf>,
 }
 
 impl SemanticsRegistry {
-    /// Build the registry for the running server.
+    /// Build the registry.
     ///
     /// `semantics_path` may be a single file, a directory, or `None`.
-    /// `data_sources` is the ctx-loaded data source list — used both for
-    /// the inline-description fallback and for the dangling-reference
-    /// validation pass at the end.
-    pub fn build(semantics_path: Option<&Path>, data_sources: &[DataSource]) -> Result<Self> {
+    /// `ctx_descriptions` is the ctx-loaded list of `(source_name,
+    /// inline_description)` pairs — used both for the inline-description
+    /// fallback and for the dangling-reference validation pass at the end.
+    pub fn build(
+        semantics_path: Option<&Path>,
+        ctx_descriptions: &[(String, Option<String>)],
+    ) -> Result<Self> {
         let mut registry = Self::default();
 
         // Seed with ctx-inline descriptions. Semantics-file entries can
         // overwrite these (with their own collision-tracking origin), so
         // load order is: ctx first, files second.
-        for ds in data_sources {
-            if let Some(desc) = &ds.description
-                && !desc.is_empty()
+        for (name, desc) in ctx_descriptions {
+            if let Some(d) = desc.as_deref()
+                && !d.is_empty()
             {
                 registry
                     .sources
-                    .entry(ds.name.clone())
+                    .entry(name.clone())
                     .or_default()
-                    .description = Some(desc.clone());
+                    .description = Some(d.to_string());
             }
         }
 
@@ -191,7 +210,7 @@ impl SemanticsRegistry {
 
         // Warn (not fail) on dangling references — auto-generated overlays
         // shouldn't brick a partially-rebooted ctx.
-        registry.warn_on_dangling_refs(data_sources);
+        registry.warn_on_dangling_refs(ctx_descriptions);
 
         Ok(registry)
     }
@@ -234,8 +253,8 @@ impl SemanticsRegistry {
         Ok(())
     }
 
-    fn warn_on_dangling_refs(&self, data_sources: &[DataSource]) {
-        let known: HashSet<&str> = data_sources.iter().map(|ds| ds.name.as_str()).collect();
+    fn warn_on_dangling_refs(&self, ctx_descriptions: &[(String, Option<String>)]) {
+        let known: HashSet<&str> = ctx_descriptions.iter().map(|(n, _)| n.as_str()).collect();
         for name in self.sources.keys() {
             if !known.contains(name.as_str()) {
                 tracing::warn!(
@@ -259,6 +278,63 @@ impl SemanticsRegistry {
         self.sources
             .get(source)
             .and_then(|e| e.columns.get(column).map(String::as_str))
+    }
+
+    /// True when no overlay (file or ctx-inline) registered any
+    /// description. Used by `skardi query --schema` to skip the rendering
+    /// path entirely when there is nothing to show.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+
+/// Resolve which semantics path the loader should use, given an explicit
+/// override and/or a ctx directory to auto-discover from.
+///
+/// Resolution order:
+/// 1. `override_path` (e.g. `--semantics <path>`) — used directly if
+///    `Some`. No existence check here; the downstream loader will report
+///    a missing path with a clearer message.
+/// 2. `<ctx_dir>/semantics/` if it exists as a directory.
+/// 3. `<ctx_dir>/semantics.yaml` (or `.yml`) if it exists as a file.
+/// 4. `None` — no overlay configured.
+///
+/// Defining both `<ctx_dir>/semantics/` and `<ctx_dir>/semantics.yaml`
+/// is a hard error: silent shadowing of overlays that drive an agent's
+/// catalog view is exactly the sort of bug we want loud.
+pub fn resolve_semantics_source(
+    ctx_dir: Option<&Path>,
+    override_path: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    if let Some(p) = override_path {
+        return Ok(Some(p.to_path_buf()));
+    }
+    let Some(dir) = ctx_dir else {
+        return Ok(None);
+    };
+
+    let dir_path = dir.join("semantics");
+    let yaml_path = dir.join("semantics.yaml");
+    let yml_path = dir.join("semantics.yml");
+
+    let dir_exists = dir_path.is_dir();
+    let single_file = if yaml_path.is_file() {
+        Some(yaml_path)
+    } else if yml_path.is_file() {
+        Some(yml_path)
+    } else {
+        None
+    };
+
+    match (dir_exists, single_file) {
+        (true, Some(file)) => Err(SemanticsError::AmbiguousAutoDiscovery {
+            dir: dir_path,
+            file,
+        }
+        .into()),
+        (true, None) => Ok(Some(dir_path)),
+        (false, Some(file)) => Ok(Some(file)),
+        (false, None) => Ok(None),
     }
 }
 
@@ -370,23 +446,11 @@ pub fn load_required_semantics_file(path: &Path) -> Result<SemanticsFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DataSource, DataSourceType};
     use std::io::Write;
     use tempfile::TempDir;
 
-    fn ds(name: &str, description: Option<&str>) -> DataSource {
-        DataSource {
-            name: name.to_string(),
-            source_type: DataSourceType::Csv,
-            path: PathBuf::new(),
-            connection_string: None,
-            schema: None,
-            options: None,
-            hierarchy_level: Default::default(),
-            access_mode: Default::default(),
-            enable_cache: false,
-            description: description.map(str::to_string),
-        }
+    fn ctx(name: &str, description: Option<&str>) -> (String, Option<String>) {
+        (name.to_string(), description.map(str::to_string))
     }
 
     fn write_yaml(dir: &Path, name: &str, content: &str) -> PathBuf {
@@ -417,7 +481,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", None)];
+        let sources = vec![ctx("products", None)];
         let reg = SemanticsRegistry::build(Some(&path), &sources).unwrap();
         assert_eq!(reg.table_description("products"), Some("Product catalog"));
         assert_eq!(
@@ -429,7 +493,7 @@ spec:
 
     #[test]
     fn ctx_inline_description_used_as_fallback() {
-        let sources = vec![ds("products", Some("From ctx"))];
+        let sources = vec![ctx("products", Some("From ctx"))];
         let reg = SemanticsRegistry::build(None, &sources).unwrap();
         assert_eq!(reg.table_description("products"), Some("From ctx"));
     }
@@ -451,7 +515,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", Some("From ctx"))];
+        let sources = vec![ctx("products", Some("From ctx"))];
         let reg = SemanticsRegistry::build(Some(&path), &sources).unwrap();
         assert_eq!(reg.table_description("products"), Some("Override"));
     }
@@ -482,7 +546,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", None)];
+        let sources = vec![ctx("products", None)];
         let reg = SemanticsRegistry::build(Some(tmp.path()), &sources).unwrap();
         assert_eq!(reg.table_description("products"), Some("Product catalog"));
     }
@@ -515,7 +579,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", None)];
+        let sources = vec![ctx("products", None)];
         let err = SemanticsRegistry::build(Some(tmp.path()), &sources).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -556,7 +620,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", None)];
+        let sources = vec![ctx("products", None)];
         let err = SemanticsRegistry::build(Some(tmp.path()), &sources).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -581,7 +645,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", None)];
+        let sources = vec![ctx("products", None)];
         let reg = SemanticsRegistry::build(Some(&path), &sources).unwrap();
         // The orphan entry is still in the registry — it just gets a warning at load time.
         assert_eq!(reg.table_description("orphan"), Some("no matching source"));
@@ -607,7 +671,7 @@ spec:
 "#,
         );
 
-        let sources = vec![ds("products", None)];
+        let sources = vec![ctx("products", None)];
         let reg = SemanticsRegistry::build(Some(&path), &sources).unwrap();
         assert_eq!(reg.table_description("products"), None);
     }
@@ -649,8 +713,91 @@ spec:
 
     #[test]
     fn empty_path_input_returns_empty_registry() {
-        let sources: Vec<DataSource> = Vec::new();
+        let sources: Vec<(String, Option<String>)> = Vec::new();
         let reg = SemanticsRegistry::build(None, &sources).unwrap();
         assert_eq!(reg.table_description("anything"), None);
+        assert!(reg.is_empty());
+    }
+
+    // ---------- resolve_semantics_source ----------
+
+    #[test]
+    fn resolver_returns_override_when_provided() {
+        let tmp = TempDir::new().unwrap();
+        let explicit = tmp.path().join("custom.yaml");
+        let resolved = resolve_semantics_source(Some(tmp.path()), Some(&explicit)).unwrap();
+        assert_eq!(resolved.as_deref(), Some(explicit.as_path()));
+    }
+
+    #[test]
+    fn resolver_returns_none_when_no_ctx_dir_and_no_override() {
+        let resolved = resolve_semantics_source(None, None).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolver_picks_directory_when_present() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("semantics")).unwrap();
+        let resolved = resolve_semantics_source(Some(tmp.path()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, tmp.path().join("semantics"));
+    }
+
+    #[test]
+    fn resolver_picks_yaml_file_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("semantics.yaml");
+        std::fs::File::create(&file).unwrap();
+        let resolved = resolve_semantics_source(Some(tmp.path()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, file);
+    }
+
+    #[test]
+    fn resolver_picks_yml_file_when_yaml_missing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("semantics.yml");
+        std::fs::File::create(&file).unwrap();
+        let resolved = resolve_semantics_source(Some(tmp.path()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, file);
+    }
+
+    #[test]
+    fn resolver_returns_none_when_neither_present() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = resolve_semantics_source(Some(tmp.path()), None).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolver_hard_errors_when_dir_and_file_both_present() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("semantics")).unwrap();
+        std::fs::File::create(tmp.path().join("semantics.yaml")).unwrap();
+        let err = resolve_semantics_source(Some(tmp.path()), None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Ambiguous semantics auto-discovery"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolver_override_skips_collision_check() {
+        // If the user passes an explicit path, we don't even look at the
+        // ctx dir — collisions there don't matter.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("semantics")).unwrap();
+        std::fs::File::create(tmp.path().join("semantics.yaml")).unwrap();
+        let explicit = tmp.path().join("custom.yaml");
+        let resolved = resolve_semantics_source(Some(tmp.path()), Some(&explicit))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, explicit);
     }
 }

@@ -35,6 +35,7 @@ use skardi::model::GgufModelRegistry;
 use skardi::model::OnnxModelRegistry;
 #[cfg(feature = "remote-embed")]
 use skardi::model::RemoteEmbedRegistry;
+use skardi::semantics::{SemanticsRegistry, resolve_semantics_source};
 use skardi::sources::HierarchyLevel;
 use skardi::sources::providers::lance::fts_table_function::register_lance_fts_udtf;
 use skardi::sources::providers::lance::knn_table_function::register_lance_knn_udtf;
@@ -52,8 +53,9 @@ use skardi::sources::providers::{
     },
     sqlx::postgres::register_postgres_tables,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use url::Url;
@@ -90,6 +92,13 @@ enum Commands {
         /// Path to .sql file to execute (takes precedence over --sql)
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
+        /// Path to a `kind: semantics` YAML file or directory of them, used by
+        /// `--schema` to render natural-language descriptions next to tables
+        /// and columns. When omitted, the CLI auto-discovers
+        /// `<ctx_dir>/semantics/` (directory) or `<ctx_dir>/semantics.yaml`
+        /// (single file).
+        #[arg(long = "semantics", value_name = "FILE-OR-DIR")]
+        semantics: Option<PathBuf>,
     },
     /// Execute a pipeline YAML by name with named parameters
     #[command(name = "run")]
@@ -220,6 +229,11 @@ struct LocalDataSource {
     /// "read" (default) or "read_write". Currently honored by the SQLite source.
     #[serde(default)]
     access_mode: Option<String>,
+    /// Optional natural-language description of the table this source
+    /// exposes. Used as a fallback by `--schema` when no `kind: semantics`
+    /// overlay supplies one.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 impl LocalDataSource {
@@ -548,6 +562,7 @@ async fn main() -> Result<()> {
             table,
             sql,
             file,
+            semantics,
         } => {
             if schema {
                 if all && table.is_some() {
@@ -559,7 +574,8 @@ async fn main() -> Result<()> {
                 let ctx_path = resolve_ctx_path(ctx.as_deref())
                     .ok_or_else(|| anyhow::anyhow!("Could not resolve a ctx path (no --ctx, no SKARDICONFIG, no home directory)"))?;
                 let table_filter = if all { None } else { table.as_deref() };
-                show_schema(&ctx_path, table_filter).await
+                let mut stdout = std::io::stdout().lock();
+                show_schema(&ctx_path, semantics.as_deref(), table_filter, &mut stdout).await
             } else {
                 let sql_content = if let Some(path) = &file {
                     std::fs::read_to_string(path)
@@ -1098,9 +1114,34 @@ fn available_list(all: &[TableEntry], defaults: &CatalogDefaults) -> String {
         .join(", ")
 }
 
-async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> {
+async fn show_schema(
+    ctx_path: &Path,
+    semantics_override: Option<&Path>,
+    table_filter: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
     let (mut session_ctx, dataset_registry) = new_session_context();
-    load_and_register_all(ctx_path, &mut session_ctx, &dataset_registry).await?;
+    let config = load_and_register_all(ctx_path, &mut session_ctx, &dataset_registry).await?;
+
+    // Build the semantics registry from the same inputs the server uses:
+    //   - the ctx-inline `description` field on each data source (fallback), and
+    //   - either an explicit --semantics path or whatever auto-discovery finds
+    //     next to the ctx (`semantics/` dir or `semantics.yaml` file).
+    let ctx_dir = ctx_path.parent();
+    let semantics_path = resolve_semantics_source(ctx_dir, semantics_override)
+        .with_context(|| "Failed to resolve semantics source")?;
+    let ctx_descriptions: Vec<(String, Option<String>)> = config
+        .data_sources
+        .iter()
+        .map(|ds| (ds.name.clone(), ds.description.clone()))
+        .collect();
+    let semantics = SemanticsRegistry::build(semantics_path.as_deref(), &ctx_descriptions)
+        .with_context(|| "Failed to load semantics")?;
+    let source_names: HashSet<String> = config
+        .data_sources
+        .iter()
+        .map(|ds| ds.name.clone())
+        .collect();
 
     let defaults = CatalogDefaults::from_ctx(&session_ctx);
     let all_tables = enumerate_tables(&session_ctx);
@@ -1110,7 +1151,7 @@ async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> 
     };
 
     if selected.is_empty() {
-        println!("No tables registered.");
+        writeln!(out, "No tables registered.")?;
         return Ok(());
     }
 
@@ -1136,13 +1177,61 @@ async fn show_schema(ctx_path: &Path, table_filter: Option<&str>) -> Result<()> 
                 )
             })?;
         let table_schema = provider.schema();
-        println!("table: {}", entry.display_name(&defaults));
-        for field in table_schema.fields() {
-            println!("  {}: {:?}", field.name(), field.data_type());
+        let source_name = source_name_for(entry, &defaults, &source_names);
+
+        let table_desc = source_name.and_then(|name| semantics.table_description(name));
+        match table_desc {
+            Some(desc) => writeln!(out, "table: {}  -- {}", entry.display_name(&defaults), desc)?,
+            None => writeln!(out, "table: {}", entry.display_name(&defaults))?,
         }
-        println!();
+
+        for field in table_schema.fields() {
+            let col_desc =
+                source_name.and_then(|name| semantics.column_description(name, field.name()));
+            match col_desc {
+                Some(desc) => writeln!(
+                    out,
+                    "  {}: {:?}  -- {}",
+                    field.name(),
+                    field.data_type(),
+                    desc
+                )?,
+                None => writeln!(out, "  {}: {:?}", field.name(), field.data_type())?,
+            }
+        }
+        writeln!(out)?;
     }
     Ok(())
+}
+
+/// Resolve a DataFusion `(catalog, schema, table)` triple back to the ctx
+/// `data_sources[].name` it came from, so we can look up the right
+/// semantics overlay entry.
+///
+/// - **Table-mode** sources register in the session's default
+///   `(catalog, schema)` under `source.name`. So if the entry sits in the
+///   defaults and `entry.table` is a known source name, that's it.
+/// - **Catalog-mode** sources (SQLite, etc.) register the *catalog* under
+///   `source.name`, with the underlying provider supplying inner schemas
+///   and tables. So if `entry.catalog` is a known source name, the source
+///   description applies to every inner table.
+/// - Anything else (ad-hoc URL-registered tables, `information_schema`)
+///   has no source-level description; return `None`.
+///
+/// Per-inner-table semantics for catalog-mode sources is a deferred
+/// feature — see `docs/semantics.md`.
+fn source_name_for<'a>(
+    entry: &TableEntry,
+    defaults: &CatalogDefaults,
+    source_names: &'a HashSet<String>,
+) -> Option<&'a str> {
+    if entry.catalog == defaults.catalog
+        && entry.schema == defaults.schema
+        && source_names.contains(&entry.table)
+    {
+        return source_names.get(&entry.table).map(String::as_str);
+    }
+    source_names.get(&entry.catalog).map(String::as_str)
 }
 
 /// Execute a SQL query. If a context file is provided (or found via defaults), register its
@@ -1515,8 +1604,7 @@ fn validate_alias_against_pipeline(
     positional: &[String],
     defaults: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let known: std::collections::HashSet<&str> =
-        pipeline_params.iter().map(|s| s.as_str()).collect();
+    let known: HashSet<&str> = pipeline_params.iter().map(|s| s.as_str()).collect();
     for p in positional {
         if !known.contains(p.as_str()) {
             anyhow::bail!(
@@ -1544,10 +1632,8 @@ fn report_alias_coverage(
     positional: &[String],
     defaults: &BTreeMap<String, String>,
 ) {
-    let positional_set: std::collections::HashSet<&str> =
-        positional.iter().map(|s| s.as_str()).collect();
-    let default_set: std::collections::HashSet<&str> =
-        defaults.keys().map(|s| s.as_str()).collect();
+    let positional_set: HashSet<&str> = positional.iter().map(|s| s.as_str()).collect();
+    let default_set: HashSet<&str> = defaults.keys().map(|s| s.as_str()).collect();
     let unbound: Vec<&str> = pipeline_params
         .iter()
         .map(|s| s.as_str())
@@ -1732,6 +1818,7 @@ mod tests {
         CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
     };
     use datafusion::datasource::MemTable;
+    use tempfile::TempDir;
 
     fn entry(catalog: &str, schema: &str, table: &str) -> TableEntry {
         TableEntry {
@@ -1942,6 +2029,318 @@ mod tests {
             got,
             vec![entry("wiki", "main", "wiki_pages")],
             "system schemas should be filtered out"
+        );
+    }
+
+    // ---------- semantics rendering ----------
+
+    fn source_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn source_name_for_table_mode_resolves_via_default_catalog() {
+        let names = source_set(&["products", "events"]);
+        let got = source_name_for(
+            &entry("datafusion", "public", "products"),
+            &df_defaults(),
+            &names,
+        );
+        assert_eq!(got, Some("products"));
+    }
+
+    #[test]
+    fn source_name_for_catalog_mode_resolves_via_catalog_name() {
+        // SQLite-style: source.name == catalog name; inner schema/table come
+        // from the underlying provider.
+        let names = source_set(&["wiki"]);
+        let got = source_name_for(&entry("wiki", "main", "wiki_pages"), &df_defaults(), &names);
+        assert_eq!(got, Some("wiki"));
+    }
+
+    #[test]
+    fn source_name_for_returns_none_for_unknown_source() {
+        let names = source_set(&["products"]);
+        let got = source_name_for(
+            &entry("datafusion", "public", "ad_hoc_csv_url"),
+            &df_defaults(),
+            &names,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn show_schema_renders_descriptions_via_auto_discovered_semantics_yaml() {
+        // Full pipeline: ctx + auto-discovered semantics.yaml next to it.
+        // No --semantics flag passed; the resolver should pick up the file
+        // by convention.
+        let tmp = TempDir::new().unwrap();
+
+        let csv_path = tmp.path().join("products.csv");
+        std::fs::write(&csv_path, "id,price\n1,9.99\n2,19.50\n").unwrap();
+
+        let ctx_path = tmp.path().join("ctx.yaml");
+        std::fs::write(
+            &ctx_path,
+            format!(
+                r#"kind: context
+metadata:
+  name: t
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: products
+      type: csv
+      path: {}
+      options:
+        has_header: "true"
+      description: "Ctx-inline fallback"
+"#,
+                csv_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Auto-discovered: semantics.yaml sits next to ctx.yaml. Description
+        // here should *override* the ctx-inline one.
+        std::fs::write(
+            tmp.path().join("semantics.yaml"),
+            r#"kind: semantics
+metadata: { name: t }
+spec:
+  sources:
+    - name: products
+      description: "Catalog of products"
+      columns:
+        - name: id
+          description: "Stable internal SKU"
+        - name: price
+          description: "Retail price in USD"
+"#,
+        )
+        .unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        show_schema(&ctx_path, None, None, &mut out).await.unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(
+            rendered.contains("table: products  -- Catalog of products"),
+            "table-level overlay should win over ctx-inline. Got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("id: Int64  -- Stable internal SKU"),
+            "column overlay missing. Got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("price: Float64  -- Retail price in USD"),
+            "column overlay missing. Got:\n{rendered}"
+        );
+        // The ctx-inline description must not leak through once the file overrides it.
+        assert!(
+            !rendered.contains("Ctx-inline fallback"),
+            "ctx-inline description should have been overridden. Got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_schema_falls_back_to_ctx_inline_when_no_semantics_file() {
+        let tmp = TempDir::new().unwrap();
+
+        let csv_path = tmp.path().join("products.csv");
+        std::fs::write(&csv_path, "id\n1\n").unwrap();
+
+        let ctx_path = tmp.path().join("ctx.yaml");
+        std::fs::write(
+            &ctx_path,
+            format!(
+                r#"kind: context
+metadata: {{ name: t, version: 1.0.0 }}
+spec:
+  data_sources:
+    - name: products
+      type: csv
+      path: {}
+      options:
+        has_header: "true"
+      description: "From ctx"
+"#,
+                csv_path.display()
+            ),
+        )
+        .unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        show_schema(&ctx_path, None, None, &mut out).await.unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(
+            rendered.contains("table: products  -- From ctx"),
+            "ctx-inline description should render when no semantics file present. Got:\n{rendered}"
+        );
+        // No column overlays defined → columns should render bare.
+        assert!(
+            rendered.contains("\n  id: Int64\n"),
+            "column with no overlay should render bare. Got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_schema_renders_bare_when_no_descriptions_anywhere() {
+        // No semantics file, no ctx-inline description → byte-for-byte the
+        // same shape as before semantics existed.
+        let tmp = TempDir::new().unwrap();
+
+        let csv_path = tmp.path().join("products.csv");
+        std::fs::write(&csv_path, "id\n1\n").unwrap();
+
+        let ctx_path = tmp.path().join("ctx.yaml");
+        std::fs::write(
+            &ctx_path,
+            format!(
+                r#"kind: context
+metadata: {{ name: t, version: 1.0.0 }}
+spec:
+  data_sources:
+    - name: products
+      type: csv
+      path: {}
+      options:
+        has_header: "true"
+"#,
+                csv_path.display()
+            ),
+        )
+        .unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        show_schema(&ctx_path, None, None, &mut out).await.unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(
+            rendered.contains("table: products\n"),
+            "no description means no `--` suffix on the table line. Got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(" -- "),
+            "no `--` separators anywhere when nothing supplies descriptions. Got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_schema_explicit_semantics_path_overrides_auto_discovery() {
+        let tmp = TempDir::new().unwrap();
+
+        let csv_path = tmp.path().join("products.csv");
+        std::fs::write(&csv_path, "id\n1\n").unwrap();
+
+        let ctx_path = tmp.path().join("ctx.yaml");
+        std::fs::write(
+            &ctx_path,
+            format!(
+                r#"kind: context
+metadata: {{ name: t, version: 1.0.0 }}
+spec:
+  data_sources:
+    - name: products
+      type: csv
+      path: {}
+      options:
+        has_header: "true"
+"#,
+                csv_path.display()
+            ),
+        )
+        .unwrap();
+
+        // The auto-discovered file says "AUTO".
+        std::fs::write(
+            tmp.path().join("semantics.yaml"),
+            r#"kind: semantics
+metadata: { name: auto }
+spec:
+  sources:
+    - name: products
+      description: "AUTO"
+"#,
+        )
+        .unwrap();
+
+        // The explicit override says "OVERRIDE" and lives elsewhere.
+        let override_dir = tmp.path().join("custom");
+        std::fs::create_dir(&override_dir).unwrap();
+        let override_path = override_dir.join("custom.yaml");
+        std::fs::write(
+            &override_path,
+            r#"kind: semantics
+metadata: { name: override }
+spec:
+  sources:
+    - name: products
+      description: "OVERRIDE"
+"#,
+        )
+        .unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        show_schema(&ctx_path, Some(&override_path), None, &mut out)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(
+            rendered.contains("OVERRIDE"),
+            "explicit --semantics should win. Got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("AUTO"),
+            "auto-discovery must not be merged on top of override. Got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_schema_hard_errors_when_dir_and_file_collide() {
+        let tmp = TempDir::new().unwrap();
+
+        let csv_path = tmp.path().join("products.csv");
+        std::fs::write(&csv_path, "id\n1\n").unwrap();
+
+        let ctx_path = tmp.path().join("ctx.yaml");
+        std::fs::write(
+            &ctx_path,
+            format!(
+                r#"kind: context
+metadata: {{ name: t, version: 1.0.0 }}
+spec:
+  data_sources:
+    - name: products
+      type: csv
+      path: {}
+      options:
+        has_header: "true"
+"#,
+                csv_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Both a `semantics/` dir and a `semantics.yaml` next to the ctx →
+        // hard error so we don't silently shadow one with the other.
+        std::fs::create_dir(tmp.path().join("semantics")).unwrap();
+        std::fs::write(
+            tmp.path().join("semantics.yaml"),
+            "kind: semantics\nspec: {}\n",
+        )
+        .unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = show_schema(&ctx_path, None, None, &mut out)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Ambiguous semantics auto-discovery"),
+            "should bubble up the resolver's collision error: {msg}"
         );
     }
 

@@ -49,6 +49,13 @@ fn products_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn ctx_descriptions(sources: &[DataSource]) -> Vec<(String, Option<String>)> {
+    sources
+        .iter()
+        .map(|ds| (ds.name.clone(), ds.description.clone()))
+        .collect()
+}
+
 fn products_data_source(description: Option<&str>) -> DataSource {
     DataSource {
         name: "products".to_string(),
@@ -144,7 +151,8 @@ spec:
     );
 
     let data_sources = vec![products_data_source(None)];
-    let semantics = SemanticsRegistry::build(Some(&sem_path), &data_sources).unwrap();
+    let semantics =
+        SemanticsRegistry::build(Some(&sem_path), &ctx_descriptions(&data_sources)).unwrap();
     let state = make_state(data_sources, semantics).await;
 
     let body = fetch_data_source(state).await;
@@ -182,7 +190,7 @@ spec:
 #[tokio::test]
 async fn ctx_inline_description_used_when_no_semantics_file() {
     let data_sources = vec![products_data_source(Some("From ctx.yaml"))];
-    let semantics = SemanticsRegistry::build(None, &data_sources).unwrap();
+    let semantics = SemanticsRegistry::build(None, &ctx_descriptions(&data_sources)).unwrap();
     let state = make_state(data_sources, semantics).await;
 
     let body = fetch_data_source(state).await;
@@ -218,7 +226,8 @@ spec:
     );
 
     let data_sources = vec![products_data_source(Some("Original from ctx"))];
-    let semantics = SemanticsRegistry::build(Some(&sem_path), &data_sources).unwrap();
+    let semantics =
+        SemanticsRegistry::build(Some(&sem_path), &ctx_descriptions(&data_sources)).unwrap();
     let state = make_state(data_sources, semantics).await;
 
     let body = fetch_data_source(state).await;

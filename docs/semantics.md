@@ -1,14 +1,16 @@
 # Catalog Semantics
 
 A **semantics overlay** attaches natural-language descriptions to the
-tables and columns already registered through a context file. The server
-loads them at startup alongside pipelines, jobs, and the context, and
-the catalog endpoint (`GET /data_source`) emits the descriptions on its
-response so an agent can read them when picking a tool.
+tables and columns already registered through a context file. Both
+binaries consume it:
 
-This page documents the YAML shape, how the server loads it, the
-override / fallback rules, and the resulting JSON shape on the catalog
-endpoint.
+- `skardi-server` loads it at startup and emits the descriptions on
+  `GET /data_source` so an agent can read them when picking a tool.
+- `skardi query --schema` renders the descriptions inline next to each
+  table and column, for human inspection.
+
+This page documents the YAML shape, how the loader finds it, the
+override / fallback rules, and where the descriptions surface.
 
 ---
 
@@ -67,25 +69,38 @@ existing [`docs/basic/ctx.yaml`](basic/ctx.yaml).
 ## Loading
 
 ```bash
+# server
 skardi-server \
   --ctx ctx.yaml \
   --pipeline pipelines/ \
-  --semantics semantics/ \    # file or directory
+  --semantics semantics/ \    # optional; auto-discovered next to ctx if omitted
   --port 8080
+
+# CLI
+skardi query --ctx ctx.yaml --schema --all
+skardi query --ctx ctx.yaml --schema --all --semantics ./custom/semantics.yaml
 ```
 
-`--semantics` accepts either a single yaml file or a directory:
+Both binaries follow the same resolution order:
 
-- **Single file** — must be `kind: semantics`. A wrong or missing kind
-  is treated the same as for `--jobs`: the file is silently skipped.
-- **Directory** — every `*.yaml` / `*.yml` at one level is scanned, in
-  alphabetical order. Files whose root `kind:` is not `semantics` are
-  silently skipped, so a single shared config directory can mix pipeline
-  / job / context / semantics yamls.
+1. **Explicit `--semantics <path>`** — used directly. Accepts either a
+   single yaml file or a directory.
+2. **Auto-discovered `<ctx_dir>/semantics/`** (directory) — every
+   `*.yaml` / `*.yml` at one level is scanned, in alphabetical order.
+3. **Auto-discovered `<ctx_dir>/semantics.yaml`** (single file).
+4. None — the catalog falls back to `data_sources[].description` only
+   (see *Fallback* below).
 
-When no `--semantics` flag is passed, the server starts normally and
-the catalog endpoint falls back to `data_sources[].description` only
-(see *Fallback* below).
+When `--semantics` points at a directory, files whose root `kind:` is
+not `semantics` are silently skipped, so a single shared config
+directory can mix pipeline / job / context / semantics yamls. A single
+file passed explicitly with the wrong or missing kind is also a soft
+skip — same behavior as `--jobs`.
+
+> **Auto-discovery collision**: defining both
+> `<ctx_dir>/semantics/` and `<ctx_dir>/semantics.yaml` is a hard error
+> at startup. Pick one. Silent shadowing of overlays that drive an
+> agent's catalog view is exactly the bug worth being loud about.
 
 ---
 
@@ -135,7 +150,28 @@ The merge precedence:
 
 ## Where it shows up
 
-The catalog endpoint `GET /data_source` returns the merged view:
+### `skardi query --schema`
+
+The CLI renders the merged view inline next to each table and column.
+A `--` separator carries the description; lines without an overlay or
+fallback render bare, so existing scripts that parse the output keep
+working.
+
+```bash
+$ skardi query --ctx ./ctx.yaml --schema --all
+table: products  -- Product catalog with pricing/inventory. One row per SKU.
+  id: Int64  -- Stable internal SKU; primary key.
+  brand: Utf8
+  price: Float64  -- Retail price in USD.
+```
+
+No flag is needed to opt in: if a `kind: semantics` overlay is
+discovered (or `data_sources[].description` is set), the descriptions
+appear automatically.
+
+### `GET /data_source` (server)
+
+The catalog endpoint returns the merged view:
 
 ```bash
 curl http://localhost:8080/data_source
@@ -179,9 +215,13 @@ present, so the wire shape stays clean for sources that opt out.
   expose many tables under a single registration, but only the
   source-level description bubbles through today. Per-table semantics
   for catalog-mode sources is on the roadmap.
+- The same limitation applies to `skardi query --schema`: catalog-mode
+  sources (e.g. SQLite registered as a catalog) get the source-level
+  description attached to *every* inner table, since there is no
+  per-inner-table semantics yet.
 - There is no agent-callable `describe` verb yet. Agents reach the
-  semantics through the HTTP endpoint above; a CLI / pipeline form is
-  a separate task on the roadmap.
+  semantics through the HTTP endpoint above; a pipeline form is a
+  separate task on the roadmap.
 
 ---
 

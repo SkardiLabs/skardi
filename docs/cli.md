@@ -102,8 +102,31 @@ Use `--schema` with either `--all` (all tables) or `-t TABLE` (one table):
 ```bash
 skardi query --ctx ./demo/ctx.yaml --schema --all
 skardi query --ctx ./demo/ctx.yaml --schema -t products
-
 ```
+
+**Semantics overlay** — if a `kind: semantics` YAML is discovered (or
+`data_sources[].description` is set), `--schema` renders the
+descriptions inline next to each table and column with a `--`
+separator. No flag is needed to opt in.
+
+```text
+table: products  -- Product catalog with pricing/inventory. One row per SKU.
+  id: Int64  -- Stable internal SKU; primary key.
+  brand: Utf8
+  price: Float64  -- Retail price in USD.
+```
+
+The overlay is resolved in this order:
+
+1. `--semantics <FILE-OR-DIR>` (explicit override).
+2. Auto-discovered `<ctx_dir>/semantics/` directory.
+3. Auto-discovered `<ctx_dir>/semantics.yaml` (or `.yml`) file.
+4. None — descriptions fall back to `data_sources[].description` from
+   the ctx, or render bare if neither is set.
+
+Defining both `<ctx_dir>/semantics/` and `<ctx_dir>/semantics.yaml` is
+a hard error to prevent silent shadowing. See [semantics.md](semantics.md)
+for the file format and composition rules.
 
 #### Context file format
 

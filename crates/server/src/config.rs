@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::OptimizerRegistry;
 use crate::remote_storage::{RemoteStorage, S3Storage};
-use crate::semantics::SemanticsRegistry;
+use crate::semantics::{SemanticsRegistry, resolve_semantics_source};
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -491,9 +491,20 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         );
     }
 
-    // Load semantics overlays (if --semantics was passed) and seed the
-    // registry with the ctx-inline descriptions as a fallback.
-    let semantics = SemanticsRegistry::build(args.semantics_path.as_deref(), &data_sources)
+    // Load semantics overlays. The path is either:
+    //   1. `--semantics <path>` (explicit override), or
+    //   2. auto-discovered next to the ctx file (`<ctx_dir>/semantics/`
+    //      directory or `<ctx_dir>/semantics.yaml` single file).
+    // The registry is then seeded with the ctx-inline `description` fields
+    // as a fallback for any source not covered by the overlay.
+    let ctx_dir = args.ctx_file.as_deref().and_then(Path::parent);
+    let semantics_path = resolve_semantics_source(ctx_dir, args.semantics_path.as_deref())
+        .with_context(|| "Failed to resolve semantics source")?;
+    let ctx_descriptions: Vec<(String, Option<String>)> = data_sources
+        .iter()
+        .map(|ds| (ds.name.clone(), ds.description.clone()))
+        .collect();
+    let semantics = SemanticsRegistry::build(semantics_path.as_deref(), &ctx_descriptions)
         .with_context(|| "Failed to load semantics")?;
 
     tracing::info!(
