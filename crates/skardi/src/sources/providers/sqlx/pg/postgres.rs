@@ -1885,6 +1885,95 @@ mod tests {
         assert!(total_rows(&batches) >= 4);
     }
 
+    /// Multi-row VALUES with a **nested-array cell** for a pgvector column —
+    /// the exact shape the server-side renderer emits when one column of
+    /// `{rows}` is itself an array (e.g. `["d1", "doc-a", "books", [1.0,
+    /// 0.0, 0.0, 0.0]]`). DataFusion parses the bracket form as a
+    /// `List<Float64>` literal, the pgvector schema introspection exposes
+    /// the column as Utf8, and `SqlxPostgresInsertExec` re-renders the
+    /// batch onto the wire — pgvector then accepts it as the canonical
+    /// `'[v1, v2, …]'` text input. Asserts the row count and reads the
+    /// embedding back as a vector to confirm the data is searchable, not
+    /// just stored as a coerced opaque string.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values_with_vector_cell() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "docs").await;
+
+        // Pre-clean so a re-run starts from a known state (`id` is the
+        // primary key).
+        ctx.sql("DELETE FROM docs WHERE category = 'PgBatchVec'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "INSERT INTO docs (id, title, category, embedding) VALUES \
+             ('pg-vec-1', 'doc-a', 'PgBatchVec', [1.0, 0.0, 0.0, 0.0]), \
+             ('pg-vec-2', 'doc-b', 'PgBatchVec', [0.0, 1.0, 0.0, 0.0]), \
+             ('pg-vec-3', 'doc-c', 'PgBatchVec', [0.0, 0.0, 1.0, 0.0])",
+        )
+        .await
+        .expect("parse multi-row insert with nested-array vector cells")
+        .collect()
+        .await
+        .expect("execute multi-row insert with nested-array vector cells");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id FROM docs WHERE category = 'PgBatchVec' ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            total_rows(&batches),
+            3,
+            "all three rows must commit when the embedding column is pgvector"
+        );
+    }
+
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. SqlxPostgresInsertExec
+    /// re-renders the batch through `InsertBuilder` so the multi-row VALUES
+    /// reaches Postgres as one statement inside a transaction.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        // Pre-clean so a re-run starts from a known state (the seed table has
+        // a UNIQUE constraint on `email`).
+        ctx.sql("DELETE FROM users WHERE name LIKE 'PgBatch%'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES \
+             ('PgBatch1', 'pgbatch1@example.com'), \
+             ('PgBatch2', 'pgbatch2@example.com'), \
+             ('PgBatch3', 'pgbatch3@example.com')",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name FROM users WHERE name LIKE 'PgBatch%' ORDER BY name",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
     // ─── Delete tests (integration) ─────────────────────────────────────
 
     #[tokio::test]

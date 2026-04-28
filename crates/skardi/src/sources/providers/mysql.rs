@@ -1009,6 +1009,47 @@ mod tests {
         assert!(total_rows(&batches) >= 4);
     }
 
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. The MySQL provider
+    /// delegates to `datafusion-table-providers`, which re-renders the batch
+    /// as a single multi-row VALUES so the insert reaches MySQL as one
+    /// statement.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        // Pre-clean so a re-run starts from a known state (the seed table has
+        // a UNIQUE constraint on `email`).
+        ctx.sql("DELETE FROM users WHERE name LIKE 'MyBatch%'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES \
+             ('MyBatch1', 'mybatch1@example.com'), \
+             ('MyBatch2', 'mybatch2@example.com'), \
+             ('MyBatch3', 'mybatch3@example.com')",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name FROM users WHERE name LIKE 'MyBatch%' ORDER BY name",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
     // ─── Delete tests (integration) ─────────────────────────────────────
 
     #[tokio::test]

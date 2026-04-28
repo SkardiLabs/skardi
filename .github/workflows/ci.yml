@@ -52,7 +52,12 @@ jobs:
           --health-retries=5
 
       postgres:
-        image: postgres:16
+        # `pgvector/pgvector:pg16` is the upstream Postgres 16 image with
+        # the pgvector extension pre-built in. Used so the `docs` table
+        # can declare an `embedding vector(N)` column and the integration
+        # tests can round-trip vector cells through the multi-row VALUES
+        # renderer without a separate extension build step.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_DB: mydb
           POSTGRES_USER: skardi_user
@@ -126,11 +131,24 @@ jobs:
       - name: install nextest
         uses: taiki-e/install-action@nextest
       - name: Free up disk space
+        # GitHub-hosted runners ship with ~25 GB free on the smaller VM
+        # pool — not enough for the coverage-instrumented `--all-features`
+        # link step (LLD crashes with SIGBUS when the build write hits a
+        # full filesystem). Remove the bulky preinstalled toolchains and
+        # caches to give the linker headroom.
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/microsoft
+          sudo rm -rf /opt/google
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune -af || true
           df -h
       - uses: Swatinem/rust-cache@v2
       - name: Check code format
@@ -184,6 +202,7 @@ jobs:
       - name: Seed PostgreSQL data
         run: |
           PGPASSWORD=skardi_pass psql -h 127.0.0.1 -U skardi_user -d mydb <<'EOF'
+          CREATE EXTENSION IF NOT EXISTS vector;
           CREATE TABLE users (
               id SERIAL PRIMARY KEY,
               name VARCHAR(100) NOT NULL,
@@ -223,6 +242,16 @@ jobs:
               ('Database Query Optimization', 'database query optimization indexing performance tuning relational algebra', 'database'),
               ('Deep Learning Advances', 'machine learning classification supervised training model convolutional neural network', 'research'),
               ('Neural Network Architectures', 'deep learning neural network convolutional image recognition transformer attention', 'ai');
+          -- pgvector-backed `docs` table — exercises the multi-row VALUES
+          -- renderer's nested-array cell shape (`{"rows": [["a", "b", [v1,
+          -- v2, v3, v4]], ...]}`) end-to-end. Mirrors the SeekDB `docs`
+          -- table schema so the same parameter shape works on both.
+          CREATE TABLE docs (
+              id        TEXT PRIMARY KEY,
+              title     TEXT NOT NULL,
+              category  TEXT NOT NULL,
+              embedding vector(4) NOT NULL
+          );
           EOF
 
       - name: Seed MongoDB data

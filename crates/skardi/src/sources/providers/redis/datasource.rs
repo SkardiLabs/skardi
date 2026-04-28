@@ -1862,6 +1862,47 @@ mod tests {
         assert_eq!(ci_total_rows(&batches), 1);
     }
 
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. DataFusion materializes
+    /// the VALUES list into a batch with N rows, and `RedisSink` writes one
+    /// hash per row keyed on `product_id`. Verifies all N keys land.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values_live() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "products");
+
+        // Pre-clean so a re-run starts from a known state.
+        for id in ["PROD_RBATCH_1", "PROD_RBATCH_2", "PROD_RBATCH_3"] {
+            ctx.sql(&format!("DELETE FROM products WHERE product_id = '{id}'"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        }
+
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock) VALUES \
+             ('PROD_RBATCH_1', 'RB1', 'RBatchCat', '1.0', 'true'), \
+             ('PROD_RBATCH_2', 'RB2', 'RBatchCat', '2.0', 'true'), \
+             ('PROD_RBATCH_3', 'RB3', 'RBatchCat', '3.0', 'false')",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = ci_query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE category = 'RBatchCat' ORDER BY product_id",
+        )
+        .await;
+        assert_eq!(ci_total_rows(&batches), 3);
+    }
+
     // ─── Delete tests (integration) ─────────────────────────────────────
 
     #[tokio::test]

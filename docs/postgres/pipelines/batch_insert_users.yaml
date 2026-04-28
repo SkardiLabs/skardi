@@ -1,0 +1,27 @@
+kind: pipeline
+
+metadata:
+  name: "batch_insert_users"
+  version: "1.0"
+  description: >
+    Insert multiple users into PostgreSQL `users` in a single statement,
+    using the array-of-arrays parameter shape. The {rows} parameter is a
+    JSON array whose elements are themselves arrays of column values, e.g.
+
+      {"rows": [
+        ["alice", "alice@example.com"],
+        ["bob",   "bob@example.com"]
+      ]}
+
+    skardi-server's parameter renderer turns that into a tuple list
+    `('alice', 'alice@example.com'), ('bob', 'bob@example.com')` so the
+    resulting INSERT runs as one round trip — batch size is determined by
+    the caller, not baked into the pipeline.
+
+    Mixed-shape arrays (some elements scalar, some array) are rejected as
+    Unsupported: callers must pass *every* element of {rows} as an array
+    so the renderer can unambiguously emit a multi-row VALUES clause.
+
+spec:
+  query: |
+    INSERT INTO users (name, email) VALUES {rows}

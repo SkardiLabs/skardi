@@ -1,0 +1,23 @@
+kind: pipeline
+
+metadata:
+  name: "batch_insert_users"
+  version: "1.0"
+  description: >
+    MySQL counterpart of postgres/pipelines/batch_insert_users.yaml.
+    Inserts a caller-sized batch of rows in one statement using the
+    `{rows}` array-of-arrays shape, e.g.
+
+      {"rows": [
+        ["alice", "alice@example.com"],
+        ["bob",   "bob@example.com"]
+      ]}
+
+    Renders to `INSERT INTO users (name, email) VALUES
+    ('alice', 'alice@example.com'), ('bob', 'bob@example.com')` and
+    reaches MySQL as one statement (the provider delegates to
+    `datafusion-table-providers`, which re-renders the multi-row VALUES
+    from the inbound batch).
+
+spec:
+  query: "INSERT INTO users (name, email) VALUES {rows}"

@@ -1,0 +1,40 @@
+kind: pipeline
+
+metadata:
+  name: "postgres-batch-insert-docs-with-embeddings"
+  version: "1.0"
+  description: >
+    Demonstrates the multi-row VALUES tuple-list parameter when one of
+    the columns is a pgvector `vector(N)`. Each element of {rows} is
+    `[id, title, category, embedding]`, where `embedding` is itself a
+    JSON array of numbers. The renderer emits the embedding as the
+    bracketed scalar form `[v1, v2, …]` inside the row tuple; pgvector
+    accepts that as the vector text literal — same shape used by
+    single-row inserts.
+
+    Assumes the table is created with the pgvector extension enabled,
+    e.g.:
+      CREATE EXTENSION IF NOT EXISTS vector;
+      CREATE TABLE docs (
+        id        TEXT PRIMARY KEY,
+        title     TEXT NOT NULL,
+        category  TEXT NOT NULL,
+        embedding vector(4) NOT NULL
+      );
+
+    Example request body:
+      {"rows": [
+        ["d1", "doc-a", "books", [1.0, 0.0, 0.0, 0.0]],
+        ["d2", "doc-b", "music", [0.0, 1.0, 0.0, 0.0]],
+        ["d3", "doc-c", "books", [0.0, 0.0, 1.0, 0.0]]
+      ]}
+
+    Renders to:
+      INSERT INTO docs (id, title, category, embedding) VALUES
+        ('d1', 'doc-a', 'books', [1.0, 0.0, 0.0, 0.0]),
+        ('d2', 'doc-b', 'music', [0.0, 1.0, 0.0, 0.0]),
+        ('d3', 'doc-c', 'books', [0.0, 0.0, 1.0, 0.0])
+
+spec:
+  query: |
+    INSERT INTO docs (id, title, category, embedding) VALUES {rows}

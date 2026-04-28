@@ -168,6 +168,19 @@ impl SqlSchemaInferrer {
             }
         }
 
+        // Pre-pass: `VALUES {name}` is the multi-row tuple-list shape — the
+        // server-side renderer will expand `{name}` into `(c1, c2), (c1, c2)`
+        // at request time. The bare-`?` substitution would produce
+        // `VALUES ?`, which sqlparser rejects (`Expected: (, found: ?`),
+        // breaking pipeline load. Substitute with `VALUES (?)` so the SQL
+        // parses as a single-row tuple stub; runtime types still come from
+        // the renderer, not from this stub.
+        let values_pattern = regex::Regex::new(r"(?i)\bVALUES\s*\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+            .map_err(|e| anyhow!("Failed to compile VALUES placeholder regex: {}", e))?;
+        sql_with_placeholders = values_pattern
+            .replace_all(&sql_with_placeholders, "VALUES (?)")
+            .to_string();
+
         // Replace each unique {parameter_name} with ? placeholders
         for param_name in &parameter_order {
             let pattern = format!(r"\{{{}\}}", regex::escape(param_name));
@@ -620,10 +633,19 @@ impl SqlSchemaInferrer {
     /// - UDFs like `candle()` have hardcoded return types independent of argument types,
     ///   so `candle('model', NULL)` still resolves to `List<Float32>` as long as the UDF
     ///   is registered in the SessionContext before pipeline loading.
+    /// - `VALUES {rows}` (the multi-row tuple-list shape) gets a special-case
+    ///   pre-pass that emits `VALUES (NULL)` rather than the malformed
+    ///   `VALUES NULL`, since DataFusion rejects the latter at parse time.
     fn replace_parameters_for_parsing(&self, sql: &str) -> Result<String> {
+        // Pre-pass: `VALUES {name}` → `VALUES (NULL)` so the multi-row
+        // tuple-list shape parses (`VALUES NULL` is not valid SQL).
+        let values_pattern = regex::Regex::new(r"(?i)\bVALUES\s*\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+            .map_err(|e| anyhow!("Failed to compile VALUES placeholder regex: {}", e))?;
+        let sql = values_pattern.replace_all(sql, "VALUES (NULL)").to_string();
+
         let parameter_pattern = regex::Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
             .map_err(|e| anyhow!("Failed to compile parameter regex: {}", e))?;
-        Ok(parameter_pattern.replace_all(sql, "NULL").to_string())
+        Ok(parameter_pattern.replace_all(&sql, "NULL").to_string())
     }
 
     /// Infer data type from SQL context when table schema is not available
@@ -979,6 +1001,31 @@ mod tests {
         assert_eq!(replaced, expected);
     }
 
+    /// `VALUES {rows}` must produce `VALUES (NULL)` rather than the
+    /// malformed `VALUES NULL` so the logical-plan path also accepts the
+    /// multi-row tuple-list shape.
+    #[tokio::test]
+    async fn test_parameter_replacement_for_parsing_values_tuple_list() {
+        let ctx = SessionContext::new();
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        let replaced = inferrer
+            .replace_parameters_for_parsing("INSERT INTO t (a, b) VALUES {rows}")
+            .unwrap();
+        assert_eq!(replaced, "INSERT INTO t (a, b) VALUES (NULL)");
+
+        // Multi-line YAML form survives the regex.
+        let replaced = inferrer
+            .replace_parameters_for_parsing(
+                "INSERT INTO products (product_id, name)\nVALUES {rows}",
+            )
+            .unwrap();
+        assert_eq!(
+            replaced,
+            "INSERT INTO products (product_id, name)\nVALUES (NULL)"
+        );
+    }
+
     #[tokio::test]
     async fn test_rust_identifier_validation() {
         let ctx = SessionContext::new();
@@ -1111,6 +1158,42 @@ mod tests {
         assert!(parameter_order.contains(&"brand".to_string()));
         assert!(parameter_order.contains(&"min_price".to_string()));
         assert!(parameter_order.contains(&"limit".to_string()));
+    }
+
+    /// `INSERT … VALUES {rows}` is the multi-row tuple-list shape the
+    /// server-side renderer expands at request time. The parser stub must
+    /// emit `VALUES (?)`, not the malformed `VALUES ?`, otherwise pipeline
+    /// load fails with `Expected: (, found: ?` and the pipeline never
+    /// becomes available — the same class of bug the SQL validator fix
+    /// addressed at config-load time.
+    #[tokio::test]
+    async fn test_convert_named_to_placeholders_values_tuple_list() {
+        let ctx = SessionContext::new();
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        let (sql_with_placeholders, parameter_order) = inferrer
+            .convert_named_to_placeholders("INSERT INTO users (name, email) VALUES {rows}")
+            .unwrap();
+        assert_eq!(
+            sql_with_placeholders,
+            "INSERT INTO users (name, email) VALUES (?)"
+        );
+        assert_eq!(parameter_order, vec!["rows"]);
+
+        // Multi-line YAML form (`query: |` produces a newline between
+        // `(cols)` and `VALUES`) — the regex must still match.
+        let (sql_with_placeholders, _) = inferrer
+            .convert_named_to_placeholders("INSERT INTO products (product_id, name)\nVALUES {rows}")
+            .unwrap();
+        assert_eq!(
+            sql_with_placeholders,
+            "INSERT INTO products (product_id, name)\nVALUES (?)"
+        );
+
+        // The rendered stub must be a parseable SQL statement — i.e. the
+        // pipeline-loader's `parse_sql_syntax` accepts it.
+        Parser::parse_sql(&GenericDialect {}, &sql_with_placeholders)
+            .expect("VALUES (?) stub must parse");
     }
 
     #[tokio::test]
