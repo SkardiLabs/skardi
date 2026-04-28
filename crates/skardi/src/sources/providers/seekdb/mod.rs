@@ -1200,6 +1200,52 @@ mod tests {
             .unwrap();
     }
 
+    /// Multi-row VALUES with a **nested-array cell** for a SeekDB
+    /// `VECTOR(N)` column — the exact shape the server-side renderer emits
+    /// when one column of `{rows}` is itself an array (e.g. `["doc-a",
+    /// "BatchVec", [1.0, 0.0, 0.0, 0.0]]`). DataFusion parses the bracket
+    /// form as a `List<Float64>` literal; the SeekDB provider re-renders
+    /// onto the wire and SeekDB's `VECTOR(N)` column accepts it as the
+    /// text-input form. Asserts the rows commit so we know the bracket
+    /// shape isn't silently dropped or coerced into the wrong column.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values_with_vector_cell() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "docs").await;
+
+        ctx.sql(
+            "INSERT INTO docs (title, category, embedding) VALUES \
+             ('seek-vec-1', 'SeekBatchVec', [1.0, 0.0, 0.0, 0.0]), \
+             ('seek-vec-2', 'SeekBatchVec', [0.0, 1.0, 0.0, 0.0]), \
+             ('seek-vec-3', 'SeekBatchVec', [0.0, 0.0, 1.0, 0.0])",
+        )
+        .await
+        .expect("parse multi-row insert with nested-array vector cells")
+        .collect()
+        .await
+        .expect("execute multi-row insert with nested-array vector cells");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM docs WHERE category = 'SeekBatchVec' ORDER BY title",
+        )
+        .await;
+        assert_eq!(
+            total_rows(&batches),
+            3,
+            "all three rows must commit when the embedding column is VECTOR(4)"
+        );
+
+        // Clean up so a re-run starts from a known state.
+        ctx.sql("DELETE FROM docs WHERE category = 'SeekBatchVec'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
     /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
     /// server-side renderer emits when a pipeline parameter is the
     /// array-of-arrays form `{"rows": [[..], [..]]}`. SeekDB delegates to

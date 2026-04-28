@@ -510,6 +510,11 @@ fn row_cell_to_sql(v: &Value) -> String {
 /// cells, so the caller catches a malformed batch at the renderer rather
 /// than as a less-specific arity error from the database.
 ///
+/// A zero-length top-level array (`{"rows": []}` or `{"embedding": []}`)
+/// is rejected with a specific "empty array" error rather than the
+/// generic "Unsupported parameter type" so CDC consumers that may emit
+/// empty batches see a clear instruction to filter client-side.
+///
 /// Returns `(missing_params, unsupported_params)` — both empty on full success.
 fn substitute_sql_params(
     sql: &mut String,
@@ -528,7 +533,26 @@ fn substitute_sql_params(
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "NULL".to_string(),
-                Value::Array(arr) if !arr.is_empty() => {
+                Value::Array(arr) if arr.is_empty() => {
+                    // CDC consumers commonly produce empty batches; surface a
+                    // specific, actionable error (rather than the generic
+                    // "Unsupported parameter type") so the caller knows to
+                    // filter zero-row batches client-side. There is no SQL
+                    // expansion that makes `VALUES` with zero rows valid.
+                    tracing::error!(
+                        "Empty array for {}: cannot expand into a VALUES tuple \
+                         list with zero rows, or into a vector literal of zero \
+                         elements. Filter empty batches client-side.",
+                        param_name
+                    );
+                    unsupported_params.push(format!(
+                        "{}: empty array — provide at least one row/element, \
+                         or filter empty batches client-side",
+                        param_name
+                    ));
+                    continue;
+                }
+                Value::Array(arr) => {
                     if arr.iter().all(|v| v.is_array()) {
                         // Multi-row tuple list — `(c1, c2, …), (c1, c2, …)`.
                         let row_arrays: Vec<&Vec<Value>> = arr
@@ -1451,6 +1475,32 @@ spec:
         assert_eq!(unsupported.len(), 1);
         assert!(unsupported[0].starts_with("rows: "));
         assert_eq!(sql, "INSERT INTO t (a, b) VALUES {rows}");
+    }
+
+    #[test]
+    fn test_substitute_empty_top_level_array_is_rejected_with_specific_error() {
+        // `"rows": []` is a common CDC-consumer shape (empty batch). Surface
+        // a specific, actionable error rather than the generic "Unsupported
+        // parameter type" so callers can fix it without digging through logs.
+        let mut sql = "INSERT INTO t (a) VALUES {rows}".to_string();
+        let params_map = params(&[("rows", Value::Array(vec![]))]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert!(
+            unsupported[0].contains("empty array"),
+            "expected error to mention 'empty array', got: {}",
+            unsupported[0]
+        );
+        assert!(
+            unsupported[0].contains("filter empty batches"),
+            "expected error to point at client-side filtering, got: {}",
+            unsupported[0]
+        );
+        // Placeholder left untouched on rejection.
+        assert_eq!(sql, "INSERT INTO t (a) VALUES {rows}");
     }
 
     #[test]
