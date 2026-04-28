@@ -23,7 +23,7 @@ Two flavours ship side by side:
 Both flavours use the **same pipeline YAML format**, because the whole point
 of the Skardi design is that one declaration is every agent-facing surface:
 REST today, shell today, skills soon, MCP soon after. For the thinking
-behind that, read [`docs/spark_for_agents.md`](../../docs/spark_for_agents.md).
+behind that, read [`docs/agent_data_plane.md`](../../docs/agent_data_plane.md).
 
 ---
 
@@ -430,6 +430,29 @@ JOIN. The script also creates `wiki_pages_fts`, `wiki_pages_vec`, the
 `wiki_log` activity table, and `AFTER INSERT` / `AFTER UPDATE` triggers that
 keep both mirrors in sync. See [setup.py](setup.py) for the schema.
 
+### 4b. (Optional) Seed sample pages
+
+To explore the demo with non-empty data, [seed.py](seed.py) splits the
+markdown files in [`data/test_corpus/`](../../data/test_corpus/) (Alice in
+Wonderland, Jane Eyre, The Art of War) into ~110 paragraph-sized pages,
+computes a real `bge-small-en-v1.5` embedding for each one in Python, and
+INSERTs them through the same triggers — so `skardi grep` and `skardi ls`
+work end-to-end without writing a page yourself.
+
+```bash
+pip install transformers torch
+python demo/llm_wiki/seed.py
+```
+
+Embeddings use CLS pooling + L2 normalization, matching what the `candle()`
+UDF produces, so seeded pages and pages later written via `skardi write`
+share the same vector space. Pages are tagged by source (`page_type =
+alice | jane-eyre | art-of-war`) so `skardi ls --page_type_pattern=alice`
+shows only Alice excerpts.
+
+Re-running `seed.py` on an already-seeded DB will fail on the
+`UNIQUE(slug)` constraint — re-run `setup.py` first to drop and recreate.
+
 ### 5. Config layout
 
 Everything the CLI needs for the demo lives under [cli/](cli/):
@@ -558,8 +581,12 @@ dance.
 
 ### 9. `open` — fetch one page by slug
 
+If you ran the optional seed step in 4b, every paragraph in the corpus is
+already a page. The opening of *Alice in Wonderland* is at
+`alice/chapter-i-down-the-rabbit-hole/p001`:
+
 ```bash
-skardi open entity/alan-turing
+skardi open alice/chapter-i-down-the-rabbit-hole/p001
 ```
 
 Under the hood this runs [cli/pipelines/get.yaml](cli/pipelines/get.yaml):
@@ -567,17 +594,25 @@ Under the hood this runs [cli/pipelines/get.yaml](cli/pipelines/get.yaml):
 
 ### 10. `grep` — hybrid search (RRF over FTS + vector)
 
+A single positional arg drives both halves of the RRF merge — semantic
+nearest-neighbour over `sqlite_knn` and BM25 over `sqlite_fts`:
+
 ```bash
-skardi grep "turing machine computation" --limit=10
+# Pure semantic intent — finds the rabbit-hole paragraphs in Alice ch.1
+skardi grep "white rabbit pocket watch" --limit=5
+
+# Same query crosses corpora — top hits mix Alice and Jane Eyre
+skardi grep "young girl sent away to her room" --limit=5
 ```
 
-One positional arg binds to both `{query}` (embedded with `candle()` for
+The positional arg binds to both `{query}` (embedded with `candle()` for
 `sqlite_knn`) and `{text_query}` (via the `text_query: "{query}"` default in
-the alias). Override either independently:
+the alias). Override either independently — useful when you want a loose
+semantic intent paired with strict keyword filters:
 
 ```bash
-skardi grep "turing machine" \
-  --text_query="bletchley OR enigma" \
+skardi grep "Sun Tzu" \
+  --text_query="strategy OR victory OR planning" \
   --vector_weight=0.3 --text_weight=0.7 --limit=5
 ```
 
@@ -590,11 +625,11 @@ exposes and where each value comes from.
 ```bash
 skardi ls
 
-# Entity pages only
-skardi ls --page_type_pattern=entity
+# All Alice excerpts (page_type tags pages by source after seeding)
+skardi ls --page_type_pattern=alice
 
-# Everything under concept/
-skardi ls --slug_prefix='concept/%'
+# Just one chapter
+skardi ls --slug_prefix='art-of-war/chapter-i-laying-plans/%'
 ```
 
 ### 12. `log` — append an activity entry
