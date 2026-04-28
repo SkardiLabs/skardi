@@ -1200,6 +1200,45 @@ mod tests {
             .unwrap();
     }
 
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. SeekDB delegates to
+    /// `datafusion-table-providers`, which re-renders the batch as a single
+    /// multi-row VALUES so SeekDB receives one statement.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES \
+             ('SeekBatch1', 'seekbatch1@example.com'), \
+             ('SeekBatch2', 'seekbatch2@example.com'), \
+             ('SeekBatch3', 'seekbatch3@example.com')",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name FROM users WHERE name LIKE 'SeekBatch%' ORDER BY name",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+
+        // Clean up
+        ctx.sql("DELETE FROM users WHERE name LIKE 'SeekBatch%'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_delete_with_filter() {

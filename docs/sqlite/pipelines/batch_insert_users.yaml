@@ -1,0 +1,25 @@
+kind: pipeline
+
+metadata:
+  name: "batch_insert_users"
+  version: "1.0"
+  description: >
+    SQLite counterpart of postgres/pipelines/batch_insert_users.yaml.
+    Inserts a caller-sized batch of rows in one statement using the
+    `{rows}` array-of-arrays shape, e.g.
+
+      {"rows": [
+        ["alice", "alice@example.com"],
+        ["bob",   "bob@example.com"]
+      ]}
+
+    Renders to `INSERT INTO users (name, email) VALUES
+    ('alice', 'alice@example.com'), ('bob', 'bob@example.com')`.
+
+    DataFusion materializes the multi-row VALUES list into a single batch
+    that the SQLite provider replays inside one transaction — atomic
+    commit even though the underlying driver fires N parameterized
+    INSERTs.
+
+spec:
+  query: "INSERT INTO users (name, email) VALUES {rows}"

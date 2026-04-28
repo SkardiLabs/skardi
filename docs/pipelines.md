@@ -120,10 +120,33 @@ themselves arrays and others are scalars — return
 silently emitting malformed SQL. Callers must pass *every* element of a
 row-list parameter as an array, even for batch size 1.
 
-Runnable examples:
+**Supported sources.** The renderer emits standard SQL, but only the
+writable sources accept it through DataFusion's `INSERT INTO` path:
+
+| Source | Multi-row `VALUES {rows}` | How |
+|---|---|---|
+| PostgreSQL | ✅ | `SqlxPostgresInsertExec` re-renders as one multi-row VALUES inside a transaction |
+| MySQL | ✅ | Delegated to `datafusion-table-providers`; one multi-row VALUES per call |
+| SeekDB | ✅ | Delegated to `datafusion-table-providers`; one multi-row VALUES per call |
+| SQLite | ✅ | DataFusion materializes VALUES into one batch; provider replays row-by-row in a single transaction |
+| MongoDB | ✅ | DataFusion materializes VALUES into one batch; each row → one BSON document |
+| Redis | ✅ | DataFusion materializes VALUES into one batch; each row → one keyed hash |
+| Lance | ❌ | `Dataset` is scan-only — use the [`kind: job`](jobs.md) primitive for atomic writes |
+| Iceberg | ❌ | Read-only in MVP (writes deferred to v1.1) |
+| CSV | ❌ | File source has no commit primitive |
+| Parquet | ❌ | File source has no commit primitive |
+
+For Lance, point the pipeline at a writable mirror (Postgres / SQLite)
+or use a job to land batches atomically; the renderer itself is identical.
+
+Runnable examples (one per writable source):
 - `docs/postgres/pipelines/batch_insert_users.yaml`
+- `docs/mysql/pipelines/batch_insert_users.yaml`
+- `docs/sqlite/pipelines/batch_insert_users.yaml`
 - `docs/seekdb/pipelines/batch_insert_users.yaml`
 - `docs/seekdb/pipelines/batch_insert_docs_with_embeddings.yaml`
+- `docs/mongo/pipelines/batch_insert_products.yaml`
+- `docs/redis/pipelines/batch_insert_products.yaml`
 
 ### Optional filter pattern
 

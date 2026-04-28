@@ -1,0 +1,24 @@
+kind: pipeline
+
+metadata:
+  name: "batch_insert_products"
+  version: "1.0"
+  description: >
+    MongoDB counterpart of postgres/pipelines/batch_insert_users.yaml.
+    Inserts a caller-sized batch of rows in one statement using the
+    `{rows}` array-of-arrays shape, e.g.
+
+      {"rows": [
+        ["PROD_BATCH_1", "Batch1", "BatchCat", 1.0, true],
+        ["PROD_BATCH_2", "Batch2", "BatchCat", 2.0, true]
+      ]}
+
+    DataFusion materializes the multi-row VALUES list into a single batch
+    that `MongoInsertExec` writes as N BSON documents (one per row, keyed
+    on the configured `primary_key` → `_id`). Batch size is set by the
+    caller, not baked into the YAML.
+
+spec:
+  query: |
+    INSERT INTO products (product_id, name, category, price, in_stock)
+    VALUES {rows}

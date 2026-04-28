@@ -1885,6 +1885,46 @@ mod tests {
         assert!(total_rows(&batches) >= 4);
     }
 
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. SqlxPostgresInsertExec
+    /// re-renders the batch through `InsertBuilder` so the multi-row VALUES
+    /// reaches Postgres as one statement inside a transaction.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        // Pre-clean so a re-run starts from a known state (the seed table has
+        // a UNIQUE constraint on `email`).
+        ctx.sql("DELETE FROM users WHERE name LIKE 'PgBatch%'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "INSERT INTO users (name, email) VALUES \
+             ('PgBatch1', 'pgbatch1@example.com'), \
+             ('PgBatch2', 'pgbatch2@example.com'), \
+             ('PgBatch3', 'pgbatch3@example.com')",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT name FROM users WHERE name LIKE 'PgBatch%' ORDER BY name",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
     // ─── Delete tests (integration) ─────────────────────────────────────
 
     #[tokio::test]
