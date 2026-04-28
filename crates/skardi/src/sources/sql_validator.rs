@@ -79,12 +79,7 @@ fn preprocess_parameters(sql: &str) -> String {
         let open = start + open;
         if let Some(close) = result[open..].find('}') {
             let close = open + close;
-            result = format!(
-                "{}{}{}",
-                &result[..open],
-                REPLACEMENT,
-                &result[close + 1..]
-            );
+            result = format!("{}{}{}", &result[..open], REPLACEMENT, &result[close + 1..]);
             start = open + REPLACEMENT.len();
         } else {
             break;
@@ -403,10 +398,7 @@ mod tests {
         // crashed config load.
         let config = test_config();
 
-        let result = validate_sql(
-            "INSERT INTO orders (id, amount) VALUES {rows}",
-            &config,
-        );
+        let result = validate_sql("INSERT INTO orders (id, amount) VALUES {rows}", &config);
         assert!(
             result.is_ok(),
             "VALUES {{rows}} (multi-row tuple list shape) should validate, got: {:?}",
@@ -424,16 +416,16 @@ mod tests {
         );
 
         // Access-mode enforcement must still apply to the tuple-list shape.
-        let result = validate_sql(
-            "INSERT INTO users (id, name) VALUES {rows}",
-            &config,
-        );
+        let result = validate_sql("INSERT INTO users (id, name) VALUES {rows}", &config);
         match result {
             Err(SqlValidationError::WriteNotAllowed { operation, table }) => {
                 assert_eq!(operation, "INSERT");
                 assert_eq!(table, "users");
             }
-            other => panic!("Expected WriteNotAllowed for read-only table, got: {:?}", other),
+            other => panic!(
+                "Expected WriteNotAllowed for read-only table, got: {:?}",
+                other
+            ),
         }
     }
 }
