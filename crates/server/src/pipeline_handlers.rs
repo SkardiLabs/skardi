@@ -505,6 +505,11 @@ fn row_cell_to_sql(v: &Value) -> String {
 /// `Unsupported` so a caller can't accidentally emit malformed SQL by
 /// passing an array-of-arrays with a stray scalar.
 ///
+/// Tuple lists with empty rows or rows of inconsistent width are also
+/// rejected — every row must be non-empty and have the same number of
+/// cells, so the caller catches a malformed batch at the renderer rather
+/// than as a less-specific arity error from the database.
+///
 /// Returns `(missing_params, unsupported_params)` — both empty on full success.
 fn substitute_sql_params(
     sql: &mut String,
@@ -526,16 +531,27 @@ fn substitute_sql_params(
                 Value::Array(arr) if !arr.is_empty() => {
                     if arr.iter().all(|v| v.is_array()) {
                         // Multi-row tuple list — `(c1, c2, …), (c1, c2, …)`.
-                        let rows: Vec<String> = arr
+                        let row_arrays: Vec<&Vec<Value>> = arr
                             .iter()
-                            .map(|row| {
-                                let cells: Vec<String> = row
-                                    .as_array()
-                                    .expect("checked above")
-                                    .iter()
-                                    .map(row_cell_to_sql)
-                                    .collect();
-                                format!("({})", cells.join(", "))
+                            .map(|row| row.as_array().expect("checked above"))
+                            .collect();
+                        let width = row_arrays[0].len();
+                        if width == 0 || row_arrays.iter().any(|r| r.len() != width) {
+                            tracing::error!(
+                                "Inconsistent or empty row widths for {}: every \
+                                 row in a VALUES tuple list must have the same \
+                                 non-zero number of cells.",
+                                param_name
+                            );
+                            unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                            continue;
+                        }
+                        let rows: Vec<String> = row_arrays
+                            .iter()
+                            .map(|cells| {
+                                let rendered: Vec<String> =
+                                    cells.iter().map(row_cell_to_sql).collect();
+                                format!("({})", rendered.join(", "))
                             })
                             .collect();
                         rows.join(", ")
@@ -1412,6 +1428,47 @@ spec:
         assert_eq!(unsupported.len(), 1);
         assert!(unsupported[0].starts_with("rows: "));
         // Placeholder left untouched on rejection.
+        assert_eq!(sql, "INSERT INTO t (a) VALUES {rows}");
+    }
+
+    #[test]
+    fn test_substitute_tuple_list_rejects_uneven_row_widths() {
+        // Different cell counts per row would render as `(1, 2), (3)` and
+        // fail at the database with a generic arity error. Reject at the
+        // renderer so the caller sees a precise parameter_validation_error.
+        let mut sql = "INSERT INTO t (a, b) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![
+                Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
+                Value::Array(vec![Value::Number(3.into())]),
+            ]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].starts_with("rows: "));
+        assert_eq!(sql, "INSERT INTO t (a, b) VALUES {rows}");
+    }
+
+    #[test]
+    fn test_substitute_tuple_list_rejects_empty_inner_rows() {
+        // A row with zero cells would render as `()` — invalid SQL on every
+        // engine. Reject so the parameter renderer is the source of truth
+        // for "this batch is malformed".
+        let mut sql = "INSERT INTO t (a) VALUES {rows}".to_string();
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![Value::Array(vec![]), Value::Array(vec![])]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].starts_with("rows: "));
         assert_eq!(sql, "INSERT INTO t (a) VALUES {rows}");
     }
 
