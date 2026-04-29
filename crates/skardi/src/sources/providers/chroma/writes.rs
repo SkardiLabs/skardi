@@ -1,10 +1,14 @@
 //! Write paths: insert (add/upsert) and delete.
 //!
-//! Status: scaffolding compiles end-to-end; Arrow→Chroma row-conversion in
-//! `ChromaInsertExec::execute` and the actual `delete()` call in
-//! `ChromaDmlExec::execute` are stubbed out and will return an
-//! `unimplemented` error at runtime. This unblocks the rest of the wiring;
-//! flesh these out next.
+//! `ChromaInsertExec` pulls batches from its child plan, converts each row's
+//! `id` / `document` / `embedding` / `metadata` columns and dispatches to
+//! `ChromaCollection::add` (Append) or `upsert` (Replace/Overwrite). Metadata
+//! values are coerced from the user-facing `Map<Utf8, Utf8>` into
+//! `MetadataValue::{Int, Float, Bool, Str}` via best-effort parsing — strings
+//! that don't parse as int/float/bool are stored as-is.
+//!
+//! `ChromaDmlExec` handles `DELETE` by translating the WHERE clause into a
+//! Chroma `Where` filter and calling `collection.delete()`.
 
 use std::any::Any;
 use std::collections::HashMap;

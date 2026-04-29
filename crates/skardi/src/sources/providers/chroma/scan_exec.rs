@@ -1,8 +1,8 @@
 //! `ChromaScanExec` — single-partition scan against `ChromaCollection::get()`.
 //!
-//! Status: scaffolding compiles end-to-end; Arrow conversion of
-//! `GetResponse { ids, documents, embeddings, metadatas }` into a `RecordBatch`
-//! is the next focused task. See TODOs in `execute_scan`.
+//! Always requests document/embedding/metadata from Chroma (cheaper than fanning
+//! WHERE/LIMIT semantics across two paths) and applies the user's column
+//! projection after the full batch is materialized via `arrow_conv`.
 
 use std::any::Any;
 use std::fmt;

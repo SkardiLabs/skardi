@@ -5,14 +5,14 @@
 //! -- Literal vector
 //! SELECT * FROM chroma_knn('docs', 'embedding', [0.1, 0.2, ...], 5);
 //!
+//! -- Subquery vector
+//! SELECT * FROM chroma_knn('docs', 'embedding',
+//!     (SELECT embedding FROM users WHERE id = 1), 5);
+//!
 //! -- With Skardi WHERE filter pushed down to Chroma's typed Where DSL
 //! SELECT * FROM chroma_knn('docs', 'embedding', [0.1, 0.2, ...], 5)
 //! WHERE category = 'finance';
 //! ```
-//!
-//! Status: literal-vector path is wired through to `ChromaKnnExec`. Deferred
-//! (subquery) vectors return `NotImplemented` at execute time — same shape as
-//! Lance's, ready to flesh out.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ impl ChromaKnnTableFunction {
 
 impl TableFunctionImpl for ChromaKnnTableFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        if exprs.len() < 4 || exprs.len() > 4 {
+        if exprs.len() != 4 {
             return plan_err!(
                 "chroma_knn(table_name, embedding_column, query_vector, k) expects 4 arguments, got {}",
                 exprs.len()
@@ -52,8 +52,20 @@ impl TableFunctionImpl for ChromaKnnTableFunction {
         }
         let table_name = extract_string(&exprs[0], "table_name")?;
         let _embedding_column = extract_string(&exprs[1], "embedding_column")?;
-        let query_vector = extract_literal_vector(&exprs[2], "chroma_knn")?;
         let k = extract_k(&exprs[3], "chroma_knn")?;
+
+        // Either a literal `[…]` vector or a `(SELECT …)` subquery — anything
+        // else is a planning error.
+        let query_vector_expr = exprs[2].clone();
+        let literal_vector = match &query_vector_expr {
+            Expr::Literal(_, _) => Some(extract_literal_vector(&query_vector_expr, "chroma_knn")?),
+            Expr::ScalarSubquery(_) => None,
+            _ => {
+                return plan_err!(
+                    "chroma_knn: query_vector must be a literal array or scalar subquery"
+                );
+            }
+        };
 
         let entry = {
             let registry = self.registry.read().map_err(|e| {
@@ -79,7 +91,8 @@ impl TableFunctionImpl for ChromaKnnTableFunction {
 
         Ok(Arc::new(ChromaKnnProvider {
             entry,
-            query_vector,
+            literal_vector,
+            query_vector_expr,
             k,
         }))
     }
@@ -88,7 +101,8 @@ impl TableFunctionImpl for ChromaKnnTableFunction {
 #[derive(Debug)]
 struct ChromaKnnProvider {
     entry: ChromaEntry,
-    query_vector: Vec<f32>,
+    literal_vector: Option<Vec<f32>>,
+    query_vector_expr: Expr,
     k: usize,
 }
 
@@ -115,19 +129,38 @@ impl TableProvider for ChromaKnnProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         _projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let where_filter = exprs_to_chroma_filter(filters)
             .map_err(|e| datafusion::error::DataFusionError::Plan(format!("chroma_knn: {e}")))?;
-        Ok(Arc::new(ChromaKnnExec::try_new_literal(
-            self.entry.collection.clone(),
-            self.query_vector.clone(),
-            self.k,
-            where_filter,
-        )?))
+
+        let exec = if let Some(ref v) = self.literal_vector {
+            ChromaKnnExec::try_new_literal(
+                self.entry.collection.clone(),
+                v.clone(),
+                self.k,
+                where_filter,
+            )?
+        } else {
+            let Expr::ScalarSubquery(subquery) = &self.query_vector_expr else {
+                return plan_err!(
+                    "chroma_knn: query_vector must be a literal array or scalar subquery"
+                );
+            };
+            let physical_plan = state
+                .create_physical_plan(subquery.subquery.as_ref())
+                .await?;
+            ChromaKnnExec::try_new_with_deferred_extraction(
+                self.entry.collection.clone(),
+                physical_plan,
+                self.k,
+                where_filter,
+            )?
+        };
+        Ok(Arc::new(exec))
     }
 }
 

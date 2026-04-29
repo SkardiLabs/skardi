@@ -1,8 +1,11 @@
 //! `ChromaKnnExec` — physical operator backing the `chroma_knn` UDTF.
 //!
-//! Status: scaffolding compiles; Arrow conversion of `QueryResponse` and the
-//! deferred-vector (subquery) extraction path are TODO. The structural shape
-//! mirrors `LanceKnnExec` so it stays familiar to reviewers.
+//! Supports two query-vector shapes:
+//! - literal: `chroma_knn('docs', 'embedding', [0.1, 0.2, ...], 5)`
+//! - subquery: `chroma_knn('docs', 'embedding', (SELECT embedding FROM …), 5)`
+//!
+//! Subquery vectors are resolved at execute-time via the shared
+//! `knn_utils::extract_query_vector` helper, matching `LanceKnnExec`'s shape.
 
 use std::any::Any;
 use std::fmt;
@@ -23,6 +26,7 @@ use datafusion::physical_plan::{
 use futures::stream;
 
 use crate::sources::providers::chroma::arrow_conv::knn_response_to_batch;
+use crate::sources::providers::knn_utils::extract_query_vector;
 
 #[derive(Debug)]
 pub struct ChromaKnnExec {
@@ -76,6 +80,32 @@ impl ChromaKnnExec {
             collection,
             query_vector: Some(query_vector),
             query_vector_plan: None,
+            k,
+            where_filter,
+            schema,
+            plan_properties,
+        })
+    }
+
+    /// Build a KNN exec whose query vector is materialized from a child plan
+    /// at execute-time (used for `chroma_knn(..., (SELECT … FROM …), k)`).
+    pub fn try_new_with_deferred_extraction(
+        collection: Arc<ChromaCollection>,
+        query_vector_plan: Arc<dyn ExecutionPlan>,
+        k: usize,
+        where_filter: Option<Where>,
+    ) -> DFResult<Self> {
+        let schema = knn_output_schema();
+        let plan_properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Ok(Self {
+            collection,
+            query_vector: None,
+            query_vector_plan: Some(query_vector_plan),
             k,
             where_filter,
             schema,
@@ -139,7 +169,7 @@ impl ExecutionPlan for ChromaKnnExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(
@@ -148,16 +178,28 @@ impl ExecutionPlan for ChromaKnnExec {
         }
         let collection = self.collection.clone();
         let query_vector = self.query_vector.clone();
+        let query_vector_plan = self.query_vector_plan.clone();
         let k = self.k as u32;
         let where_filter = self.where_filter.clone();
         let schema = self.schema.clone();
 
         let fut = async move {
-            let v = query_vector.ok_or_else(|| {
-                DataFusionError::NotImplemented(
-                    "chroma: deferred-vector KNN (subquery embedding) not yet implemented".into(),
-                )
-            })?;
+            let v = match query_vector {
+                Some(v) => v,
+                None => {
+                    let plan = query_vector_plan.ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "ChromaKnnExec has neither query_vector nor query_vector_plan".into(),
+                        )
+                    })?;
+                    match extract_query_vector(plan, context).await? {
+                        Some(v) => v,
+                        None => {
+                            return Ok(arrow::array::RecordBatch::new_empty(schema));
+                        }
+                    }
+                }
+            };
             let include = IncludeList(vec![
                 Include::Document,
                 Include::Metadata,

@@ -10,11 +10,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, MapBuilder, StringBuilder,
-    UInt32Array,
+    ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, MapBuilder, StringBuilder,
 };
 use arrow::array::{RecordBatch, StringArray};
-use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use chroma::types::{Metadata, MetadataValue};
 
@@ -144,15 +142,4 @@ fn metadata_value_to_string(v: &MetadataValue) -> String {
         // debug repr rather than failing the whole query.
         other => format!("{other:?}"),
     }
-}
-
-// Suppress dead-code on imports we keep for future projection logic.
-#[allow(dead_code)]
-fn _project_unused(arr: &ArrayRef) -> ArrayRef {
-    Arc::new(UInt32Array::from(vec![0u32; arr.len()]))
-}
-
-#[allow(dead_code)]
-fn _offset_buffer_unused() -> OffsetBuffer<i32> {
-    OffsetBuffer::new_empty()
 }

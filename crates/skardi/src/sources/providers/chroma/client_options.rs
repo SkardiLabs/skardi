@@ -11,6 +11,7 @@
 //! | `database` | database name | `default_database` |
 //! | `auth_token_env` | env-var name holding the auth token; presence enables auth | none |
 //! | `auth_header_name` | HTTP header name to send the token in | `x-chroma-token` |
+//! | `embedding_dim` | embedding vector dimension (positive integer) | 1536 |
 
 use std::collections::HashMap;
 
@@ -26,6 +27,9 @@ const DEFAULT_AUTH_HEADER: &str = "x-chroma-token";
 pub struct ChromaConnection {
     pub options: ChromaHttpClientOptions,
     pub collection: String,
+    /// User-supplied embedding dimension override. When `None`, the caller
+    /// falls back to inference / a default.
+    pub embedding_dim: Option<i32>,
 }
 
 pub fn parse_connection(
@@ -70,6 +74,21 @@ pub fn parse_connection(
         }
     };
 
+    let embedding_dim = match opts.and_then(|m| m.get("embedding_dim")) {
+        None => None,
+        Some(s) => {
+            let v: i32 = s.parse().with_context(|| {
+                format!("chroma: embedding_dim must be a positive integer, got '{s}'")
+            })?;
+            if v <= 0 {
+                return Err(anyhow!(
+                    "chroma: embedding_dim must be a positive integer, got {v}"
+                ));
+            }
+            Some(v)
+        }
+    };
+
     Ok(ChromaConnection {
         options: ChromaHttpClientOptions {
             endpoint,
@@ -79,5 +98,6 @@ pub fn parse_connection(
             database_name: Some(database_name),
         },
         collection,
+        embedding_dim,
     })
 }

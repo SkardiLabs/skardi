@@ -54,15 +54,18 @@ pub async fn register_chroma_tables(
         })?;
     let collection = Arc::new(collection);
 
-    // Derive embedding dim from the collection's Schema if available; otherwise
-    // fall back to the configured default and warn so users can fix their config.
-    let embedding_dim = match infer_embedding_dim(collection.as_ref()) {
+    // Resolution order: explicit `embedding_dim` option → infer from collection
+    // → configured default (with a warning so users can fix their config).
+    let embedding_dim = match conn
+        .embedding_dim
+        .or_else(|| infer_embedding_dim(collection.as_ref()))
+    {
         Some(d) => d,
         None => {
             tracing::warn!(
                 source = %name,
                 collection = %conn.collection,
-                "chroma: could not infer embedding dimension from collection schema; defaulting to {DEFAULT_EMBEDDING_DIM}"
+                "chroma: could not infer embedding dimension from collection schema; defaulting to {DEFAULT_EMBEDDING_DIM}. Set the `embedding_dim` option to silence this warning."
             );
             DEFAULT_EMBEDDING_DIM
         }
