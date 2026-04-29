@@ -17,18 +17,44 @@ permissions:
   contents: read
   packages: write
 
+env:
+  ORG: skardilabs
+  PACKAGE: skardi/skardi-server
+  RELEASE_TAG_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+$'
+
 jobs:
-  cleanup:
-    name: "Delete tags matching ${{ inputs.pattern }}"
+  plan:
+    name: "Plan deletions for ${{ inputs.pattern }}"
     runs-on: ubuntu-latest
+    outputs:
+      matched_count: ${{ steps.match.outputs.matched_count }}
     env:
-      ORG: skardilabs
-      PACKAGE: skardi/skardi-server
       PATTERN: ${{ inputs.pattern }}
       DRY_RUN: ${{ inputs.dry_run }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: List and delete matching versions
+      - name: List all available images
+        run: |
+          set -euo pipefail
+
+          PKG_ENC=$(printf '%s' "$PACKAGE" | jq -sRr @uri)
+          gh api --paginate -H "Accept: application/vnd.github+json" \
+            "/orgs/$ORG/packages/container/$PKG_ENC/versions?per_page=100" \
+            | jq -s 'add // []' > /tmp/versions.json
+
+          total=$(jq 'length' /tmp/versions.json)
+          echo "Found $total package versions for $ORG/$PACKAGE"
+
+          {
+            echo "### Available images (${total} versions)"
+            echo ""
+            echo "Package: \`ghcr.io/$ORG/$PACKAGE\`"
+            echo ""
+            jq -r '.[] | "- id=`\(.id)` tags=[\((.metadata.container.tags // []) | join(", "))]"' /tmp/versions.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Identify matches (excluding x.x.x release tags)
+        id: match
         run: |
           set -euo pipefail
 
@@ -37,22 +63,30 @@ jobs:
             exit 1
           fi
 
-          PKG_ENC=$(printf '%s' "$PACKAGE" | jq -sRr @uri)
-
-          echo "Listing versions for $ORG/$PACKAGE (pattern: $PATTERN, dry_run: $DRY_RUN)"
-          gh api --paginate -H "Accept: application/vnd.github+json" \
-            "/orgs/$ORG/packages/container/$PKG_ENC/versions?per_page=100" \
-            | jq -s 'add // []' > /tmp/versions.json
+          echo "Pattern: $PATTERN | Release exclusion: $RELEASE_TAG_PATTERN | Dry run: $DRY_RUN"
 
           total=$(jq 'length' /tmp/versions.json)
-          echo "Found $total package versions"
-
           matched=0
-          deleted=0
+          skipped_release=0
           : > /tmp/summary.txt
+          : > /tmp/to_delete.tsv
 
           while IFS=$'\t' read -r id tags; do
             [ -z "$id" ] && continue
+
+            release_tag=""
+            for tag in $tags; do
+              if printf '%s' "$tag" | grep -Eq "$RELEASE_TAG_PATTERN"; then
+                release_tag="$tag"
+                break
+              fi
+            done
+            if [ -n "$release_tag" ]; then
+              skipped_release=$((skipped_release + 1))
+              echo "SKIP_RELEASE id=$id release_tag=$release_tag all_tags=[$tags]"
+              continue
+            fi
+
             matched_tag=""
             for tag in $tags; do
               if printf '%s' "$tag" | grep -Eq "$PATTERN"; then
@@ -65,29 +99,71 @@ jobs:
             matched=$((matched + 1))
             echo "MATCH id=$id matched_tag=$matched_tag all_tags=[$tags]"
             echo "- \`$matched_tag\` (version $id; tags: $tags)" >> /tmp/summary.txt
-
-            if [ "$DRY_RUN" != "true" ]; then
-              if gh api -X DELETE -H "Accept: application/vnd.github+json" \
-                "/orgs/$ORG/packages/container/$PKG_ENC/versions/$id"; then
-                deleted=$((deleted + 1))
-              else
-                echo "::warning::failed to delete version $id"
-              fi
-            fi
+            printf '%s\t%s\n' "$id" "$matched_tag" >> /tmp/to_delete.tsv
           done < <(jq -r '.[] | [(.id|tostring), ((.metadata.container.tags // []) | join(" "))] | @tsv' /tmp/versions.json)
 
+          echo "matched_count=$matched" >> "$GITHUB_OUTPUT"
+
           {
-            echo "### Dev Docker Cleanup"
             echo ""
-            echo "- Package: \`ghcr.io/$ORG/$PACKAGE\`"
+            echo "### Deletion plan"
             echo "- Pattern: \`$PATTERN\`"
             echo "- Dry run: \`$DRY_RUN\`"
             echo "- Versions scanned: $total"
-            echo "- Matched: $matched"
-            echo "- Deleted: $deleted"
+            echo "- Matched (will delete): $matched"
+            echo "- Skipped because tagged as release (x.x.x): $skipped_release"
             if [ -s /tmp/summary.txt ]; then
               echo ""
               echo "#### Matches"
               cat /tmp/summary.txt
             fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deletion plan
+        if: steps.match.outputs.matched_count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deletion-plan
+          path: /tmp/to_delete.tsv
+          retention-days: 1
+
+  delete:
+    name: "Delete matched versions (requires approval)"
+    needs: plan
+    if: ${{ inputs.dry_run != true && needs.plan.outputs.matched_count != '0' }}
+    runs-on: ubuntu-latest
+    environment: dev-docker-cleanup-approval
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download deletion plan
+        uses: actions/download-artifact@v4
+        with:
+          name: deletion-plan
+          path: /tmp
+
+      - name: Delete versions
+        run: |
+          set -euo pipefail
+
+          PKG_ENC=$(printf '%s' "$PACKAGE" | jq -sRr @uri)
+          deleted=0
+          failed=0
+
+          while IFS=$'\t' read -r id tag; do
+            [ -z "$id" ] && continue
+            echo "Deleting id=$id tag=$tag"
+            if gh api -X DELETE -H "Accept: application/vnd.github+json" \
+              "/orgs/$ORG/packages/container/$PKG_ENC/versions/$id"; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+              echo "::warning::failed to delete version $id"
+            fi
+          done < /tmp/to_delete.tsv
+
+          {
+            echo "### Deletion result"
+            echo "- Deleted: $deleted"
+            echo "- Failed: $failed"
           } >> "$GITHUB_STEP_SUMMARY"
