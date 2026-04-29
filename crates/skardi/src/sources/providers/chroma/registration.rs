@@ -76,7 +76,11 @@ pub async fn register_chroma_tables(
     }
 
     let schema = chroma_schema(embedding_dim);
-    let provider = Arc::new(ChromaTableProvider::new(collection.clone(), schema.clone()));
+    let provider = Arc::new(ChromaTableProvider::new(
+        collection.clone(),
+        schema.clone(),
+        embedding_dim,
+    ));
 
     session_ctx
         .register_table(name, provider)

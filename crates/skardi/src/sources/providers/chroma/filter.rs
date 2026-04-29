@@ -67,9 +67,7 @@ fn expr_to_where(expr: &Expr) -> Result<Where> {
             // since Chroma's $contains is plain substring, not regex.
             let trimmed = pattern.trim_matches('%').to_string();
             if trimmed.contains('%') || trimmed.contains('_') {
-                bail!(
-                    "chroma: only %substring% LIKE patterns are pushable; got '{pattern}'"
-                );
+                bail!("chroma: only %substring% LIKE patterns are pushable; got '{pattern}'");
             }
             let op = if like.negated {
                 DocumentOperator::NotContains
@@ -145,3 +143,205 @@ fn scalar_to_metadata_value(s: &ScalarValue) -> Result<MetadataValue> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chroma::types::{CompositeExpression, BooleanOperator};
+    use datafusion::common::Column;
+    use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(Column::from_name(name))
+    }
+    fn lit_str(s: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+    }
+    fn lit_i64(n: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(n)), None)
+    }
+    fn binary(left: Expr, op: Operator, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        })
+    }
+
+    fn metadata_of(w: &Where) -> &MetadataExpression {
+        match w {
+            Where::Metadata(m) => m,
+            other => panic!("expected Where::Metadata, got {other:?}"),
+        }
+    }
+    fn document_of(w: &Where) -> &DocumentExpression {
+        match w {
+            Where::Document(d) => d,
+            other => panic!("expected Where::Document, got {other:?}"),
+        }
+    }
+    fn composite_of(w: &Where) -> &CompositeExpression {
+        match w {
+            Where::Composite(c) => c,
+            other => panic!("expected Where::Composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_filters_return_none() {
+        assert!(exprs_to_chroma_filter(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn eq_int_metadata() {
+        let f = binary(col("category"), Operator::Eq, lit_i64(7));
+        let w = exprs_to_chroma_filter(&[f]).unwrap().unwrap();
+        let m = metadata_of(&w);
+        assert_eq!(m.key, "category");
+        assert!(matches!(
+            m.comparison,
+            MetadataComparison::Primitive(PrimitiveOperator::Equal, MetadataValue::Int(7))
+        ));
+    }
+
+    #[test]
+    fn comparison_operators_round_trip() {
+        for (op, expected) in [
+            (Operator::NotEq, PrimitiveOperator::NotEqual),
+            (Operator::Lt, PrimitiveOperator::LessThan),
+            (Operator::LtEq, PrimitiveOperator::LessThanOrEqual),
+            (Operator::Gt, PrimitiveOperator::GreaterThan),
+            (Operator::GtEq, PrimitiveOperator::GreaterThanOrEqual),
+        ] {
+            let f = binary(col("k"), op, lit_i64(1));
+            let w = exprs_to_chroma_filter(&[f]).unwrap().unwrap();
+            let MetadataComparison::Primitive(actual_op, _) = &metadata_of(&w).comparison else {
+                panic!("expected primitive comparison");
+            };
+            assert_eq!(*actual_op, expected, "op {op:?} -> wrong primitive");
+        }
+    }
+
+    #[test]
+    fn and_or_compose() {
+        let a = binary(col("a"), Operator::Eq, lit_i64(1));
+        let b = binary(col("b"), Operator::Eq, lit_i64(2));
+        let and = binary(a.clone(), Operator::And, b.clone());
+        let or = binary(a, Operator::Or, b);
+
+        let w_and = exprs_to_chroma_filter(&[and]).unwrap().unwrap();
+        let c_and = composite_of(&w_and);
+        assert_eq!(c_and.operator, BooleanOperator::And);
+        assert_eq!(c_and.children.len(), 2);
+
+        let w_or = exprs_to_chroma_filter(&[or]).unwrap().unwrap();
+        let c_or = composite_of(&w_or);
+        assert_eq!(c_or.operator, BooleanOperator::Or);
+        assert_eq!(c_or.children.len(), 2);
+    }
+
+    #[test]
+    fn multiple_filters_implicit_and() {
+        let a = binary(col("x"), Operator::Eq, lit_i64(1));
+        let b = binary(col("y"), Operator::Eq, lit_i64(2));
+        let w = exprs_to_chroma_filter(&[a, b]).unwrap().unwrap();
+        let c = composite_of(&w);
+        assert_eq!(c.operator, BooleanOperator::And);
+    }
+
+    #[test]
+    fn like_on_document_becomes_contains() {
+        let f = Expr::Like(Like {
+            negated: false,
+            expr: Box::new(col("document")),
+            pattern: Box::new(lit_str("%hello%")),
+            escape_char: None,
+            case_insensitive: false,
+        });
+        let w = exprs_to_chroma_filter(&[f]).unwrap().unwrap();
+        let d = document_of(&w);
+        assert_eq!(d.operator, DocumentOperator::Contains);
+        assert_eq!(d.pattern, "hello");
+    }
+
+    #[test]
+    fn not_like_on_document_becomes_not_contains() {
+        let f = Expr::Like(Like {
+            negated: true,
+            expr: Box::new(col("document")),
+            pattern: Box::new(lit_str("%spam%")),
+            escape_char: None,
+            case_insensitive: false,
+        });
+        let w = exprs_to_chroma_filter(&[f]).unwrap().unwrap();
+        let d = document_of(&w);
+        assert_eq!(d.operator, DocumentOperator::NotContains);
+        assert_eq!(d.pattern, "spam");
+    }
+
+    #[test]
+    fn like_on_non_document_column_errors() {
+        let f = Expr::Like(Like {
+            negated: false,
+            expr: Box::new(col("title")),
+            pattern: Box::new(lit_str("%hi%")),
+            escape_char: None,
+            case_insensitive: false,
+        });
+        let err = exprs_to_chroma_filter(&[f]).unwrap_err().to_string();
+        assert!(err.contains("LIKE only supported on the 'document' column"));
+    }
+
+    #[test]
+    fn mid_pattern_wildcard_rejected() {
+        let f = Expr::Like(Like {
+            negated: false,
+            expr: Box::new(col("document")),
+            pattern: Box::new(lit_str("%foo%bar%")),
+            escape_char: None,
+            case_insensitive: false,
+        });
+        let err = exprs_to_chroma_filter(&[f]).unwrap_err().to_string();
+        assert!(err.contains("only %substring% LIKE patterns"));
+    }
+
+    #[test]
+    fn comparison_on_document_column_errors() {
+        let f = binary(col("document"), Operator::Eq, lit_str("hi"));
+        let err = exprs_to_chroma_filter(&[f]).unwrap_err().to_string();
+        assert!(err.contains("comparison on 'document'"));
+    }
+
+    #[test]
+    fn null_predicates_unsupported() {
+        let f = Expr::IsNull(Box::new(col("k")));
+        let err = exprs_to_chroma_filter(&[f]).unwrap_err().to_string();
+        assert!(err.contains("NULL predicates"));
+    }
+
+    #[test]
+    fn float_and_bool_literals() {
+        let f = binary(
+            col("score"),
+            Operator::Gt,
+            Expr::Literal(ScalarValue::Float64(Some(0.5)), None),
+        );
+        let w = exprs_to_chroma_filter(&[f]).unwrap().unwrap();
+        let MetadataComparison::Primitive(_, MetadataValue::Float(v)) = &metadata_of(&w).comparison
+        else {
+            panic!("expected float metadata value");
+        };
+        assert!((v - 0.5).abs() < 1e-9);
+
+        let f = binary(
+            col("active"),
+            Operator::Eq,
+            Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+        );
+        let w = exprs_to_chroma_filter(&[f]).unwrap().unwrap();
+        let MetadataComparison::Primitive(_, MetadataValue::Bool(v)) = &metadata_of(&w).comparison
+        else {
+            panic!("expected bool metadata value");
+        };
+        assert!(*v);
+    }
+}

@@ -8,10 +8,9 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use chroma::ChromaCollection;
-use chroma::types::Where;
+use chroma::types::{Include, IncludeList, Where};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -22,6 +21,8 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures::stream;
+
+use crate::sources::providers::chroma::arrow_conv::knn_response_to_batch;
 
 #[derive(Debug)]
 pub struct ChromaKnnExec {
@@ -50,10 +51,7 @@ pub fn knn_output_schema() -> SchemaRef {
         Field::new("document", DataType::Utf8, true),
         Field::new(
             "metadata",
-            DataType::Map(
-                Arc::new(Field::new("entries", entry_struct, false)),
-                false,
-            ),
+            DataType::Map(Arc::new(Field::new("entries", entry_struct, false)), false),
             true,
         ),
         Field::new("_distance", DataType::Float32, true),
@@ -160,17 +158,34 @@ impl ExecutionPlan for ChromaKnnExec {
                     "chroma: deferred-vector KNN (subquery embedding) not yet implemented".into(),
                 )
             })?;
-            // Issue the typed query call. Hooking the response into Arrow is the
-            // next focused task — see plan ("KNN — the killer feature").
-            let _ = collection
-                .query(vec![v], Some(k), where_filter, None, None)
+            let include = IncludeList(vec![
+                Include::Document,
+                Include::Metadata,
+                Include::Distance,
+            ]);
+            let response = collection
+                .query(vec![v], Some(k), where_filter, None, Some(include))
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("chroma: query failed: {e}")))?;
 
-            // Force-suppress unused warning on Float32Array import until conversion lands.
-            let _: ArrayRef = Arc::new(Float32Array::from(Vec::<f32>::new()));
+            // We sent one query vector, so each top-level Vec has exactly one slot.
+            let ids = response.ids.into_iter().next().unwrap_or_default();
+            let documents = response
+                .documents
+                .and_then(|mut v| v.pop())
+                .unwrap_or_else(|| vec![None; ids.len()]);
+            let metadatas = response
+                .metadatas
+                .and_then(|mut v| v.pop())
+                .unwrap_or_else(|| vec![None; ids.len()]);
+            let distances = response
+                .distances
+                .and_then(|mut v| v.pop())
+                .unwrap_or_else(|| vec![None; ids.len()]);
 
-            Ok::<RecordBatch, DataFusionError>(RecordBatch::new_empty(schema))
+            knn_response_to_batch(schema, ids, documents, metadatas, distances).map_err(|e| {
+                DataFusionError::Execution(format!("chroma: arrow conversion failed: {e}"))
+            })
         };
         let stream = stream::once(fut);
         Ok(Box::pin(RecordBatchStreamAdapter::new(

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use chroma::ChromaCollection;
-use chroma::types::Where;
+use chroma::types::{Include, IncludeList, Where};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -23,6 +23,8 @@ use datafusion::physical_plan::{
 };
 use futures::stream;
 
+use crate::sources::providers::chroma::arrow_conv::get_response_to_batch;
+
 #[derive(Debug)]
 pub struct ChromaScanExec {
     collection: Arc<ChromaCollection>,
@@ -31,6 +33,7 @@ pub struct ChromaScanExec {
     projection: Option<Vec<usize>>,
     where_filter: Option<Where>,
     limit: Option<usize>,
+    embedding_dim: i32,
     plan_properties: PlanProperties,
 }
 
@@ -38,6 +41,7 @@ impl ChromaScanExec {
     pub fn try_new(
         collection: Arc<ChromaCollection>,
         schema: SchemaRef,
+        embedding_dim: i32,
         projection: Option<Vec<usize>>,
         where_filter: Option<Where>,
         limit: Option<usize>,
@@ -59,6 +63,7 @@ impl ChromaScanExec {
             projection,
             where_filter,
             limit,
+            embedding_dim,
             plan_properties,
         })
     }
@@ -112,12 +117,22 @@ impl ExecutionPlan for ChromaScanExec {
         let collection = self.collection.clone();
         let where_filter = self.where_filter.clone();
         let limit = self.limit;
-        let schema = self.projected_schema.clone();
+        let projected_schema = self.projected_schema.clone();
         let projection = self.projection.clone();
         let full_schema = self.schema.clone();
+        let embedding_dim = self.embedding_dim;
 
         let fut = async move {
-            execute_scan(collection, full_schema, projection, schema, where_filter, limit).await
+            execute_scan(
+                collection,
+                full_schema,
+                embedding_dim,
+                projection,
+                projected_schema,
+                where_filter,
+                limit,
+            )
+            .await
         };
 
         let stream = stream::once(fut);
@@ -134,28 +149,48 @@ impl ExecutionPlan for ChromaScanExec {
 
 async fn execute_scan(
     collection: Arc<ChromaCollection>,
-    _full_schema: SchemaRef,
-    _projection: Option<Vec<usize>>,
+    full_schema: SchemaRef,
+    embedding_dim: i32,
+    projection: Option<Vec<usize>>,
     projected_schema: SchemaRef,
     where_filter: Option<Where>,
     limit: Option<usize>,
 ) -> DFResult<RecordBatch> {
-    // Issue the get() request — minimum viable hook so wiring compiles and
-    // a no-op scan returns an empty batch with the right schema. Arrow
-    // conversion of ids/documents/embeddings/metadatas is the next task
-    // (see plan: "Net-new: schema model" item).
-    let _response = collection
+    // Always include all four fields; the user's SQL projection is applied
+    // after we materialize the full batch. Cheaper to ask Chroma for them
+    // unconditionally than to fan WHERE/LIMIT semantics out across two paths.
+    let include = IncludeList(vec![
+        Include::Document,
+        Include::Embedding,
+        Include::Metadata,
+    ]);
+
+    let response = collection
         .get(
             None,
             where_filter,
             limit.map(|n| n as u32),
             None,
-            None,
+            Some(include),
         )
         .await
         .map_err(|e| DataFusionError::Execution(format!("chroma: get failed: {e}")))?;
 
-    // TODO: convert _response.{ids,documents,embeddings,metadatas} → RecordBatch.
-    // For now, return an empty batch with the projected schema so plans run end-to-end.
-    Ok(RecordBatch::new_empty(projected_schema))
+    let full_batch = get_response_to_batch(
+        full_schema,
+        embedding_dim,
+        response.ids,
+        response.documents,
+        response.embeddings,
+        response.metadatas,
+    )
+    .map_err(|e| DataFusionError::Execution(format!("chroma: arrow conversion failed: {e}")))?;
+
+    match projection {
+        None => Ok(full_batch),
+        Some(indices) => {
+            let cols: Vec<_> = indices.iter().map(|&i| full_batch.column(i).clone()).collect();
+            Ok(RecordBatch::try_new(projected_schema, cols)?)
+        }
+    }
 }

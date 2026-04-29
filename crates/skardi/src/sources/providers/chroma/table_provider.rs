@@ -38,11 +38,16 @@ pub struct ChromaEntry {
 pub struct ChromaTableProvider {
     pub(crate) collection: Arc<ChromaCollection>,
     pub(crate) schema: SchemaRef,
+    pub(crate) embedding_dim: i32,
 }
 
 impl ChromaTableProvider {
-    pub fn new(collection: Arc<ChromaCollection>, schema: SchemaRef) -> Self {
-        Self { collection, schema }
+    pub fn new(collection: Arc<ChromaCollection>, schema: SchemaRef, embedding_dim: i32) -> Self {
+        Self {
+            collection,
+            schema,
+            embedding_dim,
+        }
     }
 }
 
@@ -68,10 +73,7 @@ pub fn chroma_schema(embedding_dim: i32) -> SchemaRef {
         ),
         Field::new(
             "metadata",
-            DataType::Map(
-                Arc::new(Field::new("entries", entry_struct, false)),
-                false,
-            ),
+            DataType::Map(Arc::new(Field::new("entries", entry_struct, false)), false),
             true,
         ),
     ]))
@@ -115,6 +117,7 @@ impl TableProvider for ChromaTableProvider {
         Ok(Arc::new(ChromaScanExec::try_new(
             self.collection.clone(),
             self.schema.clone(),
+            self.embedding_dim,
             projection.cloned(),
             where_filter,
             limit,

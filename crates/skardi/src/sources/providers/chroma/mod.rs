@@ -16,6 +16,7 @@
 //! produces typed `chroma::types::Where` expressions that route metadata
 //! predicates and document `LIKE '%x%'` predicates to Chroma in a single call.
 
+pub mod arrow_conv;
 pub mod client_options;
 pub mod filter;
 pub mod knn_exec;

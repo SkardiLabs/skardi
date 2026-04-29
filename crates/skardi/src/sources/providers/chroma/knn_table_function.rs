@@ -120,9 +120,8 @@ impl TableProvider for ChromaKnnProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let where_filter = exprs_to_chroma_filter(filters).map_err(|e| {
-            datafusion::error::DataFusionError::Plan(format!("chroma_knn: {e}"))
-        })?;
+        let where_filter = exprs_to_chroma_filter(filters)
+            .map_err(|e| datafusion::error::DataFusionError::Plan(format!("chroma_knn: {e}")))?;
         Ok(Arc::new(ChromaKnnExec::try_new_literal(
             self.entry.collection.clone(),
             self.query_vector.clone(),
@@ -146,5 +145,8 @@ pub fn register_chroma_knn_udtf(
     ctx: &datafusion::prelude::SessionContext,
     registry: DatasetRegistry,
 ) {
-    ctx.register_udtf("chroma_knn", Arc::new(ChromaKnnTableFunction::new(registry)));
+    ctx.register_udtf(
+        "chroma_knn",
+        Arc::new(ChromaKnnTableFunction::new(registry)),
+    );
 }
