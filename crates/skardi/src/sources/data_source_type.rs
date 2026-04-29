@@ -15,6 +15,7 @@ pub enum DataSourceType {
     Redis,
     Lance,
     Seekdb,
+    Chroma,
 }
 
 impl DataSourceType {
@@ -30,6 +31,7 @@ impl DataSourceType {
             Self::Redis => "redis",
             Self::Lance => "lance",
             Self::Seekdb => "seekdb",
+            Self::Chroma => "chroma",
         }
     }
 }

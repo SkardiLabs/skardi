@@ -1,3 +1,4 @@
+pub mod chroma;
 pub mod iceberg;
 pub mod knn_utils;
 pub mod lance;
@@ -13,6 +14,7 @@ use ::lance::dataset::Dataset;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use chroma::ChromaEntry;
 use mongo::fts_table_function::MongoFtsEntry;
 use seekdb::knn_table_function::SeekDbKnnEntry;
 use sqlite::knn_table_function::SqliteEntry;
@@ -26,6 +28,7 @@ pub enum DatasetEntry {
     Mongo(MongoFtsEntry),
     Sqlite(SqliteEntry),
     Seekdb(SeekDbKnnEntry),
+    Chroma(ChromaEntry),
 }
 
 /// Unified registry mapping table name → dataset entry.

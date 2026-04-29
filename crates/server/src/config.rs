@@ -7,6 +7,7 @@ use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::lance::register_lance_table;
+use skardi::sources::providers::chroma::register_chroma_tables;
 use skardi::sources::providers::mongo::register_mongo_tables;
 use skardi::sources::providers::mysql::register_mysql_tables;
 use skardi::sources::providers::redis::datasource::register_redis_tables;
@@ -648,6 +649,7 @@ const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Mongo,
     DataSourceType::Redis,
     DataSourceType::Seekdb,
+    DataSourceType::Chroma,
 ];
 
 /// Validate data source configurations
@@ -1189,6 +1191,39 @@ async fn register_data_source(
             .await
             .map_err(|e| {
                 tracing::error!("MongoDB registration failed for '{}': {:?}", source.name, e);
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Chroma => {
+            tracing::info!("Registering Chroma collection: {}", source.name);
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            tracing::debug!(
+                "Connection string for {}: {} (options: {:?})",
+                source.name,
+                connection_string,
+                source.options
+            );
+
+            let chroma_registry = optimizer_registry.map(|r| r.datasets());
+            register_chroma_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+                chroma_registry.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("Chroma registration failed for '{}': {:?}", source.name, e);
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
