@@ -189,7 +189,10 @@ async fn execute_scan(
     match projection {
         None => Ok(full_batch),
         Some(indices) => {
-            let cols: Vec<_> = indices.iter().map(|&i| full_batch.column(i).clone()).collect();
+            let cols: Vec<_> = indices
+                .iter()
+                .map(|&i| full_batch.column(i).clone())
+                .collect();
             Ok(RecordBatch::try_new(projected_schema, cols)?)
         }
     }

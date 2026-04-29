@@ -146,7 +146,7 @@ fn scalar_to_metadata_value(s: &ScalarValue) -> Result<MetadataValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chroma::types::{CompositeExpression, BooleanOperator};
+    use chroma::types::{BooleanOperator, CompositeExpression};
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 

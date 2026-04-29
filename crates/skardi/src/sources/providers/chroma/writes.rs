@@ -137,10 +137,8 @@ impl ExecutionPlan for ChromaInsertExec {
             let mut input_stream = input.execute(0, context)?;
             while let Some(batch) = input_stream.next().await {
                 let batch = batch?;
-                let (ids, embeddings, documents, metadatas) =
-                    extract_insert_columns(&batch).map_err(|e| {
-                        DataFusionError::Execution(format!("chroma: {e}"))
-                    })?;
+                let (ids, embeddings, documents, metadatas) = extract_insert_columns(&batch)
+                    .map_err(|e| DataFusionError::Execution(format!("chroma: {e}")))?;
                 let n = ids.len() as u64;
                 let docs_opt = if documents.iter().any(Option::is_some) {
                     Some(documents)
@@ -311,20 +309,18 @@ fn extract_insert_columns(
         .ok_or_else(|| anyhow::anyhow!("INSERT 'id' column must be Utf8"))?;
     let embedding = batch
         .column_by_name("embedding")
-        .ok_or_else(|| {
-            anyhow::anyhow!("INSERT input is missing required column 'embedding'")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("INSERT input is missing required column 'embedding'"))?
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .ok_or_else(|| {
             anyhow::anyhow!("INSERT 'embedding' column must be FixedSizeList<Float32>")
         })?;
-    let document = batch.column_by_name("document").and_then(|c| {
-        c.as_any().downcast_ref::<StringArray>().cloned()
-    });
-    let metadata = batch.column_by_name("metadata").and_then(|c| {
-        c.as_any().downcast_ref::<MapArray>().cloned()
-    });
+    let document = batch
+        .column_by_name("document")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned());
+    let metadata = batch
+        .column_by_name("metadata")
+        .and_then(|c| c.as_any().downcast_ref::<MapArray>().cloned());
 
     let mut ids = Vec::with_capacity(n);
     let mut embeddings = Vec::with_capacity(n);
@@ -345,9 +341,7 @@ fn extract_insert_columns(
         let f32_arr = values
             .as_any()
             .downcast_ref::<Float32Array>()
-            .ok_or_else(|| {
-                anyhow::anyhow!("INSERT row {i}: embedding child must be Float32")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("INSERT row {i}: embedding child must be Float32"))?;
         if f32_arr.len() != dim {
             anyhow::bail!(
                 "INSERT row {i}: embedding length {} does not match collection dim {}",
@@ -371,10 +365,7 @@ fn extract_insert_columns(
     Ok((ids, embeddings, documents, metadatas))
 }
 
-fn extract_metadata_row(
-    map: Option<&MapArray>,
-    i: usize,
-) -> anyhow::Result<Option<Metadata>> {
+fn extract_metadata_row(map: Option<&MapArray>, i: usize) -> anyhow::Result<Option<Metadata>> {
     let Some(map) = map else { return Ok(None) };
     if map.is_null(i) {
         return Ok(None);

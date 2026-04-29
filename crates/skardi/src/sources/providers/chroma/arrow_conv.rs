@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, MapBuilder,
-    StringBuilder, UInt32Array,
+    Array, ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, MapBuilder, StringBuilder,
+    UInt32Array,
 };
 use arrow::array::{RecordBatch, StringArray};
 use arrow::buffer::OffsetBuffer;
@@ -102,10 +102,7 @@ fn build_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
-fn build_metadata_array(
-    n: usize,
-    metadatas: Option<Vec<Option<Metadata>>>,
-) -> Result<ArrayRef> {
+fn build_metadata_array(n: usize, metadatas: Option<Vec<Option<Metadata>>>) -> Result<ArrayRef> {
     // Arrow Map = list of struct<key,value> pairs per row. MapBuilder handles
     // the offsets and the validity buffer for us.
     let mut builder: MapBuilder<StringBuilder, StringBuilder> =
