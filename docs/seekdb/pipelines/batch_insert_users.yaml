@@ -1,0 +1,25 @@
+kind: pipeline
+
+metadata:
+  name: "seekdb-batch-insert-users"
+  version: "1.0"
+  description: >
+    SeekDB counterpart of postgres/pipelines/batch_insert_users.yaml.
+    Inserts a caller-sized batch of rows in one statement using the
+    `{rows}` array-of-arrays shape, e.g.
+
+      {"rows": [
+        ["alice", "alice@example.com"],
+        ["bob",   "bob@example.com"]
+      ]}
+
+    Renders to `INSERT INTO users (name, email) VALUES
+    ('alice', 'alice@example.com'), ('bob', 'bob@example.com')`.
+
+    Use this shape when the per-row cost (parse + plan + commit) is high
+    enough that amortising it across N rows is the dominant throughput
+    win — typical for vector-heavy workloads where the row payload itself
+    is the bottleneck.
+
+spec:
+  query: "INSERT INTO users (name, email) VALUES {rows}"

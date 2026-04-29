@@ -16,7 +16,7 @@ path = "src/main.rs"
 default = []
 candle = ["skardi/candle"]
 onnx = ["skardi/onnx"]
-embedding = ["skardi/embedding"]
+embedding = ["candle", "gguf", "onnx", "remote-embed"]
 remote-embed = ["skardi/remote-embed"]
 gguf = ["skardi/gguf"]
 

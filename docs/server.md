@@ -13,7 +13,7 @@ Both surfaces share the same context file (data sources + access mode +
 caching), the same YAML envelope, and the same HTTP listener. This page covers the
 shared server concerns; the per-surface reference lives in
 [pipelines.md](pipelines.md) and [jobs.md](jobs.md). For the broader
-story, see [spark_for_agents.md](spark_for_agents.md).
+story, see [agent_data_plane.md](agent_data_plane.md).
 
 ---
 
@@ -210,4 +210,4 @@ on that source, from pipelines and jobs alike.
 - **[Jobs](jobs.md)** — YAML shape, destinations, run ledger, and cancellation for the offline-batch side.
 - **[Semantics](semantics.md)** — natural-language descriptions on tables and columns; the agent-facing catalog overlay.
 - **[CLI](cli.md)** — `skardi run`, aliases, federated SQL from the shell.
-- **[Spark for Agents](spark_for_agents.md)** — why the platform is shaped this way.
+- **[Why an agent data plane](agent_data_plane.md)** — why the data plane is shaped this way.

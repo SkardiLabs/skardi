@@ -1692,6 +1692,46 @@ mod tests {
         assert_eq!(total_rows(&batches), 1);
     }
 
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. DataFusion materializes
+    /// the VALUES list into a batch with N rows; MongoInsertExec writes each
+    /// row as a BSON document. Verifies all N documents land.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values() {
+        let mut ctx = SessionContext::new();
+        register_ci_collection(&mut ctx, "products", "product_id").await;
+
+        // Pre-clean so a re-run starts from a known state (`product_id` maps
+        // to `_id`, which is unique).
+        ctx.sql("DELETE FROM products WHERE category = 'BatchCat'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "INSERT INTO products (product_id, name, category, price, in_stock) VALUES \
+             ('PROD_BATCH_1', 'Batch1', 'BatchCat', 1.0, true), \
+             ('PROD_BATCH_2', 'Batch2', 'BatchCat', 2.0, true), \
+             ('PROD_BATCH_3', 'Batch3', 'BatchCat', 3.0, false)",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT product_id FROM products WHERE category = 'BatchCat' ORDER BY product_id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
     // ─── Delete tests (integration) ─────────────────────────────────────
 
     #[tokio::test]

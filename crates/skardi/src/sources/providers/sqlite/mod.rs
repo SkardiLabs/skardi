@@ -1853,6 +1853,38 @@ mod tests {
         assert!(ids.values().iter().any(|&v| v == 4), "id 4 should exist");
     }
 
+    /// Multi-row `INSERT INTO ... VALUES (...), (...), (...)` — the shape the
+    /// server-side renderer emits when a pipeline parameter is the
+    /// array-of-arrays form `{"rows": [[..], [..]]}`. DataFusion parses the
+    /// VALUES list into a single batch with N rows, then SqliteInsertExec
+    /// loops the batch row-by-row inside a transaction. Verifies the path
+    /// commits all rows atomically.
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_multi_row_values() {
+        let db_path = create_test_db().await;
+        let db = db_path.to_str().unwrap();
+        let mut ctx = SessionContext::new();
+        register_test_table(&mut ctx, db).await;
+
+        ctx.sql(
+            "INSERT INTO test_items (id, name, value) VALUES \
+             (10, 'eve', 100), (11, 'frank', 110), (12, 'gina', 120)",
+        )
+        .await
+        .expect("parse multi-row insert")
+        .collect()
+        .await
+        .expect("execute multi-row insert");
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id, name FROM test_items WHERE id >= 10 ORDER BY id",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 3);
+    }
+
     // ─── Delete tests ───────────────────────────────────────────────────
 
     #[tokio::test]

@@ -391,4 +391,67 @@ mod tests {
         .await;
         assert!(res.is_ok());
     }
+
+    /// Locks down the fact that a Lance-backed table rejects SQL
+    /// `INSERT INTO ... VALUES` (single- or multi-row). Lance's `Dataset`
+    /// implements only `TableProvider::scan`, not `insert_into`, so any
+    /// pipeline that targets a Lance source with the multi-row VALUES
+    /// renderer fails at planning. Lance writes must go through the
+    /// `kind: job` primitive (which calls `write_lance_dataset` directly)
+    /// rather than through a pipeline INSERT.
+    #[tokio::test]
+    async fn test_lance_table_rejects_sql_insert_values() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("dataset.lance");
+        let path_str = path.to_str().unwrap();
+
+        // Seed a dataset so registration succeeds.
+        write_lance_dataset(path_str, vec![test_batch()], WriteMode::Create)
+            .await
+            .expect("create");
+
+        let mut ctx = SessionContext::new();
+        register_lance_table(&mut ctx, "t", path_str, None)
+            .await
+            .expect("register");
+
+        // Multi-row VALUES — the shape the server-side renderer emits when a
+        // pipeline parameter is the array-of-arrays form.
+        let parse_err = ctx
+            .sql("INSERT INTO t (id, name) VALUES (10, 'x'), (11, 'y')")
+            .await
+            .err();
+        let exec_err = if parse_err.is_none() {
+            ctx.sql("INSERT INTO t (id, name) VALUES (10, 'x'), (11, 'y')")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .err()
+        } else {
+            None
+        };
+        assert!(
+            parse_err.is_some() || exec_err.is_some(),
+            "Lance table must reject SQL INSERT VALUES at parse, plan, or execute"
+        );
+
+        // Whichever phase rejects, the row count is unchanged from the seed.
+        let n = ctx
+            .sql("SELECT COUNT(id) AS n FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            n, 3,
+            "Lance content must be untouched after a rejected INSERT"
+        );
+    }
 }
