@@ -40,10 +40,10 @@
 //! - Multiple files may be loaded by pointing at a directory. Files in that
 //!   directory whose root `kind:` is not `semantics` are silently skipped,
 //!   mirroring how `--jobs` tolerates plain pipelines.
-//! - The `name:` field is parsed into a [`SemanticsKey`]: a bare segment
-//!   becomes [`SemanticsKey::Source`], three dot-separated segments become
-//!   [`SemanticsKey::Qualified`]. Anything else (0, 2, 4+ segments, empty
-//!   segments) is a hard error.
+//! - The `name:` field is parsed into one of two key shapes: a bare
+//!   segment is treated as a source name; three dot-separated segments
+//!   are treated as a fully-qualified `catalog.schema.table` triple.
+//!   Anything else (0, 2, 4+ segments, empty segments) is a hard error.
 //! - Bare and qualified entries live in separate addressing spaces — one
 //!   bare and one qualified entry can coexist for the same physical
 //!   table, and the qualified entry wins through
@@ -231,10 +231,10 @@ pub enum SemanticsError {
 }
 
 /// In-memory lookup attached to `ServerConfig` (server side) or built
-/// on-demand by `skardi query --schema` (CLI side). Indexed by
-/// [`SemanticsKey`] so a single registry can hold both bare source-name
-/// entries and fully-qualified `catalog.schema.table` entries; per-column
-/// descriptions live in a nested map.
+/// on-demand by `skardi query --schema` (CLI side). Holds both bare
+/// source-name entries and fully-qualified `catalog.schema.table`
+/// entries in a single keyed map; per-column descriptions live in a
+/// nested map.
 ///
 /// The registry merges *all* semantics files passed in, plus the
 /// ctx-inline `description` field, into a single view. Lookups should
