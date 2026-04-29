@@ -279,7 +279,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [ ] MCP binding — same pipeline YAML projected to MCP tools for non-Claude hosts
 
 `6` Governance & lineage
-   - [x] Catalog with semantics — `kind: semantics` YAML overlay attaching NL descriptions to tables / columns; surfaced on `GET /data_source` for agent-side discovery
+   - [x] Catalog with semantics — `kind: semantics` YAML overlay attaching NL descriptions to tables / columns; supports both bare source names and fully-qualified `catalog.schema.table` paths for per-table targeting on catalog-mode sources; surfaced on `GET /data_source` for agent-side discovery
    - [ ] Agent-callable `describe` verb — CLI / pipeline form on top of the catalog endpoint
    - [ ] Lineage capture — `agent_id`, `session_id`, `tool_call_id`, `timestamp` on writes; queryable from metadata tables
    - [ ] Agent identity passthrough — any binding injects client identity into a SQL context var pipelines can read

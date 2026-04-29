@@ -1143,8 +1143,23 @@ async fn show_schema(
         .map(|ds| ds.name.clone())
         .collect();
 
-    let defaults = CatalogDefaults::from_ctx(&session_ctx);
-    let all_tables = enumerate_tables(&session_ctx);
+    render_schema(&session_ctx, &semantics, &source_names, table_filter, out).await
+}
+
+/// Render the schema view (table + columns, with overlay descriptions)
+/// for whatever is registered in `session_ctx`. Split out from
+/// [`show_schema`] so tests can drive it with a hand-built session that
+/// exercises rare paths (catalog-mode sources, custom defaults, etc.)
+/// without going through `load_and_register_all`.
+async fn render_schema(
+    session_ctx: &SessionContext,
+    semantics: &SemanticsRegistry,
+    source_names: &HashSet<String>,
+    table_filter: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let defaults = CatalogDefaults::from_ctx(session_ctx);
+    let all_tables = enumerate_tables(session_ctx);
     let selected = match table_filter {
         Some(t) => select_tables(&all_tables, t, &defaults)?,
         None => all_tables,
@@ -1177,17 +1192,30 @@ async fn show_schema(
                 )
             })?;
         let table_schema = provider.schema();
-        let source_name = source_name_for(entry, &defaults, &source_names);
+        let source_name = source_name_for(entry, &defaults, source_names);
 
-        let table_desc = source_name.and_then(|name| semantics.table_description(name));
+        // Most-specific overlay wins: a fully-qualified `name:
+        // catalog.schema.table` entry beats the bare `name: <source>`
+        // fallback. Both ultimately resolve through the same registry.
+        let table_desc = semantics.resolve_table_description(
+            &entry.catalog,
+            &entry.schema,
+            &entry.table,
+            source_name,
+        );
         match table_desc {
             Some(desc) => writeln!(out, "table: {}  -- {}", entry.display_name(&defaults), desc)?,
             None => writeln!(out, "table: {}", entry.display_name(&defaults))?,
         }
 
         for field in table_schema.fields() {
-            let col_desc =
-                source_name.and_then(|name| semantics.column_description(name, field.name()));
+            let col_desc = semantics.resolve_column_description(
+                &entry.catalog,
+                &entry.schema,
+                &entry.table,
+                source_name,
+                field.name(),
+            );
             match col_desc {
                 Some(desc) => writeln!(
                     out,
@@ -1227,9 +1255,9 @@ fn source_name_for<'a>(
 ) -> Option<&'a str> {
     if entry.catalog == defaults.catalog
         && entry.schema == defaults.schema
-        && source_names.contains(&entry.table)
+        && let Some(name) = source_names.get(&entry.table)
     {
-        return source_names.get(&entry.table).map(String::as_str);
+        return Some(name.as_str());
     }
     source_names.get(&entry.catalog).map(String::as_str)
 }
@@ -2341,6 +2369,207 @@ spec:
         assert!(
             msg.contains("Ambiguous semantics auto-discovery"),
             "should bubble up the resolver's collision error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_schema_attaches_catalog_mode_description_to_every_inner_table() {
+        // Catalog-mode sources (e.g. SQLite registered with `type: sqlite`)
+        // present as a *catalog* whose name == the source name, with
+        // multiple inner tables underneath. With a bare `name: <source>`
+        // entry (the broad form), the source-level description attaches
+        // to every inner table and column overlays match against the
+        // live Arrow column names regardless of which inner table holds
+        // them. (Per-table targeting is exercised by the qualified-path
+        // test below.)
+        //
+        // This test fakes the registration with an in-memory catalog so we
+        // don't need a real SQLite source — the rendering path is what we
+        // care about pinning.
+        let ctx = SessionContext::new();
+        let inner_schema = Arc::new(MemorySchemaProvider::new());
+        let pages = Arc::new(
+            MemTable::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("title", DataType::Utf8, false),
+                    Field::new("body", DataType::Utf8, true),
+                ])),
+                vec![vec![]],
+            )
+            .unwrap(),
+        );
+        let revisions = Arc::new(
+            MemTable::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("title", DataType::Utf8, false),
+                    Field::new("revised_at", DataType::Int64, false),
+                ])),
+                vec![vec![]],
+            )
+            .unwrap(),
+        );
+        inner_schema
+            .register_table("pages".to_string(), pages)
+            .unwrap();
+        inner_schema
+            .register_table("revisions".to_string(), revisions)
+            .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog
+            .register_schema("main", inner_schema as Arc<dyn SchemaProvider>)
+            .unwrap();
+        ctx.register_catalog("wiki", catalog as Arc<dyn CatalogProvider>);
+
+        let ctx_descriptions = vec![("wiki".to_string(), None)];
+        let tmp = TempDir::new().unwrap();
+        let sem_path = tmp.path().join("sem.yaml");
+        std::fs::write(
+            &sem_path,
+            r#"kind: semantics
+metadata: { name: t }
+spec:
+  sources:
+    - name: wiki
+      description: "Wiki content store"
+      columns:
+        - name: title
+          description: "Page title"
+        - name: revised_at
+          description: "Last edit (epoch seconds)"
+"#,
+        )
+        .unwrap();
+        let semantics = SemanticsRegistry::build(Some(&sem_path), &ctx_descriptions).unwrap();
+        let source_names: HashSet<String> = ["wiki".to_string()].into_iter().collect();
+
+        let mut out: Vec<u8> = Vec::new();
+        render_schema(&ctx, &semantics, &source_names, None, &mut out)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        // Source-level description must attach to *both* inner tables.
+        assert!(
+            rendered.contains("table: wiki.main.pages  -- Wiki content store"),
+            "pages row missing source-level description. Got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("table: wiki.main.revisions  -- Wiki content store"),
+            "revisions row missing source-level description. Got:\n{rendered}"
+        );
+        // Column overlays match by name across inner tables (no
+        // per-inner-table targeting yet), so `title` shows up annotated
+        // in *both* rows.
+        let title_hits = rendered.matches("title: Utf8  -- Page title").count();
+        assert_eq!(
+            title_hits, 2,
+            "the `title` overlay should attach in both pages and revisions. Got:\n{rendered}"
+        );
+        // A column unique to one inner table picks up its own overlay.
+        assert!(
+            rendered.contains("revised_at: Int64  -- Last edit (epoch seconds)"),
+            "revised_at column overlay missing. Got:\n{rendered}"
+        );
+        // A column with no overlay renders bare.
+        assert!(
+            rendered.contains("\n  body: Utf8\n"),
+            "body column should render bare. Got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_schema_uses_qualified_path_for_specific_inner_table() {
+        // Same catalog-mode setup as above, but the semantics file uses
+        // a fully-qualified `name: wiki.main.pages` to target *only*
+        // the pages table. The other inner table (revisions) should
+        // fall through to the bare `wiki` source-level fallback.
+        let ctx = SessionContext::new();
+        let inner_schema = Arc::new(MemorySchemaProvider::new());
+        let pages = Arc::new(
+            MemTable::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("title", DataType::Utf8, false),
+                    Field::new("body", DataType::Utf8, true),
+                ])),
+                vec![vec![]],
+            )
+            .unwrap(),
+        );
+        let revisions = Arc::new(
+            MemTable::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("title", DataType::Utf8, false),
+                    Field::new("revised_at", DataType::Int64, false),
+                ])),
+                vec![vec![]],
+            )
+            .unwrap(),
+        );
+        inner_schema
+            .register_table("pages".to_string(), pages)
+            .unwrap();
+        inner_schema
+            .register_table("revisions".to_string(), revisions)
+            .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog
+            .register_schema("main", inner_schema as Arc<dyn SchemaProvider>)
+            .unwrap();
+        ctx.register_catalog("wiki", catalog as Arc<dyn CatalogProvider>);
+
+        let ctx_descriptions = vec![("wiki".to_string(), None)];
+        let tmp = TempDir::new().unwrap();
+        let sem_path = tmp.path().join("sem.yaml");
+        std::fs::write(
+            &sem_path,
+            r#"kind: semantics
+metadata: { name: t }
+spec:
+  sources:
+    - name: wiki
+      description: "Wiki content store (broad)"
+    - name: wiki.main.pages
+      description: "Page contents only"
+      columns:
+        - name: title
+          description: "Page heading"
+"#,
+        )
+        .unwrap();
+        let semantics = SemanticsRegistry::build(Some(&sem_path), &ctx_descriptions).unwrap();
+        let source_names: HashSet<String> = ["wiki".to_string()].into_iter().collect();
+
+        let mut out: Vec<u8> = Vec::new();
+        render_schema(&ctx, &semantics, &source_names, None, &mut out)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        // The qualified entry wins for `pages`...
+        assert!(
+            rendered.contains("table: wiki.main.pages  -- Page contents only"),
+            "pages should pick the qualified description. Got:\n{rendered}"
+        );
+        // ...and the broad fallback covers the other inner table.
+        assert!(
+            rendered.contains("table: wiki.main.revisions  -- Wiki content store (broad)"),
+            "revisions should fall back to the bare `wiki` description. Got:\n{rendered}"
+        );
+        // The qualified column overlay applies on `pages.title`.
+        // (The line for pages comes right after `table: wiki.main.pages`.)
+        assert!(
+            rendered.contains("title: Utf8  -- Page heading"),
+            "qualified column overlay missing on pages.title. Got:\n{rendered}"
+        );
+        // `revisions.title` has no overlay (the qualified entry only
+        // covers pages, and the bare `wiki` entry has no `columns:`).
+        let revisions_block = rendered
+            .split("table: wiki.main.revisions")
+            .nth(1)
+            .expect("revisions block should be present");
+        assert!(
+            revisions_block.contains("\n  title: Utf8\n"),
+            "revisions.title should render bare. Got revisions block:\n{revisions_block}"
         );
     }
 

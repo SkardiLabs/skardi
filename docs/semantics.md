@@ -51,10 +51,46 @@ spec:
           description: "Retail price in USD."
 ```
 
-`spec.sources[]` is a flat list of overlays. The `name` field
-cross-references `data_sources[].name` from the ctx; semantics for an
-unknown source are warned about (not failed) at load time so a stale
-overlay does not brick a partially-rebooted server.
+`spec.sources[]` is a flat list of overlays. The `name` field is either:
+
+- **A bare source name** — cross-references `data_sources[].name` from
+  the ctx. For table-mode sources (CSV, Parquet, Lance, Iceberg…) where
+  the source name *is* the physical table name, this is the only form
+  you need. For [catalog-mode sources](catalog.md) (Postgres / MySQL /
+  SQLite registered with `hierarchy_level: catalog`), the bare entry
+  applies as a *broad fallback* to every inner table.
+- **A fully-qualified DataFusion path** `catalog.schema.table` —
+  targets one specific physical table. Useful for catalog-mode sources
+  where a single ctx registration spawns many inner tables and you
+  want per-inner-table descriptions.
+
+```yaml
+spec:
+  sources:
+    # 1-part: broad fallback for the whole `mydb` catalog.
+    - name: mydb
+      description: "Internal application DB"
+
+    # 3-part: targets a specific inner table. Wins over the bare entry
+    # above for `mydb.public.users` only.
+    - name: mydb.public.users
+      description: "Auth + profile data, one row per registered account"
+      columns:
+        - name: id
+          description: "User ID (auth.users.id)"
+
+    - name: mydb.public.orders
+      description: "Submitted orders"
+      columns:
+        - name: id
+          description: "Order number, monotonic"
+```
+
+Names with anything other than 1 or 3 dot-separated segments are a
+hard error (e.g. `schema.table`, `a.b.c.d`, or empty segments like
+`mydb..users`). Semantics for an unknown source / catalog are warned
+about (not failed) at load time so a stale overlay does not brick a
+partially-rebooted server.
 
 `description` and `columns` are both optional — supply only what you
 have. Unknown columns are not reported (the merge runs at request time
@@ -106,13 +142,17 @@ skip — same behavior as `--jobs`.
 
 ## Composition rules
 
-Multiple semantics files may be merged into one registry. The rules:
+Multiple semantics files may be merged into one registry. Bare and
+qualified entries live in different addressing spaces — they're not
+duplicates of each other even when they describe the same physical
+table. The rules:
 
 | Situation | Behavior |
 |-----------|----------|
-| Two files describe the same `(source)` table | **Hard error** at startup. Both file paths are reported. |
-| Two files describe the same `(source, column)` | **Hard error** at startup. Both file paths are reported. |
-| A file references an unknown source | **Warning**. The entry is kept in the registry but never matches. |
+| Two files share the same key (same bare `name:`, **or** same `catalog.schema.table`) at table or column level | **Hard error** at startup. Both file paths are reported. |
+| One file has `name: mydb`, another has `name: mydb.public.users` | **Both kept**. The qualified entry wins for `mydb.public.users`; the bare entry covers every other inner table. |
+| `name:` has 0, 2, or 4+ dot-separated segments (or any empty segment) | **Hard error** at startup. |
+| A file references an unknown source / catalog | **Warning**. The entry is kept in the registry but never matches. |
 | A file is named explicitly (`--semantics file.yaml`) and is missing `kind: semantics` | Soft skip — same as a non-semantics file in a directory scan. |
 
 The duplicate-is-error rule keeps auto-generated overlays composable:
@@ -121,7 +161,7 @@ a sibling.
 
 ---
 
-## Fallback to ctx-inline `description`
+## Fallback / precedence
 
 `data_sources[]` in `ctx.yaml` already accepts a free-text `description`
 field:
@@ -135,16 +175,23 @@ spec:
       description: "Product catalog dataset"
 ```
 
-That value is **the table-level fallback** — used when no semantics
-overlay supplies one. A semantics file's `description` always wins over
-the ctx-inline value when both are present. Column-level descriptions
-have no ctx fallback; they live only in semantics files.
+That value is the table-level **ctx-inline fallback** — used when no
+semantics overlay supplies one. Column-level descriptions have no ctx
+fallback; they live only in semantics files.
 
-The merge precedence:
+The merge precedence (most-specific wins):
 
-1. `kind: semantics` overlay (table or column)
-2. `data_sources[].description` (table-level only)
-3. None — the field is omitted from the JSON response.
+1. **Qualified semantics overlay** — `name: catalog.schema.table` (table
+   or column).
+2. **Bare semantics overlay** — `name: <source>` (table or column).
+3. **`data_sources[].description`** (table-level only).
+4. None — the field is omitted from the JSON response.
+
+Steps 1 and 2 cooperate: a qualified entry only covers what it
+addresses; the bare entry continues to apply to anything the qualified
+entry didn't touch. So writing both forms is the normal path for
+catalog-mode sources where most inner tables share a description but a
+few want their own.
 
 ---
 
@@ -210,15 +257,13 @@ present, so the wire shape stays clean for sources that opt out.
 
 ## Limitations
 
-- The current `GET /data_source` response emits **one table per data
-  source** (the source name *is* the table name). Catalog-mode sources
-  expose many tables under a single registration, but only the
-  source-level description bubbles through today. Per-table semantics
-  for catalog-mode sources is on the roadmap.
-- The same limitation applies to `skardi query --schema`: catalog-mode
-  sources (e.g. SQLite registered as a catalog) get the source-level
-  description attached to *every* inner table, since there is no
-  per-inner-table semantics yet.
+- `GET /data_source` still emits **one table per data source** (the
+  source name *is* the table name in the JSON response). Catalog-mode
+  sources expose many inner tables, but the HTTP endpoint doesn't
+  enumerate them yet — so qualified `catalog.schema.table` overlays
+  defined for inner tables won't surface on the endpoint until the
+  endpoint is extended. The CLI (`skardi query --schema --all`) does
+  enumerate inner tables and renders qualified overlays correctly today.
 - There is no agent-callable `describe` verb yet. Agents reach the
   semantics through the HTTP endpoint above; a pipeline form is a
   separate task on the roadmap.

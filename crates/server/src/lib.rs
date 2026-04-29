@@ -9,9 +9,7 @@ pub mod remote_storage;
 pub mod server;
 pub mod telemetry;
 
-// Re-export the relocated semantics module under its old path so existing
-// `crate::semantics::...` imports keep working without churning every
-// caller. The implementation lives in `crates/skardi`.
+// Re-export `skardi::semantics` so server code can use `crate::semantics::...`.
 pub use skardi::semantics;
 
 // Re-export public types for easy access
