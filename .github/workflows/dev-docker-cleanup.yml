@@ -1,0 +1,93 @@
+name: Dev Docker Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "Extended regex matching image tags to delete (e.g. '^feature-.*-test-img-.*')"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run — list matches without deleting"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    name: "Delete tags matching ${{ inputs.pattern }}"
+    runs-on: ubuntu-latest
+    env:
+      ORG: skardilabs
+      PACKAGE: skardi/skardi-server
+      PATTERN: ${{ inputs.pattern }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: List and delete matching versions
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PATTERN" ]; then
+            echo "::error::pattern input must not be empty"
+            exit 1
+          fi
+
+          PKG_ENC=$(printf '%s' "$PACKAGE" | jq -sRr @uri)
+
+          echo "Listing versions for $ORG/$PACKAGE (pattern: $PATTERN, dry_run: $DRY_RUN)"
+          gh api --paginate -H "Accept: application/vnd.github+json" \
+            "/orgs/$ORG/packages/container/$PKG_ENC/versions?per_page=100" \
+            | jq -s 'add // []' > /tmp/versions.json
+
+          total=$(jq 'length' /tmp/versions.json)
+          echo "Found $total package versions"
+
+          matched=0
+          deleted=0
+          : > /tmp/summary.txt
+
+          while IFS=$'\t' read -r id tags; do
+            [ -z "$id" ] && continue
+            matched_tag=""
+            for tag in $tags; do
+              if printf '%s' "$tag" | grep -Eq "$PATTERN"; then
+                matched_tag="$tag"
+                break
+              fi
+            done
+            [ -z "$matched_tag" ] && continue
+
+            matched=$((matched + 1))
+            echo "MATCH id=$id matched_tag=$matched_tag all_tags=[$tags]"
+            echo "- \`$matched_tag\` (version $id; tags: $tags)" >> /tmp/summary.txt
+
+            if [ "$DRY_RUN" != "true" ]; then
+              if gh api -X DELETE -H "Accept: application/vnd.github+json" \
+                "/orgs/$ORG/packages/container/$PKG_ENC/versions/$id"; then
+                deleted=$((deleted + 1))
+              else
+                echo "::warning::failed to delete version $id"
+              fi
+            fi
+          done < <(jq -r '.[] | [(.id|tostring), ((.metadata.container.tags // []) | join(" "))] | @tsv' /tmp/versions.json)
+
+          {
+            echo "### Dev Docker Cleanup"
+            echo ""
+            echo "- Package: \`ghcr.io/$ORG/$PACKAGE\`"
+            echo "- Pattern: \`$PATTERN\`"
+            echo "- Dry run: \`$DRY_RUN\`"
+            echo "- Versions scanned: $total"
+            echo "- Matched: $matched"
+            echo "- Deleted: $deleted"
+            if [ -s /tmp/summary.txt ]; then
+              echo ""
+              echo "#### Matches"
+              cat /tmp/summary.txt
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
