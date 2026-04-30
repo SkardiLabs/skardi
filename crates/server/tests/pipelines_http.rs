@@ -22,6 +22,7 @@ use tower::ServiceExt;
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::config::{CliArgs, ServerConfig};
 use skardi_server::metrics::PipelineMetrics;
+use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
 
 fn write_yaml(path: &std::path::Path, content: &str) {
@@ -99,11 +100,13 @@ spec:
         pipelines,
         jobs: HashMap::new(),
         data_sources: vec![],
+        semantics: SemanticsRegistry::default(),
         args: CliArgs {
             pipeline_path: None,
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 0,
         },
     };

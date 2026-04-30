@@ -341,6 +341,7 @@ mod tests {
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
         use crate::metrics::PipelineMetrics;
+        use crate::semantics::SemanticsRegistry;
         use crate::server::AppState;
         use datafusion::prelude::SessionContext;
         use skardi::engine::datafusion::DataFusionEngine;
@@ -351,11 +352,13 @@ mod tests {
             pipelines: Default::default(),
             jobs: Default::default(),
             data_sources: vec![],
+            semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
                 ctx_file: None,
+                semantics_path: None,
                 port: 8080,
             },
         };
@@ -382,6 +385,7 @@ mod tests {
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
         use crate::metrics::PipelineMetrics;
+        use crate::semantics::SemanticsRegistry;
         use crate::server::AppState;
         use datafusion::prelude::SessionContext;
         use skardi::engine::datafusion::DataFusionEngine;
@@ -402,11 +406,13 @@ mod tests {
             pipelines: Default::default(),
             jobs: Default::default(),
             data_sources: vec![],
+            semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
                 ctx_file: None,
+                semantics_path: None,
                 port: 8080,
             },
         };

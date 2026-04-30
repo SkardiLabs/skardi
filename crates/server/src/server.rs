@@ -30,6 +30,8 @@ use crate::pipeline_handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
     pipeline_health_check,
 };
+#[cfg(test)]
+use crate::semantics::SemanticsRegistry;
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
 /// Shared application state containing pipeline and engine
@@ -365,6 +367,7 @@ spec:
             access_mode: AccessMode::default(),
             enable_cache: false,
             hierarchy_level: Default::default(),
+            description: None,
         }];
 
         let pipeline = create_test_pipeline().await;
@@ -375,11 +378,13 @@ spec:
             pipelines,
             jobs: std::collections::HashMap::new(),
             data_sources,
+            semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
                 ctx_file: None,
+                semantics_path: None,
                 port: 8080,
             },
         };
@@ -396,11 +401,13 @@ spec:
             pipelines,
             jobs: std::collections::HashMap::new(),
             data_sources: vec![],
+            semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
                 ctx_file: None,
+                semantics_path: None,
                 port: 8080,
             },
         }

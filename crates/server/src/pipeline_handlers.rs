@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::DataSourceType;
+use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
 
 /// Request structure for pipeline execution
@@ -71,6 +72,10 @@ pub struct FieldInfo {
     pub r#type: String,
     /// Whether the field is nullable
     pub nullable: bool,
+    /// Natural-language description sourced from the loaded `kind: semantics`
+    /// overlay, if any. Omitted from the JSON response when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Table information with schema
@@ -78,6 +83,10 @@ pub struct FieldInfo {
 pub struct TableInfo {
     /// Table name (same as data source name)
     pub name: String,
+    /// Natural-language description for the table (semantics overlay first,
+    /// ctx-inline `description` second). Omitted when neither supplies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Table schema fields
     pub schema: Vec<FieldInfo>,
 }
@@ -136,7 +145,11 @@ fn create_success_response(data: Vec<Value>, rows: usize, execution_time_ms: u64
 ///
 /// Returns a vector of FieldInfo containing column name, type, and nullability.
 /// Returns an error if the table is not found or schema retrieval fails.
-async fn get_table_schema(ctx: &SessionContext, table_name: &str) -> Result<Vec<FieldInfo>> {
+async fn get_table_schema(
+    ctx: &SessionContext,
+    table_name: &str,
+    semantics: &SemanticsRegistry,
+) -> Result<Vec<FieldInfo>> {
     // Get the default catalog
     let catalog = ctx
         .catalog("datafusion")
@@ -157,7 +170,8 @@ async fn get_table_schema(ctx: &SessionContext, table_name: &str) -> Result<Vec<
     // Get the table schema
     let table_schema = table.schema();
 
-    // Convert Arrow fields to FieldInfo
+    // Convert Arrow fields to FieldInfo, attaching any column-level
+    // semantics overlay registered for this (table, column) pair.
     let fields: Vec<FieldInfo> = table_schema
         .fields()
         .iter()
@@ -165,6 +179,9 @@ async fn get_table_schema(ctx: &SessionContext, table_name: &str) -> Result<Vec<
             name: field.name().clone(),
             r#type: format!("{:?}", field.data_type()),
             nullable: field.is_nullable(),
+            description: semantics
+                .column_description(table_name, field.name())
+                .map(str::to_string),
         })
         .collect();
 
@@ -360,8 +377,9 @@ pub async fn get_pipelines_info(
 pub async fn get_data_sources(
     State(app_state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Acquire lock and extract data sources, then drop lock before async operations
-    let data_sources = {
+    // Acquire lock and extract data sources + semantics, then drop lock
+    // before async operations.
+    let (data_sources, semantics) = {
         let config = app_state.config.read().map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -372,7 +390,7 @@ pub async fn get_data_sources(
                 ),
             )
         })?;
-        config.data_sources.clone()
+        (config.data_sources.clone(), config.semantics.clone())
     };
 
     let session_ctx = app_state.engine.session_context();
@@ -420,8 +438,10 @@ pub async fn get_data_sources(
             _ => None,
         };
 
-        // Get table schema from SessionContext
-        let table_schema = match get_table_schema(session_ctx, &data_source.name).await {
+        // Get table schema from SessionContext, with column descriptions
+        // merged in from the semantics registry.
+        let table_schema = match get_table_schema(session_ctx, &data_source.name, &semantics).await
+        {
             Ok(fields) => fields,
             Err(e) => {
                 tracing::warn!(
@@ -434,9 +454,16 @@ pub async fn get_data_sources(
             }
         };
 
-        // Build table info (data source name is the table name)
+        // Build table info (data source name is the table name). The table
+        // description is the merged view: a `kind: semantics` overlay wins
+        // when present, falling back to the ctx-inline `description` field
+        // (this fallback is seeded into the registry at boot, so the
+        // single lookup here covers both cases).
         let tables = vec![TableInfo {
             name: data_source.name.clone(),
+            description: semantics
+                .table_description(&data_source.name)
+                .map(str::to_string),
             schema: table_schema,
         }];
 
@@ -875,6 +902,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 8080,
         };
 
@@ -882,6 +910,7 @@ spec:
             pipelines,
             jobs: HashMap::new(),
             data_sources,
+            semantics: SemanticsRegistry::default(),
             args,
         };
 
@@ -943,6 +972,7 @@ spec:
             access_mode: AccessMode::default(),
             enable_cache: false,
             hierarchy_level: Default::default(),
+            description: None,
         };
 
         // Create pipeline that queries the registered data source
@@ -956,6 +986,7 @@ spec:
             jobs_path: None,
             jobs_db_path: None,
             ctx_file: None,
+            semantics_path: None,
             port: 8080,
         };
 
@@ -963,6 +994,7 @@ spec:
             pipelines,
             jobs: HashMap::new(),
             data_sources: vec![data_source],
+            semantics: SemanticsRegistry::default(),
             args,
         };
 

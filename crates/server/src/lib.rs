@@ -9,6 +9,9 @@ pub mod remote_storage;
 pub mod server;
 pub mod telemetry;
 
+// Re-export `skardi::semantics` so server code can use `crate::semantics::...`.
+pub use skardi::semantics;
+
 // Re-export public types for easy access
 pub use config::{
     CliArgs, DataSource, DataSourceType, ServerConfig, load_server_config, register_data_sources,

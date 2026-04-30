@@ -132,6 +132,7 @@ Full reference:
 - **Server** — [docs/server.md](docs/server.md)
 - **Pipelines (online serving)** — [docs/pipelines.md](docs/pipelines.md)
 - **Jobs (offline batch)** — [docs/jobs.md](docs/jobs.md)
+- **Catalog semantics** — [docs/semantics.md](docs/semantics.md)
 - **Why an agent data plane** — [docs/agent_data_plane.md](docs/agent_data_plane.md)
 
 ---
@@ -170,6 +171,7 @@ The **[`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/
 ## Additional Features
 
 - **Federated queries** — JOIN across different source types. See [docs/federated-queries.md](docs/federated-queries.md).
+- **Catalog semantics** — NL descriptions on tables and columns, surfaced on the catalog endpoint so agents can pick the right tool from `GET /data_source`. See [docs/semantics.md](docs/semantics.md).
 - **Authentication** — session-based via better-auth + SQLite. See [docs/auth/](docs/auth/).
 - **ONNX inference** — inline model predictions in SQL. See [docs/onnx_predict.md](docs/onnx_predict.md).
 - **Embedding inference** — GGUF, Candle, or remote APIs. See [docs/embeddings/](docs/embeddings/).
@@ -280,7 +282,8 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [ ] MCP binding — same pipeline YAML projected to MCP tools for non-Claude hosts
 
 `6` Governance & lineage
-   - [ ] Catalog with semantics — NL `description` on catalog / table / column; an agent-callable `describe` pipeline
+   - [x] Catalog with semantics — `kind: semantics` YAML overlay attaching NL descriptions to tables / columns; supports both bare source names and fully-qualified `catalog.schema.table` paths for per-table targeting on catalog-mode sources; surfaced on `GET /data_source` for agent-side discovery
+   - [ ] Agent-callable `describe` verb — CLI / pipeline form on top of the catalog endpoint
    - [ ] Lineage capture — `agent_id`, `session_id`, `tool_call_id`, `timestamp` on writes; queryable from metadata tables
    - [ ] Agent identity passthrough — any binding injects client identity into a SQL context var pipelines can read
    - [ ] Snapshot-as-branch / agent checkpoints — Iceberg / Lance-backed; `git checkout`-like semantics for destructive agent experiments

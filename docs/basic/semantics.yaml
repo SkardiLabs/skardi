@@ -1,0 +1,19 @@
+kind: semantics
+
+metadata:
+  name: basic-semantics
+  version: 1.0.0
+
+spec:
+  sources:
+    - name: products
+      description: "Product catalog dataset with comprehensive product information including pricing, inventory, and categorization. One row per SKU."
+      columns:
+        - name: id
+          description: "Stable internal SKU; primary key."
+        - name: brand
+          description: "Manufacturer / brand name as it appears on product packaging."
+        - name: price
+          description: "Retail price in USD."
+        - name: category
+          description: "Top-level product category (e.g. Electronics, Audio)."
