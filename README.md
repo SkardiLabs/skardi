@@ -217,7 +217,7 @@ The fastest cloud path is the [Sealos](https://sealos.io) template in **[skardi-
 
 ## Cloud (Railway)
 
-A one-click [Railway](https://railway.com) template lives in [`railway/`](railway/) — Skardi v0.3.0 with the simple-backend demo (SQLite + four CRUD pipelines) on a persistent volume. See [railway/README.md](railway/README.md) for deploy and submission steps.
+A one-click [Railway](https://railway.com) template for Skardi v0.3.0 lives in **[SkardiLabs/skardi-railway](https://github.com/SkardiLabs/skardi-railway)** — simple-backend demo (SQLite + four CRUD pipelines) on a persistent volume.
 
 ## Building from Source
 
