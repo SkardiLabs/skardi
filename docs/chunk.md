@@ -1,14 +1,14 @@
 # Text Chunking (`chunk`)
 
-> **Requires `--features chunking`** — build with:
+> **Build flags:**
 > ```bash
-> cargo build --release -p skardi-server --features chunking
+> cargo build --release -p skardi-server --features chunking   # just chunk()
+> cargo build --release -p skardi-server --features rag        # chunk() + embedding UDFs
 > ```
 >
-> To chain chunking with inline embeddings in a single pipeline, combine features:
-> ```bash
-> cargo build --release -p skardi-server --features "chunking,embedding"
-> ```
+> The `rag` umbrella feature bundles `embedding` and `chunking` so the
+> chunk → embed → write loop ships in one flag. The pre-built Docker image
+> `ghcr.io/skardilabs/skardi/skardi-server-rag:<tag>` includes both.
 
 `chunk` is a DataFusion scalar UDF that splits text into smaller pieces directly inside SQL, so document ingestion can chunk inline alongside embedding and writing — no out-of-band Python step. It wraps the [`text-splitter`](https://crates.io/crates/text-splitter) crate.
 
@@ -75,7 +75,7 @@ FROM (
 );
 ```
 
-Requires the `chunking` and `embedding` (or `candle`) features.
+Requires `--features rag` (or `--features "chunking,candle"` if you want to pick à la carte).
 
 ### Keep chunks as a list column
 

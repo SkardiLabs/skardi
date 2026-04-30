@@ -1,0 +1,50 @@
+kind: pipeline
+
+metadata:
+  name: "wiki-bulk-create"
+  version: "1.0.0"
+  description: >
+    Create many wiki pages from one long markdown document by chunking it
+    inline. Each chunk becomes its own page: slug = '{slug_prefix}/p<NNN>',
+    title = '{title} #<N>', page_type = {page_type}, content = the chunk
+    body, embedding = vec_to_binary(candle(chunk_body)). The AFTER INSERT
+    trigger fans every row out to wiki_pages_fts and wiki_pages_vec, so an
+    N-chunk doc yields N searchable pages in one statement.
+
+    Per-page edits remain the responsibility of `skardi write` /
+    `skardi rm` (i.e. wiki-create / wiki-delete). Bulk-create is for the
+    seeding / long-document path — same flow seed.py uses today, but in
+    SQL with no Python.
+
+    The synthesized projection is wrapped in `SELECT ... FROM (...) AS t`
+    so DataFusion's INSERT planner does not validate row width against
+    the inner subquery and drop vec_to_binary(candle(...)).
+
+# Parameters:
+#   {slug_prefix} - Slug prefix, e.g. 'alice/chap-1' (chunks become .../p001, /p002, ...)
+#   {title}       - Title prefix; chunk index suffixed as ' #N'
+#   {page_type}   - Page-type tag for the bulk run (e.g. 'alice', 'rfc', 'summary')
+#   {content}     - Markdown body to chunk
+#   {chunk_size}  - Target max chunk length in characters
+#   {overlap}     - Characters of overlap between adjacent chunks
+
+spec:
+  query: |
+    INSERT INTO wiki.main.wiki_pages (slug, title, page_type, content, embedding, updated_at)
+    SELECT
+      slug, title, page_type, content,
+      vec_to_binary(candle('models/generated/bge-small-en-v1.5', content)),
+      CAST(now() AS VARCHAR)
+    FROM (
+      SELECT
+        {slug_prefix} || '/p' || lpad(CAST(rn AS VARCHAR), 3, '0') AS slug,
+        {title} || ' #' || CAST(rn AS VARCHAR)                    AS title,
+        {page_type}                                                AS page_type,
+        chunk_text                                                 AS content
+      FROM (
+        SELECT chunk_text, ROW_NUMBER() OVER (ORDER BY 1) AS rn
+        FROM (
+          SELECT UNNEST(chunk('markdown', {content}, {chunk_size}, {overlap})) AS chunk_text
+        ) c
+      ) r
+    ) AS t

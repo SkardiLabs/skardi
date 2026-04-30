@@ -581,4 +581,51 @@ mod tests {
             "both source rows should appear in the expanded output"
         );
     }
+
+    /// Smoke-tests the exact SQL pattern the demo pipelines emit:
+    /// `ROW_NUMBER() OVER (ORDER BY 1)` over `UNNEST(chunk(...))`.
+    /// If this stops working, the demos break too — fail loudly here first.
+    #[tokio::test]
+    async fn sql_row_number_over_unnest_chunk() {
+        let ctx = build_ctx();
+        let body = "a".repeat(250);
+        let sql = format!(
+            "SELECT ROW_NUMBER() OVER (ORDER BY 1) AS rn, chunk_text \
+             FROM (SELECT UNNEST(chunk('character', '{body}', 100)) AS chunk_text)"
+        );
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total >= 3, "expected ≥3 rows, got {total}");
+    }
+
+    /// Smoke-tests slug synthesis used by the LLM Wiki bulk-create demo:
+    /// `prefix || '/p' || lpad(CAST(rn AS VARCHAR), 3, '0')`.
+    #[tokio::test]
+    async fn sql_slug_synthesis_over_chunked_text() {
+        let ctx = build_ctx();
+        let body = "a".repeat(220);
+        let sql = format!(
+            "SELECT \
+               'alice/chap1' || '/p' || lpad(CAST(rn AS VARCHAR), 3, '0') AS slug, \
+               chunk_text \
+             FROM ( \
+               SELECT chunk_text, ROW_NUMBER() OVER (ORDER BY 1) AS rn \
+               FROM (SELECT UNNEST(chunk('character', '{body}', 100)) AS chunk_text) \
+             )"
+        );
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total >= 3, "expected ≥3 rows, got {total}");
+
+        let mut slugs: Vec<String> = vec![];
+        for b in &batches {
+            let s = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..s.len() {
+                slugs.push(s.value(i).to_string());
+            }
+        }
+        slugs.sort();
+        assert!(slugs[0].starts_with("alice/chap1/p0"), "got {slugs:?}");
+        assert!(slugs.iter().all(|s| s.starts_with("alice/chap1/p")));
+    }
 }

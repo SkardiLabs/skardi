@@ -21,6 +21,8 @@ remote-embed = ["dep:reqwest"]
 gguf = ["dep:llama-cpp-4"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 chunking = ["dep:text-splitter"]
+# RAG umbrella: chunk → embed → write loop in one feature.
+rag = ["embedding", "chunking"]
 
 [dependencies]
 # engine

@@ -153,6 +153,45 @@ VALUES (
 
 One row, one write — immediately searchable by both `pg_fts` and `pg_knn`.
 
+### Long-form ingestion: chunk → embed → write
+
+`/ingest` above expects each `content` to already be chunk-sized. For real
+documents (a wiki page, a chapter, a long support thread) Skardi can do the
+chunking inline — `chunk('markdown', ...)` splits the body, `UNNEST` expands
+each chunk into its own row, and `candle()` embeds every chunk. One request,
+N rows, all atomically searchable.
+
+```bash
+curl -X POST http://localhost:8080/ingest-chunked/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "doc_id": 100,
+    "content": "# Vector Search\n\nVector databases index high-dimensional embeddings. They use approximate nearest-neighbour algorithms — HNSW, IVF, and product quantisation are common — to keep recall high while bounding latency.\n\n# Hybrid Search\n\nHybrid search merges semantic similarity with keyword relevance. Reciprocal Rank Fusion (RRF) is a common merge: each candidate gets a score of `weight / (60 + rank)` from each ranker, and the sums are sorted.\n\n# Practical Notes\n\nChunk size and overlap matter. Too small and chunks lose context; too large and precision drops. Markdown splitters preserve heading boundaries so each chunk stays semantically coherent.",
+    "chunk_size": 250,
+    "overlap": 50
+  }' | jq .
+```
+
+Server SQL (see [server/pipelines/ingest_chunked.yaml](server/pipelines/ingest_chunked.yaml)):
+
+```sql
+INSERT INTO documents (id, content, embedding)
+SELECT
+  {doc_id} * 1000 + (ROW_NUMBER() OVER (ORDER BY 1) - 1) AS id,
+  chunk_text                                              AS content,
+  candle('models/generated/bge-small-en-v1.5', chunk_text) AS embedding
+FROM (
+  SELECT UNNEST(chunk('markdown', {content}, {chunk_size}, {overlap})) AS chunk_text
+) c
+```
+
+Synthesised ids are `doc_id * 1000 + chunk_idx` (0-based), so doc 100
+above becomes rows `100000, 100001, 100002 …`. Pick `doc_id`s that don't
+collide with the single-row `/ingest` path.
+
+Requires `--features rag` on `skardi-server` (the umbrella that bundles
+`embedding` + `chunking`).
+
 ---
 
 ## Read Path: Searching
@@ -246,6 +285,7 @@ lookup, no id-type conversion.
 | Pipeline | Endpoint | Description |
 |---|---|---|
 | [server/pipelines/ingest.yaml](server/pipelines/ingest.yaml) | `/ingest/execute` | Single INSERT writes content + candle embedding into `documents` |
+| [server/pipelines/ingest_chunked.yaml](server/pipelines/ingest_chunked.yaml) | `/ingest-chunked/execute` | Inline `chunk('markdown', …)` + `candle(…)` per chunk; one row per chunk |
 | [server/pipelines/search_vector.yaml](server/pipelines/search_vector.yaml) | `/search-vector/execute` | Semantic search via `pg_knn` |
 | [server/pipelines/search_fulltext.yaml](server/pipelines/search_fulltext.yaml) | `/search-fulltext/execute` | Keyword search via `pg_fts` over `documents.content` |
 | [server/pipelines/search_hybrid.yaml](server/pipelines/search_hybrid.yaml) | `/search-hybrid/execute` | RRF hybrid search combining `pg_knn` + `pg_fts` |
@@ -394,6 +434,48 @@ document searchable by both `sqlite_fts` and `sqlite_knn`.
 > ignoring the intermediate projection that adds
 > `vec_to_binary(candle(...))`. The SELECT-wrapper keeps the subquery's own
 > schema in scope so the projection lands the row at full width.
+
+### 6b. `ingest-doc` — write one *long* document, chunked inline
+
+`ingest` above expects content that's already chunk-sized. For a real
+document, `ingest-doc` chunks it inline with the markdown splitter,
+embeds each chunk with `candle()`, and writes one row per chunk — all in
+one statement, all going through the same `AFTER INSERT` trigger:
+
+```bash
+skardi ingest-doc 100 "# Vector Search
+
+Vector databases index high-dimensional embeddings. They use approximate
+nearest-neighbour algorithms — HNSW, IVF, and product quantisation are
+common.
+
+# Hybrid Search
+
+Hybrid search merges semantic similarity with keyword relevance.
+Reciprocal Rank Fusion (RRF) is a common merge.
+
+# Practical Notes
+
+Chunk size and overlap matter. Too small and chunks lose context; too
+large and precision drops."
+```
+
+Override the chunk shape on the same line:
+
+```bash
+skardi ingest-doc 101 "$(cat my-long-doc.md)" \
+  --chunk_size=400 --overlap=80
+```
+
+Synthesised ids are `doc_id * 1000 + chunk_idx` (0-based), so the
+example above becomes ids `100000, 100001, 100002, …`. Pick `doc_id`s
+that don't collide with single-row `ingest` calls.
+
+Install the CLI with the RAG umbrella (bundles embedding UDFs + `chunk`):
+
+```bash
+cargo install --locked --path crates/cli --features rag
+```
 
 ### 7. `grep` — hybrid search (RRF over FTS + vector)
 

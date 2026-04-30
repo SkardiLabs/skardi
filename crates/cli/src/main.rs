@@ -29,6 +29,8 @@ use pipeline::{
 use serde::Deserialize;
 #[cfg(feature = "candle")]
 use skardi::model::CandleModelRegistry;
+#[cfg(feature = "chunking")]
+use skardi::model::ChunkingRegistry;
 #[cfg(feature = "gguf")]
 use skardi::model::GgufModelRegistry;
 #[cfg(feature = "onnx")]
@@ -527,6 +529,11 @@ fn new_session_context() -> (SessionContext, DatasetRegistry) {
     {
         let registry = Arc::new(CandleModelRegistry::new());
         registry.register_candle_udf(&mut ctx);
+    }
+    #[cfg(feature = "chunking")]
+    {
+        let registry = Arc::new(ChunkingRegistry::new());
+        registry.register_chunk_udf(&mut ctx);
     }
 
     (ctx, dataset_registry)

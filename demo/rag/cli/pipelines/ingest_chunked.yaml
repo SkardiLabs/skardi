@@ -1,0 +1,43 @@
+kind: pipeline
+
+metadata:
+  name: "ingest-chunked"
+  version: "1.0.0"
+  description: >
+    Ingest one long document by splitting it into chunks inline with
+    chunk('markdown', ...), embedding each chunk with candle, and writing
+    one row per chunk into rag.main.documents. The AFTER INSERT trigger
+    fans every new row out to documents_fts and documents_vec, so an
+    N-chunk document yields N rows that are immediately searchable via
+    sqlite_fts and sqlite_knn.
+
+    Synthesized chunk ids: `id = doc_id * 1000 + chunk_idx` (0-based), so
+    pick `doc_id` values that don't collide with the single-row `ingest`
+    pipeline. ROW_NUMBER drives the chunk_idx; chunk order matches
+    text-splitter's emission order.
+
+    The synthesized projection is wrapped in `SELECT ... FROM (...) AS t`
+    rather than going straight into INSERT — same reason as the simple
+    ingest path: DataFusion's INSERT planner otherwise validates row
+    width against the inner subquery and drops the
+    vec_to_binary(candle(...)) column from the projection.
+
+# Parameters:
+#   {doc_id}     - Source-doc id, used as a prefix for synthesized chunk ids
+#   {content}    - Full document text (any length); chunked inline
+#   {chunk_size} - Target max chunk length in characters
+#   {overlap}    - Characters of overlap between adjacent chunks
+
+spec:
+  query: |
+    INSERT INTO rag.main.documents (id, content, embedding)
+    SELECT id, content,
+           vec_to_binary(candle('models/generated/bge-small-en-v1.5', content))
+    FROM (
+      SELECT
+        {doc_id} * 1000 + (ROW_NUMBER() OVER (ORDER BY 1) - 1) AS id,
+        chunk_text                                              AS content
+      FROM (
+        SELECT UNNEST(chunk('markdown', {content}, {chunk_size}, {overlap})) AS chunk_text
+      ) c
+    ) AS t

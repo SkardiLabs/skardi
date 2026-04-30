@@ -151,14 +151,14 @@ jobs:
             suffix: ""
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - variant: embedding
-            features: "embedding"
-            suffix: "-embedding"
+          - variant: rag
+            features: "rag"
+            suffix: "-rag"
             platform: linux/amd64
             runner: ubuntu-latest
-          - variant: embedding
-            features: "embedding"
-            suffix: "-embedding"
+          - variant: rag
+            features: "rag"
+            suffix: "-rag"
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -221,8 +221,8 @@ jobs:
         include:
           - variant: default
             suffix: ""
-          - variant: embedding
-            suffix: "-embedding"
+          - variant: rag
+            suffix: "-rag"
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3

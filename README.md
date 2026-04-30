@@ -197,10 +197,11 @@ The **[`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/
 ```bash
 # Build
 docker build -t skardi .
-docker build -t skardi --build-arg FEATURES=embedding .
+docker build -t skardi --build-arg FEATURES=rag .   # adds embedding + chunk UDFs
 
 # Or pull pre-built
 docker pull ghcr.io/skardilabs/skardi/skardi-server:latest
+docker pull ghcr.io/skardilabs/skardi/skardi-server-rag:latest   # embedding + chunk UDFs
 
 # Run
 docker run --rm \
@@ -226,7 +227,10 @@ cd skardi
 cargo build --release -p skardi-cli
 cargo build --release -p skardi-server
 
-# With embedding support (ONNX, GGUF, Candle, remote embed)
+# With the full RAG kit (embedding UDFs + chunk UDF)
+cargo build --release -p skardi-server --features rag
+
+# Or just the embedding UDFs (ONNX, GGUF, Candle, remote embed) without chunking
 cargo build --release -p skardi-server --features embedding
 ```
 

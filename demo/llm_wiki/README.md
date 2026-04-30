@@ -253,6 +253,37 @@ create and update are separate endpoints. The agent pattern is: try
 `wiki-update` first; if it reports zero rows affected, fall back to
 `wiki-create`.
 
+### Bulk-create from a long document — `wiki-bulk-create`
+
+`wiki-create` keeps one page = one row, which is the wiki's editing model.
+But for **seeding** the wiki — turning a long markdown doc into many pages
+in one shot — `wiki-bulk-create` chunks the body inline with
+[`chunk('markdown', …)`](../../docs/chunk.md), embeds each chunk with
+`candle()`, and writes one page per chunk:
+
+```bash
+curl -X POST http://localhost:8080/wiki-bulk-create/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "slug_prefix": "rfc/9110",
+    "title": "RFC 9110: HTTP Semantics",
+    "page_type": "rfc",
+    "content": "<the full RFC body in markdown>",
+    "chunk_size": 800,
+    "overlap": 150
+  }' | jq .
+```
+
+Synthesised slugs follow `{slug_prefix}/p<NNN>` (`rfc/9110/p001`,
+`/p002`, …) and titles get a `#N` suffix so each chunk is a distinct page
+visible to `wiki-list`, `wiki-search-hybrid`, etc. Pages later edited
+via `wiki-update` keep their slug — the bulk-create path is a
+one-way seeder, not a re-runnable upsert.
+
+Requires `--features rag` on `skardi-server` (the umbrella that bundles
+`embedding` + `chunking`). See
+[server/pipelines/bulk_create.yaml](server/pipelines/bulk_create.yaml).
+
 ---
 
 ## Read Path: Agent Retrieval Loop
@@ -334,6 +365,7 @@ curl -X POST http://localhost:8080/wiki-log-append/execute \
 |---|---|---|
 | [server/pipelines/create.yaml](server/pipelines/create.yaml) | `/wiki-create/execute` | INSERT a new page; re-embeds with `candle()` inline |
 | [server/pipelines/update.yaml](server/pipelines/update.yaml) | `/wiki-update/execute` | UPDATE an existing page by slug; re-embeds with `candle()` inline |
+| [server/pipelines/bulk_create.yaml](server/pipelines/bulk_create.yaml) | `/wiki-bulk-create/execute` | Chunk a long doc with `chunk('markdown', …)`, embed each chunk with `candle()`, write one page per chunk |
 | [server/pipelines/get.yaml](server/pipelines/get.yaml) | `/wiki-get/execute` | Fetch one page by slug |
 | [server/pipelines/search_hybrid.yaml](server/pipelines/search_hybrid.yaml) | `/wiki-search-hybrid/execute` | RRF hybrid search over `pg_knn` + `pg_fts` |
 | [server/pipelines/list.yaml](server/pipelines/list.yaml) | `/wiki-list/execute` | Filter pages by `page_type` + slug prefix, newest first |
@@ -551,6 +583,53 @@ mirrors the row to `wiki_pages_fts` and `wiki_pages_vec` atomically.
 > width against it, ignoring the intermediate projection that adds
 > `vec_to_binary(candle(...))`. The SELECT-wrapper keeps the subquery's own
 > schema in scope so the projection lands the row at full width.
+
+### 7b. `bulk-write` — seed many pages from one long markdown doc
+
+`write` is for hand-curated pages. To seed a long document — a chapter,
+an RFC, a transcript — `bulk-write` chunks the body inline with
+[`chunk('markdown', …)`](../../docs/chunk.md), embeds each chunk with
+`candle()`, and inserts one page per chunk. Each call goes through the
+same `AFTER INSERT` trigger as `write`, so the resulting pages are
+immediately searchable via `skardi grep`.
+
+```bash
+skardi bulk-write \
+  --slug_prefix=rfc/9110 \
+  --title="RFC 9110: HTTP Semantics" \
+  --page_type=rfc \
+  --content="$(cat rfc9110.md)"
+```
+
+Override the chunk shape on the same line:
+
+```bash
+skardi bulk-write \
+  --slug_prefix=alice/ch1 \
+  --title="Alice in Wonderland — Chapter 1" \
+  --page_type=alice \
+  --content="$(cat data/test_corpus/alice_sample.md)" \
+  --chunk_size=400 --overlap=80
+```
+
+Synthesised slugs follow `{slug_prefix}/p<NNN>` (`rfc/9110/p001`,
+`/p002`, …) and titles get a `#N` suffix so each chunk is a distinct
+page visible to `skardi ls` and `skardi grep`. Per-page edits stay on
+`rm` + `write` (or direct UPDATE against SQLite) — `bulk-write` is a
+one-shot seeder, not a re-runnable upsert. Re-running it on the same
+slug prefix will fail on the `UNIQUE(slug)` constraint.
+
+This is the same flow [seed.py](seed.py) implements in Python today,
+but in pure SQL: `chunk('markdown', body, ...)` replaces the manual
+paragraph splitter and `candle()` replaces the Python embedding step.
+Seeding a fresh corpus needs only `setup.py` + `bulk-write` calls —
+no Python embedding loop.
+
+Install the CLI with the RAG umbrella (bundles embedding UDFs + `chunk`):
+
+```bash
+cargo install --locked --path crates/cli --features rag
+```
 
 ### 8. Edit an existing page (`rm` + `write`)
 

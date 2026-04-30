@@ -49,3 +49,10 @@ spec:
     defaults:
       page_type: entity
     description: Create a new wiki page (re-embeds content inline); use --slug --title --content
+  bulk-write:
+    pipeline: wiki-bulk-create
+    defaults:
+      chunk_size: '800'
+      overlap: '150'
+      page_type: entity
+    description: Chunk a long markdown doc into many pages (slug_prefix/pNNN); use --slug_prefix --title --content [--page_type --chunk_size --overlap]
