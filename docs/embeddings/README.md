@@ -40,6 +40,24 @@ Quick rule of thumb:
 
 The shared corpus means you can run all three demos against the same source data and compare results side by side.
 
+## Inline Ingestion: Chunk → Embed → Write
+
+The demos above pre-embed documents via Python because the source corpus is small and pre-chunked. For real ingest where each document is too large to embed as a single vector, combine [`chunk()`](../chunk.md) with the embedding UDF and skip Python entirely:
+
+```sql
+INSERT INTO doc_chunks
+SELECT
+  doc_id,
+  chunk_text,
+  candle('models/bge-small-en-v1.5', chunk_text) AS embedding
+FROM (
+  SELECT doc_id, UNNEST(chunk('markdown', body, 1000, 200)) AS chunk_text
+  FROM raw_docs
+);
+```
+
+Build with both features enabled: `--features "chunking,embedding"`. See [docs/chunk.md](../chunk.md) for full `chunk()` semantics, supported modes, and overlap behaviour.
+
 ## Pipeline Shape
 
 Every backend uses the same parameter shape so pipelines are interchangeable:

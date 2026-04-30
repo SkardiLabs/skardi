@@ -260,7 +260,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [x] Hybrid search — RRF merge of FTS + KNN in plain SQL
    - [x] Inline embeddings — `candle()` UDF (GGUF / Candle / remote embed APIs) runs directly inside SQL; content + vector stay on the same row atomically
    - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
-   - [ ] Chunking UDF — character / token / markdown / code splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL
+   - [x] Chunking UDF — `chunk()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
    - [ ] Memory primitive — hybrid access + TTL + provenance + consolidation collapsed into one declarative macro
 
 `3` Online serving (pipelines)
@@ -303,6 +303,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 - **Vector search** — native KNN via Lance, `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), SeekDB HNSW.
 - **Full-text search** — Lance BM25 inverted indexes, `pg_fts`, `sqlite_fts`, SeekDB native FULLTEXT.
 - **Inline embeddings** — `candle()` UDF (GGUF / Candle / remote embed APIs) directly inside SQL, so content + vector stay on the same row atomically.
+- **Inline chunking** — `chunk()` UDF (character / markdown splitters via [`text-splitter`](https://crates.io/crates/text-splitter)) so RAG ingest stays a single SQL statement: chunk → embed → write ([docs](docs/chunk.md)).
 - **ONNX inference** — `onnx_predict` UDF for inline model predictions in SQL.
 - **Hybrid search** — RRF merge of FTS + KNN in plain SQL (see [llm_wiki demo](demo/llm_wiki/)).
 

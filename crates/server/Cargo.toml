@@ -19,6 +19,7 @@ onnx = ["skardi/onnx"]
 embedding = ["candle", "gguf", "onnx", "remote-embed"]
 remote-embed = ["skardi/remote-embed"]
 gguf = ["skardi/gguf"]
+chunking = ["skardi/chunking"]
 
 [dependencies]
 better-auth = { workspace = true }
