@@ -137,6 +137,8 @@ impl ScalarUDFImpl for ChunkingUDF {
         } else {
             0
         };
+        // text-splitter's ChunkConfig::with_overlap also rejects this; the explicit
+        // check exists so the error names both values instead of a generic message.
         if overlap >= size {
             return Err(DataFusionError::Execution(format!(
                 "chunk: 'overlap' ({overlap}) must be strictly less than 'size' ({size})"
@@ -178,19 +180,9 @@ fn read_scalar_string(arg: &ColumnarValue, name: &str) -> DfResult<String> {
         ColumnarValue::Scalar(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => Err(
             DataFusionError::Execution(format!("chunk: '{name}' argument must not be null")),
         ),
-        ColumnarValue::Array(arr) => {
-            let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "chunk: '{name}' argument must be a Utf8 literal"
-                ))
-            })?;
-            if str_arr.is_empty() || str_arr.is_null(0) {
-                return Err(DataFusionError::Execution(format!(
-                    "chunk: '{name}' argument must not be null"
-                )));
-            }
-            Ok(str_arr.value(0).to_string())
-        }
+        ColumnarValue::Array(_) => Err(DataFusionError::Execution(format!(
+            "chunk: '{name}' must be a literal, not a column"
+        ))),
         _ => Err(DataFusionError::Execution(format!(
             "chunk: '{name}' argument must be a Utf8 literal"
         ))),
@@ -223,7 +215,7 @@ fn read_scalar_usize(arg: &ColumnarValue, name: &str) -> DfResult<usize> {
     Ok(n as usize)
 }
 
-fn read_text_column(arg: &ColumnarValue, name: &str) -> DfResult<Vec<Option<String>>> {
+fn read_text_column<'a>(arg: &'a ColumnarValue, name: &str) -> DfResult<Vec<Option<&'a str>>> {
     match arg {
         ColumnarValue::Array(arr) => {
             let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
@@ -234,13 +226,13 @@ fn read_text_column(arg: &ColumnarValue, name: &str) -> DfResult<Vec<Option<Stri
                     if str_arr.is_null(i) {
                         None
                     } else {
-                        Some(str_arr.value(i).to_string())
+                        Some(str_arr.value(i))
                     }
                 })
                 .collect())
         }
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(vec![Some(s.clone())]),
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(vec![Some(s.as_str())]),
         ColumnarValue::Scalar(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {
             Ok(vec![None])
         }
@@ -261,16 +253,16 @@ fn build_config(size: usize, overlap: usize) -> DfResult<ChunkConfig<text_splitt
 }
 
 /// Build a `ListArray<Utf8>` by applying `split` to each non-null row.
-fn build_list_array<'a, F, I>(texts: &'a [Option<String>], mut split: F) -> ArrayRef
+fn build_list_array<'t, F, I>(texts: &[Option<&'t str>], mut split: F) -> ArrayRef
 where
-    F: FnMut(&'a str) -> I,
-    I: Iterator<Item = &'a str>,
+    F: FnMut(&'t str) -> I,
+    I: Iterator<Item = &'t str>,
 {
     let mut builder = ListBuilder::new(StringBuilder::new());
     for maybe_text in texts {
         match maybe_text {
             Some(text) => {
-                for chunk in split(text.as_str()) {
+                for chunk in split(text) {
                     builder.values().append_value(chunk);
                 }
                 builder.append(true);
@@ -398,6 +390,35 @@ mod tests {
     }
 
     #[test]
+    fn character_mode_counts_chars_not_bytes() {
+        // Each "日" is 3 bytes but 1 char. Size=20 chars must hold for char count,
+        // not byte count — a byte-based splitter would emit chunks well under 20 chars.
+        let text = "日本語段落。".repeat(50);
+        let result = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(text.clone()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(20))),
+            ]))
+            .unwrap();
+        let arr = match result {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        let chunks = list_at(list, 0);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(
+                c.chars().count() <= 20,
+                "chunk exceeds 20 chars: {} chars in {c:?}",
+                c.chars().count()
+            );
+        }
+        assert_eq!(chunks.concat(), text, "chunks should reconstruct input");
+    }
+
+    #[test]
     fn array_input_chunks_per_row() {
         let texts = StringArray::from(vec![Some("a".repeat(250)), Some("b".repeat(50)), None]);
         let result = udf()
@@ -446,6 +467,25 @@ mod tests {
     }
 
     #[test]
+    fn array_mode_argument_rejected() {
+        // `mode` must be a literal — passing a column (Array) should error,
+        // not silently use row 0.
+        let modes = StringArray::from(vec!["character", "markdown"]);
+        let err = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Array(Arc::new(modes)),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("hello".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be a literal, not a column"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn wrong_arity_errors() {
         let err = udf()
             .invoke_with_args(make_args(vec![
@@ -465,7 +505,6 @@ mod tests {
     use arrow::datatypes::Schema;
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::FunctionRegistry;
-    use datafusion::prelude::SessionContext;
 
     fn build_ctx() -> SessionContext {
         let mut ctx = SessionContext::new();
