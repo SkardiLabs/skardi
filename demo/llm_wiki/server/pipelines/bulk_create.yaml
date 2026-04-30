@@ -1,0 +1,39 @@
+kind: pipeline
+
+metadata:
+  name: "wiki-bulk-create"
+  version: "1.0.0"
+  description: >
+    Create many wiki pages from one long markdown document by chunking it
+    inline. Each chunk becomes its own page: slug = '{slug_prefix}/p<NNN>',
+    title = '{title} #<N>', page_type = {page_type}, content = the chunk
+    body, embedding = candle(chunk_body). One INSERT writes N rows; pg_fts
+    and pg_knn are populated atomically by the same row.
+
+    Per-page edits remain the responsibility of the wiki-create / wiki-update
+    endpoints. Bulk-create is for the seeding / long-document path.
+
+# Parameters:
+#   {slug_prefix} - Prefix for synthesized slugs, e.g. "alice/chap-1"
+#   {title}       - Title prefix; chunk index suffixed as " #N"
+#   {page_type}   - One of entity | concept | summary | index | schema | <book-tag>
+#   {content}     - Markdown body to chunk
+#   {chunk_size}  - Target max chunk length in characters
+#   {overlap}     - Characters of overlap between adjacent chunks
+
+spec:
+  query: |
+    INSERT INTO wikidb.public.wiki_pages (slug, title, page_type, content, embedding, updated_at)
+    SELECT
+      {slug_prefix} || '/p' || lpad(CAST(rn AS VARCHAR), 3, '0') AS slug,
+      {title} || ' #' || CAST(rn AS VARCHAR)                    AS title,
+      {page_type}                                                AS page_type,
+      chunk_text                                                 AS content,
+      candle('models/generated/bge-small-en-v1.5', chunk_text)   AS embedding,
+      now()                                                      AS updated_at
+    FROM (
+      SELECT chunk_text, ROW_NUMBER() OVER (ORDER BY 1) AS rn
+      FROM (
+        SELECT UNNEST(chunk('markdown', {content}, {chunk_size}, {overlap})) AS chunk_text
+      ) c
+    ) t

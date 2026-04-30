@@ -1,5 +1,7 @@
 #[cfg(feature = "candle")]
 pub mod candle;
+#[cfg(feature = "chunking")]
+pub mod chunking;
 #[cfg(feature = "onnx")]
 pub mod converter;
 #[cfg(feature = "gguf")]
@@ -13,6 +15,8 @@ pub mod remote_embed;
 // Re-export for convenience
 #[cfg(feature = "candle")]
 pub use candle::CandleModelRegistry;
+#[cfg(feature = "chunking")]
+pub use chunking::ChunkingRegistry;
 #[cfg(feature = "gguf")]
 pub use gguf::GgufModelRegistry;
 #[cfg(feature = "onnx")]

@@ -20,6 +20,9 @@ embedding = ["onnx", "candle", "gguf", "remote-embed"]
 remote-embed = ["dep:reqwest"]
 gguf = ["dep:llama-cpp-4"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
+chunking = ["dep:text-splitter"]
+# RAG umbrella: chunk → embed → write loop in one feature.
+rag = ["embedding", "chunking"]
 
 [dependencies]
 # engine
@@ -47,6 +50,7 @@ candle-core = { version = "0.8", optional = true }
 candle-nn = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+text-splitter = { version = "0.30", features = ["markdown"], optional = true }
 # sources
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }

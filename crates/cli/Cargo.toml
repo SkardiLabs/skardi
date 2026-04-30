@@ -13,12 +13,15 @@ name = "skardi"
 path = "src/main.rs"
 
 [features]
-default = ["candle", "gguf", "onnx", "remote-embed"]
+default = ["candle", "gguf", "onnx", "remote-embed", "chunking"]
 candle = ["skardi/candle"]
 gguf = ["skardi/gguf"]
 onnx = ["skardi/onnx"]
 remote-embed = ["skardi/remote-embed"]
 embedding = ["skardi/embedding"]
+chunking = ["skardi/chunking"]
+# RAG umbrella: chunk → embed → write loop in one feature.
+rag = ["skardi/rag"]
 
 [dependencies]
 anyhow = { workspace = true }

@@ -378,6 +378,9 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register candle UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "candle")]
     register_candle_udf(&mut session_ctx);
+    // Register chunk UDF (text-splitter wrapper for inline ingestion)
+    #[cfg(feature = "chunking")]
+    register_chunk_udf(&mut session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
@@ -615,6 +618,20 @@ pub fn register_gguf_udf(ctx: &mut SessionContext) {
 pub fn register_candle_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::CandleModelRegistry::new());
     registry.register_candle_udf(ctx);
+}
+
+/// Register the `chunk` UDF for inline text chunking.
+///
+/// SQL:
+///   chunk('character', text_col, 1000)
+///   chunk('character', text_col, 1000, 200)
+///   chunk('markdown',  text_col, 1000, 200)
+///
+/// Returns `List<Utf8>`; combine with `UNNEST(...)` to expand into rows.
+#[cfg(feature = "chunking")]
+pub fn register_chunk_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::ChunkingRegistry::new());
+    registry.register_chunk_udf(ctx);
 }
 
 /// Load context configuration from YAML file

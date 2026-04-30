@@ -197,10 +197,11 @@ The **[`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/
 ```bash
 # Build
 docker build -t skardi .
-docker build -t skardi --build-arg FEATURES=embedding .
+docker build -t skardi --build-arg FEATURES=rag .   # adds embedding + chunk UDFs
 
 # Or pull pre-built
 docker pull ghcr.io/skardilabs/skardi/skardi-server:latest
+docker pull ghcr.io/skardilabs/skardi/skardi-server-rag:latest   # embedding + chunk UDFs
 
 # Run
 docker run --rm \
@@ -226,7 +227,10 @@ cd skardi
 cargo build --release -p skardi-cli
 cargo build --release -p skardi-server
 
-# With embedding support (ONNX, GGUF, Candle, remote embed)
+# With the full RAG kit (embedding UDFs + chunk UDF)
+cargo build --release -p skardi-server --features rag
+
+# Or just the embedding UDFs (ONNX, GGUF, Candle, remote embed) without chunking
 cargo build --release -p skardi-server --features embedding
 ```
 
@@ -260,7 +264,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [x] Hybrid search — RRF merge of FTS + KNN in plain SQL
    - [x] Inline embeddings — `candle()` UDF (GGUF / Candle / remote embed APIs) runs directly inside SQL; content + vector stay on the same row atomically
    - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
-   - [ ] Chunking UDF — character / token / markdown / code splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL
+   - [x] Chunking UDF — `chunk()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
    - [ ] Memory primitive — hybrid access + TTL + provenance + consolidation collapsed into one declarative macro
 
 `3` Online serving (pipelines)
@@ -303,6 +307,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 - **Vector search** — native KNN via Lance, `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), SeekDB HNSW.
 - **Full-text search** — Lance BM25 inverted indexes, `pg_fts`, `sqlite_fts`, SeekDB native FULLTEXT.
 - **Inline embeddings** — `candle()` UDF (GGUF / Candle / remote embed APIs) directly inside SQL, so content + vector stay on the same row atomically.
+- **Inline chunking** — `chunk()` UDF (character / markdown splitters via [`text-splitter`](https://crates.io/crates/text-splitter)) so RAG ingest stays a single SQL statement: chunk → embed → write ([docs](docs/chunk.md)).
 - **ONNX inference** — `onnx_predict` UDF for inline model predictions in SQL.
 - **Hybrid search** — RRF merge of FTS + KNN in plain SQL (see [llm_wiki demo](demo/llm_wiki/)).
 

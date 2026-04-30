@@ -12,6 +12,15 @@ spec:
       - doc_id
       - content
     description: Insert one document (id, content) — computes embedding inline
+  ingest-doc:
+    pipeline: ingest-chunked
+    positional:
+      - doc_id
+      - content
+    defaults:
+      chunk_size: "500"
+      overlap: "100"
+    description: Chunk a long document inline (markdown splitter), embed each chunk, insert one row per chunk
   grep:
     pipeline: search-hybrid
     positional:

@@ -19,6 +19,9 @@ onnx = ["skardi/onnx"]
 embedding = ["candle", "gguf", "onnx", "remote-embed"]
 remote-embed = ["skardi/remote-embed"]
 gguf = ["skardi/gguf"]
+chunking = ["skardi/chunking"]
+# RAG umbrella: chunk → embed → write loop in one feature.
+rag = ["embedding", "chunking"]
 
 [dependencies]
 better-auth = { workspace = true }

@@ -1,0 +1,33 @@
+kind: pipeline
+
+metadata:
+  name: "ingest-chunked"
+  version: "1.0.0"
+  description: >
+    Ingest one long document by splitting it into chunks inline with
+    chunk('markdown', ...), embedding each chunk with candle, and writing
+    one row per chunk. The whole loop — chunk → embed → write — happens in
+    a single SQL statement, so an N-chunk document is N rows, all
+    immediately searchable via pg_fts and pg_knn.
+
+    Synthesized chunk ids: `id = doc_id * 1000 + chunk_idx` (0-based), so
+    pick `doc_id` values that don't collide if you also use the single-row
+    `ingest` pipeline. ROW_NUMBER drives the chunk_idx; chunk order
+    matches text-splitter's emission order.
+
+# Parameters:
+#   {doc_id}     - Source-doc id, used as a prefix for synthesized chunk ids
+#   {content}    - Full document text (any length); chunked inline
+#   {chunk_size} - Target max chunk length in characters (default 500)
+#   {overlap}    - Characters of overlap between adjacent chunks (default 100)
+
+spec:
+  query: |
+    INSERT INTO documents (id, content, embedding)
+    SELECT
+      {doc_id} * 1000 + (ROW_NUMBER() OVER (ORDER BY 1) - 1) AS id,
+      chunk_text                                              AS content,
+      candle('models/generated/bge-small-en-v1.5', chunk_text) AS embedding
+    FROM (
+      SELECT UNNEST(chunk('markdown', {content}, {chunk_size}, {overlap})) AS chunk_text
+    ) c
