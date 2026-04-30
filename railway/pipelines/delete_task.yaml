@@ -1,0 +1,13 @@
+kind: pipeline
+
+metadata:
+  name: "delete-task"
+  version: "1.0.0"
+  description: "Delete a task by ID."
+
+# Parameters:
+#   {id} - Task ID to delete
+
+spec:
+  query: |
+    DELETE FROM tasks WHERE id = {id}

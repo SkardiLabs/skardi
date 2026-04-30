@@ -215,6 +215,10 @@ docker run --rm \
 
 The fastest cloud path is the [Sealos](https://sealos.io) template in **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — our growing library of ready-to-use Skardi setups. One-click launch, no local setup.
 
+## Cloud (Railway)
+
+A one-click [Railway](https://railway.com) template lives in [`railway/`](railway/) — Skardi v0.3.0 with the simple-backend demo (SQLite + four CRUD pipelines) on a persistent volume. See [railway/README.md](railway/README.md) for deploy and submission steps.
+
 ## Building from Source
 
 ```bash
