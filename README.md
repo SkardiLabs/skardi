@@ -63,6 +63,18 @@ Skardi closes that gap with three deliberate choices:
 Read the full narrative in [docs/agent_data_plane.md](docs/agent_data_plane.md).
 
 ---
+
+## ⭐️ Star the Repository
+
+If you find Skardi useful or interesting, a GitHub Star ⭐️ would be greatly appreciated — it helps others discover the project and signals which directions are worth pushing on.
+
+<p align="center">
+  <a href="https://github.com/SkardiLabs/skardi">
+    <img src="asset/skardi-star.gif" alt="Star Skardi" width="700">
+  </a>
+</p>
+
+---
 ## Quick Start
 
 ### Install the CLI
