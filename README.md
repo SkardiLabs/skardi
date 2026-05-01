@@ -155,9 +155,12 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 
 ---
 
-## Local knowledge base for local agents
+## RAG skills for agents
 
-The **[`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** turns a directory of documents into a queryable RAG with one command — chunking, embedding, indexing, and hybrid search exposed as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code or Cursor session gets a grounded, citable local knowledge base.
+Two ready-to-use skills from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** you can drop into Claude Code or Cursor:
+
+- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — turn a directory of documents into a queryable local RAG with one command. Chunking, embedding, indexing, and hybrid search exposed as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any agent session gets a grounded, citable local knowledge base.
+- **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — stand up server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the `ctx.yaml` + pipelines, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
 
 ---
 
