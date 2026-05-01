@@ -667,4 +667,8 @@ mod tests {
         assert!(slugs[0].starts_with("alice/chap1/p0"), "got {slugs:?}");
         assert!(slugs.iter().all(|s| s.starts_with("alice/chap1/p")));
     }
+
+    // Cross-UDF composition guards (chunk × candle/gguf/onnx/remote_embed)
+    // live in `crates/skardi/tests/cross_udf_composition.rs` so chunking
+    // module tests stay focused on chunk()'s own behaviour.
 }
