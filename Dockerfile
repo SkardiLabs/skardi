@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y \
     libssl3t64 \
     libsqlite3-0 \
     zlib1g \
+    libgomp1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
