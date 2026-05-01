@@ -17,6 +17,8 @@ use crate::auth::mode::AuthMode;
 use crate::config::ServerConfig;
 #[cfg(feature = "candle")]
 use crate::config::register_candle_udf;
+#[cfg(feature = "chunking")]
+use crate::config::register_chunk_udf;
 #[cfg(feature = "gguf")]
 use crate::config::register_gguf_udf;
 #[cfg(feature = "onnx")]
@@ -148,6 +150,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register candle UDF (lazy — models loaded on first call from inline path)
     #[cfg(feature = "candle")]
     register_candle_udf(&mut session_ctx);
+    // Register chunk UDF (text-splitter wrapper for inline ingestion)
+    #[cfg(feature = "chunking")]
+    register_chunk_udf(&mut session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;
