@@ -83,17 +83,6 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
 - **`skardi-server`** — same engine over HTTP, with two surfaces: **online serving** (a YAML pipeline becomes a parameterized REST endpoint with an inferred request/response schema) and **offline jobs** (async batch writes into Lance or any read-write DB; if a job fails halfway you don't get a corrupted dataset, and every run is logged in a SQLite ledger you can list and inspect).
 - **Skardi-server is stateful but lightweight** — a single Rust process, plus a small SQLite file for the run ledger and (optional) auth. One server can serve many agents; deploy it next to your data, behind your usual auth.
 
-> **Glossary (for terms used below).**
-> **Pipeline** — a YAML file with a parameterized SQL query; becomes one REST endpoint + one CLI verb.
-> **Job** — a YAML file like a pipeline, but runs asynchronously and writes its result rows to a destination table.
-> **`ctx.yaml`** — the config that lists your data sources (a Postgres URL, a SQLite path, an S3 bucket, etc.) and gives each one a name you can reference in SQL.
-> **DataFusion** — an in-process Rust SQL engine ([Apache project](https://datafusion.apache.org/)). Runs inside `skardi-server`, so there is no separate cluster to manage. "Single-node" means the engine itself is in-process; the data sources it queries can be remote.
-> **Lance** — an open columnar file format with built-in vector and full-text indexes ([lancedb.github.io/lance](https://lancedb.github.io/lance/)). Useful as a job destination when you want a self-contained queryable dataset on disk or S3.
-> **Hybrid search / RRF** — combining keyword (full-text, "FTS") and semantic (vector, "KNN") results into one ranking. RRF (Reciprocal Rank Fusion) is the standard merge formula. Skardi does it in a single SQL query so there is no Python re-ranking layer.
-> **Catalog mode** — point Skardi at a database connection and let it auto-discover every table, instead of registering tables one at a time. Catalog-registered tables are addressed in SQL with the 3-part `catalog.schema.table` name (e.g. `wiki.main.wiki_pages_vec` below: `wiki` is the source name, `main` is the SQLite schema, `wiki_pages_vec` is the table).
-> **`sqlite_knn` / `sqlite_fts`** — Skardi UDFs that wrap [sqlite-vec](https://github.com/asg017/sqlite-vec) KNN and SQLite FTS5 inside SQL; analogous `pg_knn` / `pg_fts` exist for Postgres + pgvector. Full UDF reference in [docs/sqlite/](docs/sqlite/) and [docs/postgres/](docs/postgres/).
-> **SeekDB** — a MySQL-wire-compatible store with native HNSW vector indexes and FULLTEXT FTS, usable as a single-source replacement for "Postgres + pgvector + tsvector" (see [docs/seekdb/](docs/seekdb/)).
-
 > **Beta.** Skardi is under active development. APIs may move. Hit us on [Discord](https://discord.gg/S5YQQPEV2m) if you want to co-design a POC.
 
 <p align="center">
