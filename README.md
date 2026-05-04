@@ -49,11 +49,9 @@ Borrowing Spark's shape — one engine over every data source — but tilted for
 > **Beta.** Skardi is under active development. APIs may move. Hit us on [Discord](https://discord.gg/S5YQQPEV2m) if you want to co-design a POC.
 
 <p align="center">
-  <video src="asset/architecture-open-source.mp4" poster="asset/architecture-open-source.svg" width="900" autoplay loop muted playsinline>
-    <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">
-      <img src="asset/architecture-open-source.svg" alt="Skardi open source architecture — agent data plane between any AI agent and your data sources" width="900">
-    </a>
-  </video>
+  <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">
+    <img src="asset/architecture-open-source.gif" alt="Skardi open source architecture — agent data plane between any AI agent and your data sources" width="900">
+  </a>
   <br>
   <sub><em>fig. 01 — skardi open source topology.</em> <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
 </p>
