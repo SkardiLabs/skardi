@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Skardi — Open Source Architecture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-2: #f6f8fa;
+    --ink: #1f2328;
+    --ink-2: #59636e;
+    --ink-3: #818b98;
+    --line: #d1d9e0;
+    --line-2: #e6ebf1;
+    --line-soft: #eaeef2;
+    --accent: #0b8fd1;        /* skardi cyan-blue, matching the logo */
+    --accent-2: #1ec3e6;       /* lighter cyan accent */
+    --accent-soft: #e6f6fc;
+    --accent-line: #7cc8e3;
+    --warn: #bf6a02;
+    --warn-soft: #fff4e0;
+    --warn-line: #f0c178;
+    --ok: #1a7f37;
+    --card: #ffffff;
+    --shadow: 0 1px 0 rgba(31,35,40,.04), 0 8px 24px -12px rgba(31,35,40,.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1320px; margin: 0 auto; padding: 24px 28px 40px; }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink-3); display: inline-flex; align-items: center; gap: 8px;
+  }
+  .eyebrow::before { content:""; width:6px; height:6px; border-radius:50%; background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+  h1 { font-size: 26px; line-height: 1.2; letter-spacing: -0.01em; margin: 10px 0 6px; font-weight: 600; max-width: 820px; color: var(--ink); }
+  h1 em { font-style: normal; color: var(--accent); }
+  .sub { color: var(--ink-2); max-width: 820px; font-size: 14px; line-height: 1.55; margin: 0 0 18px; }
+  .sub code { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--ink); background: var(--bg-2); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line-soft); }
+
+  .stage-wrap { position: relative; width: 100%; }
+  .stage {
+    position: relative; width: 1280px; height: 640px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    transform-origin: top left;
+  }
+  .stage::before {
+    content: ""; position: absolute; inset: 0;
+    background-image:
+      linear-gradient(to right, rgba(31,35,40,.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(31,35,40,.03) 1px, transparent 1px);
+    background-size: 28px 28px;
+    pointer-events: none;
+  }
+  .stage-tag {
+    position: absolute; top: 14px; left: 16px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--ink-3); letter-spacing: .08em;
+    display: flex; align-items: center; gap: 8px; z-index: 5;
+  }
+  .stage-tag .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: blink 2.4s ease-in-out infinite; }
+  .stage-legend {
+    position: absolute; bottom: 12px; right: 16px;
+    display: flex; gap: 16px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--ink-3); z-index: 5;
+  }
+  .stage-legend .swatch { display:inline-block; width:18px; height:2px; vertical-align:middle; margin-right:6px; }
+  .stage-legend .req { background: var(--accent); }
+  .stage-legend .data { background: var(--warn); }
+
+  svg.diagram { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  /* Generic node */
+  .node {
+    position: absolute; background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+  }
+  .node .head {
+    padding: 7px 11px; border-bottom: 1px solid var(--line-soft);
+    display: flex; align-items: center; gap: 8px;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--ink-3); letter-spacing: .08em; text-transform: uppercase;
+  }
+  .node .head .glyph { width: 14px; height: 14px; display: grid; place-items: center; color: var(--ink-3); }
+  .node .head .id { margin-left:auto; color: var(--ink-3); font-size: 9.5px; text-transform: none; letter-spacing: 0; }
+  .node .body { padding: 9px 12px 11px; }
+  .node .title { font-size: 13px; font-weight: 600; color: var(--ink); margin: 0 0 3px; letter-spacing: -0.01em; }
+  .node .desc { font-size: 11px; color: var(--ink-2); line-height: 1.4; margin: 0; }
+
+  .pill {
+    font-family: 'JetBrains Mono', monospace; font-size: 9.5px;
+    color: var(--ink-2); background: var(--bg-2);
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 2px 7px; letter-spacing: .02em;
+  }
+  .pill.accent { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+  .pill.warn { color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft); }
+
+  /* Agent Box (consolidated) */
+  .agent-box {
+    position: absolute; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: var(--shadow);
+  }
+  .agent-box .ab-head {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line-soft);
+    background: linear-gradient(180deg, #fafcfe 0%, #ffffff 100%);
+    border-radius: 12px 12px 0 0;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .agent-box .ab-head .robot {
+    width: 30px; height: 30px; border-radius: 8px;
+    background: var(--accent-soft); border: 1px solid var(--accent-line);
+    display: grid; place-items: center;
+  }
+  .agent-box .ab-head .ab-title {
+    font-size: 13.5px; font-weight: 600; color: var(--ink); letter-spacing: -0.01em;
+  }
+  .agent-box .ab-head .ab-sub {
+    font-family: 'JetBrains Mono', monospace; font-size: 9.5px;
+    color: var(--ink-3); letter-spacing: .08em; text-transform: uppercase;
+    margin-top: 1px;
+  }
+  .agent-box .ab-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+  }
+  .agent-box .skill {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .agent-box .skill:nth-child(odd) { border-right: 1px solid var(--line-soft); }
+  .agent-box .skill .icon {
+    flex: none; width: 28px; height: 28px; border-radius: 6px;
+    background: var(--accent-soft); border: 1px solid var(--accent-line);
+    display: grid; place-items: center;
+  }
+  .agent-box .skill .icon.warn {
+    background: var(--warn-soft); border-color: var(--warn-line);
+  }
+  .agent-box .skill .name {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600;
+    color: var(--ink); letter-spacing: -0.01em;
+  }
+  .agent-box .skill .desc {
+    font-size: 10.5px; color: var(--ink-2); line-height: 1.35; margin-top: 1px;
+  }
+
+  /* skardi-server card (Agent Data Plane) */
+  .server {
+    position: absolute; background: var(--card);
+    border: 1px solid var(--accent-line);
+    border-radius: 12px;
+    box-shadow: 0 1px 0 rgba(31,35,40,.04), 0 14px 32px -16px rgba(11,143,209,.32);
+  }
+  .server .head {
+    padding: 10px 14px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-bottom: 1px solid var(--accent-line);
+    border-radius: 12px 12px 0 0;
+    display: flex; align-items: center; gap: 10px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    letter-spacing: .06em; text-transform: uppercase; font-weight: 600;
+  }
+  .server .head .id { margin-left:auto; font-size:10px; text-transform:none; letter-spacing:0; color: var(--accent); opacity: .8; }
+  .server-section { padding: 9px 14px; border-top: 1px solid var(--line-soft); }
+  .server-section:first-of-type { border-top: none; }
+  .server-section .label {
+    font-family: 'JetBrains Mono', monospace; font-size: 9.5px;
+    color: var(--ink-3); letter-spacing: .12em; text-transform: uppercase;
+    margin-bottom: 3px; display: flex; align-items: center; gap: 6px;
+  }
+  .server-section .label::before { content:""; width:4px; height:4px; border-radius:50%; background: var(--accent); }
+  .server-section .row { font-size: 11px; color: var(--ink); line-height: 1.35; }
+  .server-section .row .mono { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--ink-2); }
+
+  /* Sources grid */
+  .ds-grid {
+    position: absolute; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: var(--shadow);
+  }
+  .ds-grid .ds-head {
+    padding: 10px 14px; border-bottom: 1px solid var(--line-soft);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--ink-3); letter-spacing: .08em; text-transform: uppercase;
+    display: flex; align-items: center; gap: 9px; font-weight: 600;
+  }
+  .ds-grid .ds-head .id { margin-left:auto; font-size:10px; text-transform:none; letter-spacing:0; color: var(--ink-3); opacity:.8; font-weight: 500; }
+  .ds-grid .grid { display: grid; grid-template-columns: 1fr; gap: 0; }
+  .ds-grid .cell {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px;
+    border-top: 1px solid var(--line-soft);
+    min-height: 42px;
+  }
+  .ds-grid .cell .logo { width: 22px; height: 22px; flex: none; display: grid; place-items: center; }
+  .ds-grid .cell .logo svg { width: 100%; height: 100%; }
+  .ds-grid .cell .name { font-size: 12px; font-weight: 500; color: var(--ink); line-height: 1.15; }
+  .ds-grid .cell .kind { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; color: var(--ink-3); letter-spacing: .04em; }
+
+  /* Annotations */
+  .anno {
+    position: absolute; font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px; letter-spacing: .08em; color: var(--ink-3); text-transform: uppercase;
+  }
+
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+  @keyframes dash { to { stroke-dashoffset: -240; } }
+  @keyframes dash-rev { to { stroke-dashoffset: 240; } }
+  .flow-req { animation: dash 6s linear infinite; }
+  .flow-data { animation: dash-rev 5s linear infinite; }
+
+  .footnote {
+    margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-3);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px;
+  }
+  .footnote a { color: var(--accent); text-decoration: none; }
+  .footnote a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<template id="__bundler_thumbnail">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+    <rect width="200" height="200" fill="#ffffff"/>
+    <g stroke="#0b8fd1" stroke-width="3" fill="none">
+      <rect x="40" y="80" width="40" height="40" rx="6"/>
+      <rect x="120" y="80" width="40" height="40" rx="6"/>
+      <path d="M80 100 H120" stroke-dasharray="4 4"/>
+    </g>
+    <circle cx="60" cy="100" r="6" fill="#0b8fd1"/>
+    <circle cx="140" cy="100" r="6" fill="#1ec3e6"/>
+  </svg>
+</template>
+<div class="page">
+  <div class="eyebrow">Skardi · Open Source Architecture</div>
+  <h1>An <em>agent data plane</em> that gives AI agents data autonomy.</h1>
+  <p class="sub">Any <strong>AI agent</strong> — Claude Code, Codex, your own — talks to <code>skardi-server</code> through a uniform set of skills (<code>rag</code>, <code>grep</code>, <code>batch</code>, <code>ingest</code>) and gets governed access to every database, file, and object store you connect. One control plane. Any source. Federated SQL + retrieval primitives, written in Rust.</p>
+
+  <div class="stage-wrap" id="stage-wrap">
+  <div class="stage" id="stage">
+    <div class="stage-tag"><span class="dot"></span>SKARDI · OPEN SOURCE</div>
+
+    <svg class="diagram" viewBox="0 0 1280 640" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#0b8fd1"/>
+        </marker>
+        <marker id="arrow-warn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#bf6a02"/>
+        </marker>
+      </defs>
+
+      <!-- Agent Box → skardi-server: SQL / REST request flow -->
+      <path d="M 446 317 C 530 317, 590 317, 660 317"
+            fill="none" stroke="#0b8fd1" stroke-width="1.6" stroke-dasharray="6 6"
+            class="flow-req" marker-end="url(#arrow-accent)"/>
+
+      <!-- skardi-server → Sources: governed data access -->
+      <path d="M 922 317 C 990 317, 1020 317, 1080 317"
+            fill="none" stroke="#bf6a02" stroke-width="1.6" stroke-dasharray="6 6"
+            class="flow-data" marker-end="url(#arrow-warn)"/>
+    </svg>
+
+    <!-- ============ AGENT BOX (consolidated) ============ -->
+    <div class="anno" style="left: 60px; top: 194px; color: var(--accent);">▍ Any AI Agent</div>
+
+    <div class="agent-box" style="left: 60px; top: 220px; width: 386px;">
+      <div class="ab-head">
+        <div class="robot" title="agent">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0b8fd1" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="7" width="16" height="12" rx="2"/>
+            <circle cx="9" cy="13" r="1.2" fill="#0b8fd1"/>
+            <circle cx="15" cy="13" r="1.2" fill="#0b8fd1"/>
+            <path d="M10 17h4"/>
+            <path d="M12 3v4M9 5l3 2 3-2"/>
+          </svg>
+        </div>
+        <div>
+          <div class="ab-title">Agent</div>
+          <div class="ab-sub">claude code · codex · custom</div>
+        </div>
+        <div style="margin-left:auto; display:flex; gap:6px;">
+          <span class="pill accent">skardi-skills</span>
+        </div>
+      </div>
+      <div class="ab-grid">
+        <div class="skill">
+          <div class="icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0b8fd1" stroke-width="1.6" stroke-linecap="round">
+              <circle cx="10" cy="10" r="5"/><path d="M14 14l5 5"/>
+              <path d="M7 10h6M10 7v6" stroke-width="1.2"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">rag</div>
+            <div class="desc">hybrid retrieval across sources</div>
+          </div>
+        </div>
+        <div class="skill">
+          <div class="icon">
+            <span style="font-family:'JetBrains Mono',monospace; font-size:11px; color:#0b8fd1; font-weight:600;">&gt;_</span>
+          </div>
+          <div>
+            <div class="name">grep</div>
+            <div class="desc">walk files · objects · tables</div>
+          </div>
+        </div>
+        <div class="skill">
+          <div class="icon warn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#bf6a02" stroke-width="1.5" stroke-linejoin="round">
+              <rect x="3" y="5" width="6" height="5" rx="1"/>
+              <rect x="15" y="5" width="6" height="5" rx="1"/>
+              <rect x="3" y="14" width="6" height="5" rx="1"/>
+              <rect x="15" y="14" width="6" height="5" rx="1"/>
+              <path d="M9 7.5h6M9 16.5h6M12 10v4" stroke-width="1.1"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">batch</div>
+            <div class="desc">distributed jobs · poll · cancel</div>
+          </div>
+        </div>
+        <div class="skill">
+          <div class="icon warn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#bf6a02" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v11"/><path d="M7 10l5 5 5-5"/>
+              <path d="M4 19h16" stroke-width="1.4"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">ingest <span style="font-family:'Inter',sans-serif; font-weight:500; font-size:9.5px; color:var(--ink-3); letter-spacing:.04em; margin-left:4px; padding:1px 5px; border:1px solid var(--line); border-radius:4px; background:var(--bg-2); text-transform:uppercase;">upcoming</span></div>
+            <div class="desc">embed · chunk · atomic commit</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ SKARDI-SERVER (Agent Data Plane) ============ -->
+    <div class="anno" style="left: 660px; top: 151px; color: var(--accent);">▍ Agent Data Plane</div>
+
+    <div class="server" style="left: 660px; top: 177px; width: 262px;">
+      <div class="head">
+        <span style="display:grid; place-items:center; width:18px; height:18px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0b8fd1" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+            <path d="M12 2 L20 6 V12 C20 16.5 16.5 20 12 22 C7.5 20 4 16.5 4 12 V6 Z"/>
+            <path d="M9 12l2 2 4-4"/>
+          </svg>
+        </span>
+        <span>skardi-server</span>
+        <span class="id">rust · apache 2.0</span>
+      </div>
+      <div class="server-section">
+        <div class="label">Federated SQL</div>
+        <div class="row"><span class="mono">DataFusion · JOIN any source</span></div>
+      </div>
+      <div class="server-section">
+        <div class="label">Retrieval primitives</div>
+        <div class="row"><span class="mono">knn · fts · hybrid (RRF)</span></div>
+      </div>
+      <div class="server-section">
+        <div class="label">Semantic layer</div>
+        <div class="row"><span class="mono">table descs · entity graph</span></div>
+      </div>
+      <div class="server-section">
+        <div class="label">Catalog</div>
+        <div class="row"><span class="mono">GET /data_source · NL descs</span></div>
+      </div>
+      <div class="server-section">
+        <div class="label">Embedding · ONNX</div>
+        <div class="row"><span class="mono">skardi-server-embedding · -onnx</span></div>
+      </div>
+      <div class="server-section">
+        <div class="label">Governance</div>
+        <div class="row" style="display:flex; flex-wrap:wrap; gap:4px;">
+          <span class="pill accent">RBAC</span>
+          <span class="pill accent">agent identity</span>
+          <span class="pill accent">audit</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ SOURCES ============ -->
+    <div class="anno" style="left: 1080px; top: 62px; color: var(--ink-3);">▍ Sources</div>
+
+    <div class="ds-grid" style="left: 1080px; top: 88px; width: 184px;">
+      <div class="ds-head">
+        <span>Sources</span>
+        <span class="id">10+</span>
+      </div>
+      <div class="grid">
+        <div class="cell">
+          <div class="logo" title="PostgreSQL">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#336791" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
+              <path d="M5 9c0-3 2-5 5-5 2 0 3 .8 4 2 1-.7 2-1 3-1 3 0 4 2 4 4 0 2-1 3.3-2 4 0 2 .5 3.5-.5 5-1 1.5-3 2-5 2-1 0-2-.3-3-1-1 .5-2 1-3 1-2 0-3.5-1-3.5-3"/>
+              <circle cx="9" cy="10" r=".7" fill="#336791" stroke="none"/>
+              <path d="M14 11c-.5 1-.5 2 0 3"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">PostgreSQL</div>
+            <div class="kind">+ pgvector</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="MySQL">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#00758F" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 14c2-4 6-6 10-6 3 0 5 1 7 3-2 0-3 1-4 2-1 1-3 2-5 2-3 0-5-.5-8-1Z"/>
+              <path d="M16 11l3-2"/>
+              <circle cx="18" cy="10" r=".5" fill="#00758F" stroke="none"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">MySQL</div>
+            <div class="kind">full CRUD</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="SQLite">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#003B57" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M4 4h12l4 4v12H4z" fill="#0F80CC" fill-opacity=".15"/>
+              <path d="M7 10c2-2 6-2 9 0M8 14c2-1.5 5-1.5 7 0"/>
+              <path d="M16 4v4h4"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">SQLite</div>
+            <div class="kind">FTS · vec</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="MongoDB">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#13AA52" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2c2.5 4 4.5 7.5 4.5 11.5S14 20 12 22c-2-2-4.5-4.5-4.5-8.5S9.5 6 12 2Z" fill="#13AA52" fill-opacity=".12"/>
+              <path d="M12 4v18"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">MongoDB</div>
+            <div class="kind">document</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="Redis">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#DC382C" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M3 7l9-3 9 3-9 3-9-3Z" fill="#DC382C" fill-opacity=".15"/>
+              <path d="M3 12l9 3 9-3"/>
+              <path d="M3 17l9 3 9-3"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">Redis</div>
+            <div class="kind">KV · cache</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="LanceDB">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#0b8fd1" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M12 3l8 9-8 9-8-9 8-9Z" fill="#0b8fd1" fill-opacity=".12"/>
+              <path d="M12 3v18M4 12h16"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">LanceDB</div>
+            <div class="kind">KNN · BM25</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="Apache Iceberg">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#2B6FB0" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M6 12l3-7 3 4 4-3 2 6Z" fill="#2B6FB0" fill-opacity=".15"/>
+              <path d="M3 13h18" stroke-dasharray="2 2"/>
+              <path d="M5 13l4 6 6-1 4-5" fill="#2B6FB0" fill-opacity=".08"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">Iceberg</div>
+            <div class="kind">partitioned</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="SeekDB">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#6a6f7a" stroke-width="1.4" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="6"/>
+              <path d="M16 16l4 4"/>
+              <circle cx="11" cy="11" r="2" fill="#6a6f7a" fill-opacity=".25"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">SeekDB</div>
+            <div class="kind">FTS · HNSW</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="Files">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#6a6f7a" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M6 3h9l4 4v14H6z" fill="#6a6f7a" fill-opacity=".08"/>
+              <path d="M15 3v4h4"/>
+              <path d="M9 12h7M9 15h5M9 18h7"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">CSV · Parquet · JSON</div>
+            <div class="kind">files</div>
+          </div>
+        </div>
+        <div class="cell">
+          <div class="logo" title="Object stores">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#E25444" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M5 7h14l-1 13H6Z" fill="#E25444" fill-opacity=".12"/>
+              <path d="M5 7c0-2 3-3 7-3s7 1 7 3"/>
+              <path d="M9 11v5M15 11v5"/>
+            </svg>
+          </div>
+          <div>
+            <div class="name">S3 · GCS · Azure</div>
+            <div class="kind">object store</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Connector annotations -->
+    <div class="anno" style="left: 488px; top: 293px; color: var(--accent);">SQL / REST</div>
+    <div class="anno" style="left: 950px; top: 293px; color: var(--warn);">GOVERNED</div>
+
+    <div class="stage-legend">
+      <div><span class="swatch req"></span>SQL / REST</div>
+      <div><span class="swatch data"></span>governed data</div>
+    </div>
+  </div>
+  </div>
+
+  <script>
+    (function () {
+      var wrap = document.getElementById('stage-wrap');
+      var stage = document.getElementById('stage');
+      var W = 1280, H = 640;
+      function fit() {
+        var avail = wrap.clientWidth;
+        var scale = Math.min(1, avail / W);
+        stage.style.transform = 'scale(' + scale + ')';
+        wrap.style.height = (H * scale) + 'px';
+      }
+      window.addEventListener('resize', fit);
+      fit();
+    })();
+  </script>
+
+  <div class="footnote">
+    <div>fig. 01 — skardi · open source topology</div>
+    <div><a href="https://github.com/SkardiLabs/skardi">github.com/SkardiLabs/skardi</a> · Apache 2.0</div>
+  </div>
+</div>
+</body>
+</html>
