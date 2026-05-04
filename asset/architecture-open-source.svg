@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 620" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 600" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
   <title id="title">Skardi — Open Source Architecture</title>
   <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, LanceDB, Apache Iceberg, SeekDB, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
 
@@ -48,10 +48,10 @@
       }
     ]]></style>
 
-    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#0b8fd1"/>
     </marker>
-    <marker id="arrow-warn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow-warn" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#bf6a02"/>
     </marker>
 
@@ -61,9 +61,9 @@
   </defs>
 
   <!-- ============== STAGE BACKGROUND ============== -->
-  <rect x="0" y="0" width="1280" height="620" fill="#ffffff"/>
-  <rect x="12" y="12" width="1256" height="596" rx="14" ry="14" fill="#ffffff" stroke="#d1d9e0"/>
-  <rect x="13" y="13" width="1254" height="594" rx="13" ry="13" fill="url(#grid)" opacity="0.7"/>
+  <rect x="0" y="0" width="1280" height="600" fill="#ffffff"/>
+  <rect x="12" y="12" width="1256" height="576" rx="14" ry="14" fill="#ffffff" stroke="#d1d9e0"/>
+  <rect x="13" y="13" width="1254" height="574" rx="13" ry="13" fill="url(#grid)" opacity="0.7"/>
 
   <!-- header tag -->
   <g transform="translate(36, 38)">
@@ -71,41 +71,34 @@
     <text x="20" y="5" class="mono ink3 upper b" font-size="14">SKARDI · OPEN SOURCE</text>
   </g>
 
-  <!-- bottom-right legend -->
-  <g transform="translate(840, 580)" class="mono ink3" font-size="13">
-    <line x1="0" y1="-4" x2="22" y2="-4" stroke="#0b8fd1" stroke-width="2.5"/>
-    <text x="30" y="0">SQL / REST</text>
-    <line x1="140" y1="-4" x2="162" y2="-4" stroke="#bf6a02" stroke-width="2.5"/>
-    <text x="170" y="0">governed data</text>
-    <text x="350" y="0" class="ink3">fig. 01 — skardi · open-source topology</text>
-  </g>
-
   <!-- ============== CONNECTOR FLOW LINES ============== -->
-  <!-- Agent → server -->
-  <path d="M 470 340 C 510 340, 540 340, 560 340"
+  <!-- Agent → server: tip lands on the card's outer left border -->
+  <path d="M 380 340 C 420 340, 470 340, 510 340"
         fill="none" stroke="#0b8fd1" stroke-width="2.2" stroke-dasharray="8 8"
         class="flow-req" marker-end="url(#arrow-accent)"/>
-  <text x="490" y="324" class="mono accent upper b" font-size="13">SQL / REST</text>
+  <rect x="408" y="312" width="74" height="18" rx="4" ry="4" fill="#ffffff" opacity="0.94"/>
+  <text x="445" y="325" text-anchor="middle" class="mono accent upper b" font-size="13">SQL / REST</text>
 
-  <!-- Server → sources -->
-  <path d="M 840 340 C 880 340, 900 340, 920 340"
+  <!-- Server → sources: line starts at the card's outer right border -->
+  <path d="M 790 340 C 830 340, 880 340, 920 340"
         fill="none" stroke="#bf6a02" stroke-width="2.2" stroke-dasharray="8 8"
         class="flow-data" marker-end="url(#arrow-warn)"/>
-  <text x="847" y="324" class="mono warn upper b" font-size="13">GOVERNED</text>
+  <rect x="818" y="312" width="74" height="18" rx="4" ry="4" fill="#ffffff" opacity="0.94"/>
+  <text x="855" y="325" text-anchor="middle" class="mono warn upper b" font-size="13">GOVERNED</text>
 
-  <!-- ============== AGENT BOX (consolidated) ============== -->
+  <!-- ============== AGENT BOX (consolidated, 1x4 vertical) ============== -->
   <text x="40" y="116" class="mono accent upper b" font-size="13">▍ Any AI Agent</text>
 
   <g transform="translate(40, 130)">
-    <rect class="card" x="0" y="0" width="430" height="410" rx="12" ry="12"/>
+    <rect class="card" x="0" y="0" width="340" height="410" rx="12" ry="12"/>
 
     <!-- header bar -->
-    <rect class="head-soft" x="1" y="1" width="428" height="74" rx="11" ry="11"/>
-    <rect fill="#ffffff" x="1" y="40" width="428" height="35"/>
-    <line x1="0" y1="74" x2="430" y2="74" class="divider"/>
+    <rect class="head-soft" x="1" y="1" width="338" height="74" rx="11" ry="11"/>
+    <rect fill="#ffffff" x="1" y="40" width="338" height="35"/>
+    <line x1="0" y1="74" x2="340" y2="74" class="divider"/>
 
     <!-- robot icon -->
-    <g transform="translate(20, 22)">
+    <g transform="translate(16, 16)">
       <rect class="icon-bg" x="0" y="0" width="32" height="32" rx="8" ry="8"/>
       <g transform="translate(4, 4)" fill="none" stroke="#0b8fd1" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
         <rect x="3" y="9" width="18" height="13" rx="2"/>
@@ -116,21 +109,22 @@
       </g>
     </g>
 
-    <text x="64" y="38" class="ink b" font-size="18">Agent</text>
-    <text x="64" y="58" class="mono ink3 upper" font-size="13">claude code · codex · custom</text>
+    <text x="60" y="34" class="ink b" font-size="18">Agent</text>
+    <text x="16" y="64" class="mono ink3 upper" font-size="12">claude code · codex · custom</text>
 
-    <!-- skardi-skills pill -->
-    <g transform="translate(322, 26)">
-      <rect class="pill-accent" width="92" height="24" rx="12" ry="12"/>
-      <text x="46" y="16" text-anchor="middle" class="mono accent b" font-size="13">skardi-skills</text>
+    <!-- skardi-skills pill (top-right of header) -->
+    <g transform="translate(218, 22)">
+      <rect class="pill-accent" width="108" height="22" rx="11" ry="11"/>
+      <text x="54" y="15" text-anchor="middle" class="mono accent b" font-size="13">skardi-skills</text>
     </g>
 
-    <!-- 2 x 2 skill grid -->
-    <line x1="215" y1="75" x2="215" y2="410" class="divider"/>
-    <line x1="0" y1="242" x2="430" y2="242" class="divider"/>
+    <!-- 4 skills stacked vertically: each row 84px tall, full width -->
+    <line x1="0" y1="158" x2="340" y2="158" class="divider"/>
+    <line x1="0" y1="242" x2="340" y2="242" class="divider"/>
+    <line x1="0" y1="326" x2="340" y2="326" class="divider"/>
 
-    <!-- rag -->
-    <g transform="translate(20, 100)">
+    <!-- rag (y=74-158) -->
+    <g transform="translate(16, 98)">
       <rect class="icon-bg" x="0" y="0" width="36" height="36" rx="8" ry="8"/>
       <g transform="translate(8, 8)" fill="none" stroke="#0b8fd1" stroke-width="1.7" stroke-linecap="round">
         <circle cx="8" cy="8" r="5"/><path d="M11.5 11.5l5 5"/>
@@ -140,16 +134,16 @@
       <text x="50" y="33" class="ink2" font-size="14">hybrid retrieval across sources</text>
     </g>
 
-    <!-- grep -->
-    <g transform="translate(235, 100)">
+    <!-- grep (y=158-242) -->
+    <g transform="translate(16, 182)">
       <rect class="icon-bg" x="0" y="0" width="36" height="36" rx="8" ry="8"/>
       <text x="18" y="24" text-anchor="middle" class="mono accent b" font-size="14">&gt;_</text>
       <text x="50" y="16" class="mono ink b" font-size="16">grep</text>
       <text x="50" y="33" class="ink2" font-size="14">walk files · objects · tables</text>
     </g>
 
-    <!-- batch -->
-    <g transform="translate(20, 268)">
+    <!-- batch (y=242-326) -->
+    <g transform="translate(16, 266)">
       <rect class="icon-bg-w" x="0" y="0" width="36" height="36" rx="8" ry="8"/>
       <g transform="translate(8, 8)" fill="none" stroke="#bf6a02" stroke-width="1.6" stroke-linejoin="round">
         <rect x="0" y="2" width="6" height="5" rx="1"/>
@@ -162,29 +156,26 @@
       <text x="50" y="33" class="ink2" font-size="14">distributed jobs · poll · cancel</text>
     </g>
 
-    <!-- ingest -->
-    <g transform="translate(235, 268)">
+    <!-- ingest (y=326-410) -->
+    <g transform="translate(16, 350)">
       <rect class="icon-bg-w" x="0" y="0" width="36" height="36" rx="8" ry="8"/>
       <g transform="translate(8, 8)" fill="none" stroke="#bf6a02" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
         <path d="M10 1v11"/><path d="M5 8l5 5 5-5"/>
         <path d="M2 17h16" stroke-width="1.5"/>
       </g>
       <text x="50" y="16" class="mono ink b" font-size="16">ingest</text>
-      <g transform="translate(98, 5)">
-        <rect class="pill-base" width="72" height="16" rx="4" ry="4"/>
-        <text x="36" y="12" text-anchor="middle" class="ink3" font-size="11">UPCOMING</text>
+      <g transform="translate(118, 3)">
+        <rect class="pill-base" width="78" height="16" rx="4" ry="4"/>
+        <text x="39" y="12" text-anchor="middle" class="ink3" font-size="11">UPCOMING</text>
       </g>
       <text x="50" y="33" class="ink2" font-size="14">embed · chunk · atomic commit</text>
     </g>
   </g>
 
   <!-- ============== SKARDI-SERVER (Agent Data Plane) ============== -->
-  <text x="560" y="96" class="mono accent upper b" font-size="13">▍ Agent Data Plane</text>
+  <text x="510" y="96" class="mono accent upper b" font-size="13">▍ Agent Data Plane</text>
 
-  <!-- soft halo -->
-  <rect class="halo" x="544" y="100" width="312" height="448" rx="22" ry="22" fill="#0b8fd1" opacity="0.12"/>
-
-  <g transform="translate(560, 110)">
+  <g transform="translate(510, 110)">
     <rect class="card-accent" x="0" y="0" width="280" height="430" rx="12" ry="12"/>
 
     <!-- header (accent) -->
@@ -199,7 +190,6 @@
       </g>
     </g>
     <text x="44" y="29" class="mono accent b upper" font-size="16">skardi-server</text>
-    <text x="269" y="29" text-anchor="end" class="mono accent" font-size="11" opacity="0.8">rust · apache 2.0</text>
 
     <!-- Section 1: Federated SQL -->
     <g transform="translate(0, 48)">
@@ -247,16 +237,16 @@
       <text x="24" y="16" class="mono ink3 upper b" font-size="13">Governance</text>
       <g transform="translate(14, 28)">
         <g>
-          <rect class="pill-accent" width="48" height="20" rx="10" ry="10"/>
-          <text x="24" y="14" text-anchor="middle" class="mono accent b" font-size="12">RBAC</text>
+          <rect class="pill-accent" width="52" height="20" rx="10" ry="10"/>
+          <text x="26" y="14" text-anchor="middle" class="mono accent b" font-size="12">RBAC</text>
         </g>
-        <g transform="translate(54, 0)">
-          <rect class="pill-accent" width="92" height="20" rx="10" ry="10"/>
-          <text x="46" y="14" text-anchor="middle" class="mono accent b" font-size="12">agent identity</text>
+        <g transform="translate(58, 0)">
+          <rect class="pill-accent" width="110" height="20" rx="10" ry="10"/>
+          <text x="55" y="14" text-anchor="middle" class="mono accent b" font-size="12">agent identity</text>
         </g>
-        <g transform="translate(152, 0)">
-          <rect class="pill-accent" width="50" height="20" rx="10" ry="10"/>
-          <text x="25" y="14" text-anchor="middle" class="mono accent b" font-size="12">audit</text>
+        <g transform="translate(174, 0)">
+          <rect class="pill-accent" width="54" height="20" rx="10" ry="10"/>
+          <text x="27" y="14" text-anchor="middle" class="mono accent b" font-size="12">audit</text>
         </g>
       </g>
     </g>
