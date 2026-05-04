@@ -3,9 +3,9 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**Skardi is an open-source agent data plane** — the single layer every data call your agent makes flows through. RAG retrieval, table lookups, vector search, audit writes: declare each one as parameterized SQL in a YAML pipeline, and Skardi serves it as both a REST endpoint and a shell verb your agent can call as a tool, federated across Postgres, SQLite, MongoDB, S3, data lakes, and vector stores in a single query.
+**Skardi is an open-source agent data plane** — every read and write your agent makes flows through one uniform layer of parameterized SQL pipelines, served as REST endpoints and shell verbs your agent calls as tools. Putting reads and writes behind the same plane is what makes the durable thing possible: semantic discovery, audit, and rollback compose across your whole stack instead of fragmenting across SDKs — turning *data autonomy* (letting the agent decide what to query and write) from a gamble into a default you can actually govern.
 
-**Federated** · one engine over every source &nbsp;·&nbsp; **Declarative** · YAML pipelines &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
+**Federated** · one engine over every source &nbsp;·&nbsp; **Governed** · semantic overlay, lineage, branching &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
 
 <a href="https://skardilabs.github.io/skardi-docs/">Documentation</a> •
 <a href="#roadmap">Roadmap</a> •
@@ -40,26 +40,32 @@
 
 ## What is an "agent data plane"?
 
-Borrowing the phrase from cloud infra: your AI agent has two layers. The **control plane** is the reasoning loop — prompts, tool selection, your orchestration code, your YAML configs. The **data plane** is where every byte of context actually comes from and goes to: vector DB hits, SQL queries, file reads, writes back, audit trails. The control plane is mostly fine these days (LLMs are smart, agent SDKs are mature). The data plane is the bottleneck — most agents today have a tangled one: a Pinecone client here, a Postgres query there, a hand-rolled RRF merge in Python, an HTTP wrapper around an internal API, glue code on top of glue code.
+Borrowing the phrase from cloud infra: your AI agent has two layers. The **control plane** is the reasoning loop — prompts, tool selection, your orchestration code. The **data plane** is where every byte of context comes from and goes to: vector DB hits, SQL queries, file reads, writes back, audit trails.
 
-**Skardi *is* the data plane.** A single open-source server (and CLI) where every one of your agent's data calls goes, declared once as parameterized SQL in YAML, then served as both a REST endpoint and a shell verb. Federated, so one query can JOIN across Postgres, SQLite, MongoDB, S3, data lakes, and vector stores. Fast enough to sit in your agent's request path — typically tens of milliseconds for a parameterized Postgres / SQLite query, dominated by your data source's own latency.
+Skardi is a uniform plane for that data layer. A single open-source server (and CLI) that exposes your data — Postgres, SQLite, MongoDB, S3 files, data lakes, vector stores — as parameterized SQL pipelines declared in YAML. Each pipeline is callable as both a REST endpoint and a `skardi` shell verb, so the same definition works in Claude Code, Cursor, your own agent loop, or any HTTP-aware host. One JOIN can span every registered source. Latency typically sits in tens of milliseconds, dominated by your data source's own.
 
-**Concretely, you're replacing this:**
-
-```python
-# What an agent retrieval tool usually looks like today:
-def search_wiki(query: str, limit: int = 10):
-    embedding = openai.embeddings.create(input=query, model="...").data[0].embedding
-    vec_hits  = pg.execute("SELECT id FROM pages ORDER BY emb <=> %s LIMIT 80", [embedding])
-    fts_hits  = pg.execute("SELECT id FROM pages WHERE tsv @@ plainto_tsquery(%s) LIMIT 60", [query])
-    fused     = rrf_merge(vec_hits, fts_hits)            # hand-rolled
-    return pg.execute("SELECT slug,title FROM pages WHERE id = ANY(%s)", [fused[:limit]])
-# + a Flask/FastAPI route exposing it, + auth, + logging, + a schema for the LLM...
+```yaml
+# pipelines/wiki-search-hybrid.yaml — your agent's hybrid-search tool, declared once
+kind: pipeline
+metadata: { name: wiki-search-hybrid }
+spec:
+  query: |
+    SELECT slug, title FROM sqlite_knn('wiki', candle('bge-small', {query}), {limit})
+    -- (full vector + FTS + RRF version in Quick Start below)
 ```
 
-**…with a 20-line YAML pipeline** (full version in [Quick Start](#quick-start) below). Skardi handles the embedding call, the hybrid-search merge, the HTTP route, the parameter parsing, and the JSON response shape. Your agent calls it as `POST /wiki-search-hybrid/execute` over REST or `skardi grep "..."` from any shell — every retrieval flows through one engine instead of N hand-rolled tools.
+```bash
+$ skardi grep "turing machines" --limit=10                # shell tool, any Bash-tool agent
+$ curl -X POST :8080/wiki-search-hybrid/execute -d '{...}' # same pipeline, served as REST
+```
 
-Build RAG, hybrid search, agent-callable APIs, and async batch writes across databases, files, data lakes, and vector stores — all behind the same SQL surface.
+That uniformity is also what makes the *durable* reason to put a plane in front possible: **governance**. Once every read and write goes through one engine, three primitives compose on top of it instead of fragmenting across N SDKs:
+
+1. **Semantic overlay.** Plain-English descriptions of every table, column, and pipeline, served on `GET /data_source` as the agent's discovery surface. The agent reads *what each table is for* before querying, instead of guessing from a schema dump. Reading agents already cash this win — the catalog endpoint *is* the agent's prompt. ([docs/semantics.md](docs/semantics.md), shipped today)
+2. **Lineage.** Every write tagged with `agent_id`, `session_id`, `tool_call_id`, and `timestamp`, queryable from metadata. The async-job ledger already records every batch write today (parameters, status, run id); inline-write lineage on the synchronous path is in progress — see [Roadmap](#roadmap).
+3. **Snapshot-as-branch.** Iceberg / Lance-backed branches with `git checkout`-like semantics — an agent writes into a branch, you review, you merge or roll back. If the agent updated 1,000 rows you don't like, undoing it is one call, not an incident. (in progress — see [Roadmap](#roadmap))
+
+Without these, "let the agent touch the database" is reckless and the right answer is "don't"; with them, *data autonomy* — letting the agent decide what to query and write — becomes a default you can actually grant. Federation, declarative SQL pipelines, REST + shell bindings — those are how the plane is built. Governance is what the plane is *for*.
 
 ```text
    your agent  ──▶  skardi-server  ──┬─▶  Postgres / MySQL / SQLite / MongoDB / Redis
@@ -102,26 +108,26 @@ Build RAG, hybrid search, agent-callable APIs, and async batch writes across dat
 
 ## Drop-in skills — go from zero to grounded retrieval in 60 seconds
 
-Don't want to hand-write YAML to see what Skardi does for your agent? The fastest path is to install one of our ready-made skills from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Each skill renders the `ctx.yaml` + pipelines for you and exposes them as agent-callable verbs — zero config to write yourself, your agent can start retrieving immediately.
+The fastest path to put Skardi in front of your agent is to install one of our ready-made skills from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Each skill renders the `ctx.yaml` + pipelines for you and wires them up as agent-callable verbs — zero config to write yourself.
 
 - **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
 - **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
 
-Drop either skill into Claude Code or Cursor and your agent's data plane is wired in one prompt. Want to see what's happening under the hood, or build pipelines of your own? Read on.
+Read-only RAG is a perfectly good first use case for the plane: you get the semantic overlay (the agent reads what your tables are for), one engine that can later JOIN against your operational data, and a swappable backend (move from SQLite-on-disk to Postgres + pgvector to Lance without touching the agent). The same plane keeps earning as the agent starts to *write* — that's where lineage and branching kick in. Drop a skill in to see the shape; read on if you want to build pipelines of your own.
 
 ---
 
-## Why not just write a Python function that wraps SQL?
+## When does a uniform data plane earn its keep?
 
-Fair question — that is the alternative, and for one tool it's fine. Skardi earns its keep when an agent needs more than one of these at once:
+Direct SDKs work fine for a single read-only RAG bot — you can wire one to Postgres + a vector DB and ship in an afternoon. The plane earns its keep cumulatively: every property below is true on day one for the simplest agent, and the last three become load-bearing once the agent starts writing, you add a second agent, or "what did the agent do yesterday?" stops being a rhetorical question.
 
-1. **One engine over every source.** Skardi runs SQL across Postgres, MySQL, SQLite, MongoDB, Redis, S3 / GCS / Azure files, Iceberg, Lance, and SeekDB — and `JOIN`s across them in one query. A handrolled Python wrapper hits one source per function; cross-source JOINs become application code.
-2. **Same query, two surfaces.** The same pipeline YAML is callable both as a REST endpoint (for hosted agents, multi-process setups) and as a `skardi` CLI verb (for Claude Code, Cursor, any Bash-tool agent) with no extra glue.
-3. **Retrieval primitives in SQL.** Vector KNN, full-text search, hybrid (RRF) merge, inline embedding, inline chunking — all UDFs you can compose in plain SQL instead of stitching together Python libraries. So a RAG pipeline (chunk → embed → write → search) is one file, not a service.
-4. **Async writes you can trust.** A job that writes 100k rows to Lance commits atomically; if the process dies mid-write, the dataset is not corrupted, and every run is logged with `submitted/running/succeeded/failed` plus parameters in a SQLite ledger you can list and inspect.
-5. **A discovery surface for the agent.** `GET /data_source` returns each table's schema plus the natural-language description you wrote in YAML, so the agent picks the right pipeline before querying — instead of discovering it by trial and error.
+1. **Discovery — the agent reads what data *means*, not just shapes.** A semantic overlay attaches plain-English descriptions to every table, column, and pipeline; the catalog endpoint serves them so the agent picks the right verb before querying instead of guessing from a schema dump. (shipped — [docs/semantics.md](docs/semantics.md))
+2. **Federation — one JOIN over every source.** Federated SQL across Postgres / SQLite / MongoDB / S3 / Iceberg / Lance / vector stores, so the agent's "give me X about Y" doesn't need application-side joins.
+3. **Bindings — one pipeline, every host.** The same YAML serves as REST endpoint, `skardi` shell verb, and (soon) MCP tool — works in Claude Code, Cursor, your own loop, or a hosted agent with no extra glue.
+4. **Audit — one trail across every write.** Every write tagged with `agent_id` / `session_id` / `tool_call_id` / `timestamp`, queryable from one place. With direct SDKs you get distributed log files; through a plane you get one ledger. (the existing async-job ledger already records every batch write today; inline-write lineage in progress)
+5. **Rollback — branch the data, not your incident channel.** Iceberg / Lance-backed branches with `git checkout`-like semantics: agent writes into a branch, you review, you merge or revert. With direct DB writes a bad agent run is an incident; through the plane it's one call. (in progress)
 
-If your agent only ever needs one parameterized Postgres query, a Python function is simpler. If it needs five, plus a vector store, plus a CSV in S3, plus an audit log — that is what Skardi is for.
+If your agent only ever reads from one source, direct SDKs are simpler. If it reads from many, or writes back, or you want to govern what it does — the plane is what makes data autonomy a responsible default rather than a gamble.
 
 For a deeper read on the agent-data-plane idea — what it borrows from cloud infra, why agents need their own, how it differs from a normal data warehouse — see [docs/agent_data_plane.md](docs/agent_data_plane.md).
 
