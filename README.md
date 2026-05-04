@@ -67,8 +67,10 @@ That uniformity is also what makes the *durable* reason to put a plane in front 
 
 Without these, "let the agent touch the database" is reckless and the right answer is "don't"; with them, *data autonomy* — letting the agent decide what to query and write — becomes a default you can actually grant. Federation, declarative SQL pipelines, REST + shell bindings — those are how the plane is built. Governance is what the plane is *for*.
 
+For the longer technical read — each primitive's shipped vs. in-progress status, the run-ledger schema, the chokepoint argument unpacked — see [docs/agent_data_plane.md](docs/agent_data_plane.md).
+
 ```text
-   your agent  ──▶  skardi-server  ──┬─▶  Postgres / MySQL / SQLite / MongoDB / Redis
+   your agent  ──▶  skardi  ──┬─▶  Postgres / MySQL / SQLite / MongoDB / Redis
    (Claude / GPT /     │              ├─▶  S3 / GCS / Azure (CSV, Parquet, Lance)
     Cursor / your      │              ├─▶  Apache Iceberg, Lance datasets
     own loop)          │              └─▶  pgvector, sqlite-vec, Lance KNN, SeekDB HNSW
@@ -129,7 +131,7 @@ Direct SDKs work fine for a single read-only RAG bot — you can wire one to Pos
 
 If your agent only ever reads from one source, direct SDKs are simpler. If it reads from many, or writes back, or you want to govern what it does — the plane is what makes data autonomy a responsible default rather than a gamble.
 
-For a deeper read on the agent-data-plane idea — what it borrows from cloud infra, why agents need their own, how it differs from a normal data warehouse — see [docs/agent_data_plane.md](docs/agent_data_plane.md).
+Full breakdown of the three primitives — semantic-overlay YAML, the verbatim run-ledger schema, and why each primitive requires a chokepoint — in [docs/agent_data_plane.md](docs/agent_data_plane.md).
 
 ---
 
