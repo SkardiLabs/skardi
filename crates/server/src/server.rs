@@ -25,7 +25,8 @@ use crate::config::register_gguf_udf;
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
 use crate::config::register_remote_embed_udf;
-use crate::handlers::{health_check, serve_dashboard};
+use crate::gui::serve_dashboard;
+use crate::handlers::health_check;
 use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
 use crate::metrics::PipelineMetrics;
 use crate::pipeline_handlers::{

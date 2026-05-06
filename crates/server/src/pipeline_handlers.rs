@@ -145,7 +145,7 @@ fn create_success_response(data: Vec<Value>, rows: usize, execution_time_ms: u64
 ///
 /// Returns a vector of FieldInfo containing column name, type, and nullability.
 /// Returns an error if the table is not found or schema retrieval fails.
-async fn get_table_schema(
+pub(crate) async fn get_table_schema(
     ctx: &SessionContext,
     table_name: &str,
     semantics: &SemanticsRegistry,
