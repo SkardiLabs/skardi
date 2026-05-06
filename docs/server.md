@@ -54,8 +54,11 @@ On startup the server:
 ## Dashboard
 
 Once the server is running, open `http://localhost:8080` in a browser to
-access the built-in dashboard. Today it covers pipelines — each
-registered pipeline is shown as a card with:
+access the built-in dashboard. The dashboard has three tabs covering the
+three primitives the server exposes — **Pipelines**, **Jobs**, and
+**Semantics** — and a shared filter input scoped to the active tab.
+
+**Pipelines tab.** One card per registered pipeline, with:
 
 - **Endpoint URL** — the `POST` path to call, with a one-click copy button.
 - **Parameters** — names and inferred types extracted from the pipeline SQL.
@@ -63,9 +66,35 @@ registered pipeline is shown as a card with:
 - **Try It** — an interactive panel to edit the JSON body and execute the
   pipeline from the browser.
 
+**Jobs tab.** One card per registered job:
+
+- **Endpoint URL** — `POST /jobs/<name>/run`.
+- **Destination** — table, write mode, `create_if_missing`, and the
+  optional `timeout_ms` from the job YAML.
+- **Parameters** — names and inferred types from the job SQL.
+- **Example request** — `curl` for a fresh submit.
+- **Submit Run** — interactive panel that submits to the run endpoint and
+  shows the response (`{ run_id, status }` on success, the structured
+  error body on failure).
+- **Recent Runs** — the five most recent runs for this job (id, status,
+  relative time), refreshed automatically after a submit and via a
+  manual *Refresh* button.
+
+When the server was started without `--jobs`, this tab shows an empty
+state pointing back to the flag. When `--jobs` was given but no job YAML
+loaded, it shows "No jobs registered."
+
+**Semantics tab.** One card per registered data source, with:
+
+- **Source name and type** (e.g. `csv`, `postgres`, `lance`).
+- **Table description** — merged from the `kind: semantics` overlay first,
+  ctx-inline `description` second, "No description provided." otherwise.
+- **Columns** — every column on the registered table with its Arrow type
+  and the column-level description from the semantics overlay (or
+  "No description.").
+
 No configuration required — the dashboard is built into `skardi-server`
-and updates automatically when pipelines reload. A job-side dashboard
-view (recent runs, submit / poll / cancel) is on the roadmap.
+and updates automatically when pipelines, jobs, or semantics reload.
 
 ---
 

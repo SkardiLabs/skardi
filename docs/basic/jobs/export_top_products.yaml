@@ -1,0 +1,24 @@
+kind: job
+
+metadata:
+  name: "export-top-products"
+  version: "1.0.0"
+  description: >
+    Demo job for the dashboard's Jobs tab. Exports the top-priced products
+    in a category to a Lance dataset. The dashboard renders the card from
+    this YAML alone — actually submitting a run requires registering
+    `products_export` as a Lance data source in ctx.yaml.
+
+spec:
+  query: |
+    SELECT "Name", "Brand", "Category", "Price"
+    FROM products
+    WHERE "Category" = {category}
+    ORDER BY "Price" DESC
+    LIMIT {limit}
+  destination:
+    table: "products_export"
+    mode: append
+    create_if_missing: true
+  execution:
+    timeout_ms: 300000
