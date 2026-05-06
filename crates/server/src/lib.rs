@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod gui;
 pub mod handlers;
 pub mod jobs_handlers;
 pub mod metrics;
