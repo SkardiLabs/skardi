@@ -40,7 +40,7 @@
 
 ## Get started in 60 seconds — drop-in skills
 
-**The fastest way to put Skardi in your agent's hands.** Install a ready-made skill from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — each one renders the `ctx.yaml` + pipelines for you and wires them up as agent-callable verbs. Zero config to write, zero infra to provision by default. Open Claude Code, install, ask your agent to query your data — that's the loop.
+**It's ok not to fully understand all the buzz words we are talking about** — you can just try out Skardi by putting it in your agent's hands through **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**! Each skill renders the `ctx.yaml` + pipelines for you and wires them up as agent-callable verbs. Zero config to write, zero infra to provision by default. Open Claude Code, install, ask your agent to query your data — that's the loop.
 
 - **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
 - **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
