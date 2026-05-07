@@ -31,7 +31,7 @@
 [![Docs Badge]][Docs]
 [![Discord Badge]][Discord]
 
-[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/) [![Install skardi-skills from Claude Marketplace](https://img.shields.io/badge/Install-skardi--skills-D97757?style=for-the-badge&label=Claude%20Marketplace)](https://github.com/SkardiLabs/skardi-skills)
+[![Deploy on Sealos](https://img.shields.io/badge/Deploy-skardi-239BF8?style=for-the-badge&label=Sealos)](https://sealos.io/products/app-store/skardi/) [![Install skardi-skills from Claude Marketplace](https://img.shields.io/badge/Install-skardi--skills-D97757?style=for-the-badge&label=Claude%20Marketplace)](https://github.com/SkardiLabs/skardi-skills)
 
 </p>
 </div>
