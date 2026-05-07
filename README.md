@@ -55,7 +55,7 @@ Borrowing Spark's shape — one engine over every data source — but tilted for
     </picture>
   </a>
   <br>
-  <sub><em>fig. 01 — skardi open source topology.</em> <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
+  <sub><a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
 </p>
 
 ---
