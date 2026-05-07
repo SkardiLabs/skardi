@@ -68,7 +68,7 @@
   <!-- header tag -->
   <g transform="translate(36, 38)">
     <circle class="blink" cx="6" cy="0" r="5" fill="#1a7f37"/>
-    <text x="20" y="5" class="mono ink3 upper b" font-size="14">SKARDI · OPEN SOURCE</text>
+    <text x="20" y="5" class="mono ink3 upper b" font-size="14">SKARDI</text>
   </g>
 
   <!-- ============== CONNECTOR FLOW LINES ============== -->

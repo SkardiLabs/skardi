@@ -92,7 +92,7 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
     </picture>
   </a>
   <br>
-  <sub><em>fig. 01 — skardi open source topology.</em> <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
+  <sub><a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
 </p>
 
 ---
