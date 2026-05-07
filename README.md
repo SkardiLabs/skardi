@@ -31,12 +31,25 @@
 [![Docs Badge]][Docs]
 [![Discord Badge]][Discord]
 
-[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/)
+[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/) [![Install skardi-skills from Claude Marketplace](https://img.shields.io/badge/Install-skardi--skills-D97757?style=for-the-badge&label=Claude%20Marketplace)](https://github.com/SkardiLabs/skardi-skills)
 
 </p>
 </div>
 
 <hr />
+
+## Get started in 60 seconds — drop-in skills
+
+**The fastest way to put Skardi in your agent's hands.** Install a ready-made skill from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — each one renders the `ctx.yaml` + pipelines for you and wires them up as agent-callable verbs. Zero config to write, zero infra to provision by default. Open Claude Code, install, ask your agent to query your data — that's the loop.
+
+- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
+- **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
+
+Read-only RAG is a perfectly good first use case for the plane: you get the semantic overlay (the agent reads what your tables are for), one engine that can later JOIN against your operational data, and a swappable backend (move from SQLite-on-disk to Postgres + pgvector to Lance without touching the agent). The same plane keeps earning as the agent starts to *write* — that's where lineage and branching kick in.
+
+Curious why a uniform plane matters? Read on.
+
+---
 
 ## What is an "agent data plane"?
 
@@ -94,17 +107,6 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
   <br>
   <sub><a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
 </p>
-
----
-
-## Drop-in skills — go from zero to grounded retrieval in 60 seconds
-
-The fastest path to put Skardi in front of your agent is to install one of our ready-made skills from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Each skill renders the `ctx.yaml` + pipelines for you and wires them up as agent-callable verbs — zero config to write yourself.
-
-- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
-- **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
-
-Read-only RAG is a perfectly good first use case for the plane: you get the semantic overlay (the agent reads what your tables are for), one engine that can later JOIN against your operational data, and a swappable backend (move from SQLite-on-disk to Postgres + pgvector to Lance without touching the agent). The same plane keeps earning as the agent starts to *write* — that's where lineage and branching kick in. Drop a skill in to see the shape; read on if you want to build pipelines of your own.
 
 ---
 
