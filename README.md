@@ -3,7 +3,7 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**Skardi is an open-source agent data plane** — every read and write your agent makes flows through one uniform layer of parameterized SQL pipelines, served as REST endpoints and shell verbs your agent calls as tools. Putting reads and writes behind the same plane is what makes the durable thing possible: semantic discovery, audit, and rollback compose across your whole stack instead of fragmenting across SDKs — turning *data autonomy* (letting the agent decide what to query and write) from a gamble into a default you can actually govern.
+**Skardi is an open-source agent data plane** — parameterized SQL templates served as REST endpoints (and shell verbs) your agent calls as tools, turning *data autonomy* (letting the agent decide what to query and write) into a default you can govern.
 
 **Federated** · one engine over every source &nbsp;·&nbsp; **Governed** · semantic overlay, lineage, branching &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
 
