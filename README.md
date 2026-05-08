@@ -54,8 +54,8 @@ You build the agent. Skardi handles the data plane.
 
 **Don't worry about the buzz words below — just install [skardi-skills](https://github.com/SkardiLabs/skardi-skills) and your agent gets a working Skardi tool.** No config, no infra.
 
-- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
 - **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
+- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
 
 Read-only RAG is a perfectly good first use case for the plane: you get the semantic overlay (the agent reads what your tables are for), one engine that can later JOIN against your operational data, and a swappable backend (move from SQLite-on-disk to Postgres + pgvector to Lance without touching the agent). The same plane keeps earning as the agent starts to *write* — that's where lineage and branching kick in.
 
