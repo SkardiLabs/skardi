@@ -67,6 +67,18 @@ Curious why a uniform plane matters? Read on.
 
 ---
 
+## ⭐️ Star the Repository
+
+If **skardi-skills** lands well in your agentic stack — auto-RAG up in a minute, a knowledge base your agent actually grounds in — drop a ⭐️ on this repo. It helps other agent builders discover Skardi, makes onboarding their first agent that much shorter, and signals which directions are worth pushing on.
+
+<p align="center">
+  <a href="https://github.com/SkardiLabs/skardi">
+    <img src="asset/skardi-star.gif" alt="Star Skardi" width="700">
+  </a>
+</p>
+
+---
+
 ## What is an "agent data plane"?
 
 Borrowing the phrase from cloud infra: your AI agent has two layers. The **control plane** is the reasoning loop — prompts, tool selection, your orchestration code. The **data plane** is where every byte of context comes from and goes to: vector DB hits, SQL queries, file reads, writes back, audit trails.
@@ -139,18 +151,6 @@ Direct SDKs work fine for a single read-only RAG bot — you can wire one to Pos
 If your agent only ever reads from one source, direct SDKs are simpler. If it reads from many, or writes back, or you want to govern what it does — the plane is what makes data autonomy a responsible default rather than a gamble.
 
 Full breakdown of the three primitives — semantic-overlay YAML, the verbatim run-ledger schema, and why each primitive requires a chokepoint — in [docs/agent_data_plane.md](docs/agent_data_plane.md).
-
----
-
-## ⭐️ Star the Repository
-
-If you find Skardi useful or interesting, a GitHub Star ⭐️ would be greatly appreciated — it helps others discover the project and signals which directions are worth pushing on.
-
-<p align="center">
-  <a href="https://github.com/SkardiLabs/skardi">
-    <img src="asset/skardi-star.gif" alt="Star Skardi" width="700">
-  </a>
-</p>
 
 ---
 ## Quick Start
