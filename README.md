@@ -18,7 +18,7 @@
 [Codecov]: https://codecov.io/gh/SkardiLabs/skardi
 [Codecov Badge]: https://codecov.io/gh/SkardiLabs/skardi/branch/main/graph/badge.svg
 [crates.io]: https://crates.io/crates/skardi
-[crates.io Badge]: https://img.shields.io/crates/v/skardi.svg
+[crates.io Badge]: https://img.shields.io/crates/v/skardi?logo=rust
 [Docs]: https://docs.rs/skardi
 [Docs Badge]: https://docs.rs/skardi/badge.svg
 [Discord]: https://discord.gg/S5YQQPEV2m
