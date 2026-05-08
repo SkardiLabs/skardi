@@ -47,6 +47,17 @@
 
 Read-only RAG is a perfectly good first use case for the plane: you get the semantic overlay (the agent reads what your tables are for), one engine that can later JOIN against your operational data, and a swappable backend (move from SQLite-on-disk to Postgres + pgvector to Lance without touching the agent). The same plane keeps earning as the agent starts to *write* — that's where lineage and branching kick in.
 
+**Install in Claude Code** — run these inside any Claude Code session:
+
+```text
+/plugin marketplace add SkardiLabs/skardi-skills
+/plugin install skardi-deploy-and-patterns@skardi-skills
+/plugin install auto-knowledge-base@skardi-skills
+/plugin install auto-rag@skardi-skills
+```
+
+That's it — the skills are now available across all your projects, and `/plugin marketplace update skardi-skills` pulls future versions. Cursor and other [Agent Skills](https://agentskills.io/)-compatible tools, plus a manual-copy fallback, are documented in the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+
 Curious why a uniform plane matters? Read on.
 
 ---
