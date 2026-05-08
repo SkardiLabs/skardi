@@ -1,0 +1,10 @@
+<svg width="185" height="42" viewBox="0 0 185 42" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0.5" width="184" height="41.2" rx="6.7" fill="#D97757"/>
+  <g transform="translate(14, 11)">
+    <path d="M10 0 L11.6 7.4 L19 9 L11.6 10.6 L10 18 L8.4 10.6 L1 9 L8.4 7.4 Z" fill="#FFFFFF"/>
+    <circle cx="2.5" cy="2" r="1.5" fill="#FFFFFF" fill-opacity="0.75"/>
+    <circle cx="17.5" cy="17" r="1.2" fill="#FFFFFF" fill-opacity="0.75"/>
+  </g>
+  <text x="46" y="19" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF" fill-opacity="0.85">Install on</text>
+  <text x="46" y="33" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#FFFFFF">Claude Skills</text>
+</svg>

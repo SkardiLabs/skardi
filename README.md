@@ -3,7 +3,7 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**Skardi is an open-source agent data plane** — every read and write your agent makes flows through one uniform layer of parameterized SQL pipelines, served as REST endpoints and shell verbs your agent calls as tools. Putting reads and writes behind the same plane is what makes the durable thing possible: semantic discovery, audit, and rollback compose across your whole stack instead of fragmenting across SDKs — turning *data autonomy* (letting the agent decide what to query and write) from a gamble into a default you can actually govern.
+**Skardi is an open-source agent data plane** — parameterized SQL templates served as REST endpoints (and shell verbs) your agent calls as tools, turning *data autonomy* (letting the agent decide what to query and write) into a default you can govern.
 
 **Federated** · one engine over every source &nbsp;·&nbsp; **Governed** · semantic overlay, lineage, branching &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
 
@@ -31,12 +31,53 @@
 [![Docs Badge]][Docs]
 [![Discord Badge]][Discord]
 
-[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/)
+[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/skardi/) [![Install on Claude Skills](asset/Install-Claude-Skills.svg)](https://github.com/SkardiLabs/skardi-skills)
 
 </p>
 </div>
 
 <hr />
+
+## Why Skardi?
+
+**The most agent-friendly backend for builders shipping their first AI agent.** The painful part of agent-building isn't the prompt — it's the data plumbing: a vector DB to stand up, an embedding pipeline to maintain, a chunker to debug, a tool-call wrapper to write for every query. Skardi auto-bootstraps the primitives every agent needs so you ship in hours, not weeks:
+
+- **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag) — Auto-RAG (Retrieval Augmented Generation).** Server-backed hybrid search (vector + full-text + RRF) via `skardi-server` over a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST. One command from a datastore to a working retrieval API your agent calls as a tool — no Python orchestration layer, no glue code.
+- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) — Auto agent knowledge base.** Point it at a directory of documents and you have a queryable, citable local KB one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded knowledge base over your files.
+- **Zero bootstrap** — `ctx.yaml`, pipelines, schema, server, all rendered for you by **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Install once and your agent has a working data tool the same hour.
+
+You build the agent. Skardi handles the data plane.
+
+---
+
+## Get started in 60 seconds — install on Claude Code
+
+Open any Claude Code session and run:
+
+```text
+/plugin marketplace add SkardiLabs/skardi-skills
+/plugin install skardi-deploy-and-patterns@skardi-skills
+/plugin install auto-knowledge-base@skardi-skills
+/plugin install auto-rag@skardi-skills
+```
+
+That's it — the skills are now available across all your projects, and `/plugin marketplace update skardi-skills` pulls future versions. For Cursor and other [Agent Skills](https://agentskills.io/)-compatible tools, plus a manual-copy fallback, see the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+
+Curious why a uniform plane matters? Read on.
+
+---
+
+## ⭐️ Star the Repository
+
+If **skardi-skills** lands well in your agentic stack — auto-RAG up in a minute, a knowledge base your agent actually grounds in — drop a ⭐️ on this repo. It helps other agent builders discover Skardi, makes onboarding their first agent that much shorter, and signals which directions are worth pushing on.
+
+<p align="center">
+  <a href="https://github.com/SkardiLabs/skardi">
+    <img src="asset/skardi-star.gif" alt="Star Skardi" width="700">
+  </a>
+</p>
+
+---
 
 ## What is an "agent data plane"?
 
@@ -97,17 +138,6 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
 
 ---
 
-## Drop-in skills — go from zero to grounded retrieval in 60 seconds
-
-The fastest path to put Skardi in front of your agent is to install one of our ready-made skills from **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Each skill renders the `ctx.yaml` + pipelines for you and wires them up as agent-callable verbs — zero config to write yourself.
-
-- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)** — point it at a directory of documents and you have a queryable local RAG one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded, citable knowledge base over your files.
-- **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)** — server-backed hybrid-search RAG via `skardi-server` on top of a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST — for when retrieval needs to be shared across multiple agents or processes.
-
-Read-only RAG is a perfectly good first use case for the plane: you get the semantic overlay (the agent reads what your tables are for), one engine that can later JOIN against your operational data, and a swappable backend (move from SQLite-on-disk to Postgres + pgvector to Lance without touching the agent). The same plane keeps earning as the agent starts to *write* — that's where lineage and branching kick in. Drop a skill in to see the shape; read on if you want to build pipelines of your own.
-
----
-
 ## When does a uniform data plane earn its keep?
 
 Direct SDKs work fine for a single read-only RAG bot — you can wire one to Postgres + a vector DB and ship in an afternoon. The plane earns its keep cumulatively: every property below is true on day one for the simplest agent, and the last three become load-bearing once the agent starts writing, you add a second agent, or "what did the agent do yesterday?" stops being a rhetorical question.
@@ -121,18 +151,6 @@ Direct SDKs work fine for a single read-only RAG bot — you can wire one to Pos
 If your agent only ever reads from one source, direct SDKs are simpler. If it reads from many, or writes back, or you want to govern what it does — the plane is what makes data autonomy a responsible default rather than a gamble.
 
 Full breakdown of the three primitives — semantic-overlay YAML, the verbatim run-ledger schema, and why each primitive requires a chokepoint — in [docs/agent_data_plane.md](docs/agent_data_plane.md).
-
----
-
-## ⭐️ Star the Repository
-
-If you find Skardi useful or interesting, a GitHub Star ⭐️ would be greatly appreciated — it helps others discover the project and signals which directions are worth pushing on.
-
-<p align="center">
-  <a href="https://github.com/SkardiLabs/skardi">
-    <img src="asset/skardi-star.gif" alt="Star Skardi" width="700">
-  </a>
-</p>
 
 ---
 ## Quick Start
