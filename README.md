@@ -38,6 +38,18 @@
 
 <hr />
 
+## Why Skardi?
+
+**The most agent-friendly backend for builders shipping their first AI agent.** The painful part of agent-building isn't the prompt — it's the data plumbing: a vector DB to stand up, an embedding pipeline to maintain, a chunker to debug, a tool-call wrapper to write for every query. Skardi auto-bootstraps the primitives every agent needs so you ship in hours, not weeks:
+
+- **Auto-RAG (Retrieval Augmented Generation)** — hybrid search (vector + full-text + RRF) over your datastore, served as REST endpoints your agent calls as tools. One command from a datastore to a working retrieval API. No Python orchestration layer, no glue code.
+- **Auto agent knowledge base** — point at a directory of documents and get a queryable, citable knowledge base one command later. Chunking, embedding, indexing, hybrid retrieval — all handled.
+- **Zero bootstrap** — `ctx.yaml`, pipelines, schema, server, all rendered for you by **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Install once and your agent has a working data tool the same hour.
+
+You build the agent. Skardi handles the data plane.
+
+---
+
 ## Get started in 60 seconds — drop-in skills
 
 **Don't worry about the buzz words below — just install [skardi-skills](https://github.com/SkardiLabs/skardi-skills) and your agent gets a working Skardi tool.** No config, no infra.
