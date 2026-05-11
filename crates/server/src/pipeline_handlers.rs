@@ -25,9 +25,35 @@ use skardi::pipeline::pipeline::Pipeline;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::auth::context::require_scope;
 use crate::config::DataSourceType;
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
+
+/// Bridge from a `require_scope` failure (which returns a raw `Response<Body>`)
+/// to the `(StatusCode, Json<ErrorResponse>)` shape every pipeline handler
+/// uses for its error path. Buffers the body once to extract the message;
+/// falls back to a generic string if the response body is not JSON.
+async fn auth_failure_to_error(
+    response: axum::http::Response<axum::body::Body>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = response.status();
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap_or_default();
+    let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+    let msg = parsed
+        .as_ref()
+        .and_then(|v| v["error"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Authentication required".to_string());
+    let kind = if status == StatusCode::FORBIDDEN {
+        "forbidden"
+    } else {
+        "unauthorized"
+    };
+    (status, create_error_response(&msg, kind, parsed))
+}
 
 /// Request structure for pipeline execution
 #[derive(Debug, Deserialize)]
@@ -196,8 +222,13 @@ pub(crate) async fn get_table_schema(
 /// - Checks that required data sources are accessible
 pub async fn pipeline_health_check(
     State(app_state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let required = format!("pipeline:read:{name}");
+    if let Err(resp) = require_scope(&app_state, &headers, &required).await {
+        return Err(auth_failure_to_error(resp).await);
+    }
     let start_time = Instant::now();
 
     // Get pipeline and data sources info
@@ -288,15 +319,43 @@ pub async fn pipeline_health_check(
 }
 
 /// List all pipelines endpoint - GET /pipelines
-pub async fn list_pipelines(State(app_state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let config = app_state
-        .config
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+///
+/// Result is filtered to pipelines the caller has `pipeline:read:<name>`
+/// for. A caller with no matching grants gets a 200 with an empty list,
+/// not a 403 — this lets generic dashboards probe the endpoint without
+/// blowing up for low-privilege users.
+pub async fn list_pipelines(
+    State(app_state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::auth::context::extract_auth_context;
+    use crate::auth::scope::any_scope_matches;
+
+    let ctx = match extract_auth_context(&app_state, &headers).await {
+        Ok(c) => c,
+        Err(_) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                create_error_response("Authentication required", "unauthorized", None),
+            ));
+        }
+    };
+
+    let config = app_state.config.read().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            create_error_response(
+                "Failed to acquire read lock on configuration",
+                "internal_error",
+                None,
+            ),
+        )
+    })?;
 
     let pipelines: Vec<Value> = config
         .pipelines
         .iter()
+        .filter(|(name, _)| any_scope_matches(&ctx.scopes, &format!("pipeline:read:{name}")))
         .map(|(name, pipeline)| {
             serde_json::json!({
                 "name": name,
@@ -318,8 +377,13 @@ pub async fn list_pipelines(State(app_state): State<AppState>) -> Result<Json<Va
 /// Get specific pipeline information endpoint - GET /pipeline/:name
 pub async fn get_pipelines_info(
     State(app_state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let required = format!("pipeline:read:{name}");
+    if let Err(resp) = require_scope(&app_state, &headers, &required).await {
+        return Err(auth_failure_to_error(resp).await);
+    }
     let config = app_state.config.read().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -376,7 +440,14 @@ pub async fn get_pipelines_info(
 /// path/URL, registered tables, and schemas.
 pub async fn get_data_sources(
     State(app_state): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Reading data-source schemas is broad — gate on a single coarse
+    // scope rather than per-source so the dashboard "data sources" tab
+    // continues to work for any operator/viewer.
+    if let Err(resp) = require_scope(&app_state, &headers, "data_source:read:*").await {
+        return Err(auth_failure_to_error(resp).await);
+    }
     // Acquire lock and extract data sources + semantics, then drop lock
     // before async operations.
     let (data_sources, semantics) = {
@@ -649,16 +720,9 @@ pub async fn execute_pipeline_by_name(
     Path(pipeline_name): Path<String>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
-        let status = unauth_response.status();
-        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
-            .await
-            .unwrap_or_default();
-        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Authentication required".to_string());
-        return Err((status, create_error_response(&msg, "unauthorized", None)));
+    let required = format!("pipeline:execute:{pipeline_name}");
+    if let Err(resp) = require_scope(&app_state, &headers, &required).await {
+        return Err(auth_failure_to_error(resp).await);
     }
     let start_time = Instant::now();
 
@@ -924,6 +988,7 @@ spec:
             session_ctx,
             metrics: PipelineMetrics::new(),
             auth_layer: crate::auth::layer::AuthLayer::None,
+            api_keys: None,
             jobs: None,
         }
     }
@@ -1013,6 +1078,7 @@ spec:
             session_ctx: session_ctx_arc,
             metrics: PipelineMetrics::new(),
             auth_layer: crate::auth::layer::AuthLayer::None,
+            api_keys: None,
             jobs: None,
         };
 

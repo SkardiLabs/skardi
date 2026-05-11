@@ -98,6 +98,7 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
         session_ctx: Arc::clone(&ctx),
         metrics: PipelineMetrics::new(),
         auth_layer: AuthLayer::None,
+        api_keys: None,
         jobs: None,
     }
 }

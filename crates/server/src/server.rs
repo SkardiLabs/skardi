@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     Router,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
+use crate::auth::api_keys::{ApiKeyStore, resolve_default_path as resolve_api_keys_path};
 use crate::auth::mode::AuthMode;
 use crate::config::ServerConfig;
 #[cfg(feature = "candle")]
@@ -48,6 +49,10 @@ pub struct AppState {
     pub metrics: PipelineMetrics,
     /// Active authentication layer (NoAuth by default)
     pub auth_layer: AuthLayer,
+    /// Bearer-token (API key) store. Present whenever the auth layer is
+    /// enabled; `None` when `AUTH_MODE=NO_AUTH` so machine credentials
+    /// are not silently honored without an underlying user.
+    pub api_keys: Option<ApiKeyStore>,
     /// Jobs executor + run ledger. `None` when the server was started
     /// without `--jobs`, which disables every `/jobs/*` endpoint.
     pub jobs: Option<Arc<JobExecutor>>,
@@ -161,6 +166,18 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         crate::auth::bridge::register_auth_tables(&mut session_ctx, auth.clone())?;
     }
 
+    // Bearer-token store sits next to the auth DB (separate file). Built
+    // only when auth is enabled — there's no point minting per-user API
+    // keys when there are no users to attach them to.
+    let api_keys = if auth_layer.is_enabled() {
+        let path = resolve_api_keys_path()
+            .map_err(|e| anyhow::anyhow!("Failed to resolve api_keys.db path: {e}"))?;
+        tracing::info!("Opening api_keys store at {}", path.display());
+        Some(ApiKeyStore::open(&path).await?)
+    } else {
+        None
+    };
+
     // Wrap SessionContext in Arc for sharing between engine and pipeline loading
     let session_ctx_arc = Arc::new(session_ctx);
 
@@ -217,6 +234,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         session_ctx: session_ctx_arc,
         metrics: PipelineMetrics::new(),
         auth_layer,
+        api_keys,
         jobs: jobs_bundle,
     };
 
@@ -262,11 +280,20 @@ pub fn configure_routes(state: AppState) -> Router {
         .route("/jobs/runs/:run_id/cancel", post(cancel_job_run));
 
     if state.auth_layer.is_enabled() {
-        tracing::info!("Auth enabled: mounting /api/auth/* routes");
-        router = router.route(
-            "/api/auth/*path",
-            axum::routing::any(crate::auth::routes::auth_handler),
-        );
+        tracing::info!("Auth enabled: mounting /api/auth/* and /api/keys routes");
+        router = router
+            .route(
+                "/api/auth/*path",
+                axum::routing::any(crate::auth::routes::auth_handler),
+            )
+            .route(
+                "/api/keys",
+                post(crate::auth::keys_routes::create_key).get(crate::auth::keys_routes::list_keys),
+            )
+            .route(
+                "/api/keys/:id",
+                delete(crate::auth::keys_routes::revoke_key),
+            );
     }
 
     router.with_state(state)

@@ -14,14 +14,39 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::jobs::{JobRun, JobSubmitError};
 use std::collections::HashMap;
 
+use crate::auth::context::{extract_auth_context, require_scope};
+use crate::auth::scope::any_scope_matches;
 use crate::server::AppState;
+
+/// Translate a `require_scope` failure into the `(StatusCode,
+/// Json<JobErrorResponse>)` shape every job endpoint already uses.
+async fn auth_failure_to_job_error(
+    response: axum::http::Response<axum::body::Body>,
+) -> (StatusCode, Json<JobErrorResponse>) {
+    let status = response.status();
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap_or_default();
+    let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+    let msg = parsed
+        .as_ref()
+        .and_then(|v| v["error"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Authentication required".to_string());
+    let kind = if status == StatusCode::FORBIDDEN {
+        "forbidden"
+    } else {
+        "unauthorized"
+    };
+    (status, error_json(&msg, kind, parsed))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitRunRequest {
@@ -92,9 +117,14 @@ fn job_run_to_json(run: &JobRun) -> Value {
 /// `POST /jobs/:name/run`
 pub async fn submit_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(req): Json<SubmitRunRequest>,
 ) -> Result<Json<SubmitRunResponse>, (StatusCode, Json<JobErrorResponse>)> {
+    let required = format!("jobs:submit:{name}");
+    if let Err(resp) = require_scope(&app_state, &headers, &required).await {
+        return Err(auth_failure_to_job_error(resp).await);
+    }
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -131,6 +161,7 @@ pub async fn submit_job_run(
 /// `GET /jobs/runs/:run_id`
 pub async fn get_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
     let Some(executor) = app_state.jobs.clone() else {
@@ -140,7 +171,17 @@ pub async fn get_job_run(
         ));
     };
     match executor.store().get_run(&run_id).await {
-        Ok(Some(run)) => Ok(Json(job_run_to_json(&run))),
+        Ok(Some(run)) => {
+            // Per-job scope check: caller must be allowed to read THIS
+            // job specifically. We have to fetch the run first to know
+            // which job it belongs to — there's no other way to derive
+            // the scope from a `run_id` alone.
+            let required = format!("jobs:read:{}", run.job_name);
+            if let Err(resp) = require_scope(&app_state, &headers, &required).await {
+                return Err(auth_failure_to_job_error(resp).await);
+            }
+            Ok(Json(job_run_to_json(&run)))
+        }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             error_json(&format!("Run '{run_id}' not found"), "unknown_run", None),
@@ -159,8 +200,14 @@ pub struct ListRunsQuery {
 }
 
 /// `GET /jobs/runs?job=...&limit=...`
+///
+/// When `?job=name` is set, gates on `jobs:read:<name>`. Without a
+/// filter we authenticate the caller and then post-filter the listing
+/// to the runs whose `job_name` they have a matching `jobs:read:` scope
+/// for — same shape as `list_pipelines`.
 pub async fn list_job_runs(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
     let Some(executor) = app_state.jobs.clone() else {
@@ -169,14 +216,36 @@ pub async fn list_job_runs(
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
+
+    let ctx = match (&q.job, extract_auth_context(&app_state, &headers).await) {
+        (Some(job_name), _) => {
+            let required = format!("jobs:read:{job_name}");
+            match require_scope(&app_state, &headers, &required).await {
+                Ok(c) => c,
+                Err(resp) => return Err(auth_failure_to_job_error(resp).await),
+            }
+        }
+        (None, Ok(c)) => c,
+        (None, Err(_)) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                error_json("Authentication required", "unauthorized", None),
+            ));
+        }
+    };
+
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     match executor.store().list_runs(q.job.as_deref(), limit).await {
         Ok(runs) => {
-            let body: Vec<Value> = runs.iter().map(job_run_to_json).collect();
+            let visible: Vec<&JobRun> = runs
+                .iter()
+                .filter(|r| any_scope_matches(&ctx.scopes, &format!("jobs:read:{}", r.job_name)))
+                .collect();
+            let body: Vec<Value> = visible.iter().map(|r| job_run_to_json(r)).collect();
             Ok(Json(serde_json::json!({
                 "success": true,
                 "runs": body,
-                "count": runs.len(),
+                "count": visible.len(),
             })))
         }
         Err(e) => Err((
@@ -191,6 +260,7 @@ pub async fn list_job_runs(
 /// the executor.
 pub async fn cancel_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
     let Some(executor) = app_state.jobs.clone() else {
@@ -199,6 +269,29 @@ pub async fn cancel_job_run(
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
+    // Same lookup-then-authorize pattern as `get_job_run` — the scope
+    // string includes the job name, which we don't have until we fetch
+    // the run. Unknown run → 404 before any scope check (no information
+    // leak: the caller already authenticated to reach this handler? No
+    // — we currently leak existence to unauthenticated callers. For v1
+    // this matches the existing handler's behaviour; tightening means
+    // checking auth first and returning a generic 401 either way.
+    let run = executor.store().get_run(&run_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&e.to_string(), "internal_error", None),
+        )
+    })?;
+    let Some(run) = run else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            error_json(&format!("Run '{run_id}' not found"), "unknown_run", None),
+        ));
+    };
+    let required = format!("jobs:cancel:{}", run.job_name);
+    if let Err(resp) = require_scope(&app_state, &headers, &required).await {
+        return Err(auth_failure_to_job_error(resp).await);
+    }
     let cancelled = executor.cancel(&run_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -213,9 +306,12 @@ pub async fn cancel_job_run(
 }
 
 /// `GET /jobs` — list registered job names with their destinations. Useful
-/// for CLI discovery.
+/// for CLI discovery. Result is filtered to jobs the caller has
+/// `jobs:read:<name>` for; an authenticated caller with no matching
+/// grants gets a 200 with an empty list.
 pub async fn list_jobs(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
@@ -223,9 +319,21 @@ pub async fn list_jobs(
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
+    let ctx = match extract_auth_context(&app_state, &headers).await {
+        Ok(c) => c,
+        Err(_) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                error_json("Authentication required", "unauthorized", None),
+            ));
+        }
+    };
     let names = executor.list_jobs().await;
     let mut items = Vec::with_capacity(names.len());
     for name in &names {
+        if !any_scope_matches(&ctx.scopes, &format!("jobs:read:{name}")) {
+            continue;
+        }
         if let Some(def) = executor.get_job(name).await {
             let params: Vec<String> = def.pipeline.request_schema.fields.keys().cloned().collect();
             items.push(serde_json::json!({
