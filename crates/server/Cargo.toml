@@ -22,6 +22,8 @@ gguf = ["skardi/gguf"]
 chunking = ["skardi/chunking"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
+# OTEL consumer (Prometheus + Loki federated reader): passthrough to skardi.
+otel = ["skardi/otel"]
 
 [dependencies]
 better-auth = { workspace = true }
@@ -62,7 +64,10 @@ url = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 http-body-util = "0.1"
+serde_json = { workspace = true }
 skardi = { path = "../skardi" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
+# Stubs Prometheus/Loki upstreams for the demo smoke test (tasks 8.3).
+wiremock = "0.6"

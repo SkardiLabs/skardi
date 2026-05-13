@@ -1,5 +1,20 @@
 use opentelemetry::{KeyValue, global, metrics::Counter, metrics::Histogram};
 
+// ----------------------------------------------------------------------------
+// OTEL consumer source metrics (task 7.3 of add-otel-data-source)
+//
+// The Prometheus/Loki provider records its own per-query metrics from inside
+// the skardi crate (so the recording site sits next to the HTTP call):
+//
+//   skardi_otel_queries_total          (counter)   labels: source, backend, outcome
+//   skardi_otel_query_duration_seconds (histogram) labels: source, backend
+//
+// They share this binary's `opentelemetry::global` meter provider initialised
+// in `telemetry::init`. See `skardi::sources::providers::otel::metrics` for
+// the instrument definitions, the `Outcome` enum, and the per-error-variant
+// mapping driving the `outcome=` label.
+// ----------------------------------------------------------------------------
+
 /// Per-pipeline OTel metrics instruments.
 ///
 /// Instruments are created once at startup from the global meter provider

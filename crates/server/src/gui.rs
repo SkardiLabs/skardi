@@ -155,8 +155,9 @@ const JOB_CARD_TEMPLATE: &str = r#"<article class="pipeline-card job-card">
 const SEMANTICS_CARD_TEMPLATE: &str = r#"<article class="semantics-card">
     <header>
         <h2>{{NAME}}</h2>
-        <span class="source-type">{{TYPE}}</span>
+        <span class="source-type">{{TYPE}}</span>{{ACCESS_BADGE}}
     </header>
+    {{SUBTITLE_BLOCK}}
     {{DESCRIPTION_BLOCK}}
     <div class="columns-section">
         <h3>Columns</h3>
@@ -318,6 +319,7 @@ fn data_source_type_str(t: &DataSourceType) -> &'static str {
         DataSourceType::Lance => "lance",
         DataSourceType::Redis => "redis",
         DataSourceType::Seekdb => "seekdb",
+        DataSourceType::Otel => "otel",
     }
 }
 
@@ -361,11 +363,54 @@ async fn render_semantics_card(
         Err(_) => r#"<div class="col-row"><span class="col-name no-desc">Schema not available.</span></div>"#.to_string(),
     };
 
+    let access_badge = if ds.access_mode.is_read_write() {
+        r#" <span class="access-badge read-write">read-write</span>"#.to_string()
+    } else {
+        r#" <span class="access-badge read-only">read-only</span>"#.to_string()
+    };
+
+    // OTEL sources get a backend-specific subtitle ("Prometheus @ url" /
+    // "Loki @ url") so the dashboard surfaces what the federated source
+    // actually points at without leaking credentials. Other source
+    // types render with no subtitle.
+    let subtitle_block = render_source_subtitle(ds);
+
     SEMANTICS_CARD_TEMPLATE
         .replace("{{NAME}}", &escape_html(&ds.name))
         .replace("{{TYPE}}", data_source_type_str(&ds.source_type))
+        .replace("{{ACCESS_BADGE}}", &access_badge)
+        .replace("{{SUBTITLE_BLOCK}}", &subtitle_block)
         .replace("{{DESCRIPTION_BLOCK}}", &description_block)
         .replace("{{COLUMNS}}", &columns_html)
+}
+
+/// Produce a one-line `Prometheus @ http://…` / `Loki @ http://…`
+/// subtitle for OTEL data sources. Returns the empty string for any
+/// non-OTEL source so the template's `{{SUBTITLE_BLOCK}}` placeholder
+/// collapses cleanly.
+#[cfg(feature = "otel")]
+fn render_source_subtitle(ds: &DataSource) -> String {
+    if ds.source_type != DataSourceType::Otel {
+        return String::new();
+    }
+    let Some(otel) = ds.otel.as_ref() else {
+        return String::new();
+    };
+    use skardi::sources::providers::otel::OtelBackend;
+    let backend_label = match otel.backend {
+        OtelBackend::Prometheus => "Prometheus",
+        OtelBackend::Loki => "Loki",
+    };
+    format!(
+        r#"<div class="source-subtitle">{} @ {}</div>"#,
+        backend_label,
+        escape_html(otel.url.as_str())
+    )
+}
+
+#[cfg(not(feature = "otel"))]
+fn render_source_subtitle(_ds: &DataSource) -> String {
+    String::new()
 }
 
 /// Serve the dashboard UI - GET /

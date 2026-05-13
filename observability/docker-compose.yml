@@ -1,3 +1,15 @@
+# `docker compose up` (no profile) starts the FULL emitter-side stack
+# used by `docs/observability.md` (Skardi pushing OTLP into
+# otel-collector → tempo + prometheus + loki, all visible in
+# Grafana).
+#
+# `docker compose --profile demo up prometheus loki` is the consumer-side
+# subset used by `demo/otel_service_health/`: the demo only needs the
+# Prometheus + Loki HTTP query endpoints (:9090 and :3100). No profile
+# tagging is necessary on the service definitions because both
+# Prometheus and Loki are already part of the default stack — operators
+# running the full stack get them automatically; demo users explicitly
+# pass `prometheus loki` as the service args. See `docs/otel/README.md`.
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -50,3 +62,4 @@ services:
       - tempo
       - prometheus
       - loki
+    profiles: ["default"]

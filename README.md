@@ -114,7 +114,8 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
    your agent  ──▶  skardi  ──┬─▶  Postgres / MySQL / SQLite / MongoDB / Redis
    (Claude / GPT /     │              ├─▶  S3 / GCS / Azure (CSV, Parquet, Lance)
     Cursor / your      │              ├─▶  Apache Iceberg, Lance datasets
-    own loop)          │              └─▶  pgvector, sqlite-vec, Lance KNN, SeekDB HNSW
+    own loop)          │              ├─▶  pgvector, sqlite-vec, Lance KNN, SeekDB HNSW
+                       │              └─▶  Prometheus / Loki (metrics + logs as SQL)
                        │
                   parameterized SQL  ──▶  one JOIN can span all of the above
                   (YAML pipelines)
@@ -325,6 +326,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | Lance | Read (job-write) | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
 | S3 / GCS / Azure | Read | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
+| OpenTelemetry (Prometheus + Loki) | Read | Federated metrics + logs; predicate-pushdown `metrics` / `logs` tables + `prom_query` / `loki_query` escape hatches | [docs/otel/](docs/otel/) |
 
 ---
 

@@ -23,6 +23,8 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 chunking = ["dep:text-splitter"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
+# OTEL consumer: federated reader over Prometheus + Loki HTTP APIs.
+otel = ["dep:reqwest", "dep:humantime-serde", "dep:prometheus-http-query", "dep:opentelemetry"]
 
 [dependencies]
 # engine
@@ -51,6 +53,10 @@ candle-nn = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
 text-splitter = { version = "0.30", features = ["markdown"], optional = true }
+# otel consumer
+humantime-serde = { version = "1.1", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+prometheus-http-query = { version = "0.8", default-features = false, features = ["rustls-tls"], optional = true }
 # sources
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
@@ -80,3 +86,5 @@ tokio-test = "0.4"
 tempfile = { workspace = true }
 redis-test = "0.13.0"
 gguf-rs-lib = "0.2"
+# OTEL provider integration tests stub Prometheus/Loki HTTP endpoints.
+wiremock = "0.6"

@@ -354,6 +354,9 @@ impl JobExecutor {
                     "CSV/Parquet destinations are not supported — bare Parquet has no atomic commit; use Lance"
                 )))
             }
+            Some(DataSourceType::Otel) => Err(JobSubmitError::Internal(anyhow::anyhow!(
+                "OTEL sources are read-only; INSERT/UPDATE/DELETE should have been rejected by the SQL validator"
+            ))),
             None => {
                 // A dotted identifier whose root is not a known source is
                 // almost certainly a typo — a real catalog-registered source
