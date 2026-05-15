@@ -388,9 +388,10 @@ fn parse_prom_value(s: &str) -> f64 {
 // Render PromQuerySpec → PromQL string
 // ---------------------------------------------------------------------------
 
-/// v1 emits selectors with no label-key matchers since 3.5.2 does not
-/// yet recognize them; section 4 will extend this once map_extract
-/// Expr shapes are validated against the real planner.
+/// The translator pre-renders `selector` from `metric_name` +
+/// `label_matchers`, so this is a straight passthrough. Kept as a
+/// named function so 4.2's aggregate-pushdown path can wrap it
+/// (`<agg> by(<keys>)(<selector>)`) without re-parsing.
 fn render_promql(spec: &PromQuerySpec) -> String {
     spec.selector.clone()
 }

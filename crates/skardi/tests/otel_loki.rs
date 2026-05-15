@@ -99,9 +99,8 @@ fn matrix_response_body() -> serde_json::Value {
 async fn tier1_logs_table_rejects_select_star_without_stream_label_predicate() {
     let (_server, ctx, _cfg) = fixture().await;
 
-    // v1 translator can't recognize `labels['app']='X'` matchers yet
-    // (3.5.3 deferred), so any tier-1 logs query falls through to the
-    // empty-selector rejection.
+    // No `labels['k']` predicate → empty stream selector → table-level
+    // rejection. LogQL requires at least one stream-label matcher.
     let result = ctx.sql("SELECT * FROM logs").await.unwrap().collect().await;
     let err = result.expect_err("expected UnsupportedPushdown");
     let msg = err.to_string();
@@ -355,6 +354,70 @@ async fn row_cap_is_enforced_for_loki() {
         "error should mention cap: {msg}"
     );
     assert!(msg.contains("loki"), "error should name source: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// `labels['k']` pushdown — end-to-end via wiremock so we pin the exact
+// LogQL stream selector that leaves the translator and reaches Loki.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tier1_logs_table_pushes_labels_eq_into_stream_selector() {
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .and(query_param("query", r#"{app="checkout"}"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(streams_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT ts, line FROM logs \
+             WHERE labels['app'] = 'checkout' \
+               AND ts BETWEEN TIMESTAMP '2023-11-14T22:00:00Z' \
+                          AND TIMESTAMP '2023-11-14T23:00:00Z'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+}
+
+#[tokio::test]
+async fn tier1_logs_table_pushes_labels_with_line_filter_into_logql() {
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .and(query_param("query", r#"{app="checkout"} |= "timeout""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(streams_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT ts, line FROM logs \
+             WHERE labels['app'] = 'checkout' \
+               AND line LIKE '%timeout%' \
+               AND ts BETWEEN TIMESTAMP '2023-11-14T22:00:00Z' \
+                          AND TIMESTAMP '2023-11-14T23:00:00Z'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
 }
 
 // ---------------------------------------------------------------------------

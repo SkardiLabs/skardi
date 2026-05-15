@@ -178,8 +178,6 @@ Use the parametric `prom_query` / `prom_range` / `loki_query` /
   `OtelUnsupportedPushdown` rather than producing wrong answers.
 - You need LogQL pipeline stages: `| json`, `| line_format`,
   `| unwrap`, metric-style aggregations like `rate({...}[5m])`.
-- A `labels['k']` matcher is required (v1 translator doesn't yet
-  recognize them — see "v1 sharp edges" below).
 
 The escape-hatch functions return the same fixed schema as the
 `metrics` / `logs` tables, so downstream SQL (joins, projections,
@@ -187,19 +185,19 @@ filtering) is identical regardless of which surface produced the rows.
 
 ## v1 sharp edges
 
-1. **`labels['k']` matchers aren't pushed down yet.** Tasks 3.5.2 and
-   3.5.3 of the change. Until they land, any `SELECT FROM logs` with
-   a label-key predicate hits `UnsupportedPushdown`; `SELECT FROM
-   metrics WHERE labels['service']='X'` does too. Reach for
-   `loki_range('{app="X"} …', …)` and `prom_query('…{service="X"}')`
-   respectively.
-2. **Aggregations on `metrics` happen at the DataFusion level**, not in
+1. **Aggregations on `metrics` happen at the DataFusion level**, not in
    PromQL. For counter metrics, `SELECT SUM(value) FROM metrics …
    GROUP BY labels['service']` sums raw counter samples — not a
    per-second rate. Use `prom_query('sum by(service)(rate(…[5m]))')`
    for counter-style aggregation. Task 4.2 closes this gap when it
    lands. See [design.md Decision 4](../../openspec/changes/add-otel-data-source/design.md#decision-4) "v1 sharp edge".
-3. **Pipeline param substitution has rough edges for timestamps and
+
+   Note: `labels['k']` matcher pushdown *is* implemented, so
+   `SELECT … FROM metrics WHERE labels['service']='X'` and
+   `SELECT … FROM logs WHERE labels['app']='Y'` work at tier-1 without
+   reaching for the escape hatch. Supported operators: `=`, `!=`,
+   `LIKE`, `NOT LIKE`, `IN`, `NOT IN`.
+2. **Pipeline param substitution has rough edges for timestamps and
    string-literal-embedded params.** The v1 substituter (a) replaces
    `{param}` with `NULL` at plan-time validation, breaking
    `INTERVAL {window}`-style usage, and (b) wraps JSON string values

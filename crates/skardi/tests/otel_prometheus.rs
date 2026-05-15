@@ -393,6 +393,73 @@ async fn extra_headers_are_forwarded_to_upstream() {
 //   C. `UNION ALL` of two `prom_query` results aliasing a literal as `name`
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// `labels['k']` pushdown — end-to-end via wiremock so we pin the exact
+// PromQL selector that leaves the translator and reaches the upstream
+// HTTP API.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tier1_metrics_table_pushes_labels_eq_into_selector() {
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/query_range"))
+        .and(query_param(
+            "query",
+            r#"http_requests_total{service="api"}"#,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(matrix_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT name, value FROM metrics \
+             WHERE name = 'http_requests_total' AND labels['service'] = 'api'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+}
+
+#[tokio::test]
+async fn tier1_metrics_table_pushes_labels_in_list_as_alternation_regex() {
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/query_range"))
+        .and(query_param(
+            "query",
+            r#"http_requests_total{service=~"^(api|checkout)$"}"#,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(matrix_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT name, value FROM metrics \
+             WHERE name = 'http_requests_total' \
+               AND labels['service'] IN ('api', 'checkout')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+}
+
 #[tokio::test]
 async fn projection_pushdown_select_labels_extract_and_value() {
     // Repro A: tier-3 + `labels['k']` projection. The outer SELECT drops
