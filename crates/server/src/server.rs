@@ -374,6 +374,8 @@ spec:
             enable_cache: false,
             hierarchy_level: Default::default(),
             description: None,
+            #[cfg(feature = "otel")]
+            otel: None,
         }];
 
         let pipeline = create_test_pipeline().await;

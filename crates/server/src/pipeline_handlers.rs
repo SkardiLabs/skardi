@@ -409,6 +409,7 @@ pub async fn get_data_sources(
             DataSourceType::Lance => "lance",
             DataSourceType::Redis => "redis",
             DataSourceType::Seekdb => "seekdb",
+            DataSourceType::Otel => "otel",
         };
 
         // Determine path or URL based on source type
@@ -422,7 +423,8 @@ pub async fn get_data_sources(
             | DataSourceType::Mysql
             | DataSourceType::Mongo
             | DataSourceType::Redis
-            | DataSourceType::Seekdb => None,
+            | DataSourceType::Seekdb
+            | DataSourceType::Otel => None,
         };
 
         let url = match data_source.source_type {
@@ -973,6 +975,8 @@ spec:
             enable_cache: false,
             hierarchy_level: Default::default(),
             description: None,
+            #[cfg(feature = "otel")]
+            otel: None,
         };
 
         // Create pipeline that queries the registered data source

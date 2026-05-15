@@ -127,6 +127,16 @@ pub struct DataSource {
     /// matching entry is present in a loaded `kind: semantics` file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// OTEL-specific source configuration, only meaningful when
+    /// `source_type == DataSourceType::Otel`. See
+    /// `skardi::sources::providers::otel::OtelSourceConfig`.
+    ///
+    /// Not serialized — `OtelSourceConfig` is deserialize-only because
+    /// `OtelAuth` has a hand-rolled `Deserialize` enforcing inline-secret
+    /// rejection that doesn't have a Serialize counterpart by design.
+    #[cfg(feature = "otel")]
+    #[serde(default, skip_serializing)]
+    pub otel: Option<skardi::sources::providers::otel::OtelSourceConfig>,
 }
 
 /// Top-level envelope for context YAML files:
@@ -849,6 +859,23 @@ fn validate_pipeline_sql(
             skardi::sources::sql_validator::AccessMode::ReadOnly
         };
         validator_config = validator_config.with_table(&ds.name, mode);
+
+        // OTEL sources don't expose a table by `ds.name`; they expose
+        // backend-specific table names (`metrics` for Prometheus,
+        // `logs` for Loki). Without this, `INSERT INTO metrics …` in a
+        // pipeline would slip past validation and only surface as a
+        // runtime DataFusion error.
+        #[cfg(feature = "otel")]
+        if ds.source_type == DataSourceType::Otel {
+            use skardi::sources::providers::otel::OtelBackend;
+            if let Some(otel) = &ds.otel {
+                let table_name = match otel.backend {
+                    OtelBackend::Prometheus => "metrics",
+                    OtelBackend::Loki => "logs",
+                };
+                validator_config = validator_config.with_table(table_name, mode);
+            }
+        }
     }
 
     // Validate the SQL against access mode restrictions
@@ -1326,6 +1353,85 @@ async fn register_data_source(
                 name: source.name.clone(),
                 error: e.to_string(),
             })?;
+        }
+        DataSourceType::Otel => {
+            // Sections 3–5 of openspec/changes/add-otel-data-source/tasks.md:
+            // parse the OTEL config, resolve env-backed credentials, build
+            // the shared HTTP client, then dispatch to the per-backend
+            // registration helper. Loki registration lands in section 5;
+            // until then `backend: loki` returns a clear error.
+            #[cfg(feature = "otel")]
+            {
+                use skardi::sources::providers::otel::OtelBackend;
+                use skardi::sources::providers::otel::http::{
+                    OtelHttpClient, OtelHttpClientConfig,
+                };
+                use skardi::sources::providers::otel::loki::register_loki_source;
+                use skardi::sources::providers::otel::prometheus::register_prometheus_source;
+
+                let otel_config = source.otel.as_ref().ok_or_else(|| {
+                    ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: "type: otel requires an `otel:` block declaring \
+                             at least `backend:` and `url:`"
+                            .to_string(),
+                    }
+                })?;
+
+                let resolved_auth = otel_config.load_credentials(&source.name).map_err(|e| {
+                    ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: e.to_string(),
+                    }
+                })?;
+
+                let client = OtelHttpClient::new(OtelHttpClientConfig {
+                    source_name: source.name.clone(),
+                    base_url: otel_config.url.clone(),
+                    auth: resolved_auth,
+                    extra_headers: otel_config.extra_headers.clone(),
+                    request_timeout: otel_config.request_timeout_or_default(),
+                })
+                .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: e.to_string(),
+                })?;
+
+                match otel_config.backend {
+                    OtelBackend::Prometheus => {
+                        register_prometheus_source(session_ctx, &source.name, otel_config, client)
+                            .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                                name: source.name.clone(),
+                                error: e.to_string(),
+                            })?;
+                        tracing::info!(
+                            "Registered OTEL source '{}' (backend=prometheus, url={}, access_mode=read_only)",
+                            source.name,
+                            otel_config.url
+                        );
+                    }
+                    OtelBackend::Loki => {
+                        register_loki_source(session_ctx, &source.name, otel_config, client)
+                            .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                                name: source.name.clone(),
+                                error: e.to_string(),
+                            })?;
+                        tracing::info!(
+                            "Registered OTEL source '{}' (backend=loki, url={}, access_mode=read_only)",
+                            source.name,
+                            otel_config.url
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "otel"))]
+            {
+                return Err(ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: "type: otel requires building with --features otel".to_string(),
+                }
+                .into());
+            }
         }
     }
 

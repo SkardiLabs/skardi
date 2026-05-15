@@ -236,6 +236,13 @@ struct LocalDataSource {
     /// overlay supplies one.
     #[serde(default)]
     description: Option<String>,
+    /// OTEL-specific source configuration. Only meaningful when
+    /// `source_type == "otel"`. Parsed via the same `OtelSourceConfig`
+    /// type the server uses so behavior (auth env-var rejection, time
+    /// defaults, etc.) is identical across CLI and server.
+    #[cfg(feature = "otel")]
+    #[serde(default)]
+    otel: Option<skardi::sources::providers::otel::OtelSourceConfig>,
 }
 
 impl LocalDataSource {
@@ -950,6 +957,73 @@ async fn register_source(
             register_iceberg_table(session_ctx, &source.name, path_str, source.options.as_ref())
                 .await
                 .with_context(|| format!("Failed to register Iceberg '{}'", source.name))?;
+        }
+        "otel" => {
+            // Per `tasks.md` 7.4 — wire OTEL sources into the CLI so
+            // `skardi sql --ctx ctx.yaml '<sql>'` can issue ad-hoc
+            // queries against `metrics` / `logs` / `prom_query` /
+            // `loki_query`. Behaviour mirrors the server registration
+            // path (`crates/server/src/config.rs`).
+            #[cfg(feature = "otel")]
+            {
+                use skardi::sources::providers::otel::OtelBackend;
+                use skardi::sources::providers::otel::http::{
+                    OtelHttpClient, OtelHttpClientConfig,
+                };
+                use skardi::sources::providers::otel::loki::register_loki_source;
+                use skardi::sources::providers::otel::prometheus::register_prometheus_source;
+
+                let otel_cfg = source.otel.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "OTEL source '{}': type: otel requires an `otel:` block \
+                         declaring at least `backend:` and `url:`",
+                        source.name
+                    )
+                })?;
+
+                let resolved_auth = otel_cfg.load_credentials(&source.name).with_context(|| {
+                    format!(
+                        "OTEL source '{}': credential resolution failed",
+                        source.name
+                    )
+                })?;
+
+                let client = OtelHttpClient::new(OtelHttpClientConfig {
+                    source_name: source.name.clone(),
+                    base_url: otel_cfg.url.clone(),
+                    auth: resolved_auth,
+                    extra_headers: otel_cfg.extra_headers.clone(),
+                    request_timeout: otel_cfg.request_timeout_or_default(),
+                })
+                .with_context(|| {
+                    format!("OTEL source '{}': failed to build HTTP client", source.name)
+                })?;
+
+                match otel_cfg.backend {
+                    OtelBackend::Prometheus => {
+                        register_prometheus_source(session_ctx, &source.name, otel_cfg, client)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to register Prometheus OTEL source '{}'",
+                                    source.name
+                                )
+                            })?
+                    }
+                    OtelBackend::Loki => {
+                        register_loki_source(session_ctx, &source.name, otel_cfg, client)
+                            .with_context(|| {
+                                format!("Failed to register Loki OTEL source '{}'", source.name)
+                            })?
+                    }
+                }
+            }
+            #[cfg(not(feature = "otel"))]
+            {
+                anyhow::bail!(
+                    "Source '{}': type: otel requires building the CLI with --features otel",
+                    source.name
+                );
+            }
         }
         _ => {
             anyhow::bail!(

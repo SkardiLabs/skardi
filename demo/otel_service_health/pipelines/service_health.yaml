@@ -1,0 +1,28 @@
+kind: pipeline
+
+metadata:
+  name: "service-health"
+  version: "1.0.0"
+  description: >
+    Per-series snapshot of an HTTP request counter from the configured
+    source `default_window` (15 minutes by default — adjust in
+    `ctx.yaml`). Returns one row per `(name, labels, ts, value)`
+    straight from the `metrics` table — tier-1 SQL with no PromQL in
+    the pipeline file. Aggregation across series is done DataFusion-side;
+    for counter-style aggregation (per-second rate grouped by service),
+    see `latency_p99_by_route.yaml`.
+    .
+    The pipeline takes no parameters by design: the v1 pipeline loader
+    validates SQL by substituting `NULL` for each `{param}`, which
+    breaks plan-time validation for the timestamp/INTERVAL shapes a
+    `metrics` query needs. Operators tighten the window by changing
+    `default_window` on the OTEL source, or by copying this pipeline
+    and hardcoding a different `WHERE ts > …` bound.
+
+spec:
+  query: |
+    SELECT name, labels, ts, value
+    FROM metrics
+    WHERE name = 'http_requests_total'
+    ORDER BY ts DESC
+    LIMIT 1000

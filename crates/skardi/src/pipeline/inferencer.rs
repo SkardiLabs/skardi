@@ -1160,6 +1160,54 @@ mod tests {
         assert!(parameter_order.contains(&"limit".to_string()));
     }
 
+    /// PromQL and LogQL label-selector braces (e.g.
+    /// `http_requests_total{service="api"}` or `{app="checkout"}`)
+    /// must NOT collide with the `{param}` template substitution. The
+    /// parameter regex requires the brace body to be a Rust-style
+    /// identifier (`[a-zA-Z_][a-zA-Z0-9_]*`), which excludes the `=`,
+    /// `"`, and `,` characters that PromQL/LogQL selectors always
+    /// contain, plus the empty `{}` shape the v1 translator emits.
+    /// This test pins the safety property so a future regex tweak
+    /// can't quietly break OTEL pipelines.
+    /// (Task 8.1 of `add-otel-data-source`.)
+    #[tokio::test]
+    async fn test_promql_logql_braces_do_not_collide_with_param_substitution() {
+        let ctx = SessionContext::new();
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        // PromQL selector with a label predicate — must pass through
+        // verbatim, only the genuine `{window}` parameter substituted.
+        let promql = "SELECT * FROM prom_query('http_requests_total{service=\"api\"}') \
+                      WHERE ts > NOW() - INTERVAL {window}";
+        let (rewritten, params) = inferrer.convert_named_to_placeholders(promql).unwrap();
+        assert!(
+            rewritten.contains(r#"http_requests_total{service="api"}"#),
+            "PromQL label selector must survive substitution intact: {rewritten}"
+        );
+        assert_eq!(params, vec!["window"]);
+
+        // LogQL stream selector embedded in loki_range.
+        let logql = r#"SELECT * FROM loki_range('{app="checkout"} |= "error"', {start}, {end})"#;
+        let (rewritten, params) = inferrer.convert_named_to_placeholders(logql).unwrap();
+        assert!(
+            rewritten.contains(r#"{app="checkout"}"#),
+            "LogQL stream selector must survive substitution intact: {rewritten}"
+        );
+        assert_eq!(params, vec!["start", "end"]);
+
+        // The empty selector `{}` the v1 translator can emit must not
+        // be interpreted as a template parameter.
+        let empty_selector = "SELECT * FROM prom_query('{}') WHERE ts > {start}";
+        let (rewritten, params) = inferrer
+            .convert_named_to_placeholders(empty_selector)
+            .unwrap();
+        assert!(
+            rewritten.contains("{}"),
+            "empty `{{}}` must pass through: {rewritten}"
+        );
+        assert_eq!(params, vec!["start"]);
+    }
+
     /// `INSERT … VALUES {rows}` is the multi-row tuple-list shape the
     /// server-side renderer expands at request time. The parser stub must
     /// emit `VALUES (?)`, not the malformed `VALUES ?`, otherwise pipeline

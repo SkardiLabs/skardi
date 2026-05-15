@@ -22,6 +22,8 @@ embedding = ["skardi/embedding"]
 chunking = ["skardi/chunking"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["skardi/rag"]
+# OTEL consumer passthrough.
+otel = ["skardi/otel"]
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,0 +1,36 @@
+kind: context
+
+metadata:
+  name: otel-service-health
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: prom
+      type: otel
+      description: "Prometheus metrics from the bundled observability docker-compose"
+      otel:
+        backend: prometheus
+        # Points at the Prometheus container in observability/docker-compose.yml.
+        # Change to your production Prometheus URL when promoting beyond the demo.
+        url: http://localhost:9090
+        # Auth omitted — the demo Prometheus has none. Production deployments
+        # SHOULD set auth.kind=bearer with env: PROMETHEUS_BEARER (or basic
+        # with username_env/password_env). Inline `token:` is rejected at
+        # config load — see docs/otel/README.md "Credentials".
+        max_result_rows: 50000
+        default_window: 15m
+        default_step: 30s
+        max_window: 24h
+        request_timeout: 10s
+
+    - name: loki
+      type: otel
+      description: "Loki logs from the bundled observability docker-compose"
+      otel:
+        backend: loki
+        url: http://localhost:3100
+        max_result_rows: 5000
+        default_window: 15m
+        max_window: 24h
+        request_timeout: 10s

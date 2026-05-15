@@ -14,7 +14,7 @@ Cargo workspace with three crates:
   - `engine/` — DataFusion engine wrapper.
   - `pipeline/` — YAML pipeline parsing, parameter inference, schema inference.
   - `model/` — embedding/ONNX model registries (`candle`, `gguf`, `onnx`).
-  - `sources/providers/` — one subdirectory per backend: `lance/`, `iceberg.rs`, `mongo/`, `redis/`, `sqlite/`, `sqlx/pg/`, `mysql.rs`, etc.
+  - `sources/providers/` — one subdirectory per backend: `lance/`, `iceberg.rs`, `mongo/`, `redis/`, `sqlite/`, `sqlx/pg/`, `mysql.rs`, `otel/` (Prometheus + Loki consumer, gated behind the `otel` cargo feature — see [docs/otel/README.md](docs/otel/README.md)), etc.
 - [crates/server/](crates/server/) — the `skardi-server` binary: Axum HTTP server, auth (better-auth), config loading, metrics, telemetry. Wires the core library into a long-running service.
 - [crates/cli/](crates/cli/) — the `skardi` CLI binary. Thin wrapper around the core library for one-shot SQL execution.
 

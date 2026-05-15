@@ -2,6 +2,16 @@
 
 `skardi-server` exports traces and metrics via [OpenTelemetry](https://opentelemetry.io/) (OTLP gRPC), giving you full visibility into query execution inside Grafana.
 
+> **Skardi has two distinct OTEL relationships.** This page covers
+> Skardi *emitting* OTEL telemetry about itself — traces and metrics
+> describing how `skardi-server` handled each pipeline request. The
+> companion page [`docs/otel/README.md`](./otel/README.md) covers the
+> consumer side: Skardi *pulling* OTEL-shaped data from external
+> Prometheus and Loki backends as a federated source via `type: otel`
+> in `ctx.yaml`. The two features are unrelated at the code level —
+> emit lives in `skardi-server::telemetry`, consume lives in
+> `skardi::sources::providers::otel`.
+
 ## What is Instrumented
 
 - **Traces** — Every DataFusion execution plan node is wrapped with a span. You can see `elapsed_compute`, `output_rows`, spill counts, and optimizer rule timings per query.

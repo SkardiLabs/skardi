@@ -1,0 +1,25 @@
+kind: pipeline
+
+metadata:
+  name: "top-error-logs"
+  version: "1.0.0"
+  description: >
+    Recent error log lines from the demo `checkout` Loki stream over
+    the configured `default_window` (15 minutes by default). Uses the
+    tier-3 `loki_range` escape hatch because the v1 logs translator
+    doesn't yet recognise `WHERE labels['app']='X'` matchers — once
+    task 3.5.3 lands this pipeline can move to plain `SELECT * FROM
+    logs WHERE labels['app']='checkout' AND line LIKE '%error%'` and
+    keep the same downstream contract.
+    .
+    Hardcoded selector + line filter; no parameters. Operators copy
+    and adjust `{app="…"} |= "…"` for their own services. Time window
+    comes from the OTEL source's `default_window` setting in
+    `ctx.yaml`.
+
+spec:
+  query: |
+    SELECT ts, labels, line, stream
+    FROM loki_range('{app="checkout"} |= "error"')
+    ORDER BY ts DESC
+    LIMIT 100

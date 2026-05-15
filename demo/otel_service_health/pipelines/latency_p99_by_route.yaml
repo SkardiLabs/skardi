@@ -1,0 +1,26 @@
+kind: pipeline
+
+metadata:
+  name: "latency-p99-by-route"
+  version: "1.0.0"
+  description: >
+    99th-percentile HTTP request latency per route over a 5-minute
+    rolling window. Uses the tier-3 `prom_query` escape hatch because
+    `histogram_quantile` and `rate` are PromQL operators with no native
+    SQL equivalent — see `design.md` Decision 4 "Why this shape".
+    Returns one row per route with the quantile estimate.
+    .
+    The rate window is hardcoded: the v1 pipeline param substituter
+    string-quotes JSON values, which produces nested single quotes
+    when `{param}` appears inside a SQL string literal (the PromQL
+    argument). Operators copy this file and edit `[5m]` for a
+    different window.
+
+spec:
+  query: |
+    SELECT name, labels, ts, value
+    FROM prom_query(
+      'histogram_quantile(0.99, sum by(route, le) (rate(http_request_duration_seconds_bucket[5m])))'
+    )
+    ORDER BY value DESC
+    LIMIT 50

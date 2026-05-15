@@ -68,6 +68,8 @@ fn products_data_source(description: Option<&str>) -> DataSource {
         enable_cache: false,
         hierarchy_level: Default::default(),
         description: description.map(str::to_string),
+        #[cfg(feature = "otel")]
+        otel: None,
     }
 }
 

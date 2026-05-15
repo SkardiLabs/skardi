@@ -31,6 +31,38 @@ jobs:
       - name: Build documentation
         run: cargo doc --no-deps -p skardi
 
+  # Fast lane — catches `#[cfg(feature = "otel")]` gating regressions on
+  # every PR without waiting for the integration test job below. Mirrors
+  # what `cargo llvm-cov --all-features` covers in the `Test` job, but
+  # runs ~2 minutes versus ~30 and surfaces compile errors immediately.
+  # Task 10.1 of openspec/changes/add-otel-data-source.
+  check-otel:
+    name: Check (otel feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      - name: Check default features
+        run: cargo check --workspace
+      - name: Check with otel feature
+        run: cargo check --workspace --features skardi/otel
+      - name: Run otel-gated unit tests
+        # Exercises the lib unit tests + the otel/otel_demo integration
+        # tests under `--features otel`. Avoids spinning up all the test
+        # job's service containers since the otel provider stubs its
+        # upstreams via wiremock at the test level.
+        run: |
+          cargo test --package skardi --features otel --lib sources::providers::otel
+          cargo test --package skardi --features otel --test otel_prometheus
+          cargo test --package skardi --features otel --test otel_loki
+          cargo test --package skardi --features otel --test otel_access_mode
+          cargo test --package skardi-server --features otel --test otel_config
+          cargo test --package skardi-server --features otel --test otel_demo_smoke
+
   test:
     name: Test
     runs-on: ubuntu-latest
