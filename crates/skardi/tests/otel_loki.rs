@@ -356,3 +356,45 @@ async fn row_cap_is_enforced_for_loki() {
     );
     assert!(msg.contains("loki"), "error should name source: {msg}");
 }
+
+// ---------------------------------------------------------------------------
+// Regression test for the projection-pushdown bug — see PR #140 review.
+//
+// Before the fix, `LokiEscapeProvider::scan` ignored the `projection`
+// argument while still advertising the full 4-column schema, causing
+// DataFusion to trip `Input field name <X> does not match with the
+// projection expression <Y>` whenever a query picked a column subset
+// or aliased a literal over a real column.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn projection_pushdown_select_labels_extract_from_loki_range() {
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(streams_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT labels['app'] AS app, line \
+             FROM loki_range( \
+                 '{app=\"checkout\"}', \
+                 TIMESTAMP '2023-11-14T22:00:00Z', \
+                 TIMESTAMP '2023-11-14T23:00:00Z')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "streams response should produce 3 rows");
+    let schema = batches[0].schema();
+    let names: Vec<_> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    assert_eq!(names, vec!["app", "line"]);
+}

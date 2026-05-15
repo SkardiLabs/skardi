@@ -376,3 +376,114 @@ async fn extra_headers_are_forwarded_to_upstream() {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the projection-pushdown bug — see PR #140 review.
+//
+// Pre-fix, `PromMetricsTable::scan` and `PromEscapeProvider::scan` ignored
+// the `projection` argument while still reporting the full 4-column schema
+// from `properties().schema()`. The planner then built downstream column
+// references against the *projected* schema and tripped the assertion
+// `Input field name <X> does not match with the projection expression <Y>`
+// in `datafusion-physical-expr/src/projection.rs`.
+//
+// These tests pin three failure shapes the reviewer reproduced:
+//   A. `SELECT labels['k'] AS …, value FROM prom_query(...)`  — column subset
+//   B. tier-1 + `labels['k']` projection over `metrics`
+//   C. `UNION ALL` of two `prom_query` results aliasing a literal as `name`
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn projection_pushdown_select_labels_extract_and_value() {
+    // Repro A: tier-3 + `labels['k']` projection. The outer SELECT drops
+    // `name` and `ts`, so DataFusion pushes a projection of [labels, value]
+    // into prom_query's scan.
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vector_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT labels['service'] AS service, value \
+             FROM prom_query('rate(http_requests_total[5m])')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+}
+
+#[tokio::test]
+async fn projection_pushdown_subset_columns_from_metrics_table() {
+    // Repro B: tier-1 — selecting a subset of columns from `metrics` must
+    // not trip the projection assertion either.
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/query_range"))
+        .and(query_param("query", "http_requests_total{}"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(matrix_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT labels, value \
+             FROM metrics \
+             WHERE name = 'http_requests_total'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+    // Projected schema must contain exactly the requested columns in order.
+    let schema = batches[0].schema();
+    let names: Vec<_> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    assert_eq!(names, vec!["labels", "value"]);
+}
+
+#[tokio::test]
+async fn projection_pushdown_union_all_of_two_prom_query_results() {
+    // Repro C: UNION ALL across two prom_query calls with a literal aliased
+    // as `name`. Pre-fix this tripped the assertion even with no
+    // `labels['k']` access at all.
+    let (server, ctx, _cfg) = fixture().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vector_response_body()))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let batches = ctx
+        .sql(
+            "SELECT 'a' AS metric, labels, value \
+                 FROM prom_query('rate(http_requests_total[5m])') \
+             UNION ALL \
+             SELECT 'b' AS metric, labels, value \
+                 FROM prom_query('rate(http_requests_total[1m])')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4, "two 2-row vector responses unioned");
+}

@@ -406,7 +406,15 @@ fn render_promql(spec: &PromQuerySpec) -> String {
 struct PromExec {
     client: PromHttpClient,
     spec: PromExecSpec,
+    /// Output schema — equal to [`metrics_schema`] when no projection
+    /// was pushed down, or the projected subset otherwise. This must
+    /// match the emitted `RecordBatch` exactly: DataFusion's planner
+    /// builds downstream column references against `properties().schema()`
+    /// (see assertion in `datafusion-physical-expr/src/projection.rs`).
     schema: SchemaRef,
+    /// Indices into [`metrics_schema`] selected by the planner's
+    /// projection pushdown. `None` means "all columns, in declared order".
+    projection: Option<Vec<usize>>,
     properties: PlanProperties,
     max_rows: usize,
 }
@@ -427,21 +435,31 @@ enum PromExecSpec {
 }
 
 impl PromExec {
-    fn new(client: PromHttpClient, spec: PromExecSpec, max_rows: usize) -> Self {
-        let schema = metrics_schema();
+    fn new(
+        client: PromHttpClient,
+        spec: PromExecSpec,
+        max_rows: usize,
+        projection: Option<Vec<usize>>,
+    ) -> DFResult<Self> {
+        let full_schema = metrics_schema();
+        let schema: SchemaRef = match &projection {
+            Some(indices) => Arc::new(full_schema.project(indices)?),
+            None => full_schema,
+        };
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
         );
-        Self {
+        Ok(Self {
             client,
             spec,
             schema,
+            projection,
             properties,
             max_rows,
-        }
+        })
     }
 }
 
@@ -498,6 +516,7 @@ impl ExecutionPlan for PromExec {
         let client = self.client.clone();
         let spec = self.spec.clone();
         let max_rows = self.max_rows;
+        let projection = self.projection.clone();
         let source_name = client.source_name().to_string();
 
         let fut = async move {
@@ -531,6 +550,16 @@ impl ExecutionPlan for PromExec {
             let data = data.map_err(DataFusionError::from)?;
             let batch =
                 build_record_batch(&data, &source_name, max_rows).map_err(DataFusionError::from)?;
+            // Honor projection pushdown: the planner builds downstream
+            // column references against `properties().schema()`, so the
+            // emitted batch must contain exactly that subset of columns
+            // in the same order. Skipping this triggers an `Internal
+            // error: Assertion failed: col.name() == matching_name`
+            // assertion later in execution.
+            let batch = match &projection {
+                Some(indices) => batch.project(indices)?,
+                None => batch,
+            };
             Ok::<_, DataFusionError>(batch)
         };
 
@@ -611,7 +640,7 @@ impl TableProvider for PromMetricsTable {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -630,7 +659,8 @@ impl TableProvider for PromMetricsTable {
             self.client.clone(),
             PromExecSpec::Translated(spec),
             max_rows,
-        );
+            projection.cloned(),
+        )?;
         Ok(Arc::new(exec))
     }
 }
@@ -773,7 +803,7 @@ impl TableProvider for PromEscapeProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -782,7 +812,8 @@ impl TableProvider for PromEscapeProvider {
             self.client.clone(),
             self.spec.clone(),
             max_rows,
-        )))
+            projection.cloned(),
+        )?))
     }
 }
 
