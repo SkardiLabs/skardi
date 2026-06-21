@@ -5,6 +5,7 @@ use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+use skardi::sources::providers::dynamodb::register_dynamodb_tables;
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::influxdb::register_influxdb_tables;
 use skardi::sources::providers::lance::register_lance_table;
@@ -209,7 +210,7 @@ pub enum ConfigError {
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
     #[error(
-        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', 'redis', and 'seekdb' sources support read_write mode."
+        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', 'redis', 'seekdb', and 'dynamodb' sources support read_write mode."
     )]
     UnsupportedWriteMode {
         name: String,
@@ -717,6 +718,7 @@ const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Mongo,
     DataSourceType::Redis,
     DataSourceType::Seekdb,
+    DataSourceType::Dynamodb,
 ];
 
 /// Validate data source configurations
@@ -796,7 +798,8 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 | DataSourceType::Mongo
                 | DataSourceType::Redis
                 | DataSourceType::Seekdb
-                | DataSourceType::Influxdb,
+                | DataSourceType::Influxdb
+                | DataSourceType::Dynamodb,
                 false,
             ) => {
                 // For database connections, ensure connection string is provided
@@ -969,7 +972,8 @@ async fn register_data_source(
             | DataSourceType::Mongo
             | DataSourceType::Redis
             | DataSourceType::Seekdb
-            | DataSourceType::Influxdb,
+            | DataSourceType::Influxdb
+            | DataSourceType::Dynamodb,
             _,
         ) => {
             // Database sources don't need file path validation
@@ -1260,6 +1264,41 @@ async fn register_data_source(
             .await
             .map_err(|e| {
                 tracing::error!("MongoDB registration failed for '{}': {:?}", source.name, e);
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Dynamodb => {
+            tracing::info!("Registering DynamoDB table: {}", source.name);
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            tracing::debug!(
+                "Endpoint for {}: {} (options: {:?})",
+                source.name,
+                connection_string,
+                source.options
+            );
+
+            register_dynamodb_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "DynamoDB registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),

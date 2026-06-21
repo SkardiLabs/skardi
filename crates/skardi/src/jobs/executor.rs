@@ -341,7 +341,8 @@ impl JobExecutor {
             Some(source_type @ DataSourceType::Mongo)
             | Some(source_type @ DataSourceType::Redis)
             | Some(source_type @ DataSourceType::Seekdb)
-            | Some(source_type @ DataSourceType::Influxdb) => {
+            | Some(source_type @ DataSourceType::Influxdb)
+            | Some(source_type @ DataSourceType::Dynamodb) => {
                 Err(JobSubmitError::NonTransactionalDestination {
                     table: dest.table.clone(),
                     source_type: source_type.clone(),

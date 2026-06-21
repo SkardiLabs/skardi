@@ -323,6 +323,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | Redis | Full | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
 | SeekDB | Full | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
 | InfluxDB 3 | Read | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
+| DynamoDB | Full | Items mapped to SQL rows, scan + filter pushdown | [docs/dynamodb/](docs/dynamodb/) |
 | Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | Lance | Read (job-write) | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
 | S3 / GCS / Azure | Read | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |

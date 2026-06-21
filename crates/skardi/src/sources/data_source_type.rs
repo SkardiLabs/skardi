@@ -17,6 +17,7 @@ pub enum DataSourceType {
     Seekdb,
     Influxdb,
     Documents,
+    Dynamodb,
 }
 
 impl DataSourceType {
@@ -34,6 +35,7 @@ impl DataSourceType {
             Self::Seekdb => "seekdb",
             Self::Influxdb => "influxdb",
             Self::Documents => "documents",
+            Self::Dynamodb => "dynamodb",
         }
     }
 }

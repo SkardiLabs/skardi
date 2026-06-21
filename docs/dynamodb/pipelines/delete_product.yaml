@@ -1,0 +1,9 @@
+kind: pipeline
+
+metadata:
+  name: "delete_product"
+  version: "1.0"
+  description: "Delete a product by product ID"
+
+spec:
+  query: "DELETE FROM products WHERE product_id = {product_id}"

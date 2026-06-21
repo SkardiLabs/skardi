@@ -45,6 +45,7 @@ use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_ud
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry,
+    dynamodb::register_dynamodb_tables,
     iceberg::register_iceberg_table,
     influxdb::register_influxdb_tables,
     lance::register_lance_table,
@@ -913,6 +914,17 @@ async fn register_source(
             register_influxdb_tables(session_ctx, &source.name, conn_str, source.options.as_ref())
                 .await
                 .with_context(|| format!("Failed to register InfluxDB '{}'", source.name))?;
+        }
+        "dynamodb" => {
+            let endpoint = source.connection_string.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DynamoDB source '{}': connection_string (endpoint URL) required",
+                    source.name
+                )
+            })?;
+            register_dynamodb_tables(session_ctx, &source.name, endpoint, source.options.as_ref())
+                .await
+                .with_context(|| format!("Failed to register DynamoDB '{}'", source.name))?;
         }
         "lance" => {
             let path_str = source
