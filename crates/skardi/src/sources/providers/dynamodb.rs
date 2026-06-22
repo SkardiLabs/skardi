@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::config::{Credentials, Region};
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -190,6 +190,73 @@ impl DynamoTableProvider {
         Ok(items)
     }
 
+    /// Fetch a single item by its full primary key (`GetItem`). Returns an empty
+    /// vec when no item matches, else a one-element vec.
+    async fn get_item_one(
+        &self,
+        key: HashMap<String, AttributeValue>,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .set_key(Some(key))
+            .send()
+            .await
+            .with_context(|| format!("DynamoDB get_item failed for '{}'", self.table_name))?;
+        Ok(out.item().cloned().into_iter().collect())
+    }
+
+    /// Run a `Query` against the key schema, paginating until exhausted (or
+    /// `limit` is reached), and return every matching item.
+    async fn query_items(
+        &self,
+        key_condition: &DynamoFilter,
+        limit: Option<usize>,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
+        let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut req = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression(&key_condition.expression)
+                .set_expression_attribute_names(Some(key_condition.names.clone()))
+                .set_expression_attribute_values(Some(key_condition.values.clone()));
+            if let Some(sk) = &start_key {
+                req = req.set_exclusive_start_key(Some(sk.clone()));
+            }
+
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("DynamoDB query failed for '{}'", self.table_name))?;
+
+            items.extend(out.items().iter().cloned());
+
+            if matches!(limit, Some(n) if items.len() >= n) {
+                if let Some(n) = limit {
+                    items.truncate(n);
+                }
+                break;
+            }
+
+            match out.last_evaluated_key() {
+                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+
+        Ok(items)
+    }
+
+    /// Pick the cheapest physical read strategy the pushable predicates allow.
+    fn plan_read(&self, pushable: &[Expr]) -> DFResult<DynamoRead> {
+        classify_read(&self.partition_key, self.sort_key.as_deref(), pushable)
+    }
+
     /// Convert scanned DynamoDB items into a single Arrow `RecordBatch` shaped
     /// by this provider's schema. Missing attributes become NULLs.
     fn items_to_record_batch(
@@ -273,12 +340,35 @@ impl TableProvider for DynamoTableProvider {
             .filter(|e| is_pushable_binary_filter(e))
             .cloned()
             .collect();
-        let filter = build_filter_expression(&pushable)?;
 
-        let items = self
-            .scan_items(filter.as_ref(), limit)
-            .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
+        // Route to the cheapest physical access pattern the predicates allow:
+        // GetItem when the full primary key is pinned, Query when the partition
+        // key is, else a full Scan. Filters stay Inexact, so DataFusion
+        // re-applies every predicate after the fetch — a misroute can only cost
+        // a fallback, never a wrong row.
+        let items = match self.plan_read(&pushable)? {
+            DynamoRead::GetItem { key } => {
+                tracing::debug!(table = %self.table_name, "DynamoDB read via GetItem (full key)");
+                self.get_item_one(key).await
+            }
+            DynamoRead::Query { key_condition } => {
+                tracing::debug!(
+                    table = %self.table_name,
+                    key_condition = %key_condition.expression,
+                    "DynamoDB read via Query (partition key)"
+                );
+                self.query_items(&key_condition, limit).await
+            }
+            DynamoRead::Scan { filter } => {
+                tracing::debug!(
+                    table = %self.table_name,
+                    filtered = filter.is_some(),
+                    "DynamoDB read via Scan (no key constraint)"
+                );
+                self.scan_items(filter.as_ref(), limit).await
+            }
+        }
+        .map_err(|e| DataFusionError::External(e.into()))?;
 
         let batch = self
             .items_to_record_batch(items)
@@ -742,6 +832,135 @@ fn operator_symbol(op: Operator) -> DFResult<&'static str> {
     }
 }
 
+// ─── Key-aware read planning ────────────────────────────────────────────────
+
+/// How a `scan()` should physically read DynamoDB given its pushable filters.
+enum DynamoRead {
+    /// Full primary key pinned by equality — a single-item `GetItem`.
+    GetItem {
+        key: HashMap<String, AttributeValue>,
+    },
+    /// Partition key pinned by equality, with an optional sort-key condition —
+    /// a `Query` against the key schema.
+    Query { key_condition: DynamoFilter },
+    /// No usable key constraint — a full `Scan` with an optional filter.
+    Scan { filter: Option<DynamoFilter> },
+}
+
+/// Operators DynamoDB accepts in a `KeyConditionExpression` on the sort key.
+/// `NotEq` (`<>`) is intentionally excluded — it is pushable as a regular filter
+/// but illegal on a key.
+fn is_key_condition_op(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    )
+}
+
+/// Normalize a pushable binary filter into `(column, operator, value)` with the
+/// column on the left (operator flipped if the literal was on the left).
+fn normalize_binary(expr: &Expr) -> Option<(String, Operator, AttributeValue)> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return None;
+    };
+    let (col, value_expr, flipped) = match (binary.left.as_ref(), binary.right.as_ref()) {
+        (Expr::Column(c), v) => (c.name.clone(), v, false),
+        (v, Expr::Column(c)) => (c.name.clone(), v, true),
+        _ => return None,
+    };
+    let op = if flipped {
+        flip_operator(binary.op)
+    } else {
+        binary.op
+    };
+    Some((col, op, expr_to_attribute_value(value_expr).ok()?))
+}
+
+/// Build a DynamoDB `KeyConditionExpression` (`#k0 = :k0 [AND #k1 <op> :k1]`).
+/// Uses a `#k`/`:k` placeholder namespace distinct from the `#n`/`:v` used by
+/// filter expressions, so the two never collide if combined on one request.
+fn build_key_condition(
+    partition_key: &str,
+    partition_value: AttributeValue,
+    sort_key: &str,
+    sort_cond: Option<(Operator, AttributeValue)>,
+) -> DynamoFilter {
+    let mut names = HashMap::new();
+    let mut values = HashMap::new();
+    names.insert("#k0".to_string(), partition_key.to_string());
+    values.insert(":k0".to_string(), partition_value);
+    let mut expression = "#k0 = :k0".to_string();
+
+    if let Some((op, value)) = sort_cond {
+        names.insert("#k1".to_string(), sort_key.to_string());
+        values.insert(":k1".to_string(), value);
+        let symbol =
+            operator_symbol(op).expect("sort condition op validated by is_key_condition_op");
+        expression.push_str(&format!(" AND #k1 {symbol} :k1"));
+    }
+
+    DynamoFilter {
+        expression,
+        names,
+        values,
+    }
+}
+
+/// Classify pushable filters into the cheapest DynamoDB access pattern.
+///
+/// Only the *key* portion of the predicate set drives the choice; any other
+/// predicate is left for DataFusion to re-apply (filters are pushed `Inexact`),
+/// so the result is always correct regardless of which path is chosen.
+fn classify_read(
+    partition_key: &str,
+    sort_key: Option<&str>,
+    pushable: &[Expr],
+) -> DFResult<DynamoRead> {
+    let mut partition_value: Option<AttributeValue> = None;
+    let mut sort_cond: Option<(Operator, AttributeValue)> = None;
+
+    for expr in pushable {
+        let Some((col, op, value)) = normalize_binary(expr) else {
+            continue;
+        };
+        if col == partition_key {
+            // The partition key only narrows the access pattern under equality.
+            if op == Operator::Eq && partition_value.is_none() {
+                partition_value = Some(value);
+            }
+        } else if Some(col.as_str()) == sort_key && is_key_condition_op(op) && sort_cond.is_none() {
+            sort_cond = Some((op, value));
+        }
+    }
+
+    let Some(partition_value) = partition_value else {
+        // Partition key not pinned by equality → must Scan.
+        return Ok(DynamoRead::Scan {
+            filter: build_filter_expression(pushable)?,
+        });
+    };
+
+    match (sort_key, sort_cond) {
+        // Single-key table: the partition key IS the full primary key → GetItem.
+        (None, _) => {
+            let mut key = HashMap::new();
+            key.insert(partition_key.to_string(), partition_value);
+            Ok(DynamoRead::GetItem { key })
+        }
+        // Composite key fully pinned by equality → GetItem.
+        (Some(sk), Some((Operator::Eq, sort_value))) => {
+            let mut key = HashMap::new();
+            key.insert(partition_key.to_string(), partition_value);
+            key.insert(sk.to_string(), sort_value);
+            Ok(DynamoRead::GetItem { key })
+        }
+        // Composite key with a sort-key range (or no sort constraint) → Query.
+        (Some(sk), sort_cond) => Ok(DynamoRead::Query {
+            key_condition: build_key_condition(partition_key, partition_value, sk, sort_cond),
+        }),
+    }
+}
+
 /// Convert a DataFusion literal expression into a DynamoDB attribute value.
 pub(crate) fn expr_to_attribute_value(expr: &Expr) -> DFResult<AttributeValue> {
     match expr {
@@ -1131,12 +1350,19 @@ fn count_batch(count: u64) -> DFResult<RecordBatch> {
 ///
 /// # Options
 /// * `table` - DynamoDB table name (required).
-/// * `partition_key` - partition (hash) key attribute name (required).
-/// * `sort_key` - sort (range) key attribute name (optional).
+/// * `partition_key` - partition (hash) key attribute name. Optional: the key
+///   schema is read authoritatively via `DescribeTable`; this is only a fallback
+///   used when `DescribeTable` is unavailable (e.g. restricted IAM permissions).
+/// * `sort_key` - sort (range) key attribute name. Optional and likewise
+///   auto-detected from `DescribeTable`; only a fallback otherwise.
 /// * `region` - AWS region (optional, default `us-east-1`).
 /// * `access_key_env` / `secret_key_env` - names of environment variables
 ///   holding static AWS credentials (optional). When omitted, the default AWS
 ///   credential provider chain is used.
+///
+/// The resolved key schema drives key-aware reads: a query that pins the full
+/// primary key uses `GetItem`, one that pins the partition key uses `Query`, and
+/// anything else falls back to a full `Scan`.
 pub async fn register_dynamodb_tables(
     session_ctx: &mut SessionContext,
     name: &str,
@@ -1156,10 +1382,6 @@ pub async fn register_dynamodb_tables(
     let table = opts
         .get("table")
         .ok_or_else(|| anyhow::anyhow!("DynamoDB data source '{name}' requires 'table' option"))?;
-    let partition_key = opts.get("partition_key").ok_or_else(|| {
-        anyhow::anyhow!("DynamoDB data source '{name}' requires 'partition_key' option")
-    })?;
-    let sort_key = opts.get("sort_key").map(String::as_str);
     let region = opts
         .get("region")
         .cloned()
@@ -1167,9 +1389,30 @@ pub async fn register_dynamodb_tables(
 
     let client = build_client(connection_string, &region, opts).await?;
 
-    let provider = DynamoTableProvider::new(client, table, partition_key, sort_key, None)
-        .await
-        .with_context(|| format!("Failed to create DynamoDB table provider for '{name}'"))?;
+    // Prefer the table's authoritative key schema (this also auto-detects the
+    // sort key). Fall back to the configured options if DescribeTable is
+    // unavailable, e.g. under restricted IAM permissions.
+    let (partition_key, sort_key) = match describe_keys(&client, table).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(
+                source = %name,
+                error = %e,
+                "DescribeTable failed; falling back to configured key options"
+            );
+            let pk = opts.get("partition_key").cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DynamoDB data source '{name}': DescribeTable failed ({e}) and no 'partition_key' option was provided"
+                )
+            })?;
+            (pk, opts.get("sort_key").cloned())
+        }
+    };
+
+    let provider =
+        DynamoTableProvider::new(client, table, &partition_key, sort_key.as_deref(), None)
+            .await
+            .with_context(|| format!("Failed to create DynamoDB table provider for '{name}'"))?;
 
     session_ctx
         .register_table(name, Arc::new(provider))
@@ -1202,6 +1445,34 @@ async fn build_client(
 
     let config = loader.load().await;
     Ok(Client::new(&config))
+}
+
+/// Read the table's authoritative key schema via `DescribeTable`, returning
+/// `(partition_key, sort_key)`. This drives key-aware read planning without
+/// trusting (possibly mismatched) configured key names, and auto-detects the
+/// sort key for composite-key tables.
+async fn describe_keys(client: &Client, table: &str) -> Result<(String, Option<String>)> {
+    let out = client
+        .describe_table()
+        .table_name(table)
+        .send()
+        .await
+        .with_context(|| format!("DescribeTable failed for '{table}'"))?;
+    let key_schema = out.table().map(|t| t.key_schema()).unwrap_or_default();
+
+    let mut partition_key: Option<String> = None;
+    let mut sort_key: Option<String> = None;
+    for element in key_schema {
+        match element.key_type() {
+            KeyType::Hash => partition_key = Some(element.attribute_name().to_string()),
+            KeyType::Range => sort_key = Some(element.attribute_name().to_string()),
+            _ => {}
+        }
+    }
+
+    let partition_key = partition_key
+        .ok_or_else(|| anyhow::anyhow!("table '{table}' has no HASH key in its key schema"))?;
+    Ok((partition_key, sort_key))
 }
 
 #[cfg(test)]
@@ -1334,6 +1605,86 @@ mod tests {
         assert!(expr.contains(", "));
         assert_eq!(names.len(), 2);
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn classify_single_key_eq_is_get_item() {
+        let filters = vec![col("product_id").eq(lit("PROD001"))];
+        match classify_read("product_id", None, &filters).unwrap() {
+            DynamoRead::GetItem { key } => {
+                assert_eq!(key.len(), 1);
+                assert!(key.contains_key("product_id"));
+            }
+            _ => panic!("expected GetItem for a full single-key lookup"),
+        }
+    }
+
+    #[test]
+    fn classify_composite_full_key_is_get_item() {
+        let filters = vec![col("pk").eq(lit("A")), col("sk").eq(lit("B"))];
+        match classify_read("pk", Some("sk"), &filters).unwrap() {
+            DynamoRead::GetItem { key } => assert_eq!(key.len(), 2),
+            _ => panic!("expected GetItem when both key parts are pinned"),
+        }
+    }
+
+    #[test]
+    fn classify_partition_eq_sort_range_is_query() {
+        let filters = vec![col("pk").eq(lit("A")), col("sk").gt(lit(5i64))];
+        match classify_read("pk", Some("sk"), &filters).unwrap() {
+            DynamoRead::Query { key_condition } => {
+                assert!(key_condition.expression.contains("#k0 = :k0"));
+                assert!(key_condition.expression.contains(" AND "));
+                assert!(key_condition.expression.contains('>'));
+                assert_eq!(key_condition.names.len(), 2);
+            }
+            _ => panic!("expected Query for partition-eq + sort-range"),
+        }
+    }
+
+    #[test]
+    fn classify_partition_eq_only_on_composite_is_query() {
+        let filters = vec![col("pk").eq(lit("A"))];
+        match classify_read("pk", Some("sk"), &filters).unwrap() {
+            DynamoRead::Query { key_condition } => {
+                assert_eq!(key_condition.expression, "#k0 = :k0");
+                assert_eq!(key_condition.names.len(), 1);
+            }
+            _ => panic!("expected partition-only Query on a composite-key table"),
+        }
+    }
+
+    #[test]
+    fn classify_partition_non_eq_is_scan() {
+        // A non-equality predicate on the partition key cannot drive Query/GetItem.
+        let filters = vec![col("product_id").gt(lit("PROD000"))];
+        assert!(matches!(
+            classify_read("product_id", None, &filters).unwrap(),
+            DynamoRead::Scan { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_non_key_filter_is_scan() {
+        let filters = vec![col("category").eq(lit("Electronics"))];
+        match classify_read("product_id", None, &filters).unwrap() {
+            DynamoRead::Scan { filter } => assert!(filter.is_some()),
+            _ => panic!("expected Scan for a non-key filter"),
+        }
+    }
+
+    #[test]
+    fn classify_sort_key_noteq_is_not_a_key_condition() {
+        // `sk <> B` is pushable as a filter but illegal in a KeyConditionExpression,
+        // so it must NOT become a key condition. With the partition key pinned this
+        // yields a partition-only Query (the `<>` is left for DataFusion).
+        let filters = vec![col("pk").eq(lit("A")), col("sk").not_eq(lit("B"))];
+        match classify_read("pk", Some("sk"), &filters).unwrap() {
+            DynamoRead::Query { key_condition } => {
+                assert_eq!(key_condition.expression, "#k0 = :k0");
+            }
+            _ => panic!("expected partition-only Query; `<>` must not become a key condition"),
+        }
     }
 
     #[test]
@@ -1537,5 +1888,130 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(after_delete, 0, "row should be gone after delete");
+    }
+
+    /// Create a composite-key (HASH + RANGE) table for Query-path tests.
+    async fn ensure_composite_table(client: &Client, table: &str) {
+        use aws_sdk_dynamodb::types::{AttributeDefinition, KeySchemaElement, ScalarAttributeType};
+        if client
+            .describe_table()
+            .table_name(table)
+            .send()
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        client
+            .create_table()
+            .table_name(table)
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("pk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("sk")
+                    .attribute_type(ScalarAttributeType::N)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("pk")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("sk")
+                    .key_type(KeyType::Range)
+                    .build()
+                    .unwrap(),
+            )
+            .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+            .send()
+            .await
+            .expect("create composite table");
+    }
+
+    /// End-to-end coverage of the Query path (partition-only predicate) and the
+    /// composite-key GetItem path (pk + sk equality) against DynamoDB Local. Also
+    /// exercises DescribeTable-based sort-key auto-detection via registration.
+    #[tokio::test]
+    #[ignore = "requires DynamoDB Local on :8000"]
+    async fn integration_composite_key_query_and_get() {
+        let table = "skardi_composite";
+        let mut opts = HashMap::new();
+        opts.insert("table".to_string(), table.to_string());
+        opts.insert("region".to_string(), "us-east-1".to_string());
+
+        let client = build_client("http://localhost:8000", "us-east-1", &opts)
+            .await
+            .expect("client");
+        ensure_composite_table(&client, table).await;
+
+        // Seed three items in one partition + one in another.
+        let put = |pk: &str, sk: i64| {
+            let client = client.clone();
+            let table = table.to_string();
+            let pk = pk.to_string();
+            async move {
+                client
+                    .put_item()
+                    .table_name(&table)
+                    .item("pk", AttributeValue::S(pk))
+                    .item("sk", AttributeValue::N(sk.to_string()))
+                    .send()
+                    .await
+                    .expect("put");
+            }
+        };
+        put("A", 1).await;
+        put("A", 2).await;
+        put("A", 3).await;
+        put("B", 1).await;
+
+        // Register via the public path so DescribeTable auto-detects the sort key
+        // (note: no partition_key/sort_key options supplied).
+        let mut ctx = SessionContext::new();
+        register_dynamodb_tables(&mut ctx, table, "http://localhost:8000", Some(&opts))
+            .await
+            .expect("register");
+
+        let rows = |sql: String| {
+            let ctx = &ctx;
+            async move {
+                ctx.sql(&sql)
+                    .await
+                    .expect("sql")
+                    .collect()
+                    .await
+                    .expect("collect")
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>()
+            }
+        };
+
+        // Partition-only predicate → Query path → all 3 items in partition A.
+        assert_eq!(
+            rows(format!("SELECT * FROM {table} WHERE pk = 'A'")).await,
+            3
+        );
+        // Full composite key by equality → GetItem path → exactly one item.
+        assert_eq!(
+            rows(format!("SELECT * FROM {table} WHERE pk = 'A' AND sk = 2")).await,
+            1
+        );
+        // Partition + sort range → Query path with a sort condition → 2 items.
+        assert_eq!(
+            rows(format!("SELECT * FROM {table} WHERE pk = 'A' AND sk >= 2")).await,
+            2
+        );
     }
 }

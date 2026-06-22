@@ -246,11 +246,29 @@ curl -X POST http://localhost:8080/federated_join/execute \
 | Option | Type | Required | Description |
 |---|---|---|---|
 | `table` | string | yes | DynamoDB table name |
-| `partition_key` | string | yes | Partition (hash) key attribute name |
-| `sort_key` | string | no | Sort (range) key attribute name for composite-key tables |
+| `partition_key` | string | no | Partition (hash) key attribute name. Auto-detected from the table's key schema via `DescribeTable`; supply it only as a fallback for when `DescribeTable` is unavailable (e.g. restricted IAM permissions) |
+| `sort_key` | string | no | Sort (range) key attribute name for composite-key tables. Also auto-detected from `DescribeTable`; a fallback otherwise |
 | `region` | string | no | AWS region (default `us-east-1`) |
 | `access_key_env` | string | no | Env var holding the AWS access key id |
 | `secret_key_env` | string | no | Env var holding the AWS secret access key |
+
+### Read planning (key-aware access)
+
+Skardi inspects each query's `WHERE` clause and picks the cheapest DynamoDB
+access pattern the predicates allow:
+
+| Predicate on the key | DynamoDB API used |
+|---|---|
+| Full primary key by equality (`pk = …`, or `pk = … AND sk = …`) | `GetItem` — single-item read |
+| Partition key by equality, with an optional sort-key condition (`pk = … [AND sk >= …]`) | `Query` — reads only that partition |
+| Anything else (non-key filter, or partition key not pinned by equality) | `Scan` — full table read + `FilterExpression` |
+
+A `Scan` reads (and bills for) the entire table regardless of how selective the
+filter is, so pinning the partition key turns an O(table) read into an O(1) /
+O(partition) one. Equality on a key is required: `pk > …` cannot use
+`Query`/`GetItem` and falls back to `Scan`. Non-key predicates are always
+re-applied by the query engine after the fetch, so results are identical
+whichever path is chosen.
 
 `connection_string` is the **endpoint URL**:
 
