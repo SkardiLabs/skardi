@@ -318,6 +318,7 @@ fn data_source_type_str(t: &DataSourceType) -> &'static str {
         DataSourceType::Lance => "lance",
         DataSourceType::Redis => "redis",
         DataSourceType::Seekdb => "seekdb",
+        DataSourceType::Influxdb => "influxdb",
     }
 }
 

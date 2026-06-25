@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::iceberg::register_iceberg_table;
+use skardi::sources::providers::influxdb::register_influxdb_tables;
 use skardi::sources::providers::lance::register_lance_table;
 use skardi::sources::providers::mongo::register_mongo_tables;
 use skardi::sources::providers::mysql::register_mysql_tables;
@@ -779,7 +780,8 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 | DataSourceType::Mysql
                 | DataSourceType::Mongo
                 | DataSourceType::Redis
-                | DataSourceType::Seekdb,
+                | DataSourceType::Seekdb
+                | DataSourceType::Influxdb,
                 false,
             ) => {
                 // For database connections, ensure connection string is provided
@@ -951,7 +953,8 @@ async fn register_data_source(
             | DataSourceType::Mysql
             | DataSourceType::Mongo
             | DataSourceType::Redis
-            | DataSourceType::Seekdb,
+            | DataSourceType::Seekdb
+            | DataSourceType::Influxdb,
             _,
         ) => {
             // Database sources don't need file path validation
@@ -1272,6 +1275,34 @@ async fn register_data_source(
             )
             .map_err(|e| {
                 tracing::error!("Redis registration failed for '{}': {:?}", source.name, e);
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Influxdb => {
+            tracing::info!("Registering InfluxDB table: {}", source.name);
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            register_influxdb_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "InfluxDB registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),

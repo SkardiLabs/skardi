@@ -409,6 +409,7 @@ pub async fn get_data_sources(
             DataSourceType::Lance => "lance",
             DataSourceType::Redis => "redis",
             DataSourceType::Seekdb => "seekdb",
+            DataSourceType::Influxdb => "influxdb",
         };
 
         // Determine path or URL based on source type
@@ -422,7 +423,8 @@ pub async fn get_data_sources(
             | DataSourceType::Mysql
             | DataSourceType::Mongo
             | DataSourceType::Redis
-            | DataSourceType::Seekdb => None,
+            | DataSourceType::Seekdb
+            | DataSourceType::Influxdb => None,
         };
 
         let url = match data_source.source_type {
@@ -430,7 +432,8 @@ pub async fn get_data_sources(
             | DataSourceType::Mysql
             | DataSourceType::Mongo
             | DataSourceType::Redis
-            | DataSourceType::Seekdb => {
+            | DataSourceType::Seekdb
+            | DataSourceType::Influxdb => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()
