@@ -108,7 +108,13 @@ pub async fn register_influxdb_tables(
         connection_string
     );
 
-    let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()));
+    // `persistent_headers` propagates our headers (database + bearer token)
+    // from the GetFlightInfo call onto the subsequent DoGet data fetch.
+    // InfluxDB 3 requires the `database` header — and the bearer token, when
+    // auth is enabled — on *every* Flight call, so without this the data
+    // stream would be rejected even though schema discovery succeeded.
+    let driver = FlightSqlDriver::new().with_persistent_headers(true);
+    let factory = FlightTableFactory::new(Arc::new(driver));
     let table = factory
         .open_table(connection_string.to_string(), flight_opts)
         .await

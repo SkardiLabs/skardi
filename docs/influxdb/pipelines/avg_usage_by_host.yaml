@@ -1,0 +1,9 @@
+kind: pipeline
+
+metadata:
+  name: "avg_usage_by_host"
+  version: "1.0"
+  description: "Average user CPU per host (aggregation)"
+
+spec:
+  query: "SELECT host, avg(usage_user) AS avg_user, count(*) AS samples FROM cpu GROUP BY host ORDER BY host"

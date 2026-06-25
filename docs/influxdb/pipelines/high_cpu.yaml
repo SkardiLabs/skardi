@@ -1,0 +1,9 @@
+kind: pipeline
+
+metadata:
+  name: "high_cpu"
+  version: "1.0"
+  description: "Samples whose user CPU exceeds a threshold (parameterised filter)"
+
+spec:
+  query: "SELECT host, time, usage_user FROM cpu WHERE usage_user > {threshold} ORDER BY usage_user DESC"

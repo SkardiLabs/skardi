@@ -1,0 +1,9 @@
+kind: pipeline
+
+metadata:
+  name: "list_all_cpu"
+  version: "1.0"
+  description: "Full scan of CPU samples, most recent first"
+
+spec:
+  query: "SELECT host, region, time, usage_user, usage_system FROM cpu ORDER BY time DESC"
