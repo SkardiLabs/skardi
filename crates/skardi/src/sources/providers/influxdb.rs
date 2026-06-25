@@ -7,7 +7,7 @@
 //! provider shipped by `datafusion-table-providers`. This module's only job is
 //! to translate Skardi's friendly `options` map (database / token / query /
 //! measurement) into the Flight SQL driver's option keys and register the
-//! resulting [`FlightTable`] — which already implements DataFusion's
+//! resulting `FlightTable` — which already implements DataFusion's
 //! `TableProvider` — into the session context.
 //!
 //! Access is **read-only**: Flight SQL serves `SELECT`s only. Writes to
@@ -224,5 +224,92 @@ mod tests {
         .unwrap();
         assert_eq!(flight.get("flight.sql.username").unwrap(), "admin");
         assert_eq!(flight.get("flight.sql.header.custom").unwrap(), "1");
+    }
+
+    #[test]
+    fn full_option_set_produces_exactly_the_expected_keys() {
+        let flight = build_flight_options(
+            "cpu",
+            &opts(&[
+                ("measurement", "cpu"),
+                ("database", "metrics"),
+                ("token", "s3cr3t"),
+            ]),
+        )
+        .unwrap();
+
+        // Friendly keys must be translated, never leaked verbatim.
+        assert!(!flight.contains_key("measurement"));
+        assert!(!flight.contains_key("database"));
+        assert!(!flight.contains_key("token"));
+
+        let mut keys: Vec<&str> = flight.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "flight.sql.header.authorization",
+                "flight.sql.header.database",
+                "flight.sql.query",
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_flight_sql_query_overrides_measurement_derived_query() {
+        // `flight.sql.query` IS the QUERY key, so a raw value wins over the
+        // measurement-derived one (passthrough runs last).
+        let flight = build_flight_options(
+            "cpu",
+            &opts(&[("measurement", "cpu"), ("flight.sql.query", "SELECT 42")]),
+        )
+        .unwrap();
+        assert_eq!(flight.get(QUERY).unwrap(), "SELECT 42");
+    }
+
+    #[test]
+    fn raw_authorization_header_overrides_token() {
+        let flight = build_flight_options(
+            "cpu",
+            &opts(&[
+                ("measurement", "cpu"),
+                ("token", "friendly"),
+                ("flight.sql.header.authorization", "Bearer raw"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            flight
+                .get(&format!("{HEADER_PREFIX}authorization"))
+                .unwrap(),
+            "Bearer raw"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_without_options_errors() {
+        let mut ctx = SessionContext::new();
+        let err = register_influxdb_tables(&mut ctx, "cpu", "http://localhost:8181", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("requires options"));
+    }
+
+    #[tokio::test]
+    async fn register_without_query_or_measurement_errors_before_connecting() {
+        // Only `database` is given — the option-validation error must fire
+        // before any network call, so this is safe to run offline.
+        let mut ctx = SessionContext::new();
+        let options = opts(&[("database", "metrics")]);
+        let err = register_influxdb_tables(
+            &mut ctx,
+            "cpu",
+            // Deliberately unroutable; we must fail before ever dialing it.
+            "http://127.0.0.1:1",
+            Some(&options),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("requires either a 'query'"));
     }
 }

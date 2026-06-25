@@ -85,9 +85,9 @@ providers).
 | `avg_usage_by_host` | Average user CPU per host (aggregation) |
 | `federated_cpu_by_datacenter` | Join InfluxDB `cpu` with a CSV host map, aggregate per datacenter |
 
-> The response bodies below are representative of the sample data above. Exact
-> column ordering and timestamp formatting follow what InfluxDB returns over
-> Flight SQL.
+> The response bodies below are captured from a live run against InfluxDB 3
+> Core with the sample data above. `execution_time_ms` and `timestamp` vary
+> per run.
 
 ---
 
@@ -102,16 +102,16 @@ curl -X POST http://localhost:8080/list_all_cpu/execute \
 **Response:**
 ```json
 {
+  "success": true,
   "data": [
-    {"host": "host2", "region": "us-west", "time": "2023-11-14T22:01:00", "usage_user": 88.7, "usage_system": 12.3},
-    {"host": "host1", "region": "us-west", "time": "2023-11-14T22:01:00", "usage_user": 64.1, "usage_system": 9.8},
-    {"host": "host2", "region": "us-west", "time": "2023-11-14T22:00:00", "usage_user": 41.0, "usage_system": 6.0},
-    {"host": "host3", "region": "us-east", "time": "2023-11-14T22:00:00", "usage_user": 22.4, "usage_system": 4.1},
-    {"host": "host1", "region": "us-west", "time": "2023-11-14T22:00:00", "usage_user": 12.5, "usage_system": 3.2}
+    {"host": "host1", "region": "us-west", "time": "2023-11-14T22:14:20", "usage_user": 64.1, "usage_system": 9.8},
+    {"host": "host2", "region": "us-west", "time": "2023-11-14T22:14:20", "usage_user": 88.7, "usage_system": 12.3},
+    {"host": "host1", "region": "us-west", "time": "2023-11-14T22:13:20", "usage_user": 12.5, "usage_system": 3.2},
+    {"host": "host2", "region": "us-west", "time": "2023-11-14T22:13:20", "usage_user": 41.0, "usage_system": 6.0},
+    {"host": "host3", "region": "us-east", "time": "2023-11-14T22:13:20", "usage_user": 22.4, "usage_system": 4.1}
   ],
-  "execution_time_ms": 18,
   "rows": 5,
-  "success": true
+  "execution_time_ms": 668
 }
 ```
 
@@ -128,13 +128,13 @@ curl -X POST http://localhost:8080/cpu_by_host/execute \
 **Response:**
 ```json
 {
+  "success": true,
   "data": [
-    {"host": "host1", "time": "2023-11-14T22:01:00", "usage_user": 64.1, "usage_system": 9.8},
-    {"host": "host1", "time": "2023-11-14T22:00:00", "usage_user": 12.5, "usage_system": 3.2}
+    {"host": "host1", "time": "2023-11-14T22:14:20", "usage_user": 64.1, "usage_system": 9.8},
+    {"host": "host1", "time": "2023-11-14T22:13:20", "usage_user": 12.5, "usage_system": 3.2}
   ],
-  "execution_time_ms": 11,
   "rows": 2,
-  "success": true
+  "execution_time_ms": 170
 }
 ```
 
@@ -151,13 +151,13 @@ curl -X POST http://localhost:8080/high_cpu/execute \
 **Response:**
 ```json
 {
+  "success": true,
   "data": [
-    {"host": "host2", "time": "2023-11-14T22:01:00", "usage_user": 88.7},
-    {"host": "host1", "time": "2023-11-14T22:01:00", "usage_user": 64.1}
+    {"host": "host2", "time": "2023-11-14T22:14:20", "usage_user": 88.7},
+    {"host": "host1", "time": "2023-11-14T22:14:20", "usage_user": 64.1}
   ],
-  "execution_time_ms": 10,
   "rows": 2,
-  "success": true
+  "execution_time_ms": 164
 }
 ```
 
@@ -174,14 +174,14 @@ curl -X POST http://localhost:8080/avg_usage_by_host/execute \
 **Response:**
 ```json
 {
+  "success": true,
   "data": [
     {"host": "host1", "avg_user": 38.3, "samples": 2},
     {"host": "host2", "avg_user": 64.85, "samples": 2},
     {"host": "host3", "avg_user": 22.4, "samples": 1}
   ],
-  "execution_time_ms": 14,
   "rows": 3,
-  "success": true
+  "execution_time_ms": 169
 }
 ```
 
@@ -213,14 +213,14 @@ curl -X POST http://localhost:8080/federated_cpu_by_datacenter/execute \
 **Response:**
 ```json
 {
+  "success": true,
   "data": [
     {"datacenter": "us-west-1b", "owner": "platform", "avg_user": 64.85, "max_user": 88.7, "samples": 2},
     {"datacenter": "us-west-1a", "owner": "platform", "avg_user": 38.3, "max_user": 64.1, "samples": 2},
     {"datacenter": "us-east-2a", "owner": "analytics", "avg_user": 22.4, "max_user": 22.4, "samples": 1}
   ],
-  "execution_time_ms": 21,
   "rows": 3,
-  "success": true
+  "execution_time_ms": 167
 }
 ```
 
