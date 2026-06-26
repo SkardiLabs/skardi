@@ -86,9 +86,9 @@ scan per query.
 
 To push work into InfluxDB's own query engine, bake the filter / projection /
 aggregation into the source's **`query` option** (see
-[Custom Query / Pre-aggregation](#custom-query--pre-aggregation) below); that
-SQL is sent verbatim and runs server-side. Dynamic, per-request pushdown is
-tracked as a follow-up.
+[Custom Query / Pre-aggregation](#custom-query--pre-aggregation-pushing-filters-into-influxdb)
+below, with a side-by-side cost comparison); that SQL is sent verbatim and runs
+server-side. Dynamic, per-request pushdown is tracked as a follow-up.
 
 ## Available Pipelines
 
@@ -262,14 +262,21 @@ InfluxDB sources use `connection_string` for the Flight gRPC endpoint URL
 | `measurement` (alias `table`) | one of these | Measurement name; expands to `SELECT * FROM "<measurement>"`. |
 | `query` | or this | Full SQL backing the table (overrides `measurement`). |
 | `database` | recommended | InfluxDB 3 database / bucket; sent as the `database` gRPC header so the server picks the right database. |
-| `token` | for auth | API token; sent as `authorization: Bearer <token>`. |
+| `token_env` | for auth (preferred) | **Name of an environment variable** holding the API token. Resolved at registration; sent as `authorization: Bearer <token>`. Keeps the secret out of the YAML. Registration fails if the variable is unset. |
+| `token` | for auth (discouraged) | Inline API token. Works, but commits the secret to config and logs a warning — prefer `token_env`. Ignored when `token_env` is set. |
 | `flight.sql.*` | optional | Any raw Flight SQL driver option, forwarded verbatim (takes precedence). E.g. `flight.sql.username`, `flight.sql.password`, `flight.sql.header.<name>`. |
 
 ### With Authentication (production)
 
-Real InfluxDB deployments require a token. Drop `--without-auth`, mint an admin
-token (`docker exec influxdb3-skardi influxdb3 create token --admin`), and add
-it to each source:
+Real InfluxDB deployments require a token. Drop `--without-auth` and mint an
+admin token:
+
+```bash
+docker exec influxdb3-skardi influxdb3 create token --admin
+```
+
+**Pass the token via an environment variable, not the YAML.** Point `token_env`
+at a variable name and export the secret in the process environment:
 
 ```yaml
 spec:
@@ -280,19 +287,104 @@ spec:
       options:
         database: "metrics"
         measurement: "cpu"
-        token: "apiv3_your_token_here"
+        token_env: "INFLUXDB_TOKEN"   # ← variable NAME, not the token itself
 ```
 
-### Custom Query / Pre-aggregation
+```bash
+export INFLUXDB_TOKEN="apiv3_your_token_here"
+skardi serve --context docs/influxdb/ctx_influxdb_demo.yaml
+```
 
-Push work into InfluxDB by binding a table to a custom query instead of a whole
-measurement:
+This keeps the token out of version control and lets the same config run across
+environments by swapping the variable. An inline `token:` option still works for
+throwaway local testing, but Skardi logs a warning and you should not commit it.
+
+### Custom Query / Pre-aggregation (pushing filters into InfluxDB)
+
+This is the lever that controls **how much data crosses the network**. Recall
+from [Query Pushdown](#query-pushdown): the SQL you put in a *pipeline* runs in
+Skardi, *after* the rows have already been pulled over Flight. The SQL you put in
+a source's **`query` option** runs *inside InfluxDB*, before anything is sent.
+
+So the rule of thumb is: **put every filter, projection, time range, and
+aggregation you can into the `query` option.** Whatever you leave for the
+pipeline to do, Skardi pays for by transferring the full measurement first.
+
+#### Side-by-side: same result, very different cost
+
+Goal: hourly average CPU for one host over the last day.
+
+<table>
+<tr><th>❌ Whole measurement + pipeline filter</th><th>✅ Pushed into the <code>query</code> option</th></tr>
+<tr valign="top"><td>
 
 ```yaml
-    - name: "cpu_hourly"
-      type: "influxdb"
-      connection_string: "http://localhost:8181"
-      options:
-        database: "metrics"
-        query: "SELECT host, date_bin(INTERVAL '1 hour', time) AS hour, avg(usage_user) AS avg_user FROM cpu GROUP BY host, hour"
+# ctx: binds the ENTIRE measurement
+- name: "cpu"
+  type: "influxdb"
+  connection_string: "http://localhost:8181"
+  options:
+    database: "metrics"
+    measurement: "cpu"      # → SELECT * FROM "cpu"
 ```
+
+```sql
+-- pipeline: filtering/aggregating happens
+-- in Skardi, locally
+SELECT host,
+       date_bin(INTERVAL '1 hour', time) AS hour,
+       avg(usage_user) AS avg_user
+FROM cpu
+WHERE host = 'web-01'
+  AND time > now() - INTERVAL '1 day'
+GROUP BY host, hour
+```
+
+**Transfers every row of `cpu`** (all hosts, all time)
+over Flight, then throws almost all of it away.
+
+</td><td>
+
+```yaml
+# ctx: binds a pre-aggregated, pre-filtered query
+- name: "cpu_web01_hourly"
+  type: "influxdb"
+  connection_string: "http://localhost:8181"
+  options:
+    database: "metrics"
+    query: >
+      SELECT host,
+             date_bin(INTERVAL '1 hour', time) AS hour,
+             avg(usage_user) AS avg_user
+      FROM cpu
+      WHERE host = 'web-01'
+        AND time > now() - INTERVAL '1 day'
+      GROUP BY host, hour
+```
+
+```sql
+-- pipeline: just read the table; the heavy
+-- lifting already ran server-side
+SELECT * FROM cpu_web01_hourly
+```
+
+**Transfers only the hourly rows for `web-01`** —
+InfluxDB does the filter + rollup before sending.
+
+</td></tr>
+</table>
+
+#### Practical notes
+
+- **Time bounds matter most.** A `WHERE time > now() - INTERVAL '…'` clause in
+  the `query` is the single biggest win on a growing measurement — without it,
+  every scan walks the full history.
+- **Parameterised, per-request filters** (e.g. a `{host}` the caller supplies)
+  can't live in the `query` option, since the query is fixed at registration. If
+  you need a value-per-call *and* server-side pushdown, register one source per
+  value, or scope the `query` to the smallest superset (e.g. one datacenter, last
+  7 days) so the pipeline filters a small set locally.
+- **The SQL is InfluxDB's dialect** (DataFusion SQL), sent verbatim — so
+  `date_bin`, `now()`, and `INTERVAL` run server-side exactly as written.
+- Anything you can't push down still works; it just costs a full-measurement
+  scan, which is fine for small or already-bounded measurements.

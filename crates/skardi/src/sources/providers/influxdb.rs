@@ -33,6 +33,31 @@ use datafusion::prelude::SessionContext;
 use datafusion_table_providers::flight::sql::{FlightSqlDriver, HEADER_PREFIX, QUERY};
 use datafusion_table_providers::flight::{FlightTable, FlightTableFactory};
 
+// Friendly `options` keys that Skardi treats specially for InfluxDB sources.
+//
+// These are the *Skardi-side* option names (as written in a `ctx` YAML), as
+// opposed to the driver-side keys (`QUERY`, `HEADER_PREFIX`, …) imported from
+// `datafusion-table-providers`. Centralising them here keeps the recognised
+// vocabulary in one place so it can't silently drift between the parser, the
+// docs, and the tests.
+
+/// Full SQL backing the table, e.g. `SELECT * FROM cpu WHERE ...`.
+const OPT_QUERY: &str = "query";
+/// InfluxDB measurement name; shorthand expanded to `SELECT * FROM "<name>"`.
+const OPT_MEASUREMENT: &str = "measurement";
+/// Alias for [`OPT_MEASUREMENT`] — a measurement is InfluxDB's table.
+const OPT_TABLE: &str = "table";
+/// InfluxDB 3 database (a.k.a. bucket); sent as the `database` gRPC header.
+const OPT_DATABASE: &str = "database";
+/// Name of an environment variable holding the API token (preferred — keeps
+/// the secret out of the YAML config). Resolved at registration time.
+const OPT_TOKEN_ENV: &str = "token_env";
+/// Inline auth token; sent as `authorization: Bearer <token>`. Discouraged —
+/// prefer [`OPT_TOKEN_ENV`] so the token isn't committed to config.
+const OPT_TOKEN: &str = "token";
+/// Prefix marking caller-supplied driver options forwarded verbatim.
+const FLIGHT_PASSTHROUGH_PREFIX: &str = "flight.sql.";
+
 /// Translate Skardi's `options` map into the Flight SQL driver's option keys.
 ///
 /// Recognised options:
@@ -41,7 +66,11 @@ use datafusion_table_providers::flight::{FlightTable, FlightTableFactory};
 ///   One of `query` or `measurement`/`table` is required.
 /// - `database` — InfluxDB 3 database (a.k.a. bucket); sent as the `database`
 ///   gRPC header that InfluxDB uses to pick the target database.
-/// - `token` — auth token; sent as `authorization: Bearer <token>`.
+/// - `token_env` — name of an environment variable holding the API token
+///   (preferred; keeps the secret out of YAML). Sent as
+///   `authorization: Bearer <token>`. Errors if the variable is unset.
+/// - `token` — inline API token (discouraged; prefer `token_env`). Takes effect
+///   only when `token_env` is absent.
 /// - Any `flight.sql.*` key is forwarded verbatim and wins over the friendly
 ///   options above, so advanced setups (basic auth, custom headers) stay
 ///   reachable.
@@ -52,27 +81,49 @@ fn build_flight_options(
     let mut flight_opts: HashMap<String, String> = HashMap::new();
 
     // Resolve the backing query.
-    let query = if let Some(q) = options.get("query") {
+    let query = if let Some(q) = options.get(OPT_QUERY) {
         q.clone()
-    } else if let Some(measurement) = options.get("measurement").or_else(|| options.get("table")) {
+    } else if let Some(measurement) = options
+        .get(OPT_MEASUREMENT)
+        .or_else(|| options.get(OPT_TABLE))
+    {
         // Double-quote the identifier and escape embedded quotes so measurement
         // names with special characters / reserved words are handled safely.
         format!("SELECT * FROM \"{}\"", measurement.replace('"', "\"\""))
     } else {
         return Err(anyhow!(
-            "InfluxDB data source '{}' requires either a 'query' or a 'measurement' option",
+            "InfluxDB data source '{}' requires either a '{OPT_QUERY}' or a '{OPT_MEASUREMENT}' option",
             name
         ));
     };
     flight_opts.insert(QUERY.to_string(), query);
 
     // InfluxDB 3 selects the target database via the `database` gRPC header.
-    if let Some(database) = options.get("database") {
+    if let Some(database) = options.get(OPT_DATABASE) {
         flight_opts.insert(format!("{HEADER_PREFIX}database"), database.clone());
     }
 
     // Bearer-token auth → authorization header on the Flight calls.
-    if let Some(token) = options.get("token") {
+    // Prefer `token_env` (names an environment variable) so the secret stays
+    // out of the YAML config; fall back to an inline `token` for quick local
+    // use, but warn against keeping it in committed config.
+    let token = if let Some(token_env) = options.get(OPT_TOKEN_ENV) {
+        Some(std::env::var(token_env).with_context(|| {
+            format!(
+                "Environment variable '{token_env}' (option '{OPT_TOKEN_ENV}') not found \
+                 for InfluxDB source '{name}' token"
+            )
+        })?)
+    } else if let Some(token) = options.get(OPT_TOKEN) {
+        tracing::warn!(
+            "InfluxDB source '{name}' uses an inline '{OPT_TOKEN}' option; prefer \
+             '{OPT_TOKEN_ENV}' to keep the API token out of YAML config"
+        );
+        Some(token.clone())
+    } else {
+        None
+    };
+    if let Some(token) = token {
         flight_opts.insert(
             format!("{HEADER_PREFIX}authorization"),
             format!("Bearer {token}"),
@@ -81,7 +132,7 @@ fn build_flight_options(
 
     // Passthrough: caller-supplied flight.sql.* keys take precedence.
     for (key, value) in options {
-        if key.starts_with("flight.sql.") {
+        if key.starts_with(FLIGHT_PASSTHROUGH_PREFIX) {
             flight_opts.insert(key.clone(), value.clone());
         }
     }
@@ -291,6 +342,58 @@ mod tests {
                 .unwrap(),
             "Bearer s3cr3t"
         );
+    }
+
+    #[test]
+    fn token_env_resolves_from_environment() {
+        // Unique var name so the test is independent of others / the host env.
+        let var = "SKARDI_TEST_INFLUX_TOKEN_ENV_OK";
+        unsafe { std::env::set_var(var, "from-env-s3cr3t") };
+        let flight =
+            build_flight_options("cpu", &opts(&[("measurement", "cpu"), ("token_env", var)]))
+                .unwrap();
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(
+            flight
+                .get(&format!("{HEADER_PREFIX}authorization"))
+                .unwrap(),
+            "Bearer from-env-s3cr3t"
+        );
+    }
+
+    #[test]
+    fn token_env_wins_over_inline_token() {
+        let var = "SKARDI_TEST_INFLUX_TOKEN_ENV_PRECEDENCE";
+        unsafe { std::env::set_var(var, "env-wins") };
+        let flight = build_flight_options(
+            "cpu",
+            &opts(&[
+                ("measurement", "cpu"),
+                ("token", "inline"),
+                ("token_env", var),
+            ]),
+        )
+        .unwrap();
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(
+            flight
+                .get(&format!("{HEADER_PREFIX}authorization"))
+                .unwrap(),
+            "Bearer env-wins"
+        );
+    }
+
+    #[test]
+    fn missing_token_env_variable_is_an_error() {
+        let err = build_flight_options(
+            "cpu",
+            &opts(&[
+                ("measurement", "cpu"),
+                ("token_env", "SKARDI_TEST_INFLUX_TOKEN_ENV_DEFINITELY_UNSET"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]
