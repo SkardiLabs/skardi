@@ -312,4 +312,100 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("requires either a 'query'"));
     }
+
+    // ─── Integration tests (need a live InfluxDB 3 endpoint) ────────────
+    //
+    // Gated with `#[ignore]`; CI runs them via `cargo nextest -- --ignored`
+    // after starting an InfluxDB 3 Core container and seeding the `metrics`
+    // database (see .github/workflows/ci.yml and docs/influxdb/README.md).
+    // The endpoint and database are read from env so the same test runs
+    // locally and in CI.
+
+    fn influx_url() -> String {
+        std::env::var("INFLUXDB_URL").unwrap_or_else(|_| "http://127.0.0.1:8181".to_string())
+    }
+
+    fn influx_database() -> String {
+        std::env::var("INFLUXDB_DATABASE").unwrap_or_else(|_| "metrics".to_string())
+    }
+
+    async fn register_ci_measurement(ctx: &mut SessionContext, name: &str, measurement: &str) {
+        let options = opts(&[
+            ("database", influx_database().as_str()),
+            ("measurement", measurement),
+        ]);
+        register_influxdb_tables(ctx, name, &influx_url(), Some(&options))
+            .await
+            .unwrap_or_else(|e| panic!("register {name} failed: {e}"));
+    }
+
+    fn total_rows(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_register_measurement_and_scan() {
+        let mut ctx = SessionContext::new();
+        register_ci_measurement(&mut ctx, "cpu", "cpu").await;
+
+        let batches = ctx
+            .sql("SELECT host, usage_user FROM cpu")
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("collect");
+        assert!(
+            total_rows(&batches) >= 5,
+            "expected at least 5 seeded cpu rows, got {}",
+            total_rows(&batches)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_aggregation_pushes_through_flight() {
+        let mut ctx = SessionContext::new();
+        register_ci_measurement(&mut ctx, "cpu", "cpu").await;
+
+        let batches = ctx
+            .sql("SELECT count(*) AS n FROM cpu WHERE host = 'host1'")
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("collect");
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_register_with_explicit_query_option() {
+        // Exercise the `query` option path (rather than `measurement`).
+        let mut ctx = SessionContext::new();
+        let options = opts(&[
+            ("database", influx_database().as_str()),
+            (
+                "query",
+                "SELECT host, usage_user FROM cpu WHERE usage_user > 50",
+            ),
+        ]);
+        register_influxdb_tables(&mut ctx, "hot_cpu", &influx_url(), Some(&options))
+            .await
+            .expect("register with query option");
+
+        let batches = ctx
+            .sql("SELECT * FROM hot_cpu")
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("collect");
+        assert!(
+            total_rows(&batches) >= 1,
+            "expected at least one high-CPU row, got {}",
+            total_rows(&batches)
+        );
+    }
 }

@@ -866,4 +866,55 @@ spec:
             "got {err}"
         );
     }
+
+    #[tokio::test]
+    async fn submit_rejects_influxdb_destination_as_non_transactional() {
+        use std::io::Write;
+
+        let ctx = Arc::new(SessionContext::new());
+        ctx.register_batch("src", mk_batch()).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let yaml_path = tmp.path().join("ingest.yaml");
+        let yaml = r#"
+kind: job
+metadata:
+  name: "ingest"
+  version: "1.0.0"
+spec:
+  query: |
+    SELECT id FROM src
+  destination:
+    table: "cpu"
+    mode: append
+    create_if_missing: false
+"#;
+        std::fs::File::create(&yaml_path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+        let job = JobDefinition::load_from_file(&yaml_path, Arc::clone(&ctx))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut map = HashMap::new();
+        map.insert("ingest".to_string(), job);
+        let store = Arc::new(
+            super::super::store::SqliteJobStore::open_in_memory()
+                .await
+                .unwrap(),
+        );
+
+        // Mark `cpu` as InfluxDB-typed so the destination resolver classifies
+        // it as a non-transactional (read-only) backend and rejects it.
+        let mut types = HashMap::new();
+        types.insert("cpu".to_string(), DataSourceType::Influxdb);
+        let exec = JobExecutor::new(map, store, ctx, types, HashMap::new());
+
+        let err = exec.submit("ingest", HashMap::new()).await.unwrap_err();
+        assert!(
+            matches!(err, JobSubmitError::NonTransactionalDestination { .. }),
+            "got {err}"
+        );
+    }
 }
