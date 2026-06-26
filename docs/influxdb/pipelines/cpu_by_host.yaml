@@ -3,7 +3,7 @@ kind: pipeline
 metadata:
   name: "cpu_by_host"
   version: "1.0"
-  description: "CPU samples for a single host (filter pushdown on a tag)"
+  description: "CPU samples for a single host (tag filter, applied in Skardi)"
 
 spec:
   query: "SELECT host, time, usage_user, usage_system FROM cpu WHERE host = {host} ORDER BY time DESC"

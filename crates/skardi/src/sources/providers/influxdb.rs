@@ -23,8 +23,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
+use datafusion::common::Statistics;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -117,6 +118,19 @@ impl TableProvider for CountSafeFlightTable {
 
     fn table_type(&self) -> TableType {
         self.inner.table_type()
+    }
+
+    // Forward the remaining planning hooks to the inner table so the wrapper is
+    // transparent to the optimizer apart from the count(*) interception below.
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
     }
 
     async fn scan(

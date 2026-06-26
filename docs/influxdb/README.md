@@ -75,6 +75,21 @@ The table's Arrow schema is inferred at server startup from InfluxDB's
 loads its context (the same eager-connect behaviour as the Postgres/MySQL/Mongo
 providers).
 
+## Query Pushdown
+
+The backing query is fixed when the source is registered. Predicates,
+projections, and `LIMIT`s that appear in a **pipeline's** SQL (e.g.
+`WHERE host = {host}`) are *not* pushed to InfluxDB — Skardi fetches the whole
+measurement over Flight and applies them locally. This is fine for small or
+bounded measurements, but for large time-series it means a full-measurement
+scan per query.
+
+To push work into InfluxDB's own query engine, bake the filter / projection /
+aggregation into the source's **`query` option** (see
+[Custom Query / Pre-aggregation](#custom-query--pre-aggregation) below); that
+SQL is sent verbatim and runs server-side. Dynamic, per-request pushdown is
+tracked as a follow-up.
+
 ## Available Pipelines
 
 | Pipeline | Description |
