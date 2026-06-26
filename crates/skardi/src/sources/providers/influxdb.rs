@@ -15,13 +15,22 @@
 //! a SQL query engine, so InfluxDB sources never participate in CRUD or job
 //! destinations.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::Session;
+use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::{Expr, TableType};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::flight::FlightTableFactory;
 use datafusion_table_providers::flight::sql::{FlightSqlDriver, HEADER_PREFIX, QUERY};
+use datafusion_table_providers::flight::{FlightTable, FlightTableFactory};
 
 /// Translate Skardi's `options` map into the Flight SQL driver's option keys.
 ///
@@ -79,6 +88,62 @@ fn build_flight_options(
     Ok(flight_opts)
 }
 
+/// Thin wrapper around [`FlightTable`] that works around a bug in
+/// `datafusion-table-providers` 0.10.1's `enforce_schema`: when DataFusion
+/// requests an **empty** projection (e.g. `SELECT count(*)`), that function
+/// returns the original, full-width batch instead of an empty-column one, so
+/// the `FlightExec` emits 5-column batches while advertising a 0-column schema.
+/// The downstream batch coalescer then panics on `assert_eq!(num_columns, 0)`.
+///
+/// We intercept the empty-projection case: scan a single real column through
+/// the inner table (which takes `enforce_schema`'s correct, non-empty path),
+/// then strip it back to zero columns with a [`ProjectionExec`], which
+/// preserves the row count via `RecordBatchOptions::with_row_count`. All other
+/// projections delegate straight to the inner table.
+#[derive(Debug)]
+struct CountSafeFlightTable {
+    inner: Arc<FlightTable>,
+}
+
+#[async_trait]
+impl TableProvider for CountSafeFlightTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        match projection {
+            // Empty projection (count(*) / EXISTS): fetch one column so the
+            // upstream FlightExec produces a correctly-shaped batch, then drop
+            // it again to honour the requested zero-column output.
+            Some(p) if p.is_empty() => {
+                let single = vec![0usize];
+                let plan = self
+                    .inner
+                    .scan(state, Some(&single), filters, limit)
+                    .await?;
+                let empty: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
+                Ok(Arc::new(ProjectionExec::try_new(empty, plan)?))
+            }
+            _ => self.inner.scan(state, projection, filters, limit).await,
+        }
+    }
+}
+
 /// Register an InfluxDB 3 measurement (or arbitrary SQL query) as a Skardi table
 /// backed by the source's Arrow Flight SQL endpoint.
 ///
@@ -125,6 +190,9 @@ pub async fn register_influxdb_tables(
             )
         })?;
 
+    let table = CountSafeFlightTable {
+        inner: Arc::new(table),
+    };
     session_ctx
         .register_table(name, Arc::new(table))
         .with_context(|| format!("Failed to register InfluxDB table '{}'", name))?;
@@ -361,6 +429,33 @@ mod tests {
             "expected at least 5 seeded cpu rows, got {}",
             total_rows(&batches)
         );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_count_star_empty_projection() {
+        // Regression: `count(*)` requests an empty projection, which trips an
+        // upstream bug in the Flight provider's `enforce_schema`. The
+        // CountSafeFlightTable wrapper must keep this from panicking and return
+        // the correct row count.
+        let mut ctx = SessionContext::new();
+        register_ci_measurement(&mut ctx, "cpu", "cpu").await;
+
+        let batches = ctx
+            .sql("SELECT count(*) AS n FROM cpu")
+            .await
+            .expect("plan count(*)")
+            .collect()
+            .await
+            .expect("collect count(*)");
+        assert_eq!(total_rows(&batches), 1);
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("count is Int64")
+            .value(0);
+        assert!(n >= 5, "expected count >= 5 seeded rows, got {n}");
     }
 
     #[tokio::test]
