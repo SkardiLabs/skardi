@@ -261,9 +261,9 @@ InfluxDB sources use `connection_string` for the Flight gRPC endpoint URL
 |--------|----------|-------------|
 | `measurement` (alias `table`) | one of these | Measurement name; expands to `SELECT * FROM "<measurement>"`. |
 | `query` | or this | Full SQL backing the table (overrides `measurement`). |
-| `database` | recommended | InfluxDB 3 database / bucket; sent as the `database` gRPC header so the server picks the right database. |
-| `token_env` | for auth (preferred) | **Name of an environment variable** holding the API token. Resolved at registration; sent as `authorization: Bearer <token>`. Keeps the secret out of the YAML. Registration fails if the variable is unset. |
-| `token` | for auth (discouraged) | Inline API token. Works, but commits the secret to config and logs a warning — prefer `token_env`. Ignored when `token_env` is set. |
+| `database` | yes | InfluxDB 3 database / bucket; sent as the `database` gRPC header so the server picks the right database. Required — registration fails if missing or blank (unless supplied via `flight.sql.header.database`). |
+| `token_env` | for auth (preferred) | **Name of an environment variable** holding the API token. Resolved at registration; sent as `authorization: Bearer <token>`. Keeps the secret out of the YAML. Registration fails if the variable is unset or empty. |
+| `token` | for auth (discouraged) | Inline API token. Works, but commits the secret to config and logs a warning — prefer `token_env`. Ignored when `token_env` is set; a blank value is rejected. |
 | `flight.sql.*` | optional | Any raw Flight SQL driver option, forwarded verbatim (takes precedence). E.g. `flight.sql.username`, `flight.sql.password`, `flight.sql.header.<name>`. |
 
 ### With Authentication (production)

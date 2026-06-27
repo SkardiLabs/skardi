@@ -48,6 +48,7 @@ const OPT_MEASUREMENT: &str = "measurement";
 /// Alias for [`OPT_MEASUREMENT`] — a measurement is InfluxDB's table.
 const OPT_TABLE: &str = "table";
 /// InfluxDB 3 database (a.k.a. bucket); sent as the `database` gRPC header.
+/// Required — InfluxDB 3 needs it on every Flight call.
 const OPT_DATABASE: &str = "database";
 /// Name of an environment variable holding the API token (preferred — keeps
 /// the secret out of the YAML config). Resolved at registration time.
@@ -65,12 +66,14 @@ const FLIGHT_PASSTHROUGH_PREFIX: &str = "flight.sql.";
 /// - `measurement` / `table` — shorthand expanded to `SELECT * FROM "<name>"`.
 ///   One of `query` or `measurement`/`table` is required.
 /// - `database` — InfluxDB 3 database (a.k.a. bucket); sent as the `database`
-///   gRPC header that InfluxDB uses to pick the target database.
+///   gRPC header that InfluxDB uses to pick the target database. Required
+///   (unless supplied via a `flight.sql.header.database` passthrough key);
+///   a missing or blank value is a configuration error.
 /// - `token_env` — name of an environment variable holding the API token
 ///   (preferred; keeps the secret out of YAML). Sent as
-///   `authorization: Bearer <token>`. Errors if the variable is unset.
+///   `authorization: Bearer <token>`. Errors if the variable is unset or empty.
 /// - `token` — inline API token (discouraged; prefer `token_env`). Takes effect
-///   only when `token_env` is absent.
+///   only when `token_env` is absent; a blank value is a configuration error.
 /// - Any `flight.sql.*` key is forwarded verbatim and wins over the friendly
 ///   options above, so advanced setups (basic auth, custom headers) stay
 ///   reachable.
@@ -98,9 +101,32 @@ fn build_flight_options(
     };
     flight_opts.insert(QUERY.to_string(), query);
 
-    // InfluxDB 3 selects the target database via the `database` gRPC header.
-    if let Some(database) = options.get(OPT_DATABASE) {
-        flight_opts.insert(format!("{HEADER_PREFIX}database"), database.clone());
+    // InfluxDB 3 selects the target database via the `database` gRPC header,
+    // which it requires on *every* Flight call. Enforce it here so a missing or
+    // blank database surfaces as a clear config error at registration rather
+    // than an opaque Flight rejection at query time. Advanced setups can still
+    // satisfy the requirement through the `flight.sql.header.database`
+    // passthrough key (applied below), so we accept that as an alternative.
+    let database_header = format!("{HEADER_PREFIX}database");
+    match options.get(OPT_DATABASE) {
+        Some(database) if !database.is_empty() => {
+            flight_opts.insert(database_header.clone(), database.clone());
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "InfluxDB data source '{name}' has an empty '{OPT_DATABASE}' option; \
+                 InfluxDB 3 requires the name of the database (bucket) to query"
+            ));
+        }
+        None if options.contains_key(&database_header) => {
+            // Supplied via the `flight.sql.*` passthrough; honoured below.
+        }
+        None => {
+            return Err(anyhow!(
+                "InfluxDB data source '{name}' requires a '{OPT_DATABASE}' option \
+                 (the InfluxDB 3 database/bucket to query)"
+            ));
+        }
     }
 
     // Bearer-token auth → authorization header on the Flight calls.
@@ -108,13 +134,29 @@ fn build_flight_options(
     // out of the YAML config; fall back to an inline `token` for quick local
     // use, but warn against keeping it in committed config.
     let token = if let Some(token_env) = options.get(OPT_TOKEN_ENV) {
-        Some(std::env::var(token_env).with_context(|| {
+        let value = std::env::var(token_env).with_context(|| {
             format!(
                 "Environment variable '{token_env}' (option '{OPT_TOKEN_ENV}') not found \
                  for InfluxDB source '{name}' token"
             )
-        })?)
+        })?;
+        // A set-but-empty variable would otherwise produce a malformed
+        // `authorization: Bearer ` header and a confusing 401 at query time;
+        // treat it as a configuration error instead.
+        if value.is_empty() {
+            return Err(anyhow!(
+                "Environment variable '{token_env}' (option '{OPT_TOKEN_ENV}') is set but \
+                 empty for InfluxDB source '{name}'; expected an API token"
+            ));
+        }
+        Some(value)
     } else if let Some(token) = options.get(OPT_TOKEN) {
+        if token.is_empty() {
+            return Err(anyhow!(
+                "InfluxDB source '{name}' has an empty '{OPT_TOKEN}' option; provide a \
+                 non-empty API token or omit the option"
+            ));
+        }
         tracing::warn!(
             "InfluxDB source '{name}' uses an inline '{OPT_TOKEN}' option; prefer \
              '{OPT_TOKEN_ENV}' to keep the API token out of YAML config"
@@ -249,9 +291,15 @@ pub async fn register_influxdb_tables(
         .open_table(connection_string.to_string(), flight_opts)
         .await
         .with_context(|| {
+            // Schema is inferred eagerly here (a live `GetFlightInfo` call), so
+            // an unreachable endpoint, wrong database, or bad token fails server
+            // startup. Spell out the likely causes so the boot failure is
+            // actionable rather than a bare transport error.
             format!(
-                "Failed to open InfluxDB Flight SQL table '{}' at {}",
-                name, connection_string
+                "Failed to open InfluxDB Flight SQL table '{name}' at {connection_string} \
+                 (schema is fetched at registration time); check that the endpoint is \
+                 reachable, the '{OPT_DATABASE}' exists, and the token (if auth is enabled) \
+                 is valid"
             )
         })?;
 
@@ -277,28 +325,38 @@ mod tests {
             .collect()
     }
 
+    /// Like [`opts`], but injects a default `database` (which is now required)
+    /// so query/token-translation tests can stay focused on what they assert.
+    fn opts_with_db(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut map = opts(pairs);
+        map.entry(OPT_DATABASE.to_string())
+            .or_insert_with(|| "metrics".to_string());
+        map
+    }
+
     #[test]
     fn measurement_shorthand_expands_to_select() {
-        let flight = build_flight_options("cpu", &opts(&[("measurement", "cpu")])).unwrap();
+        let flight = build_flight_options("cpu", &opts_with_db(&[("measurement", "cpu")])).unwrap();
         assert_eq!(flight.get(QUERY).unwrap(), "SELECT * FROM \"cpu\"");
     }
 
     #[test]
     fn table_is_accepted_as_an_alias_for_measurement() {
-        let flight = build_flight_options("cpu", &opts(&[("table", "disk")])).unwrap();
+        let flight = build_flight_options("cpu", &opts_with_db(&[("table", "disk")])).unwrap();
         assert_eq!(flight.get(QUERY).unwrap(), "SELECT * FROM \"disk\"");
     }
 
     #[test]
     fn measurement_identifier_quotes_are_escaped() {
-        let flight = build_flight_options("m", &opts(&[("measurement", "we\"ird")])).unwrap();
+        let flight =
+            build_flight_options("m", &opts_with_db(&[("measurement", "we\"ird")])).unwrap();
         assert_eq!(flight.get(QUERY).unwrap(), "SELECT * FROM \"we\"\"ird\"");
     }
 
     #[test]
     fn explicit_query_is_passed_through_verbatim() {
         let q = "SELECT host, usage FROM cpu WHERE usage > 0.5";
-        let flight = build_flight_options("cpu", &opts(&[("query", q)])).unwrap();
+        let flight = build_flight_options("cpu", &opts_with_db(&[("query", q)])).unwrap();
         assert_eq!(flight.get(QUERY).unwrap(), q);
     }
 
@@ -306,10 +364,44 @@ mod tests {
     fn explicit_query_wins_over_measurement() {
         let flight = build_flight_options(
             "cpu",
-            &opts(&[("query", "SELECT 1"), ("measurement", "cpu")]),
+            &opts_with_db(&[("query", "SELECT 1"), ("measurement", "cpu")]),
         )
         .unwrap();
         assert_eq!(flight.get(QUERY).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn missing_database_is_an_error() {
+        let err = build_flight_options("cpu", &opts(&[("measurement", "cpu")])).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a 'database'"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn empty_database_is_an_error() {
+        let err = build_flight_options("cpu", &opts(&[("measurement", "cpu"), ("database", "")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("empty 'database'"), "got {err}");
+    }
+
+    #[test]
+    fn database_via_flight_sql_passthrough_satisfies_requirement() {
+        // The advanced escape hatch: no friendly `database`, but the raw
+        // `flight.sql.header.database` key provides it.
+        let flight = build_flight_options(
+            "cpu",
+            &opts(&[
+                ("measurement", "cpu"),
+                ("flight.sql.header.database", "metrics"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            flight.get(&format!("{HEADER_PREFIX}database")).unwrap(),
+            "metrics"
+        );
     }
 
     #[test]
@@ -333,9 +425,11 @@ mod tests {
 
     #[test]
     fn token_maps_to_bearer_authorization_header() {
-        let flight =
-            build_flight_options("cpu", &opts(&[("measurement", "cpu"), ("token", "s3cr3t")]))
-                .unwrap();
+        let flight = build_flight_options(
+            "cpu",
+            &opts_with_db(&[("measurement", "cpu"), ("token", "s3cr3t")]),
+        )
+        .unwrap();
         assert_eq!(
             flight
                 .get(&format!("{HEADER_PREFIX}authorization"))
@@ -349,9 +443,11 @@ mod tests {
         // Unique var name so the test is independent of others / the host env.
         let var = "SKARDI_TEST_INFLUX_TOKEN_ENV_OK";
         unsafe { std::env::set_var(var, "from-env-s3cr3t") };
-        let flight =
-            build_flight_options("cpu", &opts(&[("measurement", "cpu"), ("token_env", var)]))
-                .unwrap();
+        let flight = build_flight_options(
+            "cpu",
+            &opts_with_db(&[("measurement", "cpu"), ("token_env", var)]),
+        )
+        .unwrap();
         unsafe { std::env::remove_var(var) };
         assert_eq!(
             flight
@@ -367,7 +463,7 @@ mod tests {
         unsafe { std::env::set_var(var, "env-wins") };
         let flight = build_flight_options(
             "cpu",
-            &opts(&[
+            &opts_with_db(&[
                 ("measurement", "cpu"),
                 ("token", "inline"),
                 ("token_env", var),
@@ -387,7 +483,7 @@ mod tests {
     fn missing_token_env_variable_is_an_error() {
         let err = build_flight_options(
             "cpu",
-            &opts(&[
+            &opts_with_db(&[
                 ("measurement", "cpu"),
                 ("token_env", "SKARDI_TEST_INFLUX_TOKEN_ENV_DEFINITELY_UNSET"),
             ]),
@@ -397,10 +493,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_token_env_variable_is_an_error() {
+        let var = "SKARDI_TEST_INFLUX_TOKEN_ENV_EMPTY";
+        unsafe { std::env::set_var(var, "") };
+        let err = build_flight_options(
+            "cpu",
+            &opts_with_db(&[("measurement", "cpu"), ("token_env", var)]),
+        )
+        .unwrap_err();
+        unsafe { std::env::remove_var(var) };
+        assert!(err.to_string().contains("set but empty"), "got {err}");
+    }
+
+    #[test]
+    fn empty_inline_token_is_an_error() {
+        let err = build_flight_options(
+            "cpu",
+            &opts_with_db(&[("measurement", "cpu"), ("token", "")]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty 'token'"), "got {err}");
+    }
+
+    #[test]
     fn raw_flight_sql_options_pass_through() {
         let flight = build_flight_options(
             "cpu",
-            &opts(&[
+            &opts_with_db(&[
                 ("measurement", "cpu"),
                 ("flight.sql.username", "admin"),
                 ("flight.sql.header.custom", "1"),
@@ -446,7 +565,7 @@ mod tests {
         // measurement-derived one (passthrough runs last).
         let flight = build_flight_options(
             "cpu",
-            &opts(&[("measurement", "cpu"), ("flight.sql.query", "SELECT 42")]),
+            &opts_with_db(&[("measurement", "cpu"), ("flight.sql.query", "SELECT 42")]),
         )
         .unwrap();
         assert_eq!(flight.get(QUERY).unwrap(), "SELECT 42");
@@ -456,7 +575,7 @@ mod tests {
     fn raw_authorization_header_overrides_token() {
         let flight = build_flight_options(
             "cpu",
-            &opts(&[
+            &opts_with_db(&[
                 ("measurement", "cpu"),
                 ("token", "friendly"),
                 ("flight.sql.header.authorization", "Bearer raw"),
