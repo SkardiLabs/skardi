@@ -3,7 +3,10 @@ kind: pipeline
 metadata:
   name: "avg_usage_by_host"
   version: "1.0"
-  description: "Average user CPU per host (aggregation)"
+  description: "Average user CPU per host within a region (aggregation)"
+
+# Parameters:
+#   {region} - Region tag to scope the aggregation to (e.g. "us-west")
 
 spec:
-  query: "SELECT host, avg(usage_user) AS avg_user, count(*) AS samples FROM cpu GROUP BY host ORDER BY host"
+  query: "SELECT host, avg(usage_user) AS avg_user, count(*) AS samples FROM cpu WHERE region = {region} GROUP BY host ORDER BY host"

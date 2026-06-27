@@ -3,7 +3,10 @@ kind: pipeline
 metadata:
   name: "list_all_cpu"
   version: "1.0"
-  description: "Full scan of CPU samples, most recent first"
+  description: "Most recent CPU samples, newest first (caller-supplied row limit)"
+
+# Parameters:
+#   {limit} - Maximum number of samples to return (most recent first)
 
 spec:
-  query: "SELECT host, region, time, usage_user, usage_system FROM cpu ORDER BY time DESC"
+  query: "SELECT host, region, time, usage_user, usage_system FROM cpu ORDER BY time DESC LIMIT {limit}"

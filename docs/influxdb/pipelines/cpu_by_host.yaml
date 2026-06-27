@@ -5,5 +5,8 @@ metadata:
   version: "1.0"
   description: "CPU samples for a single host (tag filter, applied in Skardi)"
 
+# Parameters:
+#   {host} - Host whose CPU samples to return (e.g. "host1")
+
 spec:
   query: "SELECT host, time, usage_user, usage_system FROM cpu WHERE host = {host} ORDER BY time DESC"

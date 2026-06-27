@@ -92,26 +92,29 @@ server-side. Dynamic, per-request pushdown is tracked as a follow-up.
 
 ## Available Pipelines
 
-| Pipeline | Description |
-|----------|-------------|
-| `list_all_cpu` | Full scan of CPU samples, newest first |
-| `cpu_by_host` | CPU samples for one host (tag filter) |
-| `high_cpu` | Samples above a user-CPU threshold (parameterised) |
-| `avg_usage_by_host` | Average user CPU per host (aggregation) |
-| `federated_cpu_by_datacenter` | Join InfluxDB `cpu` with a CSV host map, aggregate per datacenter |
+Every pipeline is **parameterised** — each `execute` call supplies its parameters
+in the JSON request body (the `{name}` placeholders in the pipeline SQL).
+
+| Pipeline | Parameters | Description |
+|----------|------------|-------------|
+| `list_all_cpu` | `limit` | Most recent `limit` CPU samples, newest first |
+| `cpu_by_host` | `host` | CPU samples for one `host` (tag filter) |
+| `high_cpu` | `threshold` | Samples above a user-CPU `threshold` |
+| `avg_usage_by_host` | `region` | Average user CPU per host within a `region` (aggregation) |
+| `federated_cpu_by_datacenter` | `owner` | Join InfluxDB `cpu` with a CSV host map, rollup per datacenter for one `owner` |
 
 > The response bodies below are captured from a live run against InfluxDB 3
-> Core with the sample data above. `execution_time_ms` and `timestamp` vary
-> per run.
+> Core with the sample data above, using the parameter values shown in each
+> request. `execution_time_ms` and `timestamp` vary per run.
 
 ---
 
-## 1. Full Scan
+## 1. Most Recent Samples
 
 ```bash
 curl -X POST http://localhost:8080/list_all_cpu/execute \
   -H "Content-Type: application/json" \
-  -d '{}' | jq .
+  -d '{"limit": 10}' | jq .
 ```
 
 **Response:**
@@ -183,19 +186,18 @@ curl -X POST http://localhost:8080/high_cpu/execute \
 ```bash
 curl -X POST http://localhost:8080/avg_usage_by_host/execute \
   -H "Content-Type: application/json" \
-  -d '{}' | jq .
+  -d '{"region": "us-west"}' | jq .
 ```
 
-**Response:**
+**Response:** (`host3` is in `us-east` and is excluded)
 ```json
 {
   "success": true,
   "data": [
     {"host": "host1", "avg_user": 38.3, "samples": 2},
-    {"host": "host2", "avg_user": 64.85, "samples": 2},
-    {"host": "host3", "avg_user": 22.4, "samples": 1}
+    {"host": "host2", "avg_user": 64.85, "samples": 2}
   ],
-  "rows": 3,
+  "rows": 2,
   "execution_time_ms": 169
 }
 ```
@@ -205,7 +207,8 @@ curl -X POST http://localhost:8080/avg_usage_by_host/execute \
 ## 5. Federated Query: InfluxDB ⨝ CSV
 
 Join the InfluxDB `cpu` measurement with a CSV host → datacenter map and
-aggregate per datacenter — a single SQL query spanning two backends.
+aggregate per datacenter for a given `owner` — a single SQL query spanning two
+backends.
 
 ```
 InfluxDB (cpu)          CSV (host_metadata.csv)
@@ -222,19 +225,18 @@ InfluxDB (cpu)          CSV (host_metadata.csv)
 ```bash
 curl -X POST http://localhost:8080/federated_cpu_by_datacenter/execute \
   -H "Content-Type: application/json" \
-  -d '{}' | jq .
+  -d '{"owner": "platform"}' | jq .
 ```
 
-**Response:**
+**Response:** (`us-east-2a` is owned by `analytics` and is excluded)
 ```json
 {
   "success": true,
   "data": [
     {"datacenter": "us-west-1b", "owner": "platform", "avg_user": 64.85, "max_user": 88.7, "samples": 2},
-    {"datacenter": "us-west-1a", "owner": "platform", "avg_user": 38.3, "max_user": 64.1, "samples": 2},
-    {"datacenter": "us-east-2a", "owner": "analytics", "avg_user": 22.4, "max_user": 22.4, "samples": 1}
+    {"datacenter": "us-west-1a", "owner": "platform", "avg_user": 38.3, "max_user": 64.1, "samples": 2}
   ],
-  "rows": 3,
+  "rows": 2,
   "execution_time_ms": 167
 }
 ```
