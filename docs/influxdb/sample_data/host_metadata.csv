@@ -1,0 +1,4 @@
+host,datacenter,owner
+host1,us-west-1a,platform
+host2,us-west-1b,platform
+host3,us-east-2a,analytics

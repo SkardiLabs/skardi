@@ -1,0 +1,32 @@
+kind: context
+
+metadata:
+  name: ctx_influxdb_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # Each InfluxDB measurement is registered as its own read-only table,
+    # backed by a Flight SQL query against the InfluxDB 3 endpoint.
+    - name: "cpu"
+      type: "influxdb"
+      connection_string: "http://localhost:8181"
+      description: "CPU utilisation samples from InfluxDB 3"
+      options:
+        database: "metrics"
+        measurement: "cpu"
+
+    - name: "mem"
+      type: "influxdb"
+      connection_string: "http://localhost:8181"
+      description: "Memory utilisation samples from InfluxDB 3"
+      options:
+        database: "metrics"
+        # Equivalent to `measurement: mem`, shown here as an explicit query.
+        query: "SELECT * FROM \"mem\""
+
+    # CSV data source used by the federated-join example.
+    - name: "host_metadata"
+      type: "csv"
+      path: "docs/influxdb/sample_data/host_metadata.csv"
+      description: "Static host → datacenter / owner mapping"

@@ -46,6 +46,7 @@ use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udt
 use skardi::sources::providers::{
     DatasetRegistry,
     iceberg::register_iceberg_table,
+    influxdb::register_influxdb_tables,
     lance::register_lance_table,
     mongo::register_mongo_tables,
     mysql::register_mysql_tables,
@@ -901,6 +902,17 @@ async fn register_source(
             )
             .await
             .with_context(|| format!("Failed to register MongoDB '{}'", source.name))?;
+        }
+        "influxdb" => {
+            let conn_str = source.connection_string.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "InfluxDB source '{}': connection_string required",
+                    source.name
+                )
+            })?;
+            register_influxdb_tables(session_ctx, &source.name, conn_str, source.options.as_ref())
+                .await
+                .with_context(|| format!("Failed to register InfluxDB '{}'", source.name))?;
         }
         "lance" => {
             let path_str = source

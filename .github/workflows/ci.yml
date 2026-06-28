@@ -115,6 +115,8 @@ jobs:
       MONGO_PASS: rootpass
       SEEKDB_USER: "root@sys"
       SEEKDB_PASSWORD: ""
+      INFLUXDB_URL: "http://127.0.0.1:8181"
+      INFLUXDB_DATABASE: "metrics"
 
     steps:
       - name: Checkout code
@@ -398,6 +400,41 @@ jobs:
               ('ip-b', '[0.0, 1.0, 0.0, 0.0]'),
               ('ip-c', '[1.0, 1.0, 0.0, 0.0]'),
               ('ip-d', '[0.5, 0.5, 0.5, 0.5]');
+          EOF
+
+      - name: Start and seed InfluxDB 3
+        # InfluxDB 3 Core needs `influxdb3 serve <args>`, which a GitHub
+        # Actions service container can't express (no command override), so
+        # run it as a plain container. `--object-store memory` keeps it
+        # ephemeral and disk-free; `--without-auth` skips token management for
+        # the test fixture.
+        run: |
+          docker run -d --name influxdb3 -p 8181:8181 \
+            influxdb:3-core influxdb3 serve \
+              --node-id ci-node0 \
+              --object-store memory \
+              --without-auth
+          echo "Waiting for InfluxDB 3 to become healthy..."
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8181/health >/dev/null 2>&1; then
+              echo "InfluxDB 3 is ready"
+              break
+            fi
+            echo "Waiting for InfluxDB 3... (attempt $i/60)"
+            sleep 2
+          done
+          curl -fsS -XPOST "http://127.0.0.1:8181/api/v3/configure/database" \
+            -H "Content-Type: application/json" -d '{"db": "metrics"}'
+          curl -fsS "http://127.0.0.1:8181/api/v3/write_lp?db=metrics&precision=second" \
+            --data-binary @- <<'EOF'
+          cpu,host=host1,region=us-west usage_user=12.5,usage_system=3.2 1700000000
+          cpu,host=host1,region=us-west usage_user=64.1,usage_system=9.8 1700000060
+          cpu,host=host2,region=us-west usage_user=41.0,usage_system=6.0 1700000000
+          cpu,host=host2,region=us-west usage_user=88.7,usage_system=12.3 1700000060
+          cpu,host=host3,region=us-east usage_user=22.4,usage_system=4.1 1700000000
+          mem,host=host1,region=us-west used_percent=48.2 1700000000
+          mem,host=host2,region=us-west used_percent=73.9 1700000000
+          mem,host=host3,region=us-east used_percent=31.5 1700000000
           EOF
 
       - name: Execute Integration tests

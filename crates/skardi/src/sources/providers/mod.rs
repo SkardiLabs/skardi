@@ -1,4 +1,5 @@
 pub mod iceberg;
+pub mod influxdb;
 pub mod knn_utils;
 pub mod lance;
 pub mod mongo;

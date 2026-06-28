@@ -1,0 +1,22 @@
+kind: pipeline
+
+metadata:
+  name: "federated_cpu_by_datacenter"
+  version: "1.0"
+  description: "Join InfluxDB CPU samples with the CSV host map, aggregate per datacenter for one owner"
+
+# Parameters:
+#   {owner} - Host owner to scope the rollup to (e.g. "platform")
+
+spec:
+  query: |
+    SELECT m.datacenter,
+           m.owner,
+           avg(c.usage_user) AS avg_user,
+           max(c.usage_user) AS max_user,
+           count(*)          AS samples
+    FROM cpu c
+    JOIN host_metadata m ON c.host = m.host
+    WHERE m.owner = {owner}
+    GROUP BY m.datacenter, m.owner
+    ORDER BY avg_user DESC
