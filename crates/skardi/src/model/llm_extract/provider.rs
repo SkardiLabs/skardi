@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 
 /// An image attached to a completion request for multimodal escalation.
+#[derive(Debug)]
 pub struct ImageInput {
     /// Base64-encoded image bytes.
     pub base64: String,

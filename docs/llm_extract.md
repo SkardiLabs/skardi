@@ -32,8 +32,10 @@ llm_extract(text, image_ref, json_schema) -> List<Utf8>
 | `image_ref` | `Utf8` **column**, nullable | URI of an image for multimodal escalation; `NULL` for pure-text sources |
 | `json_schema` | `Utf8` **literal** | JSON Schema describing the fields to extract per entity |
 
-`image_ref` accepts `data:<mime>;base64,<payload>` URIs, `http(s)://` URLs, and
-local file paths (optionally `file://`-prefixed).
+`image_ref` accepts `data:<mime>;base64,<payload>` URIs by default. `http(s)://`
+URLs and local file paths (optionally `file://`-prefixed) are accepted **only**
+when `LLM_EXTRACT_IMAGE_FETCH=1` is set — see the SSRF / path-traversal note
+under [Multimodal escalation](#️-image-fetching--ssrf--path-traversal).
 
 The return type is **always** `List<Utf8>` — a list of JSON entity strings. A
 scalar UDF's `return_type` only sees argument *types*, not the `json_schema`
@@ -73,6 +75,8 @@ Behavior per input row:
 | `LLM_EXTRACT_MODEL` | per-provider default (below) | chat model id |
 | `LLM_EXTRACT_THRESHOLD` | `0.75` | confidence gate |
 | `LLM_EXTRACT_MAX_CALLS` | unlimited | per-query cap on multimodal escalation calls; once exhausted, weak rows stay `low_confidence` |
+| `LLM_EXTRACT_VISION` | model-id heuristic | `true`/`false` override for whether the active model is vision-capable (gates multimodal escalation — see below) |
+| `LLM_EXTRACT_IMAGE_FETCH` | `0` (off) | opt-in to fetch `http(s)://`/`file://`/local-path `image_ref`s; **off by default for SSRF/path-traversal safety** (see below) |
 | `<PROVIDER>_API_KEY` | — | API key for the selected provider (see table); warned about at startup if missing |
 
 ### Providers
@@ -96,10 +100,40 @@ OpenAI-compatible provider is constructed at startup and warns (does not panic)
 if its API-key env var is unset. An unknown `LLM_EXTRACT_PROVIDER` falls back to
 `deepseek` with a warning.
 
-**Multimodal escalation requires a vision-capable model.** The optional image is
-attached as an OpenAI `image_url` base64 data-URI block (or an Anthropic image
-block); choose a vision-capable model (e.g. `gpt-4o-mini`, `gemini-2.0-flash`)
-via `LLM_EXTRACT_MODEL` if you rely on `image_ref` escalation.
+### Multimodal escalation — vision gate
+
+**Escalation requires a vision-capable model.** When a weak entity has a non-null
+`image_ref`, `llm_extract` may re-run with the image attached (OpenAI `image_url`
+base64 block, or an Anthropic image block). A text-only chat model — including
+the **default `deepseek-chat`** — would reject an image block (HTTP 400), so
+escalation is **gated on model vision capability**:
+
+- At startup, vision capability is inferred from the model id (a heuristic
+  matching `4o`, `-vl`, `glm-4v`, `vision`, `gemini-`, `claude`, …).
+- Override explicitly with `LLM_EXTRACT_VISION=true|false`.
+- When the active model is **not** vision-capable, escalation is **skipped** and
+  weak entities stay `low_confidence` (they are never turned into `error` rows
+  by a doomed image call).
+
+If you rely on `image_ref` escalation, select a vision-capable model (e.g.
+`gpt-4o-mini`, `gemini-2.0-flash`, a `*-vl`/`glm-4v` model, or a Claude model)
+via `LLM_EXTRACT_PROVIDER` + `LLM_EXTRACT_MODEL`.
+
+### ⚠️ Image fetching — SSRF / path-traversal
+
+`image_ref` is **data-derived** (a column value), so fetching it is an
+**SSRF and path-traversal risk**: an `http(s)://` ref can point at internal
+metadata endpoints (e.g. `169.254.169.254`) or intranet hosts, and a
+`file://`/local-path ref can read arbitrary files on the host. Therefore:
+
+- **Default-deny.** Only `data:<mime>;base64,…` URIs (which carry the image bytes
+  inline, no I/O) are accepted out of the box.
+- `http(s)://`, `file://`, and bare filesystem paths are **refused** unless you
+  explicitly opt in with `LLM_EXTRACT_IMAGE_FETCH=1`.
+- Enable it only when `image_ref` values are trusted and the deployment can
+  tolerate outbound fetches / local reads from a data-derived value. There is no
+  built-in host allowlist; restrict egress and filesystem access at the
+  deployment layer if you turn this on.
 
 ## Composition examples
 

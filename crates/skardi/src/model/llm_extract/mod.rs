@@ -487,13 +487,37 @@ fn parse_required(json_schema: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Fetch an image referenced by `image_ref`, reading the network/filesystem
+/// opt-in policy from the environment (`LLM_EXTRACT_IMAGE_FETCH`).
+fn fetch_image(image_ref: &str) -> anyhow::Result<provider::ImageInput> {
+    fetch_image_with_policy(image_ref, image_fetch_allowed())
+}
+
+/// Whether http(s)/file `image_ref` fetching is opted in via
+/// `LLM_EXTRACT_IMAGE_FETCH` (`1`/`true`/`yes`). Default-deny.
+fn image_fetch_allowed() -> bool {
+    matches!(
+        std::env::var("LLM_EXTRACT_IMAGE_FETCH")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// Fetch an image referenced by `image_ref` and return it as base64 + mime.
 ///
-/// Supports:
-/// - `data:<mime>;base64,<payload>` — payload used directly (no network).
-/// - `http://` / `https://` — fetched via a short-lived `reqwest` client.
-/// - everything else — treated as a local filesystem path.
-fn fetch_image(image_ref: &str) -> anyhow::Result<provider::ImageInput> {
+/// **Security — `image_ref` is data-derived (a column value), so fetching it is
+/// SSRF / path-traversal prone.** Policy is default-deny:
+/// - `data:<mime>;base64,<payload>` — always allowed (no I/O; payload is inline).
+/// - `http://` / `https://` — only when `allow_fetch` is `true`
+///   (`LLM_EXTRACT_IMAGE_FETCH=1`); otherwise refused. Can reach internal hosts.
+/// - any other scheme / bare path — treated as a local file, only when
+///   `allow_fetch` is `true`; otherwise refused. Can read arbitrary files.
+fn fetch_image_with_policy(
+    image_ref: &str,
+    allow_fetch: bool,
+) -> anyhow::Result<provider::ImageInput> {
     use anyhow::Context;
 
     if let Some(rest) = image_ref.strip_prefix("data:") {
@@ -511,6 +535,15 @@ fn fetch_image(image_ref: &str) -> anyhow::Result<provider::ImageInput> {
             base64: payload.to_string(),
             mime,
         });
+    }
+
+    // Anything other than a data: URI requires the explicit opt-in.
+    if !allow_fetch {
+        return Err(anyhow::anyhow!(
+            "refusing to fetch image_ref '{image_ref}': only data: URIs are allowed by \
+             default (SSRF / path-traversal guard). Set LLM_EXTRACT_IMAGE_FETCH=1 to \
+             enable http(s)/file fetching"
+        ));
     }
 
     use base64::Engine;
@@ -1029,6 +1062,31 @@ mod tests {
         let e = first_entity(list, 0);
         assert_eq!(e["model"], "weak");
         assert_eq!(e["_status"], "low_confidence");
+    }
+
+    #[test]
+    fn image_fetch_default_deny_for_non_data_schemes() {
+        // data: URIs always work (no I/O) — even with fetching disabled.
+        let img = fetch_image_with_policy("data:image/png;base64,aGVsbG8=", false).unwrap();
+        assert_eq!(img.mime, "image/png");
+        assert_eq!(img.base64, "aGVsbG8=");
+
+        // http(s) and bare/file paths are refused when the opt-in is off.
+        let err = fetch_image_with_policy("https://169.254.169.254/latest/meta-data/", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to fetch"), "got: {err}");
+        assert!(err.contains("LLM_EXTRACT_IMAGE_FETCH"), "got: {err}");
+
+        let err2 = fetch_image_with_policy("file:///etc/passwd", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("refusing to fetch"), "got: {err2}");
+
+        let err3 = fetch_image_with_policy("/etc/passwd", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err3.contains("refusing to fetch"), "got: {err3}");
     }
 
     #[test]
