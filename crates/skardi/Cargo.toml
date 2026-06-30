@@ -23,6 +23,8 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 chunking = ["dep:text-splitter"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
+# documents source connector: parse a folder of files into queryable (file, page) rows.
+documents = ["dep:liteparse"]
 
 [dependencies]
 # engine
@@ -66,6 +68,15 @@ mongodb = "3.1"
 mysql_async = "0.36"
 percent-encoding = "2.3"
 redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster"] }
+# documents source connector (optional, behind the `documents` feature).
+# Git dependency pinned to a known-good rev: liteparse is not (reliably) on crates.io,
+# and the repo layout (workspace at crates/liteparse) is fetched directly. Pulls in
+# native PDFium (downloaded by pdfium-sys build.rs).
+# `default-features = false` drops liteparse's bundled `tesseract` OCR engine, whose
+# `tesseract-rs -> zip -> xz2 -> lzma-sys` chain collides with DataFusion's `liblzma-sys`
+# (two crates can't both `links = "lzma"`) and also forces a newer tokio. OCR is still
+# available at runtime via liteparse's HTTP OCR engine (config `ocr_server_url`).
+liteparse = { git = "https://github.com/run-llama/liteparse", rev = "c8bda5be42edae9084ad0aa0f6676a3efd73c619", default-features = false, optional = true }
 secrecy = "0.10"
 pgvector = { version = "0.4", features = ["sqlx"] }
 sqlx = { workspace = true }
