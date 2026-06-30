@@ -40,27 +40,43 @@ pub const DEFAULT_THRESHOLD: f64 = 0.75;
 // LlmExtractRegistry — holds the provider + threshold
 // =============================================================================
 
-/// Holds the shared completion provider and the confidence threshold. Passed
-/// into the UDF so it can run extractions per row.
+/// Holds the shared completion provider and per-query knobs. Passed into the
+/// UDF so it can run extractions per row.
 pub struct LlmExtractRegistry {
     provider: Arc<dyn CompletionProvider>,
     threshold: f64,
+    /// Per-query cap on multimodal escalation calls. `None` = unlimited. Read
+    /// once at construction (`from_env`) — never re-read from the environment
+    /// during query execution, so it can't race with a test mutating env vars.
+    max_calls: Option<u32>,
 }
 
 impl std::fmt::Debug for LlmExtractRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmExtractRegistry")
             .field("threshold", &self.threshold)
+            .field("max_calls", &self.max_calls)
             .finish()
     }
 }
 
 impl LlmExtractRegistry {
-    /// Create a registry from an explicit provider + threshold.
+    /// Create a registry from an explicit provider + threshold, with no
+    /// escalation-call cap.
     pub fn new(provider: Arc<dyn CompletionProvider>, threshold: f64) -> Self {
+        Self::with_max_calls(provider, threshold, None)
+    }
+
+    /// Create a registry with an explicit per-query escalation-call cap.
+    pub fn with_max_calls(
+        provider: Arc<dyn CompletionProvider>,
+        threshold: f64,
+        max_calls: Option<u32>,
+    ) -> Self {
         Self {
             provider,
             threshold,
+            max_calls,
         }
     }
 
@@ -79,8 +95,12 @@ impl LlmExtractRegistry {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(DEFAULT_THRESHOLD);
+        // Per-query cost guard, read once here (not per-query in invoke).
+        let max_calls = std::env::var("LLM_EXTRACT_MAX_CALLS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
         let provider = build_provider_from_env();
-        Self::new(provider, threshold)
+        Self::with_max_calls(provider, threshold, max_calls)
     }
 
     /// Register the `llm_extract` UDF with a DataFusion `SessionContext`.
@@ -506,10 +526,9 @@ impl ScalarUDFImpl for LlmExtractUDF {
         let required = parse_required(&json_schema);
 
         // Per-query cost guard: cap the number of multimodal escalation calls.
-        // `None` = unlimited.
-        let mut escalation_budget: Option<u32> = std::env::var("LLM_EXTRACT_MAX_CALLS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
+        // `None` = unlimited. Taken from the registry (read once at from_env),
+        // not the live environment — avoids env races under parallel tests.
+        let mut escalation_budget: Option<u32> = self.registry.max_calls;
 
         let n = text_array.len();
         let mut builder = ListBuilder::new(StringBuilder::new());
@@ -985,11 +1004,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cost_guard_caps_escalations() {
-        // LLM_EXTRACT_MAX_CALLS=1: a 2-weak-row batch (both with images) makes
-        // at most 1 escalation call; the un-escalated row stays low_confidence.
-        unsafe {
-            std::env::set_var("LLM_EXTRACT_MAX_CALLS", "1");
-        }
+        // max_calls = 1: a 2-weak-row batch (both with images) makes at most 1
+        // escalation call; the un-escalated row stays low_confidence. The budget
+        // is set on the registry directly — no process-env mutation, so this is
+        // safe under parallel test runs.
 
         // Spy: counts escalation (image-bearing) calls.
         struct EscalationSpy {
@@ -1018,7 +1036,11 @@ mod tests {
         let spy = Arc::new(EscalationSpy {
             escalations: Mutex::new(0),
         });
-        let reg = Arc::new(LlmExtractRegistry::new(spy.clone(), 0.75));
+        let reg = Arc::new(LlmExtractRegistry::with_max_calls(
+            spy.clone(),
+            0.75,
+            Some(1),
+        ));
         let udf = LlmExtractUDF::new(reg);
 
         let text: StringArray = vec![Some("row0"), Some("row1")].into_iter().collect();
@@ -1060,10 +1082,6 @@ mod tests {
             statuses.contains(&"low_confidence"),
             "one row should stay low_confidence: {statuses:?}"
         );
-
-        unsafe {
-            std::env::remove_var("LLM_EXTRACT_MAX_CALLS");
-        }
     }
 
     // ----- Provider registry / selection (Task 4 multi-provider) -----
