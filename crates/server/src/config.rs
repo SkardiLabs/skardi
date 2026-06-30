@@ -1358,6 +1358,15 @@ async fn register_data_source(
                 error: e.to_string(),
             })?;
         }
+        DataSourceType::Documents => {
+            // Wired up in Task 4 (register_documents_tables). Until then the
+            // dispatch arm exists only to keep the match exhaustive.
+            return Err(ConfigError::DataSourceRegistrationFailed {
+                name: source.name.clone(),
+                error: "documents source registration is not yet implemented".to_string(),
+            }
+            .into());
+        }
     }
 
     // If enable_cache is set for Csv/Parquet/Iceberg, load the table into a MemTable
