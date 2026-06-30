@@ -1,11 +1,13 @@
-//! Opt-in live test for `llm_extract` against the real Anthropic API.
+//! Opt-in live test for `llm_extract` against the configured real provider.
 //!
-//! Disabled by default. Enable with:
-//!   LLM_EXTRACT_LIVE=1 ANTHROPIC_API_KEY=sk-... \
+//! Disabled by default. Enable with (defaults to the `deepseek` provider):
+//!   LLM_EXTRACT_LIVE=1 DEEPSEEK_API_KEY=sk-... \
 //!     cargo test -p skardi --test llm_extract_live --features llm-extract -- --ignored
 //!
-//! Hits real Claude on a tiny sample to catch prompt/schema drift. It is
-//! `#[ignore]`d so the default suite stays deterministic and offline.
+//! Pick another provider via `LLM_EXTRACT_PROVIDER` + its `<PROVIDER>_API_KEY`
+//! (and optionally `LLM_EXTRACT_MODEL`). Hits a real cheap chat model on a tiny
+//! sample to catch prompt/schema drift. It is `#[ignore]`d so the default suite
+//! stays deterministic and offline.
 
 #![cfg(feature = "llm-extract")]
 
@@ -15,17 +17,16 @@ use datafusion::prelude::SessionContext;
 use skardi::model::llm_extract::LlmExtractRegistry;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: requires LLM_EXTRACT_LIVE=1 and ANTHROPIC_API_KEY"]
+#[ignore = "live: requires LLM_EXTRACT_LIVE=1 and the selected provider's API key"]
 async fn live_extract_from_text() {
     if std::env::var("LLM_EXTRACT_LIVE").ok().as_deref() != Some("1") {
         eprintln!("skipping live test: set LLM_EXTRACT_LIVE=1 to run");
         return;
     }
-    assert!(
-        std::env::var("ANTHROPIC_API_KEY").is_ok(),
-        "ANTHROPIC_API_KEY must be set for the live test"
-    );
 
+    // Uses LLM_EXTRACT_PROVIDER / LLM_EXTRACT_MODEL (default: deepseek). The
+    // selected provider's API key must be set in the environment, or the query
+    // will fail with a clear missing-key error.
     let mut ctx = SessionContext::new();
     Arc::new(LlmExtractRegistry::from_env()).register(&mut ctx);
 

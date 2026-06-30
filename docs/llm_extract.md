@@ -2,9 +2,14 @@
 
 `llm_extract` turns a column of unstructured text (with an optional image
 reference for multimodal escalation) into a list of structured JSON entities,
-extracted by Claude and guided by a JSON Schema. It is source-agnostic: any
-pipeline that has text rows can call it and `UNNEST` the result into entity
-rows. There is **no** build dependency on the `documents` connector.
+extracted by a cheap LLM chat model and guided by a JSON Schema. It is
+source-agnostic: any pipeline that has text rows can call it and `UNNEST` the
+result into entity rows. There is **no** build dependency on the `documents`
+connector.
+
+Extraction is an easy task, so the default providers are cheap OpenAI-compatible
+chat models (DeepSeek, GLM, Gemini, OpenAI). A native Anthropic provider is
+available but is optional and **not** the default.
 
 It is behind the `llm-extract` Cargo feature:
 
@@ -64,10 +69,37 @@ Behavior per input row:
 
 | env var | default | meaning |
 |---------|---------|---------|
-| `ANTHROPIC_API_KEY` | — | required; warned about at startup if missing |
-| `LLM_EXTRACT_MODEL` | `claude-opus-4-8` | Claude model id |
+| `LLM_EXTRACT_PROVIDER` | `deepseek` | which provider to use: `deepseek` \| `glm` \| `gemini` \| `openai` \| `anthropic` |
+| `LLM_EXTRACT_MODEL` | per-provider default (below) | chat model id |
 | `LLM_EXTRACT_THRESHOLD` | `0.75` | confidence gate |
 | `LLM_EXTRACT_MAX_CALLS` | unlimited | per-query cap on multimodal escalation calls; once exhausted, weak rows stay `low_confidence` |
+| `<PROVIDER>_API_KEY` | — | API key for the selected provider (see table); warned about at startup if missing |
+
+### Providers
+
+All four built-in providers are OpenAI-compatible chat APIs; a single
+`OpenAiCompatibleCompletionProvider` covers them. The active one is chosen by
+`LLM_EXTRACT_PROVIDER`. Structured output is forced via
+`response_format: {type:"json_schema", …}`, with a `record_entities` tool +
+`tool_choice` fallback for providers/models that reject `response_format`.
+
+| `LLM_EXTRACT_PROVIDER` | base URL | API-key env | default model |
+|------------------------|----------|-------------|---------------|
+| `deepseek` (default) | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| `glm` | `https://open.bigmodel.cn/api/paas/v4` | `GLM_API_KEY` | `glm-4-flash` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-2.0-flash` |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-4o-mini` |
+| `anthropic` (optional, non-default) | Anthropic Messages API | `ANTHROPIC_API_KEY` | `claude-opus-4-8` |
+
+`LLM_EXTRACT_MODEL` overrides the per-provider default model. Every
+OpenAI-compatible provider is constructed at startup and warns (does not panic)
+if its API-key env var is unset. An unknown `LLM_EXTRACT_PROVIDER` falls back to
+`deepseek` with a warning.
+
+**Multimodal escalation requires a vision-capable model.** The optional image is
+attached as an OpenAI `image_url` base64 data-URI block (or an Anthropic image
+block); choose a vision-capable model (e.g. `gpt-4o-mini`, `gemini-2.0-flash`)
+via `LLM_EXTRACT_MODEL` if you rely on `image_ref` escalation.
 
 ## Composition examples
 
@@ -109,9 +141,16 @@ cargo test -p skardi --lib model::llm_extract --features llm-extract
 cargo test -p skardi --test llm_extract_composition --features llm-extract
 ```
 
-Opt-in live test against real Claude (off by default):
+Opt-in live test against the configured provider (off by default). It uses
+whatever `LLM_EXTRACT_PROVIDER` / `LLM_EXTRACT_MODEL` select, defaulting to
+DeepSeek:
 
 ```bash
-LLM_EXTRACT_LIVE=1 ANTHROPIC_API_KEY=sk-... \
+# default provider (deepseek)
+LLM_EXTRACT_LIVE=1 DEEPSEEK_API_KEY=sk-... \
+  cargo test -p skardi --test llm_extract_live --features llm-extract -- --ignored
+
+# or pick another provider
+LLM_EXTRACT_LIVE=1 LLM_EXTRACT_PROVIDER=openai OPENAI_API_KEY=sk-... \
   cargo test -p skardi --test llm_extract_live --features llm-extract -- --ignored
 ```
