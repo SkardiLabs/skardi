@@ -97,36 +97,218 @@ impl LlmExtractUDF {
         }
     }
 
-    /// Extract the entities for a single row. Returns the JSON `Value` entities
-    /// for that row (may be empty). In Task 2 this is the plain text-first pass;
-    /// the confidence gate / escalation / never-drop logic is layered in Task 3.
+    /// Run one provider completion synchronously (async→sync bridge mirroring
+    /// `remote_embed`). `block_in_place` lets tokio move other tasks off this
+    /// worker thread while we block.
+    fn complete_blocking(
+        &self,
+        req: CompletionRequest<'_>,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let handle = tokio::runtime::Handle::current();
+        let resp =
+            tokio::task::block_in_place(|| handle.block_on(self.registry.provider.complete(req)))?;
+        Ok(resp.entities)
+    }
+
+    /// Extract the entities for a single row: text-first pass, confidence gate,
+    /// optional multimodal escalation, `_status` stamping, and never-drop error
+    /// isolation.
     fn extract_row(
         &self,
         model: &str,
         json_schema: &str,
+        required: &[String],
         text: &str,
         image_ref: Option<&str>,
     ) -> Vec<serde_json::Value> {
-        let _ = image_ref; // escalation wired in Task 3
-        let req = CompletionRequest {
+        // --- text-first pass ---
+        let text_req = CompletionRequest {
             model,
             json_schema,
             text,
             image: None,
         };
+        let mut entities = match self.complete_blocking(text_req) {
+            Ok(e) => e,
+            // Never drop: a provider/parse failure for the row yields a single
+            // error entity; other rows are unaffected.
+            Err(e) => {
+                return vec![json!({
+                    "_status": "error",
+                    "_error": e.to_string(),
+                })];
+            }
+        };
 
-        let handle = tokio::runtime::Handle::current();
-        let result =
-            tokio::task::block_in_place(|| handle.block_on(self.registry.provider.complete(req)));
+        // --- confidence gate ---
+        let any_weak = entities
+            .iter()
+            .any(|e| is_weak(e, self.registry.threshold, required));
 
-        match result {
-            Ok(resp) => resp.entities,
-            Err(e) => vec![json!({
-                "_status": "error",
-                "_error": e.to_string(),
-            })],
+        // --- multimodal escalation ---
+        // Escalate only if there's a weak entity AND we have an image to attach.
+        if any_weak {
+            if let Some(reference) = image_ref {
+                match fetch_image(reference) {
+                    Ok(image) => {
+                        let img_req = CompletionRequest {
+                            model,
+                            json_schema,
+                            text,
+                            image: Some(image),
+                        };
+                        match self.complete_blocking(img_req) {
+                            Ok(escalated) => {
+                                // Escalated result replaces this row's entities.
+                                entities = escalated;
+                            }
+                            Err(e) => {
+                                return vec![json!({
+                                    "_status": "error",
+                                    "_error": format!("multimodal escalation failed: {e}"),
+                                })];
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("llm_extract: could not fetch image '{reference}': {e}");
+                        // Fall through: keep text-only entities, stamped below.
+                    }
+                }
+            }
+        }
+
+        // --- stamp _status per entity ---
+        for entity in &mut entities {
+            stamp_status(entity, self.registry.threshold, required);
+        }
+
+        entities
+    }
+}
+
+/// Whether an entity is "weak": confidence below threshold, or a required
+/// schema field is missing/null.
+fn is_weak(entity: &serde_json::Value, threshold: f64, required: &[String]) -> bool {
+    // An explicit error entity is always weak.
+    if entity.get("_status").and_then(|s| s.as_str()) == Some("error") {
+        return true;
+    }
+    let conf = entity.get("_confidence").and_then(|c| c.as_f64());
+    if let Some(c) = conf {
+        if c < threshold {
+            return true;
         }
     }
+    // Missing required field (or present-but-null) → weak.
+    required
+        .iter()
+        .any(|field| entity.get(field).map(|v| v.is_null()).unwrap_or(true))
+}
+
+/// Stamp `_status` on an entity in place, unless it's already an error entity.
+fn stamp_status(entity: &mut serde_json::Value, threshold: f64, required: &[String]) {
+    if let Some(obj) = entity.as_object_mut() {
+        if obj.get("_status").and_then(|s| s.as_str()) == Some("error") {
+            return;
+        }
+        let status = if is_weak(&serde_json::Value::Object(obj.clone()), threshold, required) {
+            "low_confidence"
+        } else {
+            "ok"
+        };
+        obj.insert("_status".to_string(), json!(status));
+    }
+}
+
+/// Parse the `required` field-name set from a JSON Schema string. Returns an
+/// empty vec if absent or unparseable.
+fn parse_required(json_schema: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(json_schema)
+        .ok()
+        .and_then(|v| {
+            v.get("required").and_then(|r| r.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Fetch an image referenced by `image_ref` and return it as base64 + mime.
+///
+/// Supports:
+/// - `data:<mime>;base64,<payload>` — payload used directly (no network).
+/// - `http://` / `https://` — fetched via a short-lived `reqwest` client.
+/// - everything else — treated as a local filesystem path.
+fn fetch_image(image_ref: &str) -> anyhow::Result<provider::ImageInput> {
+    use anyhow::Context;
+
+    if let Some(rest) = image_ref.strip_prefix("data:") {
+        // data:<mime>;base64,<payload>
+        let (meta, payload) = rest
+            .split_once(',')
+            .ok_or_else(|| anyhow::anyhow!("malformed data URI"))?;
+        let mime = meta.strip_suffix(";base64").unwrap_or(meta).to_string();
+        let mime = if mime.is_empty() {
+            "image/png".to_string()
+        } else {
+            mime
+        };
+        return Ok(provider::ImageInput {
+            base64: payload.to_string(),
+            mime,
+        });
+    }
+
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    if image_ref.starts_with("http://") || image_ref.starts_with("https://") {
+        let handle = tokio::runtime::Handle::current();
+        let (bytes, mime) = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?;
+                let resp = client.get(image_ref).send().await?.error_for_status()?;
+                let mime = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("image/png")
+                    .to_string();
+                let bytes = resp.bytes().await?;
+                Ok::<_, anyhow::Error>((bytes.to_vec(), mime))
+            })
+        })?;
+        return Ok(provider::ImageInput {
+            base64: engine.encode(&bytes),
+            mime,
+        });
+    }
+
+    // Local file path.
+    let path = image_ref.strip_prefix("file://").unwrap_or(image_ref);
+    let bytes = std::fs::read(path).with_context(|| format!("reading image file '{path}'"))?;
+    let mime = mime_from_path(path);
+    Ok(provider::ImageInput {
+        base64: engine.encode(&bytes),
+        mime,
+    })
+}
+
+/// Guess an image MIME type from a file extension.
+fn mime_from_path(path: &str) -> String {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    }
+    .to_string()
 }
 
 impl ScalarUDFImpl for LlmExtractUDF {
@@ -170,6 +352,9 @@ impl ScalarUDFImpl for LlmExtractUDF {
 
         let model = std::env::var("LLM_EXTRACT_MODEL").unwrap_or_else(|_| default_model());
 
+        // Parse the schema's `required` field set once per call.
+        let required = parse_required(&json_schema);
+
         let n = text_array.len();
         let mut builder = ListBuilder::new(StringBuilder::new());
 
@@ -191,7 +376,7 @@ impl ScalarUDFImpl for LlmExtractUDF {
                 Some(image_array.value(i))
             };
 
-            let entities = self.extract_row(&model, &json_schema, text, image_ref);
+            let entities = self.extract_row(&model, &json_schema, &required, text, image_ref);
             for entity in entities {
                 let s = serde_json::to_string(&entity).unwrap_or_else(|e| {
                     json!({"_status": "error", "_error": format!("serialize failed: {e}")})
@@ -428,7 +613,221 @@ mod tests {
         assert!(err.contains("string literal"), "got: {err}");
     }
 
-    // Keep ImageInput referenced so the import doesn't warn before Task 3.
+    // ----- Task 3: confidence gate, escalation, never-drop -----
+
+    /// Records each call's `image.is_some()`. First call returns a single weak
+    /// (low-confidence) entity; subsequent (escalated) calls return a strong one.
+    struct EscalatingMock {
+        calls: Mutex<Vec<bool>>, // image.is_some() per call
+    }
+
+    impl EscalatingMock {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for EscalatingMock {
+        async fn complete(&self, req: CompletionRequest<'_>) -> anyhow::Result<CompletionResponse> {
+            let had_image = req.image.is_some();
+            self.calls.lock().unwrap().push(had_image);
+            let entity = if had_image {
+                json!({"model": "strong", "_confidence": 0.95})
+            } else {
+                json!({"model": "weak", "_confidence": 0.10})
+            };
+            Ok(CompletionResponse {
+                entities: vec![entity],
+            })
+        }
+    }
+
+    /// Always returns an error.
+    struct ErroringMock;
+
+    #[async_trait]
+    impl CompletionProvider for ErroringMock {
+        async fn complete(
+            &self,
+            _req: CompletionRequest<'_>,
+        ) -> anyhow::Result<CompletionResponse> {
+            anyhow::bail!("boom")
+        }
+    }
+
+    use std::sync::Mutex;
+
+    fn first_entity(list: &ListArray, row: usize) -> serde_json::Value {
+        let elems = list.value(row);
+        let strs = elems.as_any().downcast_ref::<StringArray>().unwrap();
+        serde_json::from_str(strs.value(0)).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escalates_with_image() {
+        let mock = Arc::new(EscalatingMock::new());
+        let reg = Arc::new(LlmExtractRegistry::new(mock.clone(), 0.75));
+        let udf = LlmExtractUDF::new(reg);
+
+        let text: StringArray = vec![Some("body")].into_iter().collect();
+        // Use a data: URI so escalation needs no network.
+        let img: StringArray = vec![Some("data:image/png;base64,aGVsbG8=")]
+            .into_iter()
+            .collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                schema_scalar(),
+            ],
+            1,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+
+        // Provider called twice; 2nd call had an image.
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected text + escalation call");
+        assert!(!calls[0], "first call should be text-only");
+        assert!(calls[1], "second call should carry the image");
+        drop(calls);
+
+        // Final entity is the escalated (strong) result, status ok.
+        let e = first_entity(list, 0);
+        assert_eq!(e["model"], "strong");
+        assert_eq!(e["_status"], "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_escalation_without_image() {
+        let mock = Arc::new(EscalatingMock::new());
+        let reg = Arc::new(LlmExtractRegistry::new(mock.clone(), 0.75));
+        let udf = LlmExtractUDF::new(reg);
+
+        let text: StringArray = vec![Some("body")].into_iter().collect();
+        let img: StringArray = vec![None::<&str>].into_iter().collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                schema_scalar(),
+            ],
+            1,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+
+        // Provider called once (no escalation without an image).
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
+
+        let e = first_entity(list, 0);
+        assert_eq!(e["model"], "weak");
+        assert_eq!(e["_status"], "low_confidence");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn never_drop_on_error() {
+        let reg = Arc::new(LlmExtractRegistry::new(Arc::new(ErroringMock), 0.75));
+        let udf = LlmExtractUDF::new(reg);
+
+        let text: StringArray = vec![Some("row0")].into_iter().collect();
+        let img: StringArray = vec![None::<&str>].into_iter().collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                schema_scalar(),
+            ],
+            1,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+
+        // One-element error list for the failing row.
+        assert_eq!(list.value(0).len(), 1);
+        let e = first_entity(list, 0);
+        assert_eq!(e["_status"], "error");
+        assert!(e["_error"].as_str().unwrap().contains("boom"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn error_row_does_not_fail_other_rows() {
+        // A normal row alongside an error row: a mock that errors only on a
+        // specific text. We model this with a per-text switch.
+        struct SelectiveMock;
+        #[async_trait]
+        impl CompletionProvider for SelectiveMock {
+            async fn complete(
+                &self,
+                req: CompletionRequest<'_>,
+            ) -> anyhow::Result<CompletionResponse> {
+                if req.text == "bad" {
+                    anyhow::bail!("boom");
+                }
+                Ok(CompletionResponse {
+                    entities: vec![json!({"model": "ok", "_confidence": 0.99})],
+                })
+            }
+        }
+        let reg = Arc::new(LlmExtractRegistry::new(Arc::new(SelectiveMock), 0.75));
+        let udf = LlmExtractUDF::new(reg);
+
+        let text: StringArray = vec![Some("bad"), Some("good")].into_iter().collect();
+        let img: StringArray = vec![None::<&str>, None].into_iter().collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                schema_scalar(),
+            ],
+            2,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+
+        let bad = first_entity(list, 0);
+        assert_eq!(bad["_status"], "error");
+        let good = first_entity(list, 1);
+        assert_eq!(good["_status"], "ok");
+    }
+
+    #[test]
+    fn parse_required_extracts_fields() {
+        let schema = r#"{"type":"object","required":["a","b"],"properties":{}}"#;
+        assert_eq!(
+            parse_required(schema),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(parse_required("not json").is_empty());
+        assert!(parse_required(r#"{"type":"object"}"#).is_empty());
+    }
+
+    #[test]
+    fn weak_when_required_field_missing() {
+        let required = vec!["price".to_string()];
+        // High confidence but missing required field → still weak.
+        let e = json!({"model": "x", "_confidence": 0.99});
+        assert!(is_weak(&e, 0.75, &required));
+        let e2 = json!({"model": "x", "price": 5, "_confidence": 0.99});
+        assert!(!is_weak(&e2, 0.75, &required));
+    }
+
+    // Keep ImageInput referenced.
     #[allow(dead_code)]
     fn _image_input_smoke() -> ImageInput {
         ImageInput {
