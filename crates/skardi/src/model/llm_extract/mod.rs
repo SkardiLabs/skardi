@@ -49,6 +49,12 @@ pub struct LlmExtractRegistry {
     /// once at construction (`from_env`) — never re-read from the environment
     /// during query execution, so it can't race with a test mutating env vars.
     max_calls: Option<u32>,
+    /// Whether the active model is vision-capable. When `false`, multimodal
+    /// escalation is skipped (a text-only model would 400 on an image block) and
+    /// weak entities stay `low_confidence` (spec §3 step 3). Determined once at
+    /// `from_env` from the model id (heuristic) or the `LLM_EXTRACT_VISION`
+    /// override.
+    vision: bool,
 }
 
 impl std::fmt::Debug for LlmExtractRegistry {
@@ -56,27 +62,41 @@ impl std::fmt::Debug for LlmExtractRegistry {
         f.debug_struct("LlmExtractRegistry")
             .field("threshold", &self.threshold)
             .field("max_calls", &self.max_calls)
+            .field("vision", &self.vision)
             .finish()
     }
 }
 
 impl LlmExtractRegistry {
     /// Create a registry from an explicit provider + threshold, with no
-    /// escalation-call cap.
+    /// escalation-call cap and vision assumed capable.
     pub fn new(provider: Arc<dyn CompletionProvider>, threshold: f64) -> Self {
-        Self::with_max_calls(provider, threshold, None)
+        Self::with_options(provider, threshold, None, true)
     }
 
-    /// Create a registry with an explicit per-query escalation-call cap.
+    /// Create a registry with an explicit per-query escalation-call cap (vision
+    /// assumed capable).
     pub fn with_max_calls(
         provider: Arc<dyn CompletionProvider>,
         threshold: f64,
         max_calls: Option<u32>,
     ) -> Self {
+        Self::with_options(provider, threshold, max_calls, true)
+    }
+
+    /// Full constructor: provider, confidence threshold, escalation-call cap,
+    /// and whether the active model is vision-capable.
+    pub fn with_options(
+        provider: Arc<dyn CompletionProvider>,
+        threshold: f64,
+        max_calls: Option<u32>,
+        vision: bool,
+    ) -> Self {
         Self {
             provider,
             threshold,
             max_calls,
+            vision,
         }
     }
 
@@ -99,8 +119,15 @@ impl LlmExtractRegistry {
         let max_calls = std::env::var("LLM_EXTRACT_MAX_CALLS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok());
-        let provider = build_provider_from_env();
-        Self::with_max_calls(provider, threshold, max_calls)
+        let (provider, model) = build_provider_from_env();
+        let vision = resolve_vision(&model);
+        if !vision {
+            tracing::info!(
+                "llm_extract: model '{model}' is not vision-capable — multimodal \
+                 escalation disabled (set LLM_EXTRACT_VISION=true to override)"
+            );
+        }
+        Self::with_options(provider, threshold, max_calls, vision)
     }
 
     /// Register the `llm_extract` UDF with a DataFusion `SessionContext`.
@@ -157,13 +184,18 @@ fn active_provider_name() -> String {
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
 }
 
-/// Build the selected completion provider from the environment.
+/// Default model id for the optional Anthropic provider, used by the vision
+/// heuristic when `LLM_EXTRACT_MODEL` is unset. Kept in sync with `anthropic.rs`.
+const ANTHROPIC_DEFAULT_MODEL: &str = "claude-opus-4-8";
+
+/// Build the selected completion provider from the environment, returning it
+/// alongside the resolved model id (used to decide vision capability).
 ///
 /// Constructs all four OpenAI-compatible providers — warning (not panicking) for
 /// any whose API-key env var is unset, mirroring `remote_embed` — and returns
 /// the one named by `LLM_EXTRACT_PROVIDER`. `anthropic` selects the optional
 /// native provider. An unknown name falls back to the default with a warning.
-fn build_provider_from_env() -> Arc<dyn CompletionProvider> {
+fn build_provider_from_env() -> (Arc<dyn CompletionProvider>, String) {
     let selected = active_provider_name();
 
     // Eager warn for every OpenAI-compatible provider whose key is missing, so
@@ -178,27 +210,70 @@ fn build_provider_from_env() -> Arc<dyn CompletionProvider> {
         }
     }
 
+    let model_override = std::env::var("LLM_EXTRACT_MODEL").ok();
+
     if selected == "anthropic" {
-        return Arc::new(anthropic::AnthropicProvider::from_env());
+        let model = model_override
+            .clone()
+            .unwrap_or_else(|| ANTHROPIC_DEFAULT_MODEL.to_string());
+        return (Arc::new(anthropic::AnthropicProvider::from_env()), model);
     }
 
-    let model = std::env::var("LLM_EXTRACT_MODEL").ok();
-
     // Build the selected OpenAI-compatible provider, falling back to the default
-    // on an unknown name.
-    build_openai_compat(&selected, model.as_deref())
-        .map(|p| Arc::new(p) as Arc<dyn CompletionProvider>)
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "llm_extract: unknown LLM_EXTRACT_PROVIDER '{}', falling back to '{}'",
-                selected,
-                DEFAULT_PROVIDER
-            );
-            Arc::new(
-                build_openai_compat(DEFAULT_PROVIDER, model.as_deref())
-                    .expect("default provider must exist in the table"),
-            )
-        })
+    // on an unknown name. The resolved model id is the override, else the
+    // table's default for the chosen provider.
+    let resolved_name = if OPENAI_COMPAT_PROVIDERS.iter().any(|(n, ..)| *n == selected) {
+        selected.as_str()
+    } else {
+        tracing::warn!(
+            "llm_extract: unknown LLM_EXTRACT_PROVIDER '{}', falling back to '{}'",
+            selected,
+            DEFAULT_PROVIDER
+        );
+        DEFAULT_PROVIDER
+    };
+
+    let default_model = OPENAI_COMPAT_PROVIDERS
+        .iter()
+        .find(|(n, ..)| *n == resolved_name)
+        .map(|(.., m)| *m)
+        .expect("resolved provider must exist in the table");
+    let model = model_override.unwrap_or_else(|| default_model.to_string());
+
+    let provider = build_openai_compat(resolved_name, Some(&model))
+        .expect("resolved provider must exist in the table");
+    (Arc::new(provider), model)
+}
+
+/// Heuristic for whether a model id names a vision-capable model. Used at
+/// `from_env` to decide whether multimodal escalation is safe; overridden by
+/// `LLM_EXTRACT_VISION` (`true`/`false`/`1`/`0`).
+fn model_is_vision_capable(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    // OpenAI 4o / o-series vision; Qwen/GLM "-vl"/"v" variants; Gemini flash/pro
+    // (multimodal); Claude (vision-capable). Conservative: text-only ids like
+    // `deepseek-chat`, `glm-4-flash`, `gpt-4o-mini`-less variants stay false.
+    m.contains("4o")
+        || m.contains("-vl")
+        || m.contains("vl-")
+        || m.contains("glm-4v")
+        || m.contains("vision")
+        || m.contains("gemini-")
+        || m.contains("claude")
+}
+
+/// Resolve vision capability: explicit `LLM_EXTRACT_VISION` override wins,
+/// otherwise the model-id heuristic.
+fn resolve_vision(model_id: &str) -> bool {
+    match std::env::var("LLM_EXTRACT_VISION")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("true") | Some("1") | Some("yes") => true,
+        Some("false") | Some("0") | Some("no") => false,
+        _ => model_is_vision_capable(model_id),
+    }
 }
 
 /// Build one OpenAI-compatible provider by name, or `None` if the name isn't in
@@ -312,15 +387,19 @@ impl LlmExtractUDF {
             .any(|e| is_weak(e, self.registry.threshold, required));
 
         // --- multimodal escalation ---
-        // Escalate only if there's a weak entity, we have an image to attach,
-        // and the per-query escalation budget isn't exhausted.
+        // Escalate only if there's a weak entity, the active model is
+        // vision-capable (a text-only model would 400 on an image block — keep
+        // the entity low_confidence instead), we have an image to attach, and the
+        // per-query escalation budget isn't exhausted.
         let budget_ok = !matches!(escalation_budget, Some(0));
-        if any_weak && budget_ok {
+        if any_weak && self.registry.vision && budget_ok {
             if let Some(reference) = image_ref {
                 match fetch_image(reference) {
                     Ok(image) => {
                         // An escalation call is about to be made — spend one unit
-                        // of the budget.
+                        // of the budget now. It stays spent even if the call
+                        // below fails (intended: a failed escalation still
+                        // consumed a model call / cost).
                         if let Some(n) = escalation_budget {
                             *n = n.saturating_sub(1);
                         }
@@ -907,6 +986,63 @@ mod tests {
         let e = first_entity(list, 0);
         assert_eq!(e["model"], "weak");
         assert_eq!(e["_status"], "low_confidence");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_escalation_when_model_not_vision_capable() {
+        // Weak entity + a real image_ref, but the active model is text-only
+        // (vision = false). Escalation must be skipped: provider called exactly
+        // once with NO image, and the entity stays low_confidence (spec §3 step3).
+        let mock = Arc::new(EscalatingMock::new());
+        let reg = Arc::new(LlmExtractRegistry::with_options(
+            mock.clone(),
+            0.75,
+            None,
+            false, // not vision-capable (e.g. deepseek-chat)
+        ));
+        let udf = LlmExtractUDF::new(reg);
+
+        let text: StringArray = vec![Some("body")].into_iter().collect();
+        let img: StringArray = vec![Some("data:image/png;base64,aGVsbG8=")]
+            .into_iter()
+            .collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                schema_scalar(),
+            ],
+            1,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+
+        // Exactly one call, and it carried no image (no escalation attempted).
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no escalation call for a text-only model");
+        assert!(!calls[0], "the single call must not carry an image");
+        drop(calls);
+
+        let e = first_entity(list, 0);
+        assert_eq!(e["model"], "weak");
+        assert_eq!(e["_status"], "low_confidence");
+    }
+
+    #[test]
+    fn vision_heuristic_classifies_models() {
+        // Vision-capable ids.
+        assert!(model_is_vision_capable("gpt-4o-mini"));
+        assert!(model_is_vision_capable("glm-4v"));
+        assert!(model_is_vision_capable("qwen2-vl-7b"));
+        assert!(model_is_vision_capable("gemini-2.0-flash"));
+        assert!(model_is_vision_capable("claude-opus-4-8"));
+        // Text-only ids (the cheap defaults).
+        assert!(!model_is_vision_capable("deepseek-chat"));
+        assert!(!model_is_vision_capable("glm-4-flash"));
+        assert!(!model_is_vision_capable("gpt-3.5-turbo"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
