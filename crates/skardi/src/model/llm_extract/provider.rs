@@ -16,9 +16,11 @@ pub struct ImageInput {
 }
 
 /// A single structured-extraction request for one input row.
+///
+/// The model id is *not* carried here: each provider is constructed with its
+/// own model (from `LLM_EXTRACT_MODEL`) and uses that. A per-request model field
+/// would be dead state — the UDF has no other model to supply.
 pub struct CompletionRequest<'a> {
-    /// Model id (e.g. a Claude model).
-    pub model: &'a str,
     /// JSON Schema (the literal third UDF arg) describing fields to extract.
     pub json_schema: &'a str,
     /// The unstructured text for this row.
@@ -69,7 +71,6 @@ mod tests {
     async fn mock_provider_returns_two_entities() {
         let provider = MockProvider;
         let req = CompletionRequest {
-            model: "test-model",
             json_schema: r#"{"type":"object"}"#,
             text: "hello",
             image: None,

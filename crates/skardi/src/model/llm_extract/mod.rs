@@ -262,7 +262,6 @@ impl LlmExtractUDF {
     /// text-only entities and are stamped `low_confidence` rather than escalating.
     fn extract_row(
         &self,
-        model: &str,
         json_schema: &str,
         required: &[String],
         text: &str,
@@ -271,7 +270,6 @@ impl LlmExtractUDF {
     ) -> Vec<serde_json::Value> {
         // --- text-first pass ---
         let text_req = CompletionRequest {
-            model,
             json_schema,
             text,
             image: None,
@@ -307,7 +305,6 @@ impl LlmExtractUDF {
                             *n = n.saturating_sub(1);
                         }
                         let img_req = CompletionRequest {
-                            model,
                             json_schema,
                             text,
                             image: Some(image),
@@ -505,8 +502,6 @@ impl ScalarUDFImpl for LlmExtractUDF {
         // --- arg 2: json_schema (Utf8 literal) ---
         let json_schema = extract_string_literal(&args[2], "third argument (json_schema)")?;
 
-        let model = std::env::var("LLM_EXTRACT_MODEL").unwrap_or_else(|_| default_model());
-
         // Parse the schema's `required` field set once per call.
         let required = parse_required(&json_schema);
 
@@ -538,7 +533,6 @@ impl ScalarUDFImpl for LlmExtractUDF {
             };
 
             let entities = self.extract_row(
-                &model,
                 &json_schema,
                 &required,
                 text,
@@ -562,12 +556,6 @@ impl ScalarUDFImpl for LlmExtractUDF {
 /// Return type for `llm_extract`: `List<Utf8>`.
 fn list_utf8_type() -> DataType {
     DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
-}
-
-/// Default Claude model id, overridable via `LLM_EXTRACT_MODEL`.
-fn default_model() -> String {
-    // Kept in sync with `anthropic.rs`.
-    "claude-sonnet-4-5".to_string()
 }
 
 /// Coerce a `ColumnarValue` (array or scalar Utf8) into a `StringArray` of

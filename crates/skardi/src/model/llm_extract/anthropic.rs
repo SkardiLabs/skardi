@@ -257,7 +257,6 @@ mod tests {
     fn build_body_text_only_shape() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: r#"{"type":"object","properties":{"name":{"type":"string"}}}"#,
             text: "page body",
             image: None,
@@ -289,7 +288,6 @@ mod tests {
     fn build_body_includes_image_block_first() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: r#"{"type":"object"}"#,
             text: "body",
             image: Some(ImageInput {
@@ -313,7 +311,6 @@ mod tests {
     fn build_body_tolerates_malformed_schema() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: "not json at all",
             text: "body",
             image: None,

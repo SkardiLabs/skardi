@@ -383,7 +383,6 @@ mod tests {
     fn response_format_body_shape() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: r#"{"type":"object","properties":{"name":{"type":"string"}}}"#,
             text: "page body",
             image: None,
@@ -411,7 +410,6 @@ mod tests {
     fn response_format_body_includes_image_url_first() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: r#"{"type":"object"}"#,
             text: "body",
             image: Some(ImageInput {
@@ -434,7 +432,6 @@ mod tests {
     fn tool_fallback_body_shape() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: r#"{"type":"object","properties":{"name":{"type":"string"}}}"#,
             text: "body",
             image: None,
@@ -453,7 +450,6 @@ mod tests {
     fn malformed_schema_falls_back_to_object() {
         let p = provider();
         let req = CompletionRequest {
-            model: "ignored",
             json_schema: "not json",
             text: "body",
             image: None,
