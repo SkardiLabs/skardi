@@ -373,6 +373,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
     #[cfg(feature = "remote-embed")]
     register_remote_embed_udf(&mut session_ctx);
+
+    // Register llm_extract UDF (Anthropic structured extraction)
+    #[cfg(feature = "llm-extract")]
+    register_llm_extract_udf(&mut session_ctx);
     // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
     #[cfg(feature = "gguf")]
     register_gguf_udf(&mut session_ctx);
@@ -595,6 +599,17 @@ pub fn register_onnx_predict_udf(ctx: &mut SessionContext) {
 pub fn register_remote_embed_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::RemoteEmbedRegistry::new());
     registry.register_remote_embed_udf(ctx);
+}
+
+/// Register the `llm_extract` scalar UDF for structured entity extraction.
+///
+/// Builds an Anthropic-backed registry from the environment
+/// (`ANTHROPIC_API_KEY`, `LLM_EXTRACT_MODEL`, `LLM_EXTRACT_THRESHOLD`):
+///   SELECT UNNEST(llm_extract(text_col, image_ref_col, '{json schema}'))
+#[cfg(feature = "llm-extract")]
+pub fn register_llm_extract_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::LlmExtractRegistry::from_env());
+    registry.register(ctx);
 }
 /// Register the gguf UDF with the session context.
 ///

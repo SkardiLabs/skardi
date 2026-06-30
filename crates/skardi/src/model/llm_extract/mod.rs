@@ -54,6 +54,18 @@ impl LlmExtractRegistry {
         }
     }
 
+    /// Build a registry from the environment: an [`AnthropicProvider`] (reads
+    /// `ANTHROPIC_API_KEY` / `LLM_EXTRACT_MODEL`) and the confidence threshold
+    /// from `LLM_EXTRACT_THRESHOLD` (default [`DEFAULT_THRESHOLD`]).
+    pub fn from_env() -> Self {
+        let threshold = std::env::var("LLM_EXTRACT_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(DEFAULT_THRESHOLD);
+        let provider = Arc::new(anthropic::AnthropicProvider::from_env());
+        Self::new(provider, threshold)
+    }
+
     /// Register the `llm_extract` UDF with a DataFusion `SessionContext`.
     ///
     /// Usage: `llm_extract(text_col, image_ref_col, '{json schema}') -> List<Utf8>`
