@@ -833,8 +833,8 @@ mod tests {
     /// when the conversion tool is absent — common in minimal CI/dev envs.
     #[test]
     fn scanned_png_parses_or_skips() {
-        if !tool_available("convert") && !tool_available("magick") {
-            eprintln!("skipping scanned_png_parses_or_skips: ImageMagick not found");
+        if !libreoffice_available() && !imagemagick_available() {
+            eprintln!("skipping scanned_png_parses_or_skips: no image->PDF converter found");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -850,5 +850,110 @@ mod tests {
         };
         let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
         assert!(rows.iter().all(|r| r.file_type == "image"));
+    }
+
+    fn libreoffice_available() -> bool {
+        tool_available("soffice") || tool_available("libreoffice")
+    }
+
+    fn imagemagick_available() -> bool {
+        tool_available("magick") || tool_available("convert")
+    }
+
+    /// `.docx` with a real table → non-empty `tables_json`, against REAL
+    /// liteparse output (Office is converted to PDF via LibreOffice, then
+    /// parsed). Skips when LibreOffice is absent (e.g. this dev box); runs in
+    /// CI images that ship it.
+    #[test]
+    fn docx_table_yields_tables_json_or_skips() {
+        if !libreoffice_available() {
+            eprintln!("skipping docx_table_yields_tables_json_or_skips: LibreOffice not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/documents/table.docx",
+            dir.path().join("table.docx"),
+        )
+        .unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.docx".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+        assert!(!rows.is_empty(), "docx should produce at least one page");
+        assert!(rows.iter().all(|r| r.file_type == "docx"));
+        assert!(
+            rows.iter().any(|r| r.tables_json != "[]"),
+            "expected a non-empty tables_json from the docx table"
+        );
+    }
+
+    /// `.xlsx` with cells → non-empty `tables_json`, against REAL liteparse
+    /// output. Skips when LibreOffice is absent.
+    #[test]
+    fn xlsx_sheet_yields_tables_json_or_skips() {
+        if !libreoffice_available() {
+            eprintln!("skipping xlsx_sheet_yields_tables_json_or_skips: LibreOffice not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/documents/sheet.xlsx",
+            dir.path().join("sheet.xlsx"),
+        )
+        .unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.xlsx".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+        assert!(!rows.is_empty(), "xlsx should produce at least one page");
+        assert!(rows.iter().all(|r| r.file_type == "xlsx"));
+        assert!(
+            rows.iter().any(|r| r.tables_json != "[]"),
+            "expected a non-empty tables_json from the xlsx sheet"
+        );
+    }
+
+    /// End-to-end `image_mode=embedded`: an image converted to a 1-page PDF
+    /// carries a full-page raster, which liteparse extracts; assert the crop
+    /// file is actually written to the image_store. Skips without ImageMagick.
+    #[test]
+    fn embedded_image_mode_writes_crops_or_skips() {
+        if !imagemagick_available() {
+            eprintln!("skipping embedded_image_mode_writes_crops_or_skips: ImageMagick not found");
+            return;
+        }
+        let src = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/documents/scanned.png",
+            src.path().join("scanned.png"),
+        )
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.png".into()],
+            ocr: OcrMode::Off,
+            image_mode: ImageMode::Embedded,
+            image_store: Some(store.path().to_str().unwrap().to_string()),
+            ..ParseOptions::default()
+        };
+        let rows = parse_source(src.path().to_str().unwrap(), &opts).unwrap();
+        // The converted PDF embeds the source raster; expect at least one ref,
+        // and every recorded ref must correspond to a written crop file.
+        let refs: Vec<&String> = rows.iter().flat_map(|r| r.image_refs.iter()).collect();
+        assert!(
+            !refs.is_empty(),
+            "embedded mode over an image PDF should yield image_refs"
+        );
+        for uri in refs {
+            assert!(
+                std::path::Path::new(uri).exists(),
+                "image crop not written: {uri}"
+            );
+        }
     }
 }
