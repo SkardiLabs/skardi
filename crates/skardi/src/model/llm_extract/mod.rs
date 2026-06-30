@@ -5,3 +5,5 @@
 //! a `ScalarUDFImpl` returning a `List<Utf8>` per row (caller `UNNEST`s), and
 //! an async→sync bridge for outbound calls. No dependency on the `documents`
 //! connector.
+
+pub mod provider;
