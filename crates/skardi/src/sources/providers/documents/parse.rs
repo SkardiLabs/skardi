@@ -195,7 +195,18 @@ fn file_type_for(path: &Path) -> String {
     }
 }
 
-/// Does `file_name` match any of the simple `*.ext` / `*substr*` globs?
+/// Case-insensitive glob match options (so `*.pdf` matches `FILE.PDF`).
+fn glob_options() -> glob::MatchOptions {
+    glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    }
+}
+
+/// Does `file_name` match any of the `include_globs`? Empty globs match all.
+/// Backed by the `glob` crate's `Pattern`; an invalid pattern is logged and
+/// treated as non-matching.
 fn matches_globs(file_name: &str, globs: &[String]) -> bool {
     if globs.is_empty() {
         return true;
@@ -203,38 +214,15 @@ fn matches_globs(file_name: &str, globs: &[String]) -> bool {
     globs.iter().any(|g| glob_match(g, file_name))
 }
 
-/// Minimal case-insensitive glob: supports `*` wildcards (the only metachar the
-/// spec's globs use, e.g. `*.pdf`). Falls back to equality when no `*`.
+/// Match a single glob pattern against a file name (case-insensitive).
 fn glob_match(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let name = name.to_ascii_lowercase();
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == name;
-    }
-    let mut pos = 0usize;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            // Must match at the start.
-            if !name[pos..].starts_with(part) {
-                return false;
-            }
-            pos += part.len();
-        } else if i == parts.len() - 1 {
-            // Last part must match at the end.
-            if !name[pos..].ends_with(part) {
-                return false;
-            }
-        } else if let Some(idx) = name[pos..].find(part) {
-            pos += idx + part.len();
-        } else {
-            return false;
+    match glob::Pattern::new(pattern) {
+        Ok(p) => p.matches_with(name, glob_options()),
+        Err(e) => {
+            tracing::warn!("documents: invalid include_glob '{}': {}", pattern, e);
+            false
         }
     }
-    true
 }
 
 /// Collect candidate files under `root`, honoring `recursive` + `include_globs`.

@@ -8517,6 +8517,7 @@ dependencies = [
  "derivative",
  "futures",
  "gguf-rs-lib",
+ "glob",
  "hex",
  "iceberg",
  "iceberg-datafusion",
