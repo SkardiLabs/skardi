@@ -113,9 +113,18 @@ struct DocumentsScanExec {
 
 impl DocumentsScanExec {
     fn fetch_partition(&self, _partition: usize) -> datafusion::common::Result<RecordBatch> {
+        // TODO(scale): parse_source runs eagerly here and parses the entire
+        // directory into memory in one shot, blocking this tokio worker for the
+        // duration. For large sources this should move to spawn_blocking and/or
+        // stream batches per file (a RecordBatchStream that yields as each file
+        // parses) instead of materializing one big batch. v1: eager is fine.
         let mut rows = parse_source(&self.root, &self.opts)
             .map_err(|e| DataFusionError::Execution(format!("documents parse failed: {:#}", e)))?;
 
+        // TODO(pushdown): `limit` is applied after parsing everything, then
+        // truncating — there is no limit/predicate pushdown into parse_source, so
+        // a `LIMIT 1` still parses the whole directory. Acceptable for v1; a
+        // future version could stop parsing once `limit` rows are produced.
         if let Some(max) = self.limit {
             rows.truncate(max);
         }

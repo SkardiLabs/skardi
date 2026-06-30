@@ -8,6 +8,21 @@
 > Everything in this connector is gated behind the `documents` Cargo feature.
 > Without it, a context declaring a `documents` source fails registration with a
 > clear "feature not enabled" error.
+>
+> **⚠️ Build-time native download (no checksum):** the `documents` feature pulls
+> in liteparse's `pdfium-sys`, whose `build.rs` **downloads a prebuilt PDFium
+> native library at build time** from `github.com/run-llama/pdfium-binaries`
+> (release tag `chromium/7897`) and caches it under `$XDG_CACHE_HOME`/`$HOME`.
+> The download is **not checksum-verified**, and the build needs network access.
+> For hermetic / offline / air-gapped builds, pre-provision PDFium and point the
+> build at it:
+> ```bash
+> export PDFIUM_LIB_PATH=/opt/pdfium/lib      # dir containing libpdfium.{dylib,so,dll}
+> export PDFIUM_INCLUDE_PATH=/opt/pdfium/include
+> cargo build --release -p skardi-server --features documents
+> ```
+> When both are set, `pdfium-sys` links the provided library instead of
+> downloading one.
 
 `documents` is a read-only skardi data source that turns a directory (or
 object-store prefix) of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, and
@@ -46,9 +61,9 @@ All keys are optional except `path`.
 | `include_globs` | all supported | Comma-separated `*.ext` globs; only matching files are parsed. |
 | `image_mode` | `off` | `embedded` extracts image bytes; `placeholder` keeps refs only; `off` strips images. |
 | `image_store` | — | Destination for extracted image crops. Local paths are written immediately; remote (`s3://…`) refs are recorded and uploaded by a later pass. |
-| `ocr` | `auto` | `auto` OCRs only pages liteparse flags as complex; `on` always; `off` never. See OCR. |
-| `render_page_images` | `false` | Render full-page images for `page_image_ref`. |
-| `ocr_server_url` | — | HTTP OCR engine URL. Required for any OCR in the default build (see OCR). |
+| `ocr` | `auto` | `auto` OCRs only complex pages (needs `ocr_server_url`); `on` always (requires `ocr_server_url`, else hard error); `off` never. See OCR. |
+| `render_page_images` | `false` | Render each page to a PNG into `image_store` and set `page_image_ref` (needed for multimodal `llm_extract`). |
+| `ocr_server_url` | — | HTTP OCR engine URL. The only way to do OCR in this build (no bundled Tesseract). Mandatory for `ocr: on`. |
 
 Filtering by "batch" is just a path predicate — `WHERE path LIKE 'batch-a/%'`.
 There is no batch concept baked into the source, keeping it generic.
@@ -101,13 +116,29 @@ This build links liteparse **without its bundled Tesseract engine** (the
 result OCR is performed via an **HTTP OCR engine**: set `ocr_server_url`.
 
 - `ocr: off` — never OCR (native text extraction only). Works with no extra tools.
-- `ocr: auto` / `ocr: on` — OCR is only actually applied when `ocr_server_url`
-  is configured; otherwise the source degrades to no-OCR rather than failing.
+- `ocr: on` — OCR is mandatory and **requires `ocr_server_url`**. Because this
+  build has no bundled Tesseract, `ocr: on` without `ocr_server_url` is a hard
+  error at registration (preflight) — it does not silently produce empty pages.
+- `ocr: auto` — best-effort: OCR only the pages liteparse flags as complex, and
+  only when `ocr_server_url` is configured. With no engine, parsing proceeds on
+  native text (logged), no error.
 
-**Preflight at registration:** missing tools surface when the source is
-registered, not mid-scan. With `ocr: on` and no `tesseract` binary on `PATH`,
-registration fails with a clear, actionable error. Non-PDF globs without
-LibreOffice produce a warning (PDF-only corpora still work).
+**Preflight at registration:** problems surface when the source is registered,
+not mid-scan. `ocr: on` with no `ocr_server_url` fails with a clear, actionable
+error. Non-PDF globs without LibreOffice produce a warning (PDF-only corpora
+still work). There is **no `tesseract` binary check** — this build never uses
+the local Tesseract binary.
+
+## Full-page images and multimodal (`render_page_images`)
+
+With `render_page_images: "true"`, every page is rendered to a PNG (via PDFium,
+no external OCR needed), written to `image_store` (local paths are written
+immediately; remote `s3://` URIs are recorded for a later upload pass), and its
+URI is set on the row's `page_image_ref`. This is what the multimodal
+`llm_extract` escalation consumes (`llm_extract(markdown, page_image_ref, …)`),
+so **`render_page_images` must be enabled (with an `image_store`) for multimodal
+extraction to have an image to escalate to** — otherwise `page_image_ref` is
+`NULL` and only the text path is available.
 
 ## Error handling
 
