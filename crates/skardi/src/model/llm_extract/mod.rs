@@ -126,6 +126,11 @@ impl LlmExtractUDF {
     /// Extract the entities for a single row: text-first pass, confidence gate,
     /// optional multimodal escalation, `_status` stamping, and never-drop error
     /// isolation.
+    ///
+    /// `escalation_budget` is the per-query cost guard: `Some(n)` allows at most
+    /// `n` more multimodal escalation calls across the batch (decremented here),
+    /// `None` means unlimited. When the budget is exhausted, weak rows keep their
+    /// text-only entities and are stamped `low_confidence` rather than escalating.
     fn extract_row(
         &self,
         model: &str,
@@ -133,6 +138,7 @@ impl LlmExtractUDF {
         required: &[String],
         text: &str,
         image_ref: Option<&str>,
+        escalation_budget: &mut Option<u32>,
     ) -> Vec<serde_json::Value> {
         // --- text-first pass ---
         let text_req = CompletionRequest {
@@ -159,11 +165,18 @@ impl LlmExtractUDF {
             .any(|e| is_weak(e, self.registry.threshold, required));
 
         // --- multimodal escalation ---
-        // Escalate only if there's a weak entity AND we have an image to attach.
-        if any_weak {
+        // Escalate only if there's a weak entity, we have an image to attach,
+        // and the per-query escalation budget isn't exhausted.
+        let budget_ok = !matches!(escalation_budget, Some(0));
+        if any_weak && budget_ok {
             if let Some(reference) = image_ref {
                 match fetch_image(reference) {
                     Ok(image) => {
+                        // An escalation call is about to be made — spend one unit
+                        // of the budget.
+                        if let Some(n) = escalation_budget {
+                            *n = n.saturating_sub(1);
+                        }
                         let img_req = CompletionRequest {
                             model,
                             json_schema,
@@ -368,6 +381,12 @@ impl ScalarUDFImpl for LlmExtractUDF {
         // Parse the schema's `required` field set once per call.
         let required = parse_required(&json_schema);
 
+        // Per-query cost guard: cap the number of multimodal escalation calls.
+        // `None` = unlimited.
+        let mut escalation_budget: Option<u32> = std::env::var("LLM_EXTRACT_MAX_CALLS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+
         let n = text_array.len();
         let mut builder = ListBuilder::new(StringBuilder::new());
 
@@ -389,7 +408,14 @@ impl ScalarUDFImpl for LlmExtractUDF {
                 Some(image_array.value(i))
             };
 
-            let entities = self.extract_row(&model, &json_schema, &required, text, image_ref);
+            let entities = self.extract_row(
+                &model,
+                &json_schema,
+                &required,
+                text,
+                image_ref,
+                &mut escalation_budget,
+            );
             for entity in entities {
                 let s = serde_json::to_string(&entity).unwrap_or_else(|e| {
                     json!({"_status": "error", "_error": format!("serialize failed: {e}")})
@@ -838,6 +864,89 @@ mod tests {
         assert!(is_weak(&e, 0.75, &required));
         let e2 = json!({"model": "x", "price": 5, "_confidence": 0.99});
         assert!(!is_weak(&e2, 0.75, &required));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cost_guard_caps_escalations() {
+        // LLM_EXTRACT_MAX_CALLS=1: a 2-weak-row batch (both with images) makes
+        // at most 1 escalation call; the un-escalated row stays low_confidence.
+        unsafe {
+            std::env::set_var("LLM_EXTRACT_MAX_CALLS", "1");
+        }
+
+        // Spy: counts escalation (image-bearing) calls.
+        struct EscalationSpy {
+            escalations: Mutex<usize>,
+        }
+        #[async_trait]
+        impl CompletionProvider for EscalationSpy {
+            async fn complete(
+                &self,
+                req: CompletionRequest<'_>,
+            ) -> anyhow::Result<CompletionResponse> {
+                if req.image.is_some() {
+                    *self.escalations.lock().unwrap() += 1;
+                    Ok(CompletionResponse {
+                        entities: vec![json!({"model": "strong", "_confidence": 0.95})],
+                    })
+                } else {
+                    // Text-first pass: always weak.
+                    Ok(CompletionResponse {
+                        entities: vec![json!({"model": "weak", "_confidence": 0.10})],
+                    })
+                }
+            }
+        }
+
+        let spy = Arc::new(EscalationSpy {
+            escalations: Mutex::new(0),
+        });
+        let reg = Arc::new(LlmExtractRegistry::new(spy.clone(), 0.75));
+        let udf = LlmExtractUDF::new(reg);
+
+        let text: StringArray = vec![Some("row0"), Some("row1")].into_iter().collect();
+        let img: StringArray = vec![
+            Some("data:image/png;base64,aGVsbG8="),
+            Some("data:image/png;base64,aGVsbG8="),
+        ]
+        .into_iter()
+        .collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                schema_scalar(),
+            ],
+            2,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+
+        // At most one escalation despite two weak rows.
+        assert_eq!(*spy.escalations.lock().unwrap(), 1);
+
+        // One row escalated (ok/strong), the other stayed low_confidence/weak.
+        let e0 = first_entity(list, 0);
+        let e1 = first_entity(list, 1);
+        let statuses = [
+            e0["_status"].as_str().unwrap(),
+            e1["_status"].as_str().unwrap(),
+        ];
+        assert!(
+            statuses.contains(&"ok"),
+            "one row should escalate: {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&"low_confidence"),
+            "one row should stay low_confidence: {statuses:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("LLM_EXTRACT_MAX_CALLS");
+        }
     }
 
     // Keep ImageInput referenced.
