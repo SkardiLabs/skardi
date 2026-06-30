@@ -345,13 +345,32 @@ async fn parse_file(
             cfg.image_mode,
         );
 
-        // Image refs for this page, if image extraction is on.
+        // Reconstruct tables from the page markdown (liteparse renders tables as
+        // GFM pipe tables; we lift them back out into structured JSON).
+        let tables_json = tables_from_markdown(&markdown);
+
+        // Image refs for this page, if image extraction is on. When an
+        // `image_store` is configured we also write the crop bytes there and
+        // record only the refs for crops we could materialize.
         let image_refs: Vec<String> = if opts.image_mode == ImageMode::Embedded {
             result
                 .images
                 .iter()
                 .filter(|img| img.page as usize == page.page_number)
-                .map(|img| image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id))
+                .filter_map(|img| {
+                    let uri = image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id);
+                    if let Some(store) = opts.image_store.as_deref() {
+                        if let Err(e) = write_image_crop(store, &uri, &img.bytes) {
+                            tracing::warn!(
+                                "documents: failed to write image crop {}: {:#}",
+                                uri,
+                                e
+                            );
+                            return None;
+                        }
+                    }
+                    Some(uri)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -362,7 +381,7 @@ async fn parse_file(
             path: rel_path.to_string(),
             page: page.page_number as i32,
             markdown,
-            tables_json: "[]".to_string(),
+            tables_json,
             page_image_ref: None,
             image_refs,
             file_type: file_type.clone(),
@@ -379,6 +398,78 @@ fn image_ref_uri(store: Option<&str>, rel_path: &str, image_id: &str) -> String 
         Some(s) => format!("{}/{}_{}", s.trim_end_matches('/'), stem, image_id),
         None => format!("{}_{}", stem, image_id),
     }
+}
+
+/// Write an extracted image crop to a local `image_store`. Remote stores
+/// (`s3://…`, etc.) are not written here in v1 — the ref is still recorded so a
+/// later object-store pass can upload (spec §7 open item). Returns `Ok` for the
+/// remote-store no-op so the ref is kept.
+fn write_image_crop(store: &str, uri: &str, bytes: &[u8]) -> Result<()> {
+    if store.contains("://") {
+        // Remote object store: defer the actual upload.
+        return Ok(());
+    }
+    let path = Path::new(uri);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating image_store dir {}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).with_context(|| format!("writing image crop {}", uri))?;
+    Ok(())
+}
+
+/// Lift GFM pipe tables out of page markdown into a JSON array. Each table is
+/// `{"header": [...], "rows": [[...], ...]}`. Returns `"[]"` when none found.
+///
+/// liteparse renders reconstructed tables as standard GFM pipe tables (a header
+/// row, a `---|---` separator, then body rows), so a structural scan recovers
+/// them without a full markdown parser.
+fn tables_from_markdown(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut tables: Vec<serde_json::Value> = Vec::new();
+
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let header = lines[i].trim();
+        let sep = lines[i + 1].trim();
+        if is_table_row(header) && is_separator_row(sep) {
+            let headers = split_table_row(header);
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            let mut j = i + 2;
+            while j < lines.len() && is_table_row(lines[j].trim()) {
+                rows.push(split_table_row(lines[j].trim()));
+                j += 1;
+            }
+            tables.push(serde_json::json!({ "header": headers, "rows": rows }));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    serde_json::to_string(&tables).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// A markdown line that looks like a pipe-table row (contains a `|`).
+fn is_table_row(line: &str) -> bool {
+    line.contains('|') && !line.is_empty()
+}
+
+/// The `|---|:--:|` separator row beneath a table header.
+fn is_separator_row(line: &str) -> bool {
+    if !line.contains('|') || !line.contains('-') {
+        return false;
+    }
+    split_table_row(line)
+        .iter()
+        .all(|cell| !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':' | ' ')))
+}
+
+/// Split a pipe-table row into trimmed cell strings, dropping the empty
+/// leading/trailing cells produced by border pipes.
+fn split_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim().trim_matches('|');
+    trimmed.split('|').map(|c| c.trim().to_string()).collect()
 }
 
 /// Parse every matching file under `root` into `(file, page)` rows.
@@ -543,5 +634,68 @@ mod tests {
         let c = doc_id_for("batch-b/catalog.pdf");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn tables_from_markdown_extracts_gfm_tables() {
+        let md = "Intro text.\n\n\
+                  | Name | Qty |\n\
+                  | --- | --- |\n\
+                  | Widget | 10 |\n\
+                  | Gadget | 20 |\n\n\
+                  Trailing prose.";
+        let json = tables_from_markdown(md);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["header"], serde_json::json!(["Name", "Qty"]));
+        assert_eq!(v[0]["rows"][0], serde_json::json!(["Widget", "10"]));
+        assert_eq!(v[0]["rows"][1], serde_json::json!(["Gadget", "20"]));
+    }
+
+    #[test]
+    fn tables_from_markdown_empty_when_none() {
+        assert_eq!(
+            tables_from_markdown("just some prose\nno tables here"),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn write_image_crop_writes_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/sub/crop_p1_0.png", dir.path().display());
+        write_image_crop(dir.path().to_str().unwrap(), &uri, b"\x89PNGfake").unwrap();
+        let written = std::fs::read(&uri).unwrap();
+        assert_eq!(written, b"\x89PNGfake");
+    }
+
+    #[test]
+    fn write_image_crop_skips_remote_store() {
+        // Remote stores are a no-op (deferred upload) but must not error.
+        write_image_crop("s3://bucket/prefix", "s3://bucket/prefix/x.png", b"data").unwrap();
+    }
+
+    /// `image` file_type label and that an image source is parseable when OCR is
+    /// off (liteparse converts the image to a 1-page PDF via ImageMagick). Skips
+    /// when the conversion tool is absent — common in minimal CI/dev envs.
+    #[test]
+    fn scanned_png_parses_or_skips() {
+        if !tool_available("convert") && !tool_available("magick") {
+            eprintln!("skipping scanned_png_parses_or_skips: ImageMagick not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/documents/scanned.png",
+            dir.path().join("scanned.png"),
+        )
+        .unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.png".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+        assert!(rows.iter().all(|r| r.file_type == "image"));
     }
 }
