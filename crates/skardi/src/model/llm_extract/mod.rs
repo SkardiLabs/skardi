@@ -6,6 +6,7 @@
 //! an async→sync bridge for outbound calls. No dependency on the `documents`
 //! connector.
 
+pub mod anthropic;
 pub mod provider;
 
 use std::sync::Arc;
