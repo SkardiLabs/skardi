@@ -2002,6 +2002,51 @@ spec:
         assert_eq!(n, 2);
     }
 
+    /// `ocr: on` with no `ocr_server_url` must fail at registration (preflight),
+    /// not silently produce empty pages mid-scan. This build links liteparse
+    /// without the bundled Tesseract engine, so OCR needs an HTTP engine.
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn test_register_documents_ocr_on_without_engine_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let docs_dir = temp_dir.path().join("docs");
+        fs::create_dir_all(&docs_dir).unwrap();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../skardi/tests/fixtures/documents/two_pages.pdf");
+        fs::copy(&fixture, docs_dir.join("two_pages.pdf")).unwrap();
+
+        let context_content = format!(
+            r#"
+kind: context
+metadata:
+  name: docs-context
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: "documents"
+      type: "documents"
+      path: "{}"
+      access_mode: read_only
+      options:
+        include_globs: "*.pdf"
+        ocr: "on"
+"#,
+            docs_dir.display()
+        );
+        let context_path = temp_dir.path().join("context.yaml");
+        fs::write(&context_path, context_content).unwrap();
+
+        let data_sources = load_context_config(&context_path).unwrap();
+        let mut session_ctx = SessionContext::new();
+        let result = register_data_sources(&mut session_ctx, &data_sources).await;
+        assert!(
+            result.is_err(),
+            "ocr=on without ocr_server_url should fail registration"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("ocr_server_url"), "unexpected error: {msg}");
+    }
+
     #[test]
     fn test_cli_args_parsing() {
         use clap::Parser;

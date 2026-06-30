@@ -522,48 +522,66 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
     Ok(rows)
 }
 
-/// Validate that external tools required by the configured modes are present.
+/// Validate the configured modes are satisfiable, surfacing problems at
+/// registration rather than mid-scan.
 ///
-/// liteparse converts non-PDF inputs to PDF via LibreOffice/ImageMagick and
-/// (when OCR is on without an HTTP engine) shells out to Tesseract. Missing
-/// tools should surface at registration, not mid-scan.
+/// OCR semantics for this build: liteparse is linked with
+/// `default-features = false`, so its bundled Tesseract engine is **compiled
+/// out** — OCR is only ever performed through liteparse's HTTP OCR engine
+/// (`ocr_server_url`). There is therefore no `tesseract` binary involved, and
+/// we do not look for one.
+///
+/// * `ocr = on`  — OCR is mandatory, so an `ocr_server_url` MUST be configured.
+///   Missing it is a hard error here (rather than silently producing empty
+///   pages mid-scan).
+/// * `ocr = auto` — OCR is best-effort. With no `ocr_server_url`, no engine is
+///   available, so parsing proceeds without OCR (logged); complex/scanned pages
+///   simply yield whatever native text exists.
+/// * `ocr = off` — never OCR.
+///
+/// Non-PDF inputs are converted to PDF by liteparse via LibreOffice/ImageMagick
+/// at parse time; a missing converter is warned about (not fatal) so PDF-only
+/// corpora still work.
 pub fn preflight(opts: &ParseOptions) -> Result<()> {
+    // OCR engine contract.
+    match opts.ocr {
+        OcrMode::On if !ocr_engine_available(opts) => {
+            anyhow::bail!(
+                "documents: ocr=on requires an `ocr_server_url` option (this build links \
+                 liteparse without the bundled Tesseract engine, so OCR is only available via \
+                 an HTTP OCR server). Set `ocr_server_url`, or use ocr=auto/off."
+            );
+        }
+        OcrMode::Auto if !ocr_engine_available(opts) => {
+            // Best-effort: no engine configured, so OCR is unavailable. Parsing
+            // will proceed on native text only.
+            tracing::info!(
+                "documents: ocr=auto but no `ocr_server_url` configured; \
+                 proceeding without OCR (native text only)"
+            );
+        }
+        _ => {}
+    }
+
     // Office/ODF/image conversion needs LibreOffice (and ImageMagick for some
-    // image inputs). Only required when the globs admit non-PDF inputs.
+    // image inputs). Only relevant when the globs admit non-PDF inputs. Not
+    // fatal: a PDF-only directory still works when LibreOffice is absent.
     let needs_conversion = opts.include_globs.iter().any(|g| {
         let g = g.to_ascii_lowercase();
         !(g.ends_with(".pdf") || g == "*" || g == "*.*")
     });
     if needs_conversion && !tool_available("soffice") && !tool_available("libreoffice") {
-        // Non-fatal in practice for pure-PDF corpora, but the configured globs
-        // admit convertible inputs, so warn loudly. We do not hard-fail here so
-        // a PDF-only directory still works when LibreOffice is absent.
         tracing::warn!(
             "documents: LibreOffice (soffice) not found; non-PDF inputs cannot be converted"
-        );
-    }
-
-    // OCR via the built-in Tesseract path requires the `tesseract` binary.
-    if matches!(opts.ocr, OcrMode::On) && !tool_available("tesseract") {
-        anyhow::bail!(
-            "documents: ocr=on but the `tesseract` binary was not found on PATH; \
-             install Tesseract or configure an HTTP OCR engine"
         );
     }
 
     Ok(())
 }
 
-/// Is `name` an executable on PATH (or overridden via test seam)?
+/// Is `name` an executable on PATH? Used to decide whether optional converters
+/// (LibreOffice/ImageMagick) are present so tests/preflight can degrade or skip.
 fn tool_available(name: &str) -> bool {
-    // Test/ops seam: SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS="tesseract,soffice"
-    // forces the named tools to look absent so the preflight error path can be
-    // exercised without uninstalling anything.
-    if let Ok(forced) = std::env::var("SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS") {
-        if forced.split(',').any(|t| t.trim() == name) {
-            return false;
-        }
-    }
     let path = match std::env::var_os("PATH") {
         Some(p) => p,
         None => return false,
@@ -676,26 +694,42 @@ mod tests {
     }
 
     #[test]
-    fn preflight_errors_when_ocr_tool_missing() {
-        // Force the tesseract binary to look absent via the test seam, then ask
-        // for ocr=on: preflight must fail with a clear, actionable message
-        // rather than letting the scan blow up mid-run.
-        // SAFETY: single-threaded scope around the env mutation; no other test
-        // reads this var, and we restore it immediately.
-        unsafe {
-            std::env::set_var("SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS", "tesseract");
-        }
+    fn preflight_errors_when_ocr_on_without_engine() {
+        // ocr=on but no ocr_server_url: this build has no bundled Tesseract, so
+        // OCR is impossible. preflight must hard-fail with a clear message
+        // rather than letting the scan silently produce empty pages.
         let opts = ParseOptions {
             ocr: OcrMode::On,
+            ocr_server_url: None,
             ..ParseOptions::default()
         };
         let err = preflight(&opts).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("tesseract"), "unexpected error: {msg}");
         assert!(msg.contains("ocr=on"), "unexpected error: {msg}");
-        unsafe {
-            std::env::remove_var("SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS");
-        }
+        assert!(msg.contains("ocr_server_url"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn preflight_ok_when_ocr_on_with_engine() {
+        let opts = ParseOptions {
+            ocr: OcrMode::On,
+            ocr_server_url: Some("http://ocr.internal:8080/ocr".into()),
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+        assert!(preflight(&opts).is_ok());
+    }
+
+    #[test]
+    fn preflight_ok_when_ocr_auto_without_engine() {
+        // auto degrades to no-OCR (best-effort), not an error.
+        let opts = ParseOptions {
+            ocr: OcrMode::Auto,
+            ocr_server_url: None,
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+        assert!(preflight(&opts).is_ok());
     }
 
     #[test]
