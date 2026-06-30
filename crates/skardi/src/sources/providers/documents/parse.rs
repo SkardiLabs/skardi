@@ -675,6 +675,39 @@ mod tests {
         write_image_crop("s3://bucket/prefix", "s3://bucket/prefix/x.png", b"data").unwrap();
     }
 
+    #[test]
+    fn preflight_errors_when_ocr_tool_missing() {
+        // Force the tesseract binary to look absent via the test seam, then ask
+        // for ocr=on: preflight must fail with a clear, actionable message
+        // rather than letting the scan blow up mid-run.
+        // SAFETY: single-threaded scope around the env mutation; no other test
+        // reads this var, and we restore it immediately.
+        unsafe {
+            std::env::set_var("SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS", "tesseract");
+        }
+        let opts = ParseOptions {
+            ocr: OcrMode::On,
+            ..ParseOptions::default()
+        };
+        let err = preflight(&opts).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tesseract"), "unexpected error: {msg}");
+        assert!(msg.contains("ocr=on"), "unexpected error: {msg}");
+        unsafe {
+            std::env::remove_var("SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS");
+        }
+    }
+
+    #[test]
+    fn preflight_ok_when_ocr_off() {
+        let opts = ParseOptions {
+            ocr: OcrMode::Off,
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+        assert!(preflight(&opts).is_ok());
+    }
+
     /// `image` file_type label and that an image source is parseable when OCR is
     /// off (liteparse converts the image to a 1-page PDF via ImageMagick). Skips
     /// when the conversion tool is absent — common in minimal CI/dev envs.
