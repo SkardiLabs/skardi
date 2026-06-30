@@ -6,6 +6,8 @@ pub mod chunking;
 pub mod converter;
 #[cfg(feature = "gguf")]
 pub mod gguf;
+#[cfg(feature = "llm-extract")]
+pub mod llm_extract;
 pub mod model;
 #[cfg(feature = "onnx")]
 pub mod onnx;

@@ -18,6 +18,8 @@ default = []
 onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]
 embedding = ["onnx", "candle", "gguf", "remote-embed"]
 remote-embed = ["dep:reqwest"]
+# llm_extract scalar UDF — fully independent, NO documents dependency.
+llm-extract = ["dep:reqwest"]
 gguf = ["dep:llama-cpp-4"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 chunking = ["dep:text-splitter"]
