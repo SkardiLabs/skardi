@@ -64,6 +64,10 @@ pub struct ParseOptions {
     pub image_store: Option<String>,
     pub ocr: OcrMode,
     pub render_page_images: bool,
+    /// Optional HTTP OCR server URL. liteparse is built here without the
+    /// bundled Tesseract engine (see Cargo.toml), so OCR is only actually
+    /// performed when this is set; otherwise `on`/`auto` degrade to no-OCR.
+    pub ocr_server_url: Option<String>,
 }
 
 impl Default for ParseOptions {
@@ -77,6 +81,7 @@ impl Default for ParseOptions {
             image_store: None,
             ocr: OcrMode::Auto,
             render_page_images: false,
+            ocr_server_url: None,
         }
     }
 }
@@ -137,8 +142,22 @@ impl ParseOptions {
         if let Some(v) = map.get("render_page_images") {
             opts.render_page_images = parse_bool(v, opts.render_page_images);
         }
+        if let Some(v) = map.get("ocr_server_url") {
+            let v = v.trim();
+            if !v.is_empty() {
+                opts.ocr_server_url = Some(v.to_string());
+            }
+        }
         opts
     }
+}
+
+/// Whether OCR can actually run in this build for the given options. liteparse
+/// is compiled without the bundled Tesseract engine, so OCR requires an HTTP
+/// OCR server URL. Used to keep `on`/`auto` from hard-failing when no engine is
+/// reachable (liteparse errors if `ocr_enabled` is set with no engine).
+fn ocr_engine_available(opts: &ParseOptions) -> bool {
+    opts.ocr_server_url.is_some()
 }
 
 fn parse_bool(v: &str, default: bool) -> bool {
@@ -259,9 +278,17 @@ fn build_config(opts: &ParseOptions) -> LiteParseConfig {
         quiet: true,
         ..Default::default()
     };
-    // OCR is decided per the mode. For `Auto` we leave it off here and re-decide
-    // per file using the complexity check.
-    cfg.ocr_enabled = matches!(opts.ocr, OcrMode::On);
+    // liteparse `LiteParseConfig::default()` turns OCR on only when the bundled
+    // tesseract feature is compiled in (it is not, here). Force it off as the
+    // baseline; we re-enable below only when an engine is actually reachable.
+    cfg.ocr_enabled = false;
+    cfg.ocr_server_url = opts.ocr_server_url.clone();
+    // `On` enables OCR up front, but only if an engine is available — otherwise
+    // liteparse would hard-error ("OCR enabled but no engine"). With no engine,
+    // degrade to no-OCR rather than failing the whole scan.
+    if matches!(opts.ocr, OcrMode::On) && ocr_engine_available(opts) {
+        cfg.ocr_enabled = true;
+    }
     cfg
 }
 
@@ -280,8 +307,9 @@ async fn parse_file(
 
     // OCR Auto: ask liteparse which pages need OCR and only enable it when at
     // least one does. liteparse applies OCR per-page internally on text-sparse
-    // pages once enabled, so a global flag is sufficient here.
-    if matches!(opts.ocr, OcrMode::Auto) {
+    // pages once enabled, so a global flag is sufficient here. Skip entirely
+    // when no OCR engine is reachable — enabling OCR would hard-fail the parse.
+    if matches!(opts.ocr, OcrMode::Auto) && ocr_engine_available(opts) {
         let probe = LiteParse::new(cfg.clone());
         match probe
             .is_complex(liteparse::types::PdfInput::Path(path_str.to_string()))
@@ -468,6 +496,7 @@ mod tests {
             image_store: None,
             ocr: OcrMode::Off,
             render_page_images: false,
+            ocr_server_url: None,
         };
         let rows = parse_source("tests/fixtures/documents", &opts).unwrap();
         assert_eq!(rows.len(), 2);

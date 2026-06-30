@@ -5,5 +5,7 @@
 //! Everything here is behind the `documents` Cargo feature.
 
 mod parse;
+mod table;
 
 pub use parse::{ImageMode, OcrMode, ParseOptions, ParsedPage, parse_source, preflight};
+pub use table::DocumentsTable;
