@@ -335,6 +335,39 @@ async fn parse_file(
     let file_type = file_type_for(abs_path);
     let doc_id = doc_id_for(rel_path);
 
+    // Optionally render full-page images for `page_image_ref` (multimodal use,
+    // e.g. llm_extract's image escalation). Rendering uses pdfium directly
+    // (bundled), so it needs no external OCR/Tesseract — only LibreOffice for
+    // non-PDF inputs, same as parsing. Map page_num -> written/ref URI.
+    let mut page_image_refs: HashMap<u32, String> = HashMap::new();
+    if opts.render_page_images {
+        match parser.screenshot(path_str, None).await {
+            Ok(shots) => {
+                for shot in shots {
+                    let uri = page_image_uri(opts.image_store.as_deref(), rel_path, shot.page_num);
+                    if let Some(store) = opts.image_store.as_deref() {
+                        if let Err(e) = write_image_crop(store, &uri, &shot.image_bytes) {
+                            tracing::warn!(
+                                "documents: failed to write page image {}: {:#}",
+                                uri,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                    page_image_refs.insert(shot.page_num, uri);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "documents: page-image rendering failed for {}: {}",
+                    rel_path,
+                    e
+                );
+            }
+        }
+    }
+
     let mut pages = Vec::with_capacity(result.pages.len());
     for page in &result.pages {
         // Per-page markdown: format just this page so the row carries markdown,
@@ -382,7 +415,7 @@ async fn parse_file(
             page: page.page_number as i32,
             markdown,
             tables_json,
-            page_image_ref: None,
+            page_image_ref: page_image_refs.get(&(page.page_number as u32)).cloned(),
             image_refs,
             file_type: file_type.clone(),
         });
@@ -397,6 +430,15 @@ fn image_ref_uri(store: Option<&str>, rel_path: &str, image_id: &str) -> String 
     match store {
         Some(s) => format!("{}/{}_{}", s.trim_end_matches('/'), stem, image_id),
         None => format!("{}_{}", stem, image_id),
+    }
+}
+
+/// Build a URI for a rendered full-page image.
+fn page_image_uri(store: Option<&str>, rel_path: &str, page: u32) -> String {
+    let stem = rel_path.replace('/', "_");
+    match store {
+        Some(s) => format!("{}/{}_page_{}.png", s.trim_end_matches('/'), stem, page),
+        None => format!("{}_page_{}.png", stem, page),
     }
 }
 
@@ -740,6 +782,50 @@ mod tests {
             ..ParseOptions::default()
         };
         assert!(preflight(&opts).is_ok());
+    }
+
+    #[test]
+    fn render_page_images_sets_page_image_ref_and_writes_files() {
+        // PDF page rendering uses pdfium directly (bundled with the documents
+        // build), so this needs no external tools.
+        let store = tempfile::tempdir().unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.pdf".into()],
+            ocr: OcrMode::Off,
+            render_page_images: true,
+            image_store: Some(store.path().to_str().unwrap().to_string()),
+            ..ParseOptions::default()
+        };
+        let rows = parse_source("tests/fixtures/documents", &opts).unwrap();
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            let uri = r
+                .page_image_ref
+                .as_ref()
+                .expect("page_image_ref should be set when render_page_images=true");
+            assert!(
+                std::path::Path::new(uri).exists(),
+                "rendered page image not written: {uri}"
+            );
+            // Written file should be a non-empty PNG.
+            let bytes = std::fs::read(uri).unwrap();
+            assert!(bytes.starts_with(b"\x89PNG"), "not a PNG: {uri}");
+        }
+    }
+
+    #[test]
+    fn render_page_images_without_store_still_sets_ref() {
+        // No image_store: ref is still populated (a relative URI) but nothing is
+        // written to disk.
+        let opts = ParseOptions {
+            include_globs: vec!["*.pdf".into()],
+            ocr: OcrMode::Off,
+            render_page_images: true,
+            image_store: None,
+            ..ParseOptions::default()
+        };
+        let rows = parse_source("tests/fixtures/documents", &opts).unwrap();
+        assert!(rows.iter().all(|r| r.page_image_ref.is_some()));
     }
 
     /// `image` file_type label and that an image source is parseable when OCR is
