@@ -1359,13 +1359,51 @@ async fn register_data_source(
             })?;
         }
         DataSourceType::Documents => {
-            // Wired up in Task 4 (register_documents_tables). Until then the
-            // dispatch arm exists only to keep the match exhaustive.
-            return Err(ConfigError::DataSourceRegistrationFailed {
-                name: source.name.clone(),
-                error: "documents source registration is not yet implemented".to_string(),
+            #[cfg(feature = "documents")]
+            {
+                tracing::info!(
+                    "Registering documents source: {} at {:?}",
+                    source.name,
+                    source.path
+                );
+
+                let path_str = source
+                    .path
+                    .to_str()
+                    .ok_or_else(|| ConfigError::NonUtf8Path {
+                        name: source.name.clone(),
+                        path: source.path.clone(),
+                    })?;
+
+                skardi::sources::providers::documents::register_documents_tables(
+                    session_ctx,
+                    &source.name,
+                    path_str,
+                    source.options.as_ref(),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "documents registration failed for '{}': {:?}",
+                        source.name,
+                        e
+                    );
+                    ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: format!("{:?}", e),
+                    }
+                })?;
             }
-            .into());
+            #[cfg(not(feature = "documents"))]
+            {
+                return Err(ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: "documents data source type requires the `documents` feature to be \
+                            enabled at build time"
+                        .to_string(),
+                }
+                .into());
+            }
         }
     }
 
@@ -1904,6 +1942,64 @@ options:
         // Test that we can register the data sources
         let result = register_data_sources(&mut session_ctx, &csv_data_sources).await;
         assert!(result.is_ok());
+    }
+
+    /// A context YAML with a `documents` source pointed at a 2-page PDF fixture
+    /// loads, registers, and is queryable end-to-end through the dispatch arm.
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn test_register_documents_source_via_context() {
+        let temp_dir = TempDir::new().unwrap();
+        let docs_dir = temp_dir.path().join("docs");
+        fs::create_dir_all(&docs_dir).unwrap();
+
+        // Copy the committed 2-page PDF fixture into the temp source dir.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../skardi/tests/fixtures/documents/two_pages.pdf");
+        fs::copy(&fixture, docs_dir.join("two_pages.pdf")).unwrap();
+
+        let context_content = format!(
+            r#"
+kind: context
+metadata:
+  name: docs-context
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: "documents"
+      type: "documents"
+      path: "{}"
+      access_mode: read_only
+      options:
+        recursive: "true"
+        include_globs: "*.pdf"
+        ocr: "off"
+"#,
+            docs_dir.display()
+        );
+        let context_path = temp_dir.path().join("context.yaml");
+        fs::write(&context_path, context_content).unwrap();
+
+        let data_sources = load_context_config(&context_path).unwrap();
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect("documents source should register");
+
+        let batches = session_ctx
+            .sql("SELECT count(*) AS n FROM documents")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 2);
     }
 
     #[test]
