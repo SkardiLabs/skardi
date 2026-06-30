@@ -21,6 +21,8 @@ pub use candle::CandleModelRegistry;
 pub use chunking::ChunkingRegistry;
 #[cfg(feature = "gguf")]
 pub use gguf::GgufModelRegistry;
+#[cfg(feature = "llm-extract")]
+pub use llm_extract::LlmExtractRegistry;
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxModelRegistry;
 #[cfg(feature = "remote-embed")]
