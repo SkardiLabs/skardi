@@ -1,13 +1,23 @@
 //! `llm_extract` scalar UDF — source-agnostic structured extraction over a
-//! text column via an LLM completion provider (Anthropic).
+//! text column via cheap LLM chat models.
 //!
 //! Mirrors `remote_embed`'s mechanics: a registry holding a shared provider,
-//! a `ScalarUDFImpl` returning a `List<Utf8>` per row (caller `UNNEST`s), and
-//! an async→sync bridge for outbound calls. No dependency on the `documents`
-//! connector.
+//! a `ScalarUDFImpl` returning a `List<Utf8>` per row (caller `UNNEST`s), an
+//! async→sync bridge for outbound calls, and **multiple providers dispatched by
+//! name**. No dependency on the `documents` connector.
+//!
+//! Extraction is an easy task, so the default providers are cheap
+//! OpenAI-compatible chat models (DeepSeek / GLM / Gemini / OpenAI). A native
+//! Anthropic provider is available behind the same trait but is optional and not
+//! the default.
 
 pub mod anthropic;
+pub mod openai_compat;
 pub mod provider;
+
+use std::time::Duration;
+
+use reqwest::Client;
 
 use std::sync::Arc;
 
@@ -54,15 +64,22 @@ impl LlmExtractRegistry {
         }
     }
 
-    /// Build a registry from the environment: an [`AnthropicProvider`] (reads
-    /// `ANTHROPIC_API_KEY` / `LLM_EXTRACT_MODEL`) and the confidence threshold
-    /// from `LLM_EXTRACT_THRESHOLD` (default [`DEFAULT_THRESHOLD`]).
+    /// Build a registry from the environment.
+    ///
+    /// Selects a completion provider via `LLM_EXTRACT_PROVIDER` (default
+    /// `deepseek`), the model via `LLM_EXTRACT_MODEL`, and the confidence
+    /// threshold via `LLM_EXTRACT_THRESHOLD` (default [`DEFAULT_THRESHOLD`]).
+    ///
+    /// The four built-in OpenAI-compatible providers — deepseek, glm, gemini,
+    /// openai — are all constructed (each warning, not panicking, if its API-key
+    /// env var is unset), and the named one is selected. `anthropic` is an
+    /// optional native provider, not the default.
     pub fn from_env() -> Self {
         let threshold = std::env::var("LLM_EXTRACT_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(DEFAULT_THRESHOLD);
-        let provider = Arc::new(anthropic::AnthropicProvider::from_env());
+        let provider = build_provider_from_env();
         Self::new(provider, threshold)
     }
 
@@ -74,6 +91,118 @@ impl LlmExtractRegistry {
         ctx.register_udf(udf);
         tracing::info!("Registered 'llm_extract' UDF");
     }
+}
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default chat-completion provider when `LLM_EXTRACT_PROVIDER` is unset.
+const DEFAULT_PROVIDER: &str = "deepseek";
+
+/// OpenAI-compatible provider table: `(name, base_url, api_key_env, default_model)`.
+/// Default models are cheap chat models suited to schema-guided extraction.
+const OPENAI_COMPAT_PROVIDERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "deepseek",
+        "https://api.deepseek.com/v1",
+        "DEEPSEEK_API_KEY",
+        "deepseek-chat",
+    ),
+    (
+        "glm",
+        "https://open.bigmodel.cn/api/paas/v4",
+        "GLM_API_KEY",
+        "glm-4-flash",
+    ),
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "GEMINI_API_KEY",
+        "gemini-2.0-flash",
+    ),
+    (
+        "openai",
+        "https://api.openai.com/v1",
+        "OPENAI_API_KEY",
+        "gpt-4o-mini",
+    ),
+];
+
+/// Resolve the active provider name from `LLM_EXTRACT_PROVIDER`, defaulting to
+/// [`DEFAULT_PROVIDER`]. Lower-cased for matching.
+fn active_provider_name() -> String {
+    std::env::var("LLM_EXTRACT_PROVIDER")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
+}
+
+/// Build the selected completion provider from the environment.
+///
+/// Constructs all four OpenAI-compatible providers — warning (not panicking) for
+/// any whose API-key env var is unset, mirroring `remote_embed` — and returns
+/// the one named by `LLM_EXTRACT_PROVIDER`. `anthropic` selects the optional
+/// native provider. An unknown name falls back to the default with a warning.
+fn build_provider_from_env() -> Arc<dyn CompletionProvider> {
+    let selected = active_provider_name();
+
+    // Eager warn for every OpenAI-compatible provider whose key is missing, so
+    // misconfiguration is visible at startup (mirrors remote_embed).
+    for (name, _url, env_var, _model) in OPENAI_COMPAT_PROVIDERS {
+        if std::env::var(env_var).is_err() {
+            tracing::warn!(
+                "llm_extract provider '{}': {} not set — queries using this provider will fail",
+                name,
+                env_var
+            );
+        }
+    }
+
+    if selected == "anthropic" {
+        return Arc::new(anthropic::AnthropicProvider::from_env());
+    }
+
+    let model = std::env::var("LLM_EXTRACT_MODEL").ok();
+
+    // Build the selected OpenAI-compatible provider, falling back to the default
+    // on an unknown name.
+    build_openai_compat(&selected, model.as_deref())
+        .map(|p| Arc::new(p) as Arc<dyn CompletionProvider>)
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "llm_extract: unknown LLM_EXTRACT_PROVIDER '{}', falling back to '{}'",
+                selected,
+                DEFAULT_PROVIDER
+            );
+            Arc::new(
+                build_openai_compat(DEFAULT_PROVIDER, model.as_deref())
+                    .expect("default provider must exist in the table"),
+            )
+        })
+}
+
+/// Build one OpenAI-compatible provider by name, or `None` if the name isn't in
+/// the provider table. `model_override` (from `LLM_EXTRACT_MODEL`) wins over the
+/// table's default model. Deterministic and network-free — used in tests.
+fn build_openai_compat(
+    name: &str,
+    model_override: Option<&str>,
+) -> Option<openai_compat::OpenAiCompatibleCompletionProvider> {
+    let (name, base_url, api_key_env, default_model) =
+        OPENAI_COMPAT_PROVIDERS.iter().find(|(n, ..)| *n == name)?;
+
+    let client = Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("failed to build reqwest client");
+    let model = model_override.unwrap_or(default_model);
+    Some(openai_compat::OpenAiCompatibleCompletionProvider::new(
+        name,
+        base_url,
+        api_key_env,
+        client,
+        model,
+    ))
 }
 
 // =============================================================================
@@ -947,6 +1076,50 @@ mod tests {
         unsafe {
             std::env::remove_var("LLM_EXTRACT_MAX_CALLS");
         }
+    }
+
+    // ----- Provider registry / selection (Task 4 multi-provider) -----
+
+    #[test]
+    fn provider_table_has_all_four() {
+        let names: Vec<&str> = OPENAI_COMPAT_PROVIDERS.iter().map(|(n, ..)| *n).collect();
+        assert!(names.contains(&"deepseek"));
+        assert!(names.contains(&"glm"));
+        assert!(names.contains(&"gemini"));
+        assert!(names.contains(&"openai"));
+        assert_eq!(names.len(), 4);
+    }
+
+    #[test]
+    fn default_provider_is_deepseek() {
+        assert_eq!(DEFAULT_PROVIDER, "deepseek");
+        // build_openai_compat for the default resolves with the table's model.
+        let p = build_openai_compat(DEFAULT_PROVIDER, None).unwrap();
+        assert_eq!(p.name(), "deepseek");
+    }
+
+    #[test]
+    fn build_openai_compat_selects_named_provider() {
+        let glm = build_openai_compat("glm", None).unwrap();
+        assert_eq!(glm.name(), "glm");
+        let openai = build_openai_compat("openai", None).unwrap();
+        assert_eq!(openai.name(), "openai");
+        let gemini = build_openai_compat("gemini", None).unwrap();
+        assert_eq!(gemini.name(), "gemini");
+    }
+
+    #[test]
+    fn build_openai_compat_unknown_is_none() {
+        assert!(build_openai_compat("nope", None).is_none());
+        // anthropic is NOT in the OpenAI-compat table (it's the optional native one)
+        assert!(build_openai_compat("anthropic", None).is_none());
+    }
+
+    #[test]
+    fn build_openai_compat_with_model_override_resolves() {
+        // An override is accepted; the provider still resolves by name.
+        let p = build_openai_compat("deepseek", Some("custom-model")).unwrap();
+        assert_eq!(p.name(), "deepseek");
     }
 
     // Keep ImageInput referenced.
