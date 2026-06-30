@@ -1,0 +1,518 @@
+//! liteparse wrapper — internal to the `documents` connector.
+//!
+//! Walks a source root, runs every matching file through `liteparse`, and
+//! produces one [`ParsedPage`] per `(file, page)`. This module is consumed
+//! only by the `DocumentsTable` provider; `llm_extract` (a separate primitive)
+//! consumes the source's output through SQL, not this module.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use liteparse::config::ImageMode as LpImageMode;
+use liteparse::{LiteParse, LiteParseConfig, OutputFormat};
+
+/// How raster images on a page are surfaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageMode {
+    /// Extract image bytes and write crops to `image_store`.
+    Embedded,
+    /// Emit references in the markdown but do not extract pixels.
+    Placeholder,
+    /// Strip image references entirely.
+    Off,
+}
+
+/// OCR strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcrMode {
+    /// Use liteparse's per-page complexity check; OCR only pages that need it.
+    Auto,
+    /// Always OCR.
+    On,
+    /// Never OCR.
+    Off,
+}
+
+/// One parsed `(file, page)` row.
+#[derive(Debug, Clone)]
+pub struct ParsedPage {
+    /// Stable id for the file (hash of the relative path).
+    pub doc_id: String,
+    /// Path relative to the source root (e.g. `batch-a/catalog.pdf`).
+    pub path: String,
+    /// 1-based page index within the file.
+    pub page: i32,
+    /// liteparse reconstructed markdown for the page.
+    pub markdown: String,
+    /// JSON array of reconstructed tables (may be `"[]"`).
+    pub tables_json: String,
+    /// URI of the rendered full-page image, when produced.
+    pub page_image_ref: Option<String>,
+    /// JSON array of URIs of cropped images on the page (`"[]"` ok).
+    pub image_refs: Vec<String>,
+    /// `pdf` / `docx` / `xlsx` / `image` / …
+    pub file_type: String,
+}
+
+/// Parse-time options, derived from the context-YAML `options` map.
+#[derive(Debug, Clone)]
+pub struct ParseOptions {
+    pub recursive: bool,
+    pub include_globs: Vec<String>,
+    pub image_mode: ImageMode,
+    pub image_store: Option<String>,
+    pub ocr: OcrMode,
+    pub render_page_images: bool,
+}
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        // Defaults per spec §3: recurse, all supported types, no image
+        // extraction, OCR auto, no full-page renders.
+        Self {
+            recursive: true,
+            include_globs: default_globs(),
+            image_mode: ImageMode::Off,
+            image_store: None,
+            ocr: OcrMode::Auto,
+            render_page_images: false,
+        }
+    }
+}
+
+/// The default set of supported file globs.
+fn default_globs() -> Vec<String> {
+    [
+        "*.pdf", "*.docx", "*.xlsx", "*.pptx", "*.doc", "*.xls", "*.ppt", "*.odt", "*.ods",
+        "*.odp", "*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.gif",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+impl ParseOptions {
+    /// Build options from the context-YAML `options` map, applying spec defaults
+    /// for any key that is absent.
+    pub fn from_map(o: Option<&HashMap<String, String>>) -> Self {
+        let mut opts = ParseOptions::default();
+        let Some(map) = o else {
+            return opts;
+        };
+
+        if let Some(v) = map.get("recursive") {
+            opts.recursive = parse_bool(v, opts.recursive);
+        }
+        if let Some(v) = map.get("include_globs") {
+            let globs: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !globs.is_empty() {
+                opts.include_globs = globs;
+            }
+        }
+        if let Some(v) = map.get("image_mode") {
+            opts.image_mode = match v.trim().to_ascii_lowercase().as_str() {
+                "embedded" | "embed" => ImageMode::Embedded,
+                "off" | "none" => ImageMode::Off,
+                _ => ImageMode::Placeholder,
+            };
+        }
+        if let Some(v) = map.get("image_store") {
+            let v = v.trim();
+            if !v.is_empty() {
+                opts.image_store = Some(v.to_string());
+            }
+        }
+        if let Some(v) = map.get("ocr") {
+            opts.ocr = match v.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" => OcrMode::On,
+                "off" | "false" => OcrMode::Off,
+                _ => OcrMode::Auto,
+            };
+        }
+        if let Some(v) = map.get("render_page_images") {
+            opts.render_page_images = parse_bool(v, opts.render_page_images);
+        }
+        opts
+    }
+}
+
+fn parse_bool(v: &str, default: bool) -> bool {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+/// Map our public `ImageMode` onto liteparse's config enum.
+fn lp_image_mode(mode: ImageMode) -> LpImageMode {
+    match mode {
+        ImageMode::Embedded => LpImageMode::Embed,
+        ImageMode::Placeholder => LpImageMode::Placeholder,
+        ImageMode::Off => LpImageMode::Off,
+    }
+}
+
+/// Stable id for a file derived from its relative path.
+fn doc_id_for(rel_path: &str) -> String {
+    blake3::hash(rel_path.as_bytes()).to_hex().to_string()
+}
+
+/// File extension (lowercased) → coarse `file_type` label.
+fn file_type_for(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" => "image".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Does `file_name` match any of the simple `*.ext` / `*substr*` globs?
+fn matches_globs(file_name: &str, globs: &[String]) -> bool {
+    if globs.is_empty() {
+        return true;
+    }
+    globs.iter().any(|g| glob_match(g, file_name))
+}
+
+/// Minimal case-insensitive glob: supports `*` wildcards (the only metachar the
+/// spec's globs use, e.g. `*.pdf`). Falls back to equality when no `*`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Must match at the start.
+            if !name[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if i == parts.len() - 1 {
+            // Last part must match at the end.
+            if !name[pos..].ends_with(part) {
+                return false;
+            }
+        } else if let Some(idx) = name[pos..].find(part) {
+            pos += idx + part.len();
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collect candidate files under `root`, honoring `recursive` + `include_globs`.
+fn collect_files(root: &Path, opts: &ParseOptions) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("documents: cannot read dir {}: {}", dir.display(), e);
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if opts.recursive {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if matches_globs(file_name, &opts.include_globs) {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Build the liteparse config for a parse run.
+fn build_config(opts: &ParseOptions) -> LiteParseConfig {
+    let mut cfg = LiteParseConfig {
+        output_format: OutputFormat::Markdown,
+        image_mode: lp_image_mode(opts.image_mode),
+        quiet: true,
+        ..Default::default()
+    };
+    // OCR is decided per the mode. For `Auto` we leave it off here and re-decide
+    // per file using the complexity check.
+    cfg.ocr_enabled = matches!(opts.ocr, OcrMode::On);
+    cfg
+}
+
+/// Parse a single file into its pages. Errors propagate to the caller, which
+/// isolates them per-file.
+async fn parse_file(
+    abs_path: &Path,
+    rel_path: &str,
+    opts: &ParseOptions,
+) -> Result<Vec<ParsedPage>> {
+    let path_str = abs_path
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", abs_path.display()))?;
+
+    let mut cfg = build_config(opts);
+
+    // OCR Auto: ask liteparse which pages need OCR and only enable it when at
+    // least one does. liteparse applies OCR per-page internally on text-sparse
+    // pages once enabled, so a global flag is sufficient here.
+    if matches!(opts.ocr, OcrMode::Auto) {
+        let probe = LiteParse::new(cfg.clone());
+        match probe
+            .is_complex(liteparse::types::PdfInput::Path(path_str.to_string()))
+            .await
+        {
+            Ok(stats) => {
+                if stats.iter().any(|s| s.needs_ocr) {
+                    cfg.ocr_enabled = true;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("documents: complexity probe failed for {}: {}", rel_path, e);
+            }
+        }
+    }
+
+    let parser = LiteParse::new(cfg.clone());
+    let result = parser
+        .parse(path_str)
+        .await
+        .with_context(|| format!("liteparse failed for {}", rel_path))?;
+
+    let file_type = file_type_for(abs_path);
+    let doc_id = doc_id_for(rel_path);
+
+    let mut pages = Vec::with_capacity(result.pages.len());
+    for page in &result.pages {
+        // Per-page markdown: format just this page so the row carries markdown,
+        // not the cross-page concatenation in `result.text`.
+        let markdown = liteparse::output::markdown::format_markdown(
+            std::slice::from_ref(page),
+            &result.outline,
+            cfg.image_mode,
+        );
+
+        // Image refs for this page, if image extraction is on.
+        let image_refs: Vec<String> = if opts.image_mode == ImageMode::Embedded {
+            result
+                .images
+                .iter()
+                .filter(|img| img.page as usize == page.page_number)
+                .map(|img| image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        pages.push(ParsedPage {
+            doc_id: doc_id.clone(),
+            path: rel_path.to_string(),
+            page: page.page_number as i32,
+            markdown,
+            tables_json: "[]".to_string(),
+            page_image_ref: None,
+            image_refs,
+            file_type: file_type.clone(),
+        });
+    }
+
+    Ok(pages)
+}
+
+/// Build a URI for an extracted image crop.
+fn image_ref_uri(store: Option<&str>, rel_path: &str, image_id: &str) -> String {
+    let stem = rel_path.replace('/', "_");
+    match store {
+        Some(s) => format!("{}/{}_{}", s.trim_end_matches('/'), stem, image_id),
+        None => format!("{}_{}", stem, image_id),
+    }
+}
+
+/// Parse every matching file under `root` into `(file, page)` rows.
+///
+/// Per-file errors are logged (`tracing::warn`) and skipped; remaining files
+/// still produce rows. An empty / unmatched source returns zero rows.
+pub fn parse_source(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPage>> {
+    let root = root.to_string();
+    let opts = opts.clone();
+
+    // liteparse's parse APIs are async (PDFium FFI + optional OCR). The
+    // DataFusion scan path calls this from inside a tokio worker thread, so we
+    // can't build/`block_on` a runtime here directly (nested-runtime panic).
+    // Run the whole parse on a dedicated OS thread that owns its own
+    // current-thread runtime, keeping `parse_source` a plain synchronous call.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || parse_source_blocking(&root, &opts))
+            .join()
+            .map_err(|_| anyhow::anyhow!("documents parse thread panicked"))?
+    })
+}
+
+/// The actual blocking parse loop, run on a thread that owns a tokio runtime.
+fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPage>> {
+    let root_path = Path::new(root);
+    let files = collect_files(root_path, opts)?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for documents parse")?;
+
+    let mut rows = Vec::new();
+    for file in files {
+        let rel_path = file
+            .strip_prefix(root_path)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        match runtime.block_on(parse_file(&file, &rel_path, opts)) {
+            Ok(mut page_rows) => rows.append(&mut page_rows),
+            Err(e) => {
+                tracing::warn!("documents: skipping {}: {:#}", rel_path, e);
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Validate that external tools required by the configured modes are present.
+///
+/// liteparse converts non-PDF inputs to PDF via LibreOffice/ImageMagick and
+/// (when OCR is on without an HTTP engine) shells out to Tesseract. Missing
+/// tools should surface at registration, not mid-scan.
+pub fn preflight(opts: &ParseOptions) -> Result<()> {
+    // Office/ODF/image conversion needs LibreOffice (and ImageMagick for some
+    // image inputs). Only required when the globs admit non-PDF inputs.
+    let needs_conversion = opts.include_globs.iter().any(|g| {
+        let g = g.to_ascii_lowercase();
+        !(g.ends_with(".pdf") || g == "*" || g == "*.*")
+    });
+    if needs_conversion && !tool_available("soffice") && !tool_available("libreoffice") {
+        // Non-fatal in practice for pure-PDF corpora, but the configured globs
+        // admit convertible inputs, so warn loudly. We do not hard-fail here so
+        // a PDF-only directory still works when LibreOffice is absent.
+        tracing::warn!(
+            "documents: LibreOffice (soffice) not found; non-PDF inputs cannot be converted"
+        );
+    }
+
+    // OCR via the built-in Tesseract path requires the `tesseract` binary.
+    if matches!(opts.ocr, OcrMode::On) && !tool_available("tesseract") {
+        anyhow::bail!(
+            "documents: ocr=on but the `tesseract` binary was not found on PATH; \
+             install Tesseract or configure an HTTP OCR engine"
+        );
+    }
+
+    Ok(())
+}
+
+/// Is `name` an executable on PATH (or overridden via test seam)?
+fn tool_available(name: &str) -> bool {
+    // Test/ops seam: SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS="tesseract,soffice"
+    // forces the named tools to look absent so the preflight error path can be
+    // exercised without uninstalling anything.
+    if let Ok(forced) = std::env::var("SKARDI_DOCUMENTS_FORCE_MISSING_TOOLS") {
+        if forced.split(',').any(|t| t.trim() == name) {
+            return false;
+        }
+    }
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_two_page_pdf_into_rows() {
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            image_mode: ImageMode::Off,
+            image_store: None,
+            ocr: OcrMode::Off,
+            render_page_images: false,
+        };
+        let rows = parse_source("tests/fixtures/documents", &opts).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.file_type == "pdf"));
+        assert!(rows.iter().all(|r| !r.markdown.is_empty()));
+        assert_eq!(rows[0].page, 1);
+    }
+
+    #[test]
+    fn glob_match_basics() {
+        assert!(glob_match("*.pdf", "a.pdf"));
+        assert!(glob_match("*.pdf", "DIR.PDF"));
+        assert!(!glob_match("*.pdf", "a.docx"));
+        assert!(glob_match("*", "anything.xyz"));
+        assert!(glob_match("foo*bar", "fooXYZbar"));
+        assert!(!glob_match("foo*bar", "fooXYZ"));
+    }
+
+    #[test]
+    fn from_map_defaults_and_overrides() {
+        let d = ParseOptions::from_map(None);
+        assert!(d.recursive);
+        assert_eq!(d.ocr, OcrMode::Auto);
+
+        let mut m = HashMap::new();
+        m.insert("recursive".to_string(), "false".to_string());
+        m.insert("include_globs".to_string(), "*.pdf, *.png".to_string());
+        m.insert("image_mode".to_string(), "embedded".to_string());
+        m.insert("ocr".to_string(), "off".to_string());
+        let o = ParseOptions::from_map(Some(&m));
+        assert!(!o.recursive);
+        assert_eq!(
+            o.include_globs,
+            vec!["*.pdf".to_string(), "*.png".to_string()]
+        );
+        assert_eq!(o.image_mode, ImageMode::Embedded);
+        assert_eq!(o.ocr, OcrMode::Off);
+    }
+
+    #[test]
+    fn doc_id_is_stable_and_path_relative() {
+        let a = doc_id_for("batch-a/catalog.pdf");
+        let b = doc_id_for("batch-a/catalog.pdf");
+        let c = doc_id_for("batch-b/catalog.pdf");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+}
