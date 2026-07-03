@@ -153,6 +153,17 @@ jobs:
           sudo docker image prune -af || true
           df -h
       - uses: Swatinem/rust-cache@v2
+        with:
+          # liteparse-pdfium-sys's build.rs downloads a prebuilt PDFium
+          # native library to ~/.cache/pdfium-rs (see docs/documents.md) —
+          # outside the paths rust-cache tracks by default (~/.cargo/*,
+          # target/). On a cache *hit*, cargo's build-script fingerprinting
+          # sees the restored target/ output as still valid and skips
+          # re-running build.rs, so it never re-downloads PDFium; the
+          # runner then has no libpdfium.so and every documents-feature
+          # test that touches PDFium panics. Caching this directory too
+          # keeps the download in sync with the rest of the restored cache.
+          cache-directories: ~/.cache/pdfium-rs
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
