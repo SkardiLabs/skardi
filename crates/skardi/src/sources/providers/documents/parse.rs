@@ -379,7 +379,8 @@ async fn parse_file(
                 .iter()
                 .filter(|img| img.page as usize == page.page_number)
                 .filter_map(|img| {
-                    let uri = image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id);
+                    let uri =
+                        image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id, &img.format);
                     if let Some(store) = opts.image_store.as_deref() {
                         if let Err(e) = write_image_crop(store, &uri, &img.bytes) {
                             tracing::warn!(
@@ -412,12 +413,22 @@ async fn parse_file(
     Ok(pages)
 }
 
-/// Build a URI for an extracted image crop.
-fn image_ref_uri(store: Option<&str>, rel_path: &str, image_id: &str) -> String {
+/// Build a URI for an extracted image crop. `format` is liteparse's
+/// `ExtractedImage::format` (currently always `"png"`) and is appended as the
+/// file extension so the written bytes' type is recoverable from the name
+/// alone — consumers like `llm_extract`'s image fetch or an S3 MIME sniffer
+/// infer content-type from the extension.
+fn image_ref_uri(store: Option<&str>, rel_path: &str, image_id: &str, format: &str) -> String {
     let stem = rel_path.replace('/', "_");
     match store {
-        Some(s) => format!("{}/{}_{}", s.trim_end_matches('/'), stem, image_id),
-        None => format!("{}_{}", stem, image_id),
+        Some(s) => format!(
+            "{}/{}_{}.{}",
+            s.trim_end_matches('/'),
+            stem,
+            image_id,
+            format
+        ),
+        None => format!("{}_{}.{}", stem, image_id, format),
     }
 }
 
