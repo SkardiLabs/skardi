@@ -226,7 +226,16 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 /// Collect candidate files under `root`, honoring `recursive` + `include_globs`.
+///
+/// A missing/unreadable *root* is a configuration error (typo'd path, bad
+/// permissions) and fails the scan loudly rather than silently returning an
+/// empty corpus. Subdirectories hit during the recursive descent are more
+/// lenient (existing behavior): a permission error on one subdirectory logs
+/// a warning and is skipped rather than failing the whole scan.
 fn collect_files(root: &Path, opts: &ParseOptions) -> Result<Vec<PathBuf>> {
+    std::fs::read_dir(root)
+        .with_context(|| format!("documents: cannot read root directory {}", root.display()))?;
+
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -656,6 +665,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_root_fails_scan_instead_of_returning_empty() {
+        // A typo'd/unreadable root should error the scan, not silently look
+        // like a valid empty corpus (skardi#145 review).
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            image_mode: ImageMode::Off,
+            image_store: None,
+            ocr: OcrMode::Off,
+            render_page_images: false,
+            ocr_server_url: None,
+        };
+        let err = parse_source("tests/fixtures/documents/does-not-exist", &opts).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot read root directory"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn glob_match_basics() {
         assert!(glob_match("*.pdf", "a.pdf"));
         assert!(glob_match("*.pdf", "DIR.PDF"));
@@ -663,6 +692,18 @@ mod tests {
         assert!(glob_match("*", "anything.xyz"));
         assert!(glob_match("foo*bar", "fooXYZbar"));
         assert!(!glob_match("foo*bar", "fooXYZ"));
+    }
+
+    #[test]
+    fn glob_match_invalid_pattern_warns_and_returns_false() {
+        // An unparseable glob (unclosed character class) must not panic or
+        // propagate an error — it's logged and treated as a non-match.
+        assert!(!glob_match("[", "anything"));
+    }
+
+    #[test]
+    fn matches_globs_empty_list_matches_everything() {
+        assert!(matches_globs("whatever.xyz", &[]));
     }
 
     #[test]
@@ -684,6 +725,101 @@ mod tests {
         );
         assert_eq!(o.image_mode, ImageMode::Embedded);
         assert_eq!(o.ocr, OcrMode::Off);
+    }
+
+    #[test]
+    fn from_map_covers_remaining_option_keys() {
+        // image_mode fallback ("placeholder" for anything not embedded/off),
+        // image_store, render_page_images, ocr_server_url, and ocr="on" are
+        // not exercised by `from_map_defaults_and_overrides` above.
+        let mut m = HashMap::new();
+        m.insert("image_mode".to_string(), "placeholder".to_string());
+        m.insert("image_store".to_string(), "/tmp/store".to_string());
+        m.insert("render_page_images".to_string(), "true".to_string());
+        m.insert("ocr".to_string(), "on".to_string());
+        m.insert(
+            "ocr_server_url".to_string(),
+            "http://ocr.example/ocr".to_string(),
+        );
+        let o = ParseOptions::from_map(Some(&m));
+        assert_eq!(o.image_mode, ImageMode::Placeholder);
+        assert_eq!(o.image_store, Some("/tmp/store".to_string()));
+        assert!(o.render_page_images);
+        assert_eq!(o.ocr, OcrMode::On);
+        assert_eq!(o.ocr_server_url, Some("http://ocr.example/ocr".to_string()));
+
+        // image_mode="off" and blank image_store/ocr_server_url values.
+        let mut m2 = HashMap::new();
+        m2.insert("image_mode".to_string(), "off".to_string());
+        m2.insert("image_store".to_string(), "   ".to_string());
+        m2.insert("ocr_server_url".to_string(), "".to_string());
+        let o2 = ParseOptions::from_map(Some(&m2));
+        assert_eq!(o2.image_mode, ImageMode::Off);
+        assert_eq!(o2.image_store, None);
+        assert_eq!(o2.ocr_server_url, None);
+    }
+
+    #[test]
+    fn parse_bool_falls_back_to_default_on_unrecognized_value() {
+        assert!(parse_bool("not-a-bool", true));
+        assert!(!parse_bool("not-a-bool", false));
+        assert!(parse_bool("YES", false));
+        assert!(!parse_bool("No", true));
+    }
+
+    #[test]
+    fn lp_image_mode_maps_all_variants() {
+        assert_eq!(lp_image_mode(ImageMode::Embedded), LpImageMode::Embed);
+        assert_eq!(
+            lp_image_mode(ImageMode::Placeholder),
+            LpImageMode::Placeholder
+        );
+        assert_eq!(lp_image_mode(ImageMode::Off), LpImageMode::Off);
+    }
+
+    #[test]
+    fn image_ref_uri_and_page_image_uri_without_store() {
+        // `store: None` (no image_store configured) is a distinct branch from
+        // the `Some(store)` path every other test exercises.
+        assert_eq!(
+            image_ref_uri(None, "batch-a/catalog.pdf", "img0", "png"),
+            "batch-a_catalog.pdf_img0.png"
+        );
+        assert_eq!(
+            page_image_uri(None, "batch-a/catalog.pdf", 3),
+            "batch-a_catalog.pdf_page_3.png"
+        );
+        // `Some(store)` with a trailing slash — trimmed, not doubled.
+        assert_eq!(
+            image_ref_uri(Some("/tmp/out/"), "a.pdf", "img0", "png"),
+            "/tmp/out/a.pdf_img0.png"
+        );
+    }
+
+    #[test]
+    fn collect_files_recurses_into_subdirectories_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("top.pdf"), b"x").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nested.pdf"), b"x").unwrap();
+
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+        let files = collect_files(dir.path(), &opts).unwrap();
+        assert_eq!(files.len(), 2);
+
+        let opts_non_recursive = ParseOptions {
+            recursive: false,
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+        let files = collect_files(dir.path(), &opts_non_recursive).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name().unwrap(), "top.pdf");
     }
 
     #[test]

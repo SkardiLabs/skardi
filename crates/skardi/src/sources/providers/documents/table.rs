@@ -275,4 +275,62 @@ mod tests {
         assert_eq!(n, 2);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn documents_table_select_star_builds_every_column() -> datafusion::error::Result<()> {
+        // `documents_table_queryable` only projects `path, page`, so most of
+        // `build_column`'s per-index branches (and `image_refs_json`) never
+        // run. `SELECT *` forces every column through the projection.
+        let opts = ParseOptions::from_map(None);
+        let table = DocumentsTable::new("tests/fixtures/documents".into(), opts);
+        let ctx = SessionContext::new();
+        ctx.register_table("documents", Arc::new(table))?;
+        let batches = ctx.sql("SELECT * FROM documents").await?.collect().await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        let schema = batches[0].schema();
+        for name in [
+            "doc_id",
+            "path",
+            "page",
+            "markdown",
+            "tables_json",
+            "page_image_ref",
+            "image_refs",
+            "file_type",
+        ] {
+            assert!(
+                schema.field_with_name(name).is_ok(),
+                "missing column {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn documents_table_explain_renders_scan_exec() -> datafusion::error::Result<()> {
+        // Exercises `DisplayAs::fmt_as` (Default format) and `ExecutionPlan::name`,
+        // neither of which a plain SELECT's row-fetch path touches.
+        let opts = ParseOptions::from_map(None);
+        let table = DocumentsTable::new("tests/fixtures/documents".into(), opts);
+        let ctx = SessionContext::new();
+        ctx.register_table("documents", Arc::new(table))?;
+        let batches = ctx
+            .sql("EXPLAIN SELECT * FROM documents")
+            .await?
+            .collect()
+            .await?;
+        let plan_text: String = batches
+            .iter()
+            .map(|b| {
+                arrow::util::pretty::pretty_format_batches(&[b.clone()])
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            plan_text.contains("DocumentsScanExec"),
+            "expected DocumentsScanExec in plan: {plan_text}"
+        );
+        Ok(())
+    }
 }

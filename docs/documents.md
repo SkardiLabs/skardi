@@ -24,11 +24,18 @@
 > When both are set, `pdfium-sys` links the provided library instead of
 > downloading one.
 
-`documents` is a read-only skardi data source that turns a directory (or
-object-store prefix) of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, and
-images — into queryable rows. Each row is one parsed **(file, page)** carrying
-reconstructed markdown, tables, and references to extracted images. It is backed
-by the pure-Rust [`liteparse`](https://github.com/run-llama/liteparse) crate.
+`documents` is a read-only skardi data source that turns a **local directory**
+of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, and images — into queryable
+rows. Each row is one parsed **(file, page)** carrying reconstructed markdown,
+tables, and references to extracted images. It is backed by the pure-Rust
+[`liteparse`](https://github.com/run-llama/liteparse) crate.
+
+> **`path` is local-filesystem only in v1.** File discovery walks `path` with
+> `std::fs::read_dir`; there is no object-store listing/read path yet, so an
+> `s3://…` (or `gs://`/`az://`) `path` will register successfully but scan
+> zero files. `image_store` (below) accepts `s3://…` today only in the sense
+> that it *records* the ref — see that row for what "later upload pass" means
+> in practice.
 
 Once registered, `SELECT * FROM documents` behaves like any other table: it is
 joinable in SQL and can be fed to the `llm_extract` UDF over its `markdown`
@@ -40,14 +47,14 @@ shared Rust between the two, only SQL.
 ```yaml
 - name: documents
   type: documents
-  path: s3://pp/inbound          # directory or object-store prefix (the root)
+  path: /data/pp/inbound         # local directory (the root); recurses by default
   access_mode: read_only
   description: "Supplier source documents"
   options:
     recursive: "true"            # descend subdirectories (default: true)
     include_globs: "*.pdf,*.docx,*.xlsx,*.png,*.jpg"  # default: all supported types
     image_mode: "embedded"       # embedded | placeholder | off (default: off)
-    image_store: "s3://pp/extracted"   # where cropped images are written
+    image_store: "/data/pp/extracted"  # where cropped images are written; s3://… records refs only, see below
     ocr: "auto"                  # auto | on | off (default: auto)
     render_page_images: "true"   # render full-page images for page_image_ref
     ocr_server_url: "http://ocr:8080/ocr"  # HTTP OCR engine (see OCR below)
@@ -60,7 +67,7 @@ All keys are optional except `path`.
 | `recursive` | `true` | Descend into subdirectories. |
 | `include_globs` | all supported | Comma-separated `*.ext` globs; only matching files are parsed. |
 | `image_mode` | `off` | `embedded` extracts image bytes; `placeholder` keeps refs only; `off` strips images. |
-| `image_store` | — | Destination for extracted image crops. Local paths are written immediately; remote (`s3://…`) refs are recorded and uploaded by a later pass. |
+| `image_store` | — | Destination for extracted image crops. Local paths are written immediately and are safe to use as-is (including as `llm_extract`'s `image_ref`). Remote (`s3://…`) refs are recorded but **bytes are not uploaded** — no upload pass exists yet — so a remote `image_store` currently produces refs nothing can read. Use a local path until that lands. |
 | `ocr` | `auto` | `auto` OCRs only complex pages (needs `ocr_server_url`); `on` always (requires `ocr_server_url`, else hard error); `off` never. See OCR. |
 | `render_page_images` | `false` | Render each page to a PNG into `image_store` and set `page_image_ref` (needed for multimodal `llm_extract`). |
 | `ocr_server_url` | — | HTTP OCR engine URL. The only way to do OCR in this build (no bundled Tesseract). Mandatory for `ocr: on`. |
@@ -132,9 +139,12 @@ the local Tesseract binary.
 ## Full-page images and multimodal (`render_page_images`)
 
 With `render_page_images: "true"`, every page is rendered to a PNG (via PDFium,
-no external OCR needed), written to `image_store` (local paths are written
-immediately; remote `s3://` URIs are recorded for a later upload pass), and its
-URI is set on the row's `page_image_ref`. This is what the multimodal
+no external OCR needed), written to `image_store` (a local path is written
+immediately and readable right away; a remote `s3://` URI is recorded but
+**not uploaded** — there is no upload pass yet, so `page_image_ref` would
+point at bytes that don't exist anywhere), and its URI is set on the row's
+`page_image_ref`. Use a local `image_store` until remote upload lands. This
+is what the multimodal
 `llm_extract` escalation consumes (`llm_extract(markdown, page_image_ref, …)`),
 so **`render_page_images` must be enabled (with an `image_store`) for multimodal
 extraction to have an image to escalate to** — otherwise `page_image_ref` is
