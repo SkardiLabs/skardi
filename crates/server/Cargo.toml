@@ -18,6 +18,7 @@ candle = ["skardi/candle"]
 onnx = ["skardi/onnx"]
 embedding = ["candle", "gguf", "onnx", "remote-embed"]
 remote-embed = ["skardi/remote-embed"]
+llm-extract = ["skardi/llm-extract"]
 gguf = ["skardi/gguf"]
 chunking = ["skardi/chunking"]
 # RAG umbrella: chunk → embed → write loop in one feature.

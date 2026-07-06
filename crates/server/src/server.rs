@@ -21,6 +21,8 @@ use crate::config::register_candle_udf;
 use crate::config::register_chunk_udf;
 #[cfg(feature = "gguf")]
 use crate::config::register_gguf_udf;
+#[cfg(feature = "llm-extract")]
+use crate::config::register_llm_extract_udf;
 #[cfg(feature = "onnx")]
 use crate::config::register_onnx_predict_udf;
 #[cfg(feature = "remote-embed")]
@@ -145,6 +147,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register remote_embed UDF (OpenAI, Gemini, Voyage, Mistral)
     #[cfg(feature = "remote-embed")]
     register_remote_embed_udf(&mut session_ctx);
+    // Register llm_extract UDF (structured extraction: DeepSeek/GLM/Gemini/OpenAI/Anthropic)
+    #[cfg(feature = "llm-extract")]
+    register_llm_extract_udf(&mut session_ctx);
     // Register gguf UDF (lazy — GGUF models loaded on first call from inline path)
     #[cfg(feature = "gguf")]
     register_gguf_udf(&mut session_ctx);

@@ -6,6 +6,8 @@ pub mod chunking;
 pub mod converter;
 #[cfg(feature = "gguf")]
 pub mod gguf;
+#[cfg(feature = "llm-extract")]
+pub mod llm_extract;
 pub mod model;
 #[cfg(feature = "onnx")]
 pub mod onnx;
@@ -19,6 +21,8 @@ pub use candle::CandleModelRegistry;
 pub use chunking::ChunkingRegistry;
 #[cfg(feature = "gguf")]
 pub use gguf::GgufModelRegistry;
+#[cfg(feature = "llm-extract")]
+pub use llm_extract::LlmExtractRegistry;
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxModelRegistry;
 #[cfg(feature = "remote-embed")]
