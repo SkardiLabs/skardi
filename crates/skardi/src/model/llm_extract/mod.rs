@@ -2,9 +2,16 @@
 //! text column via cheap LLM chat models.
 //!
 //! Mirrors `remote_embed`'s mechanics: a registry holding a shared provider,
-//! a `ScalarUDFImpl` returning a `List<Utf8>` per row (caller `UNNEST`s), an
-//! async→sync bridge for outbound calls, and **multiple providers dispatched by
-//! name**. No dependency on the `documents` connector.
+//! a `ScalarUDFImpl` returning `List<Struct<...schema fields, _confidence,
+//! _status, _error>>` per row (caller `UNNEST`s, then projects fields by
+//! name — no JSON parsing), an async→sync bridge for outbound calls, and
+//! **multiple providers dispatched by name**. No dependency on the
+//! `documents` connector.
+//!
+//! The struct's field set is derived from the `json_schema` argument's
+//! *value* at plan time via `ScalarUDFImpl::return_field_from_args` (the
+//! same mechanism `arrow_cast(x, 'Int16')` uses) — see
+//! `entity_struct_fields`/`json_schema_property_to_field`.
 //!
 //! Extraction is an easy task, so the default providers are cheap
 //! OpenAI-compatible chat models (DeepSeek / GLM / Gemini / OpenAI). A native
@@ -21,11 +28,16 @@ use reqwest::Client;
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ListBuilder, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field};
+use arrow::array::{
+    Array, BooleanBuilder, Float64Builder, Int64Builder, ListArray, StringArray, StringBuilder,
+    StructBuilder,
+};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
@@ -608,8 +620,49 @@ impl ScalarUDFImpl for LlmExtractUDF {
         &self.signature
     }
 
+    /// Required by the trait, but never actually consulted: `llm_extract`'s
+    /// return type depends on the *value* of the `json_schema` literal, not
+    /// just its type, so [`Self::return_field_from_args`] is what DataFusion
+    /// calls at plan time. This fallback only matters if some caller invokes
+    /// `return_type` directly; it approximates the shape with no known
+    /// entity fields (just the reserved ones).
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
-        Ok(list_utf8_type())
+        Ok(entity_list_type(reserved_fields()))
+    }
+
+    /// The real return-type hook. `json_schema` (arg 2) is already required to
+    /// be a string literal (see [`extract_string_literal`]), so its *value* is
+    /// available here via `scalar_arguments` — mirroring how DataFusion's own
+    /// `arrow_cast(x, 'Int16')` picks a return type from a literal argument's
+    /// value rather than its type. We parse the schema's `properties` into
+    /// Arrow fields and return `List<Struct<...schema fields, _confidence,
+    /// _status, _error>>` instead of the generic `List<Utf8>` JSON-string
+    /// shape — callers get typed columns straight out of `UNNEST`, no JSON
+    /// parsing required downstream.
+    fn return_field_from_args(
+        &self,
+        args: ReturnFieldArgs,
+    ) -> datafusion::common::Result<FieldRef> {
+        let json_schema = args
+            .scalar_arguments
+            .get(2)
+            .and_then(|s| *s)
+            .and_then(|v| match v {
+                ScalarValue::Utf8(Some(s)) => Some(s.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "llm_extract third argument (json_schema) must be a non-null string literal"
+                        .to_string(),
+                )
+            })?;
+        let fields = entity_struct_fields(json_schema)?;
+        Ok(Arc::new(Field::new(
+            self.name(),
+            entity_list_type(fields),
+            true,
+        )))
     }
 
     fn invoke_with_args(
@@ -637,25 +690,29 @@ impl ScalarUDFImpl for LlmExtractUDF {
         // Parse the schema's `required` field set once per call.
         let required = parse_required(&json_schema);
 
+        // Same fields `return_field_from_args` derived at plan time — recomputed
+        // (cheap, once per query, not per row) rather than threaded through
+        // `args.return_field`, so the two can never drift apart.
+        let fields = entity_struct_fields(&json_schema)?;
+
         // Per-query cost guard: cap the number of multimodal escalation calls.
         // `None` = unlimited. Taken from the registry (read once at from_env),
         // not the live environment — avoids env races under parallel tests.
         let mut escalation_budget: Option<u32> = self.registry.max_calls;
 
         let n = text_array.len();
-        let mut builder = ListBuilder::new(StringBuilder::new());
+        let mut struct_builder = StructBuilder::from_fields(fields.clone(), n);
+        let mut offsets: Vec<i32> = Vec::with_capacity(n + 1);
+        offsets.push(0);
+        let mut total: i32 = 0;
 
         for i in 0..n {
             // Empty/NULL text → empty list, no LLM call.
-            if text_array.is_null(i) {
-                builder.append(true);
+            if text_array.is_null(i) || text_array.value(i).is_empty() {
+                offsets.push(total);
                 continue;
             }
             let text = text_array.value(i);
-            if text.is_empty() {
-                builder.append(true);
-                continue;
-            }
 
             let image_ref = if image_array.is_null(i) {
                 None
@@ -670,23 +727,223 @@ impl ScalarUDFImpl for LlmExtractUDF {
                 image_ref,
                 &mut escalation_budget,
             );
-            for entity in entities {
-                let s = serde_json::to_string(&entity).unwrap_or_else(|e| {
-                    json!({"_status": "error", "_error": format!("serialize failed: {e}")})
-                        .to_string()
-                });
-                builder.values().append_value(s);
+            for entity in &entities {
+                append_entity(&mut struct_builder, &fields, entity);
+                total += 1;
             }
-            builder.append(true);
+            offsets.push(total);
         }
 
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        let struct_array = struct_builder.finish();
+        let list_field = Arc::new(Field::new("item", DataType::Struct(fields), true));
+        let list_array = ListArray::new(
+            list_field,
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(struct_array),
+            None,
+        );
+
+        Ok(ColumnarValue::Array(Arc::new(list_array)))
     }
 }
 
-/// Return type for `llm_extract`: `List<Utf8>`.
-fn list_utf8_type() -> DataType {
-    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+/// `_confidence` / `_status` / `_error` are present on every entity regardless
+/// of the caller's schema — documented in the "Output contract" section of
+/// docs/llm_extract.md.
+fn reserved_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("_confidence", DataType::Float64, true),
+        Field::new("_status", DataType::Utf8, true),
+        Field::new("_error", DataType::Utf8, true),
+    ])
+}
+
+/// `List<Struct<fields>>` — the shape every `llm_extract` call returns.
+fn entity_list_type(fields: Fields) -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true)))
+}
+
+/// Parse a JSON Schema string into the Arrow `Fields` for one extracted
+/// entity: the schema's own `properties` (order is alphabetical by property
+/// name — `serde_json`'s default `Map` is a `BTreeMap` here, not
+/// insertion-ordered) plus the three reserved fields.
+///
+/// Errors only when `json_schema` isn't valid JSON at all — a schema that
+/// parses but lacks `properties`/`type` degrades leniently (empty entity
+/// fields, just the reserved ones), matching `parse_required`'s existing
+/// leniency for the same input.
+fn entity_struct_fields(json_schema: &str) -> Result<Fields, DataFusionError> {
+    let schema_val: serde_json::Value = serde_json::from_str(json_schema).map_err(|e| {
+        DataFusionError::Plan(format!("llm_extract: json_schema is not valid JSON: {e}"))
+    })?;
+    let mut fields: Vec<Field> = json_schema_properties_to_fields(&schema_val)
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.extend(reserved_fields().iter().map(|f| f.as_ref().clone()));
+    Ok(Fields::from(fields))
+}
+
+/// Map a JSON Schema object's `properties` map to Arrow fields.
+fn json_schema_properties_to_fields(schema: &serde_json::Value) -> Fields {
+    let props = match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return Fields::empty(),
+    };
+    Fields::from(
+        props
+            .iter()
+            .map(|(name, prop)| json_schema_property_to_field(name, prop))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Map one JSON Schema property to an Arrow field. Every field is nullable —
+/// an entity may omit any property regardless of the schema's `required`
+/// list (that's what `_status: low_confidence` / `_error` communicate).
+///
+/// Scope, chosen to cover the common flat-extraction case without a
+/// combinatorial JSON-Schema-to-Arrow mapper:
+/// - `string` → `Utf8`, `number` → `Float64`, `integer` → `Int64`, `boolean` → `Boolean`.
+/// - `array` of `string` items → `List<Utf8>` (e.g. a `colors` field). Arrays
+///   of anything else fall back to `Utf8` holding the item's raw JSON text —
+///   never dropped, just not broken out into a typed list.
+/// - `object` → `Struct` of its own nested `properties`, recursively.
+/// - missing/unrecognized/union (`"type":["string","null"]`) `type` → `Utf8`,
+///   the safest nullable-string default.
+fn json_schema_property_to_field(name: &str, prop: &serde_json::Value) -> Field {
+    let ty = prop
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("string");
+    let data_type = match ty {
+        "number" => DataType::Float64,
+        "integer" => DataType::Int64,
+        "boolean" => DataType::Boolean,
+        "array" => {
+            let item_is_string = prop
+                .get("items")
+                .and_then(|i| i.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("string");
+            if item_is_string {
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+            } else {
+                DataType::Utf8
+            }
+        }
+        "object" => DataType::Struct(json_schema_properties_to_fields(prop)),
+        _ => DataType::Utf8,
+    };
+    Field::new(name, data_type, true)
+}
+
+/// Append one extracted entity (a JSON object) as a row of `struct_builder`,
+/// dispatching per field by its Arrow type. A field absent from the entity
+/// (or present with the wrong JSON type) is appended as null rather than
+/// erroring — matches the UDF's never-drop-a-row philosophy at the field
+/// level too.
+fn append_entity(struct_builder: &mut StructBuilder, fields: &Fields, entity: &serde_json::Value) {
+    for (i, field) in fields.iter().enumerate() {
+        let value = entity.get(field.name());
+        append_field_value(struct_builder, i, field.data_type(), value);
+    }
+    struct_builder.append(true);
+}
+
+/// Append a single field's value into `builder`'s child builder at index `i`,
+/// recursing for nested `Struct`/`List<Utf8>` fields. See
+/// [`json_schema_property_to_field`] for which `DataType`s can occur here —
+/// every arm below corresponds to one of that function's outputs.
+fn append_field_value(
+    builder: &mut StructBuilder,
+    i: usize,
+    data_type: &DataType,
+    value: Option<&serde_json::Value>,
+) {
+    match data_type {
+        DataType::Utf8 => {
+            let b = builder
+                .field_builder::<StringBuilder>(i)
+                .expect("field builder type must match the field's declared DataType");
+            match value {
+                // A raw-JSON-fallback Utf8 field (e.g. a non-string array) gets
+                // the value's JSON text; a plain string field gets the string.
+                Some(serde_json::Value::String(s)) => b.append_value(s),
+                Some(v) if !v.is_null() => b.append_value(v.to_string()),
+                _ => b.append_null(),
+            }
+        }
+        DataType::Float64 => {
+            let b = builder
+                .field_builder::<Float64Builder>(i)
+                .expect("field builder type must match the field's declared DataType");
+            match value.and_then(|v| v.as_f64()) {
+                Some(f) => b.append_value(f),
+                None => b.append_null(),
+            }
+        }
+        DataType::Int64 => {
+            let b = builder
+                .field_builder::<Int64Builder>(i)
+                .expect("field builder type must match the field's declared DataType");
+            match value.and_then(|v| v.as_i64()) {
+                Some(v) => b.append_value(v),
+                None => b.append_null(),
+            }
+        }
+        DataType::Boolean => {
+            let b = builder
+                .field_builder::<BooleanBuilder>(i)
+                .expect("field builder type must match the field's declared DataType");
+            match value.and_then(|v| v.as_bool()) {
+                Some(v) => b.append_value(v),
+                None => b.append_null(),
+            }
+        }
+        DataType::List(item_field) if item_field.data_type() == &DataType::Utf8 => {
+            // `StructBuilder`/`make_builder` builds every List's inner values
+            // builder type-erased (`ListBuilder<Box<dyn ArrayBuilder>>`), even
+            // when the item type is a concrete Utf8 — so the values builder
+            // itself needs a second downcast, not `ListBuilder<StringBuilder>`.
+            let b = builder
+                .field_builder::<arrow::array::ListBuilder<Box<dyn arrow::array::ArrayBuilder>>>(i)
+                .expect("field builder type must match the field's declared DataType");
+            match value.and_then(|v| v.as_array()) {
+                Some(items) => {
+                    let values = b
+                        .values()
+                        .as_any_mut()
+                        .downcast_mut::<StringBuilder>()
+                        .expect("List<Utf8> values builder must be a StringBuilder");
+                    for item in items {
+                        match item.as_str() {
+                            Some(s) => values.append_value(s),
+                            None => values.append_null(),
+                        }
+                    }
+                    b.append(true);
+                }
+                None => b.append(false),
+            }
+        }
+        DataType::Struct(nested_fields) => {
+            let nested_obj = value.filter(|v| v.is_object());
+            {
+                let nested_builder = builder
+                    .field_builder::<StructBuilder>(i)
+                    .expect("field builder type must match the field's declared DataType");
+                for (j, nf) in nested_fields.iter().enumerate() {
+                    let nv = nested_obj.and_then(|v| v.get(nf.name()));
+                    append_field_value(nested_builder, j, nf.data_type(), nv);
+                }
+                nested_builder.append(nested_obj.is_some());
+            }
+        }
+        other => {
+            unreachable!("llm_extract: json_schema_property_to_field never produces {other:?}")
+        }
+    }
 }
 
 /// Coerce a `ColumnarValue` (array or scalar Utf8) into a `StringArray` of
@@ -734,7 +991,7 @@ fn extract_string_literal(val: &ColumnarValue, label: &str) -> Result<String, Da
 mod tests {
     use super::*;
     use crate::model::llm_extract::provider::{CompletionRequest, CompletionResponse, ImageInput};
-    use arrow::array::ListArray;
+    use arrow::array::{ListArray, StructArray};
     use async_trait::async_trait;
     use datafusion::config::ConfigOptions;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -777,7 +1034,9 @@ mod tests {
             args,
             arg_fields,
             number_rows: num_rows,
-            return_field: Arc::new(Field::new("f", list_utf8_type(), true)),
+            // Not consulted by `invoke_with_args` (which recomputes fields
+            // from the json_schema literal directly) — placeholder value only.
+            return_field: Arc::new(Field::new("f", entity_list_type(reserved_fields()), true)),
             config_options: Arc::new(ConfigOptions::default()),
         }
     }
@@ -788,15 +1047,78 @@ mod tests {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(SCHEMA.into())))
     }
 
+    fn return_field_args_for(schema: &str) -> ScalarValue {
+        ScalarValue::Utf8(Some(schema.to_string()))
+    }
+
     #[test]
-    fn return_type_is_list_utf8() {
+    fn return_field_from_args_builds_struct_matching_schema() {
         let reg = Arc::new(LlmExtractRegistry::new(
             Arc::new(MockNEntities::new(1)),
             0.75,
         ));
         let udf = LlmExtractUDF::new(reg);
-        let rt = udf.return_type(&[]).unwrap();
-        assert_eq!(rt, list_utf8_type());
+        let text_field = Arc::new(Field::new("_", DataType::Utf8, true));
+        let image_field = Arc::new(Field::new("_", DataType::Utf8, true));
+        let schema_lit = return_field_args_for(SCHEMA);
+        let schema_field = Arc::new(Field::new("_", DataType::Utf8, false));
+        let args = ReturnFieldArgs {
+            arg_fields: &[text_field, image_field, schema_field],
+            scalar_arguments: &[None, None, Some(&schema_lit)],
+        };
+        let field = udf.return_field_from_args(args).unwrap();
+        let DataType::List(item) = field.data_type() else {
+            panic!("expected List, got {:?}", field.data_type());
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected List<Struct>, got {:?}", item.data_type());
+        };
+        assert!(fields.iter().any(|f| f.name() == "model"));
+        assert!(fields.iter().any(|f| f.name() == "_confidence"));
+        assert!(fields.iter().any(|f| f.name() == "_status"));
+        assert!(fields.iter().any(|f| f.name() == "_error"));
+    }
+
+    #[test]
+    fn entity_struct_fields_maps_schema_types() {
+        let schema = r#"{"type":"object","properties":{
+            "model":{"type":"string"},
+            "price":{"type":"number"},
+            "qty":{"type":"integer"},
+            "in_stock":{"type":"boolean"},
+            "colors":{"type":"array","items":{"type":"string"}},
+            "sizes":{"type":"array","items":{"type":"number"}},
+            "spec":{"type":"object","properties":{"weight":{"type":"number"}}}
+        }}"#;
+        let fields = entity_struct_fields(schema).unwrap();
+        let by_name = |n: &str| fields.iter().find(|f| f.name() == n).unwrap().clone();
+        assert_eq!(by_name("model").data_type(), &DataType::Utf8);
+        assert_eq!(by_name("price").data_type(), &DataType::Float64);
+        assert_eq!(by_name("qty").data_type(), &DataType::Int64);
+        assert_eq!(by_name("in_stock").data_type(), &DataType::Boolean);
+        assert_eq!(
+            by_name("colors").data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
+        // array of number: not the string-item fast path -> Utf8 fallback.
+        assert_eq!(by_name("sizes").data_type(), &DataType::Utf8);
+        let DataType::Struct(nested) = by_name("spec").data_type().clone() else {
+            panic!("expected nested struct");
+        };
+        assert_eq!(
+            nested
+                .iter()
+                .find(|f| f.name() == "weight")
+                .unwrap()
+                .data_type(),
+            &DataType::Float64
+        );
+    }
+
+    #[test]
+    fn entity_struct_fields_rejects_invalid_json() {
+        let err = entity_struct_fields("not json").unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "got: {err}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -823,13 +1145,67 @@ mod tests {
         let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(list.value(0).len(), 3);
 
-        // Each element is valid JSON containing the schema field "model".
+        // Each element is a struct with the schema field "model" populated.
         let elems = list.value(0);
-        let strs = elems.as_any().downcast_ref::<StringArray>().unwrap();
-        for i in 0..strs.len() {
-            let v: serde_json::Value = serde_json::from_str(strs.value(i)).unwrap();
+        let structs = elems.as_any().downcast_ref::<StructArray>().unwrap();
+        for i in 0..structs.len() {
+            let v = struct_row_to_json(structs, i);
             assert!(v.get("model").is_some());
         }
+    }
+
+    /// `array` (of string) and nested `object` schema fields, actually
+    /// populated end-to-end through `invoke_with_args` — `entity_struct_fields_
+    /// maps_schema_types` only checks the derived *type*, not that appending a
+    /// real value into the resulting `List<Utf8>` / nested `Struct` builder
+    /// works (this caught a real bug: `StructBuilder`'s inner list builder is
+    /// type-erased `Box<dyn ArrayBuilder>`, not concretely `StringBuilder`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn array_and_nested_object_fields_populate() {
+        struct ArrayAndNestedMock;
+        #[async_trait]
+        impl CompletionProvider for ArrayAndNestedMock {
+            async fn complete(
+                &self,
+                _req: CompletionRequest<'_>,
+            ) -> anyhow::Result<CompletionResponse> {
+                Ok(CompletionResponse {
+                    entities: vec![json!({
+                        "model": "TR71019",
+                        "colors": ["11", "13", "14"],
+                        "spec": {"weight": 12.5},
+                        "_confidence": 0.9,
+                    })],
+                })
+            }
+        }
+        let schema = r#"{"type":"object","properties":{
+            "model":{"type":"string"},
+            "colors":{"type":"array","items":{"type":"string"}},
+            "spec":{"type":"object","properties":{"weight":{"type":"number"}}}
+        }}"#;
+
+        let reg = Arc::new(LlmExtractRegistry::new(Arc::new(ArrayAndNestedMock), 0.75));
+        let udf = LlmExtractUDF::new(reg);
+        let text: StringArray = vec![Some("body")].into_iter().collect();
+        let img: StringArray = vec![None::<&str>].into_iter().collect();
+        let args = make_args(
+            vec![
+                ColumnarValue::Array(Arc::new(text)),
+                ColumnarValue::Array(Arc::new(img)),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(schema.to_string()))),
+            ],
+            1,
+        );
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(arr) = out else {
+            panic!()
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        let e = first_entity(list, 0);
+        assert_eq!(e["model"], "TR71019");
+        assert_eq!(e["colors"], json!(["11", "13", "14"]));
+        assert_eq!(e["spec"]["weight"], 12.5);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -947,10 +1323,45 @@ mod tests {
 
     use std::sync::Mutex;
 
+    /// Reconstruct a `serde_json::Value` object from one row of a `StructArray`
+    /// — lets existing assertions (`e["model"]`, `e["_status"]`, ...) work
+    /// unchanged against the new typed-struct representation.
+    fn struct_row_to_json(arr: &StructArray, row: usize) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        for (field, col) in arr.fields().iter().zip(arr.columns()) {
+            if col.is_null(row) {
+                continue;
+            }
+            let value = if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+                json!(a.value(row))
+            } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                json!(a.value(row))
+            } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                json!(a.value(row))
+            } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::BooleanArray>() {
+                json!(a.value(row))
+            } else if let Some(a) = col.as_any().downcast_ref::<ListArray>() {
+                let strs = a
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|s| (0..s.len()).map(|i| s.value(i).to_string()).collect())
+                    .unwrap_or_else(Vec::<String>::new);
+                json!(strs)
+            } else if let Some(a) = col.as_any().downcast_ref::<StructArray>() {
+                struct_row_to_json(a, row)
+            } else {
+                serde_json::Value::Null
+            };
+            obj.insert(field.name().clone(), value);
+        }
+        serde_json::Value::Object(obj)
+    }
+
     fn first_entity(list: &ListArray, row: usize) -> serde_json::Value {
         let elems = list.value(row);
-        let strs = elems.as_any().downcast_ref::<StringArray>().unwrap();
-        serde_json::from_str(strs.value(0)).unwrap()
+        let structs = elems.as_any().downcast_ref::<StructArray>().unwrap();
+        struct_row_to_json(structs, 0)
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,11 +1,12 @@
 # `llm_extract` — LLM structured-extraction scalar UDF
 
 `llm_extract` turns a column of unstructured text (with an optional image
-reference for multimodal escalation) into a list of structured JSON entities,
+reference for multimodal escalation) into a list of **typed struct** entities,
 extracted by a cheap LLM chat model and guided by a JSON Schema. It is
 source-agnostic: any pipeline that has text rows can call it and `UNNEST` the
-result into entity rows. There is **no** build dependency on the `documents`
-connector.
+result into entity rows, then project the schema's fields directly (no JSON
+parsing — `entity.model`, `entity.price`, ...). There is **no** build
+dependency on the `documents` connector.
 
 Extraction is an easy task, so the default providers are cheap OpenAI-compatible
 chat models (DeepSeek, GLM, Gemini, OpenAI). A native Anthropic provider is
@@ -23,7 +24,7 @@ llm-extract = ["skardi/llm-extract"]
 ## Signature
 
 ```sql
-llm_extract(text, image_ref, json_schema) -> List<Utf8>
+llm_extract(text, image_ref, json_schema) -> List<Struct<...schema fields, _confidence, _status, _error>>
 ```
 
 | arg | kind | meaning |
@@ -37,21 +38,48 @@ URLs and local file paths (optionally `file://`-prefixed) are accepted **only**
 when `LLM_EXTRACT_IMAGE_FETCH=1` is set — see the SSRF / path-traversal note
 under [Multimodal escalation](#️-image-fetching--ssrf--path-traversal).
 
-The return type is **always** `List<Utf8>` — a list of JSON entity strings. A
-scalar UDF's `return_type` only sees argument *types*, not the `json_schema`
-literal value, so it cannot synthesize a typed struct. Callers `UNNEST` the list
-and extract/cast fields downstream.
+The return type is **derived from the `json_schema` literal's value at plan
+time**, not just its type — the same mechanism DataFusion's own
+`arrow_cast(x, 'Int16')` uses (`ScalarUDFImpl::return_field_from_args`, which
+sees the actual literal argument, not just its `DataType`). Since `json_schema`
+is already required to be a string literal, `llm_extract` parses it once per
+query and returns `List<Struct<...>>` with one field per schema property, so
+`UNNEST` gives you typed columns directly — no downstream JSON parsing, no
+extra UDF needed.
+
+JSON-Schema-to-Arrow type mapping (deliberately scoped to the common
+flat-extraction case, not a general-purpose mapper):
+
+| JSON Schema `type` | Arrow type |
+|---|---|
+| `string` | `Utf8` |
+| `number` | `Float64` |
+| `integer` | `Int64` |
+| `boolean` | `Boolean` |
+| `array` of `string` items | `List<Utf8>` |
+| `array` of anything else | `Utf8` (the array's raw JSON text — not dropped, just not broken into a typed list) |
+| `object` | `Struct` of its own nested `properties`, recursively |
+| missing / unrecognized / union (`["string","null"]`) | `Utf8` |
+
+Field order in the resulting struct is **alphabetical by property name**, not
+the order written in the schema — `serde_json`'s default `Map` is a
+`BTreeMap` here. This only matters if you're projecting struct fields
+positionally rather than by name (don't; use `entity.field_name`).
 
 ## Output contract
 
-Each list element is a JSON object string containing the `json_schema`
-properties **plus** reserved keys:
+Each list element is a struct with one field per `json_schema` property
+**plus** reserved fields:
 
 | key | type | meaning |
 |-----|------|---------|
-| `_confidence` | number | model confidence 0–1 for this entity |
-| `_status` | string | `ok` \| `low_confidence` \| `error` |
-| `_error` | string | present only when `_status = "error"` |
+| `_confidence` | `Float64` | model confidence 0–1 for this entity |
+| `_status` | `Utf8` | `ok` \| `low_confidence` \| `error` |
+| `_error` | `Utf8`, nullable | present only when `_status = "error"` |
+
+A field the model didn't populate (or a whole entity in the `error` case) is
+simply `NULL` on that struct field — no sentinel values, no missing-key
+JSON lookups.
 
 Behavior per input row:
 
@@ -137,17 +165,23 @@ metadata endpoints (e.g. `169.254.169.254`) or intranet hosts, and a
 
 ## Composition examples
 
-Extract entities from a plain text column and expand them into rows:
+Extract entities from a plain text column, expand them into rows, and project
+typed fields directly — `UNNEST`'s result is a struct, so a wrapping query (a
+CTE here) lets you reference it by field name with `.`:
 
 ```sql
-SELECT UNNEST(
-  llm_extract(
-    t.body,
-    NULL,
-    '{"type":"object","properties":{"name":{"type":"string"},"price":{"type":"number"}}}'
-  )
-) AS entity
-FROM (SELECT 'Widget Pro costs $19.99.' AS body) t;
+WITH extracted AS (
+  SELECT UNNEST(
+    llm_extract(
+      t.body,
+      NULL,
+      '{"type":"object","properties":{"name":{"type":"string"},"price":{"type":"number"}}}'
+    )
+  ) AS entity
+  FROM (SELECT 'Widget Pro costs $19.99.' AS body) t
+)
+SELECT entity.name, entity.price, entity._confidence, entity._status
+FROM extracted;
 ```
 
 Over parsed documents (the `documents` connector is just one producer of text —
@@ -155,16 +189,20 @@ the coupling is purely SQL, not Rust), with multimodal escalation using a page
 image reference:
 
 ```sql
-SELECT UNNEST(llm_extract(page.markdown, page.image_uri, '{ ...schema... }'))
-FROM document_pages page;
+WITH extracted AS (
+  SELECT path, page, UNNEST(llm_extract(page.markdown, page.image_uri, '{ ...schema... }')) AS entity
+  FROM document_pages page
+)
+SELECT path, page, entity.model, entity.price
+FROM extracted;
 ```
 
 Over Feishu / Notion / a DB text field — identical shape, only the source
 table changes.
 
-Downstream, the JSON entity strings can be parsed (e.g. via a DataFusion JSON
-function, or by landing them in a Postgres `JSONB` column exposed as typed
-generated columns).
+The struct fields are ordinary typed Arrow columns from here on — write them
+to a job destination (Lance, Postgres, SQLite, ...) or query them directly,
+with no JSON parsing step anywhere in the pipeline.
 
 ## Testing
 
