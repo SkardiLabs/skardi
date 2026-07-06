@@ -1,3 +1,5 @@
+#[cfg(feature = "documents")]
+pub mod documents;
 pub mod iceberg;
 pub mod influxdb;
 pub mod knn_utils;

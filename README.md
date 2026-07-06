@@ -326,6 +326,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | Lance | Read (job-write) | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
 | S3 / GCS / Azure | Read | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
+| Documents | Read | PDF/Office/ODF/image → per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
 
 ---
 
