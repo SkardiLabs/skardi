@@ -124,8 +124,11 @@ is why job destinations stay out of scope. Memory stays bounded for
 
 ## Guardrails (what stays blocked)
 
-- `UPDATE` / `DELETE` remain unimplemented — DataFusion's default `TableProvider` error
-  covers it; InfluxDB 3 has no row-level update/delete.
+- `UPDATE` / `DELETE` remain unsupported — `WritableInfluxTable` overrides `delete_from`
+  and `update` to return explicit errors ("InfluxDB does not support UPDATE/DELETE — the
+  line-protocol write path is append-only"). DataFusion's default error is not used
+  because `FlightTable` reports `TableType::View`, which would produce the misleading
+  message "DELETE not supported for View table".
 - **Job destinations stay rejected.** The executor's `NonTransactionalDestination`
   rejection for InfluxDB is untouched; its comment gains a pointer noting SQL INSERT is the
   supported write path.
@@ -141,7 +144,8 @@ Follows the provider's existing three-tier pattern:
 - **Unit:** option validation (`read_write`+`query` rejection, `write_endpoint` handling,
   `tags` override); batch→line-protocol serialization — type mapping, null omission,
   all-null-fields error, tag/field/time classification from a synthetic Dictionary schema,
-  escaping-sensitive names (spaces, commas, quotes).
+  escaping-sensitive names (spaces, commas, quotes); explicit UPDATE/DELETE rejection
+  messages from `WritableInfluxTable`.
 - **Integration (`#[ignore]`, live InfluxDB 3 in CI):** register read-write,
   `INSERT INTO ... VALUES`, read back via Flight and assert rows + `count(*)` delta;
   INSERT omitting `time` gets a server-assigned timestamp; INSERT into a read-only source
