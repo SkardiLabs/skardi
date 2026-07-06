@@ -16,6 +16,7 @@ pub enum DataSourceType {
     Lance,
     Seekdb,
     Influxdb,
+    Documents,
 }
 
 impl DataSourceType {
@@ -32,6 +33,7 @@ impl DataSourceType {
             Self::Lance => "lance",
             Self::Seekdb => "seekdb",
             Self::Influxdb => "influxdb",
+            Self::Documents => "documents",
         }
     }
 }
@@ -39,5 +41,17 @@ impl DataSourceType {
 impl fmt::Display for DataSourceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn documents_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("documents").unwrap();
+        assert_eq!(t, DataSourceType::Documents);
+        assert_eq!(t.as_str(), "documents");
     }
 }

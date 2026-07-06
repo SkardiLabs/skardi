@@ -410,6 +410,7 @@ pub async fn get_data_sources(
             DataSourceType::Redis => "redis",
             DataSourceType::Seekdb => "seekdb",
             DataSourceType::Influxdb => "influxdb",
+            DataSourceType::Documents => "documents",
         };
 
         // Determine path or URL based on source type
@@ -418,7 +419,8 @@ pub async fn get_data_sources(
             | DataSourceType::Parquet
             | DataSourceType::Lance
             | DataSourceType::Sqlite
-            | DataSourceType::Iceberg => Some(data_source.path.to_string_lossy().to_string()),
+            | DataSourceType::Iceberg
+            | DataSourceType::Documents => Some(data_source.path.to_string_lossy().to_string()),
             DataSourceType::Postgres
             | DataSourceType::Mysql
             | DataSourceType::Mongo

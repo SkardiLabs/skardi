@@ -22,6 +22,8 @@ gguf = ["skardi/gguf"]
 chunking = ["skardi/chunking"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
+# documents source connector (mirrors skardi/documents).
+documents = ["skardi/documents"]
 
 [dependencies]
 better-auth = { workspace = true }
