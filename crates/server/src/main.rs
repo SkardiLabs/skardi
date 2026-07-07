@@ -18,10 +18,15 @@ async fn main() -> Result<()> {
     };
 
     // Initialize tracing subscriber: fmt to stdout, plus OTel layer when enabled.
+    // aws_config logs the AWS access key id in plaintext at INFO when resolving
+    // credentials, so cap it at WARN unless RUST_LOG explicitly opts in.
+    let mut env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("aws_config")) {
+        env_filter = env_filter.add_directive("aws_config=warn".parse().expect("valid directive"));
+    }
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
