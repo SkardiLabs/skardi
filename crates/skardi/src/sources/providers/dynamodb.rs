@@ -1923,6 +1923,7 @@ fn parse_columns_option(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{BinaryExpr, col, lit};
 
@@ -2288,6 +2289,375 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("'table'"));
         });
+    }
+
+    // ─── Schema shaping (build_schema_fields) ───────────────────────────────
+
+    #[test]
+    fn schema_fields_put_keys_first_and_nullable_rest() {
+        // Attributes are given out of order and include the keys; the builder must
+        // emit partition key, then sort key (both non-nullable), then the rest in
+        // declared order (nullable), deduping any attribute that repeats a key.
+        let attrs = vec![
+            ("name".to_string(), DataType::Utf8),
+            ("sk".to_string(), DataType::Int64),
+            ("price".to_string(), DataType::Float64),
+            ("pk".to_string(), DataType::Utf8),
+        ];
+        let schema = build_schema_fields("pk", Some("sk"), &attrs);
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["pk", "sk", "name", "price"]);
+        assert!(!schema.field(0).is_nullable(), "partition key non-nullable");
+        assert!(!schema.field(1).is_nullable(), "sort key non-nullable");
+        assert!(schema.field(2).is_nullable(), "non-key column nullable");
+        // The sort key's declared type is honored even though it came from attrs.
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn schema_fields_default_key_type_is_utf8_when_unsampled() {
+        // A key never seen among the sampled attributes falls back to Utf8 rather
+        // than being dropped (an empty table still needs its key columns).
+        let schema = build_schema_fields("pk", None, &[]);
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "pk");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    }
+
+    // ─── Item ⇄ RecordBatch conversion ──────────────────────────────────────
+
+    #[test]
+    fn items_to_batch_fills_missing_attributes_with_null() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        // Second item omits `price` entirely — it must become a NULL cell, not a
+        // dropped row or a shifted column.
+        let items = vec![
+            HashMap::from([
+                ("id".to_string(), AttributeValue::S("A".into())),
+                ("price".to_string(), n("9.5")),
+            ]),
+            HashMap::from([("id".to_string(), AttributeValue::S("B".into()))]),
+        ];
+        let batch = items_to_batch(items, &schema).expect("batch");
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let prices = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), "A");
+        assert_eq!(ids.value(1), "B");
+        assert_eq!(prices.value(0), 9.5);
+        assert!(prices.is_null(1), "missing attribute reads as NULL");
+    }
+
+    #[test]
+    fn record_batch_to_items_round_trips_and_omits_nulls() {
+        // A batch with a NULL cell must produce an item that simply lacks that
+        // attribute (DynamoDB has no typed NULL columns), while typed cells map
+        // back to the matching AttributeValue variant.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("qty", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]);
+        let ids: StringArray = vec![Some("A"), Some("B")].into_iter().collect();
+        let qty: Int64Array = vec![Some(7i64), None].into_iter().collect();
+        let active: BooleanArray = vec![Some(true), Some(false)].into_iter().collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(ids), Arc::new(qty), Arc::new(active)],
+        )
+        .unwrap();
+
+        let items = record_batch_to_items(&batch, &schema).expect("items");
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0].get("id"), Some(AttributeValue::S(s)) if s == "A"));
+        assert!(matches!(items[0].get("qty"), Some(AttributeValue::N(n)) if n == "7"));
+        assert!(matches!(items[0].get("active"), Some(AttributeValue::Bool(true))));
+        // Row 1 had a NULL qty → the attribute is absent, not a typed NULL.
+        assert!(
+            !items[1].contains_key("qty"),
+            "NULL cell omits the attribute"
+        );
+        assert!(matches!(items[1].get("active"), Some(AttributeValue::Bool(false))));
+    }
+
+    #[test]
+    fn arrow_array_builders_cover_numeric_and_bool_types() {
+        // Only the Utf8 path was covered before; exercise the Int64/Float64/Boolean
+        // arms (including a NULL passthrough) so a regression in any is caught.
+        let int_vals = vec![Some(n("3")), None];
+        let arr = attribute_values_to_arrow_array(&int_vals, &DataType::Int64);
+        let ints = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 3);
+        assert!(ints.is_null(1));
+
+        let bool_vals = vec![Some(AttributeValue::Bool(true)), Some(n("1"))];
+        let arr = attribute_values_to_arrow_array(&bool_vals, &DataType::Boolean);
+        let bools = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(bools.value(0));
+        // A non-bool attribute in a Boolean column coerces to NULL, never `true`.
+        assert!(bools.is_null(1), "non-bool attribute is NULL in a Boolean column");
+    }
+
+    #[test]
+    fn av_to_string_formats_scalar_variants() {
+        assert_eq!(av_to_string(&AttributeValue::S("hi".into())), "hi");
+        assert_eq!(av_to_string(&n("9.99")), "9.99");
+        assert_eq!(av_to_string(&AttributeValue::Bool(true)), "true");
+        assert_eq!(av_to_string(&AttributeValue::Null(true)), "");
+    }
+
+    // ─── Projection / key-condition expression builders ─────────────────────
+
+    #[test]
+    fn projection_expression_names_every_field() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, true),
+        ]);
+        let (expr, names) = build_projection_expression(&schema);
+        // Uses the #p namespace so it can share a request with #n/#k/:v bindings.
+        assert_eq!(expr, "#p0, #p1");
+        assert_eq!(names.len(), 2);
+        assert_eq!(names.get("#p0").map(String::as_str), Some("id"));
+        assert_eq!(names.get("#p1").map(String::as_str), Some("price"));
+    }
+
+    #[test]
+    fn key_condition_uses_k_namespace_and_folds_sort_cond() {
+        // Partition-only.
+        let f = build_key_condition("pk", AttributeValue::S("A".into()), "sk", None);
+        assert_eq!(f.expression, "#k0 = :k0");
+        assert_eq!(f.names.get("#k0").map(String::as_str), Some("pk"));
+        assert!(f.values.contains_key(":k0"));
+
+        // Partition + sort range → second clause on the #k1/:k1 pair.
+        let f = build_key_condition(
+            "pk",
+            AttributeValue::S("A".into()),
+            "sk",
+            Some((Operator::Gt, n("5"))),
+        );
+        assert_eq!(f.expression, "#k0 = :k0 AND #k1 > :k1");
+        assert_eq!(f.names.get("#k1").map(String::as_str), Some("sk"));
+        assert!(f.values.contains_key(":k1"));
+    }
+
+    // ─── Operator / normalization helpers ───────────────────────────────────
+
+    #[test]
+    fn normalize_binary_flips_left_literal_and_rejects_unusable() {
+        // `5 < price` normalizes to `(price, >, 5)` with the column on the left.
+        let expr = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(lit(5i64)),
+            Operator::Lt,
+            Box::new(col("price")),
+        ));
+        let (col_name, op, _) = normalize_binary(&expr).expect("normalizable");
+        assert_eq!(col_name, "price");
+        assert_eq!(op, Operator::Gt);
+
+        // Column-to-column has no literal → None.
+        assert!(normalize_binary(&col("a").eq(col("b"))).is_none());
+        // Pushable-shaped but with an inconvertible literal → None (not a panic).
+        let ts = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("a")),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(0), None),
+                None,
+            )),
+        ));
+        assert!(normalize_binary(&ts).is_none());
+    }
+
+    #[test]
+    fn flip_operator_is_a_mirror() {
+        assert_eq!(flip_operator(Operator::Lt), Operator::Gt);
+        assert_eq!(flip_operator(Operator::LtEq), Operator::GtEq);
+        assert_eq!(flip_operator(Operator::Gt), Operator::Lt);
+        assert_eq!(flip_operator(Operator::GtEq), Operator::LtEq);
+        // Symmetric comparisons are unchanged.
+        assert_eq!(flip_operator(Operator::Eq), Operator::Eq);
+        assert_eq!(flip_operator(Operator::NotEq), Operator::NotEq);
+    }
+
+    #[test]
+    fn is_key_condition_op_excludes_not_eq() {
+        // `<>` is a legal filter but illegal in a KeyConditionExpression.
+        assert!(is_key_condition_op(Operator::Eq));
+        assert!(is_key_condition_op(Operator::Gt));
+        assert!(is_key_condition_op(Operator::LtEq));
+        assert!(!is_key_condition_op(Operator::NotEq));
+    }
+
+    #[test]
+    fn operator_symbol_rejects_non_comparison() {
+        assert_eq!(operator_symbol(Operator::Eq).unwrap(), "=");
+        assert_eq!(operator_symbol(Operator::NotEq).unwrap(), "<>");
+        // A logical connective is not a DynamoDB comparison operator.
+        assert!(operator_symbol(Operator::And).is_err());
+    }
+
+    // ─── Value / count builders ─────────────────────────────────────────────
+
+    #[test]
+    fn expr_to_attribute_value_rejects_non_literal() {
+        // A bare column reference is not a value.
+        assert!(expr_to_attribute_value(&col("x")).is_err());
+        assert!(matches!(
+            expr_to_attribute_value(&lit(3.5f64)).unwrap(),
+            AttributeValue::N(s) if s == "3.5"
+        ));
+    }
+
+    #[test]
+    fn scalar_to_attribute_value_maps_float_and_null() {
+        assert!(matches!(
+            scalar_to_attribute_value(&ScalarValue::Float64(Some(1.5))).unwrap(),
+            AttributeValue::N(s) if s == "1.5"
+        ));
+        assert!(matches!(
+            scalar_to_attribute_value(&ScalarValue::Null).unwrap(),
+            AttributeValue::Null(true)
+        ));
+    }
+
+    #[test]
+    fn count_batch_is_single_uint64_row() {
+        let batch = count_batch(42).expect("count batch");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.schema().field(0).name(), "count");
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::UInt64);
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 42);
+    }
+
+    #[test]
+    fn parse_columns_option_accepts_int_and_bool_aliases() {
+        let schema = parse_columns_option("qty:integer, active:boolean", "id", None)
+            .expect("valid columns");
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
+    }
+
+    // ─── Key extraction / projection (provider methods) ─────────────────────
+
+    /// Build a provider with an explicit schema (no DynamoDB round-trip needed).
+    async fn test_provider(
+        partition_key: &str,
+        sort_key: Option<&str>,
+        read_write: bool,
+    ) -> DynamoTableProvider {
+        let mut fields = vec![Field::new(partition_key, DataType::Utf8, false)];
+        if let Some(sk) = sort_key {
+            fields.push(Field::new(sk, DataType::Utf8, false));
+        }
+        fields.push(Field::new("name", DataType::Utf8, true));
+        let schema = Arc::new(Schema::new(fields));
+        let mut opts = HashMap::new();
+        opts.insert("region".to_string(), "us-east-1".to_string());
+        let client = build_client("http://localhost:8000", "us-east-1", &opts)
+            .await
+            .expect("client");
+        DynamoTableProvider::new(
+            client,
+            "t",
+            partition_key,
+            sort_key,
+            Some(schema),
+            read_write,
+        )
+        .await
+        .expect("provider")
+    }
+
+    #[tokio::test]
+    async fn key_of_extracts_full_composite_key_and_drops_non_key_attrs() {
+        let handle = test_provider("pk", Some("sk"), false).await.clone_handle();
+        let item = HashMap::from([
+            ("pk".to_string(), AttributeValue::S("A".into())),
+            ("sk".to_string(), AttributeValue::S("B".into())),
+            ("name".to_string(), AttributeValue::S("ignored".into())),
+        ]);
+        let key = handle.key_of(&item).expect("key");
+        assert_eq!(key.len(), 2, "only the two key attributes are kept");
+        assert!(key.contains_key("pk") && key.contains_key("sk"));
+    }
+
+    #[tokio::test]
+    async fn key_of_errors_when_sort_key_missing() {
+        let handle = test_provider("pk", Some("sk"), false).await.clone_handle();
+        // Composite-key table but the item lacks the sort key.
+        let item = HashMap::from([("pk".to_string(), AttributeValue::S("A".into()))]);
+        let err = handle.key_of(&item).expect_err("missing sort key must error");
+        assert!(err.to_string().contains("sort key"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn key_projection_covers_partition_and_sort() {
+        let single = test_provider("pk", None, false).await.clone_handle();
+        let (expr, names) = single.key_projection();
+        assert_eq!(expr, "#p0");
+        assert_eq!(names.get("#p0").map(String::as_str), Some("pk"));
+
+        let composite = test_provider("pk", Some("sk"), false).await.clone_handle();
+        let (expr, names) = composite.key_projection();
+        assert_eq!(expr, "#p0, #p1");
+        assert_eq!(names.get("#p1").map(String::as_str), Some("sk"));
+    }
+
+    // ─── Plan-time write guards (no network) ────────────────────────────────
+
+    async fn register_provider(provider: DynamoTableProvider) -> SessionContext {
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register");
+        ctx
+    }
+
+    #[tokio::test]
+    async fn read_only_source_rejects_delete_at_plan_time() {
+        // access_mode enforcement: a read-only source must block DML before any
+        // request reaches DynamoDB.
+        let ctx = register_provider(test_provider("id", None, false).await).await;
+        let err = ctx
+            .sql("DELETE FROM t WHERE id = 'A'")
+            .await
+            .expect("logical plan")
+            .collect()
+            .await
+            .expect_err("read-only DELETE must be rejected");
+        assert!(err.to_string().contains("read_only"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn update_of_key_column_is_rejected_at_plan_time() {
+        // DynamoDB key attributes are immutable; the guard must fire during
+        // planning rather than issuing an UpdateItem that would fail server-side.
+        let ctx = register_provider(test_provider("id", None, true).await).await;
+        let err = ctx
+            .sql("UPDATE t SET id = 'Z' WHERE id = 'A'")
+            .await
+            .expect("logical plan")
+            .collect()
+            .await
+            .expect_err("updating the key column must be rejected");
+        assert!(err.to_string().contains("immutable"), "got: {err}");
     }
 
     // ─── Integration tests (require DynamoDB Local) ─────────────────────────
