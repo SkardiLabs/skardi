@@ -254,7 +254,7 @@ for agent handling:
 | `missing_parameters` | One or more `{placeholders}` not bound |
 | `unsupported_parameter` | Bound value is an array / object |
 | `destination_missing` | DB table doesn't exist; or lake + `create_if_missing: false` |
-| `non_transactional_destination` | Destination source type is Redis / MongoDB / SeekDB — rejected because its write path cannot guarantee atomicity |
+| `non_transactional_destination` | Destination source type is Redis / MongoDB / SeekDB / InfluxDB / DynamoDB — rejected because its write path cannot guarantee atomicity |
 | `schema_mismatch` | Column diff — `details.diff` carries a human-readable string |
 | `sql_plan_failure` | DataFusion rejected the rendered SQL |
 
