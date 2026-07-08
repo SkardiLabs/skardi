@@ -1291,6 +1291,7 @@ async fn register_data_source(
                 &source.name,
                 connection_string,
                 source.options.as_ref(),
+                source.access_mode.is_read_write(),
             )
             .await
             .map_err(|e| {

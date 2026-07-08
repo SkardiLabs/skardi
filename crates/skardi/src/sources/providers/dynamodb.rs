@@ -11,7 +11,7 @@
 //! provider).
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
@@ -24,7 +24,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::config::{Credentials, Region};
-use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
+use aws_sdk_dynamodb::types::{
+    AttributeValue, DeleteRequest, KeyType, PutRequest, Select, WriteRequest,
+};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -37,7 +39,18 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use tokio::sync::RwLock;
+use futures::StreamExt;
+use futures::stream::{self, Stream};
+
+use super::is_pushable_binary_filter;
+
+/// Maximum items sampled to infer a schema when no explicit `columns` option is
+/// given. Merging several items (rather than one) makes the inferred column set
+/// deterministic and complete enough for most tables.
+const SCHEMA_SAMPLE_SIZE: i32 = 50;
+
+/// DynamoDB `BatchWriteItem` accepts at most 25 write requests per call.
+const BATCH_WRITE_CHUNK: usize = 25;
 
 /// A DynamoDB table exposed to DataFusion as a `TableProvider`.
 pub struct DynamoTableProvider {
@@ -48,6 +61,9 @@ pub struct DynamoTableProvider {
     partition_key: String,
     /// Sort (range) key attribute name, if the table has a composite key.
     sort_key: Option<String>,
+    /// When false, INSERT/UPDATE/DELETE are rejected at plan time so a
+    /// `read_only` source can never mutate a live table.
+    read_write: bool,
 }
 
 impl Debug for DynamoTableProvider {
@@ -56,6 +72,7 @@ impl Debug for DynamoTableProvider {
             .field("table_name", &self.table_name)
             .field("partition_key", &self.partition_key)
             .field("sort_key", &self.sort_key)
+            .field("read_write", &self.read_write)
             .field("schema", &self.schema)
             .finish()
     }
@@ -63,13 +80,15 @@ impl Debug for DynamoTableProvider {
 
 impl DynamoTableProvider {
     /// Build a provider against an existing DynamoDB table, inferring the schema
-    /// from a sampled item unless one is supplied.
+    /// from sampled items unless one is supplied. `read_write` gates the DML
+    /// methods; a read-only provider rejects INSERT/UPDATE/DELETE at plan time.
     pub async fn new(
         client: Client,
         table_name: &str,
         partition_key: &str,
         sort_key: Option<&str>,
         schema: Option<SchemaRef>,
+        read_write: bool,
     ) -> Result<Self> {
         let schema = match schema {
             Some(s) => s,
@@ -84,14 +103,15 @@ impl DynamoTableProvider {
             schema,
             partition_key: partition_key.to_string(),
             sort_key: sort_key.map(str::to_string),
+            read_write,
         })
     }
 
-    /// Infer an Arrow schema by sampling a single item from the table. The
-    /// partition key (then the sort key, if any) are always emitted first and
-    /// non-nullable; remaining attributes are inferred from the sample and
-    /// marked nullable, since DynamoDB items are schemaless and any attribute
-    /// may be absent on other items.
+    /// Infer an Arrow schema by sampling several items and merging their
+    /// attribute sets. The partition key (then the sort key, if any) are always
+    /// emitted first and non-nullable; remaining attributes are inferred from
+    /// the samples and marked nullable, since DynamoDB items are schemaless and
+    /// any attribute may be absent on other items.
     async fn infer_schema(
         client: &Client,
         table_name: &str,
@@ -101,198 +121,104 @@ impl DynamoTableProvider {
         let sample = client
             .scan()
             .table_name(table_name)
-            .limit(1)
+            .limit(SCHEMA_SAMPLE_SIZE)
             .send()
             .await
             .with_context(|| format!("Failed to sample DynamoDB table '{table_name}'"))?;
 
-        let item = sample.items().first();
-
-        let mut fields: Vec<Field> = Vec::new();
-        let mut seen: Vec<&str> = Vec::new();
-
-        // Key attributes first, in key order, non-nullable.
-        let pk_type = item
-            .and_then(|i| i.get(partition_key))
-            .map(attribute_value_to_arrow_type)
-            .unwrap_or(DataType::Utf8);
-        fields.push(Field::new(partition_key, pk_type, false));
-        seen.push(partition_key);
-
-        if let Some(sk) = sort_key {
-            let sk_type = item
-                .and_then(|i| i.get(sk))
-                .map(attribute_value_to_arrow_type)
-                .unwrap_or(DataType::Utf8);
-            fields.push(Field::new(sk, sk_type, false));
-            seen.push(sk);
-        }
-
-        if let Some(item) = item {
-            for (key, value) in item.iter() {
-                if seen.contains(&key.as_str()) {
-                    continue;
-                }
-                fields.push(Field::new(key, attribute_value_to_arrow_type(value), true));
-            }
-        } else {
+        let items = sample.items();
+        if items.is_empty() {
             tracing::warn!(
                 table = %table_name,
                 "DynamoDB table is empty; schema limited to declared key attributes"
             );
         }
 
-        Ok(Schema::new(fields))
-    }
-
-    /// Run a (optionally filtered) `Scan`, paginating until the table is
-    /// exhausted, and return every matching item.
-    async fn scan_items(
-        &self,
-        filter: Option<&DynamoFilter>,
-        limit: Option<usize>,
-    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
-        let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
-        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
-
-        loop {
-            let mut req = self.client.scan().table_name(&self.table_name);
-            if let Some(f) = filter {
-                req = req
-                    .filter_expression(&f.expression)
-                    .set_expression_attribute_names(Some(f.names.clone()))
-                    .set_expression_attribute_values(Some(f.values.clone()));
-            }
-            if let Some(sk) = &start_key {
-                req = req.set_exclusive_start_key(Some(sk.clone()));
-            }
-
-            let out = req
-                .send()
-                .await
-                .with_context(|| format!("DynamoDB scan failed for '{}'", self.table_name))?;
-
-            items.extend(out.items().iter().cloned());
-
-            if matches!(limit, Some(n) if items.len() >= n) {
-                if let Some(n) = limit {
-                    items.truncate(n);
+        // Merge attributes across the sampled items; first observation of an
+        // attribute fixes its type. Ordering is stable across environments
+        // because it follows first-seen order over a fixed-size sample.
+        let mut attrs: Vec<(String, DataType)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in items {
+            for (key, value) in item.iter() {
+                if seen.insert(key.clone()) {
+                    attrs.push((key.clone(), attribute_value_to_arrow_type(value)));
                 }
-                break;
-            }
-
-            match out.last_evaluated_key() {
-                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
-                _ => break,
             }
         }
 
-        Ok(items)
-    }
-
-    /// Fetch a single item by its full primary key (`GetItem`). Returns an empty
-    /// vec when no item matches, else a one-element vec.
-    async fn get_item_one(
-        &self,
-        key: HashMap<String, AttributeValue>,
-    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
-        let out = self
-            .client
-            .get_item()
-            .table_name(&self.table_name)
-            .set_key(Some(key))
-            .send()
-            .await
-            .with_context(|| format!("DynamoDB get_item failed for '{}'", self.table_name))?;
-        Ok(out.item().cloned().into_iter().collect())
-    }
-
-    /// Run a `Query` against the key schema, paginating until exhausted (or
-    /// `limit` is reached), and return every matching item.
-    async fn query_items(
-        &self,
-        key_condition: &DynamoFilter,
-        limit: Option<usize>,
-    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
-        let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
-        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
-
-        loop {
-            let mut req = self
-                .client
-                .query()
-                .table_name(&self.table_name)
-                .key_condition_expression(&key_condition.expression)
-                .set_expression_attribute_names(Some(key_condition.names.clone()))
-                .set_expression_attribute_values(Some(key_condition.values.clone()));
-            if let Some(sk) = &start_key {
-                req = req.set_exclusive_start_key(Some(sk.clone()));
-            }
-
-            let out = req
-                .send()
-                .await
-                .with_context(|| format!("DynamoDB query failed for '{}'", self.table_name))?;
-
-            items.extend(out.items().iter().cloned());
-
-            if matches!(limit, Some(n) if items.len() >= n) {
-                if let Some(n) = limit {
-                    items.truncate(n);
-                }
-                break;
-            }
-
-            match out.last_evaluated_key() {
-                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
-                _ => break,
-            }
-        }
-
-        Ok(items)
+        Ok(build_schema_fields(partition_key, sort_key, &attrs))
     }
 
     /// Pick the cheapest physical read strategy the pushable predicates allow.
     fn plan_read(&self, pushable: &[Expr]) -> DFResult<DynamoRead> {
         classify_read(&self.partition_key, self.sort_key.as_deref(), pushable)
     }
+}
 
-    /// Convert scanned DynamoDB items into a single Arrow `RecordBatch` shaped
-    /// by this provider's schema. Missing attributes become NULLs.
-    fn items_to_record_batch(
-        &self,
-        items: Vec<HashMap<String, AttributeValue>>,
-    ) -> Result<RecordBatch> {
-        let mut columns: HashMap<String, Vec<Option<AttributeValue>>> = HashMap::new();
-        for field in self.schema.fields() {
-            columns.insert(field.name().clone(), Vec::with_capacity(items.len()));
-        }
-
-        for item in &items {
-            for field in self.schema.fields() {
-                let value = item.get(field.name()).cloned();
-                columns
-                    .get_mut(field.name())
-                    .expect("column inserted for every schema field above")
-                    .push(value);
-            }
-        }
-
-        let arrays: Vec<ArrayRef> = self
-            .schema
-            .fields()
+/// Build an ordered field list: key attributes first (non-nullable, in key
+/// order), then every other attribute (nullable). Shared by schema inference
+/// and the explicit `columns` option so both produce identical shapes.
+fn build_schema_fields(
+    partition_key: &str,
+    sort_key: Option<&str>,
+    attrs: &[(String, DataType)],
+) -> Schema {
+    let type_of = |name: &str| {
+        attrs
             .iter()
-            .map(|field| {
-                let values = columns
-                    .get(field.name())
-                    .expect("column inserted for every schema field above");
-                attribute_values_to_arrow_array(values, field.data_type())
-            })
-            .collect();
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+            .unwrap_or(DataType::Utf8)
+    };
 
-        RecordBatch::try_new(self.schema.clone(), arrays)
-            .with_context(|| "Failed to build RecordBatch from DynamoDB items")
+    let mut fields: Vec<Field> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    fields.push(Field::new(partition_key, type_of(partition_key), false));
+    seen.insert(partition_key);
+    if let Some(sk) = sort_key {
+        fields.push(Field::new(sk, type_of(sk), false));
+        seen.insert(sk);
     }
+    for (name, dtype) in attrs {
+        if seen.insert(name.as_str()) {
+            fields.push(Field::new(name, dtype.clone(), true));
+        }
+    }
+    Schema::new(fields)
+}
+
+/// Convert a page of DynamoDB items into an Arrow `RecordBatch` shaped by
+/// `schema`. Consumes the items (attribute values are moved, not cloned) and
+/// fills missing attributes with NULL.
+fn items_to_batch(
+    items: Vec<HashMap<String, AttributeValue>>,
+    schema: &SchemaRef,
+) -> DFResult<RecordBatch> {
+    let n_rows = items.len();
+    let mut columns: Vec<Vec<Option<AttributeValue>>> = schema
+        .fields()
+        .iter()
+        .map(|_| Vec::with_capacity(n_rows))
+        .collect();
+
+    for mut item in items {
+        for (idx, field) in schema.fields().iter().enumerate() {
+            columns[idx].push(item.remove(field.name()));
+        }
+    }
+
+    let arrays: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .zip(columns.iter())
+        .map(|(field, values)| attribute_values_to_arrow_array(values, field.data_type()))
+        .collect();
+
+    let options = RecordBatchOptions::new().with_row_count(Some(n_rows));
+    RecordBatch::try_new_with_options(schema.clone(), arrays, &options)
+        .map_err(DataFusionError::from)
 }
 
 #[async_trait]
@@ -335,70 +261,48 @@ impl TableProvider for DynamoTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Only push filters we can actually convert. A pushable-shaped predicate
+        // with an inconvertible literal (e.g. a Timestamp) is skipped rather than
+        // failing the whole query — safe because pushdown is Inexact, so
+        // DataFusion re-applies every predicate after the fetch.
         let pushable: Vec<Expr> = filters
             .iter()
-            .filter(|e| is_pushable_binary_filter(e))
+            .filter(|e| is_convertible_pushdown(e))
             .cloned()
             .collect();
+        let read = self.plan_read(&pushable)?;
 
-        // Route to the cheapest physical access pattern the predicates allow:
-        // GetItem when the full primary key is pinned, Query when the partition
-        // key is, else a full Scan. Filters stay Inexact, so DataFusion
-        // re-applies every predicate after the fetch — a misroute can only cost
-        // a fallback, never a wrong row.
-        let items = match self.plan_read(&pushable)? {
-            DynamoRead::GetItem { key } => {
-                tracing::debug!(table = %self.table_name, "DynamoDB read via GetItem (full key)");
-                self.get_item_one(key).await
+        // Empty projection (e.g. `count(*)`) means nothing above the scan
+        // references any column — including filters, so there are none — and we
+        // can read counts server-side. A non-empty projection is fetched with a
+        // ProjectionExpression so only those attributes cross the wire.
+        let (output_schema, projection_expr, count_only) = match projection {
+            Some(p) if p.is_empty() => (Arc::new(self.schema.project(&[])?), None, true),
+            Some(p) => {
+                let ps = Arc::new(self.schema.project(p)?);
+                let pe = build_projection_expression(&ps);
+                (ps, Some(pe), false)
             }
-            DynamoRead::Query { key_condition } => {
-                tracing::debug!(
-                    table = %self.table_name,
-                    key_condition = %key_condition.expression,
-                    "DynamoDB read via Query (partition key)"
-                );
-                self.query_items(&key_condition, limit).await
+            None => {
+                let pe = build_projection_expression(&self.schema);
+                (self.schema.clone(), Some(pe), false)
             }
-            DynamoRead::Scan { filter } => {
-                tracing::debug!(
-                    table = %self.table_name,
-                    filtered = filter.is_some(),
-                    "DynamoDB read via Scan (no key constraint)"
-                );
-                self.scan_items(filter.as_ref(), limit).await
-            }
-        }
-        .map_err(|e| DataFusionError::External(e.into()))?;
-
-        let batch = self
-            .items_to_record_batch(items)
-            .map_err(|e| DataFusionError::External(e.into()))?;
-
-        let batch = if let Some(proj) = projection {
-            let projected_schema = Arc::new(self.schema.project(proj)?);
-            let columns: Vec<ArrayRef> = proj.iter().map(|&i| batch.column(i).clone()).collect();
-            if proj.is_empty() {
-                // Empty projection (e.g. `count(*)`) needs the row count passed
-                // explicitly or RecordBatch::try_new rejects the zero-column batch.
-                let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                RecordBatch::try_new_with_options(projected_schema, columns, &options)?
-            } else {
-                RecordBatch::try_new(projected_schema, columns)?
-            }
-        } else {
-            batch
         };
 
-        let schema = batch.schema();
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
+            EmissionType::Incremental,
             Boundedness::Bounded,
         );
         Ok(Arc::new(DynamoScanExec {
-            schema,
-            batch: Arc::new(RwLock::new(Some(batch))),
+            client: self.client.clone(),
+            table_name: self.table_name.clone(),
+            output_schema,
+            read,
+            projection_expr,
+            count_only,
+            limit,
             properties,
         }))
     }
@@ -407,13 +311,23 @@ impl TableProvider for DynamoTableProvider {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _insert_op: datafusion::logical_expr::dml::InsertOp,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !self.read_write {
+            return Err(read_only_error("INSERT", &self.table_name));
+        }
+        use datafusion::logical_expr::dml::InsertOp;
+        // Plain INSERT (Append) must not clobber an existing item — DynamoDB
+        // PutItem is an upsert, so a duplicate key would silently replace the
+        // whole item. Overwrite/Replace opt into upsert semantics.
+        let upsert = matches!(insert_op, InsertOp::Overwrite | InsertOp::Replace);
         Ok(Arc::new(DynamoInsertExec {
             input,
             client: self.client.clone(),
             table_name: self.table_name.clone(),
             schema: self.schema.clone(),
+            partition_key: self.partition_key.clone(),
+            upsert,
         }))
     }
 
@@ -422,15 +336,13 @@ impl TableProvider for DynamoTableProvider {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let pushable: Vec<Expr> = filters
-            .iter()
-            .filter(|e| is_pushable_binary_filter(e))
-            .cloned()
-            .collect();
-        let filter = build_filter_expression(&pushable)?;
+        if !self.read_write {
+            return Err(read_only_error("DELETE", &self.table_name));
+        }
+        let plan = self.plan_dml(&filters)?;
         Ok(Arc::new(DynamoDmlExec::new(
             self.clone_handle(),
-            DynamoDmlOp::Delete { filter },
+            DynamoDmlOp::Delete { plan },
         )))
     }
 
@@ -440,6 +352,9 @@ impl TableProvider for DynamoTableProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !self.read_write {
+            return Err(read_only_error("UPDATE", &self.table_name));
+        }
         if assignments.is_empty() {
             return Err(DataFusionError::Plan(
                 "UPDATE requires at least one assignment".to_string(),
@@ -455,16 +370,10 @@ impl TableProvider for DynamoTableProvider {
             sets.push((col.clone(), expr_to_attribute_value(expr)?));
         }
 
-        let pushable: Vec<Expr> = filters
-            .iter()
-            .filter(|e| is_pushable_binary_filter(e))
-            .cloned()
-            .collect();
-        let filter = build_filter_expression(&pushable)?;
-
+        let plan = self.plan_dml(&filters)?;
         Ok(Arc::new(DynamoDmlExec::new(
             self.clone_handle(),
-            DynamoDmlOp::Update { filter, sets },
+            DynamoDmlOp::Update { plan, sets },
         )))
     }
 }
@@ -480,6 +389,33 @@ impl DynamoTableProvider {
             sort_key: self.sort_key.clone(),
         }
     }
+
+    /// Plan a DELETE/UPDATE against the key schema.
+    ///
+    /// DynamoDB cannot mutate by arbitrary predicate, so we first resolve the
+    /// matching keys. Every WHERE predicate must be a convertible pushable
+    /// comparison: otherwise the residual predicate could not be applied
+    /// server-side and we would mutate rows it should have excluded. We refuse
+    /// rather than silently over-delete (`DELETE WHERE a = 1 OR b = 2` must not
+    /// wipe the table).
+    fn plan_dml(&self, filters: &[Expr]) -> DFResult<DmlKeyPlan> {
+        if let Some(bad) = filters.iter().find(|e| !is_convertible_pushdown(e)) {
+            return Err(DataFusionError::Plan(format!(
+                "DynamoDB DELETE/UPDATE requires every WHERE predicate to be a pushable comparison \
+                 (a column compared to a literal via =, <>, <, <=, >, >=). Unsupported predicate: {bad}. \
+                 Refusing to run to avoid mutating rows the predicate should have excluded."
+            )));
+        }
+        classify_dml(&self.partition_key, self.sort_key.as_deref(), filters)
+    }
+}
+
+/// Error returned when a write is attempted against a read-only source.
+fn read_only_error(op: &str, table: &str) -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "{op} not allowed on DynamoDB table '{table}': the data source is configured read_only. \
+         Set access_mode: read_write to enable write operations."
+    ))
 }
 
 /// Connection handle plus key metadata shared with DML execution plans.
@@ -511,58 +447,118 @@ impl DynamoHandle {
         Ok(key)
     }
 
-    /// Scan keys of items matching `filter` (used to drive key-based DML).
+    /// A `ProjectionExpression` (plus its name bindings) that fetches only the
+    /// key attributes — all the DML paths need, since they mutate by key.
+    fn key_projection(&self) -> (String, HashMap<String, String>) {
+        let mut names = HashMap::new();
+        let mut parts = vec!["#p0".to_string()];
+        names.insert("#p0".to_string(), self.partition_key.clone());
+        if let Some(sk) = &self.sort_key {
+            names.insert("#p1".to_string(), sk.clone());
+            parts.push("#p1".to_string());
+        }
+        (parts.join(", "), names)
+    }
+
+    /// Resolve the keys of items matching a DML plan, routing to Query when the
+    /// partition key is pinned (any residual predicate is applied server-side as
+    /// a `FilterExpression`) and falling back to a full Scan otherwise — instead
+    /// of always scanning the whole table.
     async fn matching_keys(
         &self,
-        filter: Option<&DynamoFilter>,
+        plan: &DmlKeyPlan,
     ) -> Result<Vec<HashMap<String, AttributeValue>>> {
+        let source = match plan {
+            DmlKeyPlan::Query {
+                key_condition,
+                residual,
+            } => PageSource::Query {
+                key_condition: key_condition.clone(),
+                filter: residual.clone(),
+            },
+            DmlKeyPlan::Scan { filter } => PageSource::Scan {
+                filter: filter.clone(),
+            },
+        };
+        let key_projection = self.key_projection();
+
         let mut keys = Vec::new();
         let mut start_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
-            let mut req = self.client.scan().table_name(&self.table_name);
-            if let Some(f) = filter {
-                req = req
-                    .filter_expression(&f.expression)
-                    .set_expression_attribute_names(Some(f.names.clone()))
-                    .set_expression_attribute_values(Some(f.values.clone()));
-            }
-            if let Some(sk) = &start_key {
-                req = req.set_exclusive_start_key(Some(sk.clone()));
-            }
-            let out = req
-                .send()
-                .await
-                .with_context(|| format!("DynamoDB scan failed for '{}'", self.table_name))?;
-            for item in out.items() {
+            let (items, last) = fetch_page(
+                &self.client,
+                &self.table_name,
+                &source,
+                Some(&key_projection),
+                start_key.take(),
+                None,
+            )
+            .await?;
+            for item in &items {
                 keys.push(self.key_of(item)?);
             }
-            match out.last_evaluated_key() {
-                Some(k) if !k.is_empty() => start_key = Some(k.clone()),
-                _ => break,
+            match last {
+                Some(k) => start_key = Some(k),
+                None => break,
             }
         }
         Ok(keys)
     }
+
+    /// Delete a set of keys via `BatchWriteItem` (25 per request), retrying any
+    /// unprocessed keys. Returns the number of keys submitted (all of which
+    /// correspond to matched items).
+    async fn batch_delete(&self, keys: Vec<HashMap<String, AttributeValue>>) -> Result<u64> {
+        let total = keys.len() as u64;
+        for chunk in keys.chunks(BATCH_WRITE_CHUNK) {
+            let requests: Vec<WriteRequest> = chunk
+                .iter()
+                .map(|k| {
+                    let del = DeleteRequest::builder()
+                        .set_key(Some(k.clone()))
+                        .build()
+                        .expect("DeleteRequest requires only a key, which is set");
+                    WriteRequest::builder().delete_request(del).build()
+                })
+                .collect();
+            batch_write(&self.client, &self.table_name, requests).await?;
+        }
+        Ok(total)
+    }
+}
+
+/// Submit one chunk of write requests, retrying `UnprocessedItems` (which
+/// DynamoDB returns under throttling) up to a bounded number of times.
+async fn batch_write(client: &Client, table: &str, requests: Vec<WriteRequest>) -> Result<()> {
+    let mut pending: HashMap<String, Vec<WriteRequest>> =
+        HashMap::from([(table.to_string(), requests)]);
+    for _ in 0..8 {
+        let out = client
+            .batch_write_item()
+            .set_request_items(Some(pending))
+            .send()
+            .await
+            .with_context(|| format!("DynamoDB batch_write_item failed for '{table}'"))?;
+        match out.unprocessed_items {
+            Some(u) if !u.is_empty() => pending = u,
+            _ => return Ok(()),
+        }
+    }
+    anyhow::bail!("DynamoDB batch_write_item left items unprocessed after retries for '{table}'")
 }
 
 // ─── Schema inference & type mapping ────────────────────────────────────────
 
-/// Map a sampled DynamoDB attribute to an Arrow type. Numbers are inferred as
-/// `Int64` when the sample has no fractional part, else `Float64`. Everything
-/// non-scalar (maps, lists, sets, binary) falls back to `Utf8`.
+/// Map a sampled DynamoDB attribute to an Arrow type. Numbers are always
+/// inferred as `Float64`: a single sampled item can't prove a column is
+/// integer-only, and a later fractional value would otherwise be silently
+/// truncated (or drop the row via the Inexact re-filter). Everything non-scalar
+/// (maps, lists, sets, binary) falls back to `Utf8`.
 pub(crate) fn attribute_value_to_arrow_type(value: &AttributeValue) -> DataType {
     match value {
         AttributeValue::S(_) => DataType::Utf8,
         AttributeValue::Bool(_) => DataType::Boolean,
-        AttributeValue::N(n) => {
-            if n.contains('.') || n.contains('e') || n.contains('E') {
-                DataType::Float64
-            } else if n.parse::<i64>().is_ok() {
-                DataType::Int64
-            } else {
-                DataType::Float64
-            }
-        }
+        AttributeValue::N(_) => DataType::Float64,
         AttributeValue::Null(_) => DataType::Utf8,
         _ => DataType::Utf8,
     }
@@ -629,21 +625,23 @@ fn av_to_string(v: &AttributeValue) -> String {
     }
 }
 
+/// Coerce to `i64` only from an exactly-integer `N`. A fractional value
+/// (`N("7.9")`) or a string (`S("7")`) yields `None` (SQL NULL) rather than a
+/// silently truncated or cross-type value — which would violate the Inexact
+/// pushdown superset contract, since DynamoDB's server-side filter is type- and
+/// value-strict.
 fn av_to_i64(v: &AttributeValue) -> Option<i64> {
     match v {
-        AttributeValue::N(n) => n
-            .parse::<i64>()
-            .ok()
-            .or_else(|| n.parse::<f64>().ok().map(|f| f as i64)),
-        AttributeValue::S(s) => s.parse::<i64>().ok(),
+        AttributeValue::N(n) => n.parse::<i64>().ok(),
         _ => None,
     }
 }
 
+/// Coerce to `f64` only from a numeric `N`. A string is not coerced (see
+/// `av_to_i64` for why cross-type coercion is unsafe under Inexact pushdown).
 fn av_to_f64(v: &AttributeValue) -> Option<f64> {
     match v {
         AttributeValue::N(n) => n.parse::<f64>().ok(),
-        AttributeValue::S(s) => s.parse::<f64>().ok(),
         _ => None,
     }
 }
@@ -733,32 +731,19 @@ fn record_batch_to_items(
 // ─── Filter pushdown ────────────────────────────────────────────────────────
 
 /// A DynamoDB `FilterExpression` plus its attribute-name/value placeholder maps.
+#[derive(Clone, Debug)]
 struct DynamoFilter {
     expression: String,
     names: HashMap<String, String>,
     values: HashMap<String, AttributeValue>,
 }
 
-/// Same predicate the MongoDB provider uses: a comparison between a bare column
-/// and a literal, with an operator DynamoDB can evaluate server-side.
-pub(crate) fn is_pushable_binary_filter(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryExpr(binary) => {
-            matches!(
-                binary.op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            ) && matches!(
-                (binary.left.as_ref(), binary.right.as_ref()),
-                (Expr::Column(_), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(_))
-            )
-        }
-        _ => false,
-    }
+/// A pushable-shaped filter (see `is_pushable_binary_filter`) whose literal can
+/// also be converted to a DynamoDB attribute value. The shape check alone is not
+/// enough: a comparison against e.g. a Timestamp literal is pushable-shaped but
+/// not convertible, and pushing it would fail the request.
+fn is_convertible_pushdown(expr: &Expr) -> bool {
+    is_pushable_binary_filter(expr) && normalize_binary(expr).is_some()
 }
 
 /// Convert a list of pushable binary filters into one ANDed DynamoDB
@@ -832,9 +817,24 @@ fn operator_symbol(op: Operator) -> DFResult<&'static str> {
     }
 }
 
+/// Build a `ProjectionExpression` naming exactly the fields in `schema`, using a
+/// `#p` placeholder namespace (distinct from filter `#n`/`:v` and key-condition
+/// `#k`/`:k`) so it can be merged onto the same request without collision.
+fn build_projection_expression(schema: &Schema) -> (String, HashMap<String, String>) {
+    let mut names = HashMap::new();
+    let mut parts = Vec::with_capacity(schema.fields().len());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let ph = format!("#p{i}");
+        names.insert(ph.clone(), field.name().clone());
+        parts.push(ph);
+    }
+    (parts.join(", "), names)
+}
+
 // ─── Key-aware read planning ────────────────────────────────────────────────
 
 /// How a `scan()` should physically read DynamoDB given its pushable filters.
+#[derive(Clone, Debug)]
 enum DynamoRead {
     /// Full primary key pinned by equality — a single-item `GetItem`.
     GetItem {
@@ -961,6 +961,97 @@ fn classify_read(
     }
 }
 
+/// How a DELETE/UPDATE should resolve the keys it will mutate. Unlike the read
+/// path (whose residual predicates DataFusion re-applies via Inexact pushdown),
+/// DML must apply *every* predicate server-side, so any residual non-key
+/// predicate travels as a `FilterExpression`.
+#[derive(Clone, Debug)]
+enum DmlKeyPlan {
+    /// Partition key pinned by equality → `Query` (with an optional sort-key
+    /// condition folded in), plus a residual `FilterExpression` over non-key
+    /// attributes. Far cheaper than scanning the whole table.
+    Query {
+        key_condition: DynamoFilter,
+        residual: Option<DynamoFilter>,
+    },
+    /// Partition key not pinned (or an inexpressible sort predicate) → full
+    /// `Scan` carrying every predicate as a `FilterExpression`.
+    Scan { filter: Option<DynamoFilter> },
+}
+
+/// Plan the key-resolution strategy for a DELETE/UPDATE. Callers must have
+/// already ensured every predicate is a convertible pushable comparison (see
+/// `plan_dml`), so nothing is silently dropped.
+///
+/// We can drive a `Query` only when the partition key is pinned by equality and
+/// every sort-key predicate is expressible on the key: a `Query`'s
+/// `FilterExpression` may not reference key attributes, and its
+/// `KeyConditionExpression` allows at most one sort-key condition using a legal
+/// operator (so `sk <> …`, or two sort predicates, force a `Scan`). A `Scan`'s
+/// filter, by contrast, may reference keys, so it always expresses the full
+/// predicate set.
+fn classify_dml(
+    partition_key: &str,
+    sort_key: Option<&str>,
+    filters: &[Expr],
+) -> DFResult<DmlKeyPlan> {
+    let mut partition_value: Option<AttributeValue> = None;
+    let mut partition_query_ok = true;
+    let mut sort_conds: Vec<(Operator, AttributeValue)> = Vec::new();
+    let mut sort_key_expressible = true;
+    let mut residual: Vec<Expr> = Vec::new();
+
+    for expr in filters {
+        let Some((col, op, value)) = normalize_binary(expr) else {
+            // Unreachable after plan_dml's guard, but stay safe: force a Scan.
+            partition_query_ok = false;
+            residual.push(expr.clone());
+            continue;
+        };
+        if col == partition_key {
+            if op == Operator::Eq && partition_value.is_none() {
+                partition_value = Some(value);
+            } else {
+                // A non-equality (or duplicate) partition predicate can't drive
+                // a Query and can't live in a Query filter → must Scan.
+                partition_query_ok = false;
+            }
+        } else if Some(col.as_str()) == sort_key {
+            if !is_key_condition_op(op) {
+                sort_key_expressible = false;
+            }
+            sort_conds.push((op, value));
+        } else {
+            residual.push(expr.clone());
+        }
+    }
+
+    let can_query = partition_query_ok
+        && partition_value.is_some()
+        && sort_conds.len() <= 1
+        && sort_key_expressible;
+
+    if can_query {
+        let partition_value = partition_value.expect("checked by can_query");
+        let sort_cond = sort_conds.into_iter().next();
+        let key_condition = build_key_condition(
+            partition_key,
+            partition_value,
+            sort_key.unwrap_or(""),
+            sort_cond,
+        );
+        Ok(DmlKeyPlan::Query {
+            key_condition,
+            residual: build_filter_expression(&residual)?,
+        })
+    } else {
+        // Scan carries every predicate; a Scan filter may reference key columns.
+        Ok(DmlKeyPlan::Scan {
+            filter: build_filter_expression(filters)?,
+        })
+    }
+}
+
 /// Convert a DataFusion literal expression into a DynamoDB attribute value.
 pub(crate) fn expr_to_attribute_value(expr: &Expr) -> DFResult<AttributeValue> {
     match expr {
@@ -998,13 +1089,210 @@ fn scalar_to_attribute_value(scalar: &datafusion::common::ScalarValue) -> DFResu
     Ok(av)
 }
 
+// ─── Page fetching & streaming ──────────────────────────────────────────────
+
+/// One page source for the shared scan/query paginator.
+#[derive(Clone, Debug)]
+enum PageSource {
+    Scan {
+        filter: Option<DynamoFilter>,
+    },
+    Query {
+        key_condition: DynamoFilter,
+        filter: Option<DynamoFilter>,
+    },
+}
+
+/// Fetch a single page from a Scan or Query, merging any filter, key-condition
+/// and projection expressions onto one request (their `#n`/`#k`/`#p` namespaces
+/// never collide). Returns the page's items — moved, not cloned — and the next
+/// `ExclusiveStartKey` (`None` when the table is exhausted).
+async fn fetch_page(
+    client: &Client,
+    table: &str,
+    source: &PageSource,
+    projection: Option<&(String, HashMap<String, String>)>,
+    start_key: Option<HashMap<String, AttributeValue>>,
+    page_limit: Option<i32>,
+) -> Result<(
+    Vec<HashMap<String, AttributeValue>>,
+    Option<HashMap<String, AttributeValue>>,
+)> {
+    let mut names: HashMap<String, String> = HashMap::new();
+    if let Some((_, pnames)) = projection {
+        names.extend(pnames.clone());
+    }
+
+    let (items, last_key) = match source {
+        PageSource::Scan { filter } => {
+            let mut req = client.scan().table_name(table);
+            if let Some(f) = filter {
+                req = req
+                    .filter_expression(&f.expression)
+                    .set_expression_attribute_values(Some(f.values.clone()));
+                names.extend(f.names.clone());
+            }
+            if let Some((expr, _)) = projection {
+                req = req.projection_expression(expr);
+            }
+            if !names.is_empty() {
+                req = req.set_expression_attribute_names(Some(names));
+            }
+            if let Some(l) = page_limit {
+                req = req.limit(l);
+            }
+            if let Some(sk) = start_key {
+                req = req.set_exclusive_start_key(Some(sk));
+            }
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("DynamoDB scan failed for '{table}'"))?;
+            (out.items.unwrap_or_default(), out.last_evaluated_key)
+        }
+        PageSource::Query {
+            key_condition,
+            filter,
+        } => {
+            let mut req = client
+                .query()
+                .table_name(table)
+                .key_condition_expression(&key_condition.expression);
+            let mut values = key_condition.values.clone();
+            names.extend(key_condition.names.clone());
+            if let Some(f) = filter {
+                req = req.filter_expression(&f.expression);
+                values.extend(f.values.clone());
+                names.extend(f.names.clone());
+            }
+            if let Some((expr, _)) = projection {
+                req = req.projection_expression(expr);
+            }
+            req = req
+                .set_expression_attribute_names(Some(names))
+                .set_expression_attribute_values(Some(values));
+            if let Some(l) = page_limit {
+                req = req.limit(l);
+            }
+            if let Some(sk) = start_key {
+                req = req.set_exclusive_start_key(Some(sk));
+            }
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("DynamoDB query failed for '{table}'"))?;
+            (out.items.unwrap_or_default(), out.last_evaluated_key)
+        }
+    };
+
+    Ok((items, last_key.filter(|k| !k.is_empty())))
+}
+
+/// State carried between paginator steps.
+struct PageState {
+    start_key: Option<HashMap<String, AttributeValue>>,
+    remaining: Option<usize>,
+}
+
+/// Stream a Scan/Query one page at a time as projected `RecordBatch`es. Memory
+/// is bounded to a single page (~1MB) instead of buffering the whole result,
+/// and a SQL `LIMIT` caps both the rows returned and the per-page request size.
+fn stream_pages(
+    client: Client,
+    table: String,
+    source: PageSource,
+    projection: Option<(String, HashMap<String, String>)>,
+    schema: SchemaRef,
+    limit: Option<usize>,
+) -> impl Stream<Item = DFResult<RecordBatch>> {
+    let initial = Some(PageState {
+        start_key: None,
+        remaining: limit,
+    });
+    stream::unfold(initial, move |maybe_state| {
+        let client = client.clone();
+        let table = table.clone();
+        let source = source.clone();
+        let projection = projection.clone();
+        let schema = schema.clone();
+        async move {
+            let state = maybe_state?;
+            let page_limit = state.remaining.map(|r| r.min(i32::MAX as usize) as i32);
+            let fetched = fetch_page(
+                &client,
+                &table,
+                &source,
+                projection.as_ref(),
+                state.start_key,
+                page_limit,
+            )
+            .await
+            .map_err(|e| DataFusionError::External(e.into()));
+
+            let (mut items, last_key) = match fetched {
+                Ok(v) => v,
+                Err(e) => return Some((Err(e), None)),
+            };
+            if let Some(r) = state.remaining {
+                items.truncate(r);
+            }
+            let got = items.len();
+            let batch = items_to_batch(items, &schema);
+            let next_remaining = state.remaining.map(|r| r.saturating_sub(got));
+            let stop = next_remaining == Some(0) || last_key.is_none();
+            let next = if stop {
+                None
+            } else {
+                Some(PageState {
+                    start_key: last_key,
+                    remaining: next_remaining,
+                })
+            };
+            Some((batch, next))
+        }
+    })
+}
+
+/// Count items server-side via `Scan` with `Select=COUNT`, emitting a single
+/// zero-column batch whose row count is the total (drives `count(*)`). Only
+/// reached when the projection is empty, i.e. no predicate references any
+/// column, so an unfiltered count is exact.
+async fn count_scan(client: &Client, table: &str, schema: SchemaRef) -> DFResult<RecordBatch> {
+    let mut total = 0usize;
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let mut req = client.scan().table_name(table).select(Select::Count);
+        if let Some(sk) = start.take() {
+            req = req.set_exclusive_start_key(Some(sk));
+        }
+        let out = req
+            .send()
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("DynamoDB count scan failed: {e}")))?;
+        total += out.count() as usize;
+        match out.last_evaluated_key {
+            Some(k) if !k.is_empty() => start = Some(k),
+            _ => break,
+        }
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(total));
+    RecordBatch::try_new_with_options(schema, vec![], &options).map_err(DataFusionError::from)
+}
+
 // ─── Scan execution plan ────────────────────────────────────────────────────
 
-/// Leaf plan holding a pre-fetched scan result batch.
+/// Leaf plan that streams a DynamoDB read, page by page, on execution.
 #[derive(Debug)]
 struct DynamoScanExec {
-    schema: SchemaRef,
-    batch: Arc<RwLock<Option<RecordBatch>>>,
+    client: Client,
+    table_name: String,
+    output_schema: SchemaRef,
+    read: DynamoRead,
+    /// `ProjectionExpression` (and its `#p` bindings) for the projected columns,
+    /// or `None` for a `count(*)` (empty projection).
+    projection_expr: Option<(String, HashMap<String, String>)>,
+    count_only: bool,
+    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -1038,18 +1326,69 @@ impl ExecutionPlan for DynamoScanExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let schema = self.schema.clone();
-        let batch = self.batch.clone();
-        let stream = futures::stream::once(async move {
-            let guard = batch.read().await;
-            match guard.as_ref() {
-                Some(b) => Ok(b.clone()),
-                None => Err(DataFusionError::Execution(
-                    "Batch already consumed".to_string(),
-                )),
+        let schema = self.output_schema.clone();
+        let client = self.client.clone();
+        let table = self.table_name.clone();
+
+        if self.count_only {
+            let count_schema = schema.clone();
+            let fut = async move { count_scan(&client, &table, count_schema).await };
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::once(fut),
+            )));
+        }
+
+        match self.read.clone() {
+            DynamoRead::GetItem { key } => {
+                let projection = self.projection_expr.clone();
+                let item_schema = schema.clone();
+                let fut = async move {
+                    let mut req = client.get_item().table_name(&table).set_key(Some(key));
+                    if let Some((expr, names)) = projection {
+                        req = req
+                            .projection_expression(expr)
+                            .set_expression_attribute_names(Some(names));
+                    }
+                    let out = req.send().await.map_err(|e| {
+                        DataFusionError::Execution(format!("DynamoDB get_item failed: {e}"))
+                    })?;
+                    let items: Vec<_> = out.item.into_iter().collect();
+                    items_to_batch(items, &item_schema)
+                };
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    stream::once(fut),
+                )))
             }
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            DynamoRead::Query { key_condition } => {
+                let src = PageSource::Query {
+                    key_condition,
+                    filter: None,
+                };
+                let s = stream_pages(
+                    client,
+                    table,
+                    src,
+                    self.projection_expr.clone(),
+                    schema.clone(),
+                    self.limit,
+                );
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)))
+            }
+            DynamoRead::Scan { filter } => {
+                let src = PageSource::Scan { filter };
+                let s = stream_pages(
+                    client,
+                    table,
+                    src,
+                    self.projection_expr.clone(),
+                    schema.clone(),
+                    self.limit,
+                );
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)))
+            }
+        }
     }
 }
 
@@ -1060,12 +1399,18 @@ struct DynamoInsertExec {
     client: Client,
     table_name: String,
     schema: SchemaRef,
+    partition_key: String,
+    /// True for INSERT OVERWRITE/REPLACE (upsert via `BatchWriteItem`); false
+    /// for plain INSERT (Append), which uses a conditional `PutItem` so a
+    /// duplicate key errors instead of silently replacing the item.
+    upsert: bool,
 }
 
 impl Debug for DynamoInsertExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("DynamoInsertExec")
             .field("table_name", &self.table_name)
+            .field("upsert", &self.upsert)
             .finish()
     }
 }
@@ -1074,6 +1419,62 @@ impl DisplayAs for DynamoInsertExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(f, "DynamoInsertExec")
     }
+}
+
+/// Append INSERT: `PutItem` guarded by `attribute_not_exists` on the partition
+/// key so an existing item is not silently overwritten.
+async fn put_conditional(
+    client: &Client,
+    table: &str,
+    partition_key: &str,
+    item: HashMap<String, AttributeValue>,
+) -> DFResult<()> {
+    let names = HashMap::from([("#pk".to_string(), partition_key.to_string())]);
+    client
+        .put_item()
+        .table_name(table)
+        .set_item(Some(item))
+        .condition_expression("attribute_not_exists(#pk)")
+        .set_expression_attribute_names(Some(names))
+        .send()
+        .await
+        .map_err(|e| {
+            let svc = e.into_service_error();
+            if svc.is_conditional_check_failed_exception() {
+                DataFusionError::Execution(format!(
+                    "DynamoDB INSERT: an item with this key already exists in '{table}'. \
+                     Use INSERT OVERWRITE to replace it."
+                ))
+            } else {
+                DataFusionError::Execution(format!("DynamoDB put_item failed: {svc}"))
+            }
+        })?;
+    Ok(())
+}
+
+/// Upsert INSERT (Overwrite/Replace): batch the items via `BatchWriteItem`
+/// (25 per request), cutting a large insert from one round-trip per row.
+async fn batch_put(
+    client: &Client,
+    table: &str,
+    items: Vec<HashMap<String, AttributeValue>>,
+) -> DFResult<()> {
+    for chunk in items.chunks(BATCH_WRITE_CHUNK) {
+        let requests: Vec<WriteRequest> = chunk
+            .iter()
+            .map(|it| {
+                let put = PutRequest::builder()
+                    .set_item(Some(it.clone()))
+                    .build()
+                    .expect("PutRequest requires only an item, which is set");
+                WriteRequest::builder().put_request(put).build()
+            })
+            .collect();
+        batch_write(client, table, requests)
+            .await
+            .map_err(|e| DataFusionError::External(e.into()))?;
+    }
+    Ok(())
 }
 
 impl ExecutionPlan for DynamoInsertExec {
@@ -1098,6 +1499,8 @@ impl ExecutionPlan for DynamoInsertExec {
             client: self.client.clone(),
             table_name: self.table_name.clone(),
             schema: self.schema.clone(),
+            partition_key: self.partition_key.clone(),
+            upsert: self.upsert,
         }))
     }
     fn execute(
@@ -1109,46 +1512,56 @@ impl ExecutionPlan for DynamoInsertExec {
         let client = self.client.clone();
         let table_name = self.table_name.clone();
         let schema = self.schema.clone();
+        let partition_key = self.partition_key.clone();
+        let upsert = self.upsert;
         let output_schema = count_schema();
 
         let future = async move {
             let mut count: u64 = 0;
-            use futures::StreamExt;
+            // Bound memory for upsert batching: flush every full chunk instead of
+            // buffering the entire input.
+            let mut buf: Vec<HashMap<String, AttributeValue>> = Vec::new();
             while let Some(batch) = input_stream.next().await {
                 let batch = batch?;
                 let items = record_batch_to_items(&batch, &schema)
                     .map_err(|e| DataFusionError::External(e.into()))?;
                 for item in items {
-                    client
-                        .put_item()
-                        .table_name(&table_name)
-                        .set_item(Some(item))
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("DynamoDB put_item failed: {e}"))
-                        })?;
-                    count += 1;
+                    if upsert {
+                        buf.push(item);
+                        if buf.len() >= BATCH_WRITE_CHUNK {
+                            let chunk = std::mem::take(&mut buf);
+                            count += chunk.len() as u64;
+                            batch_put(&client, &table_name, chunk).await?;
+                        }
+                    } else {
+                        put_conditional(&client, &table_name, &partition_key, item).await?;
+                        count += 1;
+                    }
                 }
+            }
+            if !buf.is_empty() {
+                count += buf.len() as u64;
+                batch_put(&client, &table_name, buf).await?;
             }
             count_batch(count)
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            futures::stream::once(future),
+            stream::once(future),
         )))
     }
 }
 
 // ─── DELETE / UPDATE execution plan ─────────────────────────────────────────
 
+#[derive(Clone)]
 enum DynamoDmlOp {
     Delete {
-        filter: Option<DynamoFilter>,
+        plan: DmlKeyPlan,
     },
     Update {
-        filter: Option<DynamoFilter>,
+        plan: DmlKeyPlan,
         sets: Vec<(String, AttributeValue)>,
     },
 }
@@ -1156,7 +1569,9 @@ enum DynamoDmlOp {
 /// Leaf plan that runs a key-based DELETE or UPDATE and returns `{ count }`.
 ///
 /// DynamoDB cannot delete or update by arbitrary predicate, so the matching
-/// keys are scanned first and then mutated one key at a time.
+/// keys are resolved first (via Query or Scan) and then mutated: DELETE batches
+/// them through `BatchWriteItem`, UPDATE issues one `UpdateItem` per key
+/// (`BatchWriteItem` cannot express updates).
 struct DynamoDmlExec {
     handle: DynamoHandle,
     op: DynamoDmlOp,
@@ -1219,34 +1634,22 @@ impl ExecutionPlan for DynamoDmlExec {
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let handle = self.handle.clone();
-        // Move the op out by cloning its parts (AttributeValue/maps are clonable).
-        let op = self.op.clone_op();
+        let op = self.op.clone();
         let future = async move {
             let affected = match op {
-                DynamoDmlOp::Delete { filter } => {
+                DynamoDmlOp::Delete { plan } => {
                     let keys = handle
-                        .matching_keys(filter.as_ref())
+                        .matching_keys(&plan)
                         .await
                         .map_err(|e| DataFusionError::External(e.into()))?;
-                    let mut n = 0u64;
-                    for key in keys {
-                        handle
-                            .client
-                            .delete_item()
-                            .table_name(&handle.table_name)
-                            .set_key(Some(key))
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!("DynamoDB delete failed: {e}"))
-                            })?;
-                        n += 1;
-                    }
-                    n
+                    handle
+                        .batch_delete(keys)
+                        .await
+                        .map_err(|e| DataFusionError::External(e.into()))?
                 }
-                DynamoDmlOp::Update { filter, sets } => {
+                DynamoDmlOp::Update { plan, sets } => {
                     let keys = handle
-                        .matching_keys(filter.as_ref())
+                        .matching_keys(&plan)
                         .await
                         .map_err(|e| DataFusionError::External(e.into()))?;
                     let (expr, names, values) = build_update_expression(&sets);
@@ -1275,30 +1678,8 @@ impl ExecutionPlan for DynamoDmlExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
-            futures::stream::once(future),
+            stream::once(future),
         )))
-    }
-}
-
-impl DynamoDmlOp {
-    fn clone_op(&self) -> DynamoDmlOp {
-        match self {
-            DynamoDmlOp::Delete { filter } => DynamoDmlOp::Delete {
-                filter: filter.as_ref().map(clone_filter),
-            },
-            DynamoDmlOp::Update { filter, sets } => DynamoDmlOp::Update {
-                filter: filter.as_ref().map(clone_filter),
-                sets: sets.clone(),
-            },
-        }
-    }
-}
-
-fn clone_filter(f: &DynamoFilter) -> DynamoFilter {
-    DynamoFilter {
-        expression: f.expression.clone(),
-        names: f.names.clone(),
-        values: f.values.clone(),
     }
 }
 
@@ -1359,6 +1740,14 @@ fn count_batch(count: u64) -> DFResult<RecordBatch> {
 /// * `access_key_env` / `secret_key_env` - names of environment variables
 ///   holding static AWS credentials (optional). When omitted, the default AWS
 ///   credential provider chain is used.
+/// * `columns` - explicit column schema as `name:type[,name:type…]` (types:
+///   `string`, `int`, `float`, `bool`). Optional; when omitted the schema is
+///   inferred by sampling. Declaring it makes writes to an empty table possible
+///   (inference can't see attributes absent from every sampled item) and pins a
+///   stable column set.
+///
+/// `read_write` gates DML: a read-only source rejects INSERT/UPDATE/DELETE at
+/// plan time.
 ///
 /// The resolved key schema drives key-aware reads: a query that pins the full
 /// primary key uses `GetItem`, one that pins the partition key uses `Query`, and
@@ -1368,10 +1757,12 @@ pub async fn register_dynamodb_tables(
     name: &str,
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
+    read_write: bool,
 ) -> Result<()> {
     tracing::info!(
         source = %name,
         endpoint = %connection_string,
+        read_write,
         "Registering DynamoDB table"
     );
 
@@ -1409,10 +1800,26 @@ pub async fn register_dynamodb_tables(
         }
     };
 
-    let provider =
-        DynamoTableProvider::new(client, table, &partition_key, sort_key.as_deref(), None)
-            .await
-            .with_context(|| format!("Failed to create DynamoDB table provider for '{name}'"))?;
+    // An explicit `columns` option pins the schema; otherwise it is inferred by
+    // sampling inside `DynamoTableProvider::new`.
+    let declared_schema = match opts.get("columns") {
+        Some(spec) => Some(
+            parse_columns_option(spec, &partition_key, sort_key.as_deref())
+                .with_context(|| format!("DynamoDB data source '{name}': invalid 'columns'"))?,
+        ),
+        None => None,
+    };
+
+    let provider = DynamoTableProvider::new(
+        client,
+        table,
+        &partition_key,
+        sort_key.as_deref(),
+        declared_schema,
+        read_write,
+    )
+    .await
+    .with_context(|| format!("Failed to create DynamoDB table provider for '{name}'"))?;
 
     session_ctx
         .register_table(name, Arc::new(provider))
@@ -1475,6 +1882,44 @@ async fn describe_keys(client: &Client, table: &str) -> Result<(String, Option<S
     Ok((partition_key, sort_key))
 }
 
+/// Parse the `columns` option (`name:type[,name:type…]`) into an explicit
+/// schema, ordered with the key attributes first (see `build_schema_fields`).
+fn parse_columns_option(
+    spec: &str,
+    partition_key: &str,
+    sort_key: Option<&str>,
+) -> Result<SchemaRef> {
+    let mut attrs: Vec<(String, DataType)> = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, ty) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("column '{part}' must be 'name:type'"))?;
+        let dtype = match ty.trim().to_ascii_lowercase().as_str() {
+            "string" | "str" | "utf8" | "text" => DataType::Utf8,
+            "int" | "integer" | "bigint" | "int64" | "long" => DataType::Int64,
+            "float" | "double" | "float64" | "number" | "num" => DataType::Float64,
+            "bool" | "boolean" => DataType::Boolean,
+            other => anyhow::bail!(
+                "column '{}' has unknown type '{other}' (use string, int, float, or bool)",
+                name.trim()
+            ),
+        };
+        attrs.push((name.trim().to_string(), dtype));
+    }
+    if attrs.is_empty() {
+        anyhow::bail!("'columns' option is empty");
+    }
+    Ok(Arc::new(build_schema_fields(
+        partition_key,
+        sort_key,
+        &attrs,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1491,7 +1936,10 @@ mod tests {
             attribute_value_to_arrow_type(&AttributeValue::S("x".into())),
             DataType::Utf8
         );
-        assert_eq!(attribute_value_to_arrow_type(&n("42")), DataType::Int64);
+        // Numbers always infer as Float64 — a single sampled whole number can't
+        // prove a column is integer-only, and later fractional values would be
+        // truncated or dropped by the Inexact re-filter.
+        assert_eq!(attribute_value_to_arrow_type(&n("42")), DataType::Float64);
         assert_eq!(attribute_value_to_arrow_type(&n("4.5")), DataType::Float64);
         assert_eq!(
             attribute_value_to_arrow_type(&AttributeValue::Bool(true)),
@@ -1506,9 +1954,14 @@ mod tests {
     #[test]
     fn number_coercions() {
         assert_eq!(av_to_i64(&n("7")), Some(7));
-        assert_eq!(av_to_i64(&n("7.9")), Some(7));
+        // Fractional N does not silently truncate into an Int64 column; it
+        // becomes NULL so the row can't disappear via the Inexact re-filter.
+        assert_eq!(av_to_i64(&n("7.9")), None);
+        // Cross-type coercion is refused: a string is never parsed into a
+        // numeric column (would violate the pushdown superset contract).
+        assert_eq!(av_to_i64(&AttributeValue::S("7".into())), None);
         assert_eq!(av_to_f64(&n("2.5")), Some(2.5));
-        assert_eq!(av_to_f64(&AttributeValue::S("nope".into())), None);
+        assert_eq!(av_to_f64(&AttributeValue::S("2.5".into())), None);
         assert_eq!(av_to_bool(&AttributeValue::Bool(false)), Some(false));
         assert_eq!(av_to_bool(&n("1")), None);
     }
@@ -1687,14 +2140,132 @@ mod tests {
         }
     }
 
+    // ─── DML planning (key-aware routing + guard) ───────────────────────────
+
+    #[test]
+    fn classify_dml_partition_eq_routes_query_with_residual() {
+        // pk pinned + a non-key predicate → Query, with the non-key predicate
+        // carried as a residual FilterExpression (a Query filter can't touch keys).
+        let filters = vec![col("pk").eq(lit("A")), col("category").eq(lit("x"))];
+        match classify_dml("pk", None, &filters).unwrap() {
+            DmlKeyPlan::Query {
+                key_condition,
+                residual,
+            } => {
+                assert_eq!(key_condition.expression, "#k0 = :k0");
+                let residual = residual.expect("non-key predicate becomes a residual filter");
+                assert!(residual.expression.contains("#n0"));
+            }
+            _ => panic!("expected Query when the partition key is pinned"),
+        }
+    }
+
+    #[test]
+    fn classify_dml_no_partition_routes_scan() {
+        // Partition key not pinned → Scan carrying the full predicate set.
+        let filters = vec![col("category").eq(lit("x"))];
+        match classify_dml("pk", None, &filters).unwrap() {
+            DmlKeyPlan::Scan { filter } => assert!(filter.is_some()),
+            _ => panic!("expected Scan when the partition key is not pinned"),
+        }
+    }
+
+    #[test]
+    fn classify_dml_sort_noteq_forces_scan() {
+        // `sk <> B` can live in neither a KeyCondition nor a Query filter, so the
+        // whole DML must Scan (a Scan filter may reference key attributes).
+        let filters = vec![col("pk").eq(lit("A")), col("sk").not_eq(lit("B"))];
+        match classify_dml("pk", Some("sk"), &filters).unwrap() {
+            DmlKeyPlan::Scan { filter } => {
+                let f = filter.expect("filter present");
+                // Both predicates are expressed (two placeholders).
+                assert_eq!(f.names.len(), 2);
+            }
+            _ => panic!("expected Scan when a sort predicate is inexpressible on a Query"),
+        }
+    }
+
+    #[test]
+    fn convertible_pushdown_excludes_inconvertible_literal() {
+        // Pushable-shaped but with an inconvertible literal → not convertible.
+        let ok = col("a").eq(lit(1i64));
+        assert!(is_convertible_pushdown(&ok));
+        let ts = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("a")),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(0), None),
+                None,
+            )),
+        ));
+        assert!(is_pushable_binary_filter(&ts));
+        assert!(!is_convertible_pushdown(&ts));
+    }
+
+    #[test]
+    fn parse_columns_option_orders_keys_first() {
+        let schema = parse_columns_option(
+            "price:float, name:string, product_id:string",
+            "product_id",
+            None,
+        )
+        .expect("valid columns");
+        // Key comes first and is non-nullable; declared cols follow, nullable.
+        assert_eq!(schema.field(0).name(), "product_id");
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn parse_columns_option_rejects_bad_type() {
+        assert!(parse_columns_option("x:widget", "id", None).is_err());
+        assert!(parse_columns_option("noColon", "id", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_with_non_pushable_predicate_is_rejected() {
+        // The guard must fire at plan time (no network) rather than silently
+        // dropping the OR and deleting every row. Uses an explicit schema so
+        // registration doesn't touch DynamoDB.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut opts = HashMap::new();
+        opts.insert("region".to_string(), "us-east-1".to_string());
+        let client = build_client("http://localhost:8000", "us-east-1", &opts)
+            .await
+            .expect("client");
+        let provider = DynamoTableProvider::new(client, "t", "id", None, Some(schema), true)
+            .await
+            .expect("provider");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register");
+
+        let err = ctx
+            .sql("DELETE FROM t WHERE id = 'A' OR name = 'x'")
+            .await
+            .expect("logical plan")
+            .collect()
+            .await
+            .expect_err("non-pushable DELETE predicate must be rejected");
+        assert!(
+            err.to_string().contains("pushable comparison"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn missing_options_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut ctx = SessionContext::new();
-            let err = register_dynamodb_tables(&mut ctx, "ddb", "http://localhost:8000", None)
-                .await
-                .unwrap_err();
+            let err =
+                register_dynamodb_tables(&mut ctx, "ddb", "http://localhost:8000", None, false)
+                    .await
+                    .unwrap_err();
             assert!(err.to_string().contains("requires options"));
         });
     }
@@ -1706,10 +2277,15 @@ mod tests {
             let mut ctx = SessionContext::new();
             let mut opts = HashMap::new();
             opts.insert("partition_key".to_string(), "id".to_string());
-            let err =
-                register_dynamodb_tables(&mut ctx, "ddb", "http://localhost:8000", Some(&opts))
-                    .await
-                    .unwrap_err();
+            let err = register_dynamodb_tables(
+                &mut ctx,
+                "ddb",
+                "http://localhost:8000",
+                Some(&opts),
+                false,
+            )
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains("'table'"));
         });
     }
@@ -1728,7 +2304,7 @@ mod tests {
         let client = build_client("http://localhost:8000", "us-east-1", &opts)
             .await
             .expect("client");
-        DynamoTableProvider::new(client, "products", "product_id", None, None)
+        DynamoTableProvider::new(client, "products", "product_id", None, None, false)
             .await
             .expect("provider")
     }
@@ -1739,9 +2315,15 @@ mod tests {
         opts.insert("table".to_string(), "products".to_string());
         opts.insert("partition_key".to_string(), "product_id".to_string());
         opts.insert("region".to_string(), "us-east-1".to_string());
-        register_dynamodb_tables(&mut ctx, "products", "http://localhost:8000", Some(&opts))
-            .await
-            .expect("register");
+        register_dynamodb_tables(
+            &mut ctx,
+            "products",
+            "http://localhost:8000",
+            Some(&opts),
+            false,
+        )
+        .await
+        .expect("register");
         let df = ctx.sql(sql).await.expect("sql");
         let batches = df.collect().await.expect("collect");
         batches.iter().map(|b| b.num_rows()).sum()
@@ -1831,7 +2413,7 @@ mod tests {
         ]));
 
         async fn ctx_with(table: &str, schema: SchemaRef, client: Client) -> SessionContext {
-            let provider = DynamoTableProvider::new(client, table, "id", None, Some(schema))
+            let provider = DynamoTableProvider::new(client, table, "id", None, Some(schema), true)
                 .await
                 .expect("provider");
             let ctx = SessionContext::new();
@@ -1979,7 +2561,7 @@ mod tests {
         // Register via the public path so DescribeTable auto-detects the sort key
         // (note: no partition_key/sort_key options supplied).
         let mut ctx = SessionContext::new();
-        register_dynamodb_tables(&mut ctx, table, "http://localhost:8000", Some(&opts))
+        register_dynamodb_tables(&mut ctx, table, "http://localhost:8000", Some(&opts), false)
             .await
             .expect("register");
 

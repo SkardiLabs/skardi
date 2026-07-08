@@ -512,28 +512,7 @@ impl TableProvider for MongoTableProvider {
     }
 }
 
-/// Returns true if the expression is a binary comparison (=, !=, <, <=, >, >=)
-/// between a column and a literal value, which can be pushed down to MongoDB.
-pub(crate) fn is_pushable_binary_filter(expr: &Expr) -> bool {
-    use datafusion::logical_expr::Operator;
-    match expr {
-        Expr::BinaryExpr(binary) => {
-            matches!(
-                binary.op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            ) && matches!(
-                (binary.left.as_ref(), binary.right.as_ref()),
-                (Expr::Column(_), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(_))
-            )
-        }
-        _ => false,
-    }
-}
+pub(crate) use super::is_pushable_binary_filter;
 
 pub(crate) fn bson_to_arrow_type(value: &Bson) -> DataType {
     match value {

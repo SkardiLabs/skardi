@@ -922,9 +922,15 @@ async fn register_source(
                     source.name
                 )
             })?;
-            register_dynamodb_tables(session_ctx, &source.name, endpoint, source.options.as_ref())
-                .await
-                .with_context(|| format!("Failed to register DynamoDB '{}'", source.name))?;
+            register_dynamodb_tables(
+                session_ctx,
+                &source.name,
+                endpoint,
+                source.options.as_ref(),
+                source.is_read_write(),
+            )
+            .await
+            .with_context(|| format!("Failed to register DynamoDB '{}'", source.name))?;
         }
         "lance" => {
             let path_str = source

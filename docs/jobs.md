@@ -78,8 +78,8 @@ taken as the data source name — the executor uses it to decide whether
 the destination is a lake (Lance) or a transactional SQL DB
 (**Postgres / MySQL / SQLite**).
 
-Non-transactional backends (Redis, MongoDB, SeekDB) are **rejected at
-submit time** with `error_type: non_transactional_destination`. Those
+Non-transactional backends (Redis, MongoDB, SeekDB, InfluxDB, DynamoDB) are
+**rejected at submit time** with `error_type: non_transactional_destination`. Those
 providers' write paths do not wrap an INSERT in a transaction, so a
 mid-run failure could leave partial rows visible — which violates the
 atomicity contract every other destination honors. They remain fine as

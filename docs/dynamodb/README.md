@@ -59,15 +59,22 @@ Attribute types are mapped to Arrow types as follows:
 | DynamoDB type | Arrow type |
 |---|---|
 | `S` (string) | `Utf8` |
-| `N` (number, integral) | `Int64` |
-| `N` (number, fractional) | `Float64` |
+| `N` (number) | `Float64` |
 | `BOOL` | `Boolean` |
 | everything else (`M`, `L`, `SS`, `B`, …) | `Utf8` (debug-rendered) |
 
-DynamoDB is schemaless, so the column set is inferred by sampling one item at
-startup. **An attribute that is absent from an item reads as SQL `NULL`.** If
-your table can be empty at startup, only the declared key attributes will be
-discoverable — see [Schema notes](#schema-notes).
+Numbers always map to `Float64`: a single sampled whole number can't prove a
+column is integer-only, and a later fractional value in an `Int64` column would
+be silently truncated (or dropped by the re-filter). A number value stored as a
+string — or vice versa — reads as `NULL` in the numeric/typed column rather than
+being cross-type coerced, keeping filter pushdown consistent with what you see.
+
+DynamoDB is schemaless, so the column set is inferred by sampling several items
+at startup and merging their attributes. **An attribute absent from an item
+reads as SQL `NULL`.** If your table can be empty at startup, or you want a
+stable/typed column set, declare it explicitly with the `columns` option
+(`name:type,…` — types `string`, `int`, `float`, `bool`) — see
+[Schema notes](#schema-notes).
 
 ## Available Pipelines
 
@@ -156,7 +163,12 @@ DataFusion after the scan.
 
 ## 4. Insert
 
-Inserts use DynamoDB `PutItem`, which upserts on the partition key.
+A plain `INSERT` is a guarded `PutItem` (`attribute_not_exists` on the partition
+key): inserting a row whose key already exists **errors** instead of silently
+replacing the whole item. Use `INSERT OVERWRITE` for upsert semantics (which also
+batches the writes via `BatchWriteItem`). Writes require the source to be
+configured `access_mode: read_write`; a read-only source rejects
+INSERT/UPDATE/DELETE at plan time.
 
 ```bash
 curl -X POST http://localhost:8080/insert_product/execute \
@@ -180,8 +192,12 @@ curl -X POST http://localhost:8080/query_product_by_id/execute \
 
 ## 5. Update
 
-DynamoDB cannot update by arbitrary predicate, so Skardi scans for the matching
-keys (using filter pushdown) and issues an `UpdateItem` per key. Key columns
+DynamoDB cannot update by arbitrary predicate, so Skardi first resolves the
+matching keys — via a `Query` when the partition key is pinned by equality (any
+remaining predicate is applied server-side as a `FilterExpression`), else a full
+`Scan` — then issues an `UpdateItem` per key. Every WHERE predicate must be a
+pushable comparison; a non-pushable predicate (e.g. `OR`, `LIKE`) is rejected
+rather than silently ignored (which would over-update). Key columns
 (`partition_key` / `sort_key`) cannot be updated.
 
 ```bash
@@ -199,8 +215,10 @@ curl -X POST http://localhost:8080/update_product_price/execute \
 
 ## 6. Delete
 
-Like UPDATE, DELETE resolves matching keys via a filtered scan, then issues a
-`DeleteItem` per key.
+Like UPDATE, DELETE resolves matching keys (routing to a `Query` when the
+partition key is pinned, else a `Scan`), then removes them via `BatchWriteItem`
+(25 per request). The same all-predicates-must-be-pushable rule applies, so a
+`DELETE ... WHERE a = 1 OR b = 2` is rejected rather than wiping the table.
 
 ```bash
 curl -X POST http://localhost:8080/delete_product/execute \
@@ -249,8 +267,12 @@ curl -X POST http://localhost:8080/federated_join/execute \
 | `partition_key` | string | no | Partition (hash) key attribute name. Auto-detected from the table's key schema via `DescribeTable`; supply it only as a fallback for when `DescribeTable` is unavailable (e.g. restricted IAM permissions) |
 | `sort_key` | string | no | Sort (range) key attribute name for composite-key tables. Also auto-detected from `DescribeTable`; a fallback otherwise |
 | `region` | string | no | AWS region (default `us-east-1`) |
+| `columns` | string | no | Explicit schema as `name:type,…` (types `string`, `int`, `float`, `bool`). Pins a stable/typed column set and lets you write non-key columns to an empty table. When omitted, the schema is inferred by sampling |
 | `access_key_env` | string | no | Env var holding the AWS access key id |
 | `secret_key_env` | string | no | Env var holding the AWS secret access key |
+
+Writes (INSERT/UPDATE/DELETE) additionally require `access_mode: read_write` on
+the source; the default `read_only` rejects them at plan time.
 
 ### Read planning (key-aware access)
 
@@ -281,15 +303,16 @@ ECS / Lambda no credential options are needed.
 
 ## Schema notes
 
-The schema is inferred by sampling a single item at startup. Because DynamoDB
-items are schemaless:
+The schema is inferred by sampling several items at startup and merging their
+attribute sets. Because DynamoDB items are schemaless:
 
-- An attribute missing from the sampled item won't appear as a column. If
-  different items have different attributes, declare the union you care about by
-  ensuring the sampled item is representative, or keep attributes consistent.
+- An attribute missing from **every** sampled item won't appear as a column. If
+  items have widely varying attributes, declare the columns you care about
+  explicitly with the `columns` option instead of relying on the sample.
 - An attribute absent on a given row reads as SQL `NULL`.
 - If the table is **empty** at startup, only the partition key (and sort key, if
-  configured) are available until data is written.
+  configured) are inferable — declare the rest with `columns` so you can write
+  non-key attributes before any row exists.
 
 ## Cleanup
 
