@@ -2792,4 +2792,51 @@ spec:
             );
         }
     }
+
+    // Guards for the `dynamodb` arm of `register_source`. Both failure modes
+    // trip before any network call, so no live endpoint is needed.
+    mod register_dynamodb_source {
+        use super::*;
+
+        fn dynamodb_source(connection_string: Option<&str>) -> LocalDataSource {
+            LocalDataSource {
+                name: "products".to_string(),
+                source_type: "dynamodb".to_string(),
+                path: None,
+                connection_string: connection_string.map(String::from),
+                options: None,
+                hierarchy_level: HierarchyLevel::default(),
+                access_mode: None,
+                description: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn errors_without_connection_string() {
+            let (mut session_ctx, registry) = new_session_context();
+            let err = register_source(&mut session_ctx, &dynamodb_source(None), &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("connection_string (endpoint URL) required"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_without_options() {
+            let (mut session_ctx, registry) = new_session_context();
+            let source = dynamodb_source(Some("http://localhost:8000"));
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("Failed to register DynamoDB 'products'"),
+                "unexpected error: {msg}"
+            );
+            assert!(msg.contains("requires options"), "unexpected error: {msg}");
+        }
+    }
 }

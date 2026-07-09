@@ -871,8 +871,7 @@ spec:
         );
     }
 
-    #[tokio::test]
-    async fn submit_rejects_influxdb_destination_as_non_transactional() {
+    async fn assert_submit_rejects_non_transactional_destination(source_type: DataSourceType) {
         use std::io::Write;
 
         let ctx = Arc::new(SessionContext::new());
@@ -909,10 +908,11 @@ spec:
                 .unwrap(),
         );
 
-        // Mark `cpu` as InfluxDB-typed so the destination resolver classifies
-        // it as a non-transactional (read-only) backend and rejects it.
+        // Mark `cpu` with the given source type so the destination resolver
+        // classifies it as a non-transactional (read-only) backend and
+        // rejects it.
         let mut types = HashMap::new();
-        types.insert("cpu".to_string(), DataSourceType::Influxdb);
+        types.insert("cpu".to_string(), source_type);
         let exec = JobExecutor::new(map, store, ctx, types, HashMap::new());
 
         let err = exec.submit("ingest", HashMap::new()).await.unwrap_err();
@@ -920,5 +920,15 @@ spec:
             matches!(err, JobSubmitError::NonTransactionalDestination { .. }),
             "got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_influxdb_destination_as_non_transactional() {
+        assert_submit_rejects_non_transactional_destination(DataSourceType::Influxdb).await;
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_dynamodb_destination_as_non_transactional() {
+        assert_submit_rejects_non_transactional_destination(DataSourceType::Dynamodb).await;
     }
 }
