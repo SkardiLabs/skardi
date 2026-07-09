@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 600" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 700" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
   <title id="title">Skardi — Open Source Architecture</title>
-  <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, LanceDB, Apache Iceberg, SeekDB, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
+  <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, DynamoDB, InfluxDB 3, LanceDB, Apache Iceberg, SeekDB, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
 
   <defs>
     <style><![CDATA[
@@ -41,7 +41,7 @@
       @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
       /* Halo around skardi-server card */
-      .halo { animation: halo 3.6s ease-in-out infinite; transform-origin: 700px 325px; }
+      .halo { animation: halo 3.6s ease-in-out infinite; transform-origin: 700px 361px; }
       @keyframes halo {
         0%, 100% { opacity: 0.22; }
         50%      { opacity: 0.55; }
@@ -61,9 +61,9 @@
   </defs>
 
   <!-- ============== STAGE BACKGROUND ============== -->
-  <rect x="0" y="0" width="1280" height="600" fill="#ffffff"/>
-  <rect x="12" y="12" width="1256" height="576" rx="14" ry="14" fill="#ffffff" stroke="#d1d9e0"/>
-  <rect x="13" y="13" width="1254" height="574" rx="13" ry="13" fill="url(#grid)" opacity="0.7"/>
+  <rect x="0" y="0" width="1280" height="700" fill="#ffffff"/>
+  <rect x="12" y="12" width="1256" height="676" rx="14" ry="14" fill="#ffffff" stroke="#d1d9e0"/>
+  <rect x="13" y="13" width="1254" height="674" rx="13" ry="13" fill="url(#grid)" opacity="0.7"/>
 
   <!-- header tag -->
   <g transform="translate(36, 38)">
@@ -73,23 +73,23 @@
 
   <!-- ============== CONNECTOR FLOW LINES ============== -->
   <!-- Agent → server: tip lands on the card's outer left border -->
-  <path d="M 380 340 C 420 340, 470 340, 510 340"
+  <path d="M 380 376 C 420 376, 470 376, 510 376"
         fill="none" stroke="#0b8fd1" stroke-width="2.2" stroke-dasharray="8 8"
         class="flow-req" marker-end="url(#arrow-accent)"/>
-  <rect x="408" y="312" width="74" height="18" rx="4" ry="4" fill="#ffffff" opacity="0.94"/>
-  <text x="445" y="325" text-anchor="middle" class="mono accent upper b" font-size="13">SQL / REST</text>
+  <rect x="408" y="348" width="74" height="18" rx="4" ry="4" fill="#ffffff" opacity="0.94"/>
+  <text x="445" y="361" text-anchor="middle" class="mono accent upper b" font-size="13">SQL / REST</text>
 
   <!-- Server → sources: line starts at the card's outer right border -->
-  <path d="M 790 340 C 830 340, 880 340, 920 340"
+  <path d="M 790 376 C 830 376, 880 376, 920 376"
         fill="none" stroke="#bf6a02" stroke-width="2.2" stroke-dasharray="8 8"
         class="flow-data" marker-end="url(#arrow-warn)"/>
-  <rect x="818" y="312" width="74" height="18" rx="4" ry="4" fill="#ffffff" opacity="0.94"/>
-  <text x="855" y="325" text-anchor="middle" class="mono warn upper b" font-size="13">GOVERNED</text>
+  <rect x="818" y="348" width="74" height="18" rx="4" ry="4" fill="#ffffff" opacity="0.94"/>
+  <text x="855" y="361" text-anchor="middle" class="mono warn upper b" font-size="13">GOVERNED</text>
 
   <!-- ============== AGENT BOX (consolidated, 1x4 vertical) ============== -->
-  <text x="40" y="116" class="mono accent upper b" font-size="13">▍ Any AI Agent</text>
+  <text x="40" y="152" class="mono accent upper b" font-size="13">▍ Any AI Agent</text>
 
-  <g transform="translate(40, 130)">
+  <g transform="translate(40, 166)">
     <rect class="card" x="0" y="0" width="340" height="410" rx="12" ry="12"/>
 
     <!-- header bar -->
@@ -173,9 +173,9 @@
   </g>
 
   <!-- ============== SKARDI-SERVER (Agent Data Plane) ============== -->
-  <text x="510" y="96" class="mono accent upper b" font-size="13">▍ Agent Data Plane</text>
+  <text x="510" y="132" class="mono accent upper b" font-size="13">▍ Agent Data Plane</text>
 
-  <g transform="translate(510, 110)">
+  <g transform="translate(510, 146)">
     <rect class="card-accent" x="0" y="0" width="280" height="430" rx="12" ry="12"/>
 
     <!-- header (accent) -->
@@ -256,7 +256,7 @@
   <text x="920" y="66" class="mono ink3 upper b" font-size="13">▍ Sources</text>
 
   <g transform="translate(920, 80)">
-    <rect class="card" x="0" y="0" width="320" height="500" rx="12" ry="12"/>
+    <rect class="card" x="0" y="0" width="320" height="592" rx="12" ry="12"/>
 
     <!-- head -->
     <rect class="head-soft" x="1" y="1" width="318" height="40" rx="11" ry="11"/>
@@ -265,10 +265,10 @@
     <text x="16" y="26" class="mono ink3 upper b" font-size="13">Sources</text>
     <g transform="translate(266, 12)">
       <rect class="pill-base" width="38" height="18" rx="9" ry="9"/>
-      <text x="19" y="13" text-anchor="middle" class="mono ink3 b" font-size="11">10+</text>
+      <text x="19" y="13" text-anchor="middle" class="mono ink3 b" font-size="11">12+</text>
     </g>
 
-    <!-- 10 cells, 46h each starting at y=40 -->
+    <!-- 12 cells, 46h each starting at y=40 -->
     <g class="src-cells">
       <!-- PostgreSQL -->
       <g transform="translate(0, 40)">
@@ -329,8 +329,31 @@
         <text x="50" y="38" class="mono ink3" font-size="12">KV · cache</text>
       </g>
 
-      <!-- LanceDB -->
+      <!-- DynamoDB -->
       <g transform="translate(0, 270)">
+        <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
+        <g transform="translate(14, 9)" fill="none" stroke="#4053D6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <ellipse cx="12" cy="5" rx="7" ry="2.5" fill="#4053D6" fill-opacity=".15"/>
+          <path d="M5 5v14c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V5"/>
+          <path d="M13 9l-3 4.5h3l-2 3.5"/>
+        </g>
+        <text x="50" y="20" class="ink b" font-size="16">DynamoDB</text>
+        <text x="50" y="38" class="mono ink3" font-size="12">key-value</text>
+      </g>
+
+      <!-- InfluxDB -->
+      <g transform="translate(0, 316)">
+        <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
+        <g transform="translate(14, 9)" fill="none" stroke="#22ADF6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 4v16h18"/>
+          <path d="M6 15l4-6 3 4 4-7 2.5 4"/>
+        </g>
+        <text x="50" y="20" class="ink b" font-size="16">InfluxDB 3</text>
+        <text x="50" y="38" class="mono ink3" font-size="12">time series</text>
+      </g>
+
+      <!-- LanceDB -->
+      <g transform="translate(0, 362)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#0b8fd1" stroke-width="1.5" stroke-linejoin="round">
           <path d="M12 3l8 9-8 9-8-9 8-9Z" fill="#0b8fd1" fill-opacity=".15"/>
@@ -341,7 +364,7 @@
       </g>
 
       <!-- Iceberg -->
-      <g transform="translate(0, 316)">
+      <g transform="translate(0, 408)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#2B6FB0" stroke-width="1.5" stroke-linejoin="round">
           <path d="M6 12l3-7 3 4 4-3 2 6Z" fill="#2B6FB0" fill-opacity=".18"/>
@@ -353,7 +376,7 @@
       </g>
 
       <!-- SeekDB -->
-      <g transform="translate(0, 362)">
+      <g transform="translate(0, 454)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
           <circle cx="11" cy="11" r="6"/>
@@ -365,7 +388,7 @@
       </g>
 
       <!-- Files -->
-      <g transform="translate(0, 408)">
+      <g transform="translate(0, 500)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
           <path d="M6 3h9l4 4v14H6z" fill="#6a6f7a" fill-opacity=".10"/>
@@ -377,7 +400,7 @@
       </g>
 
       <!-- Object stores -->
-      <g transform="translate(0, 454)">
+      <g transform="translate(0, 546)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#E25444" stroke-width="1.5" stroke-linejoin="round">
           <path d="M5 7h14l-1 13H6Z" fill="#E25444" fill-opacity=".15"/>
