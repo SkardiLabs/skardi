@@ -134,20 +134,7 @@ impl DynamoTableProvider {
             );
         }
 
-        // Merge attributes across the sampled items; first observation of an
-        // attribute fixes its type. The SDK item maps iterate in arbitrary
-        // order, so sort by name afterwards to give a deterministic non-key
-        // column order across runs (keys are placed explicitly downstream).
-        let mut attrs: Vec<(String, DataType)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for item in items {
-            for (key, value) in item.iter() {
-                if seen.insert(key.clone()) {
-                    attrs.push((key.clone(), attribute_value_to_arrow_type(value)));
-                }
-            }
-        }
-        attrs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let attrs = merge_sampled_attributes(items);
 
         Ok(build_schema_fields(partition_key, sort_key, &attrs))
     }
@@ -156,6 +143,24 @@ impl DynamoTableProvider {
     fn plan_read(&self, pushable: &[Expr]) -> DFResult<DynamoRead> {
         classify_read(&self.partition_key, self.sort_key.as_deref(), pushable)
     }
+}
+
+/// Merge attributes across sampled items; the first observation of an
+/// attribute fixes its type. The SDK item maps iterate in arbitrary order, so
+/// the merged list is sorted by name to give a deterministic non-key column
+/// order across runs (keys are placed explicitly downstream).
+fn merge_sampled_attributes(items: &[HashMap<String, AttributeValue>]) -> Vec<(String, DataType)> {
+    let mut attrs: Vec<(String, DataType)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for item in items {
+        for (key, value) in item.iter() {
+            if seen.insert(key.clone()) {
+                attrs.push((key.clone(), attribute_value_to_arrow_type(value)));
+            }
+        }
+    }
+    attrs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    attrs
 }
 
 /// Build an ordered field list: key attributes first (non-nullable, in key
@@ -1962,7 +1967,9 @@ mod tests {
     use super::*;
     use arrow::array::Array;
     use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::{BinaryExpr, col, lit};
+    use datafusion::physical_plan::empty::EmptyExec;
 
     fn n(s: &str) -> AttributeValue {
         AttributeValue::N(s.to_string())
@@ -2096,6 +2103,19 @@ mod tests {
         assert!(expr.contains(", "));
         assert_eq!(names.len(), 2);
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn update_expression_placeholders_cannot_collide_with_pk_guard() {
+        // UPDATE execution reserves "#pk" for its attribute_exists() resurrect
+        // guard, so SET placeholders must stay in the #s/:s namespace — even
+        // for a column literally named "pk".
+        let sets = vec![("pk".to_string(), n("1")), ("note".to_string(), n("2"))];
+        let (expr, names, values) = build_update_expression(&sets);
+        assert_eq!(expr, "SET #s0 = :s0, #s1 = :s1");
+        assert!(!names.contains_key("#pk"));
+        assert!(names.keys().all(|k| k.starts_with("#s")));
+        assert!(values.keys().all(|k| k.starts_with(":s")));
     }
 
     #[test]
@@ -2361,6 +2381,30 @@ mod tests {
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
     }
 
+    #[test]
+    fn sampled_attribute_merge_is_sorted_and_first_type_wins() {
+        let items = vec![
+            HashMap::from([
+                ("zeta".to_string(), AttributeValue::S("x".into())),
+                ("alpha".to_string(), n("1")),
+            ]),
+            HashMap::from([
+                // Repeats `alpha` with a different type: the first observation
+                // fixed it, so this one must not flip the column type.
+                ("alpha".to_string(), AttributeValue::S("later".into())),
+                ("mid".to_string(), AttributeValue::Bool(true)),
+            ]),
+        ];
+        let attrs = merge_sampled_attributes(&items);
+        let names: Vec<&str> = attrs.iter().map(|(name, _)| name.as_str()).collect();
+        // HashMap iteration order is arbitrary, so the merged list must come
+        // back sorted for the inferred schema to be identical across runs.
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+        assert_eq!(attrs[0].1, DataType::Float64, "first-seen type wins");
+        assert_eq!(attrs[1].1, DataType::Boolean);
+        assert_eq!(attrs[2].1, DataType::Utf8);
+    }
+
     // ─── Item ⇄ RecordBatch conversion ──────────────────────────────────────
 
     #[test]
@@ -2456,11 +2500,38 @@ mod tests {
     }
 
     #[test]
-    fn av_to_string_formats_scalar_variants() {
-        assert_eq!(av_to_string(&AttributeValue::S("hi".into())), "hi");
-        assert_eq!(av_to_string(&n("9.99")), "9.99");
-        assert_eq!(av_to_string(&AttributeValue::Bool(true)), "true");
-        assert_eq!(av_to_string(&AttributeValue::Null(true)), "");
+    fn av_to_string_formats_scalars_and_maps_null_to_none() {
+        assert_eq!(
+            av_to_string(&AttributeValue::S("hi".into())).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(av_to_string(&n("9.99")).as_deref(), Some("9.99"));
+        assert_eq!(
+            av_to_string(&AttributeValue::Bool(true)).as_deref(),
+            Some("true")
+        );
+        // An explicit DynamoDB NULL is None (an Arrow null), not "".
+        assert_eq!(av_to_string(&AttributeValue::Null(true)), None);
+    }
+
+    #[test]
+    fn explicit_null_attribute_is_arrow_null_in_string_columns() {
+        // `UPDATE ... SET col = NULL` stores AttributeValue::Null; reading it
+        // back must yield a NULL cell, not the empty string "".
+        let values = vec![
+            Some(AttributeValue::S("a".into())),
+            Some(AttributeValue::Null(true)),
+        ];
+        let arr = attribute_values_to_arrow_array(&values, &DataType::Utf8);
+        let strs = arr.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strs.value(0), "a");
+        assert!(strs.is_null(1), "explicit NULL reads as NULL, not \"\"");
+
+        // The fallback arm (unsupported column types render as strings)
+        // applies the same rule.
+        let arr = attribute_values_to_arrow_array(&values, &DataType::Date32);
+        assert!(!arr.is_null(0));
+        assert!(arr.is_null(1));
     }
 
     // ─── Projection / key-condition expression builders ─────────────────────
@@ -2594,6 +2665,20 @@ mod tests {
     }
 
     #[test]
+    fn count_plan_properties_describe_single_count_row() {
+        // Must stay in lockstep with count_batch()/count_schema(): one bounded,
+        // final partition whose schema is the `{count}` row.
+        let props = count_plan_properties();
+        assert_eq!(
+            props.equivalence_properties().schema().as_ref(),
+            count_schema().as_ref()
+        );
+        assert_eq!(props.output_partitioning().partition_count(), 1);
+        assert_eq!(props.emission_type, EmissionType::Final);
+        assert_eq!(props.boundedness, Boundedness::Bounded);
+    }
+
+    #[test]
     fn parse_columns_option_accepts_int_and_bool_aliases() {
         let schema =
             parse_columns_option("qty:integer, active:boolean", "id", None).expect("valid columns");
@@ -2706,6 +2791,29 @@ mod tests {
             .await
             .expect_err("updating the key column must be rejected");
         assert!(err.to_string().contains("immutable"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn insert_plan_reports_count_output_not_input_schema() {
+        // DynamoInsertExec's execute() streams a single `{count}` batch, so its
+        // advertised plan properties must describe that shape — not the input's
+        // schema (which is what `input.properties()` would leak).
+        let provider = test_provider("id", None, true).await;
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(provider.schema()));
+        let ctx = SessionContext::new();
+        let plan = provider
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("insert plan");
+        assert_eq!(plan.schema().as_ref(), count_schema().as_ref());
+        assert_eq!(plan.properties().output_partitioning().partition_count(), 1);
+
+        // Optimizer passes rebuild nodes via with_new_children; the count
+        // shape must survive the rewrite.
+        let rebuilt = plan
+            .with_new_children(vec![Arc::new(EmptyExec::new(provider.schema()))])
+            .expect("with_new_children");
+        assert_eq!(rebuilt.schema().as_ref(), count_schema().as_ref());
     }
 
     // ─── Integration tests (require DynamoDB Local) ─────────────────────────
