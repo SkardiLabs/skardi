@@ -313,20 +313,20 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 
 | Type | CRUD | Description | Docs |
 |------|------|-------------|------|
-| CSV | Read | Local or remote CSV files | [docs/server.md](docs/server.md) |
-| Parquet | Read | Local or remote Parquet files | [docs/server.md](docs/server.md) |
-| JSON / NDJSON | Read | Local or remote JSON files | [docs/cli.md](docs/cli.md) |
 | PostgreSQL | Full | Table or catalog registration, pgvector KNN | [docs/postgres/](docs/postgres/) |
 | MySQL | Full | Table or catalog registration | [docs/mysql/](docs/mysql/) |
 | SQLite | Full | Table or catalog registration, sqlite-vec KNN, FTS | [docs/sqlite/](docs/sqlite/) |
 | MongoDB | Full | Collections with point lookups | [docs/mongo/](docs/mongo/) |
 | Redis | Full | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
-| SeekDB | Full | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
-| InfluxDB 3 | Read | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
 | DynamoDB | Full | Items mapped to SQL rows, scan + filter pushdown | [docs/dynamodb/](docs/dynamodb/) |
-| Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
+| SeekDB | Full | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
 | Lance | Read (job-write) | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
+| CSV | Read | Local or remote CSV files | [docs/server.md](docs/server.md) |
+| Parquet | Read | Local or remote Parquet files | [docs/server.md](docs/server.md) |
+| JSON / NDJSON | Read | Local or remote JSON files | [docs/cli.md](docs/cli.md) |
 | S3 / GCS / Azure | Read | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
+| Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
+| InfluxDB 3 | Read | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
 | Documents | Read | PDF/Office/ODF/image → per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
 
 ---
