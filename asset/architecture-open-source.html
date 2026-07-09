@@ -50,7 +50,7 @@
 
   .stage-wrap { position: relative; width: 100%; }
   .stage {
-    position: relative; width: 1280px; height: 640px;
+    position: relative; width: 1280px; height: 720px;
     background: var(--bg);
     border: 1px solid var(--line);
     border-radius: 12px;
@@ -209,9 +209,9 @@
   .ds-grid .grid { display: grid; grid-template-columns: 1fr; gap: 0; }
   .ds-grid .cell {
     display: flex; align-items: center; gap: 10px;
-    padding: 6px 14px;
+    padding: 9px 14px;
     border-top: 1px solid var(--line-soft);
-    min-height: 38px;
+    min-height: 42px;
   }
   .ds-grid .cell .logo { width: 22px; height: 22px; flex: none; display: grid; place-items: center; }
   .ds-grid .cell .logo svg { width: 100%; height: 100%; }
@@ -260,7 +260,7 @@
   <div class="stage" id="stage">
     <div class="stage-tag"><span class="dot"></span>SKARDI</div>
 
-    <svg class="diagram" viewBox="0 0 1280 640" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+    <svg class="diagram" viewBox="0 0 1280 720" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0,0 L10,5 L0,10 z" fill="#0b8fd1"/>
@@ -271,20 +271,20 @@
       </defs>
 
       <!-- Agent Box → skardi-server: SQL / REST request flow -->
-      <path d="M 446 317 C 530 317, 590 317, 660 317"
+      <path d="M 446 353 C 530 353, 590 353, 660 353"
             fill="none" stroke="#0b8fd1" stroke-width="1.6" stroke-dasharray="6 6"
             class="flow-req" marker-end="url(#arrow-accent)"/>
 
       <!-- skardi-server → Sources: governed data access -->
-      <path d="M 922 317 C 990 317, 1020 317, 1080 317"
+      <path d="M 922 353 C 990 353, 1020 353, 1080 353"
             fill="none" stroke="#bf6a02" stroke-width="1.6" stroke-dasharray="6 6"
             class="flow-data" marker-end="url(#arrow-warn)"/>
     </svg>
 
     <!-- ============ AGENT BOX (consolidated) ============ -->
-    <div class="anno" style="left: 60px; top: 194px; color: var(--accent);">▍ Any AI Agent</div>
+    <div class="anno" style="left: 60px; top: 230px; color: var(--accent);">▍ Any AI Agent</div>
 
-    <div class="agent-box" style="left: 60px; top: 220px; width: 386px;">
+    <div class="agent-box" style="left: 60px; top: 256px; width: 386px;">
       <div class="ab-head">
         <div class="robot" title="agent">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0b8fd1" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -356,9 +356,9 @@
     </div>
 
     <!-- ============ SKARDI-SERVER (Agent Data Plane) ============ -->
-    <div class="anno" style="left: 660px; top: 151px; color: var(--accent);">▍ Agent Data Plane</div>
+    <div class="anno" style="left: 660px; top: 187px; color: var(--accent);">▍ Agent Data Plane</div>
 
-    <div class="server" style="left: 660px; top: 177px; width: 262px;">
+    <div class="server" style="left: 660px; top: 213px; width: 262px;">
       <div class="head">
         <span style="display:grid; place-items:center; width:18px; height:18px;">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0b8fd1" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
@@ -565,8 +565,8 @@
     </div>
 
     <!-- Connector annotations -->
-    <div class="anno" style="left: 488px; top: 293px; color: var(--accent);">SQL / REST</div>
-    <div class="anno" style="left: 950px; top: 293px; color: var(--warn);">GOVERNED</div>
+    <div class="anno" style="left: 488px; top: 329px; color: var(--accent);">SQL / REST</div>
+    <div class="anno" style="left: 950px; top: 329px; color: var(--warn);">GOVERNED</div>
 
     <div class="stage-legend">
       <div><span class="swatch req"></span>SQL / REST</div>
@@ -579,7 +579,7 @@
     (function () {
       var wrap = document.getElementById('stage-wrap');
       var stage = document.getElementById('stage');
-      var W = 1280, H = 640;
+      var W = 1280, H = 720;
       function fit() {
         var avail = wrap.clientWidth;
         var scale = Math.min(1, avail / W);
