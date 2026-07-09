@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 600" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
   <title id="title">Skardi — Open Source Architecture</title>
-  <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, LanceDB, Apache Iceberg, SeekDB, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
+  <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, DynamoDB, InfluxDB 3, LanceDB, Apache Iceberg, SeekDB, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
 
   <defs>
     <style><![CDATA[
@@ -253,10 +253,10 @@
   </g>
 
   <!-- ============== SOURCES ============== -->
-  <text x="920" y="66" class="mono ink3 upper b" font-size="13">▍ Sources</text>
+  <text x="920" y="44" class="mono ink3 upper b" font-size="13">▍ Sources</text>
 
-  <g transform="translate(920, 80)">
-    <rect class="card" x="0" y="0" width="320" height="500" rx="12" ry="12"/>
+  <g transform="translate(920, 56)">
+    <rect class="card" x="0" y="0" width="320" height="520" rx="12" ry="12"/>
 
     <!-- head -->
     <rect class="head-soft" x="1" y="1" width="318" height="40" rx="11" ry="11"/>
@@ -265,127 +265,150 @@
     <text x="16" y="26" class="mono ink3 upper b" font-size="13">Sources</text>
     <g transform="translate(266, 12)">
       <rect class="pill-base" width="38" height="18" rx="9" ry="9"/>
-      <text x="19" y="13" text-anchor="middle" class="mono ink3 b" font-size="11">10+</text>
+      <text x="19" y="13" text-anchor="middle" class="mono ink3 b" font-size="11">12+</text>
     </g>
 
-    <!-- 10 cells, 46h each starting at y=40 -->
+    <!-- 12 cells, 40h each starting at y=40 -->
     <g class="src-cells">
       <!-- PostgreSQL -->
       <g transform="translate(0, 40)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#336791" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#336791" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">
           <path d="M5 9c0-3 2-5 5-5 2 0 3 .8 4 2 1-.7 2-1 3-1 3 0 4 2 4 4 0 2-1 3.3-2 4 0 2 .5 3.5-.5 5-1 1.5-3 2-5 2-1 0-2-.3-3-1-1 .5-2 1-3 1-2 0-3.5-1-3.5-3"/>
           <circle cx="9" cy="10" r=".8" fill="#336791" stroke="none"/>
           <path d="M14 11c-.5 1-.5 2 0 3"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">PostgreSQL</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">+ pgvector</text>
+        <text x="50" y="17" class="ink b" font-size="16">PostgreSQL</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">+ pgvector</text>
       </g>
 
       <!-- MySQL -->
-      <g transform="translate(0, 86)">
+      <g transform="translate(0, 80)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#00758F" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#00758F" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 14c2-4 6-6 10-6 3 0 5 1 7 3-2 0-3 1-4 2-1 1-3 2-5 2-3 0-5-.5-8-1Z"/>
           <path d="M16 11l3-2"/>
           <circle cx="18" cy="10" r=".5" fill="#00758F" stroke="none"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">MySQL</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">full CRUD</text>
+        <text x="50" y="17" class="ink b" font-size="16">MySQL</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">full CRUD</text>
       </g>
 
       <!-- SQLite -->
-      <g transform="translate(0, 132)">
+      <g transform="translate(0, 120)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#003B57" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#003B57" stroke-width="1.5" stroke-linejoin="round">
           <path d="M4 4h12l4 4v12H4z" fill="#0F80CC" fill-opacity=".18"/>
           <path d="M7 10c2-2 6-2 9 0M8 14c2-1.5 5-1.5 7 0"/>
           <path d="M16 4v4h4"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">SQLite</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">FTS · vec</text>
+        <text x="50" y="17" class="ink b" font-size="16">SQLite</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">FTS · vec</text>
       </g>
 
       <!-- MongoDB -->
-      <g transform="translate(0, 178)">
+      <g transform="translate(0, 160)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#13AA52" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#13AA52" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 2c2.5 4 4.5 7.5 4.5 11.5S14 20 12 22c-2-2-4.5-4.5-4.5-8.5S9.5 6 12 2Z" fill="#13AA52" fill-opacity=".15"/>
           <path d="M12 4v18"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">MongoDB</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">document</text>
+        <text x="50" y="17" class="ink b" font-size="16">MongoDB</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">document</text>
       </g>
 
       <!-- Redis -->
-      <g transform="translate(0, 224)">
+      <g transform="translate(0, 200)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#DC382C" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#DC382C" stroke-width="1.5" stroke-linejoin="round">
           <path d="M3 7l9-3 9 3-9 3-9-3Z" fill="#DC382C" fill-opacity=".18"/>
           <path d="M3 12l9 3 9-3"/>
           <path d="M3 17l9 3 9-3"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">Redis</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">KV · cache</text>
+        <text x="50" y="17" class="ink b" font-size="16">Redis</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">KV · cache</text>
+      </g>
+
+      <!-- DynamoDB -->
+      <g transform="translate(0, 240)">
+        <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
+        <g transform="translate(14, 8)" fill="none" stroke="#4053D6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <ellipse cx="12" cy="5" rx="7" ry="2.5" fill="#4053D6" fill-opacity=".15"/>
+          <path d="M5 5v14c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V5"/>
+          <path d="M13 9l-3 4.5h3l-2 3.5"/>
+        </g>
+        <text x="50" y="17" class="ink b" font-size="16">DynamoDB</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">key-value</text>
+      </g>
+
+      <!-- InfluxDB -->
+      <g transform="translate(0, 280)">
+        <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
+        <g transform="translate(14, 8)" fill="none" stroke="#22ADF6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 4v16h18"/>
+          <path d="M6 15l4-6 3 4 4-7 2.5 4"/>
+        </g>
+        <text x="50" y="17" class="ink b" font-size="16">InfluxDB 3</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">time series</text>
       </g>
 
       <!-- LanceDB -->
-      <g transform="translate(0, 270)">
+      <g transform="translate(0, 320)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#0b8fd1" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#0b8fd1" stroke-width="1.5" stroke-linejoin="round">
           <path d="M12 3l8 9-8 9-8-9 8-9Z" fill="#0b8fd1" fill-opacity=".15"/>
           <path d="M12 3v18M4 12h16"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">LanceDB</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">KNN · BM25</text>
+        <text x="50" y="17" class="ink b" font-size="16">LanceDB</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">KNN · BM25</text>
       </g>
 
       <!-- Iceberg -->
-      <g transform="translate(0, 316)">
+      <g transform="translate(0, 360)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#2B6FB0" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#2B6FB0" stroke-width="1.5" stroke-linejoin="round">
           <path d="M6 12l3-7 3 4 4-3 2 6Z" fill="#2B6FB0" fill-opacity=".18"/>
           <path d="M3 13h18" stroke-dasharray="2 2"/>
           <path d="M5 13l4 6 6-1 4-5" fill="#2B6FB0" fill-opacity=".10"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">Iceberg</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">partitioned</text>
+        <text x="50" y="17" class="ink b" font-size="16">Iceberg</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">partitioned</text>
       </g>
 
       <!-- SeekDB -->
-      <g transform="translate(0, 362)">
+      <g transform="translate(0, 400)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
           <circle cx="11" cy="11" r="6"/>
           <path d="M16 16l4 4"/>
           <circle cx="11" cy="11" r="2" fill="#6a6f7a" fill-opacity=".30"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">SeekDB</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">FTS · HNSW</text>
+        <text x="50" y="17" class="ink b" font-size="16">SeekDB</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">FTS · HNSW</text>
       </g>
 
       <!-- Files -->
-      <g transform="translate(0, 408)">
+      <g transform="translate(0, 440)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
           <path d="M6 3h9l4 4v14H6z" fill="#6a6f7a" fill-opacity=".10"/>
           <path d="M15 3v4h4"/>
           <path d="M9 12h7M9 15h5M9 18h7"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">CSV · Parquet · JSON</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">files</text>
+        <text x="50" y="17" class="ink b" font-size="16">CSV · Parquet · JSON</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">files</text>
       </g>
 
       <!-- Object stores -->
-      <g transform="translate(0, 454)">
+      <g transform="translate(0, 480)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
-        <g transform="translate(14, 9)" fill="none" stroke="#E25444" stroke-width="1.5" stroke-linejoin="round">
+        <g transform="translate(14, 8)" fill="none" stroke="#E25444" stroke-width="1.5" stroke-linejoin="round">
           <path d="M5 7h14l-1 13H6Z" fill="#E25444" fill-opacity=".15"/>
           <path d="M5 7c0-2 3-3 7-3s7 1 7 3"/>
           <path d="M9 11v5M15 11v5"/>
         </g>
-        <text x="50" y="20" class="ink b" font-size="16">S3 · GCS · Azure</text>
-        <text x="50" y="38" class="mono ink3" font-size="12">object store</text>
+        <text x="50" y="17" class="ink b" font-size="16">S3 · GCS · Azure</text>
+        <text x="50" y="34" class="mono ink3" font-size="12">object store</text>
       </g>
     </g>
   </g>
