@@ -1,0 +1,9 @@
+kind: pipeline
+
+metadata:
+  name: "filter_by_category"
+  version: "1.0"
+  description: "Filter products by category (pushed down as a DynamoDB FilterExpression)"
+
+spec:
+  query: "SELECT * FROM products WHERE category = {category}"

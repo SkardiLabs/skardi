@@ -411,6 +411,7 @@ pub async fn get_data_sources(
             DataSourceType::Seekdb => "seekdb",
             DataSourceType::Influxdb => "influxdb",
             DataSourceType::Documents => "documents",
+            DataSourceType::Dynamodb => "dynamodb",
         };
 
         // Determine path or URL based on source type
@@ -426,7 +427,8 @@ pub async fn get_data_sources(
             | DataSourceType::Mongo
             | DataSourceType::Redis
             | DataSourceType::Seekdb
-            | DataSourceType::Influxdb => None,
+            | DataSourceType::Influxdb
+            | DataSourceType::Dynamodb => None,
         };
 
         let url = match data_source.source_type {
@@ -435,7 +437,8 @@ pub async fn get_data_sources(
             | DataSourceType::Mongo
             | DataSourceType::Redis
             | DataSourceType::Seekdb
-            | DataSourceType::Influxdb => {
+            | DataSourceType::Influxdb
+            | DataSourceType::Dynamodb => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()
@@ -1588,5 +1591,35 @@ spec:
         } else {
             panic!("Expected second row to be an object");
         }
+    }
+
+    #[tokio::test]
+    async fn get_data_sources_reports_dynamodb_as_url_source() {
+        let app_state = create_test_app_state().await;
+        {
+            let mut config = app_state.config.write().unwrap();
+            config.data_sources.push(DataSource {
+                name: "products".to_string(),
+                source_type: DataSourceType::Dynamodb,
+                path: PathBuf::new(),
+                connection_string: Some("http://localhost:8000".to_string()),
+                schema: None,
+                options: None,
+                hierarchy_level: Default::default(),
+                access_mode: AccessMode::ReadWrite,
+                enable_cache: false,
+                description: None,
+            });
+        }
+
+        let Json(body) = get_data_sources(State(app_state)).await.unwrap();
+        let data = body["data"].as_array().unwrap();
+        let entry = data
+            .iter()
+            .find(|d| d["name"] == "products")
+            .expect("dynamodb source should be listed");
+        assert_eq!(entry["type"], "dynamodb");
+        assert!(entry["path"].is_null(), "db sources expose no path");
+        assert_eq!(entry["url"], "http://localhost:8000");
     }
 }

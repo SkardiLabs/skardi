@@ -17,6 +17,7 @@ pub enum DataSourceType {
     Seekdb,
     Influxdb,
     Documents,
+    Dynamodb,
 }
 
 impl DataSourceType {
@@ -34,6 +35,7 @@ impl DataSourceType {
             Self::Seekdb => "seekdb",
             Self::Influxdb => "influxdb",
             Self::Documents => "documents",
+            Self::Dynamodb => "dynamodb",
         }
     }
 }
@@ -53,5 +55,12 @@ mod tests {
         let t: DataSourceType = serde_yaml::from_str("documents").unwrap();
         assert_eq!(t, DataSourceType::Documents);
         assert_eq!(t.as_str(), "documents");
+    }
+
+    #[test]
+    fn dynamodb_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("dynamodb").unwrap();
+        assert_eq!(t, DataSourceType::Dynamodb);
+        assert_eq!(t.as_str(), "dynamodb");
     }
 }

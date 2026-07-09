@@ -1,0 +1,14 @@
+kind: pipeline
+
+metadata:
+  name: "federated_join"
+  version: "1.0"
+  description: "Join CSV inventory with the DynamoDB products table"
+
+spec:
+  query: |
+    SELECT p.product_id, p.name, p.category, p.price, SUM(i.quantity) AS total_quantity
+    FROM products p
+    JOIN csv_inventory i ON p.product_id = i.product_id
+    WHERE p.category = {category}
+    GROUP BY p.product_id, p.name, p.category, p.price

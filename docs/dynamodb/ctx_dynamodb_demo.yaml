@@ -1,0 +1,31 @@
+kind: context
+
+metadata:
+  name: ctx_dynamodb_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "products"
+      type: "dynamodb"
+      access_mode: "read_write"
+      # Endpoint URL. For DynamoDB Local use http://localhost:8000.
+      # For Amazon DynamoDB use the regional endpoint, e.g.
+      #   https://dynamodb.us-east-1.amazonaws.com
+      connection_string: "http://localhost:8000"
+      description: "DynamoDB products table"
+      options:
+        table: "products"
+        partition_key: "product_id"
+        region: "us-east-1"
+        # Optional: read static AWS credentials from environment variables.
+        # When omitted, the default AWS credential provider chain is used
+        # (env vars, shared config, IAM role, etc.).
+        access_key_env: "AWS_ACCESS_KEY_ID"
+        secret_key_env: "AWS_SECRET_ACCESS_KEY"
+
+    # CSV data source (for the federated query demo)
+    - name: "csv_inventory"
+      type: "csv"
+      path: "docs/sample_data/product_inventory.csv"
+      description: "CSV file containing product inventory data"

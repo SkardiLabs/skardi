@@ -45,6 +45,7 @@ use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_ud
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry,
+    dynamodb::register_dynamodb_tables,
     iceberg::register_iceberg_table,
     influxdb::register_influxdb_tables,
     lance::register_lance_table,
@@ -913,6 +914,23 @@ async fn register_source(
             register_influxdb_tables(session_ctx, &source.name, conn_str, source.options.as_ref())
                 .await
                 .with_context(|| format!("Failed to register InfluxDB '{}'", source.name))?;
+        }
+        "dynamodb" => {
+            let endpoint = source.connection_string.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DynamoDB source '{}': connection_string (endpoint URL) required",
+                    source.name
+                )
+            })?;
+            register_dynamodb_tables(
+                session_ctx,
+                &source.name,
+                endpoint,
+                source.options.as_ref(),
+                source.is_read_write(),
+            )
+            .await
+            .with_context(|| format!("Failed to register DynamoDB '{}'", source.name))?;
         }
         "lance" => {
             let path_str = source
@@ -2772,6 +2790,53 @@ spec:
                 msg.contains("only-this-one"),
                 "error should list known pipelines: {msg}"
             );
+        }
+    }
+
+    // Guards for the `dynamodb` arm of `register_source`. Both failure modes
+    // trip before any network call, so no live endpoint is needed.
+    mod register_dynamodb_source {
+        use super::*;
+
+        fn dynamodb_source(connection_string: Option<&str>) -> LocalDataSource {
+            LocalDataSource {
+                name: "products".to_string(),
+                source_type: "dynamodb".to_string(),
+                path: None,
+                connection_string: connection_string.map(String::from),
+                options: None,
+                hierarchy_level: HierarchyLevel::default(),
+                access_mode: None,
+                description: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn errors_without_connection_string() {
+            let (mut session_ctx, registry) = new_session_context();
+            let err = register_source(&mut session_ctx, &dynamodb_source(None), &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("connection_string (endpoint URL) required"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_without_options() {
+            let (mut session_ctx, registry) = new_session_context();
+            let source = dynamodb_source(Some("http://localhost:8000"));
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("Failed to register DynamoDB 'products'"),
+                "unexpected error: {msg}"
+            );
+            assert!(msg.contains("requires options"), "unexpected error: {msg}");
         }
     }
 }

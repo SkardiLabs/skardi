@@ -57,6 +57,8 @@ candle-transformers = { version = "0.8", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
 text-splitter = { version = "0.30", features = ["markdown"], optional = true }
 # sources
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1"
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 derivative = "2.2.0"

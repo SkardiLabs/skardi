@@ -5,6 +5,7 @@ use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+use skardi::sources::providers::dynamodb::register_dynamodb_tables;
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::influxdb::register_influxdb_tables;
 use skardi::sources::providers::lance::register_lance_table;
@@ -209,7 +210,7 @@ pub enum ConfigError {
     S3ObjectStoreRegistrationFailed { name: String, error: String },
 
     #[error(
-        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', 'redis', and 'seekdb' sources support read_write mode."
+        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', 'redis', 'seekdb', and 'dynamodb' sources support read_write mode."
     )]
     UnsupportedWriteMode {
         name: String,
@@ -717,6 +718,7 @@ const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
     DataSourceType::Mongo,
     DataSourceType::Redis,
     DataSourceType::Seekdb,
+    DataSourceType::Dynamodb,
 ];
 
 /// Validate data source configurations
@@ -796,7 +798,8 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 | DataSourceType::Mongo
                 | DataSourceType::Redis
                 | DataSourceType::Seekdb
-                | DataSourceType::Influxdb,
+                | DataSourceType::Influxdb
+                | DataSourceType::Dynamodb,
                 false,
             ) => {
                 // For database connections, ensure connection string is provided
@@ -969,7 +972,8 @@ async fn register_data_source(
             | DataSourceType::Mongo
             | DataSourceType::Redis
             | DataSourceType::Seekdb
-            | DataSourceType::Influxdb,
+            | DataSourceType::Influxdb
+            | DataSourceType::Dynamodb,
             _,
         ) => {
             // Database sources don't need file path validation
@@ -1260,6 +1264,42 @@ async fn register_data_source(
             .await
             .map_err(|e| {
                 tracing::error!("MongoDB registration failed for '{}': {:?}", source.name, e);
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Dynamodb => {
+            tracing::info!("Registering DynamoDB table: {}", source.name);
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            tracing::debug!(
+                "Endpoint for {}: {} (options: {:?})",
+                source.name,
+                connection_string,
+                source.options
+            );
+
+            register_dynamodb_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+                source.access_mode.is_read_write(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "DynamoDB registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
@@ -2165,5 +2205,101 @@ options:
             error.to_string(),
             "Duplicate data source name: duplicate_source"
         );
+    }
+
+    fn dynamodb_source(
+        name: &str,
+        connection_string: Option<&str>,
+        options: Option<HashMap<String, String>>,
+        access_mode: AccessMode,
+    ) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::Dynamodb,
+            path: PathBuf::new(),
+            connection_string: connection_string.map(String::from),
+            schema: None,
+            options,
+            hierarchy_level: HierarchyLevel::default(),
+            access_mode,
+            enable_cache: false,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_dynamodb_read_write() {
+        let source = dynamodb_source(
+            "products",
+            Some("http://localhost:8000"),
+            None,
+            AccessMode::ReadWrite,
+        );
+        validate_data_sources(&[source]).expect("dynamodb supports read_write");
+    }
+
+    #[test]
+    fn validate_rejects_dynamodb_without_connection_string() {
+        let source = dynamodb_source("products", None, None, AccessMode::ReadOnly);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingConnectionString { name } if name == "products"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn unsupported_write_mode_error_lists_dynamodb() {
+        let err = ConfigError::UnsupportedWriteMode {
+            name: "events".to_string(),
+            source_type: DataSourceType::Csv,
+        };
+        assert!(err.to_string().contains("'dynamodb'"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn register_dynamodb_without_connection_string_errors() {
+        let mut session_ctx = SessionContext::new();
+        let source = dynamodb_source("products", None, None, AccessMode::ReadOnly);
+        let err = register_data_sources(&mut session_ctx, &[source])
+            .await
+            .unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingConnectionString { name } if name == "products"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dynamodb_without_options_reports_registration_failure() {
+        let mut session_ctx = SessionContext::new();
+        // `register_dynamodb_tables` fails before any network call when no
+        // options are provided, so this exercises the registration arm and
+        // its error mapping without a live endpoint.
+        let source = dynamodb_source(
+            "products",
+            Some("http://localhost:8000"),
+            None,
+            AccessMode::ReadOnly,
+        );
+        let err = register_data_sources(&mut session_ctx, &[source])
+            .await
+            .unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        match config_err {
+            ConfigError::DataSourceRegistrationFailed { name, error } => {
+                assert_eq!(name, "products");
+                assert!(error.contains("requires options"), "got {error}");
+            }
+            other => panic!("expected DataSourceRegistrationFailed, got {other}"),
+        }
     }
 }

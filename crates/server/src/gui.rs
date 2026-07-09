@@ -320,6 +320,7 @@ fn data_source_type_str(t: &DataSourceType) -> &'static str {
         DataSourceType::Seekdb => "seekdb",
         DataSourceType::Influxdb => "influxdb",
         DataSourceType::Documents => "documents",
+        DataSourceType::Dynamodb => "dynamodb",
     }
 }
 
@@ -455,4 +456,14 @@ pub async fn serve_dashboard(State(app_state): State<AppState>) -> axum::respons
         .replace("{{JOBS_CONTENT}}", &jobs_html)
         .replace("{{SEMANTICS_CONTENT}}", &semantics_html);
     axum::response::Html(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_source_type_str_covers_dynamodb() {
+        assert_eq!(data_source_type_str(&DataSourceType::Dynamodb), "dynamodb");
+    }
 }

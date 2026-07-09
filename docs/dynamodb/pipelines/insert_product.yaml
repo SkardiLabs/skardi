@@ -1,0 +1,11 @@
+kind: pipeline
+
+metadata:
+  name: "insert_product"
+  version: "1.0"
+  description: "Insert (put) a single product"
+
+spec:
+  query: |
+    INSERT INTO products (product_id, name, category, price, in_stock)
+    VALUES ({product_id}, {name}, {category}, {price}, {in_stock})

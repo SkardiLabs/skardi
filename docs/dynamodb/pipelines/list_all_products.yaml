@@ -1,0 +1,9 @@
+kind: pipeline
+
+metadata:
+  name: "list_all_products"
+  version: "1.0"
+  description: "Full scan of all products"
+
+spec:
+  query: "SELECT * FROM products"
