@@ -135,8 +135,9 @@ impl DynamoTableProvider {
         }
 
         // Merge attributes across the sampled items; first observation of an
-        // attribute fixes its type. Ordering is stable across environments
-        // because it follows first-seen order over a fixed-size sample.
+        // attribute fixes its type. The SDK item maps iterate in arbitrary
+        // order, so sort by name afterwards to give a deterministic non-key
+        // column order across runs (keys are placed explicitly downstream).
         let mut attrs: Vec<(String, DataType)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for item in items {
@@ -146,6 +147,7 @@ impl DynamoTableProvider {
                 }
             }
         }
+        attrs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         Ok(build_schema_fields(partition_key, sort_key, &attrs))
     }
@@ -326,6 +328,7 @@ impl TableProvider for DynamoTableProvider {
             client: self.client.clone(),
             table_name: self.table_name.clone(),
             schema: self.schema.clone(),
+            properties: count_plan_properties(),
             partition_key: self.partition_key.clone(),
             upsert,
         }))
@@ -573,7 +576,7 @@ pub(crate) fn attribute_values_to_arrow_array(
         DataType::Utf8 => {
             let arr: StringArray = values
                 .iter()
-                .map(|v| v.as_ref().map(av_to_string))
+                .map(|v| v.as_ref().and_then(av_to_string))
                 .collect();
             Arc::new(arr)
         }
@@ -608,20 +611,24 @@ pub(crate) fn attribute_values_to_arrow_array(
         _ => {
             let arr: StringArray = values
                 .iter()
-                .map(|v| v.as_ref().map(av_to_string))
+                .map(|v| v.as_ref().and_then(av_to_string))
                 .collect();
             Arc::new(arr)
         }
     }
 }
 
-fn av_to_string(v: &AttributeValue) -> String {
+/// Render a scalar attribute as the string form for a Utf8 column. An explicit
+/// DynamoDB `NULL` maps to `None` (Arrow null) rather than an empty string, so a
+/// SQL NULL written via `UPDATE ... SET col = NULL` round-trips as NULL instead
+/// of `""`.
+fn av_to_string(v: &AttributeValue) -> Option<String> {
     match v {
-        AttributeValue::S(s) => s.clone(),
-        AttributeValue::N(n) => n.clone(),
-        AttributeValue::Bool(b) => b.to_string(),
-        AttributeValue::Null(_) => String::new(),
-        other => format!("{other:?}"),
+        AttributeValue::S(s) => Some(s.clone()),
+        AttributeValue::N(n) => Some(n.clone()),
+        AttributeValue::Bool(b) => Some(b.to_string()),
+        AttributeValue::Null(_) => None,
+        other => Some(format!("{other:?}")),
     }
 }
 
@@ -1398,7 +1405,11 @@ struct DynamoInsertExec {
     input: Arc<dyn ExecutionPlan>,
     client: Client,
     table_name: String,
+    /// Target-table schema, used to shape input batches into items to write.
     schema: SchemaRef,
+    /// Properties of this node's own output (`{ count }`), distinct from
+    /// `input`'s schema — `execute` streams a count, not the inserted rows.
+    properties: PlanProperties,
     partition_key: String,
     /// True for INSERT OVERWRITE/REPLACE (upsert via `BatchWriteItem`); false
     /// for plain INSERT (Append), which uses a conditional `PutItem` so a
@@ -1485,7 +1496,7 @@ impl ExecutionPlan for DynamoInsertExec {
         self
     }
     fn properties(&self) -> &PlanProperties {
-        self.input.properties()
+        &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
@@ -1499,6 +1510,7 @@ impl ExecutionPlan for DynamoInsertExec {
             client: self.client.clone(),
             table_name: self.table_name.clone(),
             schema: self.schema.clone(),
+            properties: self.properties.clone(),
             partition_key: self.partition_key.clone(),
             upsert: self.upsert,
         }))
@@ -1581,18 +1593,11 @@ struct DynamoDmlExec {
 
 impl DynamoDmlExec {
     fn new(handle: DynamoHandle, op: DynamoDmlOp) -> Self {
-        let schema = count_schema();
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        );
         Self {
             handle,
             op,
-            schema,
-            properties,
+            schema: count_schema(),
+            properties: count_plan_properties(),
         }
     }
 }
@@ -1652,23 +1657,43 @@ impl ExecutionPlan for DynamoDmlExec {
                         .matching_keys(&plan)
                         .await
                         .map_err(|e| DataFusionError::External(e.into()))?;
-                    let (expr, names, values) = build_update_expression(&sets);
+                    let (expr, mut names, values) = build_update_expression(&sets);
+                    // Guard against resurrecting a row deleted between key
+                    // resolution and this update: DynamoDB's UpdateItem creates
+                    // the item if absent, so without a condition a concurrently
+                    // deleted row would come back as key attributes plus the SET
+                    // fields. `attribute_exists` on the partition key (which can
+                    // never be a SET target, so `#pk` won't collide with `#s*`)
+                    // makes the update a no-op for a vanished row.
+                    names.insert("#pk".to_string(), handle.partition_key.clone());
                     let mut n = 0u64;
                     for key in keys {
-                        handle
+                        let result = handle
                             .client
                             .update_item()
                             .table_name(&handle.table_name)
                             .set_key(Some(key))
                             .update_expression(&expr)
+                            .condition_expression("attribute_exists(#pk)")
                             .set_expression_attribute_names(Some(names.clone()))
                             .set_expression_attribute_values(Some(values.clone()))
                             .send()
-                            .await
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!("DynamoDB update failed: {e}"))
-                            })?;
-                        n += 1;
+                            .await;
+                        match result {
+                            Ok(_) => n += 1,
+                            // Row disappeared after matching_keys(); skip it
+                            // rather than recreating a partial item or failing
+                            // the whole statement.
+                            Err(e)
+                                if e.as_service_error().is_some_and(|se| {
+                                    se.is_conditional_check_failed_exception()
+                                }) => {}
+                            Err(e) => {
+                                return Err(DataFusionError::Execution(format!(
+                                    "DynamoDB update failed: {e}"
+                                )));
+                            }
+                        }
                     }
                     n
                 }
@@ -1710,6 +1735,18 @@ fn count_schema() -> SchemaRef {
         DataType::UInt64,
         false,
     )]))
+}
+
+/// `PlanProperties` for an insert/DML leaf whose execution emits a single
+/// `{ count }` row. Kept in sync with the schema returned by `execute` so
+/// planning/introspection see the real output shape, not the input's.
+fn count_plan_properties() -> PlanProperties {
+    PlanProperties::new(
+        EquivalenceProperties::new(count_schema()),
+        Partitioning::UnknownPartitioning(1),
+        EmissionType::Final,
+        Boundedness::Bounded,
+    )
 }
 
 fn count_batch(count: u64) -> DFResult<RecordBatch> {
@@ -2382,13 +2419,19 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0].get("id"), Some(AttributeValue::S(s)) if s == "A"));
         assert!(matches!(items[0].get("qty"), Some(AttributeValue::N(n)) if n == "7"));
-        assert!(matches!(items[0].get("active"), Some(AttributeValue::Bool(true))));
+        assert!(matches!(
+            items[0].get("active"),
+            Some(AttributeValue::Bool(true))
+        ));
         // Row 1 had a NULL qty → the attribute is absent, not a typed NULL.
         assert!(
             !items[1].contains_key("qty"),
             "NULL cell omits the attribute"
         );
-        assert!(matches!(items[1].get("active"), Some(AttributeValue::Bool(false))));
+        assert!(matches!(
+            items[1].get("active"),
+            Some(AttributeValue::Bool(false))
+        ));
     }
 
     #[test]
@@ -2406,7 +2449,10 @@ mod tests {
         let bools = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(bools.value(0));
         // A non-bool attribute in a Boolean column coerces to NULL, never `true`.
-        assert!(bools.is_null(1), "non-bool attribute is NULL in a Boolean column");
+        assert!(
+            bools.is_null(1),
+            "non-bool attribute is NULL in a Boolean column"
+        );
     }
 
     #[test]
@@ -2549,8 +2595,8 @@ mod tests {
 
     #[test]
     fn parse_columns_option_accepts_int_and_bool_aliases() {
-        let schema = parse_columns_option("qty:integer, active:boolean", "id", None)
-            .expect("valid columns");
+        let schema =
+            parse_columns_option("qty:integer, active:boolean", "id", None).expect("valid columns");
         assert_eq!(schema.field(1).data_type(), &DataType::Int64);
         assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
     }
@@ -2604,7 +2650,9 @@ mod tests {
         let handle = test_provider("pk", Some("sk"), false).await.clone_handle();
         // Composite-key table but the item lacks the sort key.
         let item = HashMap::from([("pk".to_string(), AttributeValue::S("A".into()))]);
-        let err = handle.key_of(&item).expect_err("missing sort key must error");
+        let err = handle
+            .key_of(&item)
+            .expect_err("missing sort key must error");
         assert!(err.to_string().contains("sort key"), "got: {err}");
     }
 
