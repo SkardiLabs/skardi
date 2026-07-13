@@ -274,6 +274,37 @@ curl -X POST http://localhost:8080/federated_join/execute \
 Writes (INSERT/UPDATE/DELETE) additionally require `access_mode: read_write` on
 the source; the default `read_only` rejects them at plan time.
 
+### Catalog mode
+
+Set `hierarchy_level: "catalog"` to expose multiple DynamoDB tables under one
+DataFusion catalog. DynamoDB has no native schema layer, so Skardi registers
+tables under the fixed `tables` schema:
+
+```yaml
+kind: context
+metadata:
+  name: dynamodb-catalog
+spec:
+  data_sources:
+    - name: "ddb"
+      type: "dynamodb"
+      hierarchy_level: "catalog"
+      connection_string: "http://localhost:8000"
+      options:
+        region: "us-east-1"
+        allowed_tables: "products,orders" # optional; omit to discover all tables
+```
+
+```sql
+SELECT * FROM ddb.tables.products LIMIT 10;
+```
+
+When `allowed_tables` is present, Skardi registers only those table names and
+does not call `ListTables`. When it is omitted, Skardi discovers tables with
+`ListTables`. Catalog registration is best-effort: if one table cannot be
+described or sampled for schema inference, that table is skipped with a warning
+and the remaining tables continue to load.
+
 ### Read planning (key-aware access)
 
 Skardi inspects each query's `WHERE` clause and picks the cheapest DynamoDB

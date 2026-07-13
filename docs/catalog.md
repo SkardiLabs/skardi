@@ -2,7 +2,7 @@
 
 Instead of registering tables one by one, set `hierarchy_level: "catalog"` on a data source to load the entire database automatically. Every table and view is registered under a named DataFusion catalog and queried with a three-part reference.
 
-Supported for **PostgreSQL**, **MySQL**, and **SQLite**.
+Supported for **PostgreSQL**, **MySQL**, **SQLite**, **SeekDB**, and **DynamoDB**.
 
 ## Configuration
 
@@ -36,6 +36,9 @@ SELECT * FROM mydb_catalog.public.users LIMIT 10;
 
 -- SQLite (schema is always "main")
 SELECT * FROM mydb_catalog.main.users LIMIT 10;
+
+-- DynamoDB (schema is always "tables")
+SELECT * FROM ddb_catalog.tables.products LIMIT 10;
 ```
 
 ## Working Examples
@@ -44,3 +47,4 @@ See the docs directories for full working examples:
 - [docs/postgres/](postgres/) — `ctx_postgres_catalog_demo.yaml`
 - [docs/mysql/](mysql/) — `ctx_mysql_catalog_demo.yaml`
 - [docs/sqlite/](sqlite/) — `ctx_sqlite_catalog_demo.yaml`
+- [docs/dynamodb/](dynamodb/) — use `hierarchy_level: "catalog"` with optional `allowed_tables`
