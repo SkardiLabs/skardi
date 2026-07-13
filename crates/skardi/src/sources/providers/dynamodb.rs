@@ -43,6 +43,13 @@ use futures::StreamExt;
 use futures::stream::{self, Stream};
 
 use super::is_pushable_binary_filter;
+use crate::sources::DataSourceType;
+use crate::sources::hierarchy::{HierarchyLevel, SourceLabel, build_catalog, retry_with_timeout};
+
+/// Schema name used for DynamoDB catalog mode. DynamoDB has no native schema/database
+/// layer; all tables live under a single endpoint/region. We expose them under a fixed
+/// schema so SQL references are consistently three-part: `catalog.tables.<table>`.
+const DYNAMODB_CATALOG_SCHEMA: &str = "tables";
 
 /// Maximum items sampled to infer a schema when no explicit `columns` option is
 /// given. Merging several items (rather than one) makes the inferred column set
@@ -51,6 +58,10 @@ const SCHEMA_SAMPLE_SIZE: i32 = 50;
 
 /// DynamoDB `BatchWriteItem` accepts at most 25 write requests per call.
 const BATCH_WRITE_CHUNK: usize = 25;
+
+/// Maximum tables returned per `ListTables` page. AWS allows up to 100; we use the
+/// default and follow `last_evaluated_table_name` when present.
+const LIST_TABLES_PAGE_SIZE: i32 = 100;
 
 /// A DynamoDB table exposed to DataFusion as a `TableProvider`.
 pub struct DynamoTableProvider {
@@ -1761,45 +1772,85 @@ fn count_batch(count: u64) -> DFResult<RecordBatch> {
 
 // ─── Registration ───────────────────────────────────────────────────────────
 
-/// Register a DynamoDB table as a DataFusion table.
+/// Register a DynamoDB table or a whole account/endpoint (catalog) into a DataFusion
+/// [`SessionContext`].
+///
+/// Single-table mode (default) registers one table under `name`. Catalog mode discovers all
+/// accessible DynamoDB tables via `ListTables` and registers each one under
+/// `name.tables.<table_name>`.
 ///
 /// # Arguments
-/// * `session_ctx` - session context to register the table into.
-/// * `name` - the SQL table name to expose.
+/// * `session_ctx` - session context to register the table(s) into.
+/// * `name` - the SQL table name (table mode) or catalog name (catalog mode) to expose.
 /// * `connection_string` - the DynamoDB endpoint URL. For Amazon DynamoDB use
 ///   the regional endpoint (e.g. `https://dynamodb.us-east-1.amazonaws.com`);
 ///   for DynamoDB Local use `http://localhost:8000`.
 /// * `options` - configuration options (see below).
+/// * `read_write` - gates DML for every table registered.
+/// * `hierarchy_level` - [`HierarchyLevel::Table`] (default) or [`HierarchyLevel::Catalog`].
 ///
 /// # Options
-/// * `table` - DynamoDB table name (required).
-/// * `partition_key` - partition (hash) key attribute name. Optional: the key
+/// * `table` - DynamoDB table name (required in table mode; not allowed in catalog mode).
+/// * `partition_key` - partition (hash) key attribute name. Optional in table mode: the key
 ///   schema is read authoritatively via `DescribeTable`; this is only a fallback
 ///   used when `DescribeTable` is unavailable (e.g. restricted IAM permissions).
-/// * `sort_key` - sort (range) key attribute name. Optional and likewise
-///   auto-detected from `DescribeTable`; only a fallback otherwise.
+///   Ignored in catalog mode.
+/// * `sort_key` - sort (range) key attribute name. Optional in table mode and likewise
+///   auto-detected from `DescribeTable`; ignored in catalog mode.
 /// * `region` - AWS region (optional, default `us-east-1`).
 /// * `access_key_env` / `secret_key_env` - names of environment variables
 ///   holding static AWS credentials (optional). When omitted, the default AWS
 ///   credential provider chain is used.
 /// * `columns` - explicit column schema as `name:type[,name:type…]` (types:
-///   `string`, `int`, `float`, `bool`). Optional; when omitted the schema is
-///   inferred by sampling. Declaring it makes writes to an empty table possible
-///   (inference can't see attributes absent from every sampled item) and pins a
-///   stable column set.
-///
-/// `read_write` gates DML: a read-only source rejects INSERT/UPDATE/DELETE at
-/// plan time.
-///
-/// The resolved key schema drives key-aware reads: a query that pins the full
-/// primary key uses `GetItem`, one that pins the partition key uses `Query`, and
-/// anything else falls back to a full `Scan`.
+///   `string`, `int`, `float`, `bool`). Optional in table mode; ignored in catalog
+///   mode because each DynamoDB table has its own attribute set.
 pub async fn register_dynamodb_tables(
     session_ctx: &mut SessionContext,
     name: &str,
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     read_write: bool,
+    hierarchy_level: HierarchyLevel,
+) -> Result<()> {
+    let mode_str = if read_write {
+        "read-write"
+    } else {
+        "read-only"
+    };
+    match hierarchy_level {
+        HierarchyLevel::Catalog => {
+            register_dynamodb_catalog(
+                session_ctx,
+                name,
+                connection_string,
+                options,
+                read_write,
+                mode_str,
+            )
+            .await
+        }
+        HierarchyLevel::Table => {
+            register_single_dynamodb_table(
+                session_ctx,
+                name,
+                connection_string,
+                options,
+                read_write,
+                mode_str,
+            )
+            .await
+        }
+    }
+}
+
+/// Register one DynamoDB table under `name` in the default catalog.
+async fn register_single_dynamodb_table(
+    session_ctx: &mut SessionContext,
+    name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
 ) -> Result<()> {
     tracing::info!(
         source = %name,
@@ -1867,8 +1918,153 @@ pub async fn register_dynamodb_tables(
         .register_table(name, Arc::new(provider))
         .with_context(|| format!("Failed to register DynamoDB table '{name}' with DataFusion"))?;
 
-    tracing::info!(source = %name, table = %table, "Registered DynamoDB table");
+    tracing::info!(
+        source = %name,
+        table = %table,
+        "Successfully registered DynamoDB table '{}' as '{}' ({})",
+        table,
+        name,
+        mode_str
+    );
     Ok(())
+}
+
+/// Register all accessible DynamoDB tables as a named DataFusion catalog.
+///
+/// Tables are discovered via `ListTables` and registered under the fixed schema
+/// `tables`, so they are addressable as `catalog.tables.<table_name>`.
+///
+/// Tables whose key schema cannot be determined are skipped with a warning rather
+/// than failing the entire catalog registration, because DynamoDB permissions or
+/// table states can vary across a large account.
+async fn register_dynamodb_catalog(
+    session_ctx: &mut SessionContext,
+    catalog_name: &str,
+    connection_string: &str,
+    options: Option<&HashMap<String, String>>,
+    read_write: bool,
+    mode_str: &str,
+) -> Result<()> {
+    tracing::info!(
+        catalog = %catalog_name,
+        endpoint = %connection_string,
+        read_write,
+        "Registering DynamoDB catalog"
+    );
+
+    let opts = options.cloned().unwrap_or_default();
+    let region = opts
+        .get("region")
+        .cloned()
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    let label = SourceLabel::new(
+        DataSourceType::Dynamodb,
+        HierarchyLevel::Catalog,
+        catalog_name,
+    );
+    let client = retry_with_timeout(label, "DynamoDB client creation", || async {
+        build_client(connection_string, &region, &opts).await
+    })
+    .await
+    .with_context(|| format!("Failed to build DynamoDB client for catalog '{catalog_name}'"))?;
+
+    let table_names = retry_with_timeout(label, "ListTables", || async {
+        list_dynamodb_tables(&client).await
+    })
+    .await
+    .with_context(|| format!("Failed to list DynamoDB tables for catalog '{catalog_name}'"))?;
+
+    if table_names.is_empty() {
+        tracing::warn!(catalog = %catalog_name, "No DynamoDB tables found for catalog registration");
+    }
+
+    // Build the (schema, table) pairs expected by `build_catalog`. DynamoDB has no
+    // schema layer, so every table lives under the fixed `DYNAMODB_CATALOG_SCHEMA`.
+    let schema_tables: Vec<(String, String)> = table_names
+        .into_iter()
+        .map(|t| (DYNAMODB_CATALOG_SCHEMA.to_string(), t))
+        .collect();
+
+    let table_count = schema_tables.len();
+    let client = Arc::new(client);
+    let catalog_name_owned = catalog_name.to_string();
+
+    build_catalog(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        |_schema, table_name| {
+            let client = Arc::clone(&client);
+            let catalog_name = catalog_name_owned.clone();
+            async move {
+                let provider =
+                    build_dynamodb_table_provider(client, &table_name, read_write, &catalog_name)
+                        .await?;
+                Ok(Arc::new(provider) as Arc<dyn TableProvider>)
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("Failed to build DynamoDB catalog '{catalog_name}'"))?;
+
+    tracing::info!(
+        "Successfully registered DynamoDB catalog '{}' with {} table(s) ({})",
+        catalog_name,
+        table_count,
+        mode_str
+    );
+    Ok(())
+}
+
+/// Build a [`DynamoTableProvider`] for `table_name`.
+async fn build_dynamodb_table_provider(
+    client: Arc<Client>,
+    table_name: &str,
+    read_write: bool,
+    catalog_name: &str,
+) -> Result<DynamoTableProvider> {
+    let (partition_key, sort_key) =
+        describe_keys(&client, table_name).await.with_context(|| {
+            format!("DynamoDB catalog '{catalog_name}': DescribeTable failed for '{table_name}'")
+        })?;
+
+    DynamoTableProvider::new(
+        (*client).clone(),
+        table_name,
+        &partition_key,
+        sort_key.as_deref(),
+        None,
+        read_write,
+    )
+    .await
+    .with_context(|| {
+        format!("DynamoDB catalog '{catalog_name}': failed to create provider for '{table_name}'")
+    })
+}
+
+/// List all DynamoDB table names accessible through `client`, following pagination.
+async fn list_dynamodb_tables(client: &Client) -> Result<Vec<String>> {
+    let mut table_names = Vec::new();
+    let mut last_evaluated: Option<String> = None;
+
+    loop {
+        let mut req = client.list_tables().limit(LIST_TABLES_PAGE_SIZE);
+        if let Some(exclusive_start) = last_evaluated.take() {
+            req = req.exclusive_start_table_name(exclusive_start);
+        }
+
+        let resp = req.send().await.with_context(|| "ListTables failed")?;
+        table_names.extend(resp.table_names().iter().cloned());
+
+        match resp.last_evaluated_table_name() {
+            Some(name) if !name.is_empty() => last_evaluated = Some(name.to_string()),
+            _ => break,
+        }
+    }
+
+    table_names.sort();
+    Ok(table_names)
 }
 
 /// Build a DynamoDB client from the endpoint, region, and credential options.
@@ -1965,6 +2161,7 @@ fn parse_columns_option(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::hierarchy::HierarchyLevel;
     use arrow::array::Array;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::dml::InsertOp;
@@ -2320,10 +2517,16 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut ctx = SessionContext::new();
-            let err =
-                register_dynamodb_tables(&mut ctx, "ddb", "http://localhost:8000", None, false)
-                    .await
-                    .unwrap_err();
+            let err = register_dynamodb_tables(
+                &mut ctx,
+                "ddb",
+                "http://localhost:8000",
+                None,
+                false,
+                HierarchyLevel::Table,
+            )
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains("requires options"));
         });
     }
@@ -2341,11 +2544,90 @@ mod tests {
                 "http://localhost:8000",
                 Some(&opts),
                 false,
+                HierarchyLevel::Table,
             )
             .await
             .unwrap_err();
             assert!(err.to_string().contains("'table'"));
         });
+    }
+
+    #[test]
+    fn table_mode_explicitly_requires_options() {
+        // Explicit table mode (the default) still requires options so the provider
+        // can read the `table` name and credentials.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut ctx = SessionContext::new();
+            let err = register_dynamodb_tables(
+                &mut ctx,
+                "ddb",
+                "http://localhost:8000",
+                None,
+                false,
+                HierarchyLevel::Table,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("requires options"));
+        });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DynamoDB Local on :8000"]
+    async fn catalog_mode_accepts_empty_options() {
+        // Catalog mode discovers tables via ListTables, so it does not need a
+        // `table` option. This should reach the network layer without failing
+        // option validation.
+        let mut ctx = SessionContext::new();
+        register_dynamodb_tables(
+            &mut ctx,
+            "ddb",
+            "http://localhost:8000",
+            None,
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration should not fail due to missing options");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DynamoDB Local on :8000 with `products` and `orders` tables"]
+    async fn catalog_mode_registers_tables_under_fixed_schema() {
+        let mut ctx = SessionContext::new();
+        register_dynamodb_tables(
+            &mut ctx,
+            "ddb",
+            "http://localhost:8000",
+            None,
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("register catalog");
+
+        // DynamoDB has no native schema layer; Skardi exposes every discovered
+        // table under the fixed `tables` schema.
+        let df = ctx
+            .sql("SELECT * FROM ddb.tables.products LIMIT 1")
+            .await
+            .expect("plan products");
+        let batches = df.collect().await.expect("collect products");
+        assert!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 1,
+            "expected products table under ddb.tables"
+        );
+
+        let df = ctx
+            .sql("SELECT * FROM ddb.tables.orders LIMIT 1")
+            .await
+            .expect("plan orders");
+        let batches = df.collect().await.expect("collect orders");
+        assert!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 1,
+            "expected orders table under ddb.tables"
+        );
     }
 
     // ─── Schema shaping (build_schema_fields) ───────────────────────────────
@@ -2847,6 +3129,7 @@ mod tests {
             "http://localhost:8000",
             Some(&opts),
             false,
+            HierarchyLevel::Table,
         )
         .await
         .expect("register");
@@ -3087,9 +3370,16 @@ mod tests {
         // Register via the public path so DescribeTable auto-detects the sort key
         // (note: no partition_key/sort_key options supplied).
         let mut ctx = SessionContext::new();
-        register_dynamodb_tables(&mut ctx, table, "http://localhost:8000", Some(&opts), false)
-            .await
-            .expect("register");
+        register_dynamodb_tables(
+            &mut ctx,
+            table,
+            "http://localhost:8000",
+            Some(&opts),
+            false,
+            HierarchyLevel::Table,
+        )
+        .await
+        .expect("register");
 
         let rows = |sql: String| {
             let ctx = &ctx;

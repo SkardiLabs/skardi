@@ -708,6 +708,7 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Mysql,
     DataSourceType::Sqlite,
     DataSourceType::Seekdb,
+    DataSourceType::Dynamodb,
 ];
 
 /// Data source types that support read_write access mode
@@ -1292,6 +1293,7 @@ async fn register_data_source(
                 connection_string,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                source.hierarchy_level,
             )
             .await
             .map_err(|e| {
