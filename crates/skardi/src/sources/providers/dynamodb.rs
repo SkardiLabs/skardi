@@ -25,10 +25,9 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::config::{Credentials, Region};
 use aws_sdk_dynamodb::types::{
-    AttributeValue, DeleteRequest, KeyType, PutRequest, Select, WriteRequest,
+    AttributeValue, DeleteRequest, KeyType, PutRequest, ScalarAttributeType, Select, WriteRequest,
 };
 use datafusion::catalog::Session;
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
@@ -45,7 +44,10 @@ use futures::stream::{self, Stream};
 
 use super::is_pushable_binary_filter;
 use crate::sources::DataSourceType;
-use crate::sources::hierarchy::{HierarchyLevel, SourceLabel, retry_with_timeout};
+use crate::sources::hierarchy::{
+    HierarchyLevel, SourceLabel, build_catalog_best_effort, build_catalog_with_required_schemas,
+    retry_with_timeout,
+};
 
 /// Schema name used for DynamoDB catalog mode. DynamoDB has no native schema/database
 /// layer; all tables live under a single endpoint/region. We expose them under a fixed
@@ -64,8 +66,36 @@ const BATCH_WRITE_CHUNK: usize = 25;
 /// default and follow `last_evaluated_table_name` when present.
 const LIST_TABLES_PAGE_SIZE: i32 = 100;
 
-/// Upper bound on concurrent DynamoDB table introspection during catalog registration.
-const DYNAMODB_CATALOG_BUILD_CONCURRENCY: usize = 8;
+const DYNAMODB_CATALOG_CONFLICT_OPTIONS: &[&str] =
+    &["table", "schema", "partition_key", "sort_key", "columns"];
+
+#[derive(Clone, Debug, PartialEq)]
+struct DynamoKeySchema {
+    partition_key: String,
+    partition_type: DataType,
+    sort_key: Option<String>,
+    sort_type: Option<DataType>,
+}
+
+impl DynamoKeySchema {
+    fn new(
+        partition_key: String,
+        partition_type: DataType,
+        sort_key: Option<String>,
+        sort_type: Option<DataType>,
+    ) -> Self {
+        Self {
+            partition_key,
+            partition_type,
+            sort_key,
+            sort_type,
+        }
+    }
+
+    fn fallback(partition_key: String, sort_key: Option<String>) -> Self {
+        Self::new(partition_key, DataType::Utf8, sort_key, None)
+    }
+}
 
 /// A DynamoDB table exposed to DataFusion as a `TableProvider`.
 pub struct DynamoTableProvider {
@@ -105,11 +135,42 @@ impl DynamoTableProvider {
         schema: Option<SchemaRef>,
         read_write: bool,
     ) -> Result<Self> {
+        Self::new_with_key_types(
+            client,
+            table_name,
+            partition_key,
+            None,
+            sort_key,
+            None,
+            schema,
+            read_write,
+        )
+        .await
+    }
+
+    async fn new_with_key_types(
+        client: Client,
+        table_name: &str,
+        partition_key: &str,
+        partition_key_type: Option<DataType>,
+        sort_key: Option<&str>,
+        sort_key_type: Option<DataType>,
+        schema: Option<SchemaRef>,
+        read_write: bool,
+    ) -> Result<Self> {
         let schema = match schema {
             Some(s) => s,
-            None => {
-                Arc::new(Self::infer_schema(&client, table_name, partition_key, sort_key).await?)
-            }
+            None => Arc::new(
+                Self::infer_schema(
+                    &client,
+                    table_name,
+                    partition_key,
+                    partition_key_type,
+                    sort_key,
+                    sort_key_type,
+                )
+                .await?,
+            ),
         };
 
         Ok(Self {
@@ -131,7 +192,9 @@ impl DynamoTableProvider {
         client: &Client,
         table_name: &str,
         partition_key: &str,
+        partition_key_type: Option<DataType>,
         sort_key: Option<&str>,
+        sort_key_type: Option<DataType>,
     ) -> Result<Schema> {
         let sample = client
             .scan()
@@ -149,7 +212,18 @@ impl DynamoTableProvider {
             );
         }
 
-        let attrs = merge_sampled_attributes(items);
+        let mut attrs = Vec::new();
+        if let Some(dtype) = partition_key_type {
+            attrs.push((partition_key.to_string(), dtype));
+        }
+        if let (Some(sort_key), Some(dtype)) = (sort_key, sort_key_type) {
+            attrs.push((sort_key.to_string(), dtype));
+        }
+        let mut sampled_attrs = merge_sampled_attributes(items);
+        sampled_attrs.retain(|(name, _)| {
+            name != partition_key && sort_key.map(|sk| name != sk).unwrap_or(true)
+        });
+        attrs.extend(sampled_attrs);
 
         Ok(build_schema_fields(partition_key, sort_key, &attrs))
     }
@@ -1823,6 +1897,7 @@ pub async fn register_dynamodb_tables(
     } else {
         "read-only"
     };
+    validate_dynamodb_mode_options(name, hierarchy_level, options)?;
     match hierarchy_level {
         HierarchyLevel::Catalog => {
             register_dynamodb_catalog(
@@ -1847,6 +1922,37 @@ pub async fn register_dynamodb_tables(
             .await
         }
     }
+}
+
+fn validate_dynamodb_mode_options(
+    name: &str,
+    hierarchy_level: HierarchyLevel,
+    options: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    let Some(opts) = options else {
+        return Ok(());
+    };
+
+    match hierarchy_level {
+        HierarchyLevel::Catalog => {
+            for option in DYNAMODB_CATALOG_CONFLICT_OPTIONS {
+                if opts.contains_key(*option) {
+                    anyhow::bail!(
+                        "DynamoDB catalog data source '{name}' cannot use option '{option}'; catalog mode supports endpoint/credential options plus optional 'allowed_tables'"
+                    );
+                }
+            }
+        }
+        HierarchyLevel::Table => {
+            if opts.contains_key("allowed_tables") {
+                anyhow::bail!(
+                    "DynamoDB table data source '{name}' cannot use catalog-only option 'allowed_tables'"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Register one DynamoDB table under `name` in the default catalog.
@@ -1882,8 +1988,8 @@ async fn register_single_dynamodb_table(
     // Prefer the table's authoritative key schema (this also auto-detects the
     // sort key). Fall back to the configured options if DescribeTable is
     // unavailable, e.g. under restricted IAM permissions.
-    let (partition_key, sort_key) = match describe_keys(&client, table).await {
-        Ok(keys) => keys,
+    let key_schema = match describe_keys(&client, table).await {
+        Ok(schema) => schema,
         Err(e) => {
             tracing::warn!(
                 source = %name,
@@ -1895,7 +2001,7 @@ async fn register_single_dynamodb_table(
                     "DynamoDB data source '{name}': DescribeTable failed ({e}) and no 'partition_key' option was provided"
                 )
             })?;
-            (pk, opts.get("sort_key").cloned())
+            DynamoKeySchema::fallback(pk, opts.get("sort_key").cloned())
         }
     };
 
@@ -1903,17 +2009,23 @@ async fn register_single_dynamodb_table(
     // sampling inside `DynamoTableProvider::new`.
     let declared_schema = match opts.get("columns") {
         Some(spec) => Some(
-            parse_columns_option(spec, &partition_key, sort_key.as_deref())
-                .with_context(|| format!("DynamoDB data source '{name}': invalid 'columns'"))?,
+            parse_columns_option(
+                spec,
+                &key_schema.partition_key,
+                key_schema.sort_key.as_deref(),
+            )
+            .with_context(|| format!("DynamoDB data source '{name}': invalid 'columns'"))?,
         ),
         None => None,
     };
 
-    let provider = DynamoTableProvider::new(
+    let provider = DynamoTableProvider::new_with_key_types(
         client,
         table,
-        &partition_key,
-        sort_key.as_deref(),
+        &key_schema.partition_key,
+        Some(key_schema.partition_type.clone()),
+        key_schema.sort_key.as_deref(),
+        key_schema.sort_type.clone(),
         declared_schema,
         read_write,
     )
@@ -1976,7 +2088,9 @@ async fn register_dynamodb_catalog(
     .await
     .with_context(|| format!("Failed to build DynamoDB client for catalog '{catalog_name}'"))?;
 
-    let table_names = match parse_allowed_tables(Some(&opts))? {
+    let allowed_tables = parse_allowed_tables(Some(&opts))?;
+    let explicit_allowlist = allowed_tables.is_some();
+    let table_names = match allowed_tables {
         Some(allowed) => {
             tracing::info!(
                 catalog = %catalog_name,
@@ -1985,11 +2099,11 @@ async fn register_dynamodb_catalog(
             );
             allowed
         }
-        None => retry_with_timeout(label, "ListTables", || async {
-            list_dynamodb_tables(&client).await
-        })
-        .await
-        .with_context(|| format!("Failed to list DynamoDB tables for catalog '{catalog_name}'"))?,
+        None => list_dynamodb_tables(&client, label)
+            .await
+            .with_context(|| {
+                format!("Failed to list DynamoDB tables for catalog '{catalog_name}'")
+            })?,
     };
 
     if table_names.is_empty() {
@@ -1998,21 +2112,57 @@ async fn register_dynamodb_catalog(
 
     let discovered_count = table_names.len();
     let client = Arc::new(client);
-    let (registered_count, skipped_count) = build_dynamodb_catalog_best_effort(
-        session_ctx,
-        catalog_name,
-        table_names,
-        client,
-        read_write,
-    )
-    .await
+    let schema_tables = table_names
+        .into_iter()
+        .map(|table_name| (DYNAMODB_CATALOG_SCHEMA.to_string(), table_name))
+        .collect::<Vec<_>>();
+    let required_schemas = vec![DYNAMODB_CATALOG_SCHEMA.to_string()];
+
+    let build_table = |_: String, table_name: String| {
+        let client = Arc::clone(&client);
+        let catalog_name = catalog_name.to_string();
+        async move {
+            let op_name = format!("DynamoDB table provider build '{table_name}'");
+            retry_with_timeout(label, &op_name, || {
+                let client = Arc::clone(&client);
+                let table_name = table_name.clone();
+                let catalog_name = catalog_name.clone();
+                async move {
+                    build_dynamodb_table_provider(client, &table_name, read_write, &catalog_name)
+                        .await
+                        .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
+                }
+            })
+            .await
+        }
+    };
+
+    let report = if explicit_allowlist {
+        build_catalog_with_required_schemas(
+            session_ctx,
+            catalog_name,
+            schema_tables,
+            required_schemas,
+            build_table,
+        )
+        .await
+    } else {
+        build_catalog_best_effort(
+            session_ctx,
+            catalog_name,
+            schema_tables,
+            required_schemas,
+            build_table,
+        )
+        .await
+    }
     .with_context(|| format!("Failed to build DynamoDB catalog '{catalog_name}'"))?;
 
     tracing::info!(
         "Successfully registered DynamoDB catalog '{}' with {} table(s), skipped {} of {} discovered ({})",
         catalog_name,
-        registered_count,
-        skipped_count,
+        report.registered,
+        report.skipped,
         discovered_count,
         mode_str
     );
@@ -2041,113 +2191,6 @@ fn parse_allowed_tables(options: Option<&HashMap<String, String>>) -> Result<Opt
     }
 }
 
-/// Build and register a DynamoDB catalog while skipping individual tables that
-/// cannot be described or sampled.
-async fn build_dynamodb_catalog_best_effort(
-    session_ctx: &SessionContext,
-    catalog_name: &str,
-    table_names: Vec<String>,
-    client: Arc<Client>,
-    read_write: bool,
-) -> Result<(usize, usize)> {
-    let catalog_name_owned = catalog_name.to_string();
-
-    let build_futures = table_names.into_iter().map(|table_name| {
-        let client = Arc::clone(&client);
-        let catalog_name = catalog_name_owned.clone();
-        async move {
-            let result =
-                build_dynamodb_table_provider(client, &table_name, read_write, &catalog_name)
-                    .await
-                    .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>);
-            (table_name, result)
-        }
-    });
-
-    let prepared = stream::iter(build_futures)
-        .buffer_unordered(DYNAMODB_CATALOG_BUILD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-
-    register_prepared_dynamodb_catalog(session_ctx, catalog_name, prepared)
-}
-
-/// Register already-built DynamoDB catalog table providers, skipping failed builds.
-fn register_prepared_dynamodb_catalog(
-    session_ctx: &SessionContext,
-    catalog_name: &str,
-    prepared: Vec<(String, Result<Arc<dyn TableProvider>>)>,
-) -> Result<(usize, usize)> {
-    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
-    let mut registered = 0usize;
-    let mut skipped = 0usize;
-    let schema_name = DYNAMODB_CATALOG_SCHEMA.to_string();
-
-    for (table_name, provider_result) in prepared {
-        match provider_result {
-            Ok(provider) => {
-                if catalog_provider.schema(&schema_name).is_none() {
-                    catalog_provider
-                        .register_schema(&schema_name, Arc::new(MemorySchemaProvider::new()))
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to register schema '{}' for DynamoDB catalog '{}': {}",
-                                schema_name,
-                                catalog_name,
-                                e
-                            )
-                        })?;
-                }
-                let schema_provider = catalog_provider.schema(&schema_name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Schema '{}' was not found after registration in DynamoDB catalog '{}'",
-                        schema_name,
-                        catalog_name
-                    )
-                })?;
-                schema_provider
-                    .register_table(table_name.clone(), provider)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to register table '{}.{}' in DynamoDB catalog '{}': {}",
-                            schema_name,
-                            table_name,
-                            catalog_name,
-                            e
-                        )
-                    })?;
-                registered += 1;
-                tracing::debug!(
-                    catalog = %catalog_name,
-                    schema = %schema_name,
-                    table = %table_name,
-                    "Registered DynamoDB catalog table"
-                );
-            }
-            Err(e) => {
-                skipped += 1;
-                tracing::warn!(
-                    catalog = %catalog_name,
-                    table = %table_name,
-                    error = %e,
-                    "Skipping DynamoDB catalog table after provider build failure"
-                );
-            }
-        }
-    }
-
-    if registered == 0 && skipped > 0 {
-        tracing::warn!(
-            catalog = %catalog_name,
-            skipped,
-            "DynamoDB catalog registered with no tables because every table was skipped"
-        );
-    }
-
-    session_ctx.register_catalog(catalog_name, catalog_provider);
-    Ok((registered, skipped))
-}
-
 /// Build a [`DynamoTableProvider`] for `table_name`.
 async fn build_dynamodb_table_provider(
     client: Arc<Client>,
@@ -2155,16 +2198,17 @@ async fn build_dynamodb_table_provider(
     read_write: bool,
     catalog_name: &str,
 ) -> Result<DynamoTableProvider> {
-    let (partition_key, sort_key) =
-        describe_keys(&client, table_name).await.with_context(|| {
-            format!("DynamoDB catalog '{catalog_name}': DescribeTable failed for '{table_name}'")
-        })?;
+    let key_schema = describe_keys(&client, table_name).await.with_context(|| {
+        format!("DynamoDB catalog '{catalog_name}': DescribeTable failed for '{table_name}'")
+    })?;
 
-    DynamoTableProvider::new(
+    DynamoTableProvider::new_with_key_types(
         (*client).clone(),
         table_name,
-        &partition_key,
-        sort_key.as_deref(),
+        &key_schema.partition_key,
+        Some(key_schema.partition_type.clone()),
+        key_schema.sort_key.as_deref(),
+        key_schema.sort_type.clone(),
         None,
         read_write,
     )
@@ -2175,17 +2219,23 @@ async fn build_dynamodb_table_provider(
 }
 
 /// List all DynamoDB table names accessible through `client`, following pagination.
-async fn list_dynamodb_tables(client: &Client) -> Result<Vec<String>> {
+async fn list_dynamodb_tables(client: &Client, label: SourceLabel<'_>) -> Result<Vec<String>> {
     let mut table_names = Vec::new();
     let mut last_evaluated: Option<String> = None;
 
     loop {
-        let mut req = client.list_tables().limit(LIST_TABLES_PAGE_SIZE);
-        if let Some(exclusive_start) = last_evaluated.take() {
-            req = req.exclusive_start_table_name(exclusive_start);
-        }
-
-        let resp = req.send().await.with_context(|| "ListTables failed")?;
+        let exclusive_start = last_evaluated.take();
+        let resp = retry_with_timeout(label, "ListTables page", || {
+            let exclusive_start = exclusive_start.clone();
+            async move {
+                let mut req = client.list_tables().limit(LIST_TABLES_PAGE_SIZE);
+                if let Some(exclusive_start) = exclusive_start {
+                    req = req.exclusive_start_table_name(exclusive_start);
+                }
+                req.send().await.with_context(|| "ListTables failed")
+            }
+        })
+        .await?;
         table_names.extend(resp.table_names().iter().cloned());
 
         match resp.last_evaluated_table_name() {
@@ -2223,18 +2273,41 @@ async fn build_client(
     Ok(Client::new(&config))
 }
 
-/// Read the table's authoritative key schema via `DescribeTable`, returning
-/// `(partition_key, sort_key)`. This drives key-aware read planning without
-/// trusting (possibly mismatched) configured key names, and auto-detects the
-/// sort key for composite-key tables.
-async fn describe_keys(client: &Client, table: &str) -> Result<(String, Option<String>)> {
+/// Map a DynamoDB key scalar type from `DescribeTable` to the Arrow type used by Skardi.
+fn scalar_attribute_type_to_arrow_type(attribute_type: &ScalarAttributeType) -> DataType {
+    match attribute_type {
+        ScalarAttributeType::S => DataType::Utf8,
+        ScalarAttributeType::N => DataType::Float64,
+        ScalarAttributeType::B => DataType::Utf8,
+        _ => DataType::Utf8,
+    }
+}
+
+/// Read the table's authoritative key schema via `DescribeTable`, returning key
+/// names and scalar types. This drives key-aware read planning without trusting
+/// (possibly mismatched) configured key names, and auto-detects the sort key for
+/// composite-key tables.
+async fn describe_keys(client: &Client, table: &str) -> Result<DynamoKeySchema> {
     let out = client
         .describe_table()
         .table_name(table)
         .send()
         .await
         .with_context(|| format!("DescribeTable failed for '{table}'"))?;
-    let key_schema = out.table().map(|t| t.key_schema()).unwrap_or_default();
+    let table_desc = out
+        .table()
+        .ok_or_else(|| anyhow::anyhow!("DescribeTable for '{table}' returned no table metadata"))?;
+    let key_schema = table_desc.key_schema();
+    let attr_types = table_desc
+        .attribute_definitions()
+        .iter()
+        .map(|attr| {
+            (
+                attr.attribute_name().to_string(),
+                scalar_attribute_type_to_arrow_type(attr.attribute_type()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut partition_key: Option<String> = None;
     let mut sort_key: Option<String> = None;
@@ -2248,7 +2321,20 @@ async fn describe_keys(client: &Client, table: &str) -> Result<(String, Option<S
 
     let partition_key = partition_key
         .ok_or_else(|| anyhow::anyhow!("table '{table}' has no HASH key in its key schema"))?;
-    Ok((partition_key, sort_key))
+    let partition_type = attr_types
+        .get(&partition_key)
+        .cloned()
+        .unwrap_or(DataType::Utf8);
+    let sort_type = sort_key
+        .as_ref()
+        .and_then(|sort_key| attr_types.get(sort_key).cloned());
+
+    Ok(DynamoKeySchema::new(
+        partition_key,
+        partition_type,
+        sort_key,
+        sort_type,
+    ))
 }
 
 /// Parse the `columns` option (`name:type[,name:type…]`) into an explicit
@@ -2737,6 +2823,28 @@ mod tests {
         assert!(err.to_string().contains("allowed_tables"));
     }
 
+    #[test]
+    fn catalog_mode_rejects_table_scoped_options_at_provider_boundary() {
+        for option in DYNAMODB_CATALOG_CONFLICT_OPTIONS {
+            let mut opts = HashMap::new();
+            opts.insert((*option).to_string(), "value".to_string());
+
+            let err = validate_dynamodb_mode_options("ddb", HierarchyLevel::Catalog, Some(&opts))
+                .unwrap_err();
+            assert!(err.to_string().contains(option), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn table_mode_rejects_catalog_only_allowed_tables() {
+        let mut opts = HashMap::new();
+        opts.insert("allowed_tables".to_string(), "products".to_string());
+
+        let err =
+            validate_dynamodb_mode_options("ddb", HierarchyLevel::Table, Some(&opts)).unwrap_err();
+        assert!(err.to_string().contains("allowed_tables"), "got: {err}");
+    }
+
     fn mem_table_provider() -> Arc<dyn TableProvider> {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
         let batch = RecordBatch::new_empty(schema.clone());
@@ -2747,17 +2855,26 @@ mod tests {
     #[tokio::test]
     async fn catalog_registration_skips_failed_tables_and_uses_fixed_schema() {
         let ctx = SessionContext::new();
-        let prepared = vec![
-            ("orders".to_string(), Ok(mem_table_provider())),
-            (
-                "broken".to_string(),
-                Err(anyhow::anyhow!("DescribeTable failed")),
-            ),
-        ];
-
-        let counts =
-            register_prepared_dynamodb_catalog(&ctx, "ddb", prepared).expect("register catalog");
-        assert_eq!(counts, (1, 1));
+        let report = build_catalog_best_effort(
+            &ctx,
+            "ddb",
+            vec![
+                (DYNAMODB_CATALOG_SCHEMA.to_string(), "orders".to_string()),
+                (DYNAMODB_CATALOG_SCHEMA.to_string(), "broken".to_string()),
+            ],
+            vec![DYNAMODB_CATALOG_SCHEMA.to_string()],
+            |_, table_name| async move {
+                if table_name == "broken" {
+                    Err(anyhow::anyhow!("DescribeTable failed"))
+                } else {
+                    Ok(mem_table_provider())
+                }
+            },
+        )
+        .await
+        .expect("register catalog");
+        assert_eq!(report.registered, 1);
+        assert_eq!(report.skipped, 1);
 
         let df = ctx
             .sql("SELECT * FROM ddb.tables.orders")
@@ -2776,37 +2893,70 @@ mod tests {
     #[tokio::test]
     async fn catalog_registration_all_failed_is_still_best_effort() {
         let ctx = SessionContext::new();
-        let prepared = vec![
-            (
-                "products".to_string(),
-                Err(anyhow::anyhow!("schema inference failed")),
-            ),
-            (
-                "orders".to_string(),
-                Err(anyhow::anyhow!("DescribeTable denied")),
-            ),
-        ];
-
-        let counts =
-            register_prepared_dynamodb_catalog(&ctx, "ddb", prepared).expect("register catalog");
-        assert_eq!(counts, (0, 2));
+        let report = build_catalog_best_effort(
+            &ctx,
+            "ddb",
+            vec![
+                (DYNAMODB_CATALOG_SCHEMA.to_string(), "products".to_string()),
+                (DYNAMODB_CATALOG_SCHEMA.to_string(), "orders".to_string()),
+            ],
+            vec![DYNAMODB_CATALOG_SCHEMA.to_string()],
+            |_, table_name| async move { Err(anyhow::anyhow!("{table_name} unavailable")) },
+        )
+        .await
+        .expect("register catalog");
+        assert_eq!(report.registered, 0);
+        assert_eq!(report.skipped, 2);
         assert!(ctx.catalog("ddb").is_some(), "catalog should still exist");
 
         let err = ctx
             .sql("SELECT * FROM ddb.tables.orders")
             .await
             .expect_err("all failed tables should be absent");
-        assert!(err.to_string().contains("tables"), "got: {err}");
+        assert!(
+            err.to_string().contains("orders") && !err.to_string().contains("schema not found"),
+            "got: {err}"
+        );
     }
 
-    #[test]
-    fn catalog_registration_empty_input_registers_empty_catalog() {
+    #[tokio::test]
+    async fn catalog_registration_empty_input_registers_empty_catalog() {
         let ctx = SessionContext::new();
-        let counts =
-            register_prepared_dynamodb_catalog(&ctx, "ddb", Vec::new()).expect("register catalog");
+        let report = build_catalog_best_effort(
+            &ctx,
+            "ddb",
+            Vec::new(),
+            vec![DYNAMODB_CATALOG_SCHEMA.to_string()],
+            |_, _| async { Ok(mem_table_provider()) },
+        )
+        .await
+        .expect("register catalog");
 
-        assert_eq!(counts, (0, 0));
+        assert_eq!(report.registered, 0);
+        assert_eq!(report.skipped, 0);
         assert!(ctx.catalog("ddb").is_some(), "empty catalog should exist");
+        assert!(
+            ctx.catalog("ddb")
+                .and_then(|catalog| catalog.schema(DYNAMODB_CATALOG_SCHEMA))
+                .is_some(),
+            "fixed schema should exist even without tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_registration_fail_fast_reports_allowlist_failures() {
+        let ctx = SessionContext::new();
+        let err = build_catalog_with_required_schemas(
+            &ctx,
+            "ddb",
+            vec![(DYNAMODB_CATALOG_SCHEMA.to_string(), "ordersx".to_string())],
+            vec![DYNAMODB_CATALOG_SCHEMA.to_string()],
+            |_, table_name| async move { Err(anyhow::anyhow!("{table_name} unavailable")) },
+        )
+        .await
+        .expect_err("explicit allow-list should fail fast");
+
+        assert!(err.to_string().contains("ordersx"), "got: {err}");
     }
 
     #[tokio::test]
@@ -2963,6 +3113,35 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "pk");
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn schema_fields_preserve_described_key_types_when_unsampled() {
+        let key_schema = DynamoKeySchema::new(
+            "pk".to_string(),
+            scalar_attribute_type_to_arrow_type(&ScalarAttributeType::N),
+            Some("sk".to_string()),
+            Some(scalar_attribute_type_to_arrow_type(&ScalarAttributeType::S)),
+        );
+        let attrs = vec![
+            (
+                key_schema.partition_key.clone(),
+                key_schema.partition_type.clone(),
+            ),
+            (
+                key_schema.sort_key.clone().expect("sort key"),
+                key_schema.sort_type.clone().expect("sort key type"),
+            ),
+        ];
+        let schema = build_schema_fields("pk", Some("sk"), &attrs);
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "pk");
+        assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "sk");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(!schema.field(1).is_nullable());
     }
 
     #[test]

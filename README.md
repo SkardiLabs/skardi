@@ -311,23 +311,23 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 
 ## Supported Data Sources
 
-| Type | CRUD | Description | Docs |
-|------|------|-------------|------|
-| PostgreSQL | Full | Table or catalog registration, pgvector KNN | [docs/postgres/](docs/postgres/) |
-| MySQL | Full | Table or catalog registration | [docs/mysql/](docs/mysql/) |
-| SQLite | Full | Table or catalog registration, sqlite-vec KNN, FTS | [docs/sqlite/](docs/sqlite/) |
-| MongoDB | Full | Collections with point lookups | [docs/mongo/](docs/mongo/) |
-| Redis | Full | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
-| DynamoDB | Full | Items mapped to SQL rows, scan + filter pushdown | [docs/dynamodb/](docs/dynamodb/) |
-| SeekDB | Full | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
-| Lance | Read (job-write) | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
-| CSV | Read | Local or remote CSV files | [docs/server.md](docs/server.md) |
-| Parquet | Read | Local or remote Parquet files | [docs/server.md](docs/server.md) |
-| JSON / NDJSON | Read | Local or remote JSON files | [docs/cli.md](docs/cli.md) |
-| S3 / GCS / Azure | Read | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
-| Apache Iceberg | Read | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
-| InfluxDB 3 | Read | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
-| Documents | Read | PDF/Office/ODF/image → per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
+| Type | CRUD | Catalog mode | Description | Docs |
+|------|------|--------------|-------------|------|
+| PostgreSQL | Full | Yes | Table or catalog registration, pgvector KNN | [docs/postgres/](docs/postgres/) |
+| MySQL | Full | Yes | Table or catalog registration | [docs/mysql/](docs/mysql/) |
+| SQLite | Full | Yes | Table or catalog registration, sqlite-vec KNN, FTS | [docs/sqlite/](docs/sqlite/) |
+| MongoDB | Full | No | Collections with point lookups | [docs/mongo/](docs/mongo/) |
+| Redis | Full | No | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
+| DynamoDB | Full | Yes | Items mapped to SQL rows, table or catalog registration, scan + filter pushdown | [docs/dynamodb/](docs/dynamodb/) |
+| SeekDB | Full | Yes | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
+| Lance | Read (job-write) | No | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
+| CSV | Read | No | Local or remote CSV files | [docs/server.md](docs/server.md) |
+| Parquet | Read | No | Local or remote Parquet files | [docs/server.md](docs/server.md) |
+| JSON / NDJSON | Read | No | Local or remote JSON files | [docs/cli.md](docs/cli.md) |
+| S3 / GCS / Azure | Read | No | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
+| Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
+| InfluxDB 3 | Read | No | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
+| Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
 
 ---
 

@@ -274,11 +274,12 @@ curl -X POST http://localhost:8080/federated_join/execute \
 
 | Option | Type | Required | Description |
 |---|---|---|---|
-| `table` | string | yes | DynamoDB table name |
-| `partition_key` | string | no | Partition (hash) key attribute name. Auto-detected from the table's key schema via `DescribeTable`; supply it only as a fallback for when `DescribeTable` is unavailable (e.g. restricted IAM permissions) |
-| `sort_key` | string | no | Sort (range) key attribute name for composite-key tables. Also auto-detected from `DescribeTable`; a fallback otherwise |
+| `table` | string | table mode only | DynamoDB table name |
+| `partition_key` | string | no, table mode only | Partition (hash) key attribute name. Auto-detected from the table's key schema via `DescribeTable`; supply it only as a fallback for when `DescribeTable` is unavailable (e.g. restricted IAM permissions) |
+| `sort_key` | string | no, table mode only | Sort (range) key attribute name for composite-key tables. Also auto-detected from `DescribeTable`; a fallback otherwise |
 | `region` | string | no | AWS region (default `us-east-1`) |
-| `columns` | string | no | Explicit schema as `name:type,…` (types `string`, `int`, `float`, `bool`). Pins a stable/typed column set and lets you write non-key columns to an empty table. When omitted, the schema is inferred by sampling |
+| `columns` | string | no, table mode only | Explicit schema as `name:type,…` (types `string`, `int`, `float`, `bool`). Pins a stable/typed column set and lets you write non-key columns to an empty table. When omitted, the schema is inferred by sampling |
+| `allowed_tables` | string | no, catalog mode only | Comma-separated table allow-list. Omit it to discover all DynamoDB tables with `ListTables` |
 | `access_key_env` | string | no | Env var holding the AWS access key id |
 | `secret_key_env` | string | no | Env var holding the AWS secret access key |
 
@@ -311,10 +312,11 @@ SELECT * FROM ddb.tables.products LIMIT 10;
 ```
 
 When `allowed_tables` is present, Skardi registers only those table names and
-does not call `ListTables`. When it is omitted, Skardi discovers tables with
-`ListTables`. Catalog registration is best-effort: if one table cannot be
-described or sampled for schema inference, that table is skipped with a warning
-and the remaining tables continue to load.
+does not call `ListTables`; every listed table must be describable, so typos fail
+catalog registration early. When `allowed_tables` is omitted, Skardi discovers
+tables with `ListTables`. Discovery-mode catalog registration is best-effort: if
+one discovered table cannot be described or sampled for schema inference, that
+table is skipped with a warning and the remaining tables continue to load.
 
 ### Read planning (key-aware access)
 
