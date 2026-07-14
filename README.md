@@ -214,6 +214,8 @@ skardi query --ctx ./ctx.yaml --sql "SELECT * FROM products LIMIT 10"
 
 **Step 3 — turn a parameterized SQL into an agent-callable verb.** Two YAMLs from [`demo/llm_wiki/cli/`](demo/llm_wiki/cli/) — the actual files, not pseudo-code:
 
+> ⚠️ Unlike Steps 1–2 (zero-dependency), this hybrid-search verb also needs a local embedding model at `models/…` + the `sqlite-vec` extension (`SQLITE_VEC_PATH`) and a seeded DB — so it is **not runnable by copy-paste alone**. The [`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) sets all of this up for you; use it if you just want the verb working.
+
 ```yaml
 # pipelines/search_hybrid.yaml — declares the SQL once; Skardi infers the params
 kind: pipeline
