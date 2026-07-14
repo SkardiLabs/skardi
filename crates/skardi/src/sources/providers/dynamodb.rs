@@ -2745,10 +2745,76 @@ mod tests {
         .expect("catalog registration should not fail due to missing options");
     }
 
+    async fn ensure_catalog_orders_table(client: &Client) {
+        use aws_sdk_dynamodb::types::{
+            AttributeDefinition, BillingMode, KeySchemaElement, ScalarAttributeType,
+        };
+
+        if client
+            .describe_table()
+            .table_name("orders")
+            .send()
+            .await
+            .is_err()
+        {
+            client
+                .create_table()
+                .table_name("orders")
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name("order_id")
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()
+                        .unwrap(),
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("order_id")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .billing_mode(BillingMode::PayPerRequest)
+                .send()
+                .await
+                .expect("create orders table");
+        }
+
+        let put = |order_id: &str, product_id: &str, quantity: i64, status: &str| {
+            let client = client.clone();
+            let order_id = order_id.to_string();
+            let product_id = product_id.to_string();
+            let status = status.to_string();
+            async move {
+                client
+                    .put_item()
+                    .table_name("orders")
+                    .item("order_id", AttributeValue::S(order_id))
+                    .item("product_id", AttributeValue::S(product_id))
+                    .item("quantity", AttributeValue::N(quantity.to_string()))
+                    .item("status", AttributeValue::S(status))
+                    .send()
+                    .await
+                    .expect("put order");
+            }
+        };
+
+        put("ORD001", "PROD001", 2, "paid").await;
+        put("ORD002", "PROD002", 1, "pending").await;
+    }
+
     #[tokio::test]
     #[ignore = "requires DynamoDB Local on :8000 with `products` and `orders` tables"]
     async fn catalog_mode_registers_tables_under_fixed_schema() {
         let mut ctx = SessionContext::new();
+        let mut client_opts = HashMap::new();
+        client_opts.insert("region".to_string(), "us-east-1".to_string());
+
+        let client = build_client("http://localhost:8000", "us-east-1", &client_opts)
+            .await
+            .expect("client");
+        ensure_catalog_orders_table(&client).await;
+
         register_dynamodb_tables(
             &mut ctx,
             "ddb",

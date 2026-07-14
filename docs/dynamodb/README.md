@@ -22,7 +22,7 @@ export AWS_SECRET_ACCESS_KEY=dummy
 export AWS_DEFAULT_REGION=us-east-1
 EP="http://localhost:8000"
 
-# 3. Create the products table (partition key: product_id) and seed sample data
+# 3. Create demo tables and seed sample data
 aws dynamodb create-table --endpoint-url "$EP" \
   --table-name products \
   --attribute-definitions AttributeName=product_id,AttributeType=S \
@@ -30,12 +30,23 @@ aws dynamodb create-table --endpoint-url "$EP" \
   --billing-mode PAY_PER_REQUEST
 aws dynamodb wait table-exists --endpoint-url "$EP" --table-name products
 
-put() { aws dynamodb put-item --endpoint-url "$EP" --table-name products --item "$1"; }
-put '{"product_id":{"S":"PROD001"},"name":{"S":"Laptop"},"category":{"S":"Electronics"},"price":{"N":"999.99"},"in_stock":{"BOOL":true}}'
-put '{"product_id":{"S":"PROD002"},"name":{"S":"Keyboard"},"category":{"S":"Electronics"},"price":{"N":"79.99"},"in_stock":{"BOOL":true}}'
-put '{"product_id":{"S":"PROD003"},"name":{"S":"Monitor"},"category":{"S":"Electronics"},"price":{"N":"299.99"},"in_stock":{"BOOL":false}}'
-put '{"product_id":{"S":"PROD004"},"name":{"S":"Mouse"},"category":{"S":"Electronics"},"price":{"N":"29.99"},"in_stock":{"BOOL":true}}'
-put '{"product_id":{"S":"PROD005"},"name":{"S":"Desk Chair"},"category":{"S":"Furniture"},"price":{"N":"199.99"},"in_stock":{"BOOL":true}}'
+aws dynamodb create-table --endpoint-url "$EP" \
+  --table-name orders \
+  --attribute-definitions AttributeName=order_id,AttributeType=S \
+  --key-schema AttributeName=order_id,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST
+aws dynamodb wait table-exists --endpoint-url "$EP" --table-name orders
+
+put_product() { aws dynamodb put-item --endpoint-url "$EP" --table-name products --item "$1"; }
+put_product '{"product_id":{"S":"PROD001"},"name":{"S":"Laptop"},"category":{"S":"Electronics"},"price":{"N":"999.99"},"in_stock":{"BOOL":true}}'
+put_product '{"product_id":{"S":"PROD002"},"name":{"S":"Keyboard"},"category":{"S":"Electronics"},"price":{"N":"79.99"},"in_stock":{"BOOL":true}}'
+put_product '{"product_id":{"S":"PROD003"},"name":{"S":"Monitor"},"category":{"S":"Electronics"},"price":{"N":"299.99"},"in_stock":{"BOOL":false}}'
+put_product '{"product_id":{"S":"PROD004"},"name":{"S":"Mouse"},"category":{"S":"Electronics"},"price":{"N":"29.99"},"in_stock":{"BOOL":true}}'
+put_product '{"product_id":{"S":"PROD005"},"name":{"S":"Desk Chair"},"category":{"S":"Furniture"},"price":{"N":"199.99"},"in_stock":{"BOOL":true}}'
+
+put_order() { aws dynamodb put-item --endpoint-url "$EP" --table-name orders --item "$1"; }
+put_order '{"order_id":{"S":"ORD001"},"product_id":{"S":"PROD001"},"quantity":{"N":"2"},"status":{"S":"paid"}}'
+put_order '{"order_id":{"S":"ORD002"},"product_id":{"S":"PROD002"},"quantity":{"N":"1"},"status":{"S":"pending"}}'
 
 # 4. Start the Skardi server against the demo context + pipelines
 cargo run --bin skardi-server -- \
