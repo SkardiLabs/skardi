@@ -2299,6 +2299,45 @@ options:
     }
 
     #[test]
+    fn validate_accepts_dynamodb_catalog_allowed_tables() {
+        let mut options = HashMap::new();
+        options.insert("allowed_tables".to_string(), "products, orders".to_string());
+        let mut source = dynamodb_source(
+            "ddb",
+            Some("http://localhost:8000"),
+            Some(options),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        validate_data_sources(&[source]).expect("valid DynamoDB catalog allow-list");
+    }
+
+    #[test]
+    fn validate_rejects_dynamodb_catalog_table_option() {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "products".to_string());
+        let mut source = dynamodb_source(
+            "ddb",
+            Some("http://localhost:8000"),
+            Some(options),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "ddb" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
     fn unsupported_write_mode_error_lists_dynamodb() {
         let err = ConfigError::UnsupportedWriteMode {
             name: "events".to_string(),

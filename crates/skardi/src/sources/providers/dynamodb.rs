@@ -2050,7 +2050,6 @@ async fn build_dynamodb_catalog_best_effort(
     client: Arc<Client>,
     read_write: bool,
 ) -> Result<(usize, usize)> {
-    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
     let catalog_name_owned = catalog_name.to_string();
 
     let build_futures = table_names.into_iter().map(|table_name| {
@@ -2058,7 +2057,9 @@ async fn build_dynamodb_catalog_best_effort(
         let catalog_name = catalog_name_owned.clone();
         async move {
             let result =
-                build_dynamodb_table_provider(client, &table_name, read_write, &catalog_name).await;
+                build_dynamodb_table_provider(client, &table_name, read_write, &catalog_name)
+                    .await
+                    .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>);
             (table_name, result)
         }
     });
@@ -2068,6 +2069,16 @@ async fn build_dynamodb_catalog_best_effort(
         .collect::<Vec<_>>()
         .await;
 
+    register_prepared_dynamodb_catalog(session_ctx, catalog_name, prepared)
+}
+
+/// Register already-built DynamoDB catalog table providers, skipping failed builds.
+fn register_prepared_dynamodb_catalog(
+    session_ctx: &SessionContext,
+    catalog_name: &str,
+    prepared: Vec<(String, Result<Arc<dyn TableProvider>>)>,
+) -> Result<(usize, usize)> {
+    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
     let mut registered = 0usize;
     let mut skipped = 0usize;
     let schema_name = DYNAMODB_CATALOG_SCHEMA.to_string();
@@ -2095,7 +2106,7 @@ async fn build_dynamodb_catalog_best_effort(
                     )
                 })?;
                 schema_provider
-                    .register_table(table_name.clone(), Arc::new(provider))
+                    .register_table(table_name.clone(), provider)
                     .map_err(|e| {
                         anyhow::anyhow!(
                             "Failed to register table '{}.{}' in DynamoDB catalog '{}': {}",
@@ -2724,6 +2735,78 @@ mod tests {
 
         let err = parse_allowed_tables(Some(&opts)).unwrap_err();
         assert!(err.to_string().contains("allowed_tables"));
+    }
+
+    fn mem_table_provider() -> Arc<dyn TableProvider> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let batch = RecordBatch::new_empty(schema.clone());
+        Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>
+    }
+
+    #[tokio::test]
+    async fn catalog_registration_skips_failed_tables_and_uses_fixed_schema() {
+        let ctx = SessionContext::new();
+        let prepared = vec![
+            ("orders".to_string(), Ok(mem_table_provider())),
+            (
+                "broken".to_string(),
+                Err(anyhow::anyhow!("DescribeTable failed")),
+            ),
+        ];
+
+        let counts =
+            register_prepared_dynamodb_catalog(&ctx, "ddb", prepared).expect("register catalog");
+        assert_eq!(counts, (1, 1));
+
+        let df = ctx
+            .sql("SELECT * FROM ddb.tables.orders")
+            .await
+            .expect("orders is registered under fixed schema");
+        let batches = df.collect().await.expect("collect orders");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        let err = ctx
+            .sql("SELECT * FROM ddb.tables.broken")
+            .await
+            .expect_err("failed provider must be skipped");
+        assert!(err.to_string().contains("broken"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn catalog_registration_all_failed_is_still_best_effort() {
+        let ctx = SessionContext::new();
+        let prepared = vec![
+            (
+                "products".to_string(),
+                Err(anyhow::anyhow!("schema inference failed")),
+            ),
+            (
+                "orders".to_string(),
+                Err(anyhow::anyhow!("DescribeTable denied")),
+            ),
+        ];
+
+        let counts =
+            register_prepared_dynamodb_catalog(&ctx, "ddb", prepared).expect("register catalog");
+        assert_eq!(counts, (0, 2));
+        assert!(ctx.catalog("ddb").is_some(), "catalog should still exist");
+
+        let err = ctx
+            .sql("SELECT * FROM ddb.tables.orders")
+            .await
+            .expect_err("all failed tables should be absent");
+        assert!(err.to_string().contains("tables"), "got: {err}");
+    }
+
+    #[test]
+    fn catalog_registration_empty_input_registers_empty_catalog() {
+        let ctx = SessionContext::new();
+        let counts =
+            register_prepared_dynamodb_catalog(&ctx, "ddb", Vec::new()).expect("register catalog");
+
+        assert_eq!(counts, (0, 0));
+        assert!(ctx.catalog("ddb").is_some(), "empty catalog should exist");
     }
 
     #[tokio::test]
