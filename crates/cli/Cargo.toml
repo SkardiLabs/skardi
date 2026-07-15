@@ -18,10 +18,13 @@ candle = ["skardi/candle"]
 gguf = ["skardi/gguf"]
 onnx = ["skardi/onnx"]
 remote-embed = ["skardi/remote-embed"]
-embedding = ["skardi/embedding"]
+# Umbrellas must enable the CLI's OWN feature flags (which the UDF registration
+# in main.rs is gated on), not just the underlying `skardi` crate's — otherwise
+# `--features embedding` compiles the deps but the CLI never registers the UDFs.
+embedding = ["onnx", "candle", "gguf", "remote-embed"]
 chunking = ["skardi/chunking"]
 # RAG umbrella: chunk → embed → write loop in one feature.
-rag = ["skardi/rag"]
+rag = ["embedding", "chunking"]
 
 [dependencies]
 anyhow = { workspace = true }
