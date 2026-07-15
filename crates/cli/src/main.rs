@@ -928,6 +928,7 @@ async fn register_source(
                 endpoint,
                 source.options.as_ref(),
                 source.is_read_write(),
+                source.hierarchy_level,
             )
             .await
             .with_context(|| format!("Failed to register DynamoDB '{}'", source.name))?;

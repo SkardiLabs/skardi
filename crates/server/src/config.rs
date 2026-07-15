@@ -240,6 +240,11 @@ pub enum ConfigError {
     )]
     EmptyAllowedSchemas { name: String },
 
+    #[error(
+        "Data source '{name}' has an empty 'allowed_tables' option. Either omit it to load all DynamoDB tables, or provide a non-empty comma-separated list such as \"products,orders\"."
+    )]
+    EmptyAllowedTables { name: String },
+
     #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
     NonUtf8Path { name: String, path: PathBuf },
 }
@@ -708,6 +713,7 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Mysql,
     DataSourceType::Sqlite,
     DataSourceType::Seekdb,
+    DataSourceType::Dynamodb,
 ];
 
 /// Data source types that support read_write access mode
@@ -783,6 +789,22 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                         name: source.name.clone(),
                     }
                     .into());
+                }
+            }
+
+            if source.source_type == DataSourceType::Dynamodb {
+                if let Some(value) = source
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.get("allowed_tables"))
+                {
+                    let has_entry = value.split(',').any(|s| !s.trim().is_empty());
+                    if !has_entry {
+                        return Err(ConfigError::EmptyAllowedTables {
+                            name: source.name.clone(),
+                        }
+                        .into());
+                    }
                 }
             }
         }
@@ -1292,6 +1314,7 @@ async fn register_data_source(
                 connection_string,
                 source.options.as_ref(),
                 source.access_mode.is_read_write(),
+                source.hierarchy_level,
             )
             .await
             .map_err(|e| {
@@ -2247,6 +2270,68 @@ options:
             matches!(
                 config_err,
                 ConfigError::MissingConnectionString { name } if name == "products"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_dynamodb_catalog_empty_allowed_tables() {
+        let mut options = HashMap::new();
+        options.insert("allowed_tables".to_string(), " , , ".to_string());
+        let mut source = dynamodb_source(
+            "ddb",
+            Some("http://localhost:8000"),
+            Some(options),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::EmptyAllowedTables { name } if name == "ddb"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_dynamodb_catalog_allowed_tables() {
+        let mut options = HashMap::new();
+        options.insert("allowed_tables".to_string(), "products, orders".to_string());
+        let mut source = dynamodb_source(
+            "ddb",
+            Some("http://localhost:8000"),
+            Some(options),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        validate_data_sources(&[source]).expect("valid DynamoDB catalog allow-list");
+    }
+
+    #[test]
+    fn validate_rejects_dynamodb_catalog_table_option() {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "products".to_string());
+        let mut source = dynamodb_source(
+            "ddb",
+            Some("http://localhost:8000"),
+            Some(options),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "ddb" && option == "table"
             ),
             "got {config_err}"
         );

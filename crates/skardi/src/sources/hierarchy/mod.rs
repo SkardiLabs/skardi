@@ -63,6 +63,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum attempts (including the first) for [`retry_with_timeout`].
 pub const MAX_RETRIES: u32 = 3;
 
+/// Summary returned by catalog assembly helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogBuildReport {
+    pub registered: usize,
+    pub skipped: usize,
+}
+
 /// How much of an upstream database to expose in DataFusion (single table vs whole catalog).
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Hash, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -173,14 +180,35 @@ pub async fn build_catalog<F, Fut>(
     session_ctx: &SessionContext,
     catalog_name: &str,
     schema_tables: Vec<(String, String)>,
-    mut build_table: F,
+    build_table: F,
 ) -> Result<()>
 where
     F: FnMut(String, String) -> Fut,
     Fut: Future<Output = Result<Arc<dyn TableProvider>>>,
 {
-    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
+    build_catalog_with_required_schemas(
+        session_ctx,
+        catalog_name,
+        schema_tables,
+        Vec::new(),
+        build_table,
+    )
+    .await
+    .map(|_| ())
+}
 
+/// Fail-fast catalog assembly with schemas that must exist even when no table is registered.
+pub async fn build_catalog_with_required_schemas<F, Fut>(
+    session_ctx: &SessionContext,
+    catalog_name: &str,
+    schema_tables: Vec<(String, String)>,
+    required_schemas: Vec<String>,
+    mut build_table: F,
+) -> Result<CatalogBuildReport>
+where
+    F: FnMut(String, String) -> Fut,
+    Fut: Future<Output = Result<Arc<dyn TableProvider>>>,
+{
     // Kick off provider construction concurrently. `build_table` (FnMut) is called eagerly
     // and sequentially in the map — the closures it returns are what run in parallel.
     let provider_futures: Vec<_> = schema_tables
@@ -200,15 +228,114 @@ where
         })
         .collect();
 
-    let mut prepared: Vec<(String, String, Arc<dyn TableProvider>)> =
+    let prepared: Vec<(String, String, Arc<dyn TableProvider>)> = stream::iter(provider_futures)
+        .buffer_unordered(CATALOG_BUILD_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    register_catalog_tables(session_ctx, catalog_name, required_schemas, prepared, 0)
+}
+
+/// Best-effort catalog assembly. Failed table providers are skipped after a warning.
+pub async fn build_catalog_best_effort<F, Fut>(
+    session_ctx: &SessionContext,
+    catalog_name: &str,
+    schema_tables: Vec<(String, String)>,
+    required_schemas: Vec<String>,
+    mut build_table: F,
+) -> Result<CatalogBuildReport>
+where
+    F: FnMut(String, String) -> Fut,
+    Fut: Future<Output = Result<Arc<dyn TableProvider>>>,
+{
+    let provider_futures: Vec<_> = schema_tables
+        .into_iter()
+        .map(|(schema, table_name)| {
+            let fut = build_table(schema.clone(), table_name.clone());
+            let catalog_name = catalog_name.to_string();
+            async move {
+                let result = fut.await.with_context(|| {
+                    format!(
+                        "Failed to build table provider for '{}.{}' in catalog '{}'",
+                        schema, table_name, catalog_name
+                    )
+                });
+                (schema, table_name, result)
+            }
+        })
+        .collect();
+
+    let prepared_results: Vec<(String, String, Result<Arc<dyn TableProvider>>)> =
         stream::iter(provider_futures)
             .buffer_unordered(CATALOG_BUILD_CONCURRENCY)
-            .try_collect()
-            .await?;
+            .collect()
+            .await;
+
+    let mut skipped = 0usize;
+    let mut prepared = Vec::new();
+    for (schema, table_name, provider_result) in prepared_results {
+        match provider_result {
+            Ok(provider) => prepared.push((schema, table_name, provider)),
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(
+                    catalog = %catalog_name,
+                    schema = %schema,
+                    table = %table_name,
+                    error = %e,
+                    "Skipping catalog table after provider build failure"
+                );
+            }
+        }
+    }
+
+    if prepared.is_empty() && skipped > 0 {
+        tracing::warn!(
+            catalog = %catalog_name,
+            skipped,
+            "Catalog registered with no tables because every table was skipped"
+        );
+    }
+
+    register_catalog_tables(
+        session_ctx,
+        catalog_name,
+        required_schemas,
+        prepared,
+        skipped,
+    )
+}
+
+fn register_catalog_tables(
+    session_ctx: &SessionContext,
+    catalog_name: &str,
+    mut required_schemas: Vec<String>,
+    mut prepared: Vec<(String, String, Arc<dyn TableProvider>)>,
+    skipped: usize,
+) -> Result<CatalogBuildReport> {
+    let catalog_provider = Arc::new(MemoryCatalogProvider::new());
+
+    required_schemas.sort();
+    required_schemas.dedup();
+    for schema in required_schemas {
+        if catalog_provider.schema(&schema).is_none() {
+            catalog_provider
+                .register_schema(&schema, Arc::new(MemorySchemaProvider::new()))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to register schema '{}' for catalog '{}': {}",
+                        schema,
+                        catalog_name,
+                        e
+                    )
+                })?;
+        }
+    }
 
     // Deterministic registration order for log output and downstream iteration.
     prepared.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
 
+    let registered = prepared.len();
     for (schema, table_name, table_provider) in prepared {
         if catalog_provider.schema(&schema).is_none() {
             catalog_provider
@@ -252,5 +379,8 @@ where
     }
 
     session_ctx.register_catalog(catalog_name, catalog_provider);
-    Ok(())
+    Ok(CatalogBuildReport {
+        registered,
+        skipped,
+    })
 }
