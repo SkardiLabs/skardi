@@ -5,7 +5,7 @@
 
 **Skardi is an open-source agent data plane** — parameterized SQL templates served as REST endpoints (and shell verbs) your agent calls as tools, turning *data autonomy* (letting the agent decide what to query and write) into a default you can govern.
 
-**Federated** · one engine over every source &nbsp;·&nbsp; **Governed** · semantic overlay, lineage, branching &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
+**Federated** · one engine over every source &nbsp;·&nbsp; **Governed** · a semantic overlay the agent reads before it queries &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
 
 <a href="https://skardilabs.github.io/skardi-docs/">Documentation</a> •
 <a href="#roadmap">Roadmap</a> •
@@ -100,13 +100,13 @@ $ skardi grep "turing machines" --limit=10                # shell tool, any Bash
 $ curl -X POST :8080/wiki-search-hybrid/execute -d '{...}' # same pipeline, served as REST
 ```
 
-That uniformity is also what makes the *durable* reason to put a plane in front possible: **governance**. Once every read and write goes through one engine, three primitives compose on top of it instead of fragmenting across N SDKs:
+That uniformity is also what makes the *durable* reason to put a plane in front possible: **governance**. Once every read and write goes through one engine, control composes on top of that single chokepoint instead of fragmenting across N SDKs.
 
-1. **Semantic overlay.** Plain-English descriptions of every table, column, and pipeline, served on `GET /data_source` as the agent's discovery surface. The agent reads *what each table is for* before querying, instead of guessing from a schema dump. Reading agents already cash this win — the catalog endpoint *is* the agent's prompt. ([docs/semantics.md](docs/semantics.md), shipped today)
-2. **Lineage.** Every write tagged with `agent_id`, `session_id`, `tool_call_id`, and `timestamp`, queryable from metadata. The async-job ledger already records every batch write today (parameters, status, run id); inline-write lineage on the synchronous path is in progress — see [Roadmap](#roadmap).
-3. **Snapshot-as-branch.** Iceberg / Lance-backed branches with `git checkout`-like semantics — an agent writes into a branch, you review, you merge or roll back. If the agent updated 1,000 rows you don't like, undoing it is one call, not an incident. (in progress — see [Roadmap](#roadmap))
+Open-source Skardi's governance starts with the **semantic overlay**: plain-English descriptions of every table, column, and pipeline, served on `GET /data_source` as the agent's discovery surface. The agent reads *what each table is for* before querying, instead of guessing from a schema dump. Reading agents already cash this win — the catalog endpoint *is* the agent's prompt. ([docs/semantics.md](docs/semantics.md), shipped today) And because every read and write shares one chokepoint, it's the natural seam to plug in mature agent-tracing tools for observability.
 
-Without these, "let the agent touch the database" is reckless and the right answer is "don't"; with them, *data autonomy* — letting the agent decide what to query and write — becomes a default you can actually grant. Federation, declarative SQL pipelines, REST + shell bindings — those are how the plane is built. Governance is what the plane is *for*.
+For agents that write to production, **Skardi Cloud** builds governed writes on the same engine: a queryable audit trail of every write (`agent_id`, `session_id`, `tool_call_id`, `timestamp`) and snapshot-as-branch rollback — an agent writes into a branch, you review, then merge or roll back a bad run in one call. That's what turns *data autonomy* — letting the agent decide what to query and write — into a default you can actually grant.
+
+Federation, declarative SQL pipelines, REST + shell bindings — those are how the plane is built. Governance is what the plane is *for*.
 
 For the longer technical read — each primitive's shipped vs. in-progress status, the run-ledger schema, the chokepoint argument unpacked — see [docs/agent_data_plane.md](docs/agent_data_plane.md).
 
@@ -140,13 +140,12 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
 
 ## When does a uniform data plane earn its keep?
 
-Direct SDKs work fine for a single read-only RAG bot — you can wire one to Postgres + a vector DB and ship in an afternoon. The plane earns its keep cumulatively: every property below is true on day one for the simplest agent, and the last three become load-bearing once the agent starts writing, you add a second agent, or "what did the agent do yesterday?" stops being a rhetorical question.
+Direct SDKs work fine for a single read-only RAG bot — you can wire one to Postgres + a vector DB and ship in an afternoon. The plane earns its keep cumulatively: every property below is true on day one for the simplest agent, and the write path becomes load-bearing once the agent starts writing, you add a second agent, or "what did the agent do yesterday?" stops being a rhetorical question.
 
 1. **Discovery — the agent reads what data *means*, not just shapes.** A semantic overlay attaches plain-English descriptions to every table, column, and pipeline; the catalog endpoint serves them so the agent picks the right verb before querying instead of guessing from a schema dump. (shipped — [docs/semantics.md](docs/semantics.md))
 2. **Federation — one JOIN over every source.** Federated SQL across Postgres / SQLite / MongoDB / S3 / Iceberg / Lance / vector stores, so the agent's "give me X about Y" doesn't need application-side joins.
 3. **Bindings — one pipeline, every host.** The same YAML serves as REST endpoint, `skardi` shell verb, and (soon) MCP tool — works in Claude Code, Cursor, your own loop, or a hosted agent with no extra glue.
-4. **Audit — one trail across every write.** Every write tagged with `agent_id` / `session_id` / `tool_call_id` / `timestamp`, queryable from one place. With direct SDKs you get distributed log files; through a plane you get one ledger. (the existing async-job ledger already records every batch write today; inline-write lineage in progress)
-5. **Rollback — branch the data, not your incident channel.** Iceberg / Lance-backed branches with `git checkout`-like semantics: agent writes into a branch, you review, you merge or revert. With direct DB writes a bad agent run is an incident; through the plane it's one call. (in progress)
+4. **Governed writes — in Skardi Cloud.** Once agents write to production you'll want a queryable audit trail of every write (`agent_id` / `session_id` / `tool_call_id` / `timestamp`) and one-call rollback of a bad run (snapshot-as-branch: the agent writes into a branch, you review, then merge or revert). Those governed-write primitives live in **Skardi Cloud**, on the same engine; open-source Skardi is the single chokepoint they build on.
 
 If your agent only ever reads from one source, direct SDKs are simpler. If it reads from many, or writes back, or you want to govern what it does — the plane is what makes data autonomy a responsible default rather than a gamble.
 
@@ -416,7 +415,7 @@ For data-source-specific demos, see the entries in [Supported Data Sources](#sup
 
 ## Roadmap
 
-**Coming soon (not yet shipped)**: a skills generator that emits Claude Code skill files per pipeline, an MCP binding for non-Claude hosts, a first-class memory primitive (one YAML block giving an agent a memory store with keyword + semantic recall, automatic expiration, and per-session provenance), lineage capture, and snapshot-as-branch checkpoints (roll back a destructive agent write — e.g. an agent that updated 1,000 rows you don't like — in one call).
+**Coming soon (not yet shipped)**: a skills generator that emits Claude Code skill files per pipeline, an MCP binding for non-Claude hosts, and a first-class memory primitive (one YAML block giving an agent a memory store with keyword + semantic recall, automatic expiration, and per-session provenance). (Governed writes — an audit trail of every write and snapshot-as-branch rollback — are part of **Skardi Cloud**, not the open-source roadmap.)
 
 We're **building in public**. `[x]` means shipped today, `[ ]` means open for contribution. Open an issue or hop into [Discord](https://discord.gg/S5YQQPEV2m) on anything unchecked.
 
@@ -452,12 +451,11 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [ ] Skills generator — `skardi skills generate --ctx <ctx.yaml> --out .claude/skills/` emits a skill Markdown per pipeline for Claude Code / Desktop auto-discovery
    - [ ] MCP binding — same pipeline YAML projected to MCP tools for non-Claude hosts
 
-`6` Governance & lineage
+`6` Governance
    - [x] Plain-English table descriptions — a `kind: semantics` YAML overlay attaching natural-language descriptions to tables / columns (supports both bare source names and fully-qualified `catalog.schema.table` paths); served on `GET /data_source` so agents can discover what each table is for before querying
    - [ ] Agent-callable `describe` verb — CLI / pipeline form on top of the discovery endpoint
-   - [ ] Lineage capture — `agent_id`, `session_id`, `tool_call_id`, `timestamp` on writes; queryable from metadata tables
    - [ ] Agent identity passthrough — any binding injects client identity into a SQL context var pipelines can read
-   - [ ] Snapshot-as-branch / agent checkpoints — Iceberg / Lance-backed `git checkout`-like semantics: if your agent updates 1,000 rows and you don't like the result, roll back in one call
+   - Governed writes — an audit trail of every write (`agent_id`, `session_id`, `tool_call_id`, `timestamp`) and snapshot-as-branch rollback — are part of **Skardi Cloud**, not the open-source roadmap
 
 `7` Ops
    - [x] Session auth — drop-in user auth via [better-auth](https://www.better-auth.com/) backed by SQLite
