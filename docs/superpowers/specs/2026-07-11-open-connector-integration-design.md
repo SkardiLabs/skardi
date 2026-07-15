@@ -10,7 +10,7 @@ Skardi will integrate with [Open Connector](https://github.com/oomol-lab/open-co
 
 The integration will expose three SQL interfaces:
 
-1. Persistent-style stable catalog tables created through `CREATE EXTERNAL TABLE` or equivalent context YAML bindings.
+1. Persistent stable catalog tables registered from context YAML bindings.
 2. `open_connector_query`, a built-in source-pack UDTF with a stable schema and known pagination behavior.
 3. `open_connector_scan`, a lower-level UDTF for explicitly allowlisted raw Open Connector read actions.
 
@@ -91,8 +91,8 @@ The approved design choices are:
 - Perform live reads by default with optional TTL caching.
 - Keep milestone one strictly read-only.
 - Validate the abstraction with GitHub, Jira, and Notion.
-- Use SQL DDL as the concise interactive table-binding interface.
-- Keep context YAML as the reproducible server-deployment equivalent of DDL.
+- Bind stable tables exclusively through context YAML, registered as a DataFusion catalog provider.
+- Keep the UDTFs as the ad-hoc interactive interface; expose no SQL DDL in milestone one.
 
 ## Alternatives Considered
 
@@ -180,7 +180,11 @@ A built-in source pack contains stable table definitions for one provider. Each 
 
 Source-pack definitions are maintained and versioned by Skardi. Users bind them to concrete resources but do not define their internal relational contracts.
 
-Stable-table overrides are intentionally narrow: users may select or rename exposed columns, adjust cache and safety bounds, and supply required resource inputs. They may not replace the action, pagination strategy, row path, field source paths, or stable Arrow types. A materially different relational mapping is a custom external table or raw-action scan, not an override of a stable definition.
+All built-in packs are compiled into the Skardi binary and registered in an in-memory registry at process start; constructing the registry involves no file discovery or network I/O. A context binding's `source_pack` name resolves against this registry during configuration validation, so an unknown pack name fails at startup with a targeted error. Only packs referenced by a binding (and explicitly allowlisted raw actions) trigger gateway action-metadata discovery and compatibility verification; unbound packs stay inert.
+
+The registry is designed to accept a second tier later: user-authored packs loaded from a configured directory, the way pipelines and jobs are loaded today. User packs would use the same declarative format and execution engine and be subject to the same engine-level read-only classification and safety bounds, but as user content — versioned by their authors, never advertised as Skardi-supported sources, and without built-in schema-stability guarantees. This tier is deliberately excluded from milestone one so the pack format can stabilize while it is still Skardi-internal.
+
+Stable-table overrides are intentionally narrow: users may select or rename exposed columns, adjust cache and safety bounds, and supply required resource inputs. They may not replace the action, pagination strategy, row path, field source paths, or stable Arrow types. A materially different relational mapping is a raw-action scan or a new source-pack contribution, not an override of a stable definition.
 
 ### Relational scan engine
 
@@ -198,10 +202,9 @@ Milestone one uses a bounded in-memory TTL cache behind a `ScanCache` interface.
 
 The integration registers:
 
-- an `OPEN_CONNECTOR` `TableProviderFactory` for `CREATE EXTERNAL TABLE`;
+- a gateway `CatalogProvider` exposing the schemas and tables declared by persistent YAML bindings;
 - a stable-source-pack `open_connector_query` table function;
-- a raw-action `open_connector_scan` table function;
-- catalogs and schemas created from persistent YAML bindings.
+- a raw-action `open_connector_scan` table function.
 
 ## Catalog Namespace
 
@@ -222,49 +225,31 @@ saas.notion_roadmap.rows
 
 This naming permits multiple Open Connector gateways, connection aliases, repositories, Jira sites, and Notion data sources without hiding resource identity.
 
-## Stable Table Registration with SQL DDL
+## Stable Table Registration from Context YAML
 
-DataFusion 52 supports custom `TableProviderFactory` implementations for `CREATE EXTERNAL TABLE ... STORED AS <FORMAT>`. Skardi will register `OPEN_CONNECTOR` as a table format.
-
-The `saas` gateway catalog must already be configured before this DDL runs. The schema is created explicitly so the table name resolves deterministically.
-
-```sql
-CREATE SCHEMA IF NOT EXISTS saas.github_skardi;
-
-CREATE EXTERNAL TABLE saas.github_skardi.issues
-STORED AS OPEN_CONNECTOR
-LOCATION 'open-connector://saas/github.issues'
-OPTIONS (
-    'connection_alias' 'work',
-    'owner' 'SkardiLabs',
-    'repo' 'skardi',
-    'cache_ttl_seconds' '60'
-);
-```
-
-The URI identifies the configured gateway and built-in source-pack table. Options bind resource parameters. The factory combines both into one internal `OpenConnectorTableSpec` and returns a table provider.
+Stable tables are registered exclusively from context YAML. At startup, each configured gateway registers a DataFusion `CatalogProvider`. Each named binding becomes a schema beneath the gateway catalog, and each selected source-pack table becomes a table entry that resolves to a streaming `TableProvider`.
 
 ```mermaid
 flowchart LR
-    DDL["CREATE EXTERNAL TABLE<br/>STORED AS OPEN_CONNECTOR"]
-    Factory["OpenConnectorTableFactory"]
+    YAML["Context YAML binding<br/>github_skardi"]
+    CatalogP["OpenConnector CatalogProvider"]
     Pack["Built-in github.issues definition"]
     Binding["Bound TableProvider<br/>owner + repo + alias"]
     Catalog["saas.github_skardi.issues"]
 
-    DDL --> Factory
-    Factory --> Pack
+    YAML --> CatalogP
+    CatalogP --> Pack
     Pack --> Binding
     Binding --> Catalog
 ```
 
-The user does not declare columns, row paths, pagination, or filter mappings for built-in definitions.
+The binding combines the built-in source-pack definition with resource parameters into one internal `OpenConnectorTableSpec`. The user does not declare columns, row paths, pagination, or filter mappings for built-in definitions.
 
-DDL-created tables live for the DataFusion session. Reproducible server deployments use the equivalent context YAML binding.
+Registration is a configuration action, not a SQL action. Binding changes are reviewed configuration changes applied at startup or configuration reload; no SQL statement can add, alter, or remove a stable table. This keeps the SQL validator's no-DDL invariant intact and gives the shared server `SessionContext` a single, operator-controlled catalog whose contents are identical for every user and reproducible across restarts. Ad-hoc exploration uses the two UDTFs, which are plain `SELECT` statements and pass SQL validation unchanged.
 
 ## Persistent Context Binding
 
-The compact YAML form persists the same table binding across restarts:
+The compact YAML form declares the gateway configuration and table bindings:
 
 ```yaml
 kind: context
@@ -304,7 +289,7 @@ spec:
               - commits
 ```
 
-DDL and YAML compile into the same internal specification and use identical validation, schema, security, caching, and execution paths.
+YAML-bound tables and UDTF invocations compile into the same internal scan specification and use identical validation, schema, security, caching, and execution paths.
 
 ## Three SQL Interfaces
 
@@ -368,7 +353,7 @@ Arguments are gateway name, Open Connector action ID, input JSON, row path, and 
 
 The function accepts either four arguments, using the gateway's default connection, or five arguments with an explicit connection alias.
 
-For a raw scan, the row-path target must have a deterministic object item schema in the discovered action output schema. Stable primitives are exposed as typed fields; arbitrary unions or maps are encoded as JSON strings. If the target cannot produce a deterministic row type, planning fails with a message recommending a built-in definition or an explicitly declared external-table schema.
+For a raw scan, the row-path target must have a deterministic object item schema in the discovered action output schema. Stable primitives are exposed as typed fields; arbitrary unions or maps are encoded as JSON strings. If the target cannot produce a deterministic row type, planning fails with a message recommending a built-in definition or a new source-pack contribution.
 
 ## Built-in Stable Schema Example
 
@@ -391,6 +376,50 @@ The built-in `github.issues` definition uses `github.list_repository_issues`, ex
 | `html_url` | `Utf8` | nullable |
 
 Built-in definitions may flatten selected nested values, such as `user.login` to `author_login`, while retaining complex unsupported fields as JSON only when they are intentionally part of the stable schema.
+
+## Source-Pack Definition Example
+
+A source pack is a declarative definition shipped inside the Skardi binary. In milestone one it is not user-editable configuration, and context YAML never references an external schema file: per-provider response-shape differences are absorbed here, where Skardi can version, fingerprint, and release-gate them. An illustrative `github.issues` definition:
+
+```yaml
+# Shipped with Skardi. Versioned and release-gated; not user configuration.
+kind: pack
+pack: github
+version: 1
+
+tables:
+  issues:
+    action: github.list_repository_issues
+    action_fingerprint: "sha256:…"
+    row_path: $.issues
+    primary_key: [id]
+    resource_inputs:
+      required: [owner, repo]
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: per_page
+      max_page_size: 100
+    columns:
+      - { name: id,           type: uint64,           nullable: false, source: $.id }
+      - { name: number,       type: uint64,           nullable: false, source: $.number }
+      - { name: title,        type: utf8,             nullable: false, source: $.title }
+      - { name: state,        type: utf8,             nullable: false, source: $.state }
+      - { name: author_login, type: utf8,             nullable: true,  source: $.user.login }
+      - { name: labels,       type: list<utf8>,       nullable: true,  source: "$.labels[*].name" }
+      - { name: created_at,   type: timestamp_ms_utc, nullable: true,  source: $.created_at }
+      - { name: updated_at,   type: timestamp_ms_utc, nullable: true,  source: $.updated_at }
+    # Predicates translatable into provider API parameters. Any predicate
+    # not listed here is still valid SQL; DataFusion evaluates it locally.
+    filter_pushdown:
+      state:      { input: state, operators: [eq],  fidelity: exact }
+      updated_at: { input: since, operators: [gte], fidelity: inexact }
+    defaults:
+      cache_ttl_seconds: 0
+      max_pages: 100
+```
+
+The pack owns the relational contract: action, row path, schema, pagination, filter translations, and safety defaults. Context YAML supplies only what the pack cannot know — gateway, credentials reference, resource values, and bounded overrides. Whether packs are embedded as YAML assets or Rust declarations is an implementation choice for the Phase 0 plan; the contract boundary is what this design fixes.
 
 ## Stable Table Read Flow
 
@@ -519,6 +548,8 @@ Cache entries are keyed by:
 - upstream projection;
 - stable Arrow schema fingerprint.
 
+Only scans that run to natural pagination exhaustion are stored. A scan that stops early — because a `LIMIT` was satisfied, the scan was cancelled, or a safety bound was reached — is never cached, so a cache entry always represents the complete result for its key and truncated data can never be served as a complete result.
+
 Milestone one cache invalidation is TTL-based. The cache is bounded by bytes and entries and uses least-recently-used eviction. Cache state is observable in traces and metrics.
 
 Caching does not claim transactional consistency. A live multi-page scan can observe upstream changes between pages, subject to the provider's own pagination guarantees.
@@ -544,12 +575,13 @@ Security is default-deny.
 - YAML overrides cannot replace a stable table action with another action.
 - `open_connector_query` can use only built-in stable definitions.
 - `open_connector_scan` can use only action IDs explicitly allowlisted for the gateway.
+- The allowlist alone does not grant execution. Read-only classification is enforced from discovered Open Connector action metadata: an allowlisted raw action executes only when its metadata identifies it as a non-mutating read. Actions whose metadata is absent or ambiguous are rejected by default, with an error naming the classification gap.
 - Milestone one registers no SQL DML provider methods and exposes no mutating actions.
 - Open Connector action policies provide a second independent allowlist boundary.
 
 ## Compatibility and Schema Drift
 
-At startup or DDL binding, Skardi verifies:
+At startup or configuration reload, Skardi verifies:
 
 - the configured gateway is reachable;
 - the source-pack action exists;
@@ -561,6 +593,8 @@ At startup or DDL binding, Skardi verifies:
 Each stable definition records a source-pack version and action-contract fingerprint. Additive upstream fields are ignored. Removed required fields, incompatible type changes, missing actions, or pagination-contract changes fail table registration with a targeted compatibility error.
 
 Stable Arrow schema changes require an explicit source-pack version change and release note. An Open Connector upgrade must not silently change a Skardi table schema.
+
+The active source-pack version for every bound table is surfaced at registration time in logs and table metadata, so a Skardi upgrade that changes a pack version is visible rather than silent. Explicit per-binding version pinning and migration tooling remain future extensions.
 
 ## Observability
 
@@ -618,7 +652,7 @@ The first implementation plan after this proposal covers only the shared foundat
 
 ### Phase 0: shared foundation
 
-Deliver the typed configuration, HTTP client, action registry, source-pack registry, Arrow converter, pagination engine, filter/limit pushdown, bounded cache, physical execution plan, external-table factory, both UDTFs, security policy, observability, and test harness.
+Deliver the typed configuration, HTTP client, action registry, source-pack registry, Arrow converter, pagination engine, filter/limit pushdown, bounded cache, physical execution plan, catalog provider, both UDTFs, security policy, observability, and test harness.
 
 ### Milestone 1: GitHub, Jira, and Notion
 
@@ -658,7 +692,7 @@ Initial stable tables:
 - blocks;
 - users.
 
-Milestone one is complete only when all three work through DDL, persistent YAML, built-in UDTF, raw-action UDTF, and federated joins.
+Milestone one is complete only when all three work through persistent YAML bindings, the built-in UDTF, the raw-action UDTF, and federated joins.
 
 ### Phase 2: highest-priority expansion
 
@@ -737,12 +771,12 @@ Credentialed tests are ignored and opt-in. They are not required for ordinary CI
 
 ### End-to-end tests
 
-End-to-end tests execute DDL and YAML registration, stable-table queries with filters, both UDTFs, cache behavior, restart-equivalent registration, and federated joins against mock SaaS responses.
+End-to-end tests execute YAML registration, stable-table queries with filters, both UDTFs, cache behavior, restart-equivalent registration, and federated joins against mock SaaS responses.
 
 ## Milestone-one Acceptance Criteria
 
-1. GitHub, Jira, and Notion register through `CREATE EXTERNAL TABLE`.
-2. Equivalent context YAML bindings reproduce the same tables after server restart.
+1. GitHub, Jira, and Notion stable tables register from context YAML bindings.
+2. Bindings reproduce identical tables after server restart.
 3. Stable tables support filters and limits with verified pushdown behavior.
 4. `open_connector_query` returns the same schema and values as its corresponding stable table.
 5. `open_connector_scan` executes an explicitly allowlisted raw read action.
@@ -754,7 +788,7 @@ End-to-end tests execute DDL and YAML registration, stable-table queries with fi
 11. Mutating actions are rejected before an HTTP request is made.
 12. Incompatible Open Connector action changes fail registration with a targeted error.
 13. Logs and traces contain useful scan metadata without credentials or sensitive bodies.
-14. README, supported-sources table, configuration reference, DDL examples, and source-specific guides are updated.
+14. README, supported-sources table, configuration reference, context YAML examples, and source-specific guides are updated.
 
 ## Expected Repository Shape
 
@@ -774,7 +808,7 @@ crates/skardi/src/sources/providers/open_connector/
 ├── cache.rs
 ├── table.rs
 ├── exec.rs
-├── table_factory.rs
+├── catalog.rs
 ├── table_functions.rs
 └── packs/
     ├── mod.rs
@@ -793,8 +827,8 @@ The implementation must update:
 - the architecture diagram and description;
 - a general `docs/open-connector.md` guide;
 - source guides for GitHub, Jira, and Notion;
-- context YAML examples;
-- DDL and UDTF examples;
+- context YAML binding examples;
+- UDTF examples;
 - authorization, visibility, rate-limit, and freshness caveats;
 - the source-pack contribution guide.
 
@@ -806,11 +840,13 @@ The design deliberately leaves room for:
 
 - persistent or distributed scan caches;
 - scheduled snapshot materialization into Parquet, Lance, or Iceberg;
+- user-authored source packs loaded from a configured directory, enforced by the same engine-level read-only classification and safety bounds but versioned by their authors and not advertised as supported sources;
 - automatic generation of candidate source-pack definitions for review;
 - additional typed pagination strategies;
 - write actions behind an explicit non-SQL action API;
 - provider-specific SQL DML only after separate safety and transaction designs;
 - source-pack version pinning and migration tools;
+- SQL DDL table registration (`CREATE EXTERNAL TABLE ... STORED AS OPEN_CONNECTOR`) once DDL authorization and shared-session semantics are designed;
 - upstream Open Connector relational metadata such as row paths and pagination contracts.
 
 These are not part of milestone one.
