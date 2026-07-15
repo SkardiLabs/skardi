@@ -1,5 +1,6 @@
 mod alias;
 mod alias_store;
+mod doctor;
 mod jobs_cli;
 mod pipeline;
 
@@ -132,6 +133,9 @@ enum Commands {
         #[command(subcommand)]
         cmd: jobs_cli::JobCmd,
     },
+    /// Run a single-machine self-check: CLI version, query engine, and capabilities.
+    #[command(name = "doctor")]
+    Doctor,
     /// Any unknown subcommand is looked up as a user-defined alias and
     /// dispatched to `run <pipeline>` with the alias's parameter bindings.
     #[command(external_subcommand)]
@@ -474,7 +478,7 @@ impl UrlTableFactory for SkardiUrlTableFactory {
 
 /// Create a new SessionContext with custom URL table support (built-in files + Lance)
 /// and the `lance_knn` / `pg_knn` UDTFs registered.
-fn new_session_context() -> (SessionContext, DatasetRegistry) {
+pub(crate) fn new_session_context() -> (SessionContext, DatasetRegistry) {
     let dataset_registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
     let session_store = SessionStore::new();
     let factory = Arc::new(SkardiUrlTableFactory::new(
@@ -608,6 +612,14 @@ async fn main() -> Result<()> {
         }
         Commands::Alias { cmd } => handle_alias_cmd(cmd).await,
         Commands::Job { cmd } => jobs_cli::handle_job_cmd(cmd).await,
+        Commands::Doctor => {
+            // doctor prints its own report; a failed CORE check → non-zero exit
+            // so scripts / CI can detect a broken install.
+            if !doctor::run().await? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Commands::External(args) => {
             // The first token is the alias name; the rest are the alias's args
             // (plus any control flags we strip out before resolution).
