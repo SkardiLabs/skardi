@@ -5,6 +5,7 @@ use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+use skardi::sources::providers::clickhouse::register_clickhouse_tables;
 use skardi::sources::providers::dynamodb::register_dynamodb_tables;
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::influxdb::register_influxdb_tables;
@@ -743,6 +744,7 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Sqlite,
     DataSourceType::Seekdb,
     DataSourceType::Dynamodb,
+    DataSourceType::Clickhouse,
     // OpenConnector is catalog-only; its tables come from typed bindings, so
     // the same catalog-mode guards (no per-table `options`) must apply.
     DataSourceType::OpenConnector,
@@ -890,6 +892,7 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 | DataSourceType::Redis
                 | DataSourceType::Seekdb
                 | DataSourceType::Influxdb
+                | DataSourceType::Clickhouse
                 | DataSourceType::OpenConnector
                 | DataSourceType::Dynamodb,
                 false,
@@ -1065,6 +1068,7 @@ async fn register_data_source(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb,
             _,
@@ -1486,6 +1490,39 @@ async fn register_data_source(
             .map_err(|e| {
                 tracing::error!(
                     "InfluxDB registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Clickhouse => {
+            tracing::info!(
+                "Registering ClickHouse table: {} (hierarchy_level: {:?})",
+                source.name,
+                source.hierarchy_level
+            );
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            register_clickhouse_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+                source.hierarchy_level,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "ClickHouse registration failed for '{}': {:?}",
                     source.name,
                     e
                 );

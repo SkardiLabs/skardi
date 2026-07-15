@@ -1,0 +1,6 @@
+product_id,warehouse,quantity
+PROD001,us-west,12
+PROD002,us-west,40
+PROD003,us-east,7
+PROD004,us-east,55
+PROD005,us-west,9

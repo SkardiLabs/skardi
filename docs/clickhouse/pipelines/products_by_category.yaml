@@ -1,0 +1,12 @@
+kind: pipeline
+
+metadata:
+  name: "products_by_category"
+  version: "1.0"
+  description: "Products in one category, priciest first (category is Nullable in ClickHouse)"
+
+# Parameters:
+#   {category} - Product category to filter on (e.g. "Electronics")
+
+spec:
+  query: "SELECT product_id, name, price, in_stock FROM products WHERE category = {category} ORDER BY price DESC"

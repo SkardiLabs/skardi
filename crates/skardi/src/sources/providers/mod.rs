@@ -1,3 +1,4 @@
+pub mod clickhouse;
 #[cfg(feature = "documents")]
 pub mod documents;
 pub mod dynamodb;

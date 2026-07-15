@@ -1,0 +1,12 @@
+kind: pipeline
+
+metadata:
+  name: "list_all_users"
+  version: "1.0"
+  description: "Full scan of the users table (LIMIT pushed down to ClickHouse)"
+
+# Parameters:
+#   {limit} - Maximum number of rows to return
+
+spec:
+  query: "SELECT id, name, email FROM users ORDER BY id LIMIT {limit}"

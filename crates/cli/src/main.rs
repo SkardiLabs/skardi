@@ -45,6 +45,7 @@ use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_ud
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry,
+    clickhouse::register_clickhouse_tables,
     dynamodb::register_dynamodb_tables,
     iceberg::register_iceberg_table,
     influxdb::register_influxdb_tables,
@@ -959,6 +960,23 @@ async fn register_source(
             )
             .await
             .with_context(|| format!("Failed to register Open Connector '{}'", source.name))?;
+        }
+        "clickhouse" => {
+            let conn_str = source.connection_string.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ClickHouse source '{}': connection_string required",
+                    source.name
+                )
+            })?;
+            register_clickhouse_tables(
+                session_ctx,
+                &source.name,
+                conn_str,
+                source.options.as_ref(),
+                source.hierarchy_level,
+            )
+            .await
+            .with_context(|| format!("Failed to register ClickHouse '{}'", source.name))?;
         }
         "dynamodb" => {
             let endpoint = source.connection_string.as_deref().ok_or_else(|| {
