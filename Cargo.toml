@@ -26,6 +26,7 @@ arrow-json = { version = "57.0.1" }
 async-trait = "0.1.88"
 axum = "0.7"
 cookie = "0.18"
+clickhouse = "0.14"
 ctor = "0.4.1"
 datafusion = { version = "52.1.0", default-features = false, features = [
     "nested_expressions",

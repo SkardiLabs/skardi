@@ -9328,6 +9328,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "chrono",
+ "clickhouse",
  "datafusion",
  "datafusion-common",
  "datafusion-federation",

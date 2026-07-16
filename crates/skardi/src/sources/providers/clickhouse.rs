@@ -19,7 +19,8 @@
 
 use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
-    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+    HierarchyLevel, SourceLabel, build_catalog_best_effort, parse_allowed_schemas,
+    retry_with_timeout,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -35,7 +36,6 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::clickhouse::ClickHouseTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::clickhousepool::ClickHouseConnectionPool;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
 use secrecy::SecretString;
 use std::any::Any;
 use std::collections::HashMap;
@@ -133,6 +133,10 @@ async fn register_single_clickhouse_table(
         })?;
     let database = options.and_then(|opts| opts.get(OPT_DATABASE));
 
+    // Validate the connection string before logging it, so a URL that embeds
+    // credentials is rejected without the secret ever reaching the logs.
+    let params = parse_connection_params(connection_string, options)?;
+
     tracing::info!(
         "Registering ClickHouse table '{}' as '{}' against endpoint {} (read-only)",
         database
@@ -142,7 +146,6 @@ async fn register_single_clickhouse_table(
         connection_string
     );
 
-    let params = parse_connection_params(connection_string, options)?;
     let label = SourceLabel::new(DataSourceType::Clickhouse, HierarchyLevel::Table, name);
     let pool = build_pool(label, params)
         .await
@@ -153,7 +156,8 @@ async fn register_single_clickhouse_table(
         None => TableReference::bare(table_name.as_str()),
     };
 
-    let table_provider = build_clickhouse_table_provider(&pool, table_reference.clone()).await?;
+    let table_provider =
+        build_clickhouse_table_provider(&pool, label, table_reference.clone()).await?;
 
     session_ctx
         .register_table(name, table_provider)
@@ -176,13 +180,16 @@ async fn register_clickhouse_catalog(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<()> {
+    // Validate the connection string before logging it, so a URL that embeds
+    // credentials is rejected without the secret ever reaching the logs.
+    let params = parse_connection_params(connection_string, options)?;
+
     tracing::info!(
         "Registering ClickHouse catalog '{}' against endpoint {} (read-only)",
         catalog_name,
         connection_string
     );
 
-    let params = parse_connection_params(connection_string, options)?;
     let label = SourceLabel::new(
         DataSourceType::Clickhouse,
         HierarchyLevel::Catalog,
@@ -211,17 +218,20 @@ async fn register_clickhouse_catalog(
         );
     }
 
-    let table_count = schema_tables.len();
-
-    build_catalog(
+    // Best-effort assembly: a single unreadable table (broken view, engine
+    // that refuses direct SELECT, permissions gap) must not take down the
+    // whole catalog — and with it server startup. Failed tables are skipped
+    // with a warning, mirroring the DynamoDB catalog path.
+    let report = build_catalog_best_effort(
         session_ctx,
         catalog_name,
         schema_tables,
+        Vec::new(),
         |schema, table_name| {
             let pool = Arc::clone(&pool);
             async move {
                 let table_reference = TableReference::partial(schema.as_str(), table_name.as_str());
-                build_clickhouse_table_provider(&pool, table_reference).await
+                build_clickhouse_table_provider(&pool, label, table_reference).await
             }
         },
     )
@@ -229,9 +239,10 @@ async fn register_clickhouse_catalog(
     .with_context(|| format!("Failed to build ClickHouse catalog '{catalog_name}'"))?;
 
     tracing::info!(
-        "Registered ClickHouse catalog '{}' with {} table(s) (read-only)",
+        "Registered ClickHouse catalog '{}' with {} table(s), {} skipped (read-only)",
         catalog_name,
-        table_count
+        report.registered,
+        report.skipped
     );
 
     Ok(())
@@ -254,23 +265,37 @@ async fn build_pool(
 }
 
 /// Build a read-only [`TableProvider`] for a single ClickHouse table. Schema is
-/// inferred eagerly via `DESCRIBE TABLE`, so a missing table fails registration
-/// with an actionable error instead of an opaque failure at query time.
+/// inferred eagerly — upstream runs `SELECT * FROM <table> LIMIT 0` through the
+/// ArrowStream format (plus an engine lookup in `system.tables`) — so a missing
+/// or unreadable table fails registration with an actionable error instead of
+/// an opaque failure at query time. The fetch is wrapped in
+/// [`retry_with_timeout`] so an endpoint that hangs mid-introspection can't
+/// stall startup indefinitely.
 async fn build_clickhouse_table_provider(
     pool: &Arc<ClickHouseConnectionPool>,
+    label: SourceLabel<'_>,
     table_reference: TableReference,
 ) -> Result<Arc<dyn TableProvider>> {
     let factory = ClickHouseTableFactory::new(Arc::clone(pool));
-    let inner = factory
-        .table_provider(table_reference.clone(), None)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to create ClickHouse table provider for '{table_reference}' \
-                 (schema is fetched at registration time); check that the table exists \
-                 and the configured user can read it: {e}"
-            )
-        })?;
+    let op_name = format!("schema inference for '{table_reference}'");
+    let inner = retry_with_timeout(label, &op_name, || {
+        let table_reference = table_reference.clone();
+        let factory = &factory;
+        async move {
+            factory
+                .table_provider(table_reference, None)
+                .await
+                .map_err(|e| anyhow!(e))
+        }
+    })
+    .await
+    .map_err(|e| {
+        anyhow!(
+            "Failed to create ClickHouse table provider for '{table_reference}' \
+             (schema is fetched at registration time); check that the table exists \
+             and the configured user can read it: {e}"
+        )
+    })?;
     Ok(Arc::new(CountSafeClickHouseTable { inner }))
 }
 
@@ -286,6 +311,11 @@ async fn build_clickhouse_table_provider(
 /// the inner table, then strip it back to zero columns with a
 /// [`ProjectionExec`], which preserves the row count. All other projections
 /// delegate straight to the inner table.
+///
+/// The column still streams in full over HTTP (the enabled feature set does
+/// no aggregate pushdown — see `docs/clickhouse/README.md`), so we pick the
+/// narrowest fixed-width column rather than whatever sits at index 0, which
+/// could be an arbitrarily wide String.
 #[derive(Debug)]
 struct CountSafeClickHouseTable {
     inner: Arc<dyn TableProvider>,
@@ -330,7 +360,7 @@ impl TableProvider for CountSafeClickHouseTable {
             // unparsed ClickHouse SQL stays well-formed, then drop it again to
             // honour the requested zero-column output.
             Some(p) if p.is_empty() => {
-                let single = vec![0usize];
+                let single = vec![narrowest_column_index(&self.inner.schema())];
                 let plan = self
                     .inner
                     .scan(state, Some(&single), filters, limit)
@@ -343,31 +373,102 @@ impl TableProvider for CountSafeClickHouseTable {
     }
 }
 
-/// List `(database, table)` pairs across the server via `system.tables`.
+/// Index of the cheapest column to stream when only a row count is needed:
+/// the narrowest fixed-width field, falling back to index 0 when every column
+/// is variable-width. Ties resolve to the first such column, so the choice is
+/// deterministic.
+fn narrowest_column_index(schema: &SchemaRef) -> usize {
+    use datafusion::arrow::datatypes::DataType;
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, field)| match field.data_type() {
+            // Bit-packed in Arrow, so `primitive_width` reports nothing; it's
+            // still the cheapest thing a ClickHouse table can hold.
+            DataType::Boolean => 1,
+            dt => dt.primitive_width().unwrap_or(usize::MAX),
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+/// Table engines that refuse direct SELECT by default (they exist to feed
+/// materialized views): querying one fails with `Code: 620 QUERY_NOT_ALLOWED`
+/// unless `stream_like_engine_allow_direct_select` is set server-side, so
+/// registering them would only produce unqueryable catalog entries.
+const STREAM_LIKE_ENGINES: &[&str] = &["Kafka", "RabbitMQ", "NATS", "FileLog"];
+
+/// List `(database, table)` pairs across the server with one `system.tables`
+/// query, so introspection cost doesn't scale with database count.
 ///
-/// When `allowed_schemas` is `Some`, only those databases are introspected (a
+/// When `allowed_schemas` is `Some`, only those databases are included (a
 /// database with no tables — or that doesn't exist — simply contributes
-/// nothing). Otherwise every non-system database on the server is included.
+/// nothing). Otherwise every non-system database on the server is included,
+/// matching upstream's `schemas()` exclusion list.
+///
+/// Stream-like engines (see [`STREAM_LIKE_ENGINES`]) and materialized-view
+/// inner tables (`.inner…` names in Atomic databases) are skipped with a log
+/// line: the former can't be SELECTed directly, the latter are implementation
+/// detail with near-unqueryable names.
 async fn list_clickhouse_tables(
     pool: &Arc<ClickHouseConnectionPool>,
     allowed_schemas: Option<&[String]>,
 ) -> Result<Vec<(String, String)>> {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct SystemTableRow {
+        database: String,
+        name: String,
+        engine: String,
+    }
+
     let client = pool.client();
 
-    let databases = match allowed_schemas {
-        Some(allowed) => allowed.to_vec(),
-        None => client
-            .schemas()
-            .await
-            .map_err(|e| anyhow!("Failed to list ClickHouse databases: {e}"))?,
+    let query = match allowed_schemas {
+        Some(allowed) => {
+            let placeholders = vec!["?"; allowed.len()].join(", ");
+            let mut query = client.query(&format!(
+                "SELECT database, name, engine FROM system.tables \
+                 WHERE database IN ({placeholders}) ORDER BY database, name"
+            ));
+            for database in allowed {
+                query = query.bind(database);
+            }
+            query
+        }
+        None => client.query(
+            "SELECT database, name, engine FROM system.tables \
+             WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA') \
+             ORDER BY database, name",
+        ),
     };
 
+    let rows: Vec<SystemTableRow> = query
+        .fetch_all()
+        .await
+        .map_err(|e| anyhow!("Failed to list ClickHouse tables from system.tables: {e}"))?;
+
     let mut schema_tables = Vec::new();
-    for database in databases {
-        let tables = client.tables(&database).await.map_err(|e| {
-            anyhow!("Failed to list tables in ClickHouse database '{database}': {e}")
-        })?;
-        schema_tables.extend(tables.into_iter().map(|t| (database.clone(), t)));
+    for row in rows {
+        if row.name.starts_with(".inner") {
+            tracing::debug!(
+                "Skipping ClickHouse materialized-view inner table '{}.{}'",
+                row.database,
+                row.name
+            );
+            continue;
+        }
+        if STREAM_LIKE_ENGINES.contains(&row.engine.as_str()) {
+            tracing::info!(
+                "Skipping ClickHouse table '{}.{}' with stream-like engine {} \
+                 (direct SELECT is not allowed on this engine)",
+                row.database,
+                row.name,
+                row.engine
+            );
+            continue;
+        }
+        schema_tables.push((row.database, row.name));
     }
 
     Ok(schema_tables)
@@ -379,8 +480,10 @@ async fn list_clickhouse_tables(
 /// The endpoint must be an `http://` or `https://` URL (ClickHouse's native
 /// TCP port 9000 speaks a different protocol — this provider uses the HTTP
 /// interface on port 8123). Credentials must come from `user_env` / `pass_env`
-/// options; `user:pass@host` embedded in the URL is ignored by the pool, so a
-/// warning is surfaced when detected.
+/// options; `user:pass@host` embedded in the URL is a hard error. The pool
+/// ignores URL-embedded credentials, so accepting them would mean a confusing
+/// authentication failure at connect time — and the connection string (which
+/// is logged and exposed by the data-sources API) would carry a live secret.
 fn parse_connection_params(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
@@ -399,10 +502,12 @@ fn parse_connection_params(
     }
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        tracing::warn!(
-            "ClickHouse connection string contains embedded credentials; these are ignored. \
-             Use '{OPT_USER_ENV}' and '{OPT_PASS_ENV}' options instead."
-        );
+        return Err(anyhow!(
+            "ClickHouse connection string must not embed credentials in the URL \
+             (they would be ignored by the connection pool, and the connection string \
+             is logged and exposed by the data-sources API). \
+             Use the '{OPT_USER_ENV}' and '{OPT_PASS_ENV}' options instead."
+        ));
     }
 
     let mut params: HashMap<String, SecretString> = HashMap::new();
@@ -550,12 +655,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_connection_params_embedded_credentials_are_ignored() {
-        // Embedded creds only trigger a warning; they must not leak into the
-        // param map where they'd silently override the env-based options.
-        let params = parse_connection_params("http://user:pass@localhost:8123", None).unwrap();
-        assert!(!params.contains_key("user"));
-        assert!(!params.contains_key("password"));
+    fn parse_connection_params_embedded_credentials_are_rejected() {
+        // The pool ignores URL-embedded credentials, so accepting them would
+        // trade a clear config error for a confusing auth failure at connect
+        // time — while the secret leaks into logs and the data-sources API.
+        let err = parse_connection_params("http://user:pass@localhost:8123", None).unwrap_err();
+        assert!(err.to_string().contains("must not embed"), "got {err}");
+
+        // Username without password is rejected the same way.
+        let err = parse_connection_params("http://user@localhost:8123", None).unwrap_err();
+        assert!(err.to_string().contains("must not embed"), "got {err}");
+    }
+
+    #[test]
+    fn narrowest_column_index_prefers_narrowest_fixed_width() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("id", DataType::UInt32, false),
+        ]));
+        assert_eq!(narrowest_column_index(&schema), 2, "Boolean is narrowest");
+    }
+
+    #[test]
+    fn narrowest_column_index_falls_back_to_first_column() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Binary, false),
+        ]));
+        assert_eq!(narrowest_column_index(&schema), 0);
     }
 
     #[tokio::test]
@@ -741,9 +872,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn integration_empty_table_schema_inference() {
-        // Schema inference must come from DESCRIBE, not from sampled rows —
-        // an empty table has to register and scan cleanly (regression case:
-        // several providers have shipped with panics here).
+        // Schema inference comes from a `LIMIT 0` query, not from sampled
+        // rows — an empty table has to register and scan cleanly (regression
+        // case: several providers have shipped with panics here).
         let mut ctx = SessionContext::new();
         register_ci_table(&mut ctx, "empty_metrics", "empty_metrics").await;
 

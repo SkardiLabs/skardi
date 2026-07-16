@@ -97,10 +97,13 @@ option). To expose several tables, declare one data source per table — see
 [`ctx_clickhouse_demo.yaml`](ctx_clickhouse_demo.yaml) — or register the whole
 server at once with [catalog mode](#catalog-mode).
 
-The table's Arrow schema is inferred at server startup with `DESCRIBE TABLE`,
-so the ClickHouse endpoint must be reachable when Skardi loads its context
-(the same eager-connect behaviour as the Postgres/MySQL/Mongo providers). An
-empty table registers cleanly — the schema never depends on sampled rows.
+The table's Arrow schema is inferred at server startup with a
+`SELECT * … LIMIT 0` probe (via ClickHouse's ArrowStream output format, plus
+an engine lookup in `system.tables`), so the ClickHouse endpoint must be
+reachable when Skardi loads its context (the same eager-connect behaviour as
+the Postgres/MySQL/Mongo providers). An empty table registers cleanly — the
+schema never depends on sampled rows. Note this means a table whose engine
+refuses direct SELECT (e.g. `Kafka`) cannot be registered in table mode.
 
 ## Query Pushdown
 
@@ -110,6 +113,13 @@ projections, and `LIMIT`s run **inside ClickHouse**, so a
 `WHERE id = {user_id}` pipeline transfers one row, not the table. Joins and
 aggregations across sources execute in Skardi after the (already filtered)
 scans return.
+
+**Aggregates are not pushed down.** A bare `SELECT count(*) FROM t` streams
+one column of `t` (the narrowest fixed-width column) over HTTP and counts
+client-side, instead of letting ClickHouse answer from part metadata. On
+OLAP-sized tables, put a selective `WHERE` on such queries — or query a
+pre-aggregated table — until aggregate pushdown lands (upstream's
+`clickhouse-federation` feature).
 
 ## Available Pipelines
 
@@ -317,10 +327,16 @@ curl -X POST http://localhost:8080/clickhouse-catalog-cross-table-join/execute \
 }
 ```
 
-Catalog mode must not mix with per-table options — `table` / `schema` are
-rejected when `hierarchy_level: catalog` is set. Use `allowed_schemas` to
-restrict which databases are exposed; omit it to include every non-system
-database.
+Catalog mode must not mix with per-table options — `table` / `schema` /
+`database` are rejected when `hierarchy_level: catalog` is set. Use
+`allowed_schemas` to restrict which databases are exposed; omit it to include
+every non-system database.
+
+Catalog assembly is **best-effort**: a table whose schema can't be fetched
+(e.g. a view over a dropped table, or a permissions gap) is skipped with a
+warning instead of failing startup. Stream-like engine tables (`Kafka`,
+`RabbitMQ`, `NATS`, `FileLog` — engines that refuse direct SELECT) and
+materialized-view inner tables (`.inner…` names) are excluded up front.
 
 ---
 
@@ -349,8 +365,10 @@ the following `options` keys:
 
 The native TCP protocol (port 9000) is not supported — registration rejects
 non-`http(s)` schemes. Credentials embedded in the URL
-(`http://user:pass@host`) are ignored with a warning; use `user_env` /
-`pass_env` so secrets stay out of the YAML.
+(`http://user:pass@host`) are rejected outright — the connection pool would
+ignore them, and connection strings are logged and surfaced by the
+data-sources API. Use `user_env` / `pass_env` so secrets stay out of the YAML,
+the logs, and the API.
 
 ## Access Mode
 

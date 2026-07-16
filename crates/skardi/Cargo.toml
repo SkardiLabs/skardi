@@ -61,6 +61,9 @@ text-splitter = { version = "0.30", features = ["markdown"], optional = true }
 # sources
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1"
+# Direct dep on the same client `datafusion-table-providers` uses, so catalog
+# introspection can run one batched `system.tables` query instead of N+1.
+clickhouse = { workspace = true }
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 derivative = "2.2.0"
