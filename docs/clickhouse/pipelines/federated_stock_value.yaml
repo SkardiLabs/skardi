@@ -14,7 +14,7 @@ spec:
   query: |
     SELECT w.warehouse,
            count(*) AS skus,
-           sum(p.price * w.quantity) AS stock_value
+           round(sum(p.price * w.quantity), 2) AS stock_value
     FROM products p
     JOIN product_inventory w ON p.product_id = w.product_id
     WHERE w.warehouse = {warehouse}
