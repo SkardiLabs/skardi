@@ -69,7 +69,7 @@ pub(crate) fn record_batch_to_json(
     let mut writer = WriterBuilder::new()
         .with_explicit_nulls(true) // Include null values in JSON output
         .build::<_, JsonArray>(buf);
-    writer.write_batches(&vec![batch])?;
+    writer.write_batches(&[batch])?;
     writer.finish()?;
     let json_data = writer.into_inner();
 
@@ -77,10 +77,7 @@ pub(crate) fn record_batch_to_json(
     let json_rows: Vec<Map<String, Value>> = serde_json::from_reader(json_data.as_slice())?;
 
     // Convert Map objects to Value objects
-    let values: Vec<Value> = json_rows
-        .into_iter()
-        .map(|map| Value::Object(map))
-        .collect();
+    let values: Vec<Value> = json_rows.into_iter().map(Value::Object).collect();
 
     Ok(values)
 }

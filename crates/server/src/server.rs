@@ -194,7 +194,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         let data_source_types = config
             .data_sources
             .iter()
-            .map(|ds| (ds.name.clone(), ds.source_type.clone()))
+            .map(|ds| (ds.name.clone(), ds.source_type))
             .collect();
         // Only Lance destinations care about a physical path today; other
         // source kinds can opt in later by adding their own entries here.

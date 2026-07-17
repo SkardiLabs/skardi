@@ -289,13 +289,13 @@ fn resolve_pipeline_files(path: Option<&PathBuf>) -> Result<Vec<PathBuf>> {
             let entry = entry.with_context(|| "Failed to read directory entry")?;
             let file_path = entry.path();
 
-            if file_path.is_file() {
-                if let Some(ext) = file_path.extension() {
-                    let ext = ext.to_string_lossy().to_lowercase();
-                    if ext == "yaml" || ext == "yml" {
-                        tracing::debug!("Found pipeline file: {:?}", file_path);
-                        pipeline_files.push(file_path);
-                    }
+            if file_path.is_file()
+                && let Some(ext) = file_path.extension()
+            {
+                let ext = ext.to_string_lossy().to_lowercase();
+                if ext == "yaml" || ext == "yml" {
+                    tracing::debug!("Found pipeline file: {:?}", file_path);
+                    pipeline_files.push(file_path);
                 }
             }
         }
@@ -496,12 +496,15 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         }
     }
 
-    if args.jobs_path.is_some() && !job_files.is_empty() && jobs.is_empty() {
+    if let Some(jobs_path) = args.jobs_path.as_ref()
+        && !job_files.is_empty()
+        && jobs.is_empty()
+    {
         tracing::warn!(
             "--jobs {:?} scanned {} YAML file(s) but none had `kind: job` at the root; \
              /jobs/* endpoints will return 503 until at least one job definition loads. \
              Did you forget the `kind: job` discriminator?",
-            args.jobs_path.as_ref().expect("just checked is_some above"),
+            jobs_path,
             job_files.len(),
         );
     }
@@ -754,7 +757,7 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         {
             return Err(ConfigError::UnsupportedWriteMode {
                 name: source.name.clone(),
-                source_type: source.source_type.clone(),
+                source_type: source.source_type,
             }
             .into());
         }
@@ -793,19 +796,18 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 }
             }
 
-            if source.source_type == DataSourceType::Dynamodb {
-                if let Some(value) = source
+            if source.source_type == DataSourceType::Dynamodb
+                && let Some(value) = source
                     .options
                     .as_ref()
                     .and_then(|o| o.get("allowed_tables"))
-                {
-                    let has_entry = value.split(',').any(|s| !s.trim().is_empty());
-                    if !has_entry {
-                        return Err(ConfigError::EmptyAllowedTables {
-                            name: source.name.clone(),
-                        }
-                        .into());
+            {
+                let has_entry = value.split(',').any(|s| !s.trim().is_empty());
+                if !has_entry {
+                    return Err(ConfigError::EmptyAllowedTables {
+                        name: source.name.clone(),
                     }
+                    .into());
                 }
             }
         }
@@ -1022,15 +1024,15 @@ async fn register_data_source(
                     csv_read_options =
                         csv_read_options.has_header(has_header.parse::<bool>().unwrap_or(true));
                 }
-                if let Some(delimiter) = options.get("delimiter") {
-                    if let Some(delimiter_char) = delimiter.chars().next() {
-                        csv_read_options = csv_read_options.delimiter(delimiter_char as u8);
-                    }
+                if let Some(delimiter) = options.get("delimiter")
+                    && let Some(delimiter_char) = delimiter.chars().next()
+                {
+                    csv_read_options = csv_read_options.delimiter(delimiter_char as u8);
                 }
-                if let Some(schema_infer_max) = options.get("schema_infer_max_records") {
-                    if let Ok(max_records) = schema_infer_max.parse::<usize>() {
-                        csv_read_options = csv_read_options.schema_infer_max_records(max_records);
-                    }
+                if let Some(schema_infer_max) = options.get("schema_infer_max_records")
+                    && let Ok(max_records) = schema_infer_max.parse::<usize>()
+                {
+                    csv_read_options = csv_read_options.schema_infer_max_records(max_records);
                 }
             }
 
@@ -2131,7 +2133,7 @@ spec:
         use clap::Parser;
 
         // Test with single pipeline file and context
-        let args = CliArgs::try_parse_from(&[
+        let args = CliArgs::try_parse_from([
             "skardi-server",
             "--pipeline",
             "/path/to/pipeline.yaml",
@@ -2150,7 +2152,7 @@ spec:
         assert_eq!(args.port, 9000);
 
         // Test with pipeline directory
-        let args = CliArgs::try_parse_from(&["skardi-server", "--pipeline", "/path/to/pipelines/"])
+        let args = CliArgs::try_parse_from(["skardi-server", "--pipeline", "/path/to/pipelines/"])
             .unwrap();
 
         assert_eq!(
@@ -2161,7 +2163,7 @@ spec:
         assert_eq!(args.port, 8080); // default value
 
         // Test with no pipelines
-        let args = CliArgs::try_parse_from(&["skardi-server"]).unwrap();
+        let args = CliArgs::try_parse_from(["skardi-server"]).unwrap();
 
         assert!(args.pipeline_path.is_none());
         assert_eq!(args.ctx_file, None);

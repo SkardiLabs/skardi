@@ -244,13 +244,13 @@ fn check_write_access(
     table_name: &str,
     config: &SqlValidatorConfig,
 ) -> Result<(), SqlValidationError> {
-    if let Some(mode) = config.table_access_modes.get(table_name) {
-        if *mode == AccessMode::ReadOnly {
-            return Err(SqlValidationError::WriteNotAllowed {
-                operation: operation.to_string(),
-                table: table_name.to_string(),
-            });
-        }
+    if let Some(mode) = config.table_access_modes.get(table_name)
+        && *mode == AccessMode::ReadOnly
+    {
+        return Err(SqlValidationError::WriteNotAllowed {
+            operation: operation.to_string(),
+            table: table_name.to_string(),
+        });
     }
     Ok(())
 }

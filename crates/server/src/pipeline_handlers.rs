@@ -663,7 +663,7 @@ pub async fn execute_pipeline_by_name(
         let mut expected_params: Vec<String> = request_schema.fields.keys().cloned().collect();
         // Sort longest-first so a shorter name (e.g. `{user}`) cannot corrupt a longer one
         // (`{user_id}`) during str::replace when both appear in the same SQL template.
-        expected_params.sort_by(|a, b| b.len().cmp(&a.len()));
+        expected_params.sort_by_key(|b| std::cmp::Reverse(b.len()));
         (query_def.sql.clone(), expected_params)
     };
 
@@ -1171,7 +1171,7 @@ spec:
 
     fn sorted_keys(map: &HashMap<String, Value>) -> Vec<String> {
         let mut v: Vec<String> = map.keys().cloned().collect();
-        v.sort_by(|a, b| b.len().cmp(&a.len()));
+        v.sort_by_key(|b| std::cmp::Reverse(b.len()));
         v
     }
 
