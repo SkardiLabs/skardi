@@ -15,6 +15,7 @@ use skardi::sources::providers::redis::datasource::register_redis_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
+use skardi::sources::sql_validator::{SqlValidatorConfig, validate_sql};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -874,24 +875,24 @@ fn validate_schema_types(_schema: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// Build a SQL validator config mapping every data source name to its
+/// configured access mode. Used at config load (pipeline SQL) and at
+/// request time (`POST /query`).
+pub(crate) fn validator_config_from_sources(data_sources: &[DataSource]) -> SqlValidatorConfig {
+    let mut validator_config = SqlValidatorConfig::new();
+    for ds in data_sources {
+        validator_config = validator_config.with_table(&ds.name, ds.access_mode);
+    }
+    validator_config
+}
+
 /// Validate pipeline SQL against data source access modes
 fn validate_pipeline_sql(
     pipeline_name: &str,
     sql: &str,
     data_sources: &[DataSource],
 ) -> Result<()> {
-    use skardi::sources::sql_validator::{SqlValidatorConfig, validate_sql};
-
-    // Build validator config from data sources
-    let mut validator_config = SqlValidatorConfig::new();
-    for ds in data_sources {
-        let mode = if ds.access_mode.is_read_write() {
-            skardi::sources::sql_validator::AccessMode::ReadWrite
-        } else {
-            skardi::sources::sql_validator::AccessMode::ReadOnly
-        };
-        validator_config = validator_config.with_table(&ds.name, mode);
-    }
+    let validator_config = validator_config_from_sources(data_sources);
 
     // Validate the SQL against access mode restrictions
     validate_sql(sql, &validator_config).map_err(|e| {

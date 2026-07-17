@@ -24,6 +24,7 @@ use skardi::pipeline::pipeline::Pipeline;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::auth::routes::require_session;
 use crate::config::DataSourceType;
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
@@ -618,17 +619,8 @@ pub async fn execute_pipeline_by_name(
     Path(pipeline_name): Path<String>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
-        let status = unauth_response.status();
-        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
-            .await
-            .unwrap_or_default();
-        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Authentication required".to_string());
-        return Err((status, create_error_response(&msg, "unauthorized", None)));
-    }
+    require_session(&app_state, &headers).await?;
+
     let start_time = Instant::now();
 
     tracing::info!(

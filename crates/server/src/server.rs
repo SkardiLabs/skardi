@@ -35,6 +35,7 @@ use crate::pipeline_handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
     pipeline_health_check,
 };
+use crate::query_handlers::execute_query;
 #[cfg(test)]
 use crate::semantics::SemanticsRegistry;
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
@@ -254,6 +255,7 @@ pub fn configure_routes(state: AppState) -> Router {
         .route("/pipelines", get(list_pipelines))
         .route("/pipeline/:name", get(get_pipelines_info))
         .route("/data_source", get(get_data_sources))
+        .route("/query", post(execute_query))
         .route("/:name/execute", post(execute_pipeline_by_name));
 
     // Jobs endpoints — mounted unconditionally so the CLI can discover
