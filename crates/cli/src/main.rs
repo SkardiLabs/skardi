@@ -2958,9 +2958,13 @@ bindings:
         }
 
         #[tokio::test]
-        async fn valid_config_fails_not_implemented_before_network() {
+        async fn errors_when_token_env_missing() {
+            // With the config valid, the next failure is the unset runtime
+            // token — before any network call to the (unroutable) gateway.
             let (mut session_ctx, registry) = new_session_context();
-            let source = open_connector_source(Some("http://127.0.0.1:1"), Some(VALID_CONFIG));
+            let config =
+                VALID_CONFIG.replace("OPEN_CONNECTOR_TOKEN", "SKARDI_CLI_TEST_OC_TOKEN_UNSET");
+            let source = open_connector_source(Some("http://127.0.0.1:1"), Some(config.as_str()));
             let err = register_source(&mut session_ctx, &source, &registry)
                 .await
                 .unwrap_err();
@@ -2970,7 +2974,7 @@ bindings:
                 "unexpected error: {msg}"
             );
             assert!(
-                msg.contains("not implemented yet"),
+                msg.contains("SKARDI_CLI_TEST_OC_TOKEN_UNSET"),
                 "unexpected error: {msg}"
             );
         }

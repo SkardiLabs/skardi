@@ -89,11 +89,69 @@ pub enum OpenConnectorError {
     )]
     CatalogHierarchyRequired { name: String },
 
-    /// The config passed validation but execution has not landed yet.
+    /// The environment variable holding the gateway runtime token was unset.
     #[error(
-        "Open Connector source '{name}' passed validation, but gateway execution is \
-         not implemented yet — only the typed-config foundation has landed; \
-         registration arrives with the HTTP client milestone"
+        "Environment variable '{env}' not found: it must contain the Open Connector \
+         gateway runtime token"
+    )]
+    MissingRuntimeToken { env: String },
+
+    /// The gateway URL used a non-HTTP(S) scheme or embedded credentials.
+    #[error(
+        "Open Connector gateway URL '{url}' must use http:// or https:// and must \
+         not embed credentials (the runtime token is sent as a Bearer header)"
+    )]
+    InvalidGatewayUrl { url: String },
+
+    /// `reqwest::Client` construction failed.
+    #[error("Failed to build the Open Connector HTTP client: {reason}")]
+    HttpClientBuild { reason: String },
+
+    /// The gateway health check returned a terminal (non-retryable) failure.
+    #[error("Open Connector gateway health check failed for '{url}': {reason}")]
+    HealthCheckFailed { url: String, reason: String },
+
+    /// The gateway answered action discovery with 404.
+    #[error("Open Connector action '{action_id}' was not found on the gateway")]
+    ActionNotFound { action_id: String },
+
+    /// Action discovery failed for a reason other than "not found".
+    #[error("Failed to discover Open Connector action '{action_id}': {reason}")]
+    ActionDiscoveryFailed { action_id: String, reason: String },
+
+    /// The action exists but cannot execute on this gateway runtime.
+    #[error("Open Connector action '{action_id}' is not locally executable on this gateway")]
+    ActionNotLocallyExecutable { action_id: String },
+
+    /// An action execution call returned a terminal (non-retryable) failure.
+    #[error("Open Connector action '{action_id}' execution failed: {reason}")]
+    ActionExecutionFailed { action_id: String, reason: String },
+
+    /// Retries on 429 / transient 5xx / transport errors were exhausted.
+    #[error("Open Connector {operation} failed after {attempts} attempt(s); last error: {reason}")]
+    RetriesExhausted {
+        operation: String,
+        attempts: u32,
+        reason: String,
+    },
+
+    /// A response body grew past the configured decoding bound.
+    #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]
+    ResponseTooLarge {
+        operation: String,
+        limit_bytes: usize,
+    },
+
+    /// A response was not the JSON shape the client contract expects.
+    #[error("Open Connector {operation} returned an invalid response: {reason}")]
+    InvalidGatewayResponse { operation: String, reason: String },
+
+    /// The gateway is reachable and its action metadata loaded, but table
+    /// registration (source packs, scan engine) has not landed yet.
+    #[error(
+        "Open Connector source '{name}': gateway contact and action discovery succeeded, \
+         but table registration is not implemented yet — source packs and the scan \
+         engine arrive in the next milestone"
     )]
     ExecutionNotImplemented { name: String },
 }
