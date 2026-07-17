@@ -515,6 +515,8 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Create: `crates/server/src/query_handlers.rs`
 - Create: `crates/server/tests/query_http.rs`
 - Modify: `crates/server/src/config.rs` (extract `validator_config_from_sources` from `validate_pipeline_sql`, lines ~877-906)
+- Modify: `crates/server/src/auth/routes.rs` (add `require_session` helper wrapping `verify_session`)
+- Modify: `crates/server/src/pipeline_handlers.rs` (replace inline auth block in `execute_pipeline_by_name` with `require_session`)
 - Modify: `crates/server/src/server.rs` (mount route)
 - Modify: `crates/server/src/lib.rs` (add module)
 
@@ -527,6 +529,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Produces:
   - `pub async fn execute_query(State<AppState>, HeaderMap, Json<QueryRequest>) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)>` mounted at `POST /query`
   - `pub(crate) fn validator_config_from_sources(&[DataSource]) -> SqlValidatorConfig` in `config.rs`
+  - `pub(crate) async fn require_session(&AppState, &HeaderMap) -> Result<(), (StatusCode, Json<ErrorResponse>)>` in `auth/routes.rs`, used by both `execute_query` and `execute_pipeline_by_name`
 
 - [ ] **Step 1: Write the failing HTTP integration tests**
 
@@ -869,6 +872,50 @@ fn validate_pipeline_sql(
 }
 ```
 
+- [ ] **Step 3.5: Extract the `require_session` helper**
+
+3.5a. In `crates/server/src/auth/routes.rs`, add below `verify_session`:
+
+```rust
+/// Enforce the session gate for JSON API handlers: on auth failure, convert
+/// the raw `verify_session` response into the shared `ErrorResponse`
+/// envelope handlers return.
+pub(crate) async fn require_session(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Err(unauth_response) = verify_session(state, headers).await {
+        let status = unauth_response.status();
+        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
+            .await
+            .unwrap_or_default();
+        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "Authentication required".to_string());
+        return Err((status, create_error_response(&msg, "unauthorized", None)));
+    }
+    Ok(())
+}
+```
+
+Add whatever of these imports `auth/routes.rs` does not already have at the top:
+
+```rust
+use axum::Json;
+use axum::http::StatusCode;
+
+use crate::response::{ErrorResponse, create_error_response};
+```
+
+3.5b. In `crates/server/src/pipeline_handlers.rs`, replace the inline auth block at the top of `execute_pipeline_by_name` (the `if let Err(unauth_response) = crate::auth::routes::verify_session(...)` block through its `return Err(...)`) with:
+
+```rust
+    require_session(&app_state, &headers).await?;
+```
+
+and add `use crate::auth::routes::require_session;` to the top-of-file imports.
+
 - [ ] **Step 4: Create `crates/server/src/query_handlers.rs`**
 
 ```rust
@@ -889,6 +936,7 @@ use skardi::engine::Engine;
 use skardi::sources::sql_validator::{SqlValidationError, StatementKind, validate_single_sql};
 use std::time::Instant;
 
+use crate::auth::routes::require_session;
 use crate::config::validator_config_from_sources;
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
@@ -916,17 +964,7 @@ pub async fn execute_query(
     headers: axum::http::HeaderMap,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
-        let status = unauth_response.status();
-        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
-            .await
-            .unwrap_or_default();
-        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Authentication required".to_string());
-        return Err((status, create_error_response(&msg, "unauthorized", None)));
-    }
+    require_session(&app_state, &headers).await?;
 
     let start_time = Instant::now();
 
@@ -1117,7 +1155,7 @@ Expected: PASS — no regressions (the `validate_pipeline_sql` refactor is cover
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/server/src/query_handlers.rs crates/server/src/config.rs crates/server/src/server.rs crates/server/src/lib.rs crates/server/tests/query_http.rs
+git add crates/server/src/query_handlers.rs crates/server/src/config.rs crates/server/src/auth/routes.rs crates/server/src/pipeline_handlers.rs crates/server/src/server.rs crates/server/src/lib.rs crates/server/tests/query_http.rs
 git commit -m "feat(server): add POST /query endpoint for ad-hoc SQL
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
