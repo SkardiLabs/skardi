@@ -46,6 +46,14 @@ pub enum SqlValidationError {
         "Write operation '{operation}' not allowed on table '{table}'. The table is configured with 'read_only' access mode."
     )]
     WriteNotAllowed { operation: String, table: String },
+
+    #[error(
+        "COPY operation not allowed. COPY can read or write files on the server and is not permitted on any data source."
+    )]
+    CopyNotAllowed,
+
+    #[error("Expected exactly one SQL statement, found {count}.")]
+    NotExactlyOneStatement { count: usize },
 }
 
 pub fn validate_sql(sql: &str, config: &SqlValidatorConfig) -> Result<(), SqlValidationError> {
@@ -62,6 +70,49 @@ pub fn validate_sql(sql: &str, config: &SqlValidatorConfig) -> Result<(), SqlVal
     }
 
     Ok(())
+}
+
+/// Shape of a statement validated by [`validate_single_sql`], so callers can
+/// pick an execution path without depending on sqlparser types (crates
+/// outside this one may link a different sqlparser version).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    /// A query (SELECT/...) — safe to wrap in a plan-level LIMIT.
+    Query,
+    /// Anything else that passed validation (DML writes, SHOW, EXPLAIN, ...).
+    Other,
+}
+
+/// Validate SQL that must consist of exactly one statement.
+///
+/// Applies the same rules as [`validate_sql`] (DDL and COPY always rejected,
+/// writes checked against per-table access modes) and additionally rejects
+/// input that parses to zero or more than one statement. Returns the
+/// statement's [`StatementKind`] on success.
+pub fn validate_single_sql(
+    sql: &str,
+    config: &SqlValidatorConfig,
+) -> Result<StatementKind, SqlValidationError> {
+    let preprocessed_sql = preprocess_parameters(sql);
+
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, &preprocessed_sql)
+        .map_err(|e| SqlValidationError::ParseError(e.to_string()))?;
+
+    if statements.len() != 1 {
+        return Err(SqlValidationError::NotExactlyOneStatement {
+            count: statements.len(),
+        });
+    }
+
+    let statement = &statements[0];
+    validate_statement(statement, config)?;
+
+    Ok(if matches!(statement, Statement::Query(_)) {
+        StatementKind::Query
+    } else {
+        StatementKind::Other
+    })
 }
 
 fn preprocess_parameters(sql: &str) -> String {
@@ -137,6 +188,10 @@ fn validate_statement(
         Statement::Truncate { .. } => Err(SqlValidationError::DdlNotAllowed {
             operation: "TRUNCATE".to_string(),
         }),
+
+        // File-transfer operations - always blocked (can touch the server's filesystem)
+        Statement::Copy { .. } => Err(SqlValidationError::CopyNotAllowed),
+        Statement::CopyIntoSnowflake { .. } => Err(SqlValidationError::CopyNotAllowed),
 
         // DML write operations - check access mode
         Statement::Insert(insert) => {
@@ -427,5 +482,67 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn test_copy_blocked() {
+        let config = test_config();
+        let result = validate_sql("COPY users TO 'out.csv'", &config);
+        assert!(
+            matches!(result, Err(SqlValidationError::CopyNotAllowed)),
+            "COPY must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_validate_single_sql_query_ok() {
+        let config = test_config();
+        let kind = validate_single_sql("SELECT * FROM users", &config).unwrap();
+        assert_eq!(kind, StatementKind::Query);
+    }
+
+    #[test]
+    fn test_validate_single_sql_write_is_other() {
+        let config = test_config();
+        let kind = validate_single_sql("INSERT INTO orders (id) VALUES (1)", &config).unwrap();
+        assert_eq!(kind, StatementKind::Other);
+    }
+
+    #[test]
+    fn test_validate_single_sql_multi_statement_rejected() {
+        let config = test_config();
+        let result = validate_single_sql("SELECT 1; SELECT 2", &config);
+        assert!(matches!(
+            result,
+            Err(SqlValidationError::NotExactlyOneStatement { count: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_validate_single_sql_empty_rejected() {
+        let config = test_config();
+        let result = validate_single_sql("", &config);
+        assert!(matches!(
+            result,
+            Err(SqlValidationError::NotExactlyOneStatement { count: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_validate_single_sql_enforces_existing_rules() {
+        let config = test_config();
+        assert!(matches!(
+            validate_single_sql("DROP TABLE users", &config),
+            Err(SqlValidationError::DdlNotAllowed { .. })
+        ));
+        assert!(matches!(
+            validate_single_sql("DELETE FROM users WHERE id = 1", &config),
+            Err(SqlValidationError::WriteNotAllowed { .. })
+        ));
+        assert!(matches!(
+            validate_single_sql("COPY users TO 'out.csv'", &config),
+            Err(SqlValidationError::CopyNotAllowed)
+        ));
     }
 }
