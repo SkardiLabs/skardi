@@ -288,3 +288,15 @@ async fn missing_session_returns_401_when_auth_enabled() {
     let resp = post_query(state, json!({"sql": "SELECT 1"})).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn explain_analyze_insert_into_read_only_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "EXPLAIN ANALYZE INSERT INTO products (id, brand) VALUES (6, 'LG')"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("sql_validation_error"));
+}

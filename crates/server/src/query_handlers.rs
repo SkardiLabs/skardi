@@ -100,7 +100,9 @@ pub async fn execute_query(
                 SqlValidationError::NotExactlyOneStatement { count } => {
                     Some(serde_json::json!({ "statement_count": count }))
                 }
-                SqlValidationError::CopyNotAllowed | SqlValidationError::ParseError(_) => None,
+                SqlValidationError::CopyNotAllowed
+                | SqlValidationError::StatementNotAllowed { .. }
+                | SqlValidationError::ParseError(_) => None,
             };
 
             return Err((

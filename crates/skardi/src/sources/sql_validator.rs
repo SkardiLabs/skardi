@@ -54,6 +54,11 @@ pub enum SqlValidationError {
 
     #[error("Expected exactly one SQL statement, found {count}.")]
     NotExactlyOneStatement { count: usize },
+
+    #[error(
+        "Statement type '{operation}' not allowed. It can mutate shared session state and is not permitted on any data source."
+    )]
+    StatementNotAllowed { operation: String },
 }
 
 pub fn validate_sql(sql: &str, config: &SqlValidatorConfig) -> Result<(), SqlValidationError> {
@@ -206,6 +211,23 @@ fn validate_statement(
             let table_name = extract_table_name_from_from_table(&delete.from);
             check_write_access("DELETE", &table_name, config)
         }
+
+        // EXPLAIN wraps an inner statement that DataFusion may execute
+        // (EXPLAIN ANALYZE runs the plan). Validate the inner statement so
+        // EXPLAIN can never smuggle past DDL/COPY/write-access checks.
+        Statement::Explain { statement, .. } => validate_statement(statement, config),
+
+        // Session-mutating statements affect the process-wide SessionContext
+        // shared across all requests — always blocked.
+        Statement::SetVariable { .. } => Err(SqlValidationError::StatementNotAllowed {
+            operation: "SET".to_string(),
+        }),
+        Statement::SetRole { .. } => Err(SqlValidationError::StatementNotAllowed {
+            operation: "SET ROLE".to_string(),
+        }),
+        Statement::SetNames { .. } => Err(SqlValidationError::StatementNotAllowed {
+            operation: "SET NAMES".to_string(),
+        }),
 
         // Read operations and others - always allowed
         _ => Ok(()),
@@ -544,5 +566,48 @@ mod tests {
             validate_single_sql("COPY users TO 'out.csv'", &config),
             Err(SqlValidationError::CopyNotAllowed)
         ));
+    }
+
+    #[test]
+    fn test_explain_analyze_insert_into_read_only_blocked() {
+        let config = test_config();
+        let result = validate_single_sql(
+            "EXPLAIN ANALYZE INSERT INTO users (id, name) VALUES (1, 'x')",
+            &config,
+        );
+        assert!(
+            matches!(result, Err(SqlValidationError::WriteNotAllowed { .. })),
+            "EXPLAIN ANALYZE must inherit the inner statement's verdict, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_explain_ddl_blocked() {
+        let config = test_config();
+        let result = validate_single_sql("EXPLAIN DROP TABLE users", &config);
+        assert!(
+            matches!(result, Err(SqlValidationError::DdlNotAllowed { .. })),
+            "EXPLAIN of DDL must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_explain_select_allowed() {
+        let config = test_config();
+        let kind = validate_single_sql("EXPLAIN SELECT * FROM users", &config).unwrap();
+        assert_eq!(kind, StatementKind::Other);
+    }
+
+    #[test]
+    fn test_set_statement_blocked() {
+        let config = test_config();
+        let result = validate_single_sql("SET a = 1", &config);
+        assert!(
+            matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
+            "SET must be rejected, got: {:?}",
+            result
+        );
     }
 }

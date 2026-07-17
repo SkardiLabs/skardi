@@ -70,6 +70,7 @@ All errors use the existing `ErrorResponse` envelope
 | Status | `error_type` | Cause |
 |--------|--------------|-------|
 | 400 | `sql_validation_error` | Parse error, DDL, COPY, multi-statement input, or a write against a `read_only` source. `details` includes the operation and table where applicable. |
+| 400 | `parameter_validation_error` | `max_rows` is present but not a positive integer (e.g. `0`). |
 | 401 | `unauthorized` | Auth layer enabled and session invalid/missing. |
 | 500 | `query_execution_error` | Engine failure during execution. |
 | 500 | `result_conversion_error` | RecordBatch → JSON conversion failure. |
