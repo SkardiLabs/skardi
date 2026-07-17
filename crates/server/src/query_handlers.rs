@@ -49,6 +49,13 @@ pub async fn execute_query(
 
     let max_rows = match request.max_rows {
         Some(0) => {
+            let elapsed_ms = start_time.elapsed().as_millis() as f64;
+            app_state.metrics.record_error(
+                QUERY_METRICS_LABEL,
+                elapsed_ms,
+                "parameter_validation_error",
+            );
+
             return Err((
                 StatusCode::BAD_REQUEST,
                 create_error_response(
@@ -108,9 +115,18 @@ pub async fn execute_query(
     // result batches (e.g. an insert count) and run uncapped.
     let result = match statement_kind {
         StatementKind::Query => {
+            // DataFusion's LIMIT plan stores `fetch` as an `i64` literal
+            // internally, so a `usize` fetch that doesn't fit in `i64`
+            // (reachable via a client-supplied `max_rows` near `usize::MAX`)
+            // round-trips to a negative literal and fails query planning.
+            // `saturating_add` avoids the arithmetic overflow from `+ 1`;
+            // the `min` additionally clamps to `i64::MAX`, a cap far beyond
+            // any result set this endpoint could ever materialize, so no
+            // real request is affected.
+            let fetch = max_rows.saturating_add(1).min(i64::MAX as usize);
             app_state
                 .engine
-                .execute_with_limit(&request.sql, max_rows + 1)
+                .execute_with_limit(&request.sql, fetch)
                 .await
         }
         StatementKind::Other => app_state.engine.execute(&request.sql).await,

@@ -160,6 +160,19 @@ async fn result_exactly_at_cap_is_not_truncated() {
     assert_eq!(body["truncated"], json!(false));
 }
 
+#[tokio::test]
+async fn max_rows_usize_max_does_not_overflow() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT id FROM products", "max_rows": 18446744073709551615u64}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["rows"], json!(5));
+    assert_eq!(body["truncated"], json!(false));
+}
+
 // ---------------------------------------------------------------------------
 // Validation errors → 400
 
