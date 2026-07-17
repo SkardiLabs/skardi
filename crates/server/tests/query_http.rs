@@ -300,3 +300,15 @@ async fn explain_analyze_insert_into_read_only_rejected() {
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("sql_validation_error"));
 }
+
+#[tokio::test]
+async fn prepare_insert_into_read_only_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "PREPARE p AS INSERT INTO products (id, brand) VALUES (6, 'LG')"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("sql_validation_error"));
+}

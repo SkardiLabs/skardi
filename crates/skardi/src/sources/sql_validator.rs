@@ -229,6 +229,16 @@ fn validate_statement(
             operation: "SET NAMES".to_string(),
         }),
 
+        // Prepared statements persist a plan on the shared SessionContext and
+        // execute it later, which would smuggle a write/DDL past the checks
+        // above. Ad-hoc one-shot queries have no use for them — always blocked.
+        Statement::Prepare { .. } => Err(SqlValidationError::StatementNotAllowed {
+            operation: "PREPARE".to_string(),
+        }),
+        Statement::Execute { .. } => Err(SqlValidationError::StatementNotAllowed {
+            operation: "EXECUTE".to_string(),
+        }),
+
         // Read operations and others - always allowed
         _ => Ok(()),
     }
@@ -607,6 +617,31 @@ mod tests {
         assert!(
             matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
             "SET must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_prepare_statement_blocked() {
+        let config = test_config();
+        let result = validate_single_sql(
+            "PREPARE p AS INSERT INTO users (id, name) VALUES (1, 'x')",
+            &config,
+        );
+        assert!(
+            matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
+            "PREPARE must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_execute_statement_blocked() {
+        let config = test_config();
+        let result = validate_single_sql("EXECUTE p", &config);
+        assert!(
+            matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
+            "EXECUTE must be rejected, got: {:?}",
             result
         );
     }
