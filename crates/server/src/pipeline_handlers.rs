@@ -412,6 +412,7 @@ pub async fn get_data_sources(
             DataSourceType::Influxdb => "influxdb",
             DataSourceType::Documents => "documents",
             DataSourceType::Dynamodb => "dynamodb",
+            DataSourceType::OpenConnector => "open_connector",
         };
 
         // Determine path or URL based on source type
@@ -428,6 +429,7 @@ pub async fn get_data_sources(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb => None,
         };
 
@@ -438,6 +440,7 @@ pub async fn get_data_sources(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
@@ -981,6 +984,7 @@ spec:
             enable_cache: false,
             hierarchy_level: Default::default(),
             description: None,
+            open_connector: None,
         };
 
         // Create pipeline that queries the registered data source
@@ -1609,6 +1613,7 @@ spec:
                 access_mode: AccessMode::ReadWrite,
                 enable_cache: false,
                 description: None,
+                open_connector: None,
             });
         }
 

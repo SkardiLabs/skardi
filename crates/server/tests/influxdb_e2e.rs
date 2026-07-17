@@ -43,6 +43,7 @@ fn influx_source(name: &str, measurement: &str) -> DataSource {
         access_mode: AccessMode::default(),
         enable_cache: false,
         description: None,
+        open_connector: None,
     }
 }
 

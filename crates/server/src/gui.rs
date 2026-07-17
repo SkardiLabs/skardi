@@ -321,6 +321,7 @@ fn data_source_type_str(t: &DataSourceType) -> &'static str {
         DataSourceType::Influxdb => "influxdb",
         DataSourceType::Documents => "documents",
         DataSourceType::Dynamodb => "dynamodb",
+        DataSourceType::OpenConnector => "open_connector",
     }
 }
 
@@ -465,5 +466,13 @@ mod tests {
     #[test]
     fn data_source_type_str_covers_dynamodb() {
         assert_eq!(data_source_type_str(&DataSourceType::Dynamodb), "dynamodb");
+    }
+
+    #[test]
+    fn data_source_type_str_covers_open_connector() {
+        assert_eq!(
+            data_source_type_str(&DataSourceType::OpenConnector),
+            "open_connector"
+        );
     }
 }
