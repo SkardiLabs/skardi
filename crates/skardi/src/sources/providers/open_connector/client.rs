@@ -105,25 +105,25 @@ pub struct DiscoveredAction {
     /// Declared output JSON Schema, if the gateway provides one.
     pub output_schema: Option<Value>,
     /// Whether the action can execute on this gateway runtime.
-    pub locally_executable: bool,
+    ///
+    /// Kept as `Option` so "the gateway did not say" is never confused with
+    /// "the gateway said yes" — default-deny consumers (the action registry)
+    /// must treat `None` as not executable.
+    pub locally_executable: Option<bool>,
     /// Connection aliases available for this action.
     pub connection_aliases: Vec<String>,
 }
 
 /// Wire shape of the action discovery response. Unknown fields are ignored
-/// so additive gateway changes don't break discovery.
+/// so additive gateway changes don't break discovery. `locally_executable`
+/// deliberately has no default: a missing field must stay missing.
 #[derive(Debug, Deserialize)]
 struct RawDiscoveredAction {
     input_schema: Option<Value>,
     output_schema: Option<Value>,
-    #[serde(default = "default_locally_executable")]
-    locally_executable: bool,
+    locally_executable: Option<bool>,
     #[serde(default)]
     connection_aliases: Vec<String>,
-}
-
-fn default_locally_executable() -> bool {
-    true
 }
 
 impl OpenConnectorClient {
@@ -627,10 +627,26 @@ mod tests {
             .discover_action("github.list_repository_issues")
             .await
             .expect("discover");
-        assert!(action.locally_executable);
+        assert_eq!(action.locally_executable, Some(true));
         assert_eq!(action.connection_aliases, vec!["work", "personal"]);
         assert!(action.input_schema.is_some());
         assert!(action.output_schema.is_some());
+    }
+
+    #[tokio::test]
+    async fn discover_action_missing_executability_stays_none() {
+        // The client must not invent a default: "gateway did not say" is
+        // preserved as None so default-deny consumers can reject it.
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(r#"{"input_schema": {}, "output_schema": {}}"#)
+        })
+        .await;
+
+        let action = test_client(&gateway, 3)
+            .discover_action("github.x")
+            .await
+            .expect("discover");
+        assert_eq!(action.locally_executable, None);
     }
 
     #[tokio::test]

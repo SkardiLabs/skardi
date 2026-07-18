@@ -123,6 +123,14 @@ pub enum OpenConnectorError {
     #[error("Open Connector action '{action_id}' is not locally executable on this gateway")]
     ActionNotLocallyExecutable { action_id: String },
 
+    /// The gateway omitted the executability flag entirely; default-deny
+    /// treats "did not say" as "not executable".
+    #[error(
+        "Open Connector action '{action_id}' does not declare whether it is locally \
+         executable; refusing to treat it as executable (default-deny)"
+    )]
+    ActionExecutabilityUnknown { action_id: String },
+
     /// An action execution call returned a terminal (non-retryable) failure.
     #[error("Open Connector action '{action_id}' execution failed: {reason}")]
     ActionExecutionFailed { action_id: String, reason: String },

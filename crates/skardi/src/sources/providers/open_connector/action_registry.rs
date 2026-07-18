@@ -124,10 +124,21 @@ impl ActionRegistry {
 
         let discovered = stream::iter(ids.into_iter().map(|action_id| async move {
             let action = client.discover_action(action_id).await?;
-            if !action.locally_executable {
-                return Err(OpenConnectorError::ActionNotLocallyExecutable {
-                    action_id: action_id.to_string(),
-                });
+            // Default-deny: only an explicit `true` admits an action into the
+            // registry. `false` and "field missing" fail differently so the
+            // operator can tell a refused action from a metadata gap.
+            match action.locally_executable {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(OpenConnectorError::ActionNotLocallyExecutable {
+                        action_id: action_id.to_string(),
+                    });
+                }
+                None => {
+                    return Err(OpenConnectorError::ActionExecutabilityUnknown {
+                        action_id: action_id.to_string(),
+                    });
+                }
             }
             Ok(ActionMetadata::from_discovered(action_id, action))
         }))
@@ -294,6 +305,26 @@ mod tests {
         assert!(matches!(
             err,
             OpenConnectorError::ActionNotLocallyExecutable { ref action_id }
+                if action_id == "github.x"
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_missing_executability_flag() {
+        // Default-deny: a gateway that omits `locally_executable` must not be
+        // read as "executable". The error is a distinct variant so operators
+        // can tell a metadata gap from an explicit refusal.
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(r#"{"input_schema": {}, "output_schema": {}}"#)
+        })
+        .await;
+
+        let err = ActionRegistry::load(&client(&gateway), &["github.x".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ActionExecutabilityUnknown { ref action_id }
                 if action_id == "github.x"
         ));
     }
