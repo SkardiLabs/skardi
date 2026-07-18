@@ -17,7 +17,7 @@ The config layer every later piece builds on. No network I/O, nothing
 registered.
 
 - [x] 1.1 `DataSourceType::OpenConnector` with explicit serde rename (`open_connector`)
-- [x] 1.2 `OpenConnectorConfig` / `OpenConnectorBinding` matching the design-spec YAML (`runtime_token_env`, timeouts, `max_pages`/`max_rows`, `cache_max_bytes`, `cache_ttl_seconds`, `raw_action_allowlist`, `bindings`)
+- [x] 1.2 `OpenConnectorConfig` / `OpenConnectorBinding` matching the design-spec YAML (`runtime_token_env`, timeouts, `max_pages`/`max_rows`, `cache_max_bytes`, `cache_ttl_seconds`, `raw_action_allowlist`, `bindings`), with `deny_unknown_fields` so a misspelled key (e.g. `source_pack_versions`) fails loudly instead of silently disabling the pin
 - [x] 1.3 Optional `source_pack_version` pin on bindings (schema stability across Skardi upgrades)
 - [x] 1.4 `OpenConnectorError` with pre-network validation variants
 - [x] 1.5 `OpenConnectorConfig::validate()` — pure, shared by server validation and provider registration (CLI/server parity)

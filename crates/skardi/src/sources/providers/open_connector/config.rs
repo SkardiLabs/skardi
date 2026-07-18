@@ -73,6 +73,10 @@ fn default_cache_max_bytes() -> u64 {
 /// URL (via `connection_string` on the data source) and the name of the
 /// environment variable holding the gateway runtime token.
 ///
+/// Unknown fields are rejected: a misspelled key (e.g.
+/// `raw_action_allowlists`) must fail loudly instead of being silently
+/// dropped and changing the config's meaning.
+///
 /// # Example
 /// ```
 /// use skardi::sources::providers::open_connector::OpenConnectorConfig;
@@ -99,6 +103,7 @@ fn default_cache_max_bytes() -> u64 {
 /// assert_eq!(config.bindings.len(), 1);
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenConnectorConfig {
     /// Name of the environment variable holding the gateway runtime token.
     /// The token value is read from the process environment at registration
@@ -183,7 +188,12 @@ impl OpenConnectorConfig {
 /// Users bind packs to resources but do not define the pack's internal
 /// relational contract (action, row path, pagination, stable schema) — that
 /// stays in the Skardi-maintained source pack itself.
+///
+/// Unknown fields are rejected: a misspelled key (e.g.
+/// `source_pack_versions`) must fail loudly instead of being silently
+/// dropped, which would quietly disable the version pin it was meant to set.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenConnectorBinding {
     /// Binding name; becomes the schema name under the gateway catalog.
     pub name: String,
@@ -450,5 +460,59 @@ bindings:
             Err(OpenConnectorError::DuplicateTableName { ref binding, ref table })
                 if binding == "b" && table == "issues"
         ));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_top_level_field() {
+        // `raw_action_allowlists` (plural typo) must fail loudly, not be
+        // silently dropped — a silently dropped allowlist entry would
+        // unexpectedly deny a raw action the operator meant to permit.
+        let err = serde_yaml::from_str::<OpenConnectorConfig>(
+            "runtime_token_env: T\nraw_action_allowlists: [github.x]",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("raw_action_allowlists"),
+            "error should name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_misspelled_source_pack_version() {
+        // The exact failure mode the version pin exists to prevent: a typo'd
+        // `source_pack_versions` would otherwise parse as "no pin", silently
+        // falling back to the latest pack on the next upgrade.
+        let err = serde_yaml::from_str::<OpenConnectorConfig>(
+            "runtime_token_env: T\nbindings:\n  - name: b\n    source_pack: github\n    source_pack_versions: 1\n    tables: [issues]",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("source_pack_versions"),
+            "error should name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_binding_field() {
+        let err = serde_yaml::from_str::<OpenConnectorConfig>(
+            "runtime_token_env: T\nbindings:\n  - name: b\n    source_pack: github\n    table: issues\n    tables: [issues]",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("table"),
+            "error should name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_misspelled_cache_field() {
+        let err = serde_yaml::from_str::<OpenConnectorConfig>(
+            "runtime_token_env: T\ncache_ttl_second: 60",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cache_ttl_second"),
+            "error should name the unknown field: {err}"
+        );
     }
 }
