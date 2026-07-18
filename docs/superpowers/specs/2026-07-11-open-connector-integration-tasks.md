@@ -70,19 +70,25 @@ mock-gateway integration tests (multi-page, empty terminal page, retry,
 cancellation, cache hit/TTL, no-partial-success); mock-pack fixtures asserting
 Arrow types and values.
 
-## Milestone 4 — DDL factory + UDTFs + security/observability (follow-up PR)
+## Milestone 4 — UDTFs + security/observability (follow-up PR)
 
-The full SQL surface for the mock pack.
+The interactive SQL surface for the mock pack. **No SQL DDL**: the approved
+design registers stable tables exclusively through context YAML
+("registration is a configuration action, not a SQL action"), keeping the
+SQL validator's no-DDL invariant and shared-`SessionContext` semantics
+intact. `CREATE EXTERNAL TABLE ... STORED AS OPEN_CONNECTOR` is a
+documented future extension only, gated on a DDL authorization design —
+do not reintroduce it here.
 
-- [ ] 4.1 `table_factory.rs`: `OPEN_CONNECTOR` `TableProviderFactory` for `CREATE EXTERNAL TABLE ... STORED AS OPEN_CONNECTOR` (session-scoped tables)
-- [ ] 4.2 `open_connector_query` UDTF (built-in pack definitions only)
-- [ ] 4.3 `open_connector_scan` UDTF (allowlisted raw actions only; deterministic row type or planning error)
-- [ ] 4.4 Security policy enforcement: mutating actions rejected pre-HTTP; YAML overrides cannot swap actions/row paths; default-deny allowlist
-- [ ] 4.5 Observability: scan spans/metrics (gateway, binding, action, cache hit, pages, rows, retries) without tokens or bodies
-- [ ] 4.6 Docs: `docs/open-connector.md`, ctx/DDL/UDTF examples, README supported-sources entry (first time the source is actually queryable)
+- [ ] 4.1 `open_connector_query` UDTF (built-in pack definitions only)
+- [ ] 4.2 `open_connector_scan` UDTF (allowlisted raw actions only; deterministic row type or planning error)
+- [ ] 4.3 Security policy enforcement: mutating actions rejected pre-HTTP; YAML overrides cannot swap actions/row paths; default-deny allowlist
+- [ ] 4.4 Observability: scan spans/metrics (gateway, binding, action, cache hit, pages, rows, retries) without tokens or bodies
+- [ ] 4.5 Docs: `docs/open-connector.md`, ctx/UDTF examples, README supported-sources entry (first time the source is actually queryable)
 
-**Verification**: DDL and YAML registrations produce identical tables; UDTFs
-share the stable schema; federated join of mock pack against a local CSV.
+**Verification**: both UDTFs return the stable schema and values of their
+corresponding YAML-registered tables; federated join of the mock pack
+against a local CSV.
 
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 
