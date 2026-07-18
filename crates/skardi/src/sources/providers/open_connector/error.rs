@@ -103,6 +103,17 @@ pub enum OpenConnectorError {
     )]
     InvalidGatewayUrl { url: String },
 
+    /// The gateway URL carried a query string or fragment. Neither has any
+    /// meaning for a base URL, and query strings are a classic way to smuggle
+    /// tokens (`?token=…`, `?access_token=…`) into logs, `Debug` output, and
+    /// the data-sources API response.
+    #[error(
+        "Open Connector gateway URL '{url}' must not contain query parameters or a \
+         fragment (credentials in the URL would leak into logs and the data-sources \
+         API; the runtime token belongs in the configured environment variable)"
+    )]
+    GatewayUrlWithQueryOrFragment { url: String },
+
     /// `reqwest::Client` construction failed.
     #[error("Failed to build the Open Connector HTTP client: {reason}")]
     HttpClientBuild { reason: String },

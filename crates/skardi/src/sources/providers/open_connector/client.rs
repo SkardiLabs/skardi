@@ -131,8 +131,9 @@ impl OpenConnectorClient {
     ///
     /// Reads the runtime token from the environment variable named by
     /// `config.runtime_token_env`. The gateway URL must be `http(s)://`
-    /// without embedded credentials — the token is sent as a Bearer header,
-    /// so credentials in the URL would only leak into logs.
+    /// without embedded credentials, query parameters, or a fragment —
+    /// the token is sent as a Bearer header, so credentials in the URL
+    /// would only leak into logs and API responses.
     ///
     /// # Example
     /// ```no_run
@@ -188,6 +189,15 @@ impl OpenConnectorClient {
         }
         if !base_url.username().is_empty() || base_url.password().is_some() {
             return Err(OpenConnectorError::InvalidGatewayUrl {
+                url: gateway_url.to_string(),
+            });
+        }
+        // A query string or fragment has no meaning for a base URL, and query
+        // strings are the classic way to smuggle tokens (`?token=…`) into a
+        // URL that later shows up in Debug output, logs, and the
+        // data-sources API response. Reject both outright.
+        if base_url.query().is_some() || base_url.fragment().is_some() {
+            return Err(OpenConnectorError::GatewayUrlWithQueryOrFragment {
                 url: gateway_url.to_string(),
             });
         }
@@ -590,6 +600,31 @@ mod tests {
         let err = OpenConnectorClient::new("http://user:pass@x", "t", Duration::from_secs(1))
             .unwrap_err();
         assert!(matches!(err, OpenConnectorError::InvalidGatewayUrl { .. }));
+    }
+
+    #[tokio::test]
+    async fn constructor_rejects_query_and_fragment() {
+        // Query strings are the classic way to smuggle tokens into a URL
+        // that later lands in Debug output, logs, and the data-sources API.
+        for url in [
+            "https://gateway/?token=abc",
+            "https://gateway/?access_token=abc",
+            "https://gateway:8443/prefix?api_key=abc",
+            "https://gateway/#token=abc",
+        ] {
+            let err = OpenConnectorClient::new(url, "t", Duration::from_secs(1)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::GatewayUrlWithQueryOrFragment { .. }
+                ),
+                "{url} should be rejected, got {err}"
+            );
+        }
+
+        // A clean URL with a path prefix remains accepted.
+        OpenConnectorClient::new("https://gateway:8443/prefix", "t", Duration::from_secs(1))
+            .expect("clean URL with path is accepted");
     }
 
     #[tokio::test]
