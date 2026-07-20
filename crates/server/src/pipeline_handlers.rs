@@ -397,23 +397,9 @@ pub async fn get_data_sources(
     let mut data_source_responses = Vec::new();
 
     for data_source in &data_sources {
-        // Convert source type to lowercase string
-        let source_type_str = match data_source.source_type {
-            DataSourceType::Csv => "csv",
-            DataSourceType::Parquet => "parquet",
-            DataSourceType::Postgres => "postgres",
-            DataSourceType::Mysql => "mysql",
-            DataSourceType::Iceberg => "iceberg",
-            DataSourceType::Mongo => "mongo",
-            DataSourceType::Sqlite => "sqlite",
-            DataSourceType::Lance => "lance",
-            DataSourceType::Redis => "redis",
-            DataSourceType::Seekdb => "seekdb",
-            DataSourceType::Influxdb => "influxdb",
-            DataSourceType::Documents => "documents",
-            DataSourceType::Dynamodb => "dynamodb",
-            DataSourceType::OpenConnector => "open_connector",
-        };
+        // Convert source type to lowercase string (single source of truth:
+        // `DataSourceType::as_str`, so a new variant needs no change here).
+        let source_type_str = data_source.source_type.as_str();
 
         // Determine path or URL based on source type
         let path = match data_source.source_type {

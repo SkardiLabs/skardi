@@ -307,22 +307,7 @@ fn render_job_card(job: &JobDefinition) -> String {
 }
 
 fn data_source_type_str(t: &DataSourceType) -> &'static str {
-    match t {
-        DataSourceType::Csv => "csv",
-        DataSourceType::Parquet => "parquet",
-        DataSourceType::Postgres => "postgres",
-        DataSourceType::Mysql => "mysql",
-        DataSourceType::Iceberg => "iceberg",
-        DataSourceType::Mongo => "mongo",
-        DataSourceType::Sqlite => "sqlite",
-        DataSourceType::Lance => "lance",
-        DataSourceType::Redis => "redis",
-        DataSourceType::Seekdb => "seekdb",
-        DataSourceType::Influxdb => "influxdb",
-        DataSourceType::Documents => "documents",
-        DataSourceType::Dynamodb => "dynamodb",
-        DataSourceType::OpenConnector => "open_connector",
-    }
+    t.as_str()
 }
 
 async fn render_semantics_card(

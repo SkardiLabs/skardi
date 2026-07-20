@@ -235,12 +235,7 @@ fn parse_entities(body: &str) -> anyhow::Result<Vec<serde_json::Value>> {
 
 /// Parse `Retry-After` as seconds, falling back to `DEFAULT_RETRY_WAIT`.
 fn parse_retry_after(resp: &reqwest::Response) -> Duration {
-    resp.headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_RETRY_WAIT)
+    crate::util::http::parse_retry_after(resp).unwrap_or(DEFAULT_RETRY_WAIT)
 }
 
 /// One outcome of an HTTP attempt.

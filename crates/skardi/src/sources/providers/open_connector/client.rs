@@ -593,10 +593,11 @@ fn backoff(attempt: u32) -> Duration {
 
 /// Parse a `Retry-After` header (integer-seconds form), capped at
 /// [`MAX_RETRY_WAIT`]. HTTP-date form is ignored.
+/// Parse a `Retry-After` header, capped at [`MAX_RETRY_WAIT`]. Shared
+/// parsing lives in [`crate::util::http::parse_retry_after`]; only the cap
+/// is Open Connector-specific.
 fn retry_after(response: &Response) -> Option<Duration> {
-    let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
-    let seconds: u64 = value.to_str().ok()?.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds).min(MAX_RETRY_WAIT))
+    crate::util::http::parse_retry_after(response).map(|wait| wait.min(MAX_RETRY_WAIT))
 }
 
 #[cfg(test)]
