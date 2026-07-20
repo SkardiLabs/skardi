@@ -158,7 +158,8 @@ mod tests {
     use super::*;
     use crate::sources::providers::open_connector::testutil::{MockGateway, MockResponse};
 
-    const TOKEN_ENV: &str = "SKARDI_TEST_OC_REGISTER_TOKEN";
+    const TOKEN_ENV_HEALTH_FAIL: &str = "SKARDI_TEST_OC_REGISTER_TOKEN_HEALTH_FAIL";
+    const TOKEN_ENV_HEALTHY: &str = "SKARDI_TEST_OC_REGISTER_TOKEN_HEALTHY";
 
     fn valid_config(token_env: &str) -> OpenConnectorConfig {
         serde_yaml::from_str(&format!(
@@ -306,21 +307,24 @@ bindings:
     async fn register_fails_health_check_before_discovery() {
         let gateway = MockGateway::start(|_| MockResponse::new(503, "{}")).await;
 
+        // Per-test env-var name: #[tokio::test]s run on parallel threads, and
+        // a shared name lets one test's remove_var land in the other's await
+        // window (intermittent MissingRuntimeToken).
         unsafe {
-            std::env::set_var(TOKEN_ENV, "test-token");
+            std::env::set_var(TOKEN_ENV_HEALTH_FAIL, "test-token");
         }
         let mut ctx = SessionContext::new();
         let result = register_open_connector_tables(
             &mut ctx,
             "saas",
             &gateway.url,
-            Some(&valid_config(TOKEN_ENV)),
+            Some(&valid_config(TOKEN_ENV_HEALTH_FAIL)),
             false,
             HierarchyLevel::Catalog,
         )
         .await;
         unsafe {
-            std::env::remove_var(TOKEN_ENV);
+            std::env::remove_var(TOKEN_ENV_HEALTH_FAIL);
         }
 
         let err = result
@@ -357,20 +361,20 @@ bindings:
         .await;
 
         unsafe {
-            std::env::set_var(TOKEN_ENV, "test-token");
+            std::env::set_var(TOKEN_ENV_HEALTHY, "test-token");
         }
         let mut ctx = SessionContext::new();
         let result = register_open_connector_tables(
             &mut ctx,
             "saas",
             &gateway.url,
-            Some(&valid_config(TOKEN_ENV)),
+            Some(&valid_config(TOKEN_ENV_HEALTHY)),
             false,
             HierarchyLevel::Catalog,
         )
         .await;
         unsafe {
-            std::env::remove_var(TOKEN_ENV);
+            std::env::remove_var(TOKEN_ENV_HEALTHY);
         }
 
         let err = result
