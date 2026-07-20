@@ -2484,7 +2484,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "serde",
- "sqlparser 0.59.0",
+ "sqlparser",
  "tempfile",
  "tokio",
  "url",
@@ -2559,7 +2559,7 @@ dependencies = [
  "parquet",
  "paste",
  "recursive",
- "sqlparser 0.59.0",
+ "sqlparser",
  "tokio",
  "web-time",
 ]
@@ -2756,7 +2756,7 @@ dependencies = [
  "paste",
  "recursive",
  "serde_json",
- "sqlparser 0.59.0",
+ "sqlparser",
 ]
 
 [[package]]
@@ -3138,7 +3138,7 @@ dependencies = [
  "log",
  "recursive",
  "regex",
- "sqlparser 0.59.0",
+ "sqlparser",
 ]
 
 [[package]]
@@ -9249,7 +9249,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sqlparser 0.53.0",
+ "sqlparser",
  "sqlx",
  "tempfile",
  "text-splitter",
@@ -9441,16 +9441,6 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "sqlparser"
-version = "0.53.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
-dependencies = [
- "log",
- "sqlparser_derive",
 ]
 
 [[package]]

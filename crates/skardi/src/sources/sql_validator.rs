@@ -1,4 +1,6 @@
-use sqlparser::ast::{FromTable, ObjectName, Statement, visit_relations};
+use sqlparser::ast::{
+    FromTable, ObjectName, ObjectNamePart, Statement, TableObject, visit_relations,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
@@ -191,12 +193,10 @@ fn check_denied_schemas(
             // Every component except the last is a qualifier (catalog or
             // schema); a bare table that happens to share the name is fine.
             for qualifier in &parts[..parts.len() - 1] {
-                if config
-                    .denied_schemas
-                    .contains(&qualifier.value.to_lowercase())
-                {
+                let qualifier = object_name_part_value(qualifier);
+                if config.denied_schemas.contains(&qualifier) {
                     return ControlFlow::Break(SqlValidationError::SchemaNotAllowed {
-                        schema: qualifier.value.to_lowercase(),
+                        schema: qualifier,
                         table: relation.to_string().to_lowercase(),
                     });
                 }
@@ -286,10 +286,13 @@ fn validate_statement(
         }),
 
         // DML write operations - check access mode
-        Statement::Insert(insert) => {
-            let table_name = extract_table_name(&insert.table_name);
-            check_write_access("INSERT", &table_name, config)
-        }
+        Statement::Insert(insert) => match &insert.table {
+            TableObject::TableName(name) => {
+                check_write_access("INSERT", &extract_table_name(name), config)
+            }
+            // Table-function targets have no registered name to check.
+            _ => Ok(()),
+        },
         Statement::Update { table, .. } => {
             let table_name = extract_table_name_from_table_with_joins(table);
             check_write_access("UPDATE", &table_name, config)
@@ -312,10 +315,27 @@ fn validate_statement(
     }
 }
 
+/// Lowercased bare value of one component of an [`ObjectName`], without
+/// quoting (`"Auth"` → `auth`).
+fn object_name_part_value(part: &ObjectNamePart) -> String {
+    match part.as_ident() {
+        Some(ident) => ident.value.to_lowercase(),
+        // Non-identifier parts (e.g. BigQuery function-call parts) have no
+        // bare value; fall back to their SQL rendering.
+        None => part.to_string().to_lowercase(),
+    }
+}
+
 fn extract_table_name(table: &ObjectName) -> String {
-    // Keep the full qualified name: `schema_a.orders` must not be confused
-    // with an unrelated flat source named `orders`.
-    table.to_string().to_lowercase()
+    // Keep the full qualified name (`schema_a.orders` must not be confused
+    // with an unrelated flat source named `orders`), joining bare component
+    // values so quoting cannot change identity (`"users"` == `users`).
+    table
+        .0
+        .iter()
+        .map(object_name_part_value)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn extract_table_name_from_table_with_joins(table: &sqlparser::ast::TableWithJoins) -> String {
@@ -491,9 +511,10 @@ mod tests {
         let config = test_config();
 
         // Test various invalid SQL statements
+        // Note: `SELECT FROM users` (empty projection) is not in this list —
+        // sqlparser 0.59 parses it; it fails later at DataFusion planning.
         let invalid_statements = vec![
             "SELEKT * FROM users",       // Misspelled keyword
-            "SELECT FROM users",         // Missing column list
             "SELECT * FORM users",       // Misspelled FROM
             "INSERT INTO",               // Incomplete statement
             "SELECT * FROM users WHERE", // Incomplete WHERE clause
@@ -747,6 +768,25 @@ mod tests {
         assert!(
             result.is_ok(),
             "unrelated qualified table must not match a flat source, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_quoted_identifiers_match_access_modes_and_denied_schemas() {
+        // Quoting must not change identity: `"users"` is the read-only
+        // `users` source, and `"auth"."sessions"` is still the auth schema.
+        let config = test_config().with_denied_schema("auth");
+        let result = validate_single_sql(r#"INSERT INTO "users" (id) VALUES (1)"#, &config);
+        assert!(
+            matches!(result, Err(SqlValidationError::WriteNotAllowed { .. })),
+            "quoted read-only table must still be rejected, got: {:?}",
+            result
+        );
+        let result = validate_single_sql(r#"SELECT * FROM "auth"."sessions""#, &config);
+        assert!(
+            matches!(result, Err(SqlValidationError::SchemaNotAllowed { .. })),
+            "quoted auth schema must still be denied, got: {:?}",
             result
         );
     }
