@@ -6,8 +6,10 @@
 //! - runtime-token authentication (`Authorization: Bearer …`);
 //! - connection-alias headers on action execution;
 //! - action execution envelopes;
-//! - bounded retries on 429 / transient 5xx / transport errors, honoring
-//!   `Retry-After`;
+//! - bounded retries on 429 / transient 5xx / transport errors for
+//!   idempotent calls (health, discovery), honoring `Retry-After`;
+//!   POST execute only retries a pre-execution 429 — 5xx and transport
+//!   failures are terminal so a possibly-executed action is never re-sent;
 //! - bounded response decoding;
 //! - per-request timeouts (from [`OpenConnectorConfig::request_timeout_seconds`]).
 //!
@@ -70,6 +72,28 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// Retryable HTTP statuses: rate limiting plus transient server errors.
 const RETRYABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
+
+/// Whether a call may be retried after an ambiguous failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPolicy {
+    /// GET-style idempotent calls (health, discovery): 429, transient 5xx,
+    /// and transport errors are all safe to retry.
+    Idempotent,
+    /// POST execute: a 5xx or transport error may mean the action already
+    /// ran against the SaaS provider — re-sending could execute it again.
+    /// Only 429 (a pre-execution rate-limit rejection) is retried.
+    NonIdempotent,
+}
+
+impl RetryPolicy {
+    /// Whether an HTTP status may be retried under this policy.
+    fn allows_status_retry(self, status: StatusCode) -> bool {
+        match self {
+            Self::Idempotent => RETRYABLE_STATUSES.contains(&status.as_u16()),
+            Self::NonIdempotent => status == StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+}
 
 /// Percent-encode set for action IDs in URL paths: everything outside
 /// `[A-Za-z0-9._-]` is encoded, so dots and underscores survive verbatim.
@@ -252,6 +276,7 @@ impl OpenConnectorClient {
         let operation = "health check".to_string();
         self.send_with_retry(
             &operation,
+            RetryPolicy::Idempotent,
             || self.http.get(&url),
             |status, body| OpenConnectorError::HealthCheckFailed {
                 url: url.clone(),
@@ -275,6 +300,7 @@ impl OpenConnectorClient {
         let response = self
             .send_with_retry(
                 &operation,
+                RetryPolicy::Idempotent,
                 || self.http.get(&url),
                 |status, body| {
                     if status == StatusCode::NOT_FOUND {
@@ -336,6 +362,9 @@ impl OpenConnectorClient {
         let response = self
             .send_with_retry(
                 &operation,
+                // POST execute is non-idempotent: 5xx/transport failures are
+                // terminal, only a pre-execution 429 is retried.
+                RetryPolicy::NonIdempotent,
                 || {
                     let mut req = self.http.post(&url).json(&body);
                     if let Some(alias) = connection_alias {
@@ -383,15 +412,17 @@ impl OpenConnectorClient {
         }
     }
 
-    /// Send one request with bounded retries on 429 / transient 5xx /
-    /// transport errors. `terminal_error` maps a non-retryable HTTP status
-    /// and its (bounded) body to the method-specific error variant.
+    /// Send one request with bounded retries. `terminal_error` maps a
+    /// non-retryable HTTP status and its (bounded) body to the
+    /// method-specific error variant; `policy` decides which failures may be
+    /// retried at all (see [`RetryPolicy`]).
     ///
     /// Retried statuses wait for `Retry-After` when present, else
     /// exponential backoff with jitter; both are capped at [`MAX_RETRY_WAIT`].
     async fn send_with_retry(
         &self,
         operation: &str,
+        policy: RetryPolicy,
         build: impl Fn() -> RequestBuilder,
         terminal_error: impl Fn(StatusCode, String) -> OpenConnectorError,
     ) -> Result<Response, OpenConnectorError> {
@@ -402,7 +433,7 @@ impl OpenConnectorClient {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
                     let status = response.status();
-                    if RETRYABLE_STATUSES.contains(&status.as_u16()) {
+                    if policy.allows_status_retry(status) {
                         last_reason = format!("HTTP {}", status.as_u16());
                         if attempt < self.max_attempts {
                             let wait = retry_after(&response).unwrap_or_else(|| backoff(attempt));
@@ -425,6 +456,15 @@ impl OpenConnectorClient {
                 }
                 Err(e) => {
                     last_reason = e.to_string();
+                    // A transport error on a non-idempotent call is ambiguous:
+                    // the request may have reached the gateway and the action
+                    // may already have run. Do not re-send.
+                    if policy == RetryPolicy::NonIdempotent {
+                        return Err(OpenConnectorError::NonIdempotentAmbiguousFailure {
+                            operation: operation.to_string(),
+                            reason: last_reason,
+                        });
+                    }
                     if attempt < self.max_attempts {
                         tracing::warn!(
                             operation = %operation,
@@ -838,5 +878,71 @@ mod tests {
             OpenConnectorError::ActionExecutionFailed { ref reason, .. } if reason.contains("400")
         ));
         assert_eq!(gateway.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_500_is_terminal_without_retry() {
+        // A 5xx on POST execute may mean the action already ran — the client
+        // must not re-send and risk re-executing it against the provider.
+        let gateway = MockGateway::start(|_| MockResponse::new(502, "{}")).await;
+        let err = test_client(&gateway, 3)
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ActionExecutionFailed { ref reason, .. } if reason.contains("502")
+        ));
+        assert_eq!(
+            gateway.requests().len(),
+            1,
+            "non-idempotent 5xx must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_429_is_still_retried() {
+        // 429 is a pre-execution rate-limit rejection, safe to retry even
+        // for non-idempotent calls.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let gateway = MockGateway::start(move |_| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                MockResponse::new(429, "{}").with_header("retry-after", "1")
+            } else {
+                MockResponse::ok(r#"{"output": {"ok": true}}"#)
+            }
+        })
+        .await;
+
+        let value = test_client(&gateway, 3)
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .expect("execute");
+        assert_eq!(value, serde_json::json!({"ok": true}));
+        assert_eq!(gateway.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_transport_error_is_not_retried() {
+        let client = OpenConnectorClient::new(
+            "http://127.0.0.1:1",
+            "test-token",
+            Duration::from_millis(200),
+        )
+        .expect("build client")
+        .with_max_attempts(3);
+        let err = client
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::NonIdempotentAmbiguousFailure { ref operation, .. }
+                    if operation.contains("execute")
+            ),
+            "got {err}"
+        );
     }
 }

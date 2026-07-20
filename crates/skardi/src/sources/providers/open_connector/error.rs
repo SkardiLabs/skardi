@@ -163,6 +163,17 @@ pub enum OpenConnectorError {
         reason: String,
     },
 
+    /// A non-idempotent call (POST execute) failed with an ambiguous
+    /// transport error: the request may have reached the gateway, so the
+    /// client does not retry it — re-sending could re-execute the action
+    /// against the SaaS provider.
+    #[error(
+        "Open Connector {operation} failed with a transport error ({reason}); \
+         not retried because the request may have reached the gateway and \
+         re-execution is not safe"
+    )]
+    NonIdempotentAmbiguousFailure { operation: String, reason: String },
+
     /// A response body grew past the configured decoding bound.
     #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]
     ResponseTooLarge {
