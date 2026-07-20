@@ -36,7 +36,7 @@ use futures::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{RequestBuilder, Response, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
@@ -58,11 +58,17 @@ const EXECUTE_SUFFIX: &str = "execute";
 const CONNECTION_ALIAS_HEADER: &str = "x-openconnector-connection-alias";
 
 /// Maximum attempts for one call (including the first) before
-/// [`OpenConnectorError::RetriesExhausted`] is raised.
-const MAX_ATTEMPTS: u32 = 3;
+/// [`OpenConnectorError::RetriesExhausted`] is raised. Also the serde
+/// default for `OpenConnectorConfig::max_attempts`.
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
-/// Default bound on decoded response bodies (16 MiB).
-const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Default bound on decoded response bodies (16 MiB). Also the serde
+/// default for `OpenConnectorConfig::max_response_bytes`.
+pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bytes read of a terminal error body — plenty for the 512-char message
+/// `terminal_reason` keeps, without buffering a worst-case 16 MiB error page.
+const ERROR_SNIPPET_BYTES: usize = 4 * 1024;
 
 /// Base delay for exponential backoff between attempts.
 const BACKOFF_BASE: Duration = Duration::from_millis(200);
@@ -155,6 +161,13 @@ struct RawDiscoveredAction {
     connection_aliases: Vec<String>,
 }
 
+/// Execute request envelope. Borrowing `input` lets reqwest serialize the
+/// struct directly, avoiding a deep clone of the caller's `Value`.
+#[derive(Debug, Serialize)]
+struct ExecuteEnvelope<'a> {
+    input: &'a Value,
+}
+
 impl OpenConnectorClient {
     /// Build a client from the gateway URL and the typed config.
     ///
@@ -206,11 +219,16 @@ impl OpenConnectorClient {
             });
         }
 
-        Self::new(
+        let client = Self::new(
             gateway_url,
             token,
             Duration::from_secs(config.request_timeout_seconds),
-        )
+        )?;
+        Ok(client
+            .with_max_response_bytes(
+                usize::try_from(config.max_response_bytes).unwrap_or(usize::MAX),
+            )
+            .with_max_attempts(config.max_attempts))
     }
 
     /// Build a client from explicit parts. Kept crate-private so production
@@ -376,7 +394,9 @@ impl OpenConnectorClient {
         validate_action_id(action_id)?;
         let url = self.action_url(action_id, Some(EXECUTE_SUFFIX));
         let operation = format!("execute action '{action_id}'");
-        let body = serde_json::json!({ "input": input });
+        // Borrowing envelope: reqwest serializes it directly, so the caller's
+        // input Value is not deep-cloned into an intermediate `json!` value.
+        let body = ExecuteEnvelope { input };
 
         let response = self
             .send_with_retry(
@@ -481,10 +501,10 @@ impl OpenConnectorClient {
                             continue;
                         }
                     } else {
-                        let body = self
-                            .read_body_bounded(response, operation)
-                            .await
-                            .unwrap_or_else(|_| "<body unreadable>".to_string());
+                        // Terminal status: read only a snippet for the
+                        // message — the caller keeps 512 chars, so there is
+                        // no reason to buffer a worst-case 16 MiB error page.
+                        let body = read_snippet(response, ERROR_SNIPPET_BYTES).await;
                         return Err(terminal_error(status, body));
                     }
                 }
@@ -566,6 +586,25 @@ impl OpenConnectorClient {
             reason: format!("response body is not valid UTF-8: {e}"),
         })
     }
+}
+
+/// Read at most `limit` bytes of a response body for error diagnostics.
+/// Unlike `read_body_bounded`, exceeding the limit is not an error — reading
+/// simply stops, since the caller only keeps the first few hundred chars.
+/// Lossy on purpose: a partial or non-UTF-8 body degrades to replacement
+/// characters rather than another error.
+async fn read_snippet(response: Response, limit: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = limit.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Render a terminal HTTP failure as `"HTTP <status>: <truncated body>"`.
@@ -848,6 +887,81 @@ mod tests {
             gateway.requests().is_empty(),
             "an unbuildable request must never hit the network"
         );
+    }
+
+    #[tokio::test]
+    async fn from_config_wires_max_attempts() {
+        let env = "SKARDI_TEST_OC_WIRE_ATTEMPTS";
+        unsafe {
+            std::env::set_var(env, "test-token");
+        }
+        let config: OpenConnectorConfig =
+            serde_yaml::from_str(&format!("runtime_token_env: {env}\nmax_attempts: 1"))
+                .expect("parse config");
+        let gateway = MockGateway::start(|_| MockResponse::new(500, "{}")).await;
+        let client = OpenConnectorClient::from_config(&gateway.url, &config).expect("build client");
+        unsafe {
+            std::env::remove_var(env);
+        }
+
+        let err = client.health().await.unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::RetriesExhausted { attempts: 1, .. }
+        ));
+        assert_eq!(
+            gateway.requests().len(),
+            1,
+            "max_attempts: 1 must disable retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_wires_max_response_bytes() {
+        let env = "SKARDI_TEST_OC_WIRE_BYTES";
+        unsafe {
+            std::env::set_var(env, "test-token");
+        }
+        let config: OpenConnectorConfig =
+            serde_yaml::from_str(&format!("runtime_token_env: {env}\nmax_response_bytes: 64"))
+                .expect("parse config");
+        let big = format!(r#"{{"pad": "{}"}}"#, "x".repeat(1024));
+        let gateway = MockGateway::start(move |_| MockResponse::ok(&big)).await;
+        let client = OpenConnectorClient::from_config(&gateway.url, &config).expect("build client");
+        unsafe {
+            std::env::remove_var(env);
+        }
+
+        let err = client.discover_action("github.x").await.unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ResponseTooLarge {
+                limit_bytes: 64,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_error_reads_only_a_snippet() {
+        // An 8 KiB error page must not be buffered whole for a 512-char
+        // message; the reason stays tightly bounded.
+        let big = "e".repeat(8 * 1024);
+        let gateway = MockGateway::start(move |_| MockResponse::new(400, &big)).await;
+        let err = test_client(&gateway, 3)
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed { reason, .. } => {
+                assert!(
+                    reason.len() < 600,
+                    "reason should be bounded by the snippet + 512-char cap, got {} bytes",
+                    reason.len()
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
     }
 
     #[tokio::test]

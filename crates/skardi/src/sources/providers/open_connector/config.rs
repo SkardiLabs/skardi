@@ -67,6 +67,14 @@ fn default_cache_max_bytes() -> u64 {
     DEFAULT_CACHE_MAX_BYTES
 }
 
+fn default_max_response_bytes() -> u64 {
+    super::client::DEFAULT_MAX_RESPONSE_BYTES as u64
+}
+
+fn default_max_attempts() -> u32 {
+    super::client::MAX_ATTEMPTS
+}
+
 /// Typed configuration for `type: open_connector` data sources.
 ///
 /// Provider credentials never appear here — Skardi only learns the gateway
@@ -130,6 +138,17 @@ pub struct OpenConnectorConfig {
     #[serde(default = "default_cache_max_bytes")]
     pub cache_max_bytes: u64,
 
+    /// Byte bound on one decoded gateway response body. Bodies are decoded
+    /// while streaming, so this caps memory per request, not per scan.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: u64,
+
+    /// Maximum attempts per gateway call (including the first). Retried
+    /// statuses and transport errors consume attempts per the client's
+    /// idempotency-aware retry policy.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+
     /// Default TTL for shared scan-cache entries, in seconds. `0` disables
     /// caching, i.e. every scan is a live read.
     #[serde(default)]
@@ -173,6 +192,18 @@ impl OpenConnectorConfig {
         }
         if self.max_rows == 0 {
             return Err(OpenConnectorError::ZeroSafetyBound { field: "max_rows" });
+        }
+        // A zero response bound rejects every body; zero attempts means no
+        // call is ever made — both are config bugs, not bounds.
+        if self.max_response_bytes == 0 {
+            return Err(OpenConnectorError::ZeroSafetyBound {
+                field: "max_response_bytes",
+            });
+        }
+        if self.max_attempts == 0 {
+            return Err(OpenConnectorError::ZeroSafetyBound {
+                field: "max_attempts",
+            });
         }
         if self
             .raw_action_allowlist
@@ -358,6 +389,8 @@ bindings:
         assert_eq!(config.max_pages, 100);
         assert_eq!(config.max_rows, 100_000);
         assert_eq!(config.cache_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.max_response_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.max_attempts, 3);
         assert_eq!(config.cache_ttl_seconds, 0);
         assert!(config.raw_action_allowlist.is_empty());
         assert!(config.bindings.is_empty());
@@ -437,6 +470,27 @@ bindings:
             config.validate(),
             Err(OpenConnectorError::ZeroSafetyBound {
                 field: "scan_timeout_seconds"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_client_bounds() {
+        // Zero response bound rejects every body; zero attempts means no
+        // call is ever made.
+        let config = parse("runtime_token_env: T\nmax_response_bytes: 0");
+        assert!(matches!(
+            config.validate(),
+            Err(OpenConnectorError::ZeroSafetyBound {
+                field: "max_response_bytes"
+            })
+        ));
+
+        let config = parse("runtime_token_env: T\nmax_attempts: 0");
+        assert!(matches!(
+            config.validate(),
+            Err(OpenConnectorError::ZeroSafetyBound {
+                field: "max_attempts"
             })
         ));
     }
