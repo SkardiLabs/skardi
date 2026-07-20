@@ -269,6 +269,11 @@ pub enum ConfigError {
     #[error("Data source '{name}' has an invalid 'open_connector' config: {reason}")]
     InvalidOpenConnectorConfig { name: String, reason: String },
 
+    #[error(
+        "Data source '{name}' has type 'open_connector' but does not set hierarchy_level to 'catalog'. Open Connector gateways are exposed as DataFusion catalogs; add `hierarchy_level: catalog`."
+    )]
+    OpenConnectorHierarchyRequired { name: String },
+
     #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
     NonUtf8Path { name: String, path: PathBuf },
 }
@@ -787,6 +792,15 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         // misconfigurations surface here at config load, not at first query.
         match (&source.source_type, &source.open_connector) {
             (DataSourceType::OpenConnector, Some(config)) => {
+                // Hierarchy defaults to Table, so a minimal config would
+                // otherwise pass validation and fail at registration with a
+                // Debug-wrapped CatalogHierarchyRequired — catch it here.
+                if source.hierarchy_level != HierarchyLevel::Catalog {
+                    return Err(ConfigError::OpenConnectorHierarchyRequired {
+                        name: source.name.clone(),
+                    }
+                    .into());
+                }
                 config
                     .validate()
                     .map_err(|e| ConfigError::InvalidOpenConnectorConfig {
@@ -2541,6 +2555,28 @@ bindings:
             matches!(
                 config_err,
                 ConfigError::MissingConnectionString { name } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_table_hierarchy() {
+        // hierarchy_level defaults to Table; a minimal config must fail at
+        // validation, not at registration with a wrapped provider error.
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Table;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::OpenConnectorHierarchyRequired { name } if name == "saas"
             ),
             "got {config_err}"
         );

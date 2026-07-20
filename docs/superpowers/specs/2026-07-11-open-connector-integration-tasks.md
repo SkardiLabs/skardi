@@ -20,7 +20,7 @@ registered.
 - [x] 1.2 `OpenConnectorConfig` / `OpenConnectorBinding` matching the design-spec YAML (`runtime_token_env`, timeouts, `max_pages`/`max_rows`, `cache_max_bytes`, `cache_ttl_seconds`, `raw_action_allowlist`, `bindings`), with `deny_unknown_fields` so a misspelled key (e.g. `source_pack_versions`) fails loudly instead of silently disabling the pin
 - [x] 1.3 Optional `source_pack_version` pin on bindings (schema stability across Skardi upgrades)
 - [x] 1.4 `OpenConnectorError` with pre-network validation variants
-- [x] 1.5 `OpenConnectorConfig::validate()` — pure, shared by server validation and provider registration (CLI/server parity)
+- [x] 1.5 `OpenConnectorConfig::validate()` — pure, shared by server validation and provider registration (CLI/server parity); server `validate_data_sources` also rejects non-catalog hierarchy at config load (`OpenConnectorHierarchyRequired`) so a minimal config fails cleanly instead of aborting boot with a wrapped provider error
 - [x] 1.6 Server wiring: `DataSource.open_connector` (required for that type, rejected elsewhere), `validate_data_sources`, registration dispatch, `/data_source` + dashboard type mapping
 - [x] 1.7 CLI wiring: same typed field and registration arm
 - [x] 1.8 Read-only by construction: excluded from `WRITABLE_SOURCE_TYPES`; job destinations rejected as non-transactional

@@ -931,6 +931,15 @@ async fn register_source(
                 .with_context(|| format!("Failed to register InfluxDB '{}'", source.name))?;
         }
         "open_connector" => {
+            // Hierarchy defaults to Table; fail here with a clear message
+            // rather than the provider's wrapped CatalogHierarchyRequired.
+            if source.hierarchy_level != HierarchyLevel::Catalog {
+                anyhow::bail!(
+                    "Open Connector source '{}': hierarchy_level must be 'catalog' \
+                     (a gateway is exposed as a DataFusion catalog, not a single table)",
+                    source.name
+                );
+            }
             let endpoint = source.connection_string.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Open Connector source '{}': connection_string (gateway URL) required",
@@ -2923,6 +2932,24 @@ bindings:
             let msg = format!("{err:?}");
             assert!(
                 msg.contains("connection_string (gateway URL) required"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_with_table_hierarchy() {
+            // hierarchy_level defaults to Table; the CLI must reject it with
+            // a clear message, not the provider's wrapped error.
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source =
+                open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
+            source.hierarchy_level = HierarchyLevel::Table;
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("hierarchy_level must be 'catalog'"),
                 "unexpected error: {msg}"
             );
         }
