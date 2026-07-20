@@ -45,9 +45,13 @@ const HEALTH_PATH: &str = "v1/health";
 /// Action metadata endpoint prefix; the percent-encoded action ID is appended.
 const ACTIONS_PATH: &str = "v1/actions";
 /// Suffix for the action execution endpoint.
+/// Only exercised by tests until the scan engine wires the production path.
+#[allow(dead_code)]
 const EXECUTE_SUFFIX: &str = "execute";
 
 /// Header carrying the Open Connector connection alias on execute calls.
+/// Only exercised by tests until the scan engine wires the production path.
+#[allow(dead_code)]
 const CONNECTION_ALIAS_HEADER: &str = "x-openconnector-connection-alias";
 
 /// Maximum attempts for one call (including the first) before
@@ -305,7 +309,19 @@ impl OpenConnectorClient {
 
     /// `POST /v1/actions/{action_id}/execute` — execute one action and return
     /// the response envelope's `output` value.
-    pub async fn execute(
+    ///
+    /// Crate-internal on purpose: execution is the *dangerous* half of the
+    /// gateway contract (mutating actions exist upstream), and the
+    /// default-deny gating lives one layer up — `ActionRegistry::load` admits
+    /// only explicitly allowlisted, locally-executable actions, and the
+    /// future scan engine / UDTFs must check membership before calling this.
+    /// Keeping the method `pub(crate)` makes that gating structurally
+    /// un-bypassable from outside the crate.
+    ///
+    /// Only exercised by tests until the scan engine wires the production
+    /// path (registration currently stops at `ExecutionNotImplemented`).
+    #[allow(dead_code)]
+    pub(crate) async fn execute(
         &self,
         action_id: &str,
         input: &Value,

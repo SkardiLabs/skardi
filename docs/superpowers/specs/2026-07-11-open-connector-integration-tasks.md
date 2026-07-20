@@ -37,7 +37,7 @@ Everything network-facing, behind one client; planning-time metadata in memory.
 - [x] 2.2 Runtime token from env var as Bearer header; `http(s)` URLs only, with embedded credentials **and** query/fragment rejected (`GatewayUrlWithQueryOrFragment` — a `?token=…` query would leak into logs, `Debug`, and the data-sources API); token excluded from `Debug`
 - [x] 2.3 Bounded retries on 429 / transient 5xx / transport errors: exponential backoff + jitter, `Retry-After` honored (capped)
 - [x] 2.4 Bounded response decoding (declared `Content-Length` + streamed bytes), per-request timeout from config
-- [x] 2.5 Connection-alias header on execute calls
+- [x] 2.5 Connection-alias header on execute calls; `execute()` is `pub(crate)` so the registry/UDTF allowlist gating is structurally un-bypassable from outside the crate (discovery and health stay public metadata)
 - [x] 2.6 `ActionRegistry`: deduplicated, concurrency-bounded discovery of `raw_action_allowlist`; non-locally-executable actions rejected; missing executability flag rejected as `ActionExecutabilityUnknown` (default-deny, `Option<bool>` so "not declared" is never read as "executable"); no partial registry
 - [x] 2.7 Compatibility fingerprint per action (canonicalized output schema → FNV-1a; stable, dependency-free)
 - [x] 2.8 Registration flow: validate → client → health → registry → `ExecutionNotImplemented`
