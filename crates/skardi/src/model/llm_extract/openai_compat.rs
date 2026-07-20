@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::provider::{CompletionProvider, CompletionRequest};
+use crate::util::http::parse_retry_after;
 
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
 const MAX_TOKENS: u32 = 4096;
@@ -233,11 +234,6 @@ fn parse_entities(body: &str) -> anyhow::Result<Vec<serde_json::Value>> {
     entities_from_object(&obj)
 }
 
-/// Parse `Retry-After` as seconds, falling back to `DEFAULT_RETRY_WAIT`.
-fn parse_retry_after(resp: &reqwest::Response) -> Duration {
-    crate::util::http::parse_retry_after(resp).unwrap_or(DEFAULT_RETRY_WAIT)
-}
-
 /// One outcome of an HTTP attempt.
 enum Attempt {
     Ok(String),
@@ -258,7 +254,7 @@ async fn send_once_with_retry(
     };
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let wait = parse_retry_after(&resp);
+        let wait = parse_retry_after(&resp).unwrap_or(DEFAULT_RETRY_WAIT);
         tracing::warn!("{provider_label}: rate-limited (429), retrying after {wait:?}");
         tokio::time::sleep(wait).await;
         let resp = match build_request().send().await {

@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::provider::{CompletionProvider, CompletionRequest, CompletionResponse};
+use crate::util::http::parse_retry_after;
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -163,11 +164,6 @@ fn parse_entities(body: &str) -> anyhow::Result<Vec<serde_json::Value>> {
     Err(anyhow!("Anthropic response contained no tool_use block"))
 }
 
-/// Parse `Retry-After` as seconds, falling back to `DEFAULT_RETRY_WAIT`.
-fn parse_retry_after(resp: &reqwest::Response) -> Duration {
-    crate::util::http::parse_retry_after(resp).unwrap_or(DEFAULT_RETRY_WAIT)
-}
-
 /// Send an HTTP request with a single retry on 429 (rate limit).
 /// Mirrors `remote_embed::send_with_rate_limit_retry`.
 async fn send_with_rate_limit_retry(
@@ -179,7 +175,7 @@ async fn send_with_rate_limit_retry(
         .context("HTTP request to Anthropic API failed")?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let wait = parse_retry_after(&resp);
+        let wait = parse_retry_after(&resp).unwrap_or(DEFAULT_RETRY_WAIT);
         tracing::warn!("anthropic: rate-limited (429), retrying after {wait:?}");
         tokio::time::sleep(wait).await;
 

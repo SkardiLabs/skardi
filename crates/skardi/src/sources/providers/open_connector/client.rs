@@ -42,6 +42,7 @@ use url::Url;
 
 use super::config::{OpenConnectorConfig, validate_action_id};
 use super::error::OpenConnectorError;
+use crate::util::http::parse_retry_after;
 
 /// Health endpoint path (relative to the gateway base URL).
 const HEALTH_PATH: &str = "v1/health";
@@ -636,7 +637,7 @@ fn backoff(attempt: u32) -> Duration {
 /// parsing lives in [`crate::util::http::parse_retry_after`]; only the cap
 /// is Open Connector-specific.
 fn retry_after(response: &Response) -> Option<Duration> {
-    crate::util::http::parse_retry_after(response).map(|wait| wait.min(MAX_RETRY_WAIT))
+    parse_retry_after(response).map(|wait| wait.min(MAX_RETRY_WAIT))
 }
 
 #[cfg(test)]
