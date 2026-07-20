@@ -33,7 +33,7 @@ modes asserted to fire before any network call.
 
 Everything network-facing, behind one client; planning-time metadata in memory.
 
-- [x] 2.1 `OpenConnectorClient`: health / discover / execute against the `/v1` contract, endpoint paths centralized in private constants
+- [x] 2.1 `OpenConnectorClient`: health / discover / execute against the `/v1` contract, endpoint paths centralized in private constants; action IDs validated at the client boundary (`InvalidActionId` — bare `.`/`..` and `/` rejected before any request, so IDs can't escape `/v1/actions/` through `Url::join` dot-segment resolution)
 - [x] 2.2 Runtime token from env var as Bearer header; `http(s)` URLs only, with embedded credentials **and** query/fragment rejected (`GatewayUrlWithQueryOrFragment` — a `?token=…` query would leak into logs, `Debug`, and the data-sources API); token excluded from `Debug`
 - [x] 2.3 Bounded retries on 429 / transient 5xx / transport errors: exponential backoff + jitter, `Retry-After` honored (capped)
 - [x] 2.4 Bounded response decoding (declared `Content-Length` + streamed bytes), per-request timeout from config

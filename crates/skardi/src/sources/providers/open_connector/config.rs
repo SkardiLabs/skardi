@@ -169,6 +169,12 @@ impl OpenConnectorConfig {
         {
             return Err(OpenConnectorError::EmptyAllowlistEntry);
         }
+        // Allowlist entries become URL path segments at discovery time, so
+        // validate them here for an early config error (the client re-checks
+        // at its own boundary for UDTF-supplied IDs).
+        for entry in &self.raw_action_allowlist {
+            validate_action_id(entry)?;
+        }
 
         let mut names = HashSet::with_capacity(self.bindings.len());
         for binding in &self.bindings {
@@ -180,6 +186,30 @@ impl OpenConnectorConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Validate one action ID for safe use as a URL path segment.
+///
+/// `/` would move path segments, and a bare `.` / `..` is resolved away by
+/// `Url::join` even after percent-encoding (the encode set preserves dots) —
+/// either one escapes the `/v1/actions/` namespace onto a misrouted endpoint.
+/// Shared by config validation (early error on `raw_action_allowlist`) and
+/// the client boundary (defense in depth for UDTF-supplied IDs).
+pub(crate) fn validate_action_id(action_id: &str) -> Result<(), OpenConnectorError> {
+    let reason = if action_id.contains('/') {
+        Some("must not contain '/'")
+    } else if action_id == "." || action_id == ".." {
+        Some("a bare dot segment is resolved by URL joining")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(OpenConnectorError::InvalidActionId {
+            action_id: action_id.to_string(),
+            reason: reason.to_string(),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -384,6 +414,29 @@ bindings:
             config.validate(),
             Err(OpenConnectorError::EmptyAllowlistEntry)
         ));
+    }
+
+    #[test]
+    fn validate_rejects_traversal_allowlist_entries() {
+        // Allowlist entries become URL path segments at discovery time; dot
+        // segments and slashes would escape the /v1/actions/ namespace.
+        for bad in ["..", ".", "a/b"] {
+            let config = parse(&format!(
+                "runtime_token_env: T\nraw_action_allowlist: ['{bad}']"
+            ));
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(OpenConnectorError::InvalidActionId { .. })
+                ),
+                "'{bad}' should be rejected"
+            );
+        }
+
+        // Dots inside a normal namespaced ID stay legal.
+        let config =
+            parse("runtime_token_env: T\nraw_action_allowlist: ['github.list_repository_issues']");
+        config.validate().expect("namespaced ID is valid");
     }
 
     #[test]

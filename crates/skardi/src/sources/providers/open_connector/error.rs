@@ -142,6 +142,15 @@ pub enum OpenConnectorError {
     )]
     ActionExecutabilityUnknown { action_id: String },
 
+    /// An action ID could escape the `/v1/actions/` namespace: `/` moves
+    /// path segments, and a bare `.` / `..` is resolved away by `Url::join`
+    /// even after percent-encoding (dots are preserved by the encode set).
+    #[error(
+        "Open Connector action ID '{action_id}' is invalid: {reason} \
+         (action IDs must be single path segments; '/', '.', and '..' are not allowed)"
+    )]
+    InvalidActionId { action_id: String, reason: String },
+
     /// An action execution call returned a terminal (non-retryable) failure.
     #[error("Open Connector action '{action_id}' execution failed: {reason}")]
     ActionExecutionFailed { action_id: String, reason: String },

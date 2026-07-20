@@ -37,7 +37,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use super::config::OpenConnectorConfig;
+use super::config::{OpenConnectorConfig, validate_action_id};
 use super::error::OpenConnectorError;
 
 /// Health endpoint path (relative to the gateway base URL).
@@ -263,6 +263,9 @@ impl OpenConnectorClient {
         &self,
         action_id: &str,
     ) -> Result<DiscoveredAction, OpenConnectorError> {
+        // Boundary check before URL construction: a dot segment would be
+        // resolved by Url::join and escape the /v1/actions/ namespace.
+        validate_action_id(action_id)?;
         let url = self.action_url(action_id, None);
         let operation = format!("discover action '{action_id}'");
         let response = self
@@ -308,6 +311,8 @@ impl OpenConnectorClient {
         input: &Value,
         connection_alias: Option<&str>,
     ) -> Result<Value, OpenConnectorError> {
+        // Same namespace-escape guard as discover_action.
+        validate_action_id(action_id)?;
         let url = self.action_url(action_id, Some(EXECUTE_SUFFIX));
         let operation = format!("execute action '{action_id}'");
         let body = serde_json::json!({ "input": input });
@@ -625,6 +630,34 @@ mod tests {
         // A clean URL with a path prefix remains accepted.
         OpenConnectorClient::new("https://gateway:8443/prefix", "t", Duration::from_secs(1))
             .expect("clean URL with path is accepted");
+    }
+
+    #[tokio::test]
+    async fn dot_segment_action_ids_are_rejected_before_any_request() {
+        // `Url::join` resolves bare dot segments even when dots survive
+        // percent-encoding, so `..` would escape /v1/actions/ onto {base}/v1/.
+        // The boundary check must fire before any request is sent.
+        let gateway = MockGateway::start(|_| MockResponse::ok("{}")).await;
+        let client = test_client(&gateway, 3);
+
+        for bad in ["..", ".", "a/b"] {
+            let err = client.discover_action(bad).await.unwrap_err();
+            assert!(
+                matches!(err, OpenConnectorError::InvalidActionId { .. }),
+                "{bad} should be rejected, got {err}"
+            );
+        }
+
+        let err = client
+            .execute("..", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenConnectorError::InvalidActionId { .. }));
+
+        assert!(
+            gateway.requests().is_empty(),
+            "no request may be sent for a rejected action ID"
+        );
     }
 
     #[tokio::test]
