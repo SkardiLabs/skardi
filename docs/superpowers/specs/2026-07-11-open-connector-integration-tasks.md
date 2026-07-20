@@ -93,9 +93,9 @@ against a local CSV.
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 
 - [ ] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue comments, pull requests, reviews, commits, workflow runs, releases
-- [ ] 5.2 Jira pack (OAuth, cursor pagination, JQL-backed filters): projects, issues, comments
+- [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
-- [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, Slack, HubSpot, …) through the source-pack admission gate
+- [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
