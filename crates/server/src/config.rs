@@ -880,8 +880,12 @@ fn validate_schema_types(_schema: &HashMap<String, String>) -> Result<()> {
 /// Build a SQL validator config mapping every data source name to its
 /// configured access mode. Used at config load (pipeline SQL) and at
 /// request time (`POST /query`).
-pub(crate) fn validator_config_from_sources(data_sources: &[DataSource]) -> SqlValidatorConfig {
-    let mut validator_config = SqlValidatorConfig::new();
+pub fn validator_config_from_sources(data_sources: &[DataSource]) -> SqlValidatorConfig {
+    // The `auth` schema (auth.users / auth.sessions, registered on the same
+    // SessionContext) holds live bearer tokens; ad-hoc SQL must never reach
+    // it. The denial only applies to `validate_single_sql`, so pipeline SQL
+    // may still read auth tables.
+    let mut validator_config = SqlValidatorConfig::new().with_denied_schema("auth");
     for ds in data_sources {
         validator_config = validator_config.with_table(&ds.name, ds.access_mode);
     }

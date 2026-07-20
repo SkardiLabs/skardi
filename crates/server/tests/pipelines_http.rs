@@ -110,6 +110,9 @@ spec:
             port: 0,
         },
     };
+    let validator_config = Arc::new(skardi_server::config::validator_config_from_sources(
+        &config.data_sources,
+    ));
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
         engine,
@@ -117,6 +120,7 @@ spec:
         metrics: PipelineMetrics::new(),
         auth_layer: AuthLayer::None,
         jobs: None,
+        validator_config,
     };
     (state, tmp)
 }

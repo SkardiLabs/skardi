@@ -17,7 +17,9 @@ use tower::ServiceExt;
 
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::auth::mode::AuthMode;
-use skardi_server::config::{AccessMode, CliArgs, DataSource, DataSourceType, ServerConfig};
+use skardi_server::config::{
+    AccessMode, CliArgs, DataSource, DataSourceType, ServerConfig, validator_config_from_sources,
+};
 use skardi_server::metrics::PipelineMetrics;
 use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
@@ -84,6 +86,7 @@ fn make_state() -> AppState {
             port: 0,
         },
     };
+    let validator_config = Arc::new(validator_config_from_sources(&config.data_sources));
     AppState {
         config: Arc::new(RwLock::new(config)),
         engine,
@@ -91,6 +94,7 @@ fn make_state() -> AppState {
         metrics: PipelineMetrics::new(),
         auth_layer: AuthLayer::None,
         jobs: None,
+        validator_config,
     }
 }
 
@@ -299,6 +303,60 @@ async fn explain_analyze_insert_into_read_only_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("sql_validation_error"));
+}
+
+#[tokio::test]
+async fn select_from_auth_schema_rejected() {
+    // `auth.sessions` holds live bearer tokens; ad-hoc SQL must never be
+    // able to read the auth schema, even for authenticated callers.
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT token FROM auth.sessions"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("sql_validation_error"));
+    assert_eq!(body["details"]["schema"], json!("auth"));
+}
+
+#[tokio::test]
+async fn auth_schema_in_subquery_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT * FROM (SELECT token FROM auth.sessions) t"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("sql_validation_error"));
+}
+
+#[tokio::test]
+async fn merge_rejected_by_allowlist() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "MERGE INTO scratch USING products ON scratch.id = products.id \
+                       WHEN MATCHED THEN UPDATE SET id = 0"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("sql_validation_error"));
+}
+
+#[tokio::test]
+async fn brace_containing_literal_is_not_mangled() {
+    // Ad-hoc SQL is not a pipeline template: `{...}` inside string literals
+    // must survive validation and execution untouched.
+    let resp = post_query(
+        make_state(),
+        json!({"sql": r#"SELECT 'a{b' AS "c}d" FROM products LIMIT 1"#}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["data"][0]["c}d"], json!("a{b"));
 }
 
 #[tokio::test]

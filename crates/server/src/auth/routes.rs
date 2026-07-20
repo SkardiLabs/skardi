@@ -394,6 +394,7 @@ mod tests {
             metrics: PipelineMetrics::new(),
             auth_layer: AuthLayer::None,
             jobs: None,
+            validator_config: Arc::new(crate::config::validator_config_from_sources(&[])),
         }
     }
 
@@ -448,6 +449,7 @@ mod tests {
             metrics: PipelineMetrics::new(),
             auth_layer: layer,
             jobs: None,
+            validator_config: Arc::new(crate::config::validator_config_from_sources(&[])),
         }
     }
 

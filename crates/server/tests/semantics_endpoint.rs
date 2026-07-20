@@ -92,6 +92,9 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
             port: 0,
         },
     };
+    let validator_config = Arc::new(skardi_server::config::validator_config_from_sources(
+        &config.data_sources,
+    ));
     AppState {
         config: Arc::new(RwLock::new(config)),
         engine,
@@ -99,6 +102,7 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
         metrics: PipelineMetrics::new(),
         auth_layer: AuthLayer::None,
         jobs: None,
+        validator_config,
     }
 }
 

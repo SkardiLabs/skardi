@@ -858,6 +858,9 @@ spec:
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
 
+        let validator_config = Arc::new(crate::config::validator_config_from_sources(
+            &config.data_sources,
+        ));
         AppState {
             config: Arc::new(RwLock::new(config)),
             engine,
@@ -865,6 +868,7 @@ spec:
             metrics: PipelineMetrics::new(),
             auth_layer: crate::auth::layer::AuthLayer::None,
             jobs: None,
+            validator_config,
         }
     }
 
@@ -947,6 +951,9 @@ spec:
         let session_ctx_arc = Arc::new(session_ctx);
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx_arc.clone()));
 
+        let validator_config = Arc::new(crate::config::validator_config_from_sources(
+            &config.data_sources,
+        ));
         let app_state = AppState {
             config: Arc::new(RwLock::new(config)),
             engine,
@@ -954,6 +961,7 @@ spec:
             metrics: PipelineMetrics::new(),
             auth_layer: crate::auth::layer::AuthLayer::None,
             jobs: None,
+            validator_config,
         };
 
         let request = ExecuteRequest {

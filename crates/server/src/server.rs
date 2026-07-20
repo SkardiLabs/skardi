@@ -7,6 +7,7 @@ use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
 use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
+use skardi::sources::sql_validator::SqlValidatorConfig;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -54,6 +55,10 @@ pub struct AppState {
     /// Jobs executor + run ledger. `None` when the server was started
     /// without `--jobs`, which disables every `/jobs/*` endpoint.
     pub jobs: Option<Arc<JobExecutor>>,
+    /// Statement policy for the ad-hoc `/query` endpoint, built once at
+    /// startup from the configured data sources (there is no runtime
+    /// config writer, so a snapshot is sufficient).
+    pub validator_config: Arc<SqlValidatorConfig>,
 }
 
 /// Main server creation function - Primary public interface
@@ -216,6 +221,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         None
     };
 
+    let validator_config = Arc::new(crate::config::validator_config_from_sources(
+        &config.data_sources,
+    ));
+
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState {
         config: Arc::new(RwLock::new(config)),
@@ -224,6 +233,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         metrics: PipelineMetrics::new(),
         auth_layer,
         jobs: jobs_bundle,
+        validator_config,
     };
 
     tracing::info!("Application state setup completed successfully");

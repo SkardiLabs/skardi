@@ -16,7 +16,6 @@ use skardi::sources::sql_validator::{SqlValidationError, StatementKind, validate
 use std::time::Instant;
 
 use crate::auth::routes::require_session;
-use crate::config::validator_config_from_sources;
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
@@ -69,17 +68,7 @@ pub async fn execute_query(
         None => DEFAULT_MAX_ROWS,
     };
 
-    // Build the validator config from the current data sources on every
-    // request so runtime config updates are respected.
-    let validator_config = {
-        let config = app_state
-            .config
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        validator_config_from_sources(&config.data_sources)
-    };
-
-    let statement_kind = match validate_single_sql(&request.sql, &validator_config) {
+    let statement_kind = match validate_single_sql(&request.sql, &app_state.validator_config) {
         Ok(kind) => kind,
         Err(e) => {
             tracing::info!("Rejected ad-hoc query: {}", e);
@@ -100,8 +89,10 @@ pub async fn execute_query(
                 SqlValidationError::NotExactlyOneStatement { count } => {
                     Some(serde_json::json!({ "statement_count": count }))
                 }
-                SqlValidationError::CopyNotAllowed
-                | SqlValidationError::StatementNotAllowed { .. }
+                SqlValidationError::SchemaNotAllowed { schema, table } => {
+                    Some(serde_json::json!({ "schema": schema, "table": table }))
+                }
+                SqlValidationError::StatementNotAllowed { .. }
                 | SqlValidationError::ParseError(_) => None,
             };
 
@@ -111,6 +102,15 @@ pub async fn execute_query(
             ));
         }
     };
+
+    // Audit trail: every statement this endpoint hands to the engine is
+    // recorded before execution, so a crash mid-query still leaves a record.
+    tracing::info!(
+        sql = %request.sql,
+        max_rows,
+        kind = ?statement_kind,
+        "Executing ad-hoc query"
+    );
 
     // Queries get the row cap pushed into the plan (fetch cap + 1 so
     // truncation is detectable). Writes and other statements return small
