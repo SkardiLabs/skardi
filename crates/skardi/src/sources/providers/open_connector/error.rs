@@ -96,6 +96,21 @@ pub enum OpenConnectorError {
     )]
     MissingRuntimeToken { env: String },
 
+    /// The runtime token is not usable as an HTTP header value — the classic
+    /// cause is a trailing newline from `export TOKEN="$(cat token.txt)"`.
+    /// Checked at client construction so a malformed credential fails fast
+    /// with the actual cause instead of three retried "builder error"s.
+    #[error(
+        "Open Connector runtime token from '{env}' is invalid: {reason} \
+         (check for a trailing newline or other control characters)"
+    )]
+    InvalidRuntimeToken { env: String, reason: String },
+
+    /// reqwest could not build the request (e.g. an illegal header value).
+    /// A permanent client-side failure — never retried.
+    #[error("Open Connector {operation} could not build the request: {reason}")]
+    RequestBuildFailed { operation: String, reason: String },
+
     /// The gateway URL used a non-HTTP(S) scheme or embedded credentials.
     #[error(
         "Open Connector gateway URL '{url}' must use http:// or https:// and must \

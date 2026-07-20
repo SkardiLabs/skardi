@@ -182,11 +182,29 @@ impl OpenConnectorClient {
         gateway_url: &str,
         config: &OpenConnectorConfig,
     ) -> Result<Self, OpenConnectorError> {
-        let token = std::env::var(&config.runtime_token_env).map_err(|_| {
+        let raw = std::env::var(&config.runtime_token_env).map_err(|_| {
             OpenConnectorError::MissingRuntimeToken {
                 env: config.runtime_token_env.clone(),
             }
         })?;
+
+        // `export TOKEN="$(cat token.txt)"` leaves a trailing newline on the
+        // value — trim that away, then reject anything still not header-legal
+        // (a control character would turn every request into a reqwest
+        // builder error, surfacing as an opaque retryable transport error).
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(OpenConnectorError::InvalidRuntimeToken {
+                env: config.runtime_token_env.clone(),
+                reason: "empty after trimming whitespace".to_string(),
+            });
+        }
+        if let Some(bad) = token.chars().find(|c| c.is_ascii_control()) {
+            return Err(OpenConnectorError::InvalidRuntimeToken {
+                env: config.runtime_token_env.clone(),
+                reason: format!("contains control character U+{:04X}", bad as u32),
+            });
+        }
 
         Self::new(
             gateway_url,
@@ -471,6 +489,15 @@ impl OpenConnectorClient {
                     }
                 }
                 Err(e) => {
+                    // A request that cannot even be built (e.g. an illegal
+                    // header value from a malformed token) will never succeed
+                    // on retry — fail fast with the real cause.
+                    if e.is_builder() {
+                        return Err(OpenConnectorError::RequestBuildFailed {
+                            operation: operation.to_string(),
+                            reason: e.to_string(),
+                        });
+                    }
                     last_reason = e.to_string();
                     // A transport error on a non-idempotent call is ambiguous:
                     // the request may have reached the gateway and the action
@@ -743,6 +770,83 @@ mod tests {
             OpenConnectorError::MissingRuntimeToken { ref env }
                 if env == "SKARDI_TEST_OC_TOKEN_DEFINITELY_UNSET"
         ));
+    }
+
+    #[tokio::test]
+    async fn from_config_trims_padded_token() {
+        // `export T="$(cat token.txt)"` leaves a trailing newline — trimming
+        // makes that case work, and the trimmed value is what goes on the wire.
+        let env = "SKARDI_TEST_OC_TOKEN_PADDED";
+        unsafe {
+            std::env::set_var(env, "  test-token \n");
+        }
+        let config: OpenConnectorConfig =
+            serde_yaml::from_str(&format!("runtime_token_env: {env}")).expect("parse config");
+        let gateway = MockGateway::start(|_| MockResponse::ok("{}")).await;
+        let client = OpenConnectorClient::from_config(&gateway.url, &config)
+            .expect("padded token is accepted after trimming")
+            .with_max_attempts(1);
+        unsafe {
+            std::env::remove_var(env);
+        }
+
+        client.health().await.expect("health");
+        let requests = gateway.requests();
+        assert_eq!(
+            requests[0].header("authorization").as_deref(),
+            Some("Bearer test-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_rejects_malformed_token() {
+        // Internal control characters can't be trimmed away — fail fast
+        // with a targeted error naming the token, not a builder error.
+        let env = "SKARDI_TEST_OC_TOKEN_MALFORMED";
+        let config: OpenConnectorConfig =
+            serde_yaml::from_str(&format!("runtime_token_env: {env}")).expect("parse config");
+
+        unsafe {
+            std::env::set_var(env, "abc\ndef");
+        }
+        let err = OpenConnectorClient::from_config("http://localhost:3000", &config).unwrap_err();
+        assert!(
+            matches!(err, OpenConnectorError::InvalidRuntimeToken { .. }),
+            "control character should be rejected, got {err}"
+        );
+
+        unsafe {
+            std::env::set_var(env, "  \n ");
+        }
+        let err = OpenConnectorClient::from_config("http://localhost:3000", &config).unwrap_err();
+        assert!(
+            matches!(err, OpenConnectorError::InvalidRuntimeToken { .. }),
+            "whitespace-only token should be rejected, got {err}"
+        );
+
+        unsafe {
+            std::env::remove_var(env);
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_error_is_terminal_not_retried() {
+        // Anything that still reaches send() with an unbuildable request
+        // (defense in depth behind from_config's token check) must fail
+        // immediately, not burn three backoff retries on a permanent error.
+        let gateway = MockGateway::start(|_| MockResponse::ok("{}")).await;
+        let client = OpenConnectorClient::new(&gateway.url, "bad\ntoken", Duration::from_secs(1))
+            .expect("build client")
+            .with_max_attempts(3);
+        let err = client.health().await.unwrap_err();
+        assert!(
+            matches!(err, OpenConnectorError::RequestBuildFailed { .. }),
+            "got {err}"
+        );
+        assert!(
+            gateway.requests().is_empty(),
+            "an unbuildable request must never hit the network"
+        );
     }
 
     #[tokio::test]
