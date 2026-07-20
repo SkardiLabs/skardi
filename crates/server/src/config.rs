@@ -743,6 +743,9 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Sqlite,
     DataSourceType::Seekdb,
     DataSourceType::Dynamodb,
+    // OpenConnector is catalog-only; its tables come from typed bindings, so
+    // the same catalog-mode guards (no per-table `options`) must apply.
+    DataSourceType::OpenConnector,
 ];
 
 /// Data source types that support read_write access mode
@@ -2577,6 +2580,54 @@ bindings:
             matches!(
                 config_err,
                 ConfigError::OpenConnectorHierarchyRequired { name } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_catalog_table_option() {
+        // OpenConnector is catalog-only and its tables come from typed
+        // bindings; a flat `table` option must fail as loudly as it would on
+        // postgres/dynamodb instead of being silently ignored.
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "issues".to_string());
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.options = Some(options);
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "saas" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_catalog_empty_allowed_schemas() {
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), " , , ".to_string());
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.options = Some(options);
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::EmptyAllowedSchemas { name } if name == "saas"
             ),
             "got {config_err}"
         );
