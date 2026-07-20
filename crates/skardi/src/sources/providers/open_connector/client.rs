@@ -26,8 +26,9 @@
 //!   `{ "input_schema": …, "output_schema": …, "locally_executable": bool,
 //!      "connection_aliases": […] }` (all fields optional but the last two).
 //! - `POST {base}/v1/actions/{action_id}/execute` — body `{"input": …}`;
-//!   the response envelope's `output` field is returned (a body without an
-//!   `output` field is returned whole).
+//!   the response envelope's `output` field is returned. An **object**
+//!   without an `output` field is rejected as an error/async envelope; a
+//!   non-object body (bare array/scalar) is returned as the output itself.
 
 use std::time::Duration;
 
@@ -387,12 +388,27 @@ impl OpenConnectorClient {
             }
         })?;
 
-        // The contract wraps results in an `output` field; tolerate gateways
-        // that return the bare value.
-        Ok(match value {
-            Value::Object(ref map) => map.get("output").cloned().unwrap_or(value.clone()),
-            other => other,
-        })
+        // The contract wraps results in an `output` field. An object without
+        // one is an envelope we don't understand (error body, async job
+        // handle) — failing loudly keeps contract violations out of Arrow
+        // rows. `map.remove` moves the value out instead of cloning the
+        // whole envelope (the eager `unwrap_or(value.clone())` cloned up to
+        // the 16 MiB bound even when `output` was present).
+        //
+        // A non-object body (bare array/scalar) can't be confused with an
+        // error envelope, so it is returned as the output itself.
+        match value {
+            Value::Object(mut map) => match map.remove("output") {
+                Some(output) => Ok(output),
+                None => Err(OpenConnectorError::InvalidGatewayResponse {
+                    operation: operation.clone(),
+                    reason: "object response has no 'output' field; it looks like an error \
+                             or async envelope, not action output"
+                        .to_string(),
+                }),
+            },
+            other => Ok(other),
+        }
     }
 
     /// Join a relative path onto the gateway base URL.
@@ -856,13 +872,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_without_output_field_returns_bare_body() {
-        let gateway = MockGateway::start(|_| MockResponse::ok(r#"{"rows": []}"#)).await;
+    async fn execute_object_without_output_field_is_invalid_response() {
+        // An object without `output` is an envelope we don't understand
+        // (error body, async job handle) — it must fail loudly rather than
+        // flow downstream as action output.
+        for body in [
+            r#"{"error": "rate limited"}"#,
+            r#"{"status": "pending", "job_id": "j-1"}"#,
+            r#"{"rows": []}"#,
+        ] {
+            let owned = body.to_string();
+            let gateway = MockGateway::start(move |_| MockResponse::ok(&owned)).await;
+            let err = test_client(&gateway, 3)
+                .execute("github.x", &serde_json::json!({}), None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, OpenConnectorError::InvalidGatewayResponse { .. }),
+                "{body} should be rejected, got {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_bare_array_body_is_returned_whole() {
+        // A non-object body can't be confused with an error envelope, so a
+        // bare array is a legitimate action result.
+        let gateway = MockGateway::start(|_| MockResponse::ok(r#"[{"id": 1}, {"id": 2}]"#)).await;
         let value = test_client(&gateway, 3)
             .execute("github.x", &serde_json::json!({}), None)
             .await
             .expect("execute");
-        assert_eq!(value, serde_json::json!({"rows": []}));
+        assert_eq!(value, serde_json::json!([{"id": 1}, {"id": 2}]));
     }
 
     #[tokio::test]
