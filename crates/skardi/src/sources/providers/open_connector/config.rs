@@ -156,6 +156,18 @@ impl OpenConnectorConfig {
         if self.runtime_token_env.trim().is_empty() {
             return Err(OpenConnectorError::EmptyRuntimeTokenEnv);
         }
+        // Zero timeouts make every request fail instantly (as an opaque
+        // retryable transport error), so they are config bugs, not bounds.
+        if self.request_timeout_seconds == 0 {
+            return Err(OpenConnectorError::ZeroSafetyBound {
+                field: "request_timeout_seconds",
+            });
+        }
+        if self.scan_timeout_seconds == 0 {
+            return Err(OpenConnectorError::ZeroSafetyBound {
+                field: "scan_timeout_seconds",
+            });
+        }
         if self.max_pages == 0 {
             return Err(OpenConnectorError::ZeroSafetyBound { field: "max_pages" });
         }
@@ -404,6 +416,28 @@ bindings:
         assert!(matches!(
             config.validate(),
             Err(OpenConnectorError::ZeroSafetyBound { field: "max_rows" })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeouts() {
+        // A zero timeout fails every request instantly, surfacing as an
+        // opaque retryable transport error at registration — it must be a
+        // targeted config error instead.
+        let config = parse("runtime_token_env: T\nrequest_timeout_seconds: 0");
+        assert!(matches!(
+            config.validate(),
+            Err(OpenConnectorError::ZeroSafetyBound {
+                field: "request_timeout_seconds"
+            })
+        ));
+
+        let config = parse("runtime_token_env: T\nscan_timeout_seconds: 0");
+        assert!(matches!(
+            config.validate(),
+            Err(OpenConnectorError::ZeroSafetyBound {
+                field: "scan_timeout_seconds"
+            })
         ));
     }
 
