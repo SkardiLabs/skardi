@@ -89,6 +89,21 @@ pub enum OpenConnectorError {
     )]
     CatalogHierarchyRequired { name: String },
 
+    /// The source requested `read_write` access; the integration is read-only
+    /// (milestone one exposes no mutating actions).
+    #[error(
+        "Open Connector data source '{name}' requests access_mode 'read_write', but \
+         Open Connector is read-only — no mutating actions are exposed"
+    )]
+    ReadWriteNotSupported { name: String },
+
+    /// The data source has no `open_connector` config block at all.
+    #[error(
+        "Open Connector data source '{name}' requires an 'open_connector' config block \
+         (runtime_token_env, bindings, …)"
+    )]
+    MissingConfig { name: String },
+
     /// The environment variable holding the gateway runtime token was unset.
     #[error(
         "Environment variable '{env}' not found: it must contain the Open Connector \

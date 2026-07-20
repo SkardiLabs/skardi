@@ -90,7 +90,8 @@ use datafusion::prelude::SessionContext;
 ///     &mut ctx,
 ///     "saas",
 ///     "http://open-connector:3000",
-///     &config,
+///     Some(&config),
+///     false,
 ///     HierarchyLevel::Catalog,
 /// )
 /// .await;
@@ -102,19 +103,32 @@ pub async fn register_open_connector_tables(
     session_ctx: &mut SessionContext,
     name: &str,
     connection_string: &str,
-    config: &OpenConnectorConfig,
+    config: Option<&OpenConnectorConfig>,
+    read_write: bool,
     hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
     // Nothing to register yet — keep the parameter so the final signature
     // (used by the server and the CLI) does not change when execution lands.
     let _ = session_ctx;
 
+    // All invariant checks live here so both front-ends (server and CLI)
+    // get identical behavior; front-ends may add earlier typed errors, but
+    // this is the single enforcement point.
     if hierarchy_level != HierarchyLevel::Catalog {
         return Err(OpenConnectorError::CatalogHierarchyRequired {
             name: name.to_string(),
         }
         .into());
     }
+    if read_write {
+        return Err(OpenConnectorError::ReadWriteNotSupported {
+            name: name.to_string(),
+        }
+        .into());
+    }
+    let config = config.ok_or_else(|| OpenConnectorError::MissingConfig {
+        name: name.to_string(),
+    })?;
     if connection_string.trim().is_empty() {
         return Err(OpenConnectorError::EmptyGatewayUrl {
             name: name.to_string(),
@@ -171,7 +185,8 @@ bindings:
             &mut ctx,
             "saas",
             "http://127.0.0.1:1",
-            &valid_config("UNUSED_ENV"),
+            Some(&valid_config("UNUSED_ENV")),
+            false,
             HierarchyLevel::Table,
         )
         .await
@@ -190,7 +205,8 @@ bindings:
             &mut ctx,
             "saas",
             "   ",
-            &valid_config("UNUSED_ENV"),
+            Some(&valid_config("UNUSED_ENV")),
+            false,
             HierarchyLevel::Catalog,
         )
         .await
@@ -199,6 +215,48 @@ bindings:
         assert!(matches!(
             err,
             OpenConnectorError::EmptyGatewayUrl { ref name } if name == "saas"
+        ));
+    }
+
+    #[tokio::test]
+    async fn register_rejects_read_write_before_any_network() {
+        // The read-only invariant is enforced here — the single point both
+        // front-ends funnel through — not left to each front-end.
+        let mut ctx = SessionContext::new();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            "http://127.0.0.1:1",
+            Some(&valid_config("UNUSED_ENV")),
+            true,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .unwrap_err();
+        let err = err.downcast::<OpenConnectorError>().unwrap();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ReadWriteNotSupported { ref name } if name == "saas"
+        ));
+    }
+
+    #[tokio::test]
+    async fn register_rejects_missing_config_block_before_any_network() {
+        let mut ctx = SessionContext::new();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            "http://127.0.0.1:1",
+            None,
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .unwrap_err();
+        let err = err.downcast::<OpenConnectorError>().unwrap();
+        assert!(matches!(
+            err,
+            OpenConnectorError::MissingConfig { ref name } if name == "saas"
         ));
     }
 
@@ -213,7 +271,8 @@ bindings:
             &mut ctx,
             "saas",
             "http://127.0.0.1:1",
-            &invalid,
+            Some(&invalid),
+            false,
             HierarchyLevel::Catalog,
         )
         .await
@@ -229,7 +288,8 @@ bindings:
             &mut ctx,
             "saas",
             "http://127.0.0.1:1",
-            &valid_config("SKARDI_TEST_OC_TOKEN_DEFINITELY_UNSET"),
+            Some(&valid_config("SKARDI_TEST_OC_TOKEN_DEFINITELY_UNSET")),
+            false,
             HierarchyLevel::Catalog,
         )
         .await
@@ -254,7 +314,8 @@ bindings:
             &mut ctx,
             "saas",
             &gateway.url,
-            &valid_config(TOKEN_ENV),
+            Some(&valid_config(TOKEN_ENV)),
+            false,
             HierarchyLevel::Catalog,
         )
         .await;
@@ -303,7 +364,8 @@ bindings:
             &mut ctx,
             "saas",
             &gateway.url,
-            &valid_config(TOKEN_ENV),
+            Some(&valid_config(TOKEN_ENV)),
+            false,
             HierarchyLevel::Catalog,
         )
         .await;

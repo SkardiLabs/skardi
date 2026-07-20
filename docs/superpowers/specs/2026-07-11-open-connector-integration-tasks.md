@@ -23,7 +23,7 @@ registered.
 - [x] 1.5 `OpenConnectorConfig::validate()` — pure, shared by server validation and provider registration (CLI/server parity); server `validate_data_sources` also rejects non-catalog hierarchy at config load (`OpenConnectorHierarchyRequired`) so a minimal config fails cleanly instead of aborting boot with a wrapped provider error
 - [x] 1.6 Server wiring: `DataSource.open_connector` (required for that type, rejected elsewhere), `validate_data_sources`, registration dispatch, `/data_source` + dashboard type mapping; `OpenConnector` is in `CATALOG_SUPPORTED_SOURCES` so the catalog-mode guards (no `table`/`schema` options, no empty `allowed_schemas`) fire for it exactly as for postgres/dynamodb
 - [x] 1.7 CLI wiring: same typed field and registration arm
-- [x] 1.8 Read-only by construction: excluded from `WRITABLE_SOURCE_TYPES`; job destinations rejected as non-transactional
+- [x] 1.8 Read-only by construction, enforced at the single shared point: `register_open_connector_tables` takes `read_write` and rejects it (`ReadWriteNotSupported`), so server **and** CLI apply the invariant identically (server additionally keeps its typed `UnsupportedWriteMode` at config validation); job destinations rejected as non-transactional
 - [x] 1.9 `register_open_connector_tables` entry point (validate → fail `ExecutionNotImplemented`)
 
 **Verification**: 19 skardi + 7 skardi-server + 4 skardi-cli tests; all failure

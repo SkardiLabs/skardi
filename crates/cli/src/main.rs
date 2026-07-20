@@ -946,18 +946,15 @@ async fn register_source(
                     source.name
                 )
             })?;
-            let config = source.open_connector.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Open Connector source '{}': 'open_connector' config block required \
-                     (runtime_token_env, bindings, …)",
-                    source.name
-                )
-            })?;
+            // Config-block presence, read-only enforcement, and hierarchy are
+            // all re-checked inside the provider — the single validation
+            // point shared with the server.
             register_open_connector_tables(
                 session_ctx,
                 &source.name,
                 endpoint,
-                config,
+                source.open_connector.as_ref(),
+                source.is_read_write(),
                 source.hierarchy_level,
             )
             .await
@@ -2962,10 +2959,27 @@ bindings:
                 .await
                 .unwrap_err();
             let msg = format!("{err:?}");
+            // The shared provider validation produces the message now.
             assert!(
-                msg.contains("'open_connector' config block required"),
+                msg.contains("requires an 'open_connector' config block"),
                 "unexpected error: {msg}"
             );
+        }
+
+        #[tokio::test]
+        async fn errors_with_read_write_access_mode() {
+            // The provider is the single enforcement point for the
+            // read-only invariant — the CLI must reject read_write exactly
+            // like the server's UnsupportedWriteMode.
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source =
+                open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
+            source.access_mode = Some("read_write".to_string());
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("read-only"), "unexpected error: {msg}");
         }
 
         #[tokio::test]

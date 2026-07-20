@@ -1413,19 +1413,15 @@ async fn register_data_source(
                 }
             })?;
 
-            // Validation in `validate_data_sources` guarantees this is Some;
-            // the provider re-validates so the CLI path is covered too.
-            let config = source.open_connector.as_ref().ok_or_else(|| {
-                ConfigError::MissingOpenConnectorConfig {
-                    name: source.name.clone(),
-                }
-            })?;
-
+            // `validate_data_sources` already guarantees the config block is
+            // present and access is read-only; the provider re-checks both so
+            // the CLI path (which has no such validation layer) is covered.
             register_open_connector_tables(
                 session_ctx,
                 &source.name,
                 connection_string,
-                config,
+                source.open_connector.as_ref(),
+                source.access_mode.is_read_write(),
                 source.hierarchy_level,
             )
             .await
