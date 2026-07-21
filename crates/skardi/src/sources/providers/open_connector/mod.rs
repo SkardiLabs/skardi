@@ -1,4 +1,4 @@
-//! Open Connector integration — config foundation + gateway client.
+//! Open Connector integration — config, gateway client, and scan engine.
 //!
 //! Open Connector is a separate authenticated SaaS gateway: it owns provider
 //! credentials, OAuth flows, token refresh, action policies, and
@@ -6,28 +6,39 @@
 //! (stable table definitions, JSON-to-Arrow conversion, pagination, filter
 //! and limit pushdown, DataFusion registration) on top.
 //!
-//! **Status: typed config + HTTP client + action registry have landed.**
+//! **Status: typed config, HTTP client, action registry, source packs, and
+//! the scan engine have landed.** A configured gateway registers as a real
+//! catalog (`<gateway>.<binding>.<table>`) and is queryable today — with the
+//! synthetic `mock` source pack. Real provider packs (GitHub, Slack, Notion)
+//! and the raw-action UDTF land next.
 //!
 //! - [`OpenConnectorConfig`] / [`OpenConnectorBinding`] — the typed
 //!   `open_connector:` block of a `type: open_connector` data source, shared
 //!   by the server and the CLI;
 //! - [`OpenConnectorError`] — pre-network and gateway-contact errors;
 //! - [`OpenConnectorClient`] — health checks, action discovery, action
-//!   execution, bounded retries, bounded decoding;
+//!   execution, idempotency-aware bounded retries, bounded decoding;
 //! - [`ActionRegistry`] — in-memory action metadata with compatibility
 //!   fingerprints, so query planning never performs network I/O;
+//! - [`SourcePackRegistry`] — built-in stable table definitions;
 //! - [`register_open_connector_tables`] — the registration entry point both
-//!   front-ends wire to. It validates the config, contacts the gateway, and
-//!   loads the registry, then fails with
-//!   [`OpenConnectorError::ExecutionNotImplemented`] until source packs and
-//!   the scan engine land.
+//!   front-ends wire to.
 //!
 //! See `docs/superpowers/specs/2026-07-11-open-connector-integration-design.md`.
 
 pub mod action_registry;
+pub mod cache;
 pub mod client;
 pub mod config;
 mod error;
+pub mod exec;
+pub mod filters;
+pub mod json_to_arrow;
+pub mod packs;
+pub mod pagination;
+pub mod row_path;
+pub mod source_pack;
+pub mod table;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -36,10 +47,20 @@ pub use action_registry::{ActionMetadata, ActionRegistry};
 pub use client::OpenConnectorClient;
 pub use config::{OpenConnectorBinding, OpenConnectorConfig};
 pub use error::OpenConnectorError;
+pub use source_pack::{SourcePack, SourcePackRegistry, SourcePackTable};
+pub use table::OpenConnectorTableProvider;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use datafusion::catalog::{
+    CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+};
+use datafusion::prelude::SessionContext;
+use serde_json::Value;
 
 use crate::sources::hierarchy::HierarchyLevel;
 use anyhow::Result;
-use datafusion::prelude::SessionContext;
 
 /// Register an Open Connector gateway into a DataFusion [`SessionContext`].
 ///
@@ -48,20 +69,19 @@ use datafusion::prelude::SessionContext;
 /// built-in source-pack tables become tables under those schemas:
 /// `<gateway>.<binding>.<table>`.
 ///
-/// # Current behavior (config + client milestone)
+/// The function:
 ///
-/// No tables are registered yet. The function:
-///
-/// 1. requires [`HierarchyLevel::Catalog`] (a gateway is a catalog, never a
-///    single table);
-/// 2. requires a non-empty `connection_string` (the gateway URL);
-/// 3. runs [`OpenConnectorConfig::validate`];
-/// 4. builds an [`OpenConnectorClient`] (runtime token from the environment)
-///    and health-checks the gateway;
-/// 5. discovers every `raw_action_allowlist` action into an
-///    [`ActionRegistry`];
-/// 6. fails with [`OpenConnectorError::ExecutionNotImplemented`] — catalog
-///    registration arrives with the source-pack milestone.
+/// 1. requires [`HierarchyLevel::Catalog`], read-only access, a present
+///    typed config, and a non-empty gateway URL (the single enforcement
+///    point both front-ends share);
+/// 2. runs [`OpenConnectorConfig::validate`];
+/// 3. health-checks the gateway with an [`OpenConnectorClient`] built from
+///    the environment-held runtime token;
+/// 4. discovers every action the bindings and the raw allowlist reference
+///    into an [`ActionRegistry`], enforcing version pins, required
+///    resources, and action-contract fingerprints;
+/// 5. builds one [`OpenConnectorTableProvider`] per bound table and
+///    registers the catalog.
 ///
 /// # Example
 /// ```no_run
@@ -77,16 +97,14 @@ use datafusion::prelude::SessionContext;
 ///     r#"
 /// runtime_token_env: OPEN_CONNECTOR_TOKEN
 /// bindings:
-///   - name: github_skardi
-///     source_pack: github
-///     resource: { owner: SkardiLabs, repo: skardi }
-///     tables: [issues]
+///   - name: ws
+///     source_pack: mock
+///     resource: { workspace: demo }
+///     tables: [items]
 /// "#,
 /// )?;
 ///
-/// // Today this contacts the gateway, then fails with
-/// // OpenConnectorError::ExecutionNotImplemented.
-/// let result = register_open_connector_tables(
+/// register_open_connector_tables(
 ///     &mut ctx,
 ///     "saas",
 ///     "http://open-connector:3000",
@@ -94,8 +112,9 @@ use datafusion::prelude::SessionContext;
 ///     false,
 ///     HierarchyLevel::Catalog,
 /// )
-/// .await;
-/// assert!(result.is_err());
+/// .await?;
+///
+/// // The mock table is now queryable as saas.ws.items.
 /// # Ok(())
 /// # }
 /// ```
@@ -107,10 +126,6 @@ pub async fn register_open_connector_tables(
     read_write: bool,
     hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
-    // Nothing to register yet — keep the parameter so the final signature
-    // (used by the server and the CLI) does not change when execution lands.
-    let _ = session_ctx;
-
     // All invariant checks live here so both front-ends (server and CLI)
     // get identical behavior; front-ends may add earlier typed errors, but
     // this is the single enforcement point.
@@ -137,29 +152,119 @@ pub async fn register_open_connector_tables(
     }
     config.validate()?;
 
-    let client = OpenConnectorClient::from_config(connection_string, config)?;
+    let client = Arc::new(OpenConnectorClient::from_config(connection_string, config)?);
     client.health().await?;
-    let registry = ActionRegistry::load(&client, &config.raw_action_allowlist).await?;
+
+    // Resolve bindings to pack table definitions first, so discovery covers
+    // the allowlist *and* every action a bound table needs.
+    let pack_registry = SourcePackRegistry::builtins();
+    let mut action_ids = config.raw_action_allowlist.clone();
+    for binding in &config.bindings {
+        let pack = pack_registry.require(&binding.source_pack)?;
+        SourcePackRegistry::check_version_pin(pack, binding.source_pack_version)?;
+        for table_name in &binding.tables {
+            let table = pack_registry.table(pack, table_name)?;
+            action_ids.push(table.action_id.to_string());
+            for key in table.required_resources {
+                if !binding.resource.contains_key(*key) {
+                    return Err(OpenConnectorError::MissingResourceInput {
+                        binding: binding.name.clone(),
+                        key: (*key).to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+    let registry = ActionRegistry::load(&client, &action_ids).await?;
+
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    let cache = Arc::new(cache::ScanCache::new(
+        Duration::from_secs(config.cache_ttl_seconds),
+        usize::try_from(config.cache_max_bytes).unwrap_or(usize::MAX),
+    ));
+    let scan_timeout = Duration::from_secs(config.scan_timeout_seconds);
+
+    for binding in &config.bindings {
+        let pack = pack_registry.require(&binding.source_pack)?;
+        let schema_provider = Arc::new(MemorySchemaProvider::new());
+
+        for table_name in &binding.tables {
+            let table = pack_registry.table(pack, table_name)?;
+
+            // Compatibility gate: the discovered action contract must match
+            // the fingerprint the pack was built against.
+            if let Some(expected) = table.expected_fingerprint {
+                let actual = registry
+                    .get(table.action_id)
+                    .map(ActionMetadata::fingerprint);
+                if actual != Some(expected) {
+                    return Err(OpenConnectorError::ActionContractMismatch {
+                        table: table.id.to_string(),
+                        reason: format!(
+                            "action '{}' fingerprint mismatch (expected {expected}, discovered {})",
+                            table.action_id,
+                            actual.unwrap_or("<none>")
+                        ),
+                    }
+                    .into());
+                }
+            }
+
+            let provider = OpenConnectorTableProvider::new(
+                Arc::clone(&client),
+                Some(Arc::clone(&cache)),
+                name.to_string(),
+                binding.connection_alias.clone(),
+                table,
+                Value::Object(
+                    binding
+                        .resource
+                        .clone()
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::from(v)))
+                        .collect(),
+                ),
+                config.max_pages,
+                config.max_rows,
+                scan_timeout,
+            )?;
+            schema_provider
+                .register_table(table_name.clone(), Arc::new(provider))
+                .map_err(|e| OpenConnectorError::ActionContractMismatch {
+                    table: table.id.to_string(),
+                    reason: format!("failed to register into catalog schema: {e}"),
+                })?;
+        }
+
+        catalog
+            .register_schema(&binding.name, schema_provider)
+            .map_err(|e| OpenConnectorError::ActionContractMismatch {
+                table: binding.name.clone(),
+                reason: format!("failed to register schema in catalog: {e}"),
+            })?;
+    }
+
+    session_ctx.register_catalog(name, catalog);
 
     tracing::info!(
         gateway = %name,
+        bindings = config.bindings.len(),
         actions = registry.len(),
-        "Open Connector gateway reachable; action metadata loaded"
+        "Open Connector catalog registered"
     );
 
-    Err(OpenConnectorError::ExecutionNotImplemented {
-        name: name.to_string(),
-    }
-    .into())
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::testutil::{MockGateway, MockResponse};
+    use crate::sources::providers::open_connector::testutil::{
+        MockGateway, MockResponse, RecordedRequest,
+    };
 
     const TOKEN_ENV_HEALTH_FAIL: &str = "SKARDI_TEST_OC_REGISTER_TOKEN_HEALTH_FAIL";
-    const TOKEN_ENV_HEALTHY: &str = "SKARDI_TEST_OC_REGISTER_TOKEN_HEALTHY";
 
     fn valid_config(token_env: &str) -> OpenConnectorConfig {
         serde_yaml::from_str(&format!(
@@ -345,59 +450,296 @@ bindings:
     }
 
     #[tokio::test]
-    async fn register_reaches_not_implemented_with_healthy_gateway() {
-        let gateway = MockGateway::start(|req| {
-            if req.path == "/v1/health" {
-                MockResponse::ok("{}")
-            } else if req.path == "/v1/actions/github.list_repository_issues" {
-                MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                       "locally_executable": true, "connection_aliases": ["work"]}"#,
-                )
-            } else {
-                MockResponse::new(404, "{}")
-            }
-        })
-        .await;
+    async fn register_builds_queryable_catalog_with_mock_pack() {
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
 
         unsafe {
-            std::env::set_var(TOKEN_ENV_HEALTHY, "test-token");
+            std::env::set_var(TOKEN_ENV_CATALOG_BASIC, "test-token");
         }
         let mut ctx = SessionContext::new();
-        let result = register_open_connector_tables(
+        register_open_connector_tables(
             &mut ctx,
             "saas",
             &gateway.url,
-            Some(&valid_config(TOKEN_ENV_HEALTHY)),
+            Some(&mock_config(TOKEN_ENV_CATALOG_BASIC, 0)),
             false,
             HierarchyLevel::Catalog,
         )
-        .await;
+        .await
+        .expect("catalog registration succeeds");
         unsafe {
-            std::env::remove_var(TOKEN_ENV_HEALTHY);
+            std::env::remove_var(TOKEN_ENV_CATALOG_BASIC);
         }
 
-        let err = result
-            .unwrap_err()
-            .downcast::<OpenConnectorError>()
-            .unwrap();
+        // The bound table is queryable through <gateway>.<binding>.<table>.
+        let df = ctx
+            .sql("SELECT id, name FROM saas.ws.items ORDER BY id")
+            .await
+            .expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 5);
+
+        // Page-number pagination walked 3 pages (per_page = 2, 5 items).
+        let executes = execute_requests(&gateway);
+        assert_eq!(executes.len(), 3, "3 pages for 5 items at per_page=2");
+        assert!(executes[0].body.contains(r#""page":1"#));
+        assert!(executes[2].body.contains(r#""page":3"#));
+    }
+
+    #[tokio::test]
+    async fn scan_pushes_allowlisted_filter_and_stops_at_limit() {
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_FILTER, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_FILTER, 0)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_FILTER);
+        }
+
+        // Exact-mapped filter is pushed into the action input…
+        // (projection [0, 2] also covers cache-key name resolution against
+        // the fixed schema — a non-contiguous projection used to panic)
+        let df = ctx
+            .sql("SELECT id, value FROM saas.ws.items WHERE value > 3.0")
+            .await
+            .expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "values 4.0 and 5.0");
         assert!(
-            matches!(
-                err,
-                OpenConnectorError::ExecutionNotImplemented { ref name } if name == "saas"
-            ),
-            "got {err}"
+            execute_requests(&gateway)
+                .iter()
+                .all(|r| r.body.contains(r#""min_value":3"#)),
+            "min_value pushed on every page"
         );
 
-        let requests = gateway.requests();
-        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
-        assert!(
-            paths.contains(&"/v1/health"),
-            "health was called: {paths:?}"
+        // …and LIMIT stops pagination after the first page.
+        let gateway2 = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_FILTER, "test-token");
+        }
+        let mut ctx2 = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx2,
+            "saas",
+            &gateway2.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_FILTER, 0)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_FILTER);
+        }
+        let df = ctx2
+            .sql("SELECT id FROM saas.ws.items LIMIT 1")
+            .await
+            .expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            execute_requests(&gateway2).len(),
+            1,
+            "LIMIT 1 must stop after the first page"
         );
-        assert!(
-            paths.contains(&"/v1/actions/github.list_repository_issues"),
-            "allowlist action was discovered: {paths:?}"
+    }
+
+    #[tokio::test]
+    async fn cached_scan_replays_without_new_requests() {
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 3)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_CACHE, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_CACHE, 60)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_CACHE);
+        }
+
+        for round in 1..=2 {
+            let df = ctx
+                .sql("SELECT id, name FROM saas.ws.items ORDER BY id")
+                .await
+                .expect("plan");
+            let batches = df.collect().await.expect("collect");
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 3, "round {round}");
+        }
+
+        let executes = execute_requests(&gateway);
+        assert_eq!(
+            executes.len(),
+            2,
+            "second identical scan must be served from cache (3 items at per_page=2 → 2 live pages)"
         );
+    }
+
+    #[tokio::test]
+    async fn self_join_scans_compute_identical_keys_but_fetch_live() {
+        // Documents the whole-scan cache boundary: both sides of a self-join
+        // compute the SAME canonical key, but because they run concurrently,
+        // each starts before the other completes — so both fetch live. The
+        // cache dedups repeated queries over time, not overlapping scans
+        // (see cache.rs module docs).
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 3)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_CACHE, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_CACHE, 60)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_CACHE);
+        }
+
+        let df = ctx
+            .sql(
+                "SELECT count(*) AS n FROM saas.ws.items i1 JOIN saas.ws.items i2 ON i1.id = i2.id",
+            )
+            .await
+            .expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "count(*) returns one row");
+
+        // Both sides fetched live (2 pages each for 3 items at per_page=2),
+        // and a subsequent identical query replays from cache instead.
+        let before = execute_requests(&gateway).len();
+        assert_eq!(before, 4, "concurrent join sides both fetch live");
+
+        let df = ctx.sql("SELECT id FROM saas.ws.items").await.expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3);
+        assert_eq!(
+            execute_requests(&gateway).len(),
+            before,
+            "no new live pages once earlier scans have completed and cached"
+        );
+    }
+    /// Env var for the catalog tests (unique per test file section).
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_BASIC: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_BASIC";
+
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_FILTER: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_FILTER";
+
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_CACHE";
+
+    #[cfg(test)]
+    fn mock_config(token_env: &str, cache_ttl_seconds: u64) -> OpenConnectorConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+cache_ttl_seconds: {cache_ttl_seconds}
+bindings:
+  - name: ws
+    source_pack: mock
+    resource: {{ workspace: demo }}
+    tables: [items]
+"#
+        ))
+        .expect("parse config")
+    }
+
+    /// All items the mock gateway serves, 1-based ids.
+    #[cfg(test)]
+    fn mock_items() -> Vec<serde_json::Value> {
+        (1..=5)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "name": format!("item-{id}"),
+                    "value": id as f64,
+                    "tags": ["t1", "t2"],
+                    "created_at": "2026-01-01T00:00:00Z"
+                })
+            })
+            .collect()
+    }
+
+    /// Mock gateway handler: health, discovery, and page-number paginated
+    /// `mock.list_items` execution (per_page = 2 per the mock pack).
+    #[cfg(test)]
+    fn mock_gateway_handler(req: &RecordedRequest, total: usize) -> MockResponse {
+        if req.method == "GET" && req.path == "/v1/health" {
+            return MockResponse::ok("{}");
+        }
+        if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
+            return MockResponse::ok(
+                r#"{"input_schema": {}, "output_schema": {"type": "object"},
+               "locally_executable": true, "connection_aliases": []}"#,
+            );
+        }
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            let input = body.get("input").cloned().unwrap_or_default();
+            let page = input
+                .get("page")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as usize;
+            let min_value = input.get("min_value").and_then(serde_json::Value::as_f64);
+            let items = mock_items();
+            let start = (page - 1) * 2;
+            let slice: Vec<_> = items
+                .into_iter()
+                .take(total)
+                .filter(|item| {
+                    min_value.is_none_or(|min| {
+                        item.get("value").and_then(serde_json::Value::as_f64) > Some(min)
+                    })
+                })
+                .skip(start)
+                .take(2)
+                .collect();
+            return MockResponse::ok(
+                &serde_json::json!({ "output": { "items": slice } }).to_string(),
+            );
+        }
+        MockResponse::new(404, "{}")
+    }
+
+    #[cfg(test)]
+    fn execute_requests(gateway: &MockGateway) -> Vec<RecordedRequest> {
+        gateway
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .collect()
     }
 }

@@ -1,0 +1,60 @@
+//! Canonical JSON helpers shared by fingerprinting and cache keys.
+
+use serde_json::Value;
+
+/// Serialize a JSON value in canonical form: object keys sorted recursively,
+/// arrays kept in order, strings via `serde_json` escaping. Two semantically
+/// equal values always produce the same string, which is what compatibility
+/// fingerprints and cache keys require.
+///
+/// # Example
+/// ```
+/// use skardi::util::json::canonical_json;
+///
+/// let a = serde_json::json!({"b": 1, "a": [true, null]});
+/// let b = serde_json::json!({"a": [true, null], "b": 1});
+/// assert_eq!(canonical_json(&a), canonical_json(&b));
+/// ```
+pub fn canonical_json(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+/// Write a JSON value in canonical form into `out` (see [`canonical_json`]).
+pub fn write_canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                if let Some(value) = map.get(*key) {
+                    write_canonical(value, out);
+                }
+            }
+            out.push('}');
+        }
+    }
+}

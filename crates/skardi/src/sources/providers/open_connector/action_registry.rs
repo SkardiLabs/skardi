@@ -18,14 +18,8 @@ use serde_json::Value;
 
 use super::client::{DiscoveredAction, OpenConnectorClient};
 use super::error::OpenConnectorError;
-
-/// FNV-1a 64-bit offset basis. FNV-1a is used for the fingerprint because it
-/// is stable across processes and compiler releases without pulling in a
-/// cryptographic hash dependency — the fingerprint detects schema *drift*,
-/// it is not a security boundary.
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-/// FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+use crate::util::hash::fnv1a_hex;
+use crate::util::json::canonical_json;
 
 /// Maximum concurrent discovery calls while loading the registry.
 const DISCOVERY_CONCURRENCY: usize = 8;
@@ -175,57 +169,11 @@ impl ActionRegistry {
 /// semantically identical schemas with different key orders fingerprint
 /// equally), then hashed with FNV-1a 64 and hex-encoded.
 fn fingerprint_schema(output_schema: Option<&Value>) -> String {
-    let mut canonical = String::new();
-    match output_schema {
-        Some(schema) => write_canonical(schema, &mut canonical),
-        None => canonical.push_str("null"),
-    }
-
-    let mut hash: u64 = FNV_OFFSET_BASIS;
-    for byte in canonical.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hex::encode(hash.to_be_bytes())
-}
-
-/// Write a JSON value in canonical form: object keys sorted recursively,
-/// arrays kept in order, strings via `serde_json` escaping.
-fn write_canonical(value: &Value, out: &mut String) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
-        Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (index, key) in keys.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
-                out.push(':');
-                if let Some(value) = map.get(*key) {
-                    write_canonical(value, out);
-                }
-            }
-            out.push('}');
-        }
-    }
+    let canonical = match output_schema {
+        Some(schema) => canonical_json(schema),
+        None => "null".to_string(),
+    };
+    fnv1a_hex(canonical.as_bytes())
 }
 
 #[cfg(test)]
