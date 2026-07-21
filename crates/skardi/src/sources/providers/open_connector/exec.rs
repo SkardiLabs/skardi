@@ -253,13 +253,15 @@ impl ScanState {
 
         // A cache hit replays whole batches (LIMIT is part of the key, so a
         // truncated cached scan only ever serves an identical query).
-        let replay = exec
+        let cached = exec
             .cache
             .as_ref()
             .and_then(|cache| cache.get(&cache_key))
-            .map(VecDeque::from)
-            .unwrap_or_default();
-        let done = !replay.is_empty();
+            .map(VecDeque::from);
+        // An empty batch list is a valid completed scan, so preserve the
+        // Option to distinguish an empty cache hit from a cache miss.
+        let done = cached.is_some();
+        let replay = cached.unwrap_or_default();
 
         Self {
             client: exec.client.clone(),

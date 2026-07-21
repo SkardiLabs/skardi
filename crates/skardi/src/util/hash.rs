@@ -1,29 +1,18 @@
-//! Dependency-free hashing for fingerprints (drift detection, cache keys).
-//!
-//! FNV-1a is used because it is stable across processes and compiler
-//! releases without pulling in a cryptographic hash crate — fingerprints
-//! detect *changes*, they are not a security boundary.
+//! Stable cryptographic hashing for fingerprints and cache keys.
 
-/// FNV-1a 64-bit offset basis.
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-/// FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// FNV-1a 64-bit hash of `bytes`, hex-encoded (16 chars).
+/// BLAKE3 digest of `bytes`, hex-encoded (64 chars).
+///
+/// Compatibility fingerprints reject changed upstream action contracts, so
+/// they require collision resistance rather than a small non-cryptographic
+/// checksum. BLAKE3 is already used for stable document IDs in this crate.
 ///
 /// # Example
 /// ```
-/// use skardi::util::hash::fnv1a_hex;
+/// use skardi::util::hash::blake3_hex;
 ///
-/// assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
-/// assert_eq!(fnv1a_hex(b"abc"), fnv1a_hex(b"abc"));
-/// assert_ne!(fnv1a_hex(b"abc"), fnv1a_hex(b"abd"));
+/// assert_eq!(blake3_hex(b"abc"), blake3_hex(b"abc"));
+/// assert_ne!(blake3_hex(b"abc"), blake3_hex(b"abd"));
 /// ```
-pub fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = FNV_OFFSET_BASIS;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hex::encode(hash.to_be_bytes())
+pub fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }

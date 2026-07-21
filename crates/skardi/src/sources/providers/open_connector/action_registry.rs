@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::client::{DiscoveredAction, OpenConnectorClient};
 use super::error::OpenConnectorError;
-use crate::util::hash::fnv1a_hex;
+use crate::util::hash::blake3_hex;
 use crate::util::json::canonical_json;
 
 /// Maximum concurrent discovery calls while loading the registry.
@@ -167,13 +167,13 @@ impl ActionRegistry {
 ///
 /// The schema is canonicalized first (object keys sorted recursively, so two
 /// semantically identical schemas with different key orders fingerprint
-/// equally), then hashed with FNV-1a 64 and hex-encoded.
+/// equally), then hashed with BLAKE3 and hex-encoded.
 fn fingerprint_schema(output_schema: Option<&Value>) -> String {
     let canonical = match output_schema {
         Some(schema) => canonical_json(schema),
         None => "null".to_string(),
     };
-    fnv1a_hex(canonical.as_bytes())
+    blake3_hex(canonical.as_bytes())
 }
 
 #[cfg(test)]
@@ -301,7 +301,7 @@ mod tests {
             Some(&serde_json::json!({"type": "array"}))
         );
         assert_eq!(meta.connection_aliases(), &["work".to_string()]);
-        assert_eq!(meta.fingerprint().len(), 16, "64-bit hash as hex");
+        assert_eq!(meta.fingerprint().len(), 64, "BLAKE3 hash as hex");
     }
 
     #[test]

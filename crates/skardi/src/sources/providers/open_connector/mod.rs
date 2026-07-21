@@ -652,6 +652,41 @@ bindings:
     }
 
     #[tokio::test]
+    async fn cached_empty_scan_replays_without_new_requests() {
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 0)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_EMPTY_CACHE, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_EMPTY_CACHE, 60)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_EMPTY_CACHE);
+        }
+
+        for round in 1..=2 {
+            let df = ctx.sql("SELECT id FROM saas.ws.items").await.expect("plan");
+            let batches = df.collect().await.expect("collect");
+            assert!(batches.is_empty(), "round {round} should be empty");
+        }
+
+        assert_eq!(
+            execute_requests(&gateway).len(),
+            1,
+            "second empty scan must be served from cache"
+        );
+    }
+
+    #[tokio::test]
     async fn self_join_scans_compute_identical_keys_but_fetch_live() {
         // Documents the whole-scan cache boundary: both sides of a self-join
         // compute the SAME canonical key, but because they run concurrently,
@@ -712,6 +747,9 @@ bindings:
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_CACHE";
+
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_EMPTY_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_EMPTY_CACHE";
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_TIMEOUT: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_TIMEOUT";

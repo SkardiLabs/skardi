@@ -8,6 +8,8 @@
 //! whose provider semantics are broader than the SQL predicate; no built-in
 //! mapping uses it yet.
 
+use std::collections::HashSet;
+
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use serde_json::Value;
@@ -35,13 +37,17 @@ pub struct TranslatedFilters {
 /// Translate scan filters against the source pack's allowlist.
 pub fn translate_filters(filters: &[Expr], mappings: &[FilterMapping]) -> TranslatedFilters {
     let mut translated = TranslatedFilters::default();
+    let mut claimed_inputs = HashSet::new();
     for filter in filters {
         match translate_one(filter, mappings) {
-            Some((input_field, value)) => {
+            // An action input holds one value. Marking two predicates that
+            // target it as Exact would let the later insert overwrite the
+            // former while DataFusion skips reapplying both filters.
+            Some((input_field, value)) if claimed_inputs.insert(input_field.clone()) => {
                 translated.inputs.push((input_field, value));
                 translated.pushdown.push(TableProviderFilterPushDown::Exact);
             }
-            None => translated
+            Some(_) | None => translated
                 .pushdown
                 .push(TableProviderFilterPushDown::Unsupported),
         }
@@ -202,6 +208,22 @@ mod tests {
     fn mixed_filters_keep_alignment() {
         let translated = translate_filters(&[gt("value", 1), col("name").is_null()], MAPPINGS);
         assert_eq!(translated.inputs.len(), 1);
+        assert_eq!(
+            translated.pushdown,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_action_input_keeps_later_predicate_local() {
+        let translated = translate_filters(&[gt("value", 20), gt("value", 10)], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("min_value".to_string(), Value::from(20))]
+        );
         assert_eq!(
             translated.pushdown,
             vec![

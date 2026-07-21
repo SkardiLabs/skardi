@@ -28,7 +28,7 @@ chunking = ["dep:text-splitter"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
-documents = ["dep:liteparse", "dep:blake3", "dep:glob"]
+documents = ["dep:liteparse", "dep:glob"]
 
 [dependencies]
 # engine
@@ -82,8 +82,8 @@ redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster
 # (two crates can't both `links = "lzma"`) and also forces a newer tokio. OCR is still
 # available at runtime via liteparse's HTTP OCR engine (config `ocr_server_url`).
 liteparse = { version = "2.4.0", default-features = false, optional = true }
-# stable doc_id hashing for the documents connector (also a liteparse dep).
-blake3 = { version = "1", optional = true }
+# Stable fingerprints for Open Connector contracts and document IDs.
+blake3 = "1"
 # include_globs matching for the documents connector.
 glob = { version = "0.3", optional = true }
 secrecy = "0.10"

@@ -23,7 +23,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use serde_json::{Value, json};
 
-use crate::util::hash::fnv1a_hex;
+use crate::util::hash::blake3_hex;
 use crate::util::json::canonical_json;
 
 /// Default entry cap when the byte budget alone would allow unbounded growth.
@@ -88,7 +88,7 @@ pub fn scan_cache_key(parts: &ScanKeyParts) -> String {
     }))
 }
 
-/// FNV-1a fingerprint of an Arrow schema: field order is significant (it is
+/// BLAKE3 fingerprint of an Arrow schema: field order is significant (it is
 /// the emitted batch shape), fields are rendered `name:type:nullable`.
 pub fn schema_fingerprint(schema: &SchemaRef) -> String {
     let mut canonical = String::new();
@@ -100,7 +100,7 @@ pub fn schema_fingerprint(schema: &SchemaRef) -> String {
         canonical.push_str(if field.is_nullable() { "1" } else { "0" });
         canonical.push(';');
     }
-    fnv1a_hex(canonical.as_bytes())
+    blake3_hex(canonical.as_bytes())
 }
 
 struct CacheInner {
@@ -277,6 +277,14 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(80));
         assert!(cache.get(&key).is_none(), "entry past its TTL must miss");
+    }
+
+    #[test]
+    fn empty_completed_scan_is_a_cache_hit() {
+        let cache = ScanCache::new(Duration::from_secs(60), 1 << 20);
+        let key = scan_cache_key(&parts("saas", &[]));
+        cache.put(key.clone(), vec![]);
+        assert_eq!(cache.get(&key), Some(vec![]));
     }
 
     #[test]

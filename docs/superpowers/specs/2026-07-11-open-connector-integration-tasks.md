@@ -39,8 +39,8 @@ Everything network-facing, behind one client; planning-time metadata in memory.
 - [x] 2.4 Bounded response decoding enforced on declared `Content-Length` + streamed bytes; per-request timeout from config; `max_response_bytes` / `max_attempts` are operator-tunable `OpenConnectorConfig` fields (wired in `from_config`, zero rejected as `ZeroSafetyBound`); terminal error paths read a 4 KiB snippet instead of buffering a worst-case error page; execute serializes a borrowing envelope (no input deep-clone)
 - [x] 2.5 Connection-alias header on execute calls; `execute()` is `pub(crate)` so the registry/UDTF allowlist gating is structurally un-bypassable from outside the crate (discovery and health stay public metadata); the execute envelope is strict — an object without `output` is `InvalidGatewayResponse` (error/async envelopes never flow downstream as action output), a non-object body is returned whole, and `map.remove` avoids cloning the envelope
 - [x] 2.6 `ActionRegistry`: deduplicated, concurrency-bounded discovery of `raw_action_allowlist`; non-locally-executable actions rejected; missing executability flag rejected as `ActionExecutabilityUnknown` (default-deny, `Option<bool>` so "not declared" is never read as "executable"); no partial registry
-- [x] 2.7 Compatibility fingerprint per action (canonicalized output schema → FNV-1a; stable, dependency-free)
-- [x] 2.8 Registration flow: validate → client → health → registry → `ExecutionNotImplemented`
+- [x] 2.7 Compatibility fingerprint per action (canonicalized output schema → collision-resistant BLAKE3)
+- [x] 2.8 Initial registration flow: validate → client → health → registry; milestone 3 replaces the temporary `ExecutionNotImplemented` result with catalog construction
 - [x] 2.9 `reqwest` becomes a hard dependency of `skardi`; `remote-embed`/`llm-extract` features only gate UDF code
 - [x] 2.10 Hand-rolled mock gateway (`testutil.rs`) — no mock-HTTP crate added
 
@@ -108,10 +108,9 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestones 1–2 (`feature/open-connector-foundation`).
-  Registration intentionally still fails with `ExecutionNotImplemented`
-  after gateway contact succeeds — the switch flips in milestone 3 when
-  catalog building replaces the final error.
+- **Current PR**: milestones 1–3 (`feature/open-connector-integration-task-3`).
+  Registration builds a queryable catalog after gateway health, action
+  discovery, source-pack validation, and fingerprint checks.
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in
