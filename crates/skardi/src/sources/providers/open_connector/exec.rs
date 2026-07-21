@@ -291,6 +291,13 @@ impl ScanState {
         }
     }
 
+    fn timeout_error(&self) -> OpenConnectorError {
+        OpenConnectorError::ScanTimeout {
+            table: self.table.id.to_string(),
+            seconds: self.scan_timeout.as_secs(),
+        }
+    }
+
     /// Fetch and convert one page; returns None when the scan is complete.
     async fn next_page(&mut self) -> Result<Option<RecordBatch>, OpenConnectorError> {
         if let Some(batch) = self.replay.pop_front() {
@@ -301,10 +308,7 @@ impl ScanState {
             return Ok(None);
         }
         if Instant::now() >= self.deadline {
-            return Err(OpenConnectorError::ScanTimeout {
-                table: self.table.id.to_string(),
-                seconds: self.scan_timeout.as_secs(),
-            });
+            return Err(self.timeout_error());
         }
         if self.pagination.page() > self.max_pages as usize {
             return Err(OpenConnectorError::ScanBoundsExceeded {
@@ -323,16 +327,29 @@ impl ScanState {
         self.pagination.apply(&mut input);
 
         let page = self.pagination.page();
-        let envelope = self
-            .client
-            .execute(
+        // The scan deadline covers the whole gateway operation, including
+        // request I/O and any retry/backoff inside the client. Dropping this
+        // future on timeout also prevents another retry from being sent.
+        let envelope = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.deadline),
+            self.client.execute(
                 self.table.action_id,
                 &Value::Object(input),
                 self.connection_alias.as_deref(),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| self.timeout_error())??;
+        if Instant::now() >= self.deadline {
+            return Err(self.timeout_error());
+        }
         let rows = self.row_path.rows(&envelope, page)?;
         let batch = self.converter.convert(rows, page)?;
+        // Conversion is synchronous, so it cannot be preempted by Tokio; do
+        // not emit its result if it consumed the remaining scan budget.
+        if Instant::now() >= self.deadline {
+            return Err(self.timeout_error());
+        }
         let batch = match &self.projection {
             Some(indices) => {
                 batch

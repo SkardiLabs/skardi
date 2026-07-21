@@ -560,6 +560,58 @@ bindings:
     }
 
     #[tokio::test]
+    async fn scan_deadline_bounds_retry_waits() {
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(
+                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                       "locally_executable": true, "connection_aliases": []}"#,
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+                // The client would wait two seconds before retrying this 429,
+                // but the one-second scan deadline must cut that wait short.
+                return MockResponse::new(429, "{}").with_header("retry-after", "2");
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_TIMEOUT, "test-token");
+        }
+        let mut config = mock_config(TOKEN_ENV_CATALOG_TIMEOUT, 0);
+        config.scan_timeout_seconds = 1;
+        config.request_timeout_seconds = 30;
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_TIMEOUT);
+        }
+
+        let df = ctx.sql("SELECT id FROM saas.ws.items").await.expect("plan");
+        let err = df.collect().await.expect_err("scan must time out");
+        assert!(err.to_string().contains("timed out after 1s"), "got {err}");
+        assert_eq!(
+            execute_requests(&gateway).len(),
+            1,
+            "retry wait was cancelled"
+        );
+    }
+
+    #[tokio::test]
     async fn cached_scan_replays_without_new_requests() {
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 3)).await;
 
@@ -660,6 +712,9 @@ bindings:
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_CACHE";
+
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_TIMEOUT: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_TIMEOUT";
 
     #[cfg(test)]
     fn mock_config(token_env: &str, cache_ttl_seconds: u64) -> OpenConnectorConfig {
