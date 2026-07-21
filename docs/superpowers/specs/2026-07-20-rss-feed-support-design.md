@@ -31,6 +31,7 @@ RSS also completes Skardi's source palette alongside the approved Open Connector
 - `rss_scan(url)` — a registration-free UDTF for previewing any feed ad hoc.
 - `html_to_markdown()` scalar UDF so feed HTML flows into `chunk('markdown', …)` pipelines.
 - A compatibility strategy for wild-web feeds: sanitation pre-pass, fixture corpus, documented tolerance floor.
+- Dialect detection + conformance checking (declared vs parsed), queryable per feed; a documented dialect→schema field mapping surfaced as semantics annotations.
 - An `auto_news_base` skill that renders and self-verifies the complete subscription → archive → hybrid-search stack.
 
 ## Non-goals
@@ -60,6 +61,8 @@ RSS also completes Skardi's source palette alongside the approved Open Connector
 13. **`rss_scan(url)` shares the same internal scan machinery as the catalog tables.** The Open Connector dual-interface pattern: persistent tables for repeated queries and joins, a UDTF for ad-hoc exploration, both compiling to one scan path. Primary consumer: the skill's subscribe-time preview.
 14. **Registration performs zero network I/O.** Startup validates configuration only (URL syntax, bounds, OPML readability). Probing dozens of feeds at boot would make startup slow and brittle; the first scan — or an explicit `rss_scan` — pays the network cost. (Deliberate deviation from Open Connector's registration-time gateway verification: a gateway is one hop, subscriptions are many.)
 15. **Filter pushdown: `Exact` on `feed`/`feed_url` equality and `IN`; everything else stays in DataFusion.** Feed predicates prune partitions — `WHERE feed = 'rust-blog'` fetches exactly one feed. `LIMIT` stops launching further fetches once satisfied (documented: items have no global order). No other predicate can reach the wire; RSS has no query parameters.
+16. **Dialect is detected, conformance-checked against the feed's own declaration, and queryable.** Many dialects coexist in the wild and a feed's self-description lies routinely (an `application/rss+xml` Content-Type serving Atom; `<rss version="2.0">` missing required channel fields). After each successful parse the provider records what the document *claimed* to be (root element + version attribute, Content-Type as corroboration) and what it *parsed as* (`feed-rs` dialect), in `feeds.dialect_declared` / `feeds.dialect`. Deviations — declared/parsed mismatch, missing spec-required fields (e.g. RSS 2.0 channel `title`/`link`/`description`), sanitation repairs applied — are collected into `feeds.conformance_notes` as a JSON array. Conformance checking never fails a feed that parsed: it converts silent tolerance into queryable evidence, feeding the same visibility principle as Decision 7.
+17. **The dialect → unified-schema mapping is a documented, annotated contract.** Internally every dialect normalizes to the single `items` schema; that mapping (see Field Mapping table) ships in `docs/rss.md` and as column descriptions in a bundled semantics overlay (`docs/semantics.md` machinery), so both humans and agents can see which wire field fed which column for which dialect. `auto_news_base` renders the same descriptions into its `semantics.yaml`.
 
 ## Alternatives Considered
 
@@ -163,6 +166,9 @@ spec:
 | `http_status` | `UInt16` | nullable | last HTTP response code |
 | `last_error` | `Utf8` | nullable | fetch/parse error, redacted |
 | `etag` / `last_modified` | `Utf8` | nullable | conditional-request state |
+| `dialect` | `Utf8` | nullable | parsed dialect: `rss-0.9x` \| `rss-1.0` \| `rss-2.0` \| `atom-0.3` \| `atom-1.0` \| `json-feed-1.x` |
+| `dialect_declared` | `Utf8` | nullable | what the document claimed (root element + version attr; Content-Type corroborates) |
+| `conformance_notes` | `Utf8` | nullable | JSON array: declared/parsed mismatch, missing spec-required fields, sanitation repairs applied; `[]` = clean (Decision 16) |
 | `item_count` | `UInt64` | nullable | entries in current window |
 
 `<name>.main.items` — the live union across subscriptions; primary key `(feed, guid)`:
@@ -186,6 +192,25 @@ spec:
 | `position` | `UInt32` | not null | document order within the feed window |
 | `extensions_json` | `Utf8` | nullable | non-core namespaces as JSON |
 
+### Field Mapping (dialect → unified schema)
+
+The normative mapping behind Decision 17. Wild feeds speak several coexisting dialects; internally all of them collapse to the one `items` schema below. This table ships in `docs/rss.md` and — as column descriptions — in a bundled semantics overlay, so an agent inspecting the schema sees the provenance of every column without reading provider source.
+
+| `items` column | RSS 2.0 | RSS 1.0 (RDF) | Atom 1.0 | JSON Feed 1.x |
+|---|---|---|---|---|
+| `guid` | `<guid>` → fallback `<link>` | `rdf:about` → fallback `<link>` | `<id>` | `id` |
+| `title` | `<title>` | `<title>` | `<title>` (text/html/xhtml normalized) | `title` |
+| `link` | `<link>` | `<link>` | `<link rel="alternate">` (first, else first link) | `url` |
+| `author` | `<author>` / `dc:creator` | `dc:creator` | `<author><name>` | `authors[0].name` |
+| `published` | `<pubDate>` (RFC 822) | `dc:date` (ISO 8601) | `<published>` (RFC 3339) | `date_published` |
+| `updated` | — (extensions) | — | `<updated>` (RFC 3339) | `date_modified` |
+| `content` | `content:encoded` | `content:encoded` | `<content>` | `content_html` / `content_text` |
+| `summary` | `<description>` | `<description>` | `<summary>` | `summary` |
+| `categories` | `<category>*` | `dc:subject*` | `<category term>*` | `tags[]` |
+| `enclosure_*` | `<enclosure url/type/length>` | — | `<link rel="enclosure">` | `attachments[0]` |
+
+Date formats differ per dialect (RFC 822 vs ISO 8601 vs RFC 3339); all normalize to `Timestamp(ms, UTC)` at parse time. Fields a dialect lacks are simply null — nullability in the schema *is* the dialect-coverage annotation. Anything outside this table lands in `extensions_json`.
+
 ### Fetch and cache
 
 Bounded everything, scaled down from the Open Connector execution rules: per-request timeout, total scan deadline, response-size cap, bounded retries with jittered backoff honoring `Retry-After` for 429/transient 5xx. Cancellation aborts in-flight requests. Concurrency is capped by `max_concurrent`, which doubles as the per-host politeness bound.
@@ -196,10 +221,11 @@ The cache is per-feed, in-memory, bounded (bytes + entries, LRU), behind a small
 
 `feed-rs` parses RSS 0.9x/1.0/2.0, Atom 0.3/1.0, and JSON Feed 1.0/1.1 — JSON Feed support arrives free. The known risk is the tolerance gap versus Python's `feedparser`, which salvages two decades of malformed feeds (encoding lies, invalid bytes, unescaped entities, HTML soup, truncation). The strategy:
 
-1. **Sanitation pre-pass, on failure only.** A strict parse is attempted first. On failure, a bounded, deterministic sanitation pass runs — encoding sniff (BOM / XML declaration / `encoding_rs`), re-encode to UTF-8, strip control characters, repair naked ampersands — and the parse is retried once. Both attempts and the applied repairs are traced.
-2. **Fixture corpus as a regression ratchet.** `providers/rss/fixtures/` holds real-world feed documents: curated wild feeds across dialects plus every failure case harvested from the probe supplement's pain log. Contract tests assert that every fixture either parses or degrades per-feed with a recorded reason — never a panic, never a silent skip. The corpus only grows.
-3. **Documented tolerance floor.** Feeds that still fail are visible via `feeds.last_status = 'error'` with `last_error` naming the parse stage. `docs/rss.md` states plainly what Skardi does not salvage.
-4. **Evidence loop with the probe.** The supplement's `feedparser` baseline quantifies the residual gap on live feeds. Material gaps extend the sanitation pass; the parser choice itself is revisited only if the gap proves structural rather than case-by-case.
+1. **Sanitation pre-pass, on failure only.** A strict parse is attempted first. On failure, a bounded, deterministic sanitation pass runs — encoding sniff (BOM / XML declaration / `encoding_rs`), re-encode to UTF-8, strip control characters, repair naked ampersands — and the parse is retried once. Both attempts and the applied repairs are traced *and* recorded in `feeds.conformance_notes`.
+2. **Conformance check, after every successful parse** (Decision 16). Detect the declared dialect from the document itself (root element + version attribute; Content-Type as corroboration), compare with what `feed-rs` parsed, and verify the dialect's spec-required fields are present. Deviations populate `feeds.dialect_declared` / `feeds.dialect` / `feeds.conformance_notes`; they never reject a feed that parsed.
+3. **Fixture corpus as a regression ratchet.** `providers/rss/fixtures/` holds real-world feed documents: curated wild feeds across dialects plus every failure case harvested from the probe supplement's pain log. Contract tests assert that every fixture either parses or degrades per-feed with a recorded reason — never a panic, never a silent skip. The corpus only grows.
+4. **Documented tolerance floor.** Feeds that still fail are visible via `feeds.last_status = 'error'` with `last_error` naming the parse stage. `docs/rss.md` states plainly what Skardi does not salvage.
+5. **Evidence loop with the probe.** The supplement's `feedparser` baseline quantifies the residual gap on live feeds. Material gaps extend the sanitation pass; the parser choice itself is revisited only if the gap proves structural rather than case-by-case.
 
 ### Execution and pushdown
 
@@ -272,7 +298,7 @@ Notes carried from proven pipelines: the `AS t` wrapper works around DataFusion'
 ## Testing Strategy
 
 - **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation pass determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback.
-- **Fixture corpus contract tests:** every fixture parses or degrades visibly; assertions on row values per dialect (RSS 0.9x/1.0/2.0, Atom 0.3/1.0, JSON Feed); corpus seeded from the probe's pain log.
+- **Fixture corpus contract tests:** every fixture parses or degrades visibly; assertions on row values per dialect (RSS 0.9x/1.0/2.0, Atom 0.3/1.0, JSON Feed) following the Field Mapping table; dialect detection and `conformance_notes` asserted per fixture (including deliberate liars: Atom served as `rss+xml`, RSS 2.0 missing required channel fields); corpus seeded from the probe's pain log.
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning (`WHERE feed = 'x'` → exactly one request), dead-feed isolation, response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration.
 - **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT) with rerun-idempotency; `rss_scan` parity with the registered-table schema.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI (Open Connector convention).
@@ -289,6 +315,7 @@ Notes carried from proven pipelines: the `AS t` wrapper works around DataFusion'
 8. `items` participates in a federated join with an existing Skardi source.
 9. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
 10. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
+11. For every fixture, `feeds.dialect` matches the known dialect; a mismatching or spec-violating fixture yields non-empty `conformance_notes` while still serving rows.
 
 ## Rollout
 
@@ -322,7 +349,8 @@ Plus the four standard touch-points: `data_source_type.rs` variant, dispatch arm
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, tolerance floor, `rss_scan` and pipeline examples, troubleshooting.
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, tolerance floor, the Field Mapping table (dialect → unified schema), conformance-check semantics, `rss_scan` and pipeline examples, troubleshooting.
+- A bundled semantics overlay snippet whose column descriptions carry the per-dialect provenance of each `items`/`feeds` column (Decision 17).
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
 - skardi-skills: `auto_news_base` README with the five-step flow and self-verification contract.
 
