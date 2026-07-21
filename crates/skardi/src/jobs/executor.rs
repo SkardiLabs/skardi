@@ -342,6 +342,7 @@ impl JobExecutor {
             | Some(source_type @ DataSourceType::Redis)
             | Some(source_type @ DataSourceType::Seekdb)
             | Some(source_type @ DataSourceType::Influxdb)
+            | Some(source_type @ DataSourceType::OpenConnector)
             | Some(source_type @ DataSourceType::Dynamodb) => {
                 Err(JobSubmitError::NonTransactionalDestination {
                     table: dest.table.clone(),
@@ -930,5 +931,12 @@ spec:
     #[tokio::test]
     async fn submit_rejects_dynamodb_destination_as_non_transactional() {
         assert_submit_rejects_non_transactional_destination(DataSourceType::Dynamodb).await;
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_open_connector_destination_as_non_transactional() {
+        // Milestone one is strictly read-only, so Open Connector sources must
+        // never become job destinations.
+        assert_submit_rejects_non_transactional_destination(DataSourceType::OpenConnector).await;
     }
 }

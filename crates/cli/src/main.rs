@@ -51,6 +51,7 @@ use skardi::sources::providers::{
     lance::register_lance_table,
     mongo::register_mongo_tables,
     mysql::register_mysql_tables,
+    open_connector::{OpenConnectorConfig, register_open_connector_tables},
     sqlite::{
         register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_sqlite_tables,
         register_vec_to_binary_udf,
@@ -238,6 +239,10 @@ struct LocalDataSource {
     /// overlay supplies one.
     #[serde(default)]
     description: Option<String>,
+    /// Typed Open Connector gateway configuration. Required when the source
+    /// type is `open_connector`, rejected for every other type.
+    #[serde(default)]
+    open_connector: Option<OpenConnectorConfig>,
 }
 
 impl LocalDataSource {
@@ -771,6 +776,16 @@ async fn register_source(
 ) -> Result<()> {
     let source_type = source.source_type.to_lowercase();
 
+    // The typed `open_connector` block is only meaningful for that source
+    // type; anywhere else it is a config typo that should fail loudly.
+    if source_type != "open_connector" && source.open_connector.is_some() {
+        anyhow::bail!(
+            "Data source '{}': 'open_connector' config is only valid for type 'open_connector', got '{}'",
+            source.name,
+            source.source_type
+        );
+    }
+
     match source_type.as_str() {
         "csv" => {
             let path_str = source
@@ -914,6 +929,36 @@ async fn register_source(
             register_influxdb_tables(session_ctx, &source.name, conn_str, source.options.as_ref())
                 .await
                 .with_context(|| format!("Failed to register InfluxDB '{}'", source.name))?;
+        }
+        "open_connector" => {
+            // Hierarchy defaults to Table; fail here with a clear message
+            // rather than the provider's wrapped CatalogHierarchyRequired.
+            if source.hierarchy_level != HierarchyLevel::Catalog {
+                anyhow::bail!(
+                    "Open Connector source '{}': hierarchy_level must be 'catalog' \
+                     (a gateway is exposed as a DataFusion catalog, not a single table)",
+                    source.name
+                );
+            }
+            let endpoint = source.connection_string.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Open Connector source '{}': connection_string (gateway URL) required",
+                    source.name
+                )
+            })?;
+            // Config-block presence, read-only enforcement, and hierarchy are
+            // all re-checked inside the provider — the single validation
+            // point shared with the server.
+            register_open_connector_tables(
+                session_ctx,
+                &source.name,
+                endpoint,
+                source.open_connector.as_ref(),
+                source.is_read_write(),
+                source.hierarchy_level,
+            )
+            .await
+            .with_context(|| format!("Failed to register Open Connector '{}'", source.name))?;
         }
         "dynamodb" => {
             let endpoint = source.connection_string.as_deref().ok_or_else(|| {
@@ -2809,6 +2854,7 @@ spec:
                 hierarchy_level: HierarchyLevel::default(),
                 access_mode: None,
                 description: None,
+                open_connector: None,
             }
         }
 
@@ -2838,6 +2884,140 @@ spec:
                 "unexpected error: {msg}"
             );
             assert!(msg.contains("requires options"), "unexpected error: {msg}");
+        }
+    }
+
+    // Guards for the `open_connector` arm of `register_source`. All failure
+    // modes trip before any network call, so no live gateway is needed.
+    mod register_open_connector_source {
+        use super::*;
+
+        const VALID_CONFIG: &str = r#"
+runtime_token_env: OPEN_CONNECTOR_TOKEN
+bindings:
+  - name: github_skardi
+    source_pack: github
+    resource: { owner: SkardiLabs, repo: skardi }
+    tables: [issues]
+"#;
+
+        fn open_connector_source(
+            connection_string: Option<&str>,
+            config_yaml: Option<&str>,
+        ) -> LocalDataSource {
+            LocalDataSource {
+                name: "saas".to_string(),
+                source_type: "open_connector".to_string(),
+                path: None,
+                connection_string: connection_string.map(String::from),
+                options: None,
+                hierarchy_level: HierarchyLevel::Catalog,
+                access_mode: None,
+                description: None,
+                open_connector: config_yaml
+                    .map(|yaml| serde_yaml::from_str(yaml).expect("parse config")),
+            }
+        }
+
+        #[tokio::test]
+        async fn errors_without_connection_string() {
+            let (mut session_ctx, registry) = new_session_context();
+            let source = open_connector_source(None, Some(VALID_CONFIG));
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("connection_string (gateway URL) required"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_with_table_hierarchy() {
+            // hierarchy_level defaults to Table; the CLI must reject it with
+            // a clear message, not the provider's wrapped error.
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source =
+                open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
+            source.hierarchy_level = HierarchyLevel::Table;
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("hierarchy_level must be 'catalog'"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_without_typed_config() {
+            let (mut session_ctx, registry) = new_session_context();
+            let source = open_connector_source(Some("http://localhost:3000"), None);
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            // The shared provider validation produces the message now.
+            assert!(
+                msg.contains("requires an 'open_connector' config block"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_with_read_write_access_mode() {
+            // The provider is the single enforcement point for the
+            // read-only invariant — the CLI must reject read_write exactly
+            // like the server's UnsupportedWriteMode.
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source =
+                open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
+            source.access_mode = Some("read_write".to_string());
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("read-only"), "unexpected error: {msg}");
+        }
+
+        #[tokio::test]
+        async fn errors_when_typed_config_on_wrong_type() {
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source =
+                open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
+            source.source_type = "csv".to_string();
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("only valid for type 'open_connector'"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_when_token_env_missing() {
+            // With the config valid, the next failure is the unset runtime
+            // token — before any network call to the (unroutable) gateway.
+            let (mut session_ctx, registry) = new_session_context();
+            let config =
+                VALID_CONFIG.replace("OPEN_CONNECTOR_TOKEN", "SKARDI_CLI_TEST_OC_TOKEN_UNSET");
+            let source = open_connector_source(Some("http://127.0.0.1:1"), Some(config.as_str()));
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("Failed to register Open Connector 'saas'"),
+                "unexpected error: {msg}"
+            );
+            assert!(
+                msg.contains("SKARDI_CLI_TEST_OC_TOKEN_UNSET"),
+                "unexpected error: {msg}"
+            );
         }
     }
 }

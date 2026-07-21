@@ -379,6 +379,7 @@ spec:
             enable_cache: false,
             hierarchy_level: Default::default(),
             description: None,
+            open_connector: None,
         }];
 
         let pipeline = create_test_pipeline().await;

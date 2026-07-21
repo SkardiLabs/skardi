@@ -20,6 +20,7 @@ use self::gemini::GeminiProvider;
 use self::openai::OpenAiCompatibleProvider;
 use self::provider::{EmbeddingProvider, EmbeddingRequest};
 use super::{embedding_return_type, vecs_to_list_array};
+use crate::util::http::parse_retry_after;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
@@ -27,16 +28,6 @@ const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
 const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 const VOYAGE_EMBEDDINGS_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const MISTRAL_EMBEDDINGS_URL: &str = "https://api.mistral.ai/v1/embeddings";
-
-/// Parse `Retry-After` header value as seconds, falling back to `DEFAULT_RETRY_WAIT`.
-fn parse_retry_after(resp: &reqwest::Response) -> Duration {
-    resp.headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_RETRY_WAIT)
-}
 
 /// Send an HTTP request with a single retry on 429 (rate limit).
 ///
@@ -52,7 +43,7 @@ async fn send_with_rate_limit_retry(
         .context("HTTP request to embedding API failed")?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let wait = parse_retry_after(&resp);
+        let wait = parse_retry_after(&resp).unwrap_or(DEFAULT_RETRY_WAIT);
         tracing::warn!("{provider_label}: rate-limited (429), retrying after {wait:?}");
         tokio::time::sleep(wait).await;
 
