@@ -3,7 +3,6 @@
 **Status:** Draft for review
 **Date:** 2026-07-20
 **Branch:** `add_RSS_Feed`
-**Companion:** `2026-07-20-rss-fetcher-probe-supplement.md` (exploratory fetcher probe; non-gating)
 
 ## Summary
 
@@ -13,7 +12,7 @@ One configured source binds a subscription list and exposes two fixed tables: `f
 
 The provider is deliberately a pure protocol adapter. History retention, chunking, embedding, and hybrid retrieval are not provider features: they compose from existing primitives — anti-join `INSERT` pipelines, `chunk()`, `candle()`, `sqlite_knn`/`sqlite_fts` — plus one new scalar UDF, `html_to_markdown()`. The `auto_news_base` skill renders and self-verifies that composition end to end.
 
-This spec supersedes the demo-first phasing of the earlier draft. The Python-fetcher probe remains documented in the supplement as exploratory evidence — chiefly to seed the parser-compatibility fixture corpus — but does not gate this design.
+This spec supersedes the demo-first phasing of the earlier draft: the native source is not gated on a prior demo, and parser tolerance is handled by a growing fixture corpus rather than a go/no-go probe.
 
 ## Motivation
 
@@ -42,12 +41,12 @@ RSS also completes Skardi's source palette alongside the approved Open Connector
 - **No write path.** `INSERT`/`UPDATE`/`DELETE` against a feed is meaningless; the source registers strictly read-only (`WRITABLE_SOURCE_TYPES` untouched).
 - **No authenticated feeds.** Cookie-, token-, or basic-auth-protected feeds are out of scope for v1; if demand appears they belong behind the Open Connector gateway or a scoped follow-up.
 - **No history retention in the provider.** The live window is the contract; archiving is a pipeline composition (Decision 4).
-- **No gateway.** RSS is unauthenticated public HTTP with an open wire format; the Open Connector gateway adds a moving part and buys nothing (carried over from the probe supplement's analysis).
+- **No gateway.** RSS is unauthenticated public HTTP with an open wire format; the Open Connector gateway adds a moving part and buys nothing.
 
 ## Decisions
 
 1. **One source = one subscription list; a single feed is a list of length one.** RSS/Atom is a fixed protocol: every feed has the same schema, differing only by origin. Relational modeling therefore dictates one table with a discriminator column, not N same-shaped tables. Per-feed tables would fragment the primary query ("search all my subscriptions") into `UNION ALL`, force table-name aliasing for unstable/unicode feed titles, and turn every subscription edit into registration churn.
-2. **Two fixed tables registered as a catalog: `<name>.main.feeds` and `<name>.main.items`.** Naming mirrors the sqlite catalog convention (`sources/providers/sqlite/mod.rs`) so pipeline SQL is congruent whether it reads the native source or the probe's SQLite layout. Schemas are protocol-pinned (see Components); nothing is discovered at runtime.
+2. **Two fixed tables registered as a catalog: `<name>.main.feeds` and `<name>.main.items`.** Naming mirrors the sqlite catalog convention (`sources/providers/sqlite/mod.rs`) so pipeline SQL is congruent with other catalog-mode sources. Schemas are protocol-pinned (see Components); nothing is discovered at runtime.
 3. **Item identity is `(feed, guid)`, with `guid` falling back to `link`.** Declared as primary-key metadata (precedent: source-pack `primary_key` in the Open Connector design). In-place updates to an entry (same `guid`, new `updated`) simply reflect in the live window; versioning is an archive concern.
 4. **The provider serves a live window only; history composes via pipelines.** Archiving is the proven anti-join `INSERT … SELECT … WHERE key NOT IN (…)` pattern (`docs/sqlite/pipelines/federated_join_and_insert.yaml`, `demo/rag/cli/pipelines/ingest_chunked.yaml`) from `items` into any writable source. Embedding history in the provider would make it stateful and duplicate what pipelines already do; the Open Connector design reached the same conclusion ("scheduled snapshot materialization" deferred to future extensions).
 5. **Scan-time fetch through a per-feed TTL cache with conditional requests.** Three freshness tiers: within TTL → serve cache, zero network; TTL expired + HTTP 304 → header-only revalidation, cache re-armed; HTTP 200 → full parse. Cache entries are per feed, not per scan (partial hits: only expired feeds refetch). The Open Connector completeness invariant is adopted at feed granularity: **only a complete, successfully parsed feed window is ever cached** — a half-parsed feed is never served. `ttl_seconds: 0` means always-live.
@@ -80,7 +79,7 @@ Rejected (carried over). RSS is unauthenticated public HTTP; a gateway owns OAut
 
 ### Demo-gated phasing (the previous draft's plan)
 
-Repositioned rather than rejected. The earlier draft built a demo first and made the native source conditional on observed friction. The open questions that phasing was meant to answer — fetch/TTL semantics, history stance, error semantics, subscription management — are now answered by this design, largely by adopting the approved Open Connector design language. The one question that genuinely benefits from live evidence, parser tolerance, maps onto a *growing fixture corpus* rather than a go/no-go gate. The probe survives as a supplement: optional, evidence-producing, non-blocking.
+Repositioned rather than rejected. The earlier draft built a demo first and made the native source conditional on observed friction. The open questions that phasing was meant to answer — fetch/TTL semantics, history stance, error semantics, subscription management — are now answered by this design, largely by adopting the approved Open Connector design language. The one question that genuinely benefits from live evidence, parser tolerance, maps onto a *growing fixture corpus* rather than a go/no-go gate.
 
 ### History/archive inside the provider
 
@@ -223,9 +222,9 @@ The cache is per-feed, in-memory, bounded (bytes + entries, LRU), behind a small
 
 1. **Sanitation pre-pass, on failure only.** A strict parse is attempted first. On failure, a bounded, deterministic sanitation pass runs — encoding sniff (BOM / XML declaration / `encoding_rs`), re-encode to UTF-8, strip control characters, repair naked ampersands — and the parse is retried once. Both attempts and the applied repairs are traced *and* recorded in `feeds.conformance_notes`.
 2. **Conformance check, after every successful parse** (Decision 16). Detect the declared dialect from the document itself (root element + version attribute; Content-Type as corroboration), compare with what `feed-rs` parsed, and verify the dialect's spec-required fields are present. Deviations populate `feeds.dialect_declared` / `feeds.dialect` / `feeds.conformance_notes`; they never reject a feed that parsed.
-3. **Fixture corpus as a regression ratchet.** `providers/rss/fixtures/` holds real-world feed documents: curated wild feeds across dialects plus every failure case harvested from the probe supplement's pain log. Contract tests assert that every fixture either parses or degrades per-feed with a recorded reason — never a panic, never a silent skip. The corpus only grows.
+3. **Fixture corpus as a regression ratchet.** `providers/rss/fixtures/` holds real-world feed documents: curated wild feeds across dialects plus every failure case encountered during development and in the field. Contract tests assert that every fixture either parses or degrades per-feed with a recorded reason — never a panic, never a silent skip. The corpus only grows.
 4. **Documented tolerance floor.** Feeds that still fail are visible via `feeds.last_status = 'error'` with `last_error` naming the parse stage. `docs/rss.md` states plainly what Skardi does not salvage.
-5. **Evidence loop with the probe.** The supplement's `feedparser` baseline quantifies the residual gap on live feeds. Material gaps extend the sanitation pass; the parser choice itself is revisited only if the gap proves structural rather than case-by-case.
+5. **Evidence loop.** Live-feed failures reported by users or observed in testing extend the sanitation pass and the fixture corpus; the parser choice itself is revisited only if the tolerance gap versus Python's `feedparser` proves structural rather than case-by-case.
 
 ### Execution and pushdown
 
@@ -298,7 +297,7 @@ Notes carried from proven pipelines: the `AS t` wrapper works around DataFusion'
 ## Testing Strategy
 
 - **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation pass determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback.
-- **Fixture corpus contract tests:** every fixture parses or degrades visibly; assertions on row values per dialect (RSS 0.9x/1.0/2.0, Atom 0.3/1.0, JSON Feed) following the Field Mapping table; dialect detection and `conformance_notes` asserted per fixture (including deliberate liars: Atom served as `rss+xml`, RSS 2.0 missing required channel fields); corpus seeded from the probe's pain log.
+- **Fixture corpus contract tests:** every fixture parses or degrades visibly; assertions on row values per dialect (RSS 0.9x/1.0/2.0, Atom 0.3/1.0, JSON Feed) following the Field Mapping table; dialect detection and `conformance_notes` asserted per fixture (including deliberate liars: Atom served as `rss+xml`, RSS 2.0 missing required channel fields).
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning (`WHERE feed = 'x'` → exactly one request), dead-feed isolation, response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration.
 - **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT) with rerun-idempotency; `rss_scan` parity with the registered-table schema.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI (Open Connector convention).
@@ -324,8 +323,6 @@ Three milestones, independently reviewable (each gets its own implementation pla
 1. **M1 — provider core.** Enum variant, dispatch, typed config, fetch/cache/sanitize/parse, both tables, partition-per-feed execution, pushdown, fixture corpus + mock-HTTP suite. Acceptance 1–4, 6, 8, 10.
 2. **M2 — surfaces.** `rss_scan` UDTF, `html_to_markdown()` UDF, `docs/rss.md`, README supported-sources row. Acceptance 5, 7.
 3. **M3 — skill.** `auto_news_base` in skardi-skills, rendering + self-verification, end-to-end validation. Acceptance 9.
-
-The fetcher probe (supplement) may run at any point — before or alongside M1 — to enrich the fixture corpus and record UX evidence. It gates nothing.
 
 ## Expected Repository Shape
 
