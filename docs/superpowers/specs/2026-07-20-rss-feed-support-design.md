@@ -12,7 +12,7 @@ One configured source binds a subscription list and exposes two fixed tables: `f
 
 The provider is deliberately a pure protocol adapter. History retention, chunking, embedding, and hybrid retrieval are not provider features: they compose from existing primitives — anti-join `INSERT` pipelines, `chunk()`, `candle()`, `sqlite_knn`/`sqlite_fts` — plus one new scalar UDF, `html_to_markdown()`. The `auto_news_base` skill renders and self-verifies that composition end to end.
 
-This spec supersedes the demo-first phasing of the earlier draft: the native source is not gated on a prior demo, and parser tolerance is handled by a growing fixture corpus rather than a go/no-go probe.
+The design's one open risk — parser tolerance against two decades of malformed wild-web feeds — is managed by a sanitation pre-pass and a growing fixture corpus rather than a one-shot go/no-go probe (see Parsing and Compatibility Strategy).
 
 ## Motivation
 
@@ -71,15 +71,15 @@ Rejected. Discovery-style catalogs (sqlite) exist because table structure is unk
 
 ### A generic `type: xml` source
 
-Rejected (carried over from the earlier draft). XML is syntax, not a data contract: a generic XML source cannot declare a fixed schema without a user-authored XPath mapping layer, which is a different and much larger product. RSS/Atom is a protocol with known fields — exactly what a `TableProvider`'s fixed `SchemaRef` wants.
+Rejected. XML is syntax, not a data contract: a generic XML source cannot declare a fixed schema without a user-authored XPath mapping layer, which is a different and much larger product. RSS/Atom is a protocol with known fields — exactly what a `TableProvider`'s fixed `SchemaRef` wants.
 
 ### Riding the Open Connector gateway
 
-Rejected (carried over). RSS is unauthenticated public HTTP; a gateway owns OAuth and credentials that RSS does not have. The two designs share the same relational-contract language — typed config, live-by-default + TTL, completeness invariant, dual interface, bounded execution — without sharing infrastructure.
+Rejected. RSS is unauthenticated public HTTP; a gateway owns OAuth and credentials that RSS does not have. The two designs share the same relational-contract language — typed config, live-by-default + TTL, completeness invariant, dual interface, bounded execution — without sharing infrastructure.
 
-### Demo-gated phasing (the previous draft's plan)
+### Demo-gated phasing
 
-Repositioned rather than rejected. The earlier draft built a demo first and made the native source conditional on observed friction. The open questions that phasing was meant to answer — fetch/TTL semantics, history stance, error semantics, subscription management — are now answered by this design, largely by adopting the approved Open Connector design language. The one question that genuinely benefits from live evidence, parser tolerance, maps onto a *growing fixture corpus* rather than a go/no-go gate.
+Rejected. Building a throwaway demo first and gating the native source on observed friction would delay the useful artifact without buying information: the open questions such phasing would answer — fetch/TTL semantics, history stance, error semantics, subscription management — are already answered by this design, largely by adopting the approved Open Connector design language. The one question that genuinely benefits from live evidence, parser tolerance, maps onto a *growing fixture corpus* rather than a go/no-go gate.
 
 ### History/archive inside the provider
 
