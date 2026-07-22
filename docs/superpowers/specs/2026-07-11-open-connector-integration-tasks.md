@@ -98,8 +98,12 @@ do not reintroduce it here.
       action/row_path/pagination/columns rejected by `deny_unknown_fields` (tests pin it);
       default-deny allowlist unchanged
 - [x] 4.4 Observability: scan completion/failure tracing events (gateway, binding, table,
-      action, cache hit, pages, rows, duration) without tokens, inputs, or bodies; client
-      retry warns already carried operation + status
+      action, cache hit, pages, rows, duration); completion events carry identity and
+      counters only, failure events add the error — whose message may quote a bounded
+      (≤512-char) snippet of the gateway's *error* response and a pagination cursor for
+      diagnosability, per the design's "no tokens / credentials / authorization headers /
+      full sensitive inputs" wording — never tokens, successful-response bodies, or row
+      data; client retry warns already carried operation + status
 - [x] 4.5 Docs: `docs/open-connector.md` (config reference, three SQL interfaces, security
       model, caching, bounds, observability), ctx/UDTF examples inside it, README
       supported-sources entry (first time the source is actually queryable)

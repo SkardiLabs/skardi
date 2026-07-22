@@ -248,6 +248,12 @@ table's schema either.
 
 Every scan completion emits a structured tracing event with the gateway,
 binding, table, action, cache hit/miss, pages fetched, rows returned, and
-duration; scan failures emit the same identity plus the error. The client
-logs each retry with the operation and status. Tokens, headers, request
-inputs, and response bodies are never logged.
+duration — identifying fields and counters only. Scan failures emit the
+same identity plus the error; for failure diagnosability the error message
+may quote a bounded (at most 512-character) snippet of the gateway's
+*error* response — which can echo request identifiers such as an owner or
+repo name — and, on pagination-loop detection, the offending cursor. The
+client logs each retry with the operation and status. Tokens,
+authorization headers, provider credentials, successful-response bodies,
+and row data are never logged; conversion and row-path failures report
+JSON *kinds*, never values.

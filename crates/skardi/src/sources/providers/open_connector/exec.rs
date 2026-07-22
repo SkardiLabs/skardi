@@ -222,8 +222,13 @@ impl ExecutionPlan for OpenConnectorExec {
                 Ok(None) => Ok(None),
                 Err(e) => {
                     // The scan-failure counterpart of the completion event in
-                    // `next_page` — same identifying fields, never tokens or
-                    // response bodies (errors carry JSON *kinds* only).
+                    // `next_page` — same identifying fields plus the error.
+                    // The error display may quote a bounded (≤512-char)
+                    // snippet of the gateway's *error* response and a
+                    // pagination cursor; it never carries tokens,
+                    // authorization headers, successful-response bodies, or
+                    // row data (conversion and row-path failures report JSON
+                    // *kinds* only).
                     tracing::warn!(
                         gateway = %state.gateway,
                         binding = state.binding.as_deref().unwrap_or("<udtf>"),
