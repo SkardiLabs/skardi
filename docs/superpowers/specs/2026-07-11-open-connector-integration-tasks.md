@@ -104,13 +104,15 @@ do not reintroduce it here.
       model, caching, bounds, observability), ctx/UDTF examples inside it, README
       supported-sources entry (first time the source is actually queryable)
 
-**Verification**: 147 open_connector tests. `open_connector_query` asserted to return the
+**Verification**: 150 open_connector tests. `open_connector_query` asserted to return the
 same schema and values as `saas.ws.items`, replay from the table's cache entry with zero
 new gateway requests, and push the same `min_value` filter and connection alias;
 `open_connector_scan` asserted to execute exactly one POST, expose derived typed/JSON
 columns, and reject unallowlisted, mutating, unclassified, and schema-indeterminate
 actions before any HTTP execute; federated join of the mock pack (via the UDTF) against a
-local CSV.
+local CSV. Scan-completion events are emitted with the final batch (LIMIT-satisfied,
+short-final-page exhaustion, and cache-replay scans included), since a satisfied
+downstream LIMIT drops the stream without another poll.
 
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 

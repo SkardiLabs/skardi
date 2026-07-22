@@ -395,6 +395,12 @@ impl ScanState {
     async fn next_page(&mut self) -> Result<Option<RecordBatch>, OpenConnectorError> {
         if let Some(batch) = self.replay.pop_front() {
             self.rows_returned += batch.num_rows() as u64;
+            // The last replayed batch may satisfy a downstream LIMIT, which
+            // drops this stream without ever polling again — log with the
+            // final batch, not on a poll that may never come.
+            if self.replay.is_empty() {
+                self.log_completion();
+            }
             return Ok(Some(batch));
         }
         if self.done || self.limit_remaining == Some(0) {
@@ -508,6 +514,15 @@ impl ScanState {
             return Ok(None);
         }
         self.rows_returned += batch.num_rows() as u64;
+        // A completing scan must log with its final batch: a satisfied
+        // downstream LIMIT drops this stream immediately (DataFusion's
+        // LimitStream clears its input), so the `self.done` early return
+        // above may never run — the same reason the LIMIT-satisfied cache
+        // store is eager. Logged after the row count so the event carries
+        // the full total.
+        if self.done {
+            self.log_completion();
+        }
         Ok(Some(batch))
     }
 }
@@ -516,19 +531,23 @@ impl ScanState {
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
+    use crate::sources::providers::open_connector::testutil::{
+        MockGateway, MockResponse, RecordedRequest,
+    };
     use serde_json::json;
 
-    fn exec_with_version(source_pack_version: u32) -> OpenConnectorExec {
+    fn build_exec(
+        client: Arc<OpenConnectorClient>,
+        cache: Option<Arc<ScanCache>>,
+        limit: Option<usize>,
+        source_pack_version: u32,
+    ) -> OpenConnectorExec {
         let table = &MOCK_PACK.tables[0];
-        let client = Arc::new(
-            OpenConnectorClient::new("http://127.0.0.1:1", "t", Duration::from_secs(1))
-                .expect("build client"),
-        );
         OpenConnectorExec::new(
             client,
-            None,
+            cache,
             "saas".to_string(),
-            None,
+            Some("ws".to_string()),
             None,
             ScanTarget::from_pack_table(table, source_pack_version),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
@@ -536,12 +555,128 @@ mod tests {
             json!({}),
             vec![],
             None,
-            None,
+            limit,
             10,
             1000,
             Duration::from_secs(30),
         )
         .expect("build exec")
+    }
+
+    fn exec_with_version(source_pack_version: u32) -> OpenConnectorExec {
+        let client = Arc::new(
+            OpenConnectorClient::new("http://127.0.0.1:1", "t", Duration::from_secs(1))
+                .expect("build client"),
+        );
+        build_exec(client, None, None, source_pack_version)
+    }
+
+    /// Execute-only mock gateway for `mock.list_items` (per_page = 2), the
+    /// only call `ScanState` makes (discovery/health happen at registration).
+    fn items_handler(req: &RecordedRequest, total: usize) -> MockResponse {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            let page = body
+                .get("input")
+                .and_then(|input| input.get("page"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as usize;
+            let items: Vec<_> = (1..=total)
+                .map(|id| json!({"id": id, "name": format!("item-{id}")}))
+                .skip((page - 1) * 2)
+                .take(2)
+                .collect();
+            return MockResponse::ok(&json!({"output": {"items": items}}).to_string());
+        }
+        MockResponse::new(404, "{}")
+    }
+
+    async fn online_client(gateway: &MockGateway) -> Arc<OpenConnectorClient> {
+        Arc::new(
+            OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5))
+                .expect("build client"),
+        )
+    }
+
+    #[tokio::test]
+    async fn limit_satisfied_scan_logs_completion_with_the_final_batch() {
+        // A satisfied downstream LIMIT drops the stream without another poll
+        // (DataFusion's LimitStream clears its input), so the completion
+        // event must be emitted together with the final batch — the
+        // early-return branch at the top of next_page is never reached.
+        let gateway = MockGateway::start(|req| items_handler(req, 5)).await;
+        let exec = build_exec(online_client(&gateway).await, None, Some(1), 1);
+
+        let mut state = ScanState::new(&exec).expect("state");
+        let batch = state.next_page().await.expect("page").expect("batch");
+        assert_eq!(batch.num_rows(), 1);
+        assert!(
+            state.completion_logged,
+            "LIMIT-satisfied scan must log completion on its final batch, \
+             not on a poll that never comes"
+        );
+        assert_eq!(
+            state.rows_returned, 1,
+            "the event must count the final batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_scan_logs_completion_with_a_nonempty_final_page() {
+        // 3 items at per_page = 2: page 2 is short (1 row), so the scan
+        // completes while still returning a batch — the event must not
+        // depend on the consumer polling once more for the None.
+        let gateway = MockGateway::start(|req| items_handler(req, 3)).await;
+        let exec = build_exec(online_client(&gateway).await, None, None, 1);
+
+        let mut state = ScanState::new(&exec).expect("state");
+        state.next_page().await.expect("page 1").expect("full page");
+        assert!(
+            !state.completion_logged,
+            "scan is still running after page 1"
+        );
+        state
+            .next_page()
+            .await
+            .expect("page 2")
+            .expect("short page");
+        assert!(
+            state.completion_logged,
+            "exhaustion must log with the final batch"
+        );
+        assert_eq!(state.rows_returned, 3);
+    }
+
+    #[tokio::test]
+    async fn cached_replay_logs_completion_with_the_last_replayed_batch() {
+        let gateway = MockGateway::start(|req| items_handler(req, 3)).await;
+        let cache = Arc::new(ScanCache::new(Duration::from_secs(60), usize::MAX));
+        let exec = build_exec(online_client(&gateway).await, Some(cache), None, 1);
+
+        // Live scan to completion populates the cache.
+        let mut state = ScanState::new(&exec).expect("live state");
+        while state.next_page().await.expect("live page").is_some() {}
+
+        // The replayed scan must log once its queue drains — a satisfied
+        // downstream LIMIT would never poll again, exactly as in the live
+        // case (LIMIT queries are cached; LIMIT is part of the key).
+        let mut state = ScanState::new(&exec).expect("replay state");
+        assert!(state.cache_hit, "second identical scan replays from cache");
+        let batches = state.replay.len();
+        assert!(batches > 0);
+        for index in 1..=batches {
+            state
+                .next_page()
+                .await
+                .expect("replayed page")
+                .expect("batch");
+            assert_eq!(
+                state.completion_logged,
+                index == batches,
+                "completion logs exactly when the replay queue drains"
+            );
+        }
+        assert_eq!(state.rows_returned, 3);
     }
 
     #[test]
