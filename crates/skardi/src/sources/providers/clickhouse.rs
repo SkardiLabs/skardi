@@ -68,6 +68,9 @@ const CATALOG_MODE_OPTIONS: &[&str] = &[OPT_ALLOWED_SCHEMAS, OPT_USER_ENV, OPT_P
 /// * `connection_string` - ClickHouse HTTP endpoint, e.g. `http://localhost:8123`.
 ///   Credentials must NOT be embedded in the URL; use `user_env` / `pass_env`.
 /// * `options` - Optional configuration (see below)
+/// * `read_write` - Must be `false`; ClickHouse sources are read-only, and
+///   `access_mode: read_write` is rejected here so the CLI and public API
+///   enforce the same contract as server config validation
 /// * `hierarchy_level` - [`HierarchyLevel::Table`] (default) or [`HierarchyLevel::Catalog`]
 ///
 /// # Options
@@ -96,6 +99,7 @@ const CATALOG_MODE_OPTIONS: &[&str] = &[OPT_ALLOWED_SCHEMAS, OPT_USER_ENV, OPT_P
 ///     "events",
 ///     "http://localhost:8123",
 ///     Some(&options),
+///     false,
 ///     HierarchyLevel::Table,
 /// )
 /// .await?;
@@ -107,8 +111,18 @@ pub async fn register_clickhouse_tables(
     name: &str,
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
+    read_write: bool,
     hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
+    // Enforced at the provider boundary — not just server config validation —
+    // so the CLI and public API reject `access_mode: read_write` identically
+    // instead of silently accepting a mode this provider cannot honor.
+    if read_write {
+        return Err(anyhow!(
+            "ClickHouse data source '{name}' does not support access_mode: read_write; \
+             ClickHouse sources are read-only"
+        ));
+    }
     validate_clickhouse_options(name, options, hierarchy_level)?;
     match hierarchy_level {
         HierarchyLevel::Catalog => {
@@ -663,6 +677,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_rejects_read_write_access_mode_before_connecting() {
+        // The provider is the single enforcement point for the read-only
+        // invariant — the CLI must reject read_write exactly like the
+        // server's UnsupportedWriteMode, not silently accept it.
+        let mut ctx = SessionContext::new();
+        let options = opts(&[("table", "events")]);
+        let err = register_clickhouse_tables(
+            &mut ctx,
+            "events",
+            "http://127.0.0.1:1",
+            Some(&options),
+            true,
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "got {err}");
+    }
+
+    #[tokio::test]
     async fn register_without_table_option_errors_before_connecting() {
         // The option-validation error must fire before any network call, so
         // this is safe to run offline (the endpoint is deliberately unroutable).
@@ -672,6 +706,7 @@ mod tests {
             "events",
             "http://127.0.0.1:1",
             None,
+            false,
             HierarchyLevel::Table,
         )
         .await
@@ -693,6 +728,7 @@ mod tests {
             "events",
             "http://127.0.0.1:1",
             Some(&options),
+            false,
             HierarchyLevel::Table,
         )
         .await
@@ -714,6 +750,7 @@ mod tests {
             "events",
             "http://127.0.0.1:1",
             Some(&options),
+            false,
             HierarchyLevel::Table,
         )
         .await
@@ -737,6 +774,7 @@ mod tests {
                 "ch",
                 "http://127.0.0.1:1",
                 Some(&options),
+                false,
                 HierarchyLevel::Catalog,
             )
             .await
@@ -760,6 +798,7 @@ mod tests {
             "ch",
             "http://127.0.0.1:1",
             Some(&options),
+            false,
             HierarchyLevel::Catalog,
         )
         .await
@@ -776,6 +815,7 @@ mod tests {
             "events",
             "clickhouse://127.0.0.1:9000",
             Some(&options),
+            false,
             HierarchyLevel::Table,
         )
         .await
@@ -822,6 +862,7 @@ mod tests {
             name,
             &clickhouse_url(),
             Some(&options),
+            false,
             HierarchyLevel::Table,
         )
         .await
@@ -996,6 +1037,7 @@ mod tests {
             "ch",
             &clickhouse_url(),
             Some(&options),
+            false,
             HierarchyLevel::Catalog,
         )
         .await

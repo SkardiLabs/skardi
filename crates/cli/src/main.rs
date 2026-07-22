@@ -973,6 +973,7 @@ async fn register_source(
                 &source.name,
                 conn_str,
                 source.options.as_ref(),
+                source.is_read_write(),
                 source.hierarchy_level,
             )
             .await
@@ -2902,6 +2903,54 @@ spec:
                 "unexpected error: {msg}"
             );
             assert!(msg.contains("requires options"), "unexpected error: {msg}");
+        }
+    }
+
+    // Guards for the `clickhouse` arm of `register_source`. All failure modes
+    // trip before any network call, so no live endpoint is needed.
+    mod register_clickhouse_source {
+        use super::*;
+
+        fn clickhouse_source(connection_string: Option<&str>) -> LocalDataSource {
+            LocalDataSource {
+                name: "events".to_string(),
+                source_type: "clickhouse".to_string(),
+                path: None,
+                connection_string: connection_string.map(String::from),
+                options: Some(HashMap::from([("table".to_string(), "events".to_string())])),
+                hierarchy_level: HierarchyLevel::default(),
+                access_mode: None,
+                description: None,
+                open_connector: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn errors_without_connection_string() {
+            let (mut session_ctx, registry) = new_session_context();
+            let err = register_source(&mut session_ctx, &clickhouse_source(None), &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("connection_string required"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_with_read_write_access_mode() {
+            // The provider is the single enforcement point for the read-only
+            // invariant — the CLI must reject read_write exactly like the
+            // server's UnsupportedWriteMode.
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source = clickhouse_source(Some("http://127.0.0.1:1"));
+            source.access_mode = Some("read_write".to_string());
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("read-only"), "unexpected error: {msg}");
         }
     }
 

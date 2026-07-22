@@ -381,7 +381,8 @@ out of the YAML, the logs, and the API.
 ## Access Mode
 
 This source is **read-only**. Declaring `access_mode: read_write` on a
-ClickHouse source fails config validation, and ClickHouse sources are rejected
-as job destinations. Ingest into ClickHouse should go through ClickHouse's own
+ClickHouse source is rejected at the provider boundary — the server config
+path and the CLI enforce the same contract — and ClickHouse sources are
+rejected as job destinations. Ingest into ClickHouse should go through ClickHouse's own
 INSERT pipelines (Kafka engine, `clickhouse-client`, HTTP inserts) — Skardi is
 the query side.
