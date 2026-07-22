@@ -204,6 +204,128 @@ pub enum OpenConnectorError {
     )]
     NonIdempotentAmbiguousFailure { operation: String, reason: String },
 
+    /// Pagination failed to advance: the gateway returned an already-seen
+    /// cursor, which would loop the scan forever.
+    #[error(
+        "Open Connector pagination loop detected: cursor '{token}' was already seen \
+         (the gateway is not advancing pagination)"
+    )]
+    PaginationLoop { token: String },
+
+    /// A binding named a source pack that is not built in.
+    #[error(
+        "Open Connector binding references unknown source pack '{name}' \
+         (built-in packs are versioned with Skardi)"
+    )]
+    SourcePackNotFound { name: String },
+
+    /// A binding exposed a table the source pack does not define.
+    #[error("Open Connector source pack '{pack}' has no table '{table}'")]
+    SourcePackTableNotFound { pack: String, table: String },
+
+    /// A binding pinned a source-pack version that is not the built-in one.
+    #[error(
+        "Open Connector source pack '{pack}' pinned to version {pinned}, \
+         but this Skardi build ships version {actual}"
+    )]
+    SourcePackVersionMismatch {
+        pack: String,
+        pinned: u32,
+        actual: u32,
+    },
+
+    /// A binding omitted a resource input the source-pack table requires.
+    #[error(
+        "Open Connector binding '{binding}' is missing required resource input '{key}' \
+         for the bound source-pack table"
+    )]
+    MissingResourceInput { binding: String, key: String },
+
+    /// The discovered action contract does not match the source pack's
+    /// expected fingerprint — the upstream action changed incompatibly.
+    #[error("Open Connector source-pack table '{table}' failed its compatibility check: {reason}")]
+    ActionContractMismatch { table: String, reason: String },
+
+    /// Assembling the DataFusion catalog/schema failed (e.g. a duplicate
+    /// registration). An internal consistency error, unrelated to the action
+    /// contract.
+    #[error("Open Connector catalog registration failed for '{name}': {reason}")]
+    CatalogRegistrationFailed { name: String, reason: String },
+
+    /// A scan hit a safety bound before the collection was exhausted, so the
+    /// result would be incomplete — fail rather than return partial rows.
+    #[error(
+        "Open Connector scan of '{table}' exceeded {bound} (limit {limit}); \
+         the result would be incomplete"
+    )]
+    ScanBoundsExceeded {
+        table: String,
+        bound: &'static str,
+        limit: u64,
+    },
+
+    /// A scan exceeded its total time budget.
+    #[error("Open Connector scan of '{table}' timed out after {seconds}s")]
+    ScanTimeout { table: String, seconds: u64 },
+
+    /// A row path was malformed (must be `$.key[.key…]` object-key segments).
+    #[error("Open Connector row path '{path}' is invalid: {reason}")]
+    InvalidRowPath { path: String, reason: String },
+
+    /// A row path segment was absent from its parent object while extracting
+    /// rows from a page. Absence is a *missing* key (nullable columns become
+    /// null) — not a structural change.
+    #[error(
+        "Open Connector row path '{path}' failed at segment '{segment}' on page {page}: \
+         the key is missing from an object"
+    )]
+    RowPathNotFound {
+        path: String,
+        segment: String,
+        page: usize,
+    },
+
+    /// A row path had to traverse into a value that is not an object — a
+    /// structural mismatch (e.g. `user` changed from object to string
+    /// upstream), which must fail even for nullable columns.
+    #[error(
+        "Open Connector row path '{path}' cannot descend into segment '{segment}' on page {page}: \
+         expected an object, found {found}"
+    )]
+    RowPathNotObject {
+        path: String,
+        segment: String,
+        page: usize,
+        found: String,
+    },
+
+    /// The row path resolved to a non-array value; relational rows must be an
+    /// array of objects.
+    #[error(
+        "Open Connector row path '{path}' on page {page} resolved to {found}, expected an array of row objects"
+    )]
+    RowPathNotArray {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
+    /// A row could not be converted to the table's fixed Arrow schema. The
+    /// `found` carries the JSON *kind* only — never the value itself, which
+    /// may contain sensitive data.
+    #[error(
+        "Open Connector conversion failed for column '{column}' (path '{path}') \
+         at page {page}, row {row}: expected {expected}, found {found}"
+    )]
+    ConversionFailed {
+        path: String,
+        column: String,
+        page: usize,
+        row: usize,
+        expected: String,
+        found: String,
+    },
+
     /// A response body grew past the configured decoding bound.
     #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]
     ResponseTooLarge {
@@ -214,13 +336,4 @@ pub enum OpenConnectorError {
     /// A response was not the JSON shape the client contract expects.
     #[error("Open Connector {operation} returned an invalid response: {reason}")]
     InvalidGatewayResponse { operation: String, reason: String },
-
-    /// The gateway is reachable and its action metadata loaded, but table
-    /// registration (source packs, scan engine) has not landed yet.
-    #[error(
-        "Open Connector source '{name}': gateway contact and action discovery succeeded, \
-         but table registration is not implemented yet — source packs and the scan \
-         engine arrive in the next milestone"
-    )]
-    ExecutionNotImplemented { name: String },
 }
