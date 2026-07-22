@@ -739,21 +739,21 @@ bindings:
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 3)).await;
 
         unsafe {
-            std::env::set_var(TOKEN_ENV_CATALOG_CACHE, "test-token");
+            std::env::set_var(TOKEN_ENV_CATALOG_SELFJOIN, "test-token");
         }
         let mut ctx = SessionContext::new();
         register_open_connector_tables(
             &mut ctx,
             "saas",
             &gateway.url,
-            Some(&mock_config(TOKEN_ENV_CATALOG_CACHE, 60)),
+            Some(&mock_config(TOKEN_ENV_CATALOG_SELFJOIN, 60)),
             false,
             HierarchyLevel::Catalog,
         )
         .await
         .expect("catalog registration succeeds");
         unsafe {
-            std::env::remove_var(TOKEN_ENV_CATALOG_CACHE);
+            std::env::remove_var(TOKEN_ENV_CATALOG_SELFJOIN);
         }
 
         let df = ctx
@@ -790,6 +790,9 @@ bindings:
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_CACHE";
+
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_SELFJOIN: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_SELFJOIN";
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_EMPTY_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_EMPTY_CACHE";
