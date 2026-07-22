@@ -174,6 +174,50 @@ mod tests {
     }
 
     #[test]
+    fn range_composes_two_mappings_on_one_column() {
+        // The scenario behind one-operator-per-mapping: Gt → min_value and
+        // Lt → max_value on the SAME column must both resolve — resolution
+        // is by (column, operator), so the second mapping is reachable.
+        const RANGE: &[FilterMapping] = &[
+            FilterMapping {
+                column: "value",
+                operator: Operator::Gt,
+                input_field: "min_value",
+            },
+            FilterMapping {
+                column: "value",
+                operator: Operator::Lt,
+                input_field: "max_value",
+            },
+        ];
+        let gt = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("value")),
+            Operator::Gt,
+            Box::new(lit(1)),
+        ));
+        let lt = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("value")),
+            Operator::Lt,
+            Box::new(lit(5)),
+        ));
+        let translated = translate_filters(&[gt, lt], RANGE);
+        assert_eq!(
+            translated.inputs,
+            vec![
+                ("min_value".to_string(), Value::from(1)),
+                ("max_value".to_string(), Value::from(5)),
+            ]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact
+            ]
+        );
+    }
+
+    #[test]
     fn unmapped_column_is_unsupported() {
         let translated = translate_filters(&[gt("score", 10)], MAPPINGS);
         assert!(translated.inputs.is_empty());
