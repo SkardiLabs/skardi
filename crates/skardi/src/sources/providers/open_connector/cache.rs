@@ -26,7 +26,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use serde_json::{Value, json};
 
-use crate::util::hash::blake3_hex;
+use crate::util::json::blake3_hex;
 use crate::util::json::canonical_json;
 
 /// Default entry cap when the byte budget alone would allow unbounded growth.

@@ -1,7 +1,6 @@
 //! Canonical JSON helpers shared by fingerprinting and cache keys.
 
 use serde_json::Value;
-
 /// Serialize a JSON value in canonical form: object keys sorted recursively,
 /// arrays kept in order, strings via `serde_json` escaping. Two semantically
 /// equal values always produce the same string, which is what compatibility
@@ -57,4 +56,23 @@ pub fn write_canonical(value: &Value, out: &mut String) {
             out.push('}');
         }
     }
+}
+
+/// BLAKE3 digest of `bytes`, hex-encoded (64 chars).
+///
+/// Compatibility fingerprints reject changed upstream action contracts, so
+/// they require collision resistance rather than a small non-cryptographic
+/// checksum. BLAKE3 is already used for stable document IDs in this crate.
+/// Pairs with [`canonical_json`]: canonicalize the structured value, then
+/// digest the canonical form for a stable fingerprint or cache key.
+///
+/// # Example
+/// ```
+/// use skardi::util::json::blake3_hex;
+///
+/// assert_eq!(blake3_hex(b"abc"), blake3_hex(b"abc"));
+/// assert_ne!(blake3_hex(b"abc"), blake3_hex(b"abd"));
+/// ```
+pub fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }

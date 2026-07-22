@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::client::{DiscoveredAction, OpenConnectorClient};
 use super::error::OpenConnectorError;
-use crate::util::hash::blake3_hex;
+use crate::util::json::blake3_hex;
 use crate::util::json::canonical_json;
 
 /// Maximum concurrent discovery calls while loading the registry.
