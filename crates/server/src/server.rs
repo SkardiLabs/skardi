@@ -7,7 +7,7 @@ use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
 use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
-use skardi::sources::sql_validator::SqlValidatorConfig;
+use skardi::sources::sql_validator::AdhocSqlPolicy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -55,10 +55,38 @@ pub struct AppState {
     /// Jobs executor + run ledger. `None` when the server was started
     /// without `--jobs`, which disables every `/jobs/*` endpoint.
     pub jobs: Option<Arc<JobExecutor>>,
-    /// Statement policy for the ad-hoc `/query` endpoint, built once at
-    /// startup from the configured data sources (there is no runtime
-    /// config writer, so a snapshot is sufficient).
-    pub validator_config: Arc<SqlValidatorConfig>,
+    /// Statement policy for the ad-hoc `/query` endpoint. Derived from the
+    /// data sources' access modes once at startup by [`AppState::new`]; see
+    /// [`crate::config::adhoc_policy_from_sources`] for why a snapshot is
+    /// safe (no runtime writer mutates access modes).
+    pub adhoc_policy: Arc<AdhocSqlPolicy>,
+}
+
+impl AppState {
+    /// Assemble the shared state, deriving the ad-hoc `/query` policy from the
+    /// config's data sources. Centralizing construction here keeps the derived
+    /// policy from drifting across the many call sites that build an
+    /// `AppState` (handlers, tests, integration harnesses).
+    pub fn new(
+        config: ServerConfig,
+        engine: Arc<DataFusionEngine>,
+        session_ctx: Arc<SessionContext>,
+        auth_layer: AuthLayer,
+        jobs: Option<Arc<JobExecutor>>,
+    ) -> Self {
+        let adhoc_policy = Arc::new(crate::config::adhoc_policy_from_sources(
+            &config.data_sources,
+        ));
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            engine,
+            session_ctx,
+            metrics: PipelineMetrics::new(),
+            auth_layer,
+            jobs,
+            adhoc_policy,
+        }
+    }
 }
 
 /// Main server creation function - Primary public interface
@@ -221,20 +249,8 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         None
     };
 
-    let validator_config = Arc::new(crate::config::validator_config_from_sources(
-        &config.data_sources,
-    ));
-
     // Create shared application state with RwLock for runtime updates
-    let app_state = AppState {
-        config: Arc::new(RwLock::new(config)),
-        engine,
-        session_ctx: session_ctx_arc,
-        metrics: PipelineMetrics::new(),
-        auth_layer,
-        jobs: jobs_bundle,
-        validator_config,
-    };
+    let app_state = AppState::new(config, engine, session_ctx_arc, auth_layer, jobs_bundle);
 
     tracing::info!("Application state setup completed successfully");
 

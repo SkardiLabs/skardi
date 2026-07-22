@@ -68,7 +68,7 @@ pub async fn execute_query(
         None => DEFAULT_MAX_ROWS,
     };
 
-    let statement_kind = match validate_single_sql(&request.sql, &app_state.validator_config) {
+    let statement_kind = match validate_single_sql(&request.sql, &app_state.adhoc_policy) {
         Ok(kind) => kind,
         Err(e) => {
             tracing::info!("Rejected ad-hoc query: {}", e);

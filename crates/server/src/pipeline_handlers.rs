@@ -778,7 +778,6 @@ pub async fn execute_pipeline_by_name(
 mod tests {
     use super::*;
     use crate::config::{CliArgs, DataSource, DataSourceType, ServerConfig};
-    use crate::metrics::PipelineMetrics;
     use crate::server::AppState;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -789,7 +788,7 @@ mod tests {
     use skardi::sources::AccessMode;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn create_test_pipeline_with_params() -> StandardPipeline {
@@ -847,18 +846,13 @@ spec:
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
 
-        let validator_config = Arc::new(crate::config::validator_config_from_sources(
-            &config.data_sources,
-        ));
-        AppState {
-            config: Arc::new(RwLock::new(config)),
+        AppState::new(
+            config,
             engine,
             session_ctx,
-            metrics: PipelineMetrics::new(),
-            auth_layer: crate::auth::layer::AuthLayer::None,
-            jobs: None,
-            validator_config,
-        }
+            crate::auth::layer::AuthLayer::None,
+            None,
+        )
     }
 
     fn create_test_record_batch() -> RecordBatch {
@@ -941,18 +935,13 @@ spec:
         let session_ctx_arc = Arc::new(session_ctx);
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx_arc.clone()));
 
-        let validator_config = Arc::new(crate::config::validator_config_from_sources(
-            &config.data_sources,
-        ));
-        let app_state = AppState {
-            config: Arc::new(RwLock::new(config)),
+        let app_state = AppState::new(
+            config,
             engine,
-            session_ctx: session_ctx_arc,
-            metrics: PipelineMetrics::new(),
-            auth_layer: crate::auth::layer::AuthLayer::None,
-            jobs: None,
-            validator_config,
-        };
+            session_ctx_arc,
+            crate::auth::layer::AuthLayer::None,
+            None,
+        );
 
         let request = ExecuteRequest {
             parameters: {

@@ -16,14 +16,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 use skardi::sources::DataSourceType;
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::config::{CliArgs, DataSource, ServerConfig};
-use skardi_server::metrics::PipelineMetrics;
 use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
 
@@ -93,18 +92,7 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
             port: 0,
         },
     };
-    let validator_config = Arc::new(skardi_server::config::validator_config_from_sources(
-        &config.data_sources,
-    ));
-    AppState {
-        config: Arc::new(RwLock::new(config)),
-        engine,
-        session_ctx: Arc::clone(&ctx),
-        metrics: PipelineMetrics::new(),
-        auth_layer: AuthLayer::None,
-        jobs: None,
-        validator_config,
-    }
+    AppState::new(config, engine, Arc::clone(&ctx), AuthLayer::None, None)
 }
 
 async fn body_to_json(resp: axum::response::Response) -> Value {

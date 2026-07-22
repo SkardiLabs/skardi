@@ -18,7 +18,7 @@ use skardi::sources::providers::redis::datasource::register_redis_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
-use skardi::sources::sql_validator::{SqlValidatorConfig, validate_sql};
+use skardi::sources::sql_validator::{AdhocSqlPolicy, SqlValidatorConfig, validate_sql};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -947,19 +947,29 @@ fn validate_schema_types(_schema: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// Build a SQL validator config mapping every data source name to its
-/// configured access mode. Used at config load (pipeline SQL) and at
-/// request time (`POST /query`).
+/// Build the access-mode map for every data source. Shared by both the
+/// trusted pipeline-load path and the untrusted `/query` policy below.
 pub fn validator_config_from_sources(data_sources: &[DataSource]) -> SqlValidatorConfig {
-    // The `auth` schema (auth.users / auth.sessions, registered on the same
-    // SessionContext) holds live bearer tokens; ad-hoc SQL must never reach
-    // it. The denial only applies to `validate_single_sql`, so pipeline SQL
-    // may still read auth tables.
-    let mut validator_config = SqlValidatorConfig::new().with_denied_schema("auth");
+    let mut validator_config = SqlValidatorConfig::new();
     for ds in data_sources {
         validator_config = validator_config.with_table(&ds.name, ds.access_mode);
     }
     validator_config
+}
+
+/// Build the statement policy for the untrusted ad-hoc `/query` endpoint:
+/// the access-mode map plus the reserved [`AUTH_SCHEMA`] denial (auth.users /
+/// auth.sessions register on the same `SessionContext` and hold live bearer
+/// tokens, so ad-hoc SQL must never reach them). The denial is scoped to this
+/// policy, so operator-authored pipeline SQL may still read auth tables.
+///
+/// Callers snapshot this once at startup into `AppState`. That is correct only
+/// as long as nothing mutates a source's `access_mode` at runtime — there is
+/// no such writer today. If one is ever added, it must rebuild this policy (or
+/// the snapshot will serve a stale, potentially more-permissive gate).
+pub fn adhoc_policy_from_sources(data_sources: &[DataSource]) -> AdhocSqlPolicy {
+    AdhocSqlPolicy::new(validator_config_from_sources(data_sources))
+        .with_denied_schema(crate::auth::bridge::AUTH_SCHEMA)
 }
 
 /// Validate pipeline SQL against data source access modes

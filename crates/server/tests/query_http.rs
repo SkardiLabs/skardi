@@ -12,15 +12,12 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use skardi::engine::datafusion::DataFusionEngine;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tower::ServiceExt;
 
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::auth::mode::AuthMode;
-use skardi_server::config::{
-    AccessMode, CliArgs, DataSource, DataSourceType, ServerConfig, validator_config_from_sources,
-};
-use skardi_server::metrics::PipelineMetrics;
+use skardi_server::config::{AccessMode, CliArgs, DataSource, DataSourceType, ServerConfig};
 use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
 
@@ -60,6 +57,7 @@ fn data_source(name: &str, access_mode: AccessMode) -> DataSource {
         access_mode,
         enable_cache: false,
         description: None,
+        open_connector: None,
     }
 }
 
@@ -86,16 +84,7 @@ fn make_state() -> AppState {
             port: 0,
         },
     };
-    let validator_config = Arc::new(validator_config_from_sources(&config.data_sources));
-    AppState {
-        config: Arc::new(RwLock::new(config)),
-        engine,
-        session_ctx: ctx,
-        metrics: PipelineMetrics::new(),
-        auth_layer: AuthLayer::None,
-        jobs: None,
-        validator_config,
-    }
+    AppState::new(config, engine, ctx, AuthLayer::None, None)
 }
 
 async fn post_query(state: AppState, body: Value) -> axum::response::Response {

@@ -1,8 +1,14 @@
-use sqlparser::ast::{
-    FromTable, ObjectName, ObjectNamePart, Statement, TableObject, visit_relations,
+// Parse with DataFusion's own re-exported sqlparser so the validator and the
+// engine can never disagree about a statement's shape: they are, by
+// construction, the same parser at the same version. A DataFusion bump that
+// moves sqlparser surfaces here as a compile error, not a silent
+// parse-divergence.
+use datafusion::sql::sqlparser::ast::{
+    FromTable, ObjectName, ObjectNamePart, Statement, TableFactor, TableObject, TableWithJoins,
+    visit_relations,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use thiserror::Error;
@@ -10,13 +16,12 @@ use thiserror::Error;
 // Re-export AccessMode for convenience
 pub use crate::sources::access_mode::AccessMode;
 
+/// Per-table access modes. Shared by both validation entry points; carries
+/// no trust-boundary state of its own, so it cannot silently grant or deny
+/// depending on which validator receives it.
 #[derive(Debug, Clone, Default)]
 pub struct SqlValidatorConfig {
     pub table_access_modes: HashMap<String, AccessMode>,
-    /// Schemas whose tables may never be referenced by ad-hoc SQL
-    /// (enforced by [`validate_single_sql`] only; pipeline SQL is
-    /// operator-authored and may legitimately reach them).
-    pub denied_schemas: HashSet<String>,
 }
 
 impl SqlValidatorConfig {
@@ -28,6 +33,31 @@ impl SqlValidatorConfig {
         self.table_access_modes
             .insert(table_name.to_lowercase(), mode);
         self
+    }
+}
+
+/// Policy for **untrusted, ad-hoc SQL** (the `/query` endpoint).
+///
+/// Distinct from [`SqlValidatorConfig`] on purpose: the untrusted entry point
+/// [`validate_single_sql`] requires *this* type, so the strict allowlist and
+/// the reserved-schema denial cannot be bypassed by reaching for the
+/// trusted-path [`validate_sql`] with a bare [`SqlValidatorConfig`]. The trust
+/// boundary lives in the type, not in which function a future caller happens
+/// to pick.
+#[derive(Debug, Clone, Default)]
+pub struct AdhocSqlPolicy {
+    /// Per-table access modes (same map the trusted path uses).
+    pub access: SqlValidatorConfig,
+    /// Schemas an ad-hoc caller may never reference in any form.
+    pub denied_schemas: HashSet<String>,
+}
+
+impl AdhocSqlPolicy {
+    pub fn new(access: SqlValidatorConfig) -> Self {
+        Self {
+            access,
+            denied_schemas: HashSet::new(),
+        }
     }
 
     pub fn with_denied_schema(mut self, schema: &str) -> Self {
@@ -95,11 +125,11 @@ pub enum StatementKind {
 /// Stricter than [`validate_sql`]: the input must parse to exactly one
 /// statement, only allowlisted statement types are accepted (queries,
 /// access-checked DML, EXPLAIN of an allowed statement, SHOW/DESCRIBE),
-/// and references into [`SqlValidatorConfig::denied_schemas`] are rejected.
+/// and references into [`AdhocSqlPolicy::denied_schemas`] are rejected.
 /// Returns the statement's [`StatementKind`] on success.
 pub fn validate_single_sql(
     sql: &str,
-    config: &SqlValidatorConfig,
+    policy: &AdhocSqlPolicy,
 ) -> Result<StatementKind, SqlValidationError> {
     // Ad-hoc SQL has no `{param}` templates, so it is parsed as-is:
     // brace substitution is not quote-aware and would rewrite string
@@ -115,8 +145,8 @@ pub fn validate_single_sql(
     }
 
     let statement = &statements[0];
-    validate_statement_strict(statement, config)?;
-    check_denied_schemas(statement, config)?;
+    validate_statement_strict(statement, &policy.access)?;
+    check_denied_schemas(statement, &policy.denied_schemas)?;
 
     Ok(if matches!(statement, Statement::Query(_)) {
         StatementKind::Query
@@ -160,30 +190,56 @@ fn validate_statement_strict(
         | Statement::ShowFunctions { .. } => Ok(()),
 
         other => Err(SqlValidationError::StatementNotAllowed {
-            operation: statement_keyword(other),
+            operation: statement_keyword(other).to_string(),
         }),
     }
 }
 
-/// First keyword of a statement, for error messages ("MERGE", "GRANT", ...).
-fn statement_keyword(statement: &Statement) -> String {
-    statement
-        .to_string()
-        .split_whitespace()
-        .next()
-        .unwrap_or("UNKNOWN")
-        .to_uppercase()
+/// Keyword naming a rejected statement, for error messages. Maps the enum
+/// variant directly rather than `Display`-rendering the whole AST just to
+/// split off the first token.
+fn statement_keyword(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::Merge { .. } => "MERGE",
+        Statement::StartTransaction { .. } => "START TRANSACTION",
+        Statement::Commit { .. } => "COMMIT",
+        Statement::Rollback { .. } => "ROLLBACK",
+        Statement::Savepoint { .. } => "SAVEPOINT",
+        Statement::Grant { .. } => "GRANT",
+        Statement::Deny(_) => "DENY",
+        Statement::Set(_) => "SET",
+        Statement::Deallocate { .. } => "DEALLOCATE",
+        Statement::Prepare { .. } => "PREPARE",
+        Statement::Execute { .. } => "EXECUTE",
+        Statement::Copy { .. } | Statement::CopyIntoSnowflake { .. } => "COPY",
+        Statement::Use(_) => "USE",
+        Statement::Pragma { .. } => "PRAGMA",
+        Statement::Call(_) => "CALL",
+        Statement::Unload { .. } => "UNLOAD",
+        Statement::Cache { .. } => "CACHE",
+        Statement::UNCache { .. } => "UNCACHE",
+        _ => "STATEMENT",
+    }
 }
 
 /// Reject any table reference whose schema qualifier names a denied schema
 /// (e.g. `auth.sessions`, `datafusion.auth.sessions`). Walks every relation
 /// in the statement — FROM, JOINs, subqueries, CTEs, DML targets, EXPLAIN
-/// bodies, DESCRIBE targets.
+/// bodies, DESCRIBE targets, and table-function arguments (`visit_relations`
+/// descends into nested queries).
+///
+/// This is a syntactic guard over relation names. It cannot see through an
+/// indirect handle that does not surface as an `auth`-qualified relation —
+/// e.g. an operator-defined view or federated alias over `auth.sessions`.
+/// Ad-hoc SQL cannot create such a handle (DDL is rejected by the allowlist),
+/// so the residual surface is operator config, which is trusted; a
+/// `/query`-scoped context that never registers the auth schema would close
+/// even that (tracked as a follow-up).
 fn check_denied_schemas(
     statement: &Statement,
-    config: &SqlValidatorConfig,
+    denied_schemas: &HashSet<String>,
 ) -> Result<(), SqlValidationError> {
-    if config.denied_schemas.is_empty() {
+    if denied_schemas.is_empty() {
         return Ok(());
     }
 
@@ -194,10 +250,10 @@ fn check_denied_schemas(
             // schema); a bare table that happens to share the name is fine.
             for qualifier in &parts[..parts.len() - 1] {
                 let qualifier = object_name_part_value(qualifier);
-                if config.denied_schemas.contains(&qualifier) {
+                if denied_schemas.contains(&qualifier) {
                     return ControlFlow::Break(SqlValidationError::SchemaNotAllowed {
                         schema: qualifier,
-                        table: relation.to_string().to_lowercase(),
+                        table: extract_table_name(relation),
                     });
                 }
             }
@@ -341,9 +397,9 @@ fn extract_table_name(table: &ObjectName) -> String {
         .join(".")
 }
 
-fn extract_table_name_from_table_with_joins(table: &sqlparser::ast::TableWithJoins) -> String {
+fn extract_table_name_from_table_with_joins(table: &TableWithJoins) -> String {
     match &table.relation {
-        sqlparser::ast::TableFactor::Table { name, .. } => extract_table_name(name),
+        TableFactor::Table { name, .. } => extract_table_name(name),
         _ => String::new(),
     }
 }
@@ -414,6 +470,11 @@ mod tests {
             .with_table("users", AccessMode::ReadOnly)
             .with_table("orders", AccessMode::ReadWrite)
             .with_table("readonly_table", AccessMode::ReadOnly)
+    }
+
+    /// Wrap access modes into an ad-hoc policy with no denied schemas.
+    fn adhoc(access: SqlValidatorConfig) -> AdhocSqlPolicy {
+        AdhocSqlPolicy::new(access)
     }
 
     #[test]
@@ -651,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_copy_rejected_on_adhoc_path() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql("COPY users TO 'out.csv'", &config);
         assert!(
             matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
@@ -676,7 +737,7 @@ mod tests {
         // The ad-hoc path is a strict allowlist: statement types that are
         // not explicitly permitted are rejected, including ones today's
         // sqlparser knows but the old denylist let through.
-        let config = test_config();
+        let config = adhoc(test_config());
         let denied = vec![
             "MERGE INTO orders USING users ON orders.id = users.id \
              WHEN MATCHED THEN UPDATE SET amount = 0",
@@ -700,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_adhoc_allows_show_and_describe() {
-        let config = test_config();
+        let config = adhoc(test_config());
         for sql in ["SHOW TABLES", "DESCRIBE users"] {
             let kind = validate_single_sql(sql, &config);
             assert!(
@@ -714,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_denied_schema_rejects_reads() {
-        let config = test_config().with_denied_schema("auth");
+        let config = adhoc(test_config()).with_denied_schema("auth");
         let denied = vec![
             "SELECT token FROM auth.sessions",
             "SELECT * FROM users u JOIN auth.sessions s ON u.id = s.user_id",
@@ -738,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_denied_schema_rejects_writes() {
-        let config = test_config().with_denied_schema("auth");
+        let config = adhoc(test_config()).with_denied_schema("auth");
         let result = validate_single_sql("INSERT INTO auth.users (id) VALUES (1)", &config);
         assert!(
             matches!(result, Err(SqlValidationError::SchemaNotAllowed { .. })),
@@ -751,7 +812,7 @@ mod tests {
     fn test_denied_schema_ignores_bare_table_named_auth() {
         // Only the schema qualifier is reserved; a table that happens to be
         // named `auth` is not in the `auth` schema.
-        let config = test_config().with_denied_schema("auth");
+        let config = adhoc(test_config()).with_denied_schema("auth");
         let result = validate_single_sql("SELECT * FROM auth", &config);
         assert!(result.is_ok(), "got: {:?}", result);
     }
@@ -760,9 +821,36 @@ mod tests {
     fn test_denied_schema_not_enforced_on_pipeline_path() {
         // Pipelines are operator-authored and may legitimately read auth
         // tables; the denial is scoped to ad-hoc SQL.
-        let config = test_config().with_denied_schema("auth");
+        // The trusted path carries no denied-schema notion at all, so it
+        // can read auth tables regardless.
+        let config = test_config();
         let result = validate_sql("SELECT token FROM auth.sessions", &config);
         assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn test_denied_schema_reached_through_indirect_relations() {
+        // The denial must descend into every relation-bearing position, not
+        // just the top-level FROM: set operations, scalar subqueries in the
+        // projection, IN-subqueries, and table-function arguments. This pins
+        // that `visit_relations` covers those forms (the guard's completeness
+        // for a single ad-hoc statement rests on it).
+        let config = adhoc(test_config()).with_denied_schema("auth");
+        let indirect = vec![
+            "SELECT id FROM users UNION SELECT token FROM auth.sessions",
+            "SELECT (SELECT token FROM auth.sessions LIMIT 1) AS t",
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM auth.sessions)",
+            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM auth.sessions s WHERE s.user_id = users.id)",
+        ];
+        for sql in indirect {
+            let result = validate_single_sql(sql, &config);
+            assert!(
+                matches!(result, Err(SqlValidationError::SchemaNotAllowed { .. })),
+                "'{}' must be rejected via an indirect relation, got: {:?}",
+                sql,
+                result
+            );
+        }
     }
 
     #[test]
@@ -771,7 +859,7 @@ mod tests {
         // validated as-is. Brace substitution here would rewrite string
         // literals and reject valid queries (the braces below cross quote
         // boundaries, so the substituted SQL does not even parse).
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql(r#"SELECT 'a{b' AS "c}d" FROM users"#, &config);
         assert!(
             matches!(result, Ok(StatementKind::Query)),
@@ -830,7 +918,7 @@ mod tests {
     fn test_insert_into_table_function_target_rejected() {
         // `INSERT INTO FUNCTION ...` (ClickHouse syntax) has no registered
         // table name to access-check; it must fail closed, not fall through.
-        use sqlparser::dialect::ClickHouseDialect;
+        use datafusion::sql::sqlparser::dialect::ClickHouseDialect;
         let statements = Parser::parse_sql(
             &ClickHouseDialect {},
             "INSERT INTO FUNCTION remote('addr', db.tbl) VALUES (1)",
@@ -848,7 +936,7 @@ mod tests {
     fn test_quoted_identifiers_match_access_modes_and_denied_schemas() {
         // Quoting must not change identity: `"users"` is the read-only
         // `users` source, and `"auth"."sessions"` is still the auth schema.
-        let config = test_config().with_denied_schema("auth");
+        let config = adhoc(test_config()).with_denied_schema("auth");
         let result = validate_single_sql(r#"INSERT INTO "users" (id) VALUES (1)"#, &config);
         assert!(
             matches!(result, Err(SqlValidationError::WriteNotAllowed { .. })),
@@ -879,21 +967,21 @@ mod tests {
 
     #[test]
     fn test_validate_single_sql_query_ok() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let kind = validate_single_sql("SELECT * FROM users", &config).unwrap();
         assert_eq!(kind, StatementKind::Query);
     }
 
     #[test]
     fn test_validate_single_sql_write_is_other() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let kind = validate_single_sql("INSERT INTO orders (id) VALUES (1)", &config).unwrap();
         assert_eq!(kind, StatementKind::Other);
     }
 
     #[test]
     fn test_validate_single_sql_multi_statement_rejected() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql("SELECT 1; SELECT 2", &config);
         assert!(matches!(
             result,
@@ -903,7 +991,7 @@ mod tests {
 
     #[test]
     fn test_validate_single_sql_empty_rejected() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql("", &config);
         assert!(matches!(
             result,
@@ -913,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_validate_single_sql_enforces_existing_rules() {
-        let config = test_config();
+        let config = adhoc(test_config());
         assert!(matches!(
             validate_single_sql("DROP TABLE users", &config),
             Err(SqlValidationError::DdlNotAllowed { .. })
@@ -930,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_explain_analyze_insert_into_read_only_blocked() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql(
             "EXPLAIN ANALYZE INSERT INTO users (id, name) VALUES (1, 'x')",
             &config,
@@ -944,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_explain_ddl_blocked() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql("EXPLAIN DROP TABLE users", &config);
         assert!(
             matches!(result, Err(SqlValidationError::DdlNotAllowed { .. })),
@@ -955,14 +1043,14 @@ mod tests {
 
     #[test]
     fn test_explain_select_allowed() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let kind = validate_single_sql("EXPLAIN SELECT * FROM users", &config).unwrap();
         assert_eq!(kind, StatementKind::Other);
     }
 
     #[test]
     fn test_set_statement_blocked() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql("SET a = 1", &config);
         assert!(
             matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
@@ -973,7 +1061,7 @@ mod tests {
 
     #[test]
     fn test_prepare_statement_blocked() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql(
             "PREPARE p AS INSERT INTO users (id, name) VALUES (1, 'x')",
             &config,
@@ -987,7 +1075,7 @@ mod tests {
 
     #[test]
     fn test_execute_statement_blocked() {
-        let config = test_config();
+        let config = adhoc(test_config());
         let result = validate_single_sql("EXECUTE p", &config);
         assert!(
             matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),

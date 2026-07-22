@@ -363,13 +363,12 @@ mod tests {
     fn make_no_auth_state() -> AppState {
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
-        use crate::metrics::PipelineMetrics;
         use crate::semantics::SemanticsRegistry;
         use crate::server::AppState;
         use datafusion::prelude::SessionContext;
         use skardi::engine::datafusion::DataFusionEngine;
         use std::path::PathBuf;
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
 
         let config = ServerConfig {
             pipelines: Default::default(),
@@ -387,15 +386,7 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState {
-            config: Arc::new(RwLock::new(config)),
-            engine,
-            session_ctx,
-            metrics: PipelineMetrics::new(),
-            auth_layer: AuthLayer::None,
-            jobs: None,
-            validator_config: Arc::new(crate::config::validator_config_from_sources(&[])),
-        }
+        AppState::new(config, engine, session_ctx, AuthLayer::None, None)
     }
 
     #[tokio::test]
@@ -408,13 +399,12 @@ mod tests {
     async fn make_better_auth_state() -> AppState {
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
-        use crate::metrics::PipelineMetrics;
         use crate::semantics::SemanticsRegistry;
         use crate::server::AppState;
         use datafusion::prelude::SessionContext;
         use skardi::engine::datafusion::DataFusionEngine;
         use std::path::PathBuf;
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
 
         unsafe {
             std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
@@ -442,15 +432,7 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState {
-            config: Arc::new(RwLock::new(config)),
-            engine,
-            session_ctx,
-            metrics: PipelineMetrics::new(),
-            auth_layer: layer,
-            jobs: None,
-            validator_config: Arc::new(crate::config::validator_config_from_sources(&[])),
-        }
+        AppState::new(config, engine, session_ctx, layer, None)
     }
 
     #[tokio::test]

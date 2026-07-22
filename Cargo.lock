@@ -9249,7 +9249,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sqlparser",
  "sqlx",
  "tempfile",
  "text-splitter",
