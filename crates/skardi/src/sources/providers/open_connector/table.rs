@@ -72,6 +72,9 @@ impl OpenConnectorTableProvider {
     ) -> Result<Self, super::error::OpenConnectorError> {
         let converter = Arc::new(RowConverter::new(table.fields)?);
         let row_path = RowPath::parse(table.row_path)?;
+        // Same bind-time guarantee as the row path: a malformed pack-authored
+        // pagination path fails here at registration, not mid-scan.
+        table.pagination.validate()?;
         Ok(Self {
             client,
             cache,
@@ -144,5 +147,96 @@ impl TableProvider for OpenConnectorTableProvider {
 
     fn statistics(&self) -> Option<Statistics> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::providers::open_connector::filters::FilterMapping;
+    use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+    use datafusion::logical_expr::Operator;
+
+    fn offline_client() -> Arc<OpenConnectorClient> {
+        Arc::new(
+            OpenConnectorClient::new("http://127.0.0.1:1", "t", Duration::from_secs(1))
+                .expect("build client"),
+        )
+    }
+
+    fn table_with_pagination(pagination: PaginationStrategy) -> &'static SourcePackTable {
+        // Leak a tiny test table; tests are few and the value is static-sized.
+        Box::leak(Box::new(SourcePackTable {
+            id: "test.t",
+            action_id: "test.action",
+            row_path: "$.items",
+            fields: &[FieldMapping {
+                name: "id",
+                path: "id",
+                field_type: FieldType::UInt64,
+                nullable: false,
+            }],
+            pagination,
+            required_resources: &[],
+            filters: &[FilterMapping {
+                column: "id",
+                operator: Operator::Gt,
+                input_field: "min_id",
+            }],
+            expected_fingerprint: None,
+        }))
+    }
+
+    #[test]
+    fn malformed_pagination_path_fails_at_bind_time() {
+        // A pack bug must surface here — alongside the row path — not
+        // mid-scan on page two.
+        let table = table_with_pagination(PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "not-a-path",
+            page_size_param: None,
+            page_size: 50,
+        });
+        let err = OpenConnectorTableProvider::new(
+            offline_client(),
+            None,
+            "saas".to_string(),
+            None,
+            table,
+            1,
+            serde_json::json!({}),
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            super::super::error::OpenConnectorError::InvalidRowPath { .. }
+        ));
+    }
+
+    #[test]
+    fn valid_cursor_pagination_binds() {
+        let table = table_with_pagination(PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "$.next_cursor",
+            page_size_param: None,
+            page_size: 50,
+        });
+        OpenConnectorTableProvider::new(
+            offline_client(),
+            None,
+            "saas".to_string(),
+            None,
+            table,
+            1,
+            serde_json::json!({}),
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .expect("valid cursor pagination binds");
     }
 }

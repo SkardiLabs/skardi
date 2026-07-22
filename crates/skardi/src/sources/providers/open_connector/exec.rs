@@ -185,7 +185,8 @@ impl ExecutionPlan for OpenConnectorExec {
         // pull-driven, so dropping it stops further requests — cancellation
         // for free, and a failed page fails the whole scan (no partial
         // success).
-        let stream = stream::try_unfold(ScanState::new(self), |mut state| async move {
+        let state = ScanState::new(self).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let stream = stream::try_unfold(state, |mut state| async move {
             match state.next_page().await {
                 Ok(Some(batch)) => Ok(Some((batch, state))),
                 Ok(None) => Ok(None),
@@ -226,7 +227,7 @@ struct ScanState {
 }
 
 impl ScanState {
-    fn new(exec: &OpenConnectorExec) -> Self {
+    fn new(exec: &OpenConnectorExec) -> Result<Self, OpenConnectorError> {
         // Projection indices index into the converter's *fixed* schema, so
         // resolve names through it — not through the (already projected)
         // plan schema, which is shorter.
@@ -266,7 +267,7 @@ impl ScanState {
         let done = cached.is_some();
         let replay = cached.unwrap_or_default();
 
-        Self {
+        Ok(Self {
             client: exec.client.clone(),
             cache: exec.cache.clone(),
             cache_key,
@@ -282,12 +283,12 @@ impl ScanState {
             max_rows: exec.max_rows,
             scan_timeout: exec.scan_timeout,
             deadline: Instant::now() + exec.scan_timeout,
-            pagination: Pagination::new(exec.table.pagination),
+            pagination: Pagination::new(exec.table.pagination)?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
             done,
-        }
+        })
     }
 
     fn store_cache(&self) {
@@ -444,8 +445,8 @@ mod tests {
         // The key component exists so a pack upgrade (v1 → v2) cannot serve
         // stale rows from the old schema's cache entry; hardcoding 1 would
         // silently defeat it.
-        let state_v1 = ScanState::new(&exec_with_version(1));
-        let state_v2 = ScanState::new(&exec_with_version(2));
+        let state_v1 = ScanState::new(&exec_with_version(1)).expect("state v1");
+        let state_v2 = ScanState::new(&exec_with_version(2)).expect("state v2");
         assert!(
             state_v1.cache_key.contains(r#""source_pack_version":1"#),
             "v1 key: {}",

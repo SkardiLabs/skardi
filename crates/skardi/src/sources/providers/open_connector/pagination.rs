@@ -51,21 +51,49 @@ pub struct Pagination {
     next_token: Option<String>,
     /// Cursors already consumed, for loop detection.
     seen_tokens: HashSet<String>,
+    /// Pre-parsed next-cursor path (Cursor only) — parsed once at
+    /// construction instead of on every page.
+    cursor_path: Option<RowPath>,
+}
+
+impl PaginationStrategy {
+    /// Validate any embedded paths. Called at binding time so a malformed
+    /// pack-authored path fails at registration, not mid-scan.
+    pub fn validate(&self) -> Result<(), OpenConnectorError> {
+        if let PaginationStrategy::Cursor {
+            next_cursor_path, ..
+        } = self
+        {
+            RowPath::parse(next_cursor_path)?;
+        }
+        Ok(())
+    }
 }
 
 impl Pagination {
-    /// Start a scan at page 1.
-    pub fn new(strategy: PaginationStrategy) -> Self {
+    /// Start a scan at page 1, parsing any strategy paths exactly once.
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::InvalidRowPath`] when a Cursor strategy's
+    /// `next_cursor_path` is malformed (a pack bug).
+    pub fn new(strategy: PaginationStrategy) -> Result<Self, OpenConnectorError> {
         let next_token = match &strategy {
             PaginationStrategy::PageNumber { .. } => Some("1".to_string()),
             PaginationStrategy::Cursor { .. } => None,
         };
-        Self {
+        let cursor_path = match &strategy {
+            PaginationStrategy::Cursor {
+                next_cursor_path, ..
+            } => Some(RowPath::parse(next_cursor_path)?),
+            PaginationStrategy::PageNumber { .. } => None,
+        };
+        Ok(Self {
             strategy,
             page: 1,
             next_token,
             seen_tokens: HashSet::new(),
-        }
+            cursor_path,
+        })
     }
 
     /// The 1-based number of the page about to be requested.
@@ -126,10 +154,13 @@ impl Pagination {
                 }
                 Ok(more)
             }
-            PaginationStrategy::Cursor {
-                next_cursor_path, ..
-            } => {
-                let path = RowPath::parse(next_cursor_path)?;
+            PaginationStrategy::Cursor { .. } => {
+                let path = self.cursor_path.as_ref().ok_or_else(|| {
+                    OpenConnectorError::InvalidRowPath {
+                        path: "<cursor>".to_string(),
+                        reason: "cursor strategy without a parsed path".to_string(),
+                    }
+                })?;
                 let next = match path.extract(envelope, self.page) {
                     Ok(Value::String(s)) if !s.is_empty() => Some(s.clone()),
                     // Missing, null, or empty cursor → scan complete.
@@ -161,6 +192,7 @@ mod tests {
             per_page_param: "per_page",
             per_page,
         })
+        .unwrap()
     }
 
     fn cursor() -> Pagination {
@@ -170,6 +202,34 @@ mod tests {
             page_size_param: Some("limit"),
             page_size: 50,
         })
+        .unwrap()
+    }
+
+    #[test]
+    fn malformed_cursor_path_fails_at_construction() {
+        let err = Pagination::new(PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "not-a-path",
+            page_size_param: None,
+            page_size: 50,
+        })
+        .unwrap_err();
+        assert!(matches!(err, OpenConnectorError::InvalidRowPath { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_cursor_path() {
+        let bad = PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "$.a..b",
+            page_size_param: None,
+            page_size: 50,
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(OpenConnectorError::InvalidRowPath { .. })
+        ));
+        cursor().strategy.validate().expect("valid strategy");
     }
 
     #[test]
