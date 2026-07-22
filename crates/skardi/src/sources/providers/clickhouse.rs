@@ -17,27 +17,19 @@
 //! - **Catalog mode**: every table across the server's non-system databases is
 //!   registered under the `name` catalog as `name.<database>.<table>`.
 
+use super::CountSafeTable;
 use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
     HierarchyLevel, SourceLabel, build_catalog_best_effort, parse_allowed_schemas,
     retry_with_timeout,
 };
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::Session;
-use datafusion::common::Statistics;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::clickhouse::ClickHouseTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::clickhousepool::ClickHouseConnectionPool;
 use secrecy::SecretString;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,6 +47,14 @@ const OPT_DATABASE: &str = "database";
 const OPT_USER_ENV: &str = "user_env";
 /// Name of an environment variable holding the password.
 const OPT_PASS_ENV: &str = "pass_env";
+/// Comma-separated database allow-list (catalog mode; optional — omit to
+/// expose every non-system database). Parsed by `parse_allowed_schemas`.
+const OPT_ALLOWED_SCHEMAS: &str = "allowed_schemas";
+
+/// Option keys accepted in table mode / catalog mode. Used by
+/// [`validate_clickhouse_options`] to reject typos and mode mismatches.
+const TABLE_MODE_OPTIONS: &[&str] = &[OPT_TABLE, OPT_DATABASE, OPT_USER_ENV, OPT_PASS_ENV];
+const CATALOG_MODE_OPTIONS: &[&str] = &[OPT_ALLOWED_SCHEMAS, OPT_USER_ENV, OPT_PASS_ENV];
 
 /// Register ClickHouse tables or a whole server (catalog) into a DataFusion
 /// [`SessionContext`].
@@ -109,6 +109,7 @@ pub async fn register_clickhouse_tables(
     options: Option<&HashMap<String, String>>,
     hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
+    validate_clickhouse_options(name, options, hierarchy_level)?;
     match hierarchy_level {
         HierarchyLevel::Catalog => {
             register_clickhouse_catalog(session_ctx, name, connection_string, options).await
@@ -117,6 +118,62 @@ pub async fn register_clickhouse_tables(
             register_single_clickhouse_table(session_ctx, name, connection_string, options).await
         }
     }
+}
+
+/// Enforce the option contract at the provider boundary, so every caller
+/// (server config load, CLI, public API) gets the same checks — the server's
+/// `validate_data_sources` is not the only gate.
+///
+/// Rejects option keys that are not recognised in the given mode: a typo like
+/// `password_env` would otherwise be silently ignored and the connection would
+/// proceed as ClickHouse's `default` user. Also mirrors the server-side
+/// catalog-mode checks: `table` / `database` conflict with catalog mode, and
+/// an `allowed_schemas` with no non-empty entry would fall through
+/// `parse_allowed_schemas` as "expose everything" — the opposite of intent.
+fn validate_clickhouse_options(
+    name: &str,
+    options: Option<&HashMap<String, String>>,
+    hierarchy_level: HierarchyLevel,
+) -> Result<()> {
+    let Some(opts) = options else {
+        return Ok(());
+    };
+
+    let (valid, other_mode_valid, mode, other_mode) = match hierarchy_level {
+        HierarchyLevel::Table => (TABLE_MODE_OPTIONS, CATALOG_MODE_OPTIONS, "table", "catalog"),
+        HierarchyLevel::Catalog => (CATALOG_MODE_OPTIONS, TABLE_MODE_OPTIONS, "catalog", "table"),
+    };
+
+    for key in opts.keys() {
+        if valid.contains(&key.as_str()) {
+            continue;
+        }
+        if other_mode_valid.contains(&key.as_str()) {
+            return Err(anyhow!(
+                "ClickHouse data source '{name}': option '{key}' is only valid in \
+                 {other_mode} mode, not with hierarchy_level: {mode}"
+            ));
+        }
+        return Err(anyhow!(
+            "ClickHouse data source '{name}': unknown option '{key}'; valid options \
+             in {mode} mode are: {}",
+            valid.join(", ")
+        ));
+    }
+
+    if hierarchy_level == HierarchyLevel::Catalog
+        && opts
+            .get(OPT_ALLOWED_SCHEMAS)
+            .is_some_and(|value| !value.split(',').any(|s| !s.trim().is_empty()))
+    {
+        return Err(anyhow!(
+            "ClickHouse data source '{name}': '{OPT_ALLOWED_SCHEMAS}' must list \
+             at least one database (an empty value would expose every \
+             non-system database; omit the option if that is the intent)"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Register one ClickHouse table under `name` in the default catalog.
@@ -296,101 +353,9 @@ async fn build_clickhouse_table_provider(
              and the configured user can read it: {e}"
         )
     })?;
-    Ok(Arc::new(CountSafeClickHouseTable { inner }))
-}
-
-/// Thin wrapper working around an upstream `datafusion-table-providers` 0.10.1
-/// bug shared with the Flight provider (see `CountSafeFlightTable` in
-/// `influxdb.rs`): when DataFusion requests an **empty** projection (e.g.
-/// `SELECT count(*)`), the inner ClickHouse table's unparsed SQL still selects
-/// a column, so the physical plan advertises one field while the logical
-/// schema has zero — and DataFusion aborts with "Physical input schema should
-/// be the same as the one converted from logical input schema".
-///
-/// We intercept the empty-projection case: scan a single real column through
-/// the inner table, then strip it back to zero columns with a
-/// [`ProjectionExec`], which preserves the row count. All other projections
-/// delegate straight to the inner table.
-///
-/// The column still streams in full over HTTP (the enabled feature set does
-/// no aggregate pushdown — see `docs/clickhouse/README.md`), so we pick the
-/// narrowest fixed-width column rather than whatever sits at index 0, which
-/// could be an arbitrarily wide String.
-#[derive(Debug)]
-struct CountSafeClickHouseTable {
-    inner: Arc<dyn TableProvider>,
-}
-
-#[async_trait]
-impl TableProvider for CountSafeClickHouseTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    // Forward the remaining planning hooks so the wrapper is transparent to
-    // the optimizer apart from the count(*) interception below.
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        match projection {
-            // Empty projection (count(*) / EXISTS): fetch one column so the
-            // unparsed ClickHouse SQL stays well-formed, then drop it again to
-            // honour the requested zero-column output.
-            Some(p) if p.is_empty() => {
-                let single = vec![narrowest_column_index(&self.inner.schema())];
-                let plan = self
-                    .inner
-                    .scan(state, Some(&single), filters, limit)
-                    .await?;
-                let empty: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
-                Ok(Arc::new(ProjectionExec::try_new(empty, plan)?))
-            }
-            _ => self.inner.scan(state, projection, filters, limit).await,
-        }
-    }
-}
-
-/// Index of the cheapest column to stream when only a row count is needed:
-/// the narrowest fixed-width field, falling back to index 0 when every column
-/// is variable-width. Ties resolve to the first such column, so the choice is
-/// deterministic.
-fn narrowest_column_index(schema: &SchemaRef) -> usize {
-    use datafusion::arrow::datatypes::DataType;
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, field)| match field.data_type() {
-            // Bit-packed in Arrow, so `primitive_width` reports nothing; it's
-            // still the cheapest thing a ClickHouse table can hold.
-            DataType::Boolean => 1,
-            dt => dt.primitive_width().unwrap_or(usize::MAX),
-        })
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
+    // Wrapped so `SELECT count(*)` survives the upstream empty-projection bug
+    // (see `CountSafeTable` in `providers/mod.rs`).
+    Ok(Arc::new(CountSafeTable { inner }))
 }
 
 /// Table engines that refuse direct SELECT by default (they exist to feed
@@ -480,10 +445,11 @@ async fn list_clickhouse_tables(
 /// The endpoint must be an `http://` or `https://` URL (ClickHouse's native
 /// TCP port 9000 speaks a different protocol — this provider uses the HTTP
 /// interface on port 8123). Credentials must come from `user_env` / `pass_env`
-/// options; `user:pass@host` embedded in the URL is a hard error. The pool
-/// ignores URL-embedded credentials, so accepting them would mean a confusing
-/// authentication failure at connect time — and the connection string (which
-/// is logged and exposed by the data-sources API) would carry a live secret.
+/// options; `user:pass@host` embedded in the URL is a hard error, as is any
+/// query string (`?user=u&password=p` is valid ClickHouse HTTP auth). The pool
+/// ignores both, so accepting them would mean a confusing authentication
+/// failure at connect time — and the connection string (which is logged and
+/// exposed by the data-sources API) would carry a live secret.
 fn parse_connection_params(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
@@ -507,6 +473,19 @@ fn parse_connection_params(
              (they would be ignored by the connection pool, and the connection string \
              is logged and exposed by the data-sources API). \
              Use the '{OPT_USER_ENV}' and '{OPT_PASS_ENV}' options instead."
+        ));
+    }
+
+    // ClickHouse's HTTP interface also accepts credentials as query parameters
+    // (?user=u&password=p). The pool doesn't forward query parameters, so no
+    // query string can work here — and a credential-carrying one would leak
+    // through the same log/API surfaces as embedded userinfo. Reject them all.
+    if parsed.query().is_some() {
+        return Err(anyhow!(
+            "ClickHouse connection string must not contain query parameters \
+             (credentials in the query string would be logged and exposed by the \
+             data-sources API, and the connection pool ignores query parameters \
+             anyway). Use the '{OPT_USER_ENV}' and '{OPT_PASS_ENV}' options instead."
         ));
     }
 
@@ -668,25 +647,19 @@ mod tests {
     }
 
     #[test]
-    fn narrowest_column_index_prefers_narrowest_fixed_width() {
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("price", DataType::Float64, false),
-            Field::new("flag", DataType::Boolean, false),
-            Field::new("id", DataType::UInt32, false),
-        ]));
-        assert_eq!(narrowest_column_index(&schema), 2, "Boolean is narrowest");
-    }
+    fn parse_connection_params_query_string_is_rejected() {
+        // ClickHouse's HTTP interface accepts credentials as query parameters
+        // (?user=u&password=p), which would sail past the embedded-credentials
+        // check and leak into logs and the data-sources API just the same.
+        let err =
+            parse_connection_params("http://localhost:8123/?user=admin&password=secret", None)
+                .unwrap_err();
+        assert!(err.to_string().contains("query parameters"), "got {err}");
 
-    #[test]
-    fn narrowest_column_index_falls_back_to_first_column() {
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Utf8, false),
-            Field::new("b", DataType::Binary, false),
-        ]));
-        assert_eq!(narrowest_column_index(&schema), 0);
+        // Any query string is rejected, credential-shaped or not: the pool
+        // doesn't forward query parameters, so none of them can work anyway.
+        let err = parse_connection_params("http://localhost:8123/?compress=1", None).unwrap_err();
+        assert!(err.to_string().contains("query parameters"), "got {err}");
     }
 
     #[tokio::test]
@@ -704,6 +677,94 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("requires a 'table'"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn register_rejects_unknown_option_before_connecting() {
+        // A misspelled option key (here `pass_env`) must be a hard error, not
+        // silently ignored — ignoring it would connect as ClickHouse's
+        // `default` user instead of the intended one. This guard runs at the
+        // provider boundary so the CLI path gets it too, not just the server's
+        // config validation.
+        let mut ctx = SessionContext::new();
+        let options = opts(&[("table", "events"), ("password_env", "CH_PASS")]);
+        let err = register_clickhouse_tables(
+            &mut ctx,
+            "events",
+            "http://127.0.0.1:1",
+            Some(&options),
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown option 'password_env'"), "got {msg}");
+        assert!(
+            msg.contains("pass_env"),
+            "should list valid keys, got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_allowed_schemas_in_table_mode() {
+        let mut ctx = SessionContext::new();
+        let options = opts(&[("table", "events"), ("allowed_schemas", "mydb")]);
+        let err = register_clickhouse_tables(
+            &mut ctx,
+            "events",
+            "http://127.0.0.1:1",
+            Some(&options),
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("catalog"),
+            "should point at catalog mode, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_catalog_rejects_table_scoped_options_before_connecting() {
+        // Mirrors the server-side CatalogModeConflictingOptions check so the
+        // CLI path enforces the same contract: `database` would otherwise
+        // silently change the pool's default database.
+        for conflicting in ["table", "database"] {
+            let mut ctx = SessionContext::new();
+            let options = opts(&[(conflicting, "mydb")]);
+            let err = register_clickhouse_tables(
+                &mut ctx,
+                "ch",
+                "http://127.0.0.1:1",
+                Some(&options),
+                HierarchyLevel::Catalog,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(conflicting),
+                "should name '{conflicting}', got {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn register_catalog_rejects_empty_allowed_schemas_before_connecting() {
+        // An empty allow-list would fall through parse_allowed_schemas as
+        // None — i.e. "expose everything" — the opposite of what the user
+        // wrote. Mirrors the server-side EmptyAllowedSchemas check.
+        let mut ctx = SessionContext::new();
+        let options = opts(&[("allowed_schemas", " , ")]);
+        let err = register_clickhouse_tables(
+            &mut ctx,
+            "ch",
+            "http://127.0.0.1:1",
+            Some(&options),
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("allowed_schemas"), "got {err}");
     }
 
     #[tokio::test]

@@ -363,12 +363,20 @@ the following `options` keys:
 | `user_env` | for auth | **Name of an environment variable** holding the username. The out-of-the-box `default` user needs no credentials, so this is optional. |
 | `pass_env` | for auth | **Name of an environment variable** holding the password. |
 
+Option validation is strict and runs at registration (server and CLI alike):
+an unrecognised key — e.g. a misspelled `pass_env`, which would otherwise
+silently connect as the `default` user — is a hard error, as is an option
+that belongs to the other hierarchy mode (`table`/`database` in catalog mode,
+`allowed_schemas` in table mode) or an `allowed_schemas` with no non-empty
+entry.
+
 The native TCP protocol (port 9000) is not supported — registration rejects
 non-`http(s)` schemes. Credentials embedded in the URL
-(`http://user:pass@host`) are rejected outright — the connection pool would
-ignore them, and connection strings are logged and surfaced by the
-data-sources API. Use `user_env` / `pass_env` so secrets stay out of the YAML,
-the logs, and the API.
+(`http://user:pass@host`) are rejected outright, and so is any URL query
+string (ClickHouse accepts `?user=…&password=…` as HTTP auth) — the
+connection pool would ignore them, and connection strings are logged and
+surfaced by the data-sources API. Use `user_env` / `pass_env` so secrets stay
+out of the YAML, the logs, and the API.
 
 ## Access Mode
 
