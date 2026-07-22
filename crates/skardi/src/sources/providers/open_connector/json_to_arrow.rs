@@ -165,9 +165,18 @@ impl RowConverter {
         for (row_index, row) in rows.iter().enumerate() {
             match field.path.extract(row, page) {
                 Ok(value) => cells.push(Some(value)),
-                Err(_) if mapping.nullable => cells.push(None),
+                // Only a genuinely-absent key may become null for a nullable
+                // column. A present-but-wrong-shape value mid-path (e.g.
+                // `user` changed from object to string) is an upstream
+                // *breaking* change and must fail, per this module's contract.
+                Err(OpenConnectorError::RowPathNotFound { .. }) if mapping.nullable => {
+                    cells.push(None)
+                }
                 Err(OpenConnectorError::RowPathNotFound { .. }) => {
                     return Err(self.failure(field, page, row_index, "missing key"));
+                }
+                Err(OpenConnectorError::RowPathNotObject { ref found, .. }) => {
+                    return Err(self.failure(field, page, row_index, found));
                 }
                 Err(e) => return Err(e),
             }
@@ -438,6 +447,38 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert!(scores.is_null(0));
+    }
+
+    #[test]
+    fn nullable_column_fails_on_shape_mismatch() {
+        // `user` changed from object to string upstream: a nullable
+        // user.login column must NOT quietly become all-null — this is a
+        // breaking change and has to fail conversion.
+        let mut value = row(1, "a");
+        value["user"] = json!("octocat");
+        let err = converter().convert(&[value], 1).unwrap_err();
+        match err {
+            OpenConnectorError::ConversionFailed { column, found, .. } => {
+                assert_eq!(column, "author_login");
+                assert_eq!(found, "a string");
+            }
+            other => panic!("expected ConversionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn missing_parent_object_still_nulls_for_nullable_column() {
+        // A genuinely-absent parent (no `user` key at all) is absence, not a
+        // shape change — nullable user.login becomes null.
+        let mut value = row(1, "a");
+        value.as_object_mut().unwrap().remove("user");
+        let batch = converter().convert(&[value], 1).unwrap();
+        let authors = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(authors.is_null(0));
     }
 
     #[test]

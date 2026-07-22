@@ -57,9 +57,11 @@ impl RowPath {
         &self.raw
     }
 
-    /// Walk the path inside `value`, failing at the first missing key or
-    /// non-object intermediate. `page` is the 1-based page number, carried
-    /// into the error for scan diagnostics.
+    /// Walk the path inside `value`. A key absent from an object fails with
+    /// [`OpenConnectorError::RowPathNotFound`]; a present non-object where
+    /// the path must descend fails with
+    /// [`OpenConnectorError::RowPathNotObject`]. `page` is the 1-based page
+    /// number, carried into the error for scan diagnostics.
     pub fn extract<'a>(
         &self,
         value: &'a Value,
@@ -67,9 +69,16 @@ impl RowPath {
     ) -> Result<&'a Value, OpenConnectorError> {
         let mut current = value;
         for segment in &self.segments {
-            current = current
+            let map = current
                 .as_object()
-                .and_then(|map| map.get(segment))
+                .ok_or_else(|| OpenConnectorError::RowPathNotObject {
+                    path: self.raw.clone(),
+                    segment: segment.clone(),
+                    page,
+                    found: json_kind(current),
+                })?;
+            current = map
+                .get(segment)
                 .ok_or_else(|| OpenConnectorError::RowPathNotFound {
                     path: self.raw.clone(),
                     segment: segment.clone(),
@@ -166,7 +175,11 @@ mod tests {
             .unwrap()
             .rows(&page, 1)
             .unwrap_err();
-        assert!(matches!(err, OpenConnectorError::RowPathNotFound { .. }));
+        assert!(matches!(
+            err,
+            OpenConnectorError::RowPathNotObject { ref segment, ref found, .. }
+                if segment == "items" && found == "an array"
+        ));
     }
 
     #[test]

@@ -266,16 +266,31 @@ pub enum OpenConnectorError {
     #[error("Open Connector row path '{path}' is invalid: {reason}")]
     InvalidRowPath { path: String, reason: String },
 
-    /// A row path segment was absent (or a non-object was traversed) while
-    /// extracting rows from a page.
+    /// A row path segment was absent from its parent object while extracting
+    /// rows from a page. Absence is a *missing* key (nullable columns become
+    /// null) — not a structural change.
     #[error(
         "Open Connector row path '{path}' failed at segment '{segment}' on page {page}: \
-         the key is missing or the value is not an object"
+         the key is missing from an object"
     )]
     RowPathNotFound {
         path: String,
         segment: String,
         page: usize,
+    },
+
+    /// A row path had to traverse into a value that is not an object — a
+    /// structural mismatch (e.g. `user` changed from object to string
+    /// upstream), which must fail even for nullable columns.
+    #[error(
+        "Open Connector row path '{path}' cannot descend into segment '{segment}' on page {page}: \
+         expected an object, found {found}"
+    )]
+    RowPathNotObject {
+        path: String,
+        segment: String,
+        page: usize,
+        found: String,
     },
 
     /// The row path resolved to a non-array value; relational rows must be an
