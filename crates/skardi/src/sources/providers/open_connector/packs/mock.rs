@@ -53,9 +53,13 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         per_page: 2,
     },
     required_resources: &["workspace"],
+    // NOTE: only `>` is mapped — the gateway's `min_value` is strictly
+    // greater-than. Mapping `>=` to the same input would be classified Exact
+    // and silently drop the boundary row (provider excludes it, DataFusion
+    // never reapplies). `>=` therefore stays in DataFusion.
     filters: &[FilterMapping {
         column: "value",
-        operators: &[Operator::Gt, Operator::GtEq],
+        operator: Operator::Gt,
         input_field: "min_value",
     }],
     // The mock gateway's action schema is test-controlled, so no fingerprint

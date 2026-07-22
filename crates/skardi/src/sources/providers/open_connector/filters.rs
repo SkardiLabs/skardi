@@ -14,13 +14,21 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use serde_json::Value;
 
-/// One allowlisted pushdown rule: `column <op> literal` → `input_field: literal`.
+/// One allowlisted pushdown rule: `column <operator> literal` → `input_field: literal`.
+///
+/// Exactly one operator per mapping, on purpose: a single
+/// `(input_field, literal)` pair can only faithfully represent one operator's
+/// semantics. Listing several operators against one input field lets two
+/// operators with *different* semantics (e.g. `>` vs `>=` against a
+/// strictly-greater input) both be classified Exact — and the wrong one
+/// silently drops rows DataFusion never reapplies. If a provider input is
+/// exact for two operators, declare two mappings.
 #[derive(Debug, Clone, Copy)]
 pub struct FilterMapping {
     /// Arrow column name the predicate references.
     pub column: &'static str,
-    /// Comparison operators this mapping accepts.
-    pub operators: &'static [Operator],
+    /// The comparison operator this mapping accepts (and exactly represents).
+    pub operator: Operator,
     /// Action input field the translated value is written to.
     pub input_field: &'static str,
 }
@@ -71,10 +79,7 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
 
     let mapping = mappings
         .iter()
-        .find(|mapping| mapping.column == column.name)?;
-    if !mapping.operators.contains(&operator) {
-        return None;
-    }
+        .find(|mapping| mapping.column == column.name && mapping.operator == operator)?;
 
     let value = scalar_to_json(literal)?;
     Some((mapping.input_field.to_string(), value))
@@ -112,12 +117,17 @@ mod tests {
     const MAPPINGS: &[FilterMapping] = &[
         FilterMapping {
             column: "value",
-            operators: &[Operator::Gt, Operator::GtEq],
+            operator: Operator::Gt,
             input_field: "min_value",
         },
         FilterMapping {
+            column: "value",
+            operator: Operator::GtEq,
+            input_field: "min_value_inclusive",
+        },
+        FilterMapping {
             column: "name",
-            operators: &[Operator::Eq],
+            operator: Operator::Eq,
             input_field: "name",
         },
     ];
@@ -136,6 +146,26 @@ mod tests {
         assert_eq!(
             translated.inputs,
             vec![("min_value".to_string(), Value::from(10))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Exact]
+        );
+    }
+
+    #[test]
+    fn per_operator_mapping_routes_to_the_right_input() {
+        // Same column, different operator → the per-operator mapping picks
+        // the input that faithfully represents THIS operator.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("value")),
+            Operator::GtEq,
+            Box::new(lit(10)),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("min_value_inclusive".to_string(), Value::from(10))]
         );
         assert_eq!(
             translated.pushdown,

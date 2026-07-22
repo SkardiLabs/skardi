@@ -612,6 +612,48 @@ bindings:
     }
 
     #[tokio::test]
+    async fn gteq_is_not_pushed_to_strict_gt_input() {
+        // The gateway's `min_value` is strictly greater-than, so `>=` has no
+        // faithful pushdown and must stay in DataFusion. Pushing it as Exact
+        // would silently drop the boundary row (value == 3.0).
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_FILTER, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_FILTER, 0)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_FILTER);
+        }
+
+        let before = execute_requests(&gateway).len();
+        let df = ctx
+            .sql("SELECT id FROM saas.ws.items WHERE value >= 3.0 ORDER BY id")
+            .await
+            .expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3, "boundary row id=3 must be present (ids 3,4,5)");
+
+        let new_requests = &execute_requests(&gateway)[before..];
+        assert!(
+            new_requests.iter().all(|r| !r.body.contains("min_value")),
+            "no min_value may be pushed for >=: {:?}",
+            new_requests.iter().map(|r| &r.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn cached_scan_replays_without_new_requests() {
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 3)).await;
 
