@@ -8,10 +8,7 @@
 
 Skardi will support RSS/Atom subscriptions as a first-class, read-only data source, `type: rss`. One configured source binds a subscription list and exposes two fixed tables: `feeds`, one row per subscription carrying fetch health, and `items`, the live union of all current entries across subscriptions. Scans fetch at query time through a per-feed TTL cache with HTTP conditional requests; each feed is an independent execution partition, so a dead feed degrades visibly instead of failing the scan.
 
-The design exposes two SQL surfaces:
-
-1. Persistent stable tables `<name>.main.feeds` and `<name>.main.items`, registered from context YAML.
-2. `html_to_markdown()`, a scalar UDF that closes the type gap between feed HTML and `chunk('markdown', …)` pipelines.
+The design exposes one SQL surface: persistent stable tables `<name>.main.feeds` and `<name>.main.items`, registered from context YAML. The type gap between wire-faithful feed HTML and markdown-aware chunking closes inside the existing `chunk()` UDF — a new `'html'` mode converts HTML to Markdown before splitting. It is a bridge between the provider and `chunk()`, not a new user-facing function.
 
 The provider is deliberately a pure protocol adapter. History retention, chunking, embedding, and hybrid retrieval compose from existing primitives — anti-join `INSERT` pipelines, `chunk()`, `candle()`, `sqlite_knn`/`sqlite_fts`. An `auto_news_base` skill renders and self-verifies that composition end to end.
 
@@ -78,7 +75,7 @@ The design choices, grouped by concern:
 
 - Parse with `feed-rs` behind an `rss` Cargo feature, hardened by a sanitation pre-pass and a fixture corpus.
 - Detect dialect and record declared-versus-parsed conformance queryably.
-- Store content wire-faithful (HTML); provide `html_to_markdown()` as a separate scalar UDF.
+- Store content wire-faithful (HTML); bridge it into chunking with an `'html'` mode on the existing `chunk()` UDF rather than a new scalar UDF.
 - Pin stable columns for the RSS/Atom core plus enclosures; collapse other namespaces into `extensions_json`.
 - Publish the dialect → unified-schema mapping in docs and as semantics-overlay column descriptions.
 
@@ -143,7 +140,7 @@ flowchart LR
         Prov["type: rss provider<br/>fetch / cache / parse<br/>partition per feed"] --> Items["items live window"]
     end
     subgraph UserSpace["user-space composition (rendered by auto_news_base)"]
-        P["archive pipeline<br/>anti-join INSERT +<br/>html_to_markdown + chunk + candle"]
+        P["archive pipeline<br/>anti-join INSERT +<br/>chunk('html') + candle"]
         A["sqlite archive<br/>news_items: wire-faithful rows<br/>news_chunks: chunks + embeddings<br/>(fts5 / vec0 mirrors)"]
         News["skardi news<br/>hybrid search, citable results"]
         P --> A --> News
@@ -154,7 +151,7 @@ flowchart LR
 
 ## Components
 
-Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the stable tables and the `html_to_markdown` UDF), and packaging (user space, outside the provider).
+Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the stable tables and the `'html'` chunk mode), and packaging (user space, outside the provider).
 
 ### Configuration layer
 
@@ -186,9 +183,9 @@ A strict `feed-rs` parse is attempted first; on failure a bounded, deterministic
 
 `feeds` and `items` are fixed-`SchemaRef` `TableProvider`s over a shared execution plan that exposes one partition per subscription. A `feeds` scan reads cache/state for feeds within TTL and revalidates the rest — the cheap health check.
 
-#### `html_to_markdown()` UDF
+#### `chunk('html')` bridge mode
 
-`html_to_markdown()` is a scalar UDF registered alongside the existing model UDFs, backed by a pure-Rust HTML→Markdown crate (`htmd`/`html2md` class, selected at implementation). It closes the type gap between wire-faithful HTML content and `chunk('markdown', …)`, and is useful for any HTML-bearing column, not just RSS.
+The existing `chunk()` UDF gains an `'html'` mode: a pure-Rust HTML→Markdown conversion (`htmd`/`html2md` class, selected at implementation) runs as a pre-pass, then the markdown-aware splitter proceeds exactly as in `'markdown'` mode. No new function is registered — the bridge between provider HTML and chunking lives inside the mode dispatch that already exists for `'character'`/`'markdown'`, and it works for any HTML-bearing column, not just RSS.
 
 ### Packaging layer
 
@@ -264,10 +261,10 @@ SELECT name, last_status, dialect, item_count, last_error
 FROM news.main.feeds;
 ```
 
-### `html_to_markdown()` in pipelines
+### Chunking feed HTML in pipelines
 
 ```sql
-SELECT chunk('markdown', html_to_markdown(COALESCE(content, summary)), 1200, 120)
+SELECT chunk('html', COALESCE(content, summary), 1200, 120)
 FROM news.main.items;
 ```
 
@@ -399,7 +396,7 @@ Caching claims no cross-feed consistency: a multi-feed scan can observe differen
 4. **Documented tolerance floor.** Feeds that still fail are visible via `feeds.last_status = 'error'` with `last_error` naming the parse stage; `docs/rss.md` states plainly what Skardi does not salvage.
 5. **Evidence loop.** Live-feed failures extend the sanitation pass and the corpus; the parser choice is revisited only if the gap versus `feedparser` proves structural rather than case-by-case.
 
-Content is stored wire-faithful (HTML); transformation is a query-time choice via `html_to_markdown()`.
+Content is stored wire-faithful (HTML); transformation to Markdown is a query-time choice inside `chunk('html', …)`.
 
 ## Failure Modes
 
@@ -426,7 +423,7 @@ Three milestones, independently reviewable; each gets its own implementation pla
 ```mermaid
 flowchart LR
     M1["M1 — provider core<br/>config, fetch/cache, parse+conformance,<br/>both tables, partitioned exec, pushdown,<br/>fixtures + mock-HTTP suite"]
-    M2["M2 — surfaces<br/>html_to_markdown UDF,<br/>docs/rss.md, README row"]
+    M2["M2 — surfaces<br/>chunk 'html' mode,<br/>docs/rss.md, README row"]
     M3["M3 — skill<br/>auto_news_base rendering<br/>+ self-verification"]
     M1 --> M2 --> M3
 ```
@@ -435,10 +432,10 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 
 ## Testing Strategy
 
-- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection.
+- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown).
 - **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields).
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation, response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration.
-- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency; citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
+- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('html')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency; citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
 ## Acceptance Criteria
@@ -448,7 +445,7 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 3. Two scans within TTL cause one fetch per feed; after TTL expiry an unchanged feed takes the 304 path with no reparse.
 4. With one dead feed among N, `items` returns the other feeds' rows, `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
 5. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
-6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `html_to_markdown()` + `chunk()` + `candle()`; rerunning it inserts zero new rows.
+6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `chunk('html')` + `candle()`; rerunning it inserts zero new rows.
 7. `items` participates in a federated join with an existing Skardi source.
 8. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
 9. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
@@ -468,7 +465,7 @@ crates/skardi/src/sources/providers/rss/
 ├── table.rs      # feeds/items TableProviders (fixed SchemaRef)
 ├── exec.rs       # partition-per-feed ExecutionPlan
 └── fixtures/     # compatibility corpus (tests only)
-crates/skardi/src/model/html_markdown.rs   # html_to_markdown() scalar UDF
+crates/skardi/src/model/chunking/          # gains the 'html' mode (HTML→Markdown pre-pass)
 docs/rss.md
 ```
 
@@ -478,6 +475,7 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 
 - README supported-sources table row and architecture mention.
 - `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, pipeline examples, troubleshooting.
+- `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
 - A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
 - skardi-skills: `auto_news_base` README with the five-step flow and self-verification contract.
