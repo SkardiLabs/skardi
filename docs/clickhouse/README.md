@@ -90,7 +90,8 @@ A ClickHouse table maps 1:1 to a SQL table; column types map to Arrow:
 | `Float64` | `Float64` column |
 | `Nullable(T)` | nullable column of `T` |
 | `Bool` | `Boolean` column |
-| `DateTime` | `Timestamp` column |
+| `DateTime64` | `Timestamp` column |
+| `DateTime` / `Date` | `UInt32` / `UInt16` (raw epoch days/seconds — ClickHouse's ArrowStream format does not tag them as timestamps; use `DateTime64` for a real `Timestamp` column) |
 
 Each table-mode data source binds to **one** ClickHouse table (via the `table`
 option). To expose several tables, declare one data source per table — see
@@ -109,10 +110,12 @@ refuses direct SELECT (e.g. `Kafka`) cannot be registered in table mode.
 
 Pipeline SQL is planned by DataFusion, and the table scan underneath is
 unparsed back into ClickHouse SQL: predicates on the scanned table,
-projections, and `LIMIT`s run **inside ClickHouse**, so a
+projections, and bare `LIMIT`s run **inside ClickHouse**, so a
 `WHERE id = {user_id}` pipeline transfers one row, not the table. Joins and
-aggregations across sources execute in Skardi after the (already filtered)
-scans return.
+aggregations execute in Skardi after the (already filtered) scans return —
+including joins between two tables on the *same* ClickHouse server. `ORDER BY`
+is not pushed down either, so a `LIMIT` that sits above an `ORDER BY` also
+runs in Skardi (the scan still only fetches the projected columns).
 
 **Aggregates are not pushed down.** A bare `SELECT count(*) FROM t` streams
 one column of `t` (the narrowest fixed-width column) over HTTP and counts
@@ -130,7 +133,7 @@ SQL).
 | Pipeline | Parameters | Description |
 |----------|------------|-------------|
 | `query_user_by_id` | `user_id` | Point lookup by primary key |
-| `list_all_users` | `limit` | Full scan, `LIMIT` pushed down |
+| `list_all_users` | `limit` | Full scan; the `ORDER BY` + `LIMIT` run in Skardi |
 | `products_by_category` | `category` | Filter on a `Nullable(String)` column |
 | `user_order_summary` | `min_total` | Join users ⨝ orders, aggregate spend per user |
 | `federated_stock_value` | `warehouse` | Join ClickHouse products with a CSV warehouse map |
