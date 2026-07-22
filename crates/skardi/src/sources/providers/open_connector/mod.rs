@@ -232,16 +232,16 @@ pub async fn register_open_connector_tables(
             )?;
             schema_provider
                 .register_table(table_name.clone(), Arc::new(provider))
-                .map_err(|e| OpenConnectorError::ActionContractMismatch {
-                    table: table.id.to_string(),
-                    reason: format!("failed to register into catalog schema: {e}"),
+                .map_err(|e| OpenConnectorError::CatalogRegistrationFailed {
+                    name: format!("{name}.{}.{table_name}", binding.name),
+                    reason: format!("failed to register table into catalog schema: {e}"),
                 })?;
         }
 
         catalog
             .register_schema(&binding.name, schema_provider)
-            .map_err(|e| OpenConnectorError::ActionContractMismatch {
-                table: binding.name.clone(),
+            .map_err(|e| OpenConnectorError::CatalogRegistrationFailed {
+                name: format!("{name}.{}", binding.name),
                 reason: format!("failed to register schema in catalog: {e}"),
             })?;
     }

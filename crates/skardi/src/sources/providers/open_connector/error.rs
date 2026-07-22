@@ -246,6 +246,12 @@ pub enum OpenConnectorError {
     #[error("Open Connector source-pack table '{table}' failed its compatibility check: {reason}")]
     ActionContractMismatch { table: String, reason: String },
 
+    /// Assembling the DataFusion catalog/schema failed (e.g. a duplicate
+    /// registration). An internal consistency error, unrelated to the action
+    /// contract.
+    #[error("Open Connector catalog registration failed for '{name}': {reason}")]
+    CatalogRegistrationFailed { name: String, reason: String },
+
     /// A scan hit a safety bound before the collection was exhausted, so the
     /// result would be incomplete — fail rather than return partial rows.
     #[error(
