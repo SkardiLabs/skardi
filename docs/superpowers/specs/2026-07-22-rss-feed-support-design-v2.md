@@ -38,7 +38,7 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 - Publish the dialect → unified-schema mapping as documentation and semantics annotations.
 - Preserve an escape hatch for ad-hoc exploration: `rss_scan(url)` without registration.
 - Support federated joins between feed items and existing Skardi sources.
-- Let `auto_news_base` assemble a searchable, citable news base from a natural-language subscription list.
+- Let `auto_news_base` assemble a searchable, citable news base from a natural-language subscription list, keep it maintainable afterwards through configuration edits alone, and keep results citable after entries leave the live window.
 
 ## Non-goals
 
@@ -82,6 +82,12 @@ The design choices, grouped by concern:
 - Store content wire-faithful (HTML); provide `html_to_markdown()` as a separate scalar UDF.
 - Pin stable columns for the RSS/Atom core plus enclosures; collapse other namespaces into `extensions_json`.
 - Publish the dialect → unified-schema mapping in docs and as semantics-overlay column descriptions.
+
+**Downstream contract**
+
+- Archive in two tables: `news_items` keeps one wire-faithful row per entry and is the anti-join target; `news_chunks` holds chunks and embeddings — so citations and re-processing survive the live window.
+- Keep every rendered artifact except the `rss:` block subscription-agnostic; subscription edits are configuration-only and re-render nothing.
+- Render idempotently: `IF NOT EXISTS` DDL, diff-before-write, never blind-overwrite a user-edited file.
 
 ## Alternatives Considered
 
@@ -132,14 +138,21 @@ flowchart LR
     S -.->|"rows"| A
 ```
 
-Downstream, the live window feeds ordinary pipelines; the `auto_news_base` skill renders this composition:
+Downstream, the live window feeds ordinary pipelines; the `auto_news_base` skill renders the user-space half of this picture:
 
 ```mermaid
 flowchart LR
+    subgraph Engine["engine-guaranteed"]
+        Prov["type: rss provider<br/>fetch / cache / parse<br/>partition per feed"] --> Items["items live window"]
+    end
+    subgraph UserSpace["user-space composition (rendered by auto_news_base)"]
+        P["archive pipeline<br/>anti-join INSERT +<br/>html_to_markdown + chunk + candle"]
+        A["sqlite archive<br/>news_items: wire-faithful rows<br/>news_chunks: chunks + embeddings<br/>(fts5 / vec0 mirrors)"]
+        News["skardi news<br/>hybrid search, citable results"]
+        P --> A --> News
+    end
     Sync["skardi sync"] -.->|runs| P
-    Items["items live window"] --> P["archive pipeline<br/>anti-join INSERT +<br/>html_to_markdown + chunk + candle"]
-    P --> A["sqlite archive<br/>news_items: wire-faithful rows<br/>news_chunks: chunks + embeddings<br/>(fts5 / vec0 mirrors)"]
-    A --> News["skardi news<br/>hybrid search, citable results"]
+    Items --> P
 ```
 
 ## Components
