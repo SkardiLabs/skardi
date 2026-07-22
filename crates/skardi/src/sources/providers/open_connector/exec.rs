@@ -42,6 +42,7 @@ pub struct OpenConnectorExec {
     gateway: String,
     connection_alias: Option<String>,
     table: &'static SourcePackTable,
+    source_pack_version: u32,
     converter: Arc<RowConverter>,
     row_path: RowPath,
     resource: Value,
@@ -77,6 +78,7 @@ impl OpenConnectorExec {
         gateway: String,
         connection_alias: Option<String>,
         table: &'static SourcePackTable,
+        source_pack_version: u32,
         converter: Arc<RowConverter>,
         row_path: RowPath,
         resource: Value,
@@ -104,6 +106,7 @@ impl OpenConnectorExec {
             gateway,
             connection_alias,
             table,
+            source_pack_version,
             converter,
             row_path,
             resource,
@@ -243,7 +246,7 @@ impl ScanState {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),
             action_id: exec.table.action_id,
-            source_pack_version: 1,
+            source_pack_version: exec.source_pack_version,
             resource: &exec.resource,
             filter_inputs: &exec.filter_inputs,
             projection: &projection_names,
@@ -401,5 +404,58 @@ impl ScanState {
             return Ok(None);
         }
         Ok(Some(batch))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
+    use serde_json::json;
+
+    fn exec_with_version(source_pack_version: u32) -> OpenConnectorExec {
+        let table = &MOCK_PACK.tables[0];
+        let client = Arc::new(
+            OpenConnectorClient::new("http://127.0.0.1:1", "t", Duration::from_secs(1))
+                .expect("build client"),
+        );
+        OpenConnectorExec::new(
+            client,
+            None,
+            "saas".to_string(),
+            None,
+            table,
+            source_pack_version,
+            Arc::new(RowConverter::new(table.fields).expect("converter")),
+            RowPath::parse(table.row_path).expect("row path"),
+            json!({}),
+            vec![],
+            None,
+            None,
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .expect("build exec")
+    }
+
+    #[test]
+    fn cache_key_uses_the_bound_pack_version() {
+        // The key component exists so a pack upgrade (v1 → v2) cannot serve
+        // stale rows from the old schema's cache entry; hardcoding 1 would
+        // silently defeat it.
+        let state_v1 = ScanState::new(&exec_with_version(1));
+        let state_v2 = ScanState::new(&exec_with_version(2));
+        assert!(
+            state_v1.cache_key.contains(r#""source_pack_version":1"#),
+            "v1 key: {}",
+            state_v1.cache_key
+        );
+        assert!(
+            state_v2.cache_key.contains(r#""source_pack_version":2"#),
+            "v2 key: {}",
+            state_v2.cache_key
+        );
+        assert_ne!(state_v1.cache_key, state_v2.cache_key);
     }
 }

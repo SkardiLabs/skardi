@@ -217,6 +217,7 @@ pub async fn register_open_connector_tables(
                 name.to_string(),
                 binding.connection_alias.clone(),
                 table,
+                pack.version,
                 Value::Object(
                     binding
                         .resource

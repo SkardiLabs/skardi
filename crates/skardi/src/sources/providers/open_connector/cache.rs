@@ -357,6 +357,12 @@ mod tests {
         };
         assert_ne!(base, scan_cache_key(&limited));
 
+        let pack_v2 = ScanKeyParts {
+            source_pack_version: 2,
+            ..parts("saas", &projection)
+        };
+        assert_ne!(base, scan_cache_key(&pack_v2));
+
         let other_projection = scan_cache_key(&parts("saas", &["name".to_string()]));
         assert_ne!(base, other_projection);
     }
