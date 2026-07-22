@@ -3,7 +3,6 @@
 **Status:** Draft for review
 **Date:** 2026-07-22
 **Branch:** `add_RSS_Feed`
-**Supersedes:** `2026-07-20-rss-feed-support-design.md` (same substance; restructured for review following the Open Connector design's document architecture)
 
 ## Summary
 
@@ -22,8 +21,6 @@ The provider is deliberately a pure protocol adapter. History retention, chunkin
 Agents need continuously updating external information — industry news, competitor blogs, arXiv categories, CVE announcements, GitHub releases — as *retrievable, citable context* rather than one-shot web searches. RSS/Atom is the only open, machine-readable standard for this class of content, and it remains ubiquitous.
 
 The engine already contains almost every needed primitive: pipelines can `INSERT`, `chunk()` and `candle()` run inline in SQL, `sqlite_knn`/`sqlite_fts` power hybrid search, aliases expose short verbs, and semantics overlays make tables agent-discoverable. What is missing is the protocol translation — feed XML to relational rows — and the packaging that lets a user get from "the blogs I read" to "my agent can search them" in one conversation.
-
-RSS also completes Skardi's source palette alongside the approved Open Connector integration (`2026-07-11-open-connector-integration-design.md`): Open Connector covers *authenticated SaaS* behind a gateway; RSS covers the *unauthenticated open web*. Both follow the same relational-contract design language; neither needs the other's machinery.
 
 ## Research Findings
 
@@ -55,25 +52,36 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 
 ## Decisions
 
-The design choices are:
+The design choices, grouped by concern:
+
+**Relational model**
 
 - Model one source as one subscription list; a single feed is a list of length one.
 - Register two fixed, protocol-pinned tables as a catalog: `feeds` and `items`, with a `feed` discriminator column instead of per-feed tables.
 - Key item identity by `(feed, guid)`, with `guid` falling back to `link`.
 - Serve a live window only; compose history through pipelines.
+
+**Freshness, execution, and failure**
+
 - Fetch at scan time through a per-feed TTL cache with HTTP conditional requests; cache only complete, successfully parsed windows.
 - Execute one DataFusion partition per feed.
 - Degrade per feed in multi-feed scans, visibly; fail fast in the single-feed `rss_scan`.
+- Compile `rss_scan` and the catalog tables to one shared scan path.
+- Push down only `feed`/`feed_url` equality and `IN`; stop launching fetches once `LIMIT` is satisfied.
+
+**Configuration and registration**
+
 - Configure through a typed `rss:` block, not the flat options map.
 - Treat the subscription list as configuration, never as SQL-mutable data.
+- Perform zero network I/O at registration.
+
+**Parsing and normalization**
+
 - Parse with `feed-rs` behind an `rss` Cargo feature, hardened by a sanitation pre-pass and a fixture corpus.
 - Detect dialect and record declared-versus-parsed conformance queryably.
 - Store content wire-faithful (HTML); provide `html_to_markdown()` as a separate scalar UDF.
 - Pin stable columns for the RSS/Atom core plus enclosures; collapse other namespaces into `extensions_json`.
 - Publish the dialect → unified-schema mapping in docs and as semantics-overlay column descriptions.
-- Compile `rss_scan` and the catalog tables to one shared scan path.
-- Perform zero network I/O at registration.
-- Push down only `feed`/`feed_url` equality and `IN`; stop launching fetches once `LIMIT` is satisfied.
 
 ## Alternatives Considered
 
@@ -84,10 +92,6 @@ Discovery-style catalogs (sqlite) exist because table structure is unknown ahead
 ### A generic `type: xml` source
 
 XML is syntax, not a data contract: a generic XML source cannot declare a fixed schema without a user-authored XPath mapping layer, which is a different and much larger product. RSS/Atom is a protocol with known fields — exactly what a `TableProvider`'s fixed `SchemaRef` wants. Rejected.
-
-### Riding the Open Connector gateway
-
-RSS is unauthenticated public HTTP; the gateway owns OAuth and credentials that RSS does not have. The two designs share the same relational-contract language — typed config, live-by-default + TTL, completeness invariant, dual interface, bounded execution — without sharing infrastructure. Rejected.
 
 ### History or archive inside the provider
 
@@ -114,48 +118,85 @@ flowchart LR
     Engine --> Web["Feed servers<br/>(open, unauthenticated web)"]
 ```
 
+One agent request, end to end — solid arrows carry the request outward, dashed arrows the response back. The Feed server leg fires only when the cache window has expired; within TTL the response turns around at the cache. Per-partition rules and failure modes are normative in "Scan Execution".
+
+```mermaid
+flowchart LR
+    A["Agent"] -->|"skardi news"| S["Skardi<br/>SQL / DataFusion"]
+    S -->|"scan"| E["RSS provider"]
+    E -->|"lookup"| C["TTL cache"]
+    C -->|"expired: conditional GET"| W["Feed server"]
+    W -.->|"304 / 200"| C
+    C -.->|"Arrow batches"| E
+    E -.->|"batches"| S
+    S -.->|"rows"| A
+```
+
 Downstream, the live window feeds ordinary pipelines; the `auto_news_base` skill renders this composition:
 
 ```mermaid
 flowchart LR
+    Sync["skardi sync"] -.->|runs| P
     Items["items live window"] --> P["archive pipeline<br/>anti-join INSERT +<br/>html_to_markdown + chunk + candle"]
-    P --> A["sqlite archive<br/>fts5 / vec0 mirrors"]
-    A --> V["verbs: skardi sync / skardi news"]
+    P --> A["sqlite archive<br/>news_items: wire-faithful rows<br/>news_chunks: chunks + embeddings<br/>(fts5 / vec0 mirrors)"]
+    A --> News["skardi news<br/>hybrid search, citable results"]
 ```
 
 ## Components
 
-### Source registration
+Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the three query entry points), and packaging (user space, outside the provider).
+
+### Configuration layer
+
+#### Source registration
 
 `DataSourceType::Rss` variant, dispatch arms in `crates/server/src/config.rs` and `crates/cli/src/main.rs`, membership in `CATALOG_SUPPORTED_SOURCES` and deliberate absence from `WRITABLE_SOURCE_TYPES`, and a Cargo feature `rss = ["dep:feed-rs", …]` following the `documents` precedent. Registration validates configuration only — URL syntax, bounds, OPML readability — and performs zero network I/O; probing dozens of feeds at boot would make startup slow and brittle.
 
-### Typed configuration
+#### Typed configuration
 
 `DataSource` receives an optional typed `rss` field, valid only for `type: rss`, because the flat `options: HashMap<String, String>` cannot safely express a nested subscription list. It carries the subscription list (inline or an OPML path, mutually exclusive), TTL, politeness bounds, and user agent.
 
-### Fetcher
+### Engine layer
+
+#### Fetcher
 
 The fetcher owns bounded HTTP: per-request timeout, total scan deadline, response-size cap, bounded jittered retries honoring `Retry-After`, cancellation, and conditional GET with stored ETag / Last-Modified validators. Concurrency is capped by `max_concurrent`, which doubles as the per-host politeness bound. A self-identifying `User-Agent` is sent by default — feed servers routinely ban anonymous clients.
 
-### Cache
+#### Cache
 
 A per-feed, in-memory, bounded (bytes + entries, LRU) TTL cache behind a small trait so a persistent implementation can be swapped in later without touching the table providers. An entry stores parsed Arrow batches, ETag / Last-Modified validators, and fetch metadata. Only complete, successfully parsed feed windows are ever stored.
 
-### Parser and conformance checker
+#### Parser and conformance checker
 
 A strict `feed-rs` parse is attempted first; on failure a bounded, deterministic sanitation pass runs and the parse is retried once. After every successful parse, a conformance check records the declared dialect, the parsed dialect, and any deviations. Details in "Parsing, Sanitation, and Conformance".
 
-### Table providers and execution plan
+### SQL layer
+
+#### Table providers and execution plan
 
 `feeds` and `items` are fixed-`SchemaRef` `TableProvider`s over a shared execution plan that exposes one partition per subscription. A `feeds` scan reads cache/state for feeds within TTL and revalidates the rest — the cheap health check.
 
-### `rss_scan` UDTF and `html_to_markdown()` UDF
+#### `rss_scan` UDTF and `html_to_markdown()` UDF
 
 `rss_scan(url)` returns the `items` schema for a single unregistered feed through the same fetch/sanitize/parse path, default TTL 0. `html_to_markdown()` is a scalar UDF registered alongside the existing model UDFs, backed by a pure-Rust HTML→Markdown crate (`htmd`/`html2md` class, selected at implementation); it is useful for any HTML-bearing column, not just RSS.
 
-### `auto_news_base` skill
+### Packaging layer
+
+#### `auto_news_base` skill
 
 Lives in skardi-skills; this spec defines the contract it renders against. It holds no privileged API — everything it produces is plain user-space configuration.
+
+Rendered artifacts: `ctx.yaml` (rss source + sqlite archive), a one-shot DDL script for the archive, `pipelines/archive_ingest.yaml`, `pipelines/search_hybrid.yaml`, `aliases.yaml` (`sync`, `news`), and a semantics overlay. Render rules: the DDL is idempotent (`CREATE TABLE IF NOT EXISTS`); re-rendering shows a diff before writing and never blind-overwrites a user-edited file.
+
+The archive contract is two tables. `news_items` retains one wire-faithful row per entry — primary key `(feed, guid)`, plus `title`, `link`, `author`, `published`, and `content` (HTML) — and is the anti-join target for ingest. `news_chunks` holds `(feed, guid, chunk_idx, chunk_text, embedding, ingested_at)` with the fts5/vec0 mirrors attached. Ingest is two `INSERT` steps: new entries land wire-faithful in `news_items`, then are chunked and embedded from `news_items` into `news_chunks`. Search joins the two inside the archive, so results remain citable (title + link + published) after entries fall out of the live window, and history can always be re-chunked or re-embedded from retained content.
+
+### Skill lifecycle
+
+First assembly is the five-step flow under Rollout. Afterwards, every rendered artifact except the `rss:` block is subscription-agnostic — pipelines, DDL, aliases, and semantics reference `news.main.items`, never individual feeds — so the lifecycle splits cleanly:
+
+- **Subscription add/remove (frequent):** a pure configuration action — preview with `rss_scan`, edit the `rss:` block or OPML, reload. No artifact is re-rendered. Removing a subscription retains its archived history by default (its rows simply stop growing); the skill offers an optional cleanup statement.
+- **Parameter change (rare):** a new chunk size, overlap, or embedding model requires re-rendering the two pipelines and rebuilding `news_chunks` from the content retained in `news_items`; the skill owns this rebuild flow.
+- **Skill re-run over an existing setup:** safe by construction — idempotent DDL, diff-before-write, no blind overwrites.
 
 ## Catalog Namespace
 
@@ -393,14 +434,14 @@ flowchart LR
     M1 --> M2 --> M3
 ```
 
-The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → preview each with `rss_scan` and confirm → render `ctx.yaml`, archive DDL script, ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results and reporting per-feed health.
+The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → preview each with `rss_scan` and confirm → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join) and reporting per-feed health.
 
 ## Testing Strategy
 
 - **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection.
 - **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields).
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation, response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration.
-- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT) with rerun idempotency; `rss_scan` schema parity with the registered tables.
+- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency; citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`; `rss_scan` schema parity with the registered tables.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
 ## Acceptance Criteria
@@ -411,11 +452,13 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 4. With one dead feed among N, `items` returns the other feeds' rows, `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
 5. `rss_scan(url)` returns the `items` schema without registration and fails fast on a broken feed.
 6. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
-7. An archive pipeline using `html_to_markdown()` + `chunk()` + `candle()` INSERTs into SQLite; rerunning it inserts zero new rows.
+7. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `html_to_markdown()` + `chunk()` + `candle()`; rerunning it inserts zero new rows.
 8. `items` participates in a federated join with an existing Skardi source.
 9. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
 10. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
 11. For every fixture, `feeds.dialect` matches the known dialect; a mismatching or spec-violating fixture yields non-empty `conformance_notes` while still serving rows.
+12. After an entry falls out of the live window (mock server shrinks the feed between syncs), `skardi news` still returns its title, link, and published timestamp from the archive.
+13. Adding or removing a subscription changes only the `rss:` block/OPML; every other rendered artifact is byte-identical.
 
 ## Expected Repository Shape
 
