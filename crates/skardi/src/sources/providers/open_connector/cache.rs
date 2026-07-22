@@ -5,10 +5,13 @@
 //! Keys are canonical (see [`scan_cache_key`]) so semantically identical
 //! scans hit regardless of map/projection ordering.
 //!
-//! Scope: entries are written when a scan *completes*, so the cache dedups
-//! repeated queries over time — it does **not** deduplicate scans that
-//! overlap in time (e.g. the two sides of a self-join, which typically run
-//! concurrently and start before either completes). In-flight request
+//! Scope: entries are written when a scan *completes* — either at
+//! pagination exhaustion or when a pushed-down LIMIT is satisfied. The
+//! latter is safe because LIMIT is part of the key: a truncated result is
+//! complete *for that key*. The cache therefore dedups repeated queries
+//! over time (with or without LIMIT) — it does **not** deduplicate scans
+//! that overlap in time (e.g. the two sides of a self-join, which typically
+//! run concurrently and start before either completes). In-flight request
 //! coalescing is a future extension.
 //!
 //! Caching claims no transactional consistency: a live multi-page scan can

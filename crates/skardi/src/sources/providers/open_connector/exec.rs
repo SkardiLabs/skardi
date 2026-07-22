@@ -224,6 +224,9 @@ struct ScanState {
     /// Batches fetched live, for the cache store on completion.
     fetched: Vec<RecordBatch>,
     done: bool,
+    /// Idempotence guard for the two store sites (LIMIT-satisfied and
+    /// exhaustion), which can both fire on the same page.
+    cache_stored: bool,
 }
 
 impl ScanState {
@@ -288,13 +291,18 @@ impl ScanState {
             replay,
             fetched: Vec::new(),
             done,
+            cache_stored: false,
         })
     }
 
-    fn store_cache(&self) {
+    fn store_cache(&mut self) {
+        if self.cache_stored {
+            return;
+        }
         if let Some(cache) = &self.cache {
             cache.put(self.cache_key.clone(), self.fetched.clone());
         }
+        self.cache_stored = true;
     }
 
     fn timeout_error(&self) -> OpenConnectorError {
@@ -392,6 +400,16 @@ impl ScanState {
         }
         if batch.num_rows() > 0 {
             self.fetched.push(batch.clone());
+        }
+
+        // LIMIT satisfied: the truncated batches are the COMPLETE result for
+        // this key (LIMIT is part of the key), so store them now even though
+        // pagination is not exhausted — DataFusion's limit operator may never
+        // poll this stream again, which is exactly why the advance-based
+        // store below is not enough.
+        if self.limit_remaining == Some(0) {
+            self.done = true;
+            self.store_cache();
         }
 
         let more = self.pagination.advance(&envelope, rows.len())?;

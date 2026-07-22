@@ -695,6 +695,50 @@ bindings:
     }
 
     #[tokio::test]
+    async fn limited_scan_is_cached_and_replayed() {
+        // A LIMIT-satisfied scan is complete *for its key* (LIMIT is part of
+        // the key), so it must be stored eagerly — repeated identical LIMIT
+        // queries replay with zero new gateway requests.
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_CACHE, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_CACHE, 60)),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_CACHE);
+        }
+
+        for round in 1..=2 {
+            let df = ctx
+                // No ORDER BY: a sort would force a full scan for TopK and
+                // defeat LIMIT pushdown, which is what we're testing.
+                .sql("SELECT id FROM saas.ws.items LIMIT 2")
+                .await
+                .expect("plan");
+            let batches = df.collect().await.expect("collect");
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 2, "round {round}");
+        }
+
+        assert_eq!(
+            execute_requests(&gateway).len(),
+            1,
+            "first LIMIT scan fetches one page; the replay adds none"
+        );
+    }
+
+    #[tokio::test]
     async fn cached_empty_scan_replays_without_new_requests() {
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 0)).await;
 
