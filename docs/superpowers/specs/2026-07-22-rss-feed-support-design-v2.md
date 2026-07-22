@@ -8,11 +8,10 @@
 
 Skardi will support RSS/Atom subscriptions as a first-class, read-only data source, `type: rss`. One configured source binds a subscription list and exposes two fixed tables: `feeds`, one row per subscription carrying fetch health, and `items`, the live union of all current entries across subscriptions. Scans fetch at query time through a per-feed TTL cache with HTTP conditional requests; each feed is an independent execution partition, so a dead feed degrades visibly instead of failing the scan.
 
-The design exposes three SQL surfaces:
+The design exposes two SQL surfaces:
 
 1. Persistent stable tables `<name>.main.feeds` and `<name>.main.items`, registered from context YAML.
-2. `rss_scan(url)`, a registration-free UDTF for previewing any feed ad hoc.
-3. `html_to_markdown()`, a scalar UDF that closes the type gap between feed HTML and `chunk('markdown', …)` pipelines.
+2. `html_to_markdown()`, a scalar UDF that closes the type gap between feed HTML and `chunk('markdown', …)` pipelines.
 
 The provider is deliberately a pure protocol adapter. History retention, chunking, embedding, and hybrid retrieval compose from existing primitives — anti-join `INSERT` pipelines, `chunk()`, `candle()`, `sqlite_knn`/`sqlite_fts`. An `auto_news_base` skill renders and self-verifies that composition end to end.
 
@@ -36,7 +35,6 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 - Isolate faults per feed; make feed health queryable in SQL, never silent.
 - Record declared-versus-parsed dialect conformance queryably.
 - Publish the dialect → unified-schema mapping as documentation and semantics annotations.
-- Preserve an escape hatch for ad-hoc exploration: `rss_scan(url)` without registration.
 - Support federated joins between feed items and existing Skardi sources.
 - Let `auto_news_base` assemble a searchable, citable news base from a natural-language subscription list, keep it maintainable afterwards through configuration edits alone, and keep results citable after entries leave the live window.
 
@@ -47,6 +45,7 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 - Push (WebSub). Recorded as a future extension; it is a cache-invalidation signal, not a different provider shape.
 - A write path. The source registers strictly read-only; `WRITABLE_SOURCE_TYPES` is untouched.
 - Authenticated feeds. Cookie-, token-, or basic-auth-protected feeds belong behind Open Connector or a scoped follow-up.
+- Ad-hoc scanning of unregistered feeds. An `rss_scan(url)` preview UDTF was cut at review: every feed Skardi reads is declared in configuration first. Registration is zero-I/O and the `feeds` health table covers the preview need; recorded as a future extension.
 - History retention in the provider. The live window is the contract; archiving is a pipeline composition.
 - A gateway. RSS is unauthenticated public HTTP with an open wire format; a gateway adds a moving part and buys nothing.
 
@@ -65,14 +64,14 @@ The design choices, grouped by concern:
 
 - Fetch at scan time through a per-feed TTL cache with HTTP conditional requests; cache only complete, successfully parsed windows.
 - Execute one DataFusion partition per feed.
-- Degrade per feed in multi-feed scans, visibly; fail fast in the single-feed `rss_scan`.
-- Compile `rss_scan` and the catalog tables to one shared scan path.
+- Degrade per feed, visibly; a dead feed never fails the whole scan.
 - Push down only `feed`/`feed_url` equality and `IN`; stop launching fetches once `LIMIT` is satisfied.
 
 **Configuration and registration**
 
 - Configure through a typed `rss:` block, not the flat options map.
 - Treat the subscription list as configuration, never as SQL-mutable data.
+- Expose registered subscriptions only; ad-hoc scanning of unregistered URLs is deferred (see Non-goals).
 - Perform zero network I/O at registration.
 
 **Parsing and normalization**
@@ -105,7 +104,7 @@ A provider that owns an archive database is stateful, needs retention policy, co
 
 ### Scan-level all-or-nothing failure for multi-feed scans
 
-One unreachable blog would render a 50-subscription news base unqueryable. The spirit of the Open Connector rule — no *silent* incompleteness — is kept while the granularity moves to the feed. Rejected for `items`; adopted for `rss_scan`.
+One unreachable blog would render a 50-subscription news base unqueryable. The spirit of the Open Connector rule — no *silent* incompleteness — is kept while the granularity moves to the feed. Rejected.
 
 ## High-level Architecture
 
@@ -116,10 +115,8 @@ flowchart LR
     SQL["SQL query"] --> DF["DataFusion"]
     DF --> Feeds["feeds table"]
     DF --> Items["items table"]
-    DF --> ScanFn["rss_scan(url)"]
     Feeds --> Engine["Shared fetch/parse engine<br/>partition per feed"]
     Items --> Engine
-    ScanFn --> Engine
     Engine --> Cache["Per-feed TTL cache<br/>+ ETag / Last-Modified state"]
     Engine --> Web["Feed servers<br/>(open, unauthenticated web)"]
 ```
@@ -157,7 +154,7 @@ flowchart LR
 
 ## Components
 
-Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the three query entry points), and packaging (user space, outside the provider).
+Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the stable tables and the `html_to_markdown` UDF), and packaging (user space, outside the provider).
 
 ### Configuration layer
 
@@ -189,9 +186,9 @@ A strict `feed-rs` parse is attempted first; on failure a bounded, deterministic
 
 `feeds` and `items` are fixed-`SchemaRef` `TableProvider`s over a shared execution plan that exposes one partition per subscription. A `feeds` scan reads cache/state for feeds within TTL and revalidates the rest — the cheap health check.
 
-#### `rss_scan` UDTF and `html_to_markdown()` UDF
+#### `html_to_markdown()` UDF
 
-`rss_scan(url)` returns the `items` schema for a single unregistered feed through the same fetch/sanitize/parse path, default TTL 0. `html_to_markdown()` is a scalar UDF registered alongside the existing model UDFs, backed by a pure-Rust HTML→Markdown crate (`htmd`/`html2md` class, selected at implementation); it is useful for any HTML-bearing column, not just RSS.
+`html_to_markdown()` is a scalar UDF registered alongside the existing model UDFs, backed by a pure-Rust HTML→Markdown crate (`htmd`/`html2md` class, selected at implementation). It closes the type gap between wire-faithful HTML content and `chunk('markdown', …)`, and is useful for any HTML-bearing column, not just RSS.
 
 ### Packaging layer
 
@@ -207,7 +204,7 @@ The archive contract is two tables. `news_items` retains one wire-faithful row p
 
 First assembly is the five-step flow under Rollout. Afterwards, every rendered artifact except the `rss:` block is subscription-agnostic — pipelines, DDL, aliases, and semantics reference `news.main.items`, never individual feeds — so the lifecycle splits cleanly:
 
-- **Subscription add/remove (frequent):** a pure configuration action — preview with `rss_scan`, edit the `rss:` block or OPML, reload. No artifact is re-rendered. Removing a subscription retains its archived history by default (its rows simply stop growing); the skill offers an optional cleanup statement.
+- **Subscription add/remove (frequent):** a pure configuration action — edit the `rss:` block or OPML, reload, then verify the new feed with one `feeds` health query (`last_status`, `last_error`). No artifact is re-rendered. Removing a subscription retains its archived history by default (its rows simply stop growing); the skill offers an optional cleanup statement.
 - **Parameter change (rare):** a new chunk size, overlap, or embedding model requires re-rendering the two pipelines and rebuilding `news_chunks` from the content retained in `news_items`; the skill owns this rebuild flow.
 - **Skill re-run over an existing setup:** safe by construction — idempotent DDL, diff-before-write, no blind overwrites.
 
@@ -249,7 +246,7 @@ Subscription management is a configuration action, not a SQL action: no SQL stat
 
 ### Stable tables
 
-The preferred interface for repeated queries and federated joins:
+Repeated queries and federated joins run against the stable tables:
 
 ```sql
 SELECT title, link, published
@@ -266,18 +263,6 @@ The `feed = 'rust-blog'` predicate prunes execution to exactly one partition —
 SELECT name, last_status, dialect, item_count, last_error
 FROM news.main.feeds;
 ```
-
-### `rss_scan` UDTF
-
-Ad-hoc preview of any feed, no registration:
-
-```sql
-SELECT title, link, published
-FROM rss_scan('https://blog.example.com/feed.xml')
-LIMIT 10;
-```
-
-Same schema, same scan path, single-origin and therefore fail-fast. This is the skill's subscribe-time preview and any user's "what is in this feed?" one-liner.
 
 ### `html_to_markdown()` in pipelines
 
@@ -351,7 +336,7 @@ All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a diale
 
 ## Scan Execution
 
-Catalog tables and `rss_scan` share one scan pipeline.
+The `feeds` and `items` tables share one scan pipeline.
 
 ```mermaid
 sequenceDiagram
@@ -428,7 +413,6 @@ Content is stored wire-faithful (HTML); transformation is a query-time choice vi
 | Slow feed | Per-request timeout isolates it; scan deadline bounds the whole query |
 | HTTP 304 | Cache re-armed without reparse; `last_status = 'revalidated'` |
 | HTTP 429 / transient 5xx | Bounded jittered retries honoring `Retry-After` within the scan deadline |
-| `rss_scan` on a bad URL/feed | Fails fast with a targeted HTTP or parse error (single-origin all-or-nothing) |
 | `LIMIT` satisfied early | Remaining partitions never launch; incomplete scans are never cached |
 
 ## Observability
@@ -442,19 +426,19 @@ Three milestones, independently reviewable; each gets its own implementation pla
 ```mermaid
 flowchart LR
     M1["M1 — provider core<br/>config, fetch/cache, parse+conformance,<br/>both tables, partitioned exec, pushdown,<br/>fixtures + mock-HTTP suite"]
-    M2["M2 — surfaces<br/>rss_scan UDTF, html_to_markdown UDF,<br/>docs/rss.md, README row"]
+    M2["M2 — surfaces<br/>html_to_markdown UDF,<br/>docs/rss.md, README row"]
     M3["M3 — skill<br/>auto_news_base rendering<br/>+ self-verification"]
     M1 --> M2 --> M3
 ```
 
-The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → preview each with `rss_scan` and confirm → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join) and reporting per-feed health.
+The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → reload and confirm each subscription against the `feeds` health table (registration is zero-I/O, so the first `feeds` scan is the preview), pruning dead or mis-discovered feeds → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join) and reporting per-feed health.
 
 ## Testing Strategy
 
 - **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection.
 - **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields).
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation, response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration.
-- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency; citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`; `rss_scan` schema parity with the registered tables.
+- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`html_to_markdown` → `chunk` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency; citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
 ## Acceptance Criteria
@@ -463,15 +447,14 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 2. `SELECT * FROM news.main.items` fetches all feeds concurrently; `WHERE feed = 'x'` fetches exactly one (verified by mock request counts).
 3. Two scans within TTL cause one fetch per feed; after TTL expiry an unchanged feed takes the 304 path with no reparse.
 4. With one dead feed among N, `items` returns the other feeds' rows, `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
-5. `rss_scan(url)` returns the `items` schema without registration and fails fast on a broken feed.
-6. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
-7. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `html_to_markdown()` + `chunk()` + `candle()`; rerunning it inserts zero new rows.
-8. `items` participates in a federated join with an existing Skardi source.
-9. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
-10. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
-11. For every fixture, `feeds.dialect` matches the known dialect; a mismatching or spec-violating fixture yields non-empty `conformance_notes` while still serving rows.
-12. After an entry falls out of the live window (mock server shrinks the feed between syncs), `skardi news` still returns its title, link, and published timestamp from the archive.
-13. Adding or removing a subscription changes only the `rss:` block/OPML; every other rendered artifact is byte-identical.
+5. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
+6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `html_to_markdown()` + `chunk()` + `candle()`; rerunning it inserts zero new rows.
+7. `items` participates in a federated join with an existing Skardi source.
+8. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
+9. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
+10. For every fixture, `feeds.dialect` matches the known dialect; a mismatching or spec-violating fixture yields non-empty `conformance_notes` while still serving rows.
+11. After an entry falls out of the live window (mock server shrinks the feed between syncs), `skardi news` still returns its title, link, and published timestamp from the archive.
+12. Adding or removing a subscription changes only the `rss:` block/OPML; every other rendered artifact is byte-identical.
 
 ## Expected Repository Shape
 
@@ -484,7 +467,6 @@ crates/skardi/src/sources/providers/rss/
 ├── parse.rs      # sanitation pre-pass + conformance check + feed-rs → Arrow
 ├── table.rs      # feeds/items TableProviders (fixed SchemaRef)
 ├── exec.rs       # partition-per-feed ExecutionPlan
-├── udtf.rs       # rss_scan table function
 └── fixtures/     # compatibility corpus (tests only)
 crates/skardi/src/model/html_markdown.rs   # html_to_markdown() scalar UDF
 docs/rss.md
@@ -495,13 +477,14 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, `rss_scan` and pipeline examples, troubleshooting.
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, pipeline examples, troubleshooting.
 - A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
 - skardi-skills: `auto_news_base` README with the five-step flow and self-verification contract.
 
 ## Future Extensions
 
+- An ad-hoc `rss_scan(url)` preview UDTF over the same fetch/sanitize/parse path, if a registration-free surface proves necessary; cut from initial scope at review.
 - WebSub (push) as a cache-invalidation signal; requires a resident server; the live-window contract is unchanged.
 - Persistent / shared cache behind the existing cache trait; enables serve-stale across restarts.
 - Scheduled snapshot materialization when a scheduler primitive exists.
