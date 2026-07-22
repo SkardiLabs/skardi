@@ -240,6 +240,23 @@ async fn insert_into_read_only_source_rejected() {
 }
 
 #[tokio::test]
+async fn default_qualified_insert_into_read_only_source_rejected() {
+    // DataFusion resolves `public.products` / `datafusion.public.products`
+    // to the same read-only `products` table — qualifying must not bypass
+    // the access-mode gate.
+    for table in ["public.products", "datafusion.public.products"] {
+        let resp = post_query(
+            make_state(),
+            json!({"sql": format!("INSERT INTO {table} (id, brand) VALUES (6, 'LG')")}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "table: {table}");
+        let body = body_to_json(resp).await;
+        assert_eq!(body["error_type"], json!("sql_validation_error"));
+    }
+}
+
+#[tokio::test]
 async fn insert_into_read_write_source_allowed() {
     let state = make_state();
     let resp = post_query(

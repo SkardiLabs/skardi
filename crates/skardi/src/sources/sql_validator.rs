@@ -290,8 +290,11 @@ fn validate_statement(
             TableObject::TableName(name) => {
                 check_write_access("INSERT", &extract_table_name(name), config)
             }
-            // Table-function targets have no registered name to check.
-            _ => Ok(()),
+            // Non-table targets (`INSERT INTO FUNCTION ...`) have no
+            // registered name to access-check — fail closed.
+            _ => Err(SqlValidationError::StatementNotAllowed {
+                operation: "INSERT INTO FUNCTION".to_string(),
+            }),
         },
         Statement::Update { table, .. } => {
             let table_name = extract_table_name_from_table_with_joins(table);
@@ -357,19 +360,41 @@ fn extract_table_name_from_from_table(from_table: &FromTable) -> String {
     }
 }
 
+/// DataFusion's default catalog and schema: flat sources register as
+/// `datafusion.public.<name>`, so `users`, `public.users`, and
+/// `datafusion.public.users` all resolve to the same table.
+const DEFAULT_CATALOG: &str = "datafusion";
+const DEFAULT_SCHEMA: &str = "public";
+
+/// Drop default-catalog/schema qualifiers so every spelling of a flat
+/// table reference is checked under its registered (bare) name.
+fn strip_default_qualifiers(parts: &[&str]) -> Vec<String> {
+    let parts = match parts {
+        [DEFAULT_CATALOG, DEFAULT_SCHEMA, table] => vec![*table],
+        [DEFAULT_SCHEMA, table] => vec![*table],
+        // Hierarchical sources live as schemas in the default catalog:
+        // `datafusion.mysrc.child` → `mysrc.child`.
+        [DEFAULT_CATALOG, schema, table] => vec![*schema, *table],
+        other => other.to_vec(),
+    };
+    parts.into_iter().map(str::to_string).collect()
+}
+
 fn check_write_access(
     operation: &str,
     table_name: &str,
     config: &SqlValidatorConfig,
 ) -> Result<(), SqlValidationError> {
-    // Look up the full qualified name first; for `source.table` references
-    // also honor the source's access mode, since hierarchical sources
-    // register their tables under the source name as schema.
-    let mode = config.table_access_modes.get(table_name).or_else(|| {
-        table_name
-            .split_once('.')
-            .and_then(|(source, _)| config.table_access_modes.get(source))
-    });
+    let raw_parts: Vec<&str> = table_name.split('.').collect();
+    let parts = strip_default_qualifiers(&raw_parts);
+
+    // Look up the normalized qualified name first; for `source.table`
+    // references also honor the source's access mode, since hierarchical
+    // sources register their tables under the source name as schema.
+    let mode = config
+        .table_access_modes
+        .get(&parts.join("."))
+        .or_else(|| config.table_access_modes.get(&parts[0]));
 
     if mode == Some(&AccessMode::ReadOnly) {
         return Err(SqlValidationError::WriteNotAllowed {
@@ -768,6 +793,53 @@ mod tests {
         assert!(
             result.is_ok(),
             "unrelated qualified table must not match a flat source, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_default_qualifiers_cannot_bypass_write_access() {
+        // DataFusion resolves `users`, `public.users`, and
+        // `datafusion.public.users` to the same flat table, so qualifying
+        // with the default catalog/schema must not skip the access check.
+        let config = test_config();
+        let denied = vec![
+            "INSERT INTO public.users (id) VALUES (1)",
+            "INSERT INTO datafusion.public.users (id) VALUES (1)",
+            "UPDATE public.users SET name = 'x' WHERE id = 1",
+            "DELETE FROM datafusion.public.users WHERE id = 1",
+        ];
+        for sql in denied {
+            let result = validate_sql(sql, &config);
+            assert!(
+                matches!(result, Err(SqlValidationError::WriteNotAllowed { .. })),
+                "'{}' must be rejected (default-qualified read-only table), got: {:?}",
+                sql,
+                result
+            );
+        }
+        // The read_write source stays writable through the same forms.
+        let result = validate_sql(
+            "INSERT INTO datafusion.public.orders (id) VALUES (1)",
+            &config,
+        );
+        assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn test_insert_into_table_function_target_rejected() {
+        // `INSERT INTO FUNCTION ...` (ClickHouse syntax) has no registered
+        // table name to access-check; it must fail closed, not fall through.
+        use sqlparser::dialect::ClickHouseDialect;
+        let statements = Parser::parse_sql(
+            &ClickHouseDialect {},
+            "INSERT INTO FUNCTION remote('addr', db.tbl) VALUES (1)",
+        )
+        .expect("ClickHouse dialect parses INSERT INTO FUNCTION");
+        let result = validate_statement(&statements[0], &test_config());
+        assert!(
+            matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
+            "non-table INSERT target must be rejected, got: {:?}",
             result
         );
     }
