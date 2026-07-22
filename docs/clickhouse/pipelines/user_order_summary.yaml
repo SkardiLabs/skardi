@@ -1,0 +1,18 @@
+kind: pipeline
+
+metadata:
+  name: "user_order_summary"
+  version: "1.0"
+  description: "Join users with orders inside Skardi and aggregate spend per user"
+
+# Parameters:
+#   {min_total} - Only include users whose total spend is at least this amount
+
+spec:
+  query: |
+    SELECT u.name, count(o.id) AS order_count, sum(o.amount) AS total_spent
+    FROM users u
+    JOIN orders o ON u.id = o.user_id
+    GROUP BY u.name
+    HAVING sum(o.amount) >= {min_total}
+    ORDER BY total_spent DESC

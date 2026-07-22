@@ -1,0 +1,21 @@
+kind: pipeline
+
+metadata:
+  name: "federated_stock_value"
+  version: "1.0"
+  description: >
+    Federated join: ClickHouse products x CSV warehouse inventory,
+    rolled up to total stock value per warehouse.
+
+# Parameters:
+#   {warehouse} - Warehouse to report on (e.g. "us-west")
+
+spec:
+  query: |
+    SELECT w.warehouse,
+           count(*) AS skus,
+           round(sum(p.price * w.quantity), 2) AS stock_value
+    FROM products p
+    JOIN product_inventory w ON p.product_id = w.product_id
+    WHERE w.warehouse = {warehouse}
+    GROUP BY w.warehouse

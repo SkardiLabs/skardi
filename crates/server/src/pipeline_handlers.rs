@@ -415,6 +415,7 @@ pub async fn get_data_sources(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb => None,
         };
@@ -426,6 +427,7 @@ pub async fn get_data_sources(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb => {
                 // For database sources, return the connection string as-is

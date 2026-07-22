@@ -1,0 +1,22 @@
+kind: context
+
+metadata:
+  name: ctx_clickhouse_catalog_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # Expose every table in the allowed ClickHouse databases as a DataFusion
+    # catalog. Query tables with the three-part reference:
+    #   ch_catalog.<database>.<table>
+    - name: "ch_catalog"
+      type: "clickhouse"
+      hierarchy_level: "catalog"
+      connection_string: "http://localhost:8123"
+      description: "ClickHouse server registered as a named DataFusion catalog"
+      options:
+        user_env: "CLICKHOUSE_USER"
+        pass_env: "CLICKHOUSE_PASSWORD"
+        # Restrict to specific databases (optional — omit to include all
+        # non-system databases):
+        allowed_schemas: "mydb"
