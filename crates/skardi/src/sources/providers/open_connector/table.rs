@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use super::cache::ScanCache;
 use super::client::OpenConnectorClient;
-use super::exec::OpenConnectorExec;
+use super::exec::{OpenConnectorExec, ScanTarget};
 use super::filters::translate_filters;
 use super::json_to_arrow::RowConverter;
 use super::row_path::RowPath;
@@ -29,6 +29,9 @@ pub struct OpenConnectorTableProvider {
     client: Arc<OpenConnectorClient>,
     cache: Option<Arc<ScanCache>>,
     gateway: String,
+    /// Binding (catalog schema) name for tracing; `None` for UDTF-planned
+    /// tables, which have no persistent binding.
+    binding: Option<String>,
     connection_alias: Option<String>,
     table: &'static SourcePackTable,
     source_pack_version: u32,
@@ -62,6 +65,7 @@ impl OpenConnectorTableProvider {
         client: Arc<OpenConnectorClient>,
         cache: Option<Arc<ScanCache>>,
         gateway: String,
+        binding: Option<String>,
         connection_alias: Option<String>,
         table: &'static SourcePackTable,
         source_pack_version: u32,
@@ -79,6 +83,7 @@ impl OpenConnectorTableProvider {
             client,
             cache,
             gateway,
+            binding,
             connection_alias,
             table,
             source_pack_version,
@@ -129,9 +134,9 @@ impl TableProvider for OpenConnectorTableProvider {
             Arc::clone(&self.client),
             self.cache.clone(),
             self.gateway.clone(),
+            self.binding.clone(),
             self.connection_alias.clone(),
-            self.table,
-            self.source_pack_version,
+            ScanTarget::from_pack_table(self.table, self.source_pack_version),
             Arc::clone(&self.converter),
             self.row_path.clone(),
             self.resource.clone(),
@@ -203,6 +208,7 @@ mod tests {
             None,
             "saas".to_string(),
             None,
+            None,
             table,
             1,
             serde_json::json!({}),
@@ -229,6 +235,7 @@ mod tests {
             offline_client(),
             None,
             "saas".to_string(),
+            None,
             None,
             table,
             1,

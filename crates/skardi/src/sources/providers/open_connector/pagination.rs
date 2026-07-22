@@ -39,6 +39,11 @@ pub enum PaginationStrategy {
         /// Page size to request (ignored when `page_size_param` is None).
         page_size: u32,
     },
+    /// One request, one page: no pagination inputs are injected and the scan
+    /// completes after the first response. Used by `open_connector_scan`,
+    /// whose raw actions declare no pagination contract — callers pass any
+    /// paging inputs explicitly in the action input JSON.
+    SinglePage,
 }
 
 /// Mutable pagination state for one scan.
@@ -79,13 +84,13 @@ impl Pagination {
     pub fn new(strategy: PaginationStrategy) -> Result<Self, OpenConnectorError> {
         let next_token = match &strategy {
             PaginationStrategy::PageNumber { .. } => Some("1".to_string()),
-            PaginationStrategy::Cursor { .. } => None,
+            PaginationStrategy::Cursor { .. } | PaginationStrategy::SinglePage => None,
         };
         let cursor_path = match &strategy {
             PaginationStrategy::Cursor {
                 next_cursor_path, ..
             } => Some(RowPath::parse(next_cursor_path)?),
-            PaginationStrategy::PageNumber { .. } => None,
+            PaginationStrategy::PageNumber { .. } | PaginationStrategy::SinglePage => None,
         };
         Ok(Self {
             strategy,
@@ -130,6 +135,7 @@ impl Pagination {
                     input.insert((*param).to_string(), Value::from(*page_size));
                 }
             }
+            PaginationStrategy::SinglePage => {}
         }
     }
 
@@ -177,6 +183,7 @@ impl Pagination {
                 self.next_token = Some(next);
                 Ok(true)
             }
+            PaginationStrategy::SinglePage => Ok(false),
         }
     }
 }
@@ -299,6 +306,27 @@ mod tests {
             err,
             OpenConnectorError::PaginationLoop { ref token } if token == "same"
         ));
+    }
+
+    #[test]
+    fn single_page_injects_nothing_and_never_advances() {
+        let mut pagination = Pagination::new(PaginationStrategy::SinglePage).unwrap();
+        assert_eq!(pagination.page(), 1);
+
+        let mut input = Map::new();
+        pagination.apply(&mut input);
+        assert!(input.is_empty(), "no pagination inputs for a raw scan");
+
+        // Even a "full-looking" page ends the scan: raw actions declare no
+        // pagination contract, so there is nothing to advance.
+        assert!(
+            !pagination
+                .advance(&json!({"next_cursor": "c2"}), 100)
+                .unwrap()
+        );
+        PaginationStrategy::SinglePage
+            .validate()
+            .expect("nothing to validate");
     }
 
     #[test]

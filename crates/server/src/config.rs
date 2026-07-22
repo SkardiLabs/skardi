@@ -1416,6 +1416,7 @@ async fn register_data_source(
             // `validate_data_sources` already guarantees the config block is
             // present and access is read-only; the provider re-checks both so
             // the CLI path (which has no such validation layer) is covered.
+            let oc_gateways = optimizer_registry.map(|r| r.open_connector_gateways());
             register_open_connector_tables(
                 session_ctx,
                 &source.name,
@@ -1423,6 +1424,7 @@ async fn register_data_source(
                 source.open_connector.as_ref(),
                 source.access_mode.is_read_write(),
                 source.hierarchy_level,
+                oc_gateways.as_ref(),
             )
             .await
             .map_err(|e| {

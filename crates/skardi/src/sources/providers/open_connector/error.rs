@@ -336,4 +336,63 @@ pub enum OpenConnectorError {
     /// A response was not the JSON shape the client contract expects.
     #[error("Open Connector {operation} returned an invalid response: {reason}")]
     InvalidGatewayResponse { operation: String, reason: String },
+
+    /// A UDTF named a gateway that is not a registered `open_connector` data
+    /// source (or whose registration failed).
+    #[error(
+        "Open Connector gateway '{name}' is not registered; the first UDTF argument \
+         must name a 'type: open_connector' data source from the context configuration"
+    )]
+    UdtfGatewayNotRegistered { name: String },
+
+    /// A UDTF referenced an action whose metadata was never discovered.
+    /// Discovery happens only at registration (query planning performs no
+    /// network I/O), and only for bound source-pack tables and allowlisted
+    /// raw actions.
+    #[error(
+        "Open Connector action '{action_id}' was not discovered when gateway '{gateway}' \
+         was registered; bind its source-pack table in the context YAML or add the \
+         action to 'raw_action_allowlist' (query planning never contacts the gateway)"
+    )]
+    ActionNotDiscovered { gateway: String, action_id: String },
+
+    /// `open_connector_scan` was called with an action outside the gateway's
+    /// `raw_action_allowlist`. Raw-action access is default-deny.
+    #[error(
+        "Open Connector action '{action_id}' is not in the 'raw_action_allowlist' of \
+         gateway '{gateway}'; open_connector_scan executes explicitly allowlisted \
+         actions only (default-deny)"
+    )]
+    RawActionNotAllowlisted { gateway: String, action_id: String },
+
+    /// An allowlisted raw action's metadata classifies it as mutating.
+    /// The allowlist alone never grants execution.
+    #[error(
+        "Open Connector action '{action_id}' is classified as mutating by its gateway \
+         metadata; open_connector_scan executes non-mutating reads only"
+    )]
+    RawActionMutating { action_id: String },
+
+    /// An allowlisted raw action's metadata does not say whether it mutates;
+    /// default-deny refuses to execute it, naming the classification gap.
+    #[error(
+        "Open Connector action '{action_id}' does not declare a read-only \
+         classification in its gateway metadata; refusing to execute it \
+         (default-deny — the allowlist alone does not grant execution)"
+    )]
+    RawActionReadOnlyUnknown { action_id: String },
+
+    /// A raw scan's row path does not resolve to a deterministic object row
+    /// type in the discovered action output schema, so no stable Arrow
+    /// schema can be planned.
+    #[error(
+        "Open Connector raw scan of action '{action_id}' cannot derive a deterministic \
+         row type at '{row_path}': {reason}; use a built-in source-pack table \
+         (open_connector_query) or contribute a source-pack definition instead"
+    )]
+    RawRowTypeIndeterminate {
+        action_id: String,
+        row_path: String,
+        reason: String,
+    },
 }

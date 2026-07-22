@@ -6,11 +6,11 @@
 //! (stable table definitions, JSON-to-Arrow conversion, pagination, filter
 //! and limit pushdown, DataFusion registration) on top.
 //!
-//! **Status: typed config, HTTP client, action registry, source packs, and
-//! the scan engine have landed.** A configured gateway registers as a real
-//! catalog (`<gateway>.<binding>.<table>`) and is queryable today — with the
-//! synthetic `mock` source pack. Real provider packs (GitHub, Slack, Notion)
-//! and the raw-action UDTF land next.
+//! **Status: typed config, HTTP client, action registry, source packs, the
+//! scan engine, and the two UDTFs have landed.** A configured gateway
+//! registers as a real catalog (`<gateway>.<binding>.<table>`) and is
+//! queryable today — with the synthetic `mock` source pack. Real provider
+//! packs (GitHub, Slack, Notion) land next.
 //!
 //! - [`OpenConnectorConfig`] / [`OpenConnectorBinding`] — the typed
 //!   `open_connector:` block of a `type: open_connector` data source, shared
@@ -22,7 +22,10 @@
 //!   fingerprints, so query planning never performs network I/O;
 //! - [`SourcePackRegistry`] — built-in stable table definitions;
 //! - [`register_open_connector_tables`] — the registration entry point both
-//!   front-ends wire to.
+//!   front-ends wire to;
+//! - [`register_open_connector_udtfs`] — the `open_connector_query` /
+//!   `open_connector_scan` table functions, planning against the
+//!   [`OpenConnectorGateways`] state captured at registration.
 //!
 //! See `docs/superpowers/specs/2026-07-11-open-connector-integration-design.md`.
 
@@ -36,9 +39,11 @@ pub mod filters;
 pub mod json_to_arrow;
 pub mod packs;
 pub mod pagination;
+mod raw_schema;
 pub mod row_path;
 pub mod source_pack;
 pub mod table;
+pub mod table_functions;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -49,6 +54,7 @@ pub use config::{OpenConnectorBinding, OpenConnectorConfig};
 pub use error::OpenConnectorError;
 pub use source_pack::{SourcePack, SourcePackRegistry, SourcePackTable};
 pub use table::OpenConnectorTableProvider;
+pub use table_functions::{GatewayHandle, OpenConnectorGateways, register_open_connector_udtfs};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +87,11 @@ use anyhow::Result;
 ///    into an [`ActionRegistry`], enforcing version pins, required
 ///    resources, and action-contract fingerprints;
 /// 5. builds one [`OpenConnectorTableProvider`] per bound table and
-///    registers the catalog.
+///    registers the catalog;
+/// 6. when `udtf_gateways` is provided, publishes the gateway's
+///    planning-time state ([`GatewayHandle`]) so the `open_connector_query`
+///    / `open_connector_scan` UDTFs (see [`register_open_connector_udtfs`])
+///    can plan against it without network I/O.
 ///
 /// # Example
 /// ```no_run
@@ -111,6 +121,7 @@ use anyhow::Result;
 ///     Some(&config),
 ///     false,
 ///     HierarchyLevel::Catalog,
+///     None,
 /// )
 /// .await?;
 ///
@@ -118,6 +129,7 @@ use anyhow::Result;
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub async fn register_open_connector_tables(
     session_ctx: &mut SessionContext,
     name: &str,
@@ -125,6 +137,7 @@ pub async fn register_open_connector_tables(
     config: Option<&OpenConnectorConfig>,
     read_write: bool,
     hierarchy_level: HierarchyLevel,
+    udtf_gateways: Option<&OpenConnectorGateways>,
 ) -> Result<()> {
     // All invariant checks live here so both front-ends (server and CLI)
     // get identical behavior; front-ends may add earlier typed errors, but
@@ -176,7 +189,7 @@ pub async fn register_open_connector_tables(
             }
         }
     }
-    let registry = ActionRegistry::load(&client, &action_ids).await?;
+    let registry = Arc::new(ActionRegistry::load(&client, &action_ids).await?);
 
     let catalog = Arc::new(MemoryCatalogProvider::new());
     let cache = Arc::new(cache::ScanCache::new(
@@ -215,6 +228,7 @@ pub async fn register_open_connector_tables(
                 Arc::clone(&client),
                 Some(Arc::clone(&cache)),
                 name.to_string(),
+                Some(binding.name.clone()),
                 binding.connection_alias.clone(),
                 table,
                 pack.version,
@@ -247,6 +261,21 @@ pub async fn register_open_connector_tables(
     }
 
     session_ctx.register_catalog(name, catalog);
+
+    // Publish the gateway's planning-time state for the UDTFs only after
+    // every gate above has passed — a failed registration must not leave a
+    // queryable handle behind.
+    if let Some(gateways) = udtf_gateways {
+        gateways.write().unwrap_or_else(|p| p.into_inner()).insert(
+            name.to_string(),
+            Arc::new(GatewayHandle::new(
+                Arc::clone(&client),
+                Arc::clone(&cache),
+                Arc::clone(&registry),
+                config,
+            )),
+        );
+    }
 
     tracing::info!(
         gateway = %name,
@@ -295,6 +324,7 @@ bindings:
             Some(&valid_config("UNUSED_ENV")),
             false,
             HierarchyLevel::Table,
+            None,
         )
         .await
         .unwrap_err();
@@ -315,6 +345,7 @@ bindings:
             Some(&valid_config("UNUSED_ENV")),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .unwrap_err();
@@ -337,6 +368,7 @@ bindings:
             Some(&valid_config("UNUSED_ENV")),
             true,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .unwrap_err();
@@ -357,6 +389,7 @@ bindings:
             None,
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .unwrap_err();
@@ -381,6 +414,7 @@ bindings:
             Some(&invalid),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .unwrap_err();
@@ -398,6 +432,7 @@ bindings:
             Some(&valid_config("SKARDI_TEST_OC_TOKEN_DEFINITELY_UNSET")),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .unwrap_err();
@@ -427,6 +462,7 @@ bindings:
             Some(&valid_config(TOKEN_ENV_HEALTH_FAIL)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await;
         unsafe {
@@ -465,6 +501,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_BASIC, 0)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -503,6 +540,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_FILTER, 0)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -540,6 +578,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_FILTER, 0)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -595,6 +634,7 @@ bindings:
             Some(&config),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -630,6 +670,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_FILTER, 0)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -669,6 +710,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_CACHE, 60)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -712,6 +754,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_CACHE, 60)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -753,6 +796,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_EMPTY_CACHE, 60)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");
@@ -793,6 +837,7 @@ bindings:
             Some(&mock_config(TOKEN_ENV_CATALOG_SELFJOIN, 60)),
             false,
             HierarchyLevel::Catalog,
+            None,
         )
         .await
         .expect("catalog registration succeeds");

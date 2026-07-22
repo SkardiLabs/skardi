@@ -31,18 +31,48 @@ use super::cache::{ScanCache, ScanKeyParts, scan_cache_key, schema_fingerprint};
 use super::client::OpenConnectorClient;
 use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
-use super::pagination::Pagination;
+use super::pagination::{Pagination, PaginationStrategy};
 use super::row_path::RowPath;
 use super::source_pack::SourcePackTable;
+
+/// The scanned collection's identity and pagination contract — the shape
+/// shared by YAML-bound source-pack tables and `open_connector_scan` raw
+/// actions, which have no static [`SourcePackTable`] to point at.
+#[derive(Debug, Clone)]
+pub struct ScanTarget {
+    /// Stable table ID (`mock.items`) or a raw-action label, for errors and
+    /// tracing.
+    pub table_id: Arc<str>,
+    /// Open Connector action to execute.
+    pub action_id: Arc<str>,
+    /// Pagination contract.
+    pub pagination: PaginationStrategy,
+    /// Source-pack version, part of the cache key (0 for raw scans, which
+    /// have no pack and bypass the cache).
+    pub source_pack_version: u32,
+}
+
+impl ScanTarget {
+    /// The target of a bound source-pack table.
+    pub fn from_pack_table(table: &SourcePackTable, source_pack_version: u32) -> Self {
+        Self {
+            table_id: Arc::from(table.id),
+            action_id: Arc::from(table.action_id),
+            pagination: table.pagination,
+            source_pack_version,
+        }
+    }
+}
 
 /// Everything a scan needs, bound once at planning time.
 pub struct OpenConnectorExec {
     client: Arc<OpenConnectorClient>,
     cache: Option<Arc<ScanCache>>,
     gateway: String,
+    /// Binding (catalog schema) name for tracing; `None` for UDTF scans.
+    binding: Option<String>,
     connection_alias: Option<String>,
-    table: &'static SourcePackTable,
-    source_pack_version: u32,
+    target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
     resource: Value,
@@ -59,8 +89,8 @@ pub struct OpenConnectorExec {
 impl fmt::Debug for OpenConnectorExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenConnectorExec")
-            .field("table", &self.table.id)
-            .field("action", &self.table.action_id)
+            .field("table", &self.target.table_id)
+            .field("action", &self.target.action_id)
             .field("limit", &self.limit)
             .field("projection", &self.projection)
             .finish()
@@ -76,9 +106,9 @@ impl OpenConnectorExec {
         client: Arc<OpenConnectorClient>,
         cache: Option<Arc<ScanCache>>,
         gateway: String,
+        binding: Option<String>,
         connection_alias: Option<String>,
-        table: &'static SourcePackTable,
-        source_pack_version: u32,
+        target: ScanTarget,
         converter: Arc<RowConverter>,
         row_path: RowPath,
         resource: Value,
@@ -104,9 +134,9 @@ impl OpenConnectorExec {
             client,
             cache,
             gateway,
+            binding,
             connection_alias,
-            table,
-            source_pack_version,
+            target,
             converter,
             row_path,
             resource,
@@ -127,7 +157,7 @@ impl DisplayAs for OpenConnectorExec {
         write!(
             f,
             "OpenConnectorExec: table={} action={} limit={:?}",
-            self.table.id, self.table.action_id, self.limit
+            self.target.table_id, self.target.action_id, self.limit
         )
     }
 }
@@ -190,7 +220,21 @@ impl ExecutionPlan for OpenConnectorExec {
             match state.next_page().await {
                 Ok(Some(batch)) => Ok(Some((batch, state))),
                 Ok(None) => Ok(None),
-                Err(e) => Err(DataFusionError::External(Box::new(e))),
+                Err(e) => {
+                    // The scan-failure counterpart of the completion event in
+                    // `next_page` — same identifying fields, never tokens or
+                    // response bodies (errors carry JSON *kinds* only).
+                    tracing::warn!(
+                        gateway = %state.gateway,
+                        binding = state.binding.as_deref().unwrap_or("<udtf>"),
+                        table = %state.target.table_id,
+                        action = %state.target.action_id,
+                        pages_fetched = state.pages_fetched,
+                        error = %e,
+                        "Open Connector scan failed"
+                    );
+                    Err(DataFusionError::External(Box::new(e)))
+                }
             }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -205,8 +249,10 @@ struct ScanState {
     client: Arc<OpenConnectorClient>,
     cache: Option<Arc<ScanCache>>,
     cache_key: String,
+    gateway: String,
+    binding: Option<String>,
     connection_alias: Option<String>,
-    table: &'static SourcePackTable,
+    target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
     resource: Value,
@@ -227,6 +273,12 @@ struct ScanState {
     /// Idempotence guard for the two store sites (LIMIT-satisfied and
     /// exhaustion), which can both fire on the same page.
     cache_stored: bool,
+    // Observability (see `log_completion`).
+    started: Instant,
+    cache_hit: bool,
+    pages_fetched: u32,
+    rows_returned: u64,
+    completion_logged: bool,
 }
 
 impl ScanState {
@@ -249,8 +301,8 @@ impl ScanState {
         let cache_key = scan_cache_key(&ScanKeyParts {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),
-            action_id: exec.table.action_id,
-            source_pack_version: exec.source_pack_version,
+            action_id: &exec.target.action_id,
+            source_pack_version: exec.target.source_pack_version,
             resource: &exec.resource,
             filter_inputs: &exec.filter_inputs,
             projection: &projection_names,
@@ -274,8 +326,10 @@ impl ScanState {
             client: exec.client.clone(),
             cache: exec.cache.clone(),
             cache_key,
+            gateway: exec.gateway.clone(),
+            binding: exec.binding.clone(),
             connection_alias: exec.connection_alias.clone(),
-            table: exec.table,
+            target: exec.target.clone(),
             converter: exec.converter.clone(),
             row_path: exec.row_path.clone(),
             resource: exec.resource.clone(),
@@ -286,12 +340,17 @@ impl ScanState {
             max_rows: exec.max_rows,
             scan_timeout: exec.scan_timeout,
             deadline: Instant::now() + exec.scan_timeout,
-            pagination: Pagination::new(exec.table.pagination)?,
+            pagination: Pagination::new(exec.target.pagination)?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
             done,
             cache_stored: false,
+            started: Instant::now(),
+            cache_hit: done,
+            pages_fetched: 0,
+            rows_returned: 0,
+            completion_logged: false,
         })
     }
 
@@ -307,18 +366,40 @@ impl ScanState {
 
     fn timeout_error(&self) -> OpenConnectorError {
         OpenConnectorError::ScanTimeout {
-            table: self.table.id.to_string(),
+            table: self.target.table_id.to_string(),
             seconds: self.scan_timeout.as_secs(),
         }
+    }
+
+    /// Emit the scan-completion event exactly once. Identifying fields and
+    /// counters only — never tokens, headers, inputs, or row values.
+    fn log_completion(&mut self) {
+        if self.completion_logged {
+            return;
+        }
+        self.completion_logged = true;
+        tracing::info!(
+            gateway = %self.gateway,
+            binding = self.binding.as_deref().unwrap_or("<udtf>"),
+            table = %self.target.table_id,
+            action = %self.target.action_id,
+            cache_hit = self.cache_hit,
+            pages = self.pages_fetched,
+            rows = self.rows_returned,
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            "Open Connector scan completed"
+        );
     }
 
     /// Fetch and convert one page; returns None when the scan is complete.
     async fn next_page(&mut self) -> Result<Option<RecordBatch>, OpenConnectorError> {
         if let Some(batch) = self.replay.pop_front() {
+            self.rows_returned += batch.num_rows() as u64;
             return Ok(Some(batch));
         }
         if self.done || self.limit_remaining == Some(0) {
             self.done = true;
+            self.log_completion();
             return Ok(None);
         }
         if Instant::now() >= self.deadline {
@@ -326,7 +407,7 @@ impl ScanState {
         }
         if self.pagination.page() > self.max_pages as usize {
             return Err(OpenConnectorError::ScanBoundsExceeded {
-                table: self.table.id.to_string(),
+                table: self.target.table_id.to_string(),
                 bound: "max_pages",
                 limit: u64::from(self.max_pages),
             });
@@ -349,13 +430,14 @@ impl ScanState {
         let envelope = tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
             self.client.execute(
-                self.table.action_id,
+                &self.target.action_id,
                 &Value::Object(input),
                 self.connection_alias.as_deref(),
             ),
         )
         .await
         .map_err(|_| self.timeout_error())??;
+        self.pages_fetched += 1;
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
         }
@@ -395,7 +477,7 @@ impl ScanState {
         self.rows_emitted += batch.num_rows() as u64;
         if self.rows_emitted > self.max_rows {
             return Err(OpenConnectorError::ScanBoundsExceeded {
-                table: self.table.id.to_string(),
+                table: self.target.table_id.to_string(),
                 bound: "max_rows",
                 limit: self.max_rows,
             });
@@ -422,8 +504,10 @@ impl ScanState {
 
         // A terminal empty page is completion, not output.
         if batch.num_rows() == 0 && self.done {
+            self.log_completion();
             return Ok(None);
         }
+        self.rows_returned += batch.num_rows() as u64;
         Ok(Some(batch))
     }
 }
@@ -445,8 +529,8 @@ mod tests {
             None,
             "saas".to_string(),
             None,
-            table,
-            source_pack_version,
+            None,
+            ScanTarget::from_pack_table(table, source_pack_version),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse(table.row_path).expect("row path"),
             json!({}),

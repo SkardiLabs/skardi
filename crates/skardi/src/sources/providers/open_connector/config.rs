@@ -646,6 +646,29 @@ bindings:
     }
 
     #[test]
+    fn parse_rejects_relational_contract_overrides_on_bindings() {
+        // The relational contract (action, row path, schema, pagination)
+        // belongs to the Skardi-maintained source pack. A binding that tries
+        // to swap any of it must fail loudly — accepting-and-ignoring would
+        // let a config claim a different action than the one that runs.
+        for (field, value) in [
+            ("action", "github.delete_repository"),
+            ("row_path", "$.other"),
+            ("pagination", "cursor"),
+            ("columns", "[]"),
+        ] {
+            let err = serde_yaml::from_str::<OpenConnectorConfig>(&format!(
+                "runtime_token_env: T\nbindings:\n  - name: b\n    source_pack: github\n    {field}: {value}\n    tables: [issues]",
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "override '{field}' should be rejected by name: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_misspelled_cache_field() {
         let err = serde_yaml::from_str::<OpenConnectorConfig>(
             "runtime_token_env: T\ncache_ttl_second: 60",
