@@ -537,9 +537,11 @@ mod tests {
     use super::*;
     use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events,
     };
+    use futures::StreamExt;
     use serde_json::json;
+    use std::sync::Mutex;
 
     fn build_exec(
         client: Arc<OpenConnectorClient>,
@@ -682,6 +684,151 @@ mod tests {
             );
         }
         assert_eq!(state.rows_returned, 3);
+    }
+
+    // ── Emitted-event assertions ─────────────────────────────────────────
+    // The flag tests above pin the state machine; these pin the actual
+    // tracing output — exactly one event per scan, with the documented
+    // fields — by consuming the real `execute()` stream.
+
+    const COMPLETED: &str = "Open Connector scan completed";
+    const FAILED: &str = "Open Connector scan failed";
+
+    /// Captured events with the given message, in emission order.
+    fn events_with_message(
+        events: &Arc<Mutex<Vec<CapturedEvent>>>,
+        message: &str,
+    ) -> Vec<CapturedEvent> {
+        events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|event| event.message == message)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn limit_satisfied_stream_emits_exactly_one_completion_event() {
+        let gateway = MockGateway::start(|req| items_handler(req, 5)).await;
+        let exec = build_exec(online_client(&gateway).await, None, Some(1), 1);
+        let (_guard, events) = capture_events();
+
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("stream");
+        let batch = stream.next().await.expect("a batch").expect("no error");
+        assert_eq!(batch.num_rows(), 1);
+        // A satisfied LimitStream drops its input without polling again.
+        drop(stream);
+
+        let completed = events_with_message(&events, COMPLETED);
+        assert_eq!(completed.len(), 1, "exactly one completion event");
+        let event = &completed[0];
+        assert_eq!(event.level, tracing::Level::INFO);
+        assert_eq!(event.field("gateway"), Some("saas"));
+        assert_eq!(event.field("binding"), Some("ws"));
+        assert_eq!(event.field("table"), Some("mock.items"));
+        assert_eq!(event.field("action"), Some("mock.list_items"));
+        assert_eq!(event.field("cache_hit"), Some("false"));
+        assert_eq!(event.field("pages"), Some("1"));
+        assert_eq!(event.field("rows"), Some("1"));
+        assert!(event.fields.contains_key("duration_ms"));
+        assert!(events_with_message(&events, FAILED).is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_scan_emits_exactly_one_completion_event() {
+        let gateway = MockGateway::start(|req| items_handler(req, 0)).await;
+        let exec = build_exec(online_client(&gateway).await, None, None, 1);
+        let (_guard, events) = capture_events();
+
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("stream");
+        assert!(
+            stream.next().await.is_none(),
+            "empty scan yields no batches"
+        );
+        assert!(stream.next().await.is_none(), "stream stays terminated");
+
+        let completed = events_with_message(&events, COMPLETED);
+        assert_eq!(completed.len(), 1, "exactly one completion event");
+        assert_eq!(completed[0].field("rows"), Some("0"));
+        assert_eq!(completed[0].field("pages"), Some("1"));
+        assert_eq!(completed[0].field("cache_hit"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn cache_replay_emits_exactly_one_completion_event_marked_cache_hit() {
+        let gateway = MockGateway::start(|req| items_handler(req, 3)).await;
+        let cache = Arc::new(ScanCache::new(Duration::from_secs(60), usize::MAX));
+        let exec = build_exec(online_client(&gateway).await, Some(cache), None, 1);
+        let (_guard, events) = capture_events();
+
+        for round in 1..=2 {
+            let mut stream = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("stream");
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                rows += batch.expect("no error").num_rows();
+            }
+            assert_eq!(rows, 3, "round {round}");
+        }
+
+        let completed = events_with_message(&events, COMPLETED);
+        assert_eq!(
+            completed.len(),
+            2,
+            "one completion event per scan, replay included"
+        );
+        assert_eq!(completed[0].field("cache_hit"), Some("false"));
+        assert_eq!(completed[0].field("pages"), Some("2"));
+        assert_eq!(completed[1].field("cache_hit"), Some("true"));
+        assert_eq!(
+            completed[1].field("pages"),
+            Some("0"),
+            "a replay fetches no live pages"
+        );
+        assert_eq!(completed[1].field("rows"), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn failed_scan_emits_one_failure_event_and_no_completion() {
+        let gateway = MockGateway::start(|req| {
+            if req.method == "POST" {
+                // 5xx is terminal for the non-idempotent execute: no retry.
+                MockResponse::new(500, r#"{"message":"boom"}"#)
+            } else {
+                MockResponse::new(404, "{}")
+            }
+        })
+        .await;
+        let exec = build_exec(online_client(&gateway).await, None, None, 1);
+        let (_guard, events) = capture_events();
+
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("stream");
+        let result = stream.next().await.expect("one item");
+        assert!(result.is_err(), "scan must fail");
+
+        let failed = events_with_message(&events, FAILED);
+        assert_eq!(failed.len(), 1, "exactly one failure event");
+        let event = &failed[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.field("gateway"), Some("saas"));
+        assert_eq!(event.field("binding"), Some("ws"));
+        assert_eq!(event.field("table"), Some("mock.items"));
+        assert_eq!(event.field("action"), Some("mock.list_items"));
+        assert_eq!(event.field("pages_fetched"), Some("0"));
+        let error = event.field("error").expect("error field");
+        assert!(
+            error.contains("HTTP 500"),
+            "error carries the terminal status: {error}"
+        );
+        assert!(events_with_message(&events, COMPLETED).is_empty());
     }
 
     #[test]
