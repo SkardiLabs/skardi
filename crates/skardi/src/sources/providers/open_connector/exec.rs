@@ -334,7 +334,9 @@ impl ScanState {
 
         // Assemble the action input: fixed resource inputs, Exact filters,
         // then page parameters.
-        let mut input = self.resource.as_object().cloned().unwrap_or_default();
+        let mut input = self.resource.as_object().cloned().expect(
+            "resource is a JSON object by construction (registration always builds Value::Object)",
+        );
         for (field, value) in &self.filter_inputs {
             input.insert(field.clone(), value.clone());
         }
