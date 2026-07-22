@@ -2704,6 +2704,7 @@ bindings:
             connection_string: Some("http://localhost:8123".to_string()),
             schema: None,
             options,
+            open_connector: None,
             hierarchy_level: HierarchyLevel::default(),
             access_mode,
             enable_cache: false,
