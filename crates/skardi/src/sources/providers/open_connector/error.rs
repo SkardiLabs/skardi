@@ -223,6 +223,18 @@ pub enum OpenConnectorError {
     #[error("Open Connector source pack '{pack}' has no table '{table}'")]
     SourcePackTableNotFound { pack: String, table: String },
 
+    /// A short table name matched more than one table in the pack;
+    /// first-match would silently bind the wrong relational contract.
+    #[error(
+        "Open Connector source pack '{pack}' has multiple tables matching '{table}' \
+         ({candidates}); use the full table ID"
+    )]
+    SourcePackTableAmbiguous {
+        pack: String,
+        table: String,
+        candidates: String,
+    },
+
     /// A binding pinned a source-pack version that is not the built-in one.
     #[error(
         "Open Connector source pack '{pack}' pinned to version {pinned}, \

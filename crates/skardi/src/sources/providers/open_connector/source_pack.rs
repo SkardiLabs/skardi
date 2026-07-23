@@ -86,13 +86,36 @@ impl SourcePackRegistry {
         pack: &'static SourcePack,
         table: &str,
     ) -> Result<&'static SourcePackTable, OpenConnectorError> {
-        pack.tables
+        // Exact full-ID match first (`github.issues`), then the short-name
+        // convention (`issues` = the ID's last segment, whole-segment
+        // equality). A short name matching several tables is an error, not
+        // first-wins — silently binding the wrong contract would defeat
+        // every schema guarantee downstream. Built-in packs keep last
+        // segments unique (pinned by a test below), so ambiguity can only
+        // come from future multi-segment or user-authored packs.
+        if let Some(exact) = pack.tables.iter().find(|candidate| candidate.id == table) {
+            return Ok(exact);
+        }
+        let mut matches = pack
+            .tables
             .iter()
-            .find(|candidate| candidate.id.rsplit('.').next() == Some(table))
-            .ok_or_else(|| OpenConnectorError::SourcePackTableNotFound {
+            .filter(|candidate| candidate.id.rsplit('.').next() == Some(table));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Ok(only),
+            (None, _) => Err(OpenConnectorError::SourcePackTableNotFound {
                 pack: pack.name.to_string(),
                 table: table.to_string(),
-            })
+            }),
+            (Some(first), Some(second)) => {
+                let mut candidates = vec![first.id, second.id];
+                candidates.extend(matches.map(|candidate| candidate.id));
+                Err(OpenConnectorError::SourcePackTableAmbiguous {
+                    pack: pack.name.to_string(),
+                    table: table.to_string(),
+                    candidates: candidates.join(", "),
+                })
+            }
+        }
     }
 
     /// Resolve a pack by name with a targeted error.
@@ -177,6 +200,81 @@ mod tests {
             OpenConnectorError::SourcePackTableNotFound { ref pack, ref table }
                 if pack == "mock" && table == "users"
         ));
+    }
+
+    #[test]
+    fn full_table_ids_resolve_exactly() {
+        let registry = SourcePackRegistry::builtins();
+        let pack = registry.require("github").unwrap();
+        let by_short = registry.table(pack, "issues").unwrap();
+        let by_full = registry.table(pack, "github.issues").unwrap();
+        assert_eq!(by_short.id, by_full.id);
+    }
+
+    #[test]
+    fn ambiguous_short_names_are_an_error_not_first_match() {
+        // Multi-segment IDs sharing a last segment: first-match would
+        // silently bind the wrong contract; the full ID disambiguates.
+        let tables = vec![
+            leaked_table("t.issue.comments"),
+            leaked_table("t.pr.comments"),
+        ];
+        let pack: &'static SourcePack = Box::leak(Box::new(SourcePack {
+            name: "t",
+            version: 1,
+            tables: Box::leak(tables.into_boxed_slice()),
+        }));
+
+        let registry = SourcePackRegistry::builtins();
+        let err = registry.table(pack, "comments").unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::SourcePackTableAmbiguous { ref candidates, .. }
+                if candidates == "t.issue.comments, t.pr.comments"
+        ));
+
+        let resolved = registry.table(pack, "t.pr.comments").unwrap();
+        assert_eq!(resolved.id, "t.pr.comments");
+    }
+
+    #[test]
+    fn builtin_pack_short_names_stay_unambiguous() {
+        // The short-name convention (`tables: [issues]`) is only sound while
+        // every built-in pack keeps `<pack>.<table>` IDs with unique last
+        // segments. New packs must keep this invariant or bindings hit the
+        // ambiguity error above.
+        let registry = SourcePackRegistry::builtins();
+        for name in ["mock", "github"] {
+            let pack = registry.require(name).unwrap();
+            let mut seen = std::collections::HashSet::new();
+            for table in pack.tables {
+                let prefix = format!("{}.", pack.name);
+                assert!(
+                    table.id.starts_with(&prefix),
+                    "table ID '{}' must be namespaced under '{prefix}'",
+                    table.id
+                );
+                let short = table.id.rsplit('.').next().unwrap();
+                assert!(
+                    seen.insert(short),
+                    "duplicate short name '{short}' in pack '{name}'"
+                );
+            }
+        }
+    }
+
+    fn leaked_table(id: &'static str) -> SourcePackTable {
+        SourcePackTable {
+            id,
+            action_id: "t.action",
+            row_path: "$.items",
+            fields: &[],
+            pagination: PaginationStrategy::SinglePage,
+            required_resources: &[],
+            fixed_inputs: &[],
+            filters: &[],
+            expected_fingerprint: None,
+        }
     }
 
     #[test]
