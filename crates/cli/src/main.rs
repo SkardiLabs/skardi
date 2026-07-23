@@ -2949,10 +2949,15 @@ spec:
 
         #[tokio::test]
         async fn errors_without_connection_string() {
-            let (mut session_ctx, registry) = new_session_context();
-            let err = register_source(&mut session_ctx, &clickhouse_source(None), &registry)
-                .await
-                .unwrap_err();
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let err = register_source(
+                &mut session_ctx,
+                &clickhouse_source(None),
+                &registry,
+                &oc_gateways,
+            )
+            .await
+            .unwrap_err();
             let msg = format!("{err:?}");
             assert!(
                 msg.contains("connection_string required"),
@@ -2965,10 +2970,10 @@ spec:
             // The provider is the single enforcement point for the read-only
             // invariant — the CLI must reject read_write exactly like the
             // server's UnsupportedWriteMode.
-            let (mut session_ctx, registry) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
             let mut source = clickhouse_source(Some("http://127.0.0.1:1"));
             source.access_mode = Some("read_write".to_string());
-            let err = register_source(&mut session_ctx, &source, &registry)
+            let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
                 .await
                 .unwrap_err();
             let msg = format!("{err:?}");
