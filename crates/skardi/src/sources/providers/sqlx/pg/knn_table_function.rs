@@ -27,7 +27,7 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{Result as DFResult, ScalarValue, plan_err};
+use datafusion::common::{Result as DFResult, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -41,6 +41,7 @@ use std::sync::Arc;
 use super::knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
 use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
+use crate::sources::providers::udtf_args::strict_string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered Postgres table.
@@ -79,11 +80,11 @@ impl TableFunctionImpl for PgKnnTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let vector_col = extract_string(&exprs[1], "vector_col")?;
+        let table_name = strict_string_arg(&exprs[0], "pg_knn", "table")?;
+        let vector_col = strict_string_arg(&exprs[1], "pg_knn", "vector_col")?;
 
         let metric = {
-            let s = extract_string(&exprs[3], "metric")?;
+            let s = strict_string_arg(&exprs[3], "pg_knn", "metric")?;
             s.parse::<DistanceMetric>()
                 .map_err(datafusion::error::DataFusionError::Plan)?
         };
@@ -91,7 +92,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
         let k = extract_k(&exprs[4], "pg_knn")?;
 
         let inline_filter = if exprs.len() == 6 {
-            extract_string(&exprs[5], "filter").ok()
+            strict_string_arg(&exprs[5], "pg_knn", "filter").ok()
         } else {
             None
         };
@@ -461,15 +462,5 @@ fn pg_type_to_arrow(
         "boolean" => DataType::Boolean,
         // Everything else (text, varchar, uuid, json, jsonb, timestamp, date, …)
         _ => DataType::Utf8,
-    }
-}
-
-// ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        _ => plan_err!("pg_knn: '{}' must be a string literal", name),
     }
 }

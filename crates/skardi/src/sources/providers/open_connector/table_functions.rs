@@ -37,7 +37,7 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{ScalarValue, plan_err};
+use datafusion::common::plan_err;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
@@ -57,6 +57,7 @@ use super::raw_schema::derive_raw_columns;
 use super::row_path::RowPath;
 use super::source_pack::SourcePackRegistry;
 use super::table::OpenConnectorTableProvider;
+use crate::sources::providers::udtf_args::strict_string_arg;
 
 /// Planning-time state of one registered gateway, captured by
 /// `register_open_connector_tables` and shared with both UDTFs.
@@ -143,12 +144,12 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                 exprs.len()
             );
         }
-        let gateway = literal_string("open_connector_query", &exprs[0], "gateway")?;
-        let table_id = literal_string("open_connector_query", &exprs[1], "table_id")?;
-        let resource_json = literal_string("open_connector_query", &exprs[2], "resource_json")?;
+        let gateway = strict_string_arg(&exprs[0], "open_connector_query", "gateway")?;
+        let table_id = strict_string_arg(&exprs[1], "open_connector_query", "table_id")?;
+        let resource_json = strict_string_arg(&exprs[2], "open_connector_query", "resource_json")?;
         let alias = exprs
             .get(3)
-            .map(|expr| literal_string("open_connector_query", expr, "connection_alias"))
+            .map(|expr| strict_string_arg(expr, "open_connector_query", "connection_alias"))
             .transpose()?;
 
         let handle = lookup_gateway(&self.gateways, &gateway)?;
@@ -242,13 +243,13 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 exprs.len()
             );
         }
-        let gateway = literal_string("open_connector_scan", &exprs[0], "gateway")?;
-        let action_id = literal_string("open_connector_scan", &exprs[1], "action_id")?;
-        let input_json = literal_string("open_connector_scan", &exprs[2], "input_json")?;
-        let row_path = literal_string("open_connector_scan", &exprs[3], "row_path")?;
+        let gateway = strict_string_arg(&exprs[0], "open_connector_scan", "gateway")?;
+        let action_id = strict_string_arg(&exprs[1], "open_connector_scan", "action_id")?;
+        let input_json = strict_string_arg(&exprs[2], "open_connector_scan", "input_json")?;
+        let row_path = strict_string_arg(&exprs[3], "open_connector_scan", "row_path")?;
         let alias = exprs
             .get(4)
-            .map(|expr| literal_string("open_connector_scan", expr, "connection_alias"))
+            .map(|expr| strict_string_arg(expr, "open_connector_scan", "connection_alias"))
             .transpose()?;
 
         let handle = lookup_gateway(&self.gateways, &gateway)?;
@@ -421,15 +422,6 @@ fn discovered_action(
 /// the user-facing diagnostic.
 fn plan_error(e: OpenConnectorError) -> DataFusionError {
     DataFusionError::Plan(e.to_string())
-}
-
-/// Extract one string-literal argument.
-fn literal_string(function: &str, expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        _ => plan_err!("{function}: {name} must be a string literal"),
-    }
 }
 
 #[cfg(test)]
@@ -755,7 +747,7 @@ raw_action_allowlist:
         expect_plan_error(
             &ctx,
             "SELECT * FROM open_connector_query(1, 'mock.items', '{}')",
-            "gateway must be a string literal",
+            "'gateway' must be a string literal",
         )
         .await;
 

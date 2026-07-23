@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use super::fts_exec::MongoFtsExec;
 use super::{binary_expr_to_mongo, is_pushable_binary_filter};
+use crate::sources::providers::udtf_args::string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit (matches MAX_KNN_K).
@@ -65,8 +66,8 @@ impl TableFunctionImpl for MongoFtsTableFunction {
             );
         }
 
-        let collection_name = extract_string(&exprs[0], "collection")?;
-        let query = extract_string(&exprs[1], "query")?;
+        let collection_name = string_arg(&exprs[0], "mongo_fts", "collection")?;
+        let query = string_arg(&exprs[1], "mongo_fts", "query")?;
         let limit = extract_int(&exprs[2], "limit")?;
 
         // The inferencer replaces {param} with NULL, yielding empty string for
@@ -235,21 +236,6 @@ fn expr_to_mongo_filter_entry(expr: &Expr, primary_key: &str) -> Option<Document
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        // Accept NULL as placeholder during pipeline validation/schema inference.
-        // The inferencer replaces {param} with NULL before plan creation.
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!(
-            "mongo_fts: '{}' must be a string literal, got {:?}",
-            name,
-            expr
-        ),
-    }
-}
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
     match expr {

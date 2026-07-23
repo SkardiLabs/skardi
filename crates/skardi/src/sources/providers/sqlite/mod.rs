@@ -16,7 +16,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, ScalarValue};
+use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -1551,18 +1551,6 @@ pub(crate) fn expr_to_sqlite_sql(expr: &Expr) -> Option<String> {
 
 /// Extract a string literal from a DataFusion `Expr`.
 /// Returns an empty string for NULL placeholders (schema inference).
-pub(crate) fn extract_string(expr: &Expr, name: &str) -> DataFusionResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => Err(DataFusionError::Plan(format!(
-            "sqlite: '{}' must be a string literal",
-            name
-        ))),
-    }
-}
-
 /// Produces a properly quoted table reference string for SQLite.
 fn quote_sqlite_table(tbl: &TableReference) -> String {
     quote_sqlite_ident(tbl.table())
