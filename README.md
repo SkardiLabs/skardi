@@ -322,6 +322,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | Redis | Full | No | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
 | DynamoDB | Full | Yes | Items mapped to SQL rows, table or catalog registration, scan + filter pushdown | [docs/dynamodb/](docs/dynamodb/) |
 | SeekDB | Full | Yes | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
+| ClickHouse | Read | Yes | Columnar OLAP over HTTP, filter/limit pushdown, table or catalog registration | [docs/clickhouse/](docs/clickhouse/) |
 | Lance | Read (job-write) | No | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
 | CSV | Read | No | Local or remote CSV files | [docs/server.md](docs/server.md) |
 | Parquet | Read | No | Local or remote Parquet files | [docs/server.md](docs/server.md) |

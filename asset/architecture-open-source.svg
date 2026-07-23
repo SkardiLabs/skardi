@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 700" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 746" role="img" aria-labelledby="title desc" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
   <title id="title">Skardi — Open Source Architecture</title>
-  <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, DynamoDB, InfluxDB 3, LanceDB, Apache Iceberg, SeekDB, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
+  <desc id="desc">An agent data plane: any AI agent (Claude Code, Codex, custom) calls skardi-server through a uniform set of skills (rag, grep, batch, ingest); skardi-server federates governed access to PostgreSQL, MySQL, SQLite, MongoDB, Redis, DynamoDB, InfluxDB 3, LanceDB, Apache Iceberg, SeekDB, ClickHouse, files (CSV / Parquet / JSON), and object stores (S3 / GCS / Azure).</desc>
 
   <defs>
     <style><![CDATA[
@@ -61,9 +61,9 @@
   </defs>
 
   <!-- ============== STAGE BACKGROUND ============== -->
-  <rect x="0" y="0" width="1280" height="700" fill="#ffffff"/>
-  <rect x="12" y="12" width="1256" height="676" rx="14" ry="14" fill="#ffffff" stroke="#d1d9e0"/>
-  <rect x="13" y="13" width="1254" height="674" rx="13" ry="13" fill="url(#grid)" opacity="0.7"/>
+  <rect x="0" y="0" width="1280" height="746" fill="#ffffff"/>
+  <rect x="12" y="12" width="1256" height="722" rx="14" ry="14" fill="#ffffff" stroke="#d1d9e0"/>
+  <rect x="13" y="13" width="1254" height="720" rx="13" ry="13" fill="url(#grid)" opacity="0.7"/>
 
   <!-- header tag -->
   <g transform="translate(36, 38)">
@@ -256,7 +256,7 @@
   <text x="920" y="66" class="mono ink3 upper b" font-size="13">▍ Sources</text>
 
   <g transform="translate(920, 80)">
-    <rect class="card" x="0" y="0" width="320" height="592" rx="12" ry="12"/>
+    <rect class="card" x="0" y="0" width="320" height="638" rx="12" ry="12"/>
 
     <!-- head -->
     <rect class="head-soft" x="1" y="1" width="318" height="40" rx="11" ry="11"/>
@@ -268,7 +268,7 @@
       <text x="19" y="13" text-anchor="middle" class="mono ink3 b" font-size="11">12+</text>
     </g>
 
-    <!-- 12 cells, 46h each starting at y=40 -->
+    <!-- 13 cells, 46h each starting at y=40 -->
     <g class="src-cells">
       <!-- PostgreSQL -->
       <g transform="translate(0, 40)">
@@ -387,8 +387,21 @@
         <text x="50" y="38" class="mono ink3" font-size="12">FTS · HNSW</text>
       </g>
 
-      <!-- Files -->
+      <!-- ClickHouse -->
       <g transform="translate(0, 500)">
+        <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
+        <g transform="translate(14, 9)" fill="#e8a300" stroke="none">
+          <rect x="4" y="4" width="3" height="16" rx=".5"/>
+          <rect x="10.5" y="4" width="3" height="16" rx=".5"/>
+          <rect x="17" y="4" width="3" height="16" rx=".5"/>
+          <rect x="4" y="14" width="16" height="3" rx=".5"/>
+        </g>
+        <text x="50" y="20" class="ink b" font-size="16">ClickHouse</text>
+        <text x="50" y="38" class="mono ink3" font-size="12">columnar OLAP</text>
+      </g>
+
+      <!-- Files -->
+      <g transform="translate(0, 546)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#6a6f7a" stroke-width="1.5" stroke-linejoin="round">
           <path d="M6 3h9l4 4v14H6z" fill="#6a6f7a" fill-opacity=".10"/>
@@ -400,7 +413,7 @@
       </g>
 
       <!-- Object stores -->
-      <g transform="translate(0, 546)">
+      <g transform="translate(0, 592)">
         <line x1="0" y1="0" x2="320" y2="0" class="divider"/>
         <g transform="translate(14, 9)" fill="none" stroke="#E25444" stroke-width="1.5" stroke-linejoin="round">
           <path d="M5 7h14l-1 13H6Z" fill="#E25444" fill-opacity=".15"/>

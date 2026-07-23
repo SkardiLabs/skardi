@@ -1,0 +1,12 @@
+kind: pipeline
+
+metadata:
+  name: "list_all_users"
+  version: "1.0"
+  description: "Full scan of the users table (ORDER BY + LIMIT run in Skardi; a bare LIMIT would push down)"
+
+# Parameters:
+#   {limit} - Maximum number of rows to return
+
+spec:
+  query: "SELECT id, name, email FROM users ORDER BY id LIMIT {limit}"

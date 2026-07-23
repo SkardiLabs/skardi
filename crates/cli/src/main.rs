@@ -45,6 +45,7 @@ use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_ud
 use skardi::sources::providers::sqlx::{register_pg_fts_udtf, register_pg_knn_udtf};
 use skardi::sources::providers::{
     DatasetRegistry,
+    clickhouse::register_clickhouse_tables,
     dynamodb::register_dynamodb_tables,
     iceberg::register_iceberg_table,
     influxdb::register_influxdb_tables,
@@ -974,6 +975,24 @@ async fn register_source(
             )
             .await
             .with_context(|| format!("Failed to register Open Connector '{}'", source.name))?;
+        }
+        "clickhouse" => {
+            let conn_str = source.connection_string.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ClickHouse source '{}': connection_string required",
+                    source.name
+                )
+            })?;
+            register_clickhouse_tables(
+                session_ctx,
+                &source.name,
+                conn_str,
+                source.options.as_ref(),
+                source.is_read_write(),
+                source.hierarchy_level,
+            )
+            .await
+            .with_context(|| format!("Failed to register ClickHouse '{}'", source.name))?;
         }
         "dynamodb" => {
             let endpoint = source.connection_string.as_deref().ok_or_else(|| {
@@ -2906,6 +2925,54 @@ spec:
                 "unexpected error: {msg}"
             );
             assert!(msg.contains("requires options"), "unexpected error: {msg}");
+        }
+    }
+
+    // Guards for the `clickhouse` arm of `register_source`. All failure modes
+    // trip before any network call, so no live endpoint is needed.
+    mod register_clickhouse_source {
+        use super::*;
+
+        fn clickhouse_source(connection_string: Option<&str>) -> LocalDataSource {
+            LocalDataSource {
+                name: "events".to_string(),
+                source_type: "clickhouse".to_string(),
+                path: None,
+                connection_string: connection_string.map(String::from),
+                options: Some(HashMap::from([("table".to_string(), "events".to_string())])),
+                hierarchy_level: HierarchyLevel::default(),
+                access_mode: None,
+                description: None,
+                open_connector: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn errors_without_connection_string() {
+            let (mut session_ctx, registry) = new_session_context();
+            let err = register_source(&mut session_ctx, &clickhouse_source(None), &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("connection_string required"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn errors_with_read_write_access_mode() {
+            // The provider is the single enforcement point for the read-only
+            // invariant — the CLI must reject read_write exactly like the
+            // server's UnsupportedWriteMode.
+            let (mut session_ctx, registry) = new_session_context();
+            let mut source = clickhouse_source(Some("http://127.0.0.1:1"));
+            source.access_mode = Some("read_write".to_string());
+            let err = register_source(&mut session_ctx, &source, &registry)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("read-only"), "unexpected error: {msg}");
         }
     }
 

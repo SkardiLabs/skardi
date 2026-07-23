@@ -15,23 +15,15 @@
 //! a SQL query engine, so InfluxDB sources never participate in CRUD or job
 //! destinations.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::Session;
-use datafusion::common::Statistics;
-use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::prelude::SessionContext;
+use datafusion_table_providers::flight::FlightTableFactory;
 use datafusion_table_providers::flight::sql::{FlightSqlDriver, HEADER_PREFIX, QUERY};
-use datafusion_table_providers::flight::{FlightTable, FlightTableFactory};
+
+use super::CountSafeTable;
 
 // Friendly `options` keys that Skardi treats specially for InfluxDB sources.
 //
@@ -182,75 +174,6 @@ fn build_flight_options(
     Ok(flight_opts)
 }
 
-/// Thin wrapper around [`FlightTable`] that works around a bug in
-/// `datafusion-table-providers` 0.10.1's `enforce_schema`: when DataFusion
-/// requests an **empty** projection (e.g. `SELECT count(*)`), that function
-/// returns the original, full-width batch instead of an empty-column one, so
-/// the `FlightExec` emits 5-column batches while advertising a 0-column schema.
-/// The downstream batch coalescer then panics on `assert_eq!(num_columns, 0)`.
-///
-/// We intercept the empty-projection case: scan a single real column through
-/// the inner table (which takes `enforce_schema`'s correct, non-empty path),
-/// then strip it back to zero columns with a [`ProjectionExec`], which
-/// preserves the row count via `RecordBatchOptions::with_row_count`. All other
-/// projections delegate straight to the inner table.
-#[derive(Debug)]
-struct CountSafeFlightTable {
-    inner: Arc<FlightTable>,
-}
-
-#[async_trait]
-impl TableProvider for CountSafeFlightTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    // Forward the remaining planning hooks to the inner table so the wrapper is
-    // transparent to the optimizer apart from the count(*) interception below.
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        match projection {
-            // Empty projection (count(*) / EXISTS): fetch one column so the
-            // upstream FlightExec produces a correctly-shaped batch, then drop
-            // it again to honour the requested zero-column output.
-            Some(p) if p.is_empty() => {
-                let single = vec![0usize];
-                let plan = self
-                    .inner
-                    .scan(state, Some(&single), filters, limit)
-                    .await?;
-                let empty: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
-                Ok(Arc::new(ProjectionExec::try_new(empty, plan)?))
-            }
-            _ => self.inner.scan(state, projection, filters, limit).await,
-        }
-    }
-}
-
 /// Register an InfluxDB 3 measurement (or arbitrary SQL query) as a Skardi table
 /// backed by the source's Arrow Flight SQL endpoint.
 ///
@@ -303,7 +226,9 @@ pub async fn register_influxdb_tables(
             )
         })?;
 
-    let table = CountSafeFlightTable {
+    // Wrapped so `SELECT count(*)` survives the upstream `enforce_schema`
+    // empty-projection bug (see `CountSafeTable` in `providers/mod.rs`).
+    let table = CountSafeTable {
         inner: Arc::new(table),
     };
     session_ctx

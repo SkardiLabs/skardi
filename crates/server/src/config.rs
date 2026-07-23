@@ -5,6 +5,7 @@ use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+use skardi::sources::providers::clickhouse::register_clickhouse_tables;
 use skardi::sources::providers::dynamodb::register_dynamodb_tables;
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::influxdb::register_influxdb_tables;
@@ -743,6 +744,7 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Sqlite,
     DataSourceType::Seekdb,
     DataSourceType::Dynamodb,
+    DataSourceType::Clickhouse,
     // OpenConnector is catalog-only; its tables come from typed bindings, so
     // the same catalog-mode guards (no per-table `options`) must apply.
     DataSourceType::OpenConnector,
@@ -828,10 +830,11 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         }
 
         // Catalog mode must not mix with per-table / per-schema options
+        // ("database" is ClickHouse's schema-analog spelling)
         if CATALOG_SUPPORTED_SOURCES.contains(&source.source_type)
             && source.hierarchy_level == HierarchyLevel::Catalog
         {
-            for conflicting in &["table", "schema"] {
+            for conflicting in &["table", "schema", "database"] {
                 if source
                     .options
                     .as_ref()
@@ -890,6 +893,7 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 | DataSourceType::Redis
                 | DataSourceType::Seekdb
                 | DataSourceType::Influxdb
+                | DataSourceType::Clickhouse
                 | DataSourceType::OpenConnector
                 | DataSourceType::Dynamodb,
                 false,
@@ -1065,6 +1069,7 @@ async fn register_data_source(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb,
             _,
@@ -1488,6 +1493,40 @@ async fn register_data_source(
             .map_err(|e| {
                 tracing::error!(
                     "InfluxDB registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Clickhouse => {
+            tracing::info!(
+                "Registering ClickHouse table: {} (hierarchy_level: {:?})",
+                source.name,
+                source.hierarchy_level
+            );
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            register_clickhouse_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+                source.access_mode.is_read_write(),
+                source.hierarchy_level,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "ClickHouse registration failed for '{}': {:?}",
                     source.name,
                     e
                 );
@@ -2650,6 +2689,73 @@ bindings:
                 config_err,
                 ConfigError::CatalogModeConflictingOptions { name, option }
                     if name == "ddb" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    fn clickhouse_source(
+        name: &str,
+        options: Option<HashMap<String, String>>,
+        access_mode: AccessMode,
+    ) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::Clickhouse,
+            path: PathBuf::new(),
+            connection_string: Some("http://localhost:8123".to_string()),
+            schema: None,
+            options,
+            open_connector: None,
+            hierarchy_level: HierarchyLevel::default(),
+            access_mode,
+            enable_cache: false,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_clickhouse_read_write() {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "events".to_string());
+        let source = clickhouse_source("events", Some(options), AccessMode::ReadWrite);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnsupportedWriteMode { name, source_type }
+                    if name == "events" && *source_type == DataSourceType::Clickhouse
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_clickhouse_table_mode_with_database_option() {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "events".to_string());
+        options.insert("database".to_string(), "analytics".to_string());
+        let source = clickhouse_source("events", Some(options), AccessMode::ReadOnly);
+        validate_data_sources(&[source]).expect("table mode accepts a database option");
+    }
+
+    #[test]
+    fn validate_rejects_clickhouse_catalog_database_option() {
+        // "database" is ClickHouse's schema-analog option; letting it through
+        // in catalog mode would silently change the pool's default database.
+        let mut options = HashMap::new();
+        options.insert("database".to_string(), "analytics".to_string());
+        let mut source = clickhouse_source("ch", Some(options), AccessMode::ReadOnly);
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "ch" && option == "database"
             ),
             "got {config_err}"
         );

@@ -1,0 +1,47 @@
+kind: context
+
+metadata:
+  name: ctx_clickhouse_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # Each ClickHouse table is registered as its own read-only Skardi table.
+    # Credentials come from env vars (CLICKHOUSE_USER / CLICKHOUSE_PASSWORD);
+    # a plain local container's `default` user needs none — drop user_env /
+    # pass_env in that case.
+    - name: "users"
+      type: "clickhouse"
+      connection_string: "http://localhost:8123"
+      description: "Demo users table in ClickHouse"
+      options:
+        database: "mydb"
+        table: "users"
+        user_env: "CLICKHOUSE_USER"
+        pass_env: "CLICKHOUSE_PASSWORD"
+
+    - name: "orders"
+      type: "clickhouse"
+      connection_string: "http://localhost:8123"
+      description: "Demo orders table in ClickHouse"
+      options:
+        database: "mydb"
+        table: "orders"
+        user_env: "CLICKHOUSE_USER"
+        pass_env: "CLICKHOUSE_PASSWORD"
+
+    - name: "products"
+      type: "clickhouse"
+      connection_string: "http://localhost:8123"
+      description: "Demo products table in ClickHouse (category is Nullable)"
+      options:
+        database: "mydb"
+        table: "products"
+        user_env: "CLICKHOUSE_USER"
+        pass_env: "CLICKHOUSE_PASSWORD"
+
+    # CSV data source used by the federated-join example.
+    - name: "product_inventory"
+      type: "csv"
+      path: "docs/clickhouse/sample_data/product_inventory.csv"
+      description: "Static product → warehouse / quantity mapping"

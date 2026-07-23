@@ -1,0 +1,18 @@
+kind: pipeline
+
+metadata:
+  name: "clickhouse-catalog-list-users"
+  version: "1.0.0"
+  description: >
+    Scan the users table via a three-part catalog reference.
+    Demonstrates catalog mode: tables are addressed as catalog.database.table.
+
+# Parameters:
+#   {limit} - Maximum number of rows to return
+
+spec:
+  query: |
+    SELECT id, name, email
+    FROM ch_catalog.mydb.users
+    ORDER BY id
+    LIMIT {limit}
