@@ -566,3 +566,4 @@ git commit -m "feat(cli): add e2e smoke test and rewrite CLI docs for thin-clien
 
 - Migrating per-source demo docs (`docs/lance/`, `docs/sqlite/`, `docs/basic/`, `docs/clickhouse/`, `docs/dynamodb/`, `docs/redis/`, `docs/embeddings/`, `docs/S3_USAGE.md`, `docs/semantics.md`) from `skardi query --ctx` local-engine workflows to server-based workflows.
 - Any release-workflow changes: none are needed (the CLI release build uses default features; the `rag` feature matrix builds skardi-server Docker images).
+- `demo/llm_wiki/README.md` and `demo/rag/README.md` reference removed CLI features/aliases (`cargo install --path crates/cli --features candle|rag`, `skardi alias`, `--ctx`) and need migration to the server-based workflow.

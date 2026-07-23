@@ -4,17 +4,21 @@
 //! to the path of the built binary, so each test spawns it as a real
 //! subprocess rather than calling library code directly.
 //!
-//! Both tests are `#[ignore]` — they require a `skardi-server` instance
-//! reachable at `SKARDI_SERVER_URL` (or the default `http://127.0.0.1:8080`).
-//! They are not run as part of `cargo test -p skardi-cli` (unit and
-//! wiremock-backed integration tests cover everything else); run them
-//! manually once a server is up:
+//! The two tests that hit a real server are `#[ignore]` — they require a
+//! `skardi-server` instance reachable at `SKARDI_SERVER_URL` (or the
+//! default `http://127.0.0.1:8080`) and are not run as part of
+//! `cargo test -p skardi-cli` (unit and wiremock-backed integration tests
+//! cover everything else); run them manually once a server is up:
 //!
 //! ```bash
 //! cargo run -p skardi-server -- --port 8080 &   # adjust flags to your setup
 //! SKARDI_SERVER_URL=http://127.0.0.1:8080 \
 //!   cargo test -p skardi-cli --test e2e_smoke -- --ignored
 //! ```
+//!
+//! The remaining tests below exercise clap's argument parsing (usage
+//! errors, `--help`) and need no server; they run as part of the normal
+//! `cargo test -p skardi-cli`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -78,5 +82,47 @@ fn run_unknown_pipeline_via_stdin_data_reports_not_found() {
     assert!(
         stderr.contains("not found"),
         "expected stderr to report the pipeline as not found\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// `skardi query --bogus` is a clap usage error (unknown flag). Per the
+/// CLI's exit-code contract, code 2 is reserved for "server unreachable",
+/// so usage errors must exit 1, not clap's default of 2. Needs no server.
+#[test]
+fn bogus_flag_exits_with_code_one() {
+    let output = Command::new(env!("CARGO_BIN_EXE_skardi"))
+        .args(["query", "--bogus"])
+        .output()
+        .expect("failed to spawn skardi binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected `skardi query --bogus` to exit 1\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// `skardi --help` exits 0 and prints usage to stdout. Needs no server.
+#[test]
+fn help_exits_zero_and_prints_usage_to_stdout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_skardi"))
+        .args(["--help"])
+        .output()
+        .expect("failed to spawn skardi binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected `skardi --help` to exit 0\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Usage"),
+        "expected stdout to contain clap's usage text\nstdout: {stdout}\nstderr: {stderr}"
     );
 }

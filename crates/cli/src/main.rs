@@ -5,6 +5,7 @@
 //! all subcommands, the `Commands` enum, and dispatch; each subcommand's
 //! request construction and response handling lives in `commands::*`.
 
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
 use commands::jobs::JobCmd;
@@ -35,7 +36,7 @@ struct Cli {
     command: Commands,
 }
 
-/// Subcommands. `Query` and `Run` exist so far — Task 9 adds the rest.
+/// Subcommands supported by the CLI.
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run ad-hoc SQL against the server and print the result.
@@ -101,7 +102,27 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // `--help`/`--version` are not usage errors: clap renders them
+            // to stdout and we exit 0. Everything else (bogus flags,
+            // missing args, ...) is a usage error: `e.print()` renders
+            // clap's usage text to stderr (as `Cli::parse()` would have),
+            // and we exit 1 rather than clap's default 2, since exit code 2
+            // is reserved for "server unreachable" in this CLI's contract.
+            match e.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    let _ = e.print();
+                    return ExitCode::SUCCESS;
+                }
+                _ => {
+                    let _ = e.print();
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
     let config = ClientConfig::resolve(cli.server, cli.token);
 
     match dispatch(cli.command, &config).await {
