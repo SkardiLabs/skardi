@@ -153,6 +153,22 @@ impl RowConverter {
         let mut fields = Vec::with_capacity(columns.len());
         let mut arrow_fields = Vec::with_capacity(columns.len());
         for spec in columns {
+            // Column paths are row-relative (`user.login`); the `$.` marker
+            // belongs to whole-document row paths only. Reject it rather
+            // than strip: `$.{path}` would otherwise parse into a literal
+            // `"$"` first segment and silently read the wrong key —
+            // all-NULL columns instead of a loud error.
+            if spec.path.starts_with("$.") {
+                return Err(OpenConnectorError::InvalidRowPath {
+                    path: spec.path.clone(),
+                    reason: format!(
+                        "column paths are row-relative object keys \
+                         (write '{}', not '{}')",
+                        &spec.path[2..],
+                        spec.path
+                    ),
+                });
+            }
             let path = RowPath::parse(&format!("$.{}", spec.path))?;
             arrow_fields.push(Field::new(
                 &spec.name,
@@ -891,6 +907,27 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(ids.value(0), 7);
+    }
+
+    #[test]
+    fn dollar_prefixed_column_paths_are_rejected_not_silently_misread() {
+        // `$.user.login` would survive the `$.{path}` concatenation as a
+        // literal `"$"` first segment and read the wrong key — nullable
+        // columns would silently go all-NULL. Reject it with the corrected
+        // spelling instead.
+        let err = RowConverter::new(&[FieldMapping {
+            name: "author",
+            path: "$.user.login",
+            field_type: FieldType::Utf8,
+            nullable: true,
+        }])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::InvalidRowPath { ref path, ref reason }
+                if path == "$.user.login"
+                    && reason.contains("write 'user.login', not '$.user.login'")
+        ));
     }
 
     #[test]
