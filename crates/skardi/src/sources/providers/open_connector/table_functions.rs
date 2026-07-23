@@ -20,6 +20,14 @@
 //! requires the action to be allowlisted **and** classified as a
 //! non-mutating read by its discovered gateway metadata — absent or
 //! ambiguous classification is refused, naming the gap.
+//!
+//! Staleness boundary: because planning never re-discovers, the metadata
+//! these gates read (read-only classification, executability, contract
+//! fingerprints) is a snapshot from registration. An upstream action that
+//! turns mutating *after* registration keeps passing the Skardi-side gate
+//! until the next restart or configuration reload; Open Connector's own
+//! action policies are the live, independent enforcement boundary for that
+//! window.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};

@@ -204,8 +204,15 @@ JOIN 'labels.csv' l ON i.id = l.id;
   unclassified actions are rejected before any HTTP request.
 - The integration registers no DML: `INSERT`/`UPDATE`/`DELETE` and
   read-write access modes fail with targeted errors.
+- The metadata these gates read (read-only classification, executability,
+  action-contract fingerprints) is discovered at registration and holds
+  until the next restart or configuration reload — query planning never
+  re-contacts the gateway. An action whose upstream definition turns
+  mutating after registration is therefore not re-checked by Skardi inside
+  that window.
 - Open Connector's own action policies remain a second, independent
-  enforcement boundary.
+  enforcement boundary — and the live one during the staleness window
+  above.
 
 ## Caching and freshness
 
