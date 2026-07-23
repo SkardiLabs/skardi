@@ -3,6 +3,7 @@
 //! clap surface, and dispatch.
 
 pub mod health;
+pub mod jobs;
 pub mod pipeline;
 pub mod query;
 pub mod run;

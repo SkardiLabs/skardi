@@ -7,6 +7,7 @@
 
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
+use commands::jobs::JobCmd;
 use commands::pipeline::PipelineCmd;
 use config::ClientConfig;
 use std::path::PathBuf;
@@ -82,6 +83,12 @@ enum Commands {
         cmd: PipelineCmd,
     },
 
+    /// Submit, inspect, list, or cancel job runs on the server.
+    Job {
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
+
     /// Show the server's data source schema.
     Schema,
 
@@ -130,6 +137,8 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
         } => commands::run::run(&client, &name, data.as_deref(), &params, table).await,
 
         Commands::Pipeline { cmd } => commands::pipeline::run(&client, cmd).await,
+
+        Commands::Job { cmd } => commands::jobs::run(&client, cmd).await,
 
         Commands::Schema => commands::schema::run(&client).await,
 

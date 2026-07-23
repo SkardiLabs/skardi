@@ -17,9 +17,6 @@ use std::io::Read;
 /// first — numbers, booleans, `null`, arrays, and quoted strings all come
 /// through typed — and falls back to a plain JSON string when it isn't
 /// valid JSON on its own (e.g. `s=hello`).
-// TODO(task 7, task 9): consumed by the request-building code once
-// subcommands are wired up; remove this `allow` when that lands.
-#[allow(dead_code)]
 pub fn parse_param(raw: &str) -> Result<(String, Value)> {
     let Some(eq_index) = raw.find('=') else {
         bail!("invalid -p parameter {raw:?}: expected NAME=VALUE");
