@@ -6,6 +6,7 @@
 
 use clap::Parser;
 
+mod client;
 mod config;
 mod output;
 mod params;
