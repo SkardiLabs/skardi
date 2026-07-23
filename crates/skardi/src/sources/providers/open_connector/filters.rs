@@ -116,9 +116,13 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
 /// `TimestampMillisUtc` column semantics.
 fn scalar_to_json(literal: &ScalarValue) -> Option<Value> {
     match literal {
-        ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) => {
-            Some(Value::from(text.as_str()))
-        }
+        // Utf8View included: DataFusion 52 can carry string literals as view
+        // scalars after coercion, and a missed match here silently demotes an
+        // Exact pushdown to a local re-filter over the full fetch. (There is
+        // no LargeUtf8View — view types have no Large variants.)
+        ScalarValue::Utf8(Some(text))
+        | ScalarValue::LargeUtf8(Some(text))
+        | ScalarValue::Utf8View(Some(text)) => Some(Value::from(text.as_str())),
         ScalarValue::Boolean(Some(b)) => Some(Value::from(*b)),
         ScalarValue::Int8(Some(v)) => Some(Value::from(*v)),
         ScalarValue::Int16(Some(v)) => Some(Value::from(*v)),
@@ -330,6 +334,29 @@ mod tests {
             translated.inputs,
             vec![("name".to_string(), Value::from("widget"))]
         );
+
+        // DataFusion 52 can coerce string literals into view scalars; a
+        // missed match would silently demote the Exact pushdown to a local
+        // re-filter over the full fetch.
+        for scalar in [
+            ScalarValue::LargeUtf8(Some("widget".to_string())),
+            ScalarValue::Utf8View(Some("widget".to_string())),
+        ] {
+            let name_eq = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("name")),
+                Operator::Eq,
+                Box::new(Expr::Literal(scalar, None)),
+            ));
+            let translated = translate_filters(&[name_eq], MAPPINGS);
+            assert_eq!(
+                translated.inputs,
+                vec![("name".to_string(), Value::from("widget"))],
+            );
+            assert_eq!(
+                translated.pushdown,
+                vec![TableProviderFilterPushDown::Exact]
+            );
+        }
     }
 
     #[test]
