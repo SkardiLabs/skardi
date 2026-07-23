@@ -13,9 +13,6 @@ use std::fmt;
 /// Holds the underlying `reqwest::Client`, the base URL with any trailing
 /// `/` stripped (so callers can safely append a `path` starting with `/`),
 /// and an optional bearer token attached to every request.
-// TODO(task 6): constructed and used once subcommand dispatch is wired up;
-// remove this `allow` when that lands.
-#[allow(dead_code)]
 pub struct ApiClient {
     http: Client,
     base_url: String,
@@ -27,9 +24,6 @@ pub struct ApiClient {
 /// Converts into `anyhow::Error` via `std::error::Error`, and `main` can
 /// `downcast_ref::<ApiError>` on the resulting `anyhow::Error` to pick an
 /// exit code.
-// TODO(task 6): matched on and downcast once subcommand dispatch is wired
-// up; remove this `allow` when that lands.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum ApiError {
     /// The request never got a response: connect/DNS/timeout failure, or
@@ -78,9 +72,6 @@ impl StdError for ApiError {}
 ///
 /// Only the two fields consumed by error mapping are modeled; the rest
 /// (`success`, `details`, `timestamp`) are left unmodeled and ignored.
-// TODO(task 6): remove this `allow` once `ApiClient` methods are called
-// outside of tests and this is no longer flagged as dead code.
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct ErrorEnvelope {
     error: String,
@@ -88,9 +79,6 @@ struct ErrorEnvelope {
     error_type: Option<String>,
 }
 
-// TODO(task 6): called from `main` once subcommand dispatch is wired up;
-// remove this `allow` when that lands.
-#[allow(dead_code)]
 impl ApiClient {
     /// Build a client from a resolved `ClientConfig`. Strips any trailing
     /// `/` from the server URL so `path` (which starts with `/`) can be
@@ -111,6 +99,9 @@ impl ApiClient {
 
     /// Issue a GET request against `path` (which must start with `/`) and
     /// return the parsed JSON body, or an `ApiError` on failure.
+    // TODO(later CLI subcommand task): no subcommand issues a GET yet (only
+    // `query` exists, and it POSTs); remove this `allow` once one does.
+    #[allow(dead_code)]
     pub async fn get(&self, path: &str) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.http.get(&url);

@@ -30,9 +30,6 @@ impl ClientConfig {
     /// Not unit-tested directly: it reads process-global environment
     /// variables, which race under parallel test execution. All precedence
     /// logic lives in `resolve_from`, which is tested exhaustively below.
-    // TODO(task 6): called from `main` once subcommands are wired up; remove
-    // this `allow` when that lands.
-    #[allow(dead_code)]
     pub fn resolve(flag_server: Option<String>, flag_token: Option<String>) -> ClientConfig {
         let env_server = std::env::var(SERVER_URL_ENV).ok();
         let env_token = std::env::var(API_TOKEN_ENV).ok();

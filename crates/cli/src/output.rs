@@ -21,9 +21,6 @@ use serde_json::Value;
 /// Not unit-tested here: it writes to real stdout/stderr. Covered by
 /// command-level tests (Tasks 6-7) asserting it doesn't panic, and by the
 /// end-to-end test.
-// TODO(tasks 6, 7): consumed once subcommands issue requests and render
-// their responses; remove this `allow` when that lands.
-#[allow(dead_code)]
 pub fn print_result(body: &Value, table: bool) {
     let empty: Vec<Value> = Vec::new();
     let rows = body.get("data").and_then(Value::as_array).unwrap_or(&empty);
