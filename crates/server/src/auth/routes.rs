@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use axum::{
+    Json,
     body::Body,
     extract::State,
     http::{HeaderName, HeaderValue, Request, Response, StatusCode},
@@ -16,6 +17,7 @@ use axum::{
 use better_auth::{AuthRequest, HttpMethod, SessionOps};
 use cookie::Cookie;
 
+use crate::response::{ErrorResponse, create_error_response};
 use crate::server::AppState;
 
 async fn to_auth_request(req: Request<Body>) -> Result<AuthRequest, String> {
@@ -181,6 +183,27 @@ pub async fn verify_session(
     }
 }
 
+/// Enforce the session gate for JSON API handlers: on auth failure, convert
+/// the raw `verify_session` response into the shared `ErrorResponse`
+/// envelope handlers return.
+pub(crate) async fn require_session(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Err(unauth_response) = verify_session(state, headers).await {
+        let status = unauth_response.status();
+        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
+            .await
+            .unwrap_or_default();
+        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "Authentication required".to_string());
+        return Err((status, create_error_response(&msg, "unauthorized", None)));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,13 +363,12 @@ mod tests {
     fn make_no_auth_state() -> AppState {
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
-        use crate::metrics::PipelineMetrics;
         use crate::semantics::SemanticsRegistry;
         use crate::server::AppState;
         use datafusion::prelude::SessionContext;
         use skardi::engine::datafusion::DataFusionEngine;
         use std::path::PathBuf;
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
 
         let config = ServerConfig {
             pipelines: Default::default(),
@@ -364,14 +386,7 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState {
-            config: Arc::new(RwLock::new(config)),
-            engine,
-            session_ctx,
-            metrics: PipelineMetrics::new(),
-            auth_layer: AuthLayer::None,
-            jobs: None,
-        }
+        AppState::new(config, engine, session_ctx, AuthLayer::None, None)
     }
 
     #[tokio::test]
@@ -384,13 +399,12 @@ mod tests {
     async fn make_better_auth_state() -> AppState {
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
-        use crate::metrics::PipelineMetrics;
         use crate::semantics::SemanticsRegistry;
         use crate::server::AppState;
         use datafusion::prelude::SessionContext;
         use skardi::engine::datafusion::DataFusionEngine;
         use std::path::PathBuf;
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
 
         unsafe {
             std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
@@ -418,14 +432,7 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState {
-            config: Arc::new(RwLock::new(config)),
-            engine,
-            session_ctx,
-            metrics: PipelineMetrics::new(),
-            auth_layer: layer,
-            jobs: None,
-        }
+        AppState::new(config, engine, session_ctx, layer, None)
     }
 
     #[tokio::test]

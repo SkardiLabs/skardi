@@ -15,13 +15,12 @@ use serde_json::{Value, json};
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::config::{CliArgs, ServerConfig};
-use skardi_server::metrics::PipelineMetrics;
 use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
 
@@ -110,14 +109,7 @@ spec:
             port: 0,
         },
     };
-    let state = AppState {
-        config: Arc::new(RwLock::new(config)),
-        engine,
-        session_ctx: Arc::clone(&ctx),
-        metrics: PipelineMetrics::new(),
-        auth_layer: AuthLayer::None,
-        jobs: None,
-    };
+    let state = AppState::new(config, engine, Arc::clone(&ctx), AuthLayer::None, None);
     (state, tmp)
 }
 
