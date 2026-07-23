@@ -166,17 +166,7 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
         let pack = self.packs.require(pack_name).map_err(plan_error)?;
         let table = self.packs.table(pack, table_name).map_err(plan_error)?;
 
-        let resource: Value = serde_json::from_str(&resource_json).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "open_connector_query: resource_json is not valid JSON: {e}"
-            ))
-        })?;
-        if !resource.is_object() {
-            return plan_err!(
-                "open_connector_query: resource_json must be a JSON object of resource \
-                 inputs, e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
-            );
-        }
+        let resource = parse_json_object("open_connector_query", "resource_json", &resource_json)?;
         for key in table.required_resources {
             if resource.get(*key).is_none() {
                 return Err(plan_error(OpenConnectorError::MissingResourceInput {
@@ -280,17 +270,7 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             }
         }
 
-        let input: Value = serde_json::from_str(&input_json).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "open_connector_scan: input_json is not valid JSON: {e}"
-            ))
-        })?;
-        if !input.is_object() {
-            return plan_err!(
-                "open_connector_scan: input_json must be a JSON object of action inputs, \
-                 e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
-            );
-        }
+        let input = parse_json_object("open_connector_scan", "input_json", &input_json)?;
 
         let row_path = RowPath::parse(&row_path).map_err(plan_error)?;
         // Deterministic row type or planning error — derived purely from the
@@ -422,6 +402,21 @@ fn discovered_action(
 /// the user-facing diagnostic.
 fn plan_error(e: OpenConnectorError) -> DataFusionError {
     DataFusionError::Plan(e.to_string())
+}
+
+/// Parse a UDTF argument that must carry a JSON object (resource / action
+/// inputs), shared by both functions so the two diagnostics stay in
+/// lockstep.
+fn parse_json_object(fn_name: &str, arg: &str, raw: &str) -> DFResult<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| DataFusionError::Plan(format!("{fn_name}: {arg} is not valid JSON: {e}")))?;
+    if !value.is_object() {
+        return plan_err!(
+            "{fn_name}: {arg} must be a JSON object of input fields, \
+             e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
+        );
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -740,6 +735,12 @@ raw_action_allowlist:
         .await;
         expect_plan_error(
             &ctx,
+            "SELECT * FROM open_connector_query('saas', 'mock.items', '[1, 2]')",
+            "resource_json must be a JSON object",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
             "SELECT * FROM open_connector_query('saas', 'mock.items')",
             "expects 3-4 arguments",
         )
@@ -988,6 +989,13 @@ raw_action_allowlist:
             r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
                                                  '{"workspace":"demo"}', 'items')"#,
             "must start with '$.'",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
+                                                 '[1, 2]', '$.items')"#,
+            "input_json must be a JSON object",
         )
         .await;
         assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");
