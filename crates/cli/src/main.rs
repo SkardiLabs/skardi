@@ -7,6 +7,7 @@
 use clap::Parser;
 
 mod config;
+mod params;
 
 /// Command-line interface for interacting with a skardi-server instance.
 #[derive(Parser, Debug)]
