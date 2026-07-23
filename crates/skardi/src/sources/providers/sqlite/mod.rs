@@ -1549,8 +1549,6 @@ pub(crate) fn expr_to_sqlite_sql(expr: &Expr) -> Option<String> {
     unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
 }
 
-/// Extract a string literal from a DataFusion `Expr`.
-/// Returns an empty string for NULL placeholders (schema inference).
 /// Produces a properly quoted table reference string for SQLite.
 fn quote_sqlite_table(tbl: &TableReference) -> String {
     quote_sqlite_ident(tbl.table())
