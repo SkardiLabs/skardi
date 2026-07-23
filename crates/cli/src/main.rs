@@ -33,7 +33,7 @@ struct Cli {
     command: Commands,
 }
 
-/// Subcommands. Only `Query` exists so far — Tasks 7-9 add the rest.
+/// Subcommands. `Query` and `Run` exist so far — Tasks 8-9 add the rest.
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run ad-hoc SQL against the server and print the result.
@@ -49,6 +49,26 @@ enum Commands {
         /// cap the number of returned rows (server default: 1000)
         #[arg(long, value_name = "N")]
         max_rows: Option<usize>,
+
+        /// render results as a table instead of JSON
+        #[arg(long)]
+        table: bool,
+    },
+
+    /// Execute a named server pipeline and print the result.
+    Run {
+        /// pipeline name (see `skardi pipeline list`)
+        name: String,
+
+        /// inline JSON body, @FILE to read from a file, or - to read stdin
+        #[arg(short = 'd', long, value_name = "JSON|@FILE|-")]
+        data: Option<String>,
+
+        /// NAME=VALUE parameter (repeatable); values are parsed as JSON
+        /// first (numbers, booleans, arrays, null, quoted strings) and fall
+        /// back to a plain string otherwise; -p overrides matching --data keys
+        #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
 
         /// render results as a table instead of JSON
         #[arg(long)]
@@ -85,5 +105,12 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
             max_rows,
             table,
         } => commands::query::run(&client, sql, file, max_rows, table).await,
+
+        Commands::Run {
+            name,
+            data,
+            params,
+            table,
+        } => commands::run::run(&client, &name, data.as_deref(), &params, table).await,
     }
 }

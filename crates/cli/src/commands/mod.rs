@@ -3,3 +3,4 @@
 //! clap surface, and dispatch.
 
 pub mod query;
+pub mod run;

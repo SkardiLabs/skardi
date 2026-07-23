@@ -45,9 +45,6 @@ pub fn parse_param(raw: &str) -> Result<(String, Value)> {
 /// The `-d` value (if any) is parsed as the base JSON object; each `-p`
 /// then sets (or overrides) one key on top of it. Supplying neither `-d`
 /// nor any `-p` yields an empty object.
-// TODO(task 7, task 9): consumed by the request-building code once
-// subcommands are wired up; remove this `allow` when that lands.
-#[allow(dead_code)]
 pub fn build_body(data: Option<&str>, params: &[String]) -> Result<Map<String, Value>> {
     let mut body = match data {
         Some(data) => {
