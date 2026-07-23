@@ -35,7 +35,7 @@ alias is now just `skardi run <pipeline-name>`.
 
 ```
 skardi query  (-e <SQL> | -f <FILE>) [--max-rows N] [--table]     → POST /query
-skardi run    <name> [-p NAME=VALUE ...] [--table]                → POST /{name}/execute
+skardi run    <name> [-d <JSON>|@FILE|-] [-p NAME=VALUE ...] [--table] → POST /{name}/execute
 skardi pipeline list                                              → GET /pipelines
 skardi pipeline show <name>                                       → GET /pipeline/{name}
 skardi schema                                                     → GET /data_source
@@ -61,6 +61,12 @@ Global flags on every command: `--server <URL>`, `--token <TOKEN>`.
 - Param values are parsed as JSON first (numbers, booleans, arrays, null),
   falling back to string. This matters because the server substitutes typed
   literals into pipeline SQL.
+- `-d/--data` supplies the whole request body as a JSON object: inline
+  (`-d '{"user_id": 1}'`), from a file (`-d @params.json`), or from stdin
+  (`-d -`). The value must be a JSON object (the server expects a flat
+  param map); anything else is a client-side error.
+- `-d` and `-p` compose: the JSON object is the base, then each
+  `-p NAME=VALUE` overrides that key. With neither flag, the body is `{}`.
 
 ### Removed
 
@@ -162,7 +168,8 @@ fresh rewrite and holds to the stricter rule.
 ## Testing
 
 1. **Unit** (in-module `#[cfg(test)]`): config precedence, `-p` param
-   JSON-typing, table rendering, error-envelope mapping.
+   JSON-typing, `-d`/`-p` merge semantics (including `@file`/stdin sources
+   and non-object rejection), table rendering, error-envelope mapping.
 2. **Integration** (mock HTTP server via `wiremock` dev-dep):
    per-command request shape (path, body, headers incl. Bearer) and response
    handling (success, truncated notice, 404, 401, connection refused).
@@ -175,6 +182,7 @@ fresh rewrite and holds to the stricter rule.
 |---|---|
 | Local engine | Removed entirely; no feature flag, no fallback |
 | Pipeline invocation | `skardi run <name>` only; no bare-verb fallback |
+| Pipeline params | `-p NAME=VALUE` flags and/or `-d <JSON>` body (inline/@file/stdin); `-p` overrides `-d` keys |
 | Extra commands | `pipeline list/show`, `schema`, `health` all included |
 | Connection config | Global flags + env + `~/.skardi/config.yaml`, flag > env > file > default |
 | Output | JSON default, `--table` opt-in |
