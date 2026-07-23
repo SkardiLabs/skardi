@@ -14,6 +14,34 @@ use super::filters::FilterMapping;
 use super::json_to_arrow::FieldMapping;
 use super::pagination::PaginationStrategy;
 
+/// A fixed action-input value a pack pins at compile time — a
+/// const-friendly stand-in for the JSON scalar set (`serde_json::Value`'s
+/// string and number variants cannot be built in `static` initializers).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FixedValue {
+    /// JSON string.
+    Str(&'static str),
+    /// JSON integer.
+    Int(i64),
+    /// JSON number. Non-finite values serialize as JSON null (a pack bug —
+    /// there is no JSON spelling for NaN/inf), so packs pin finite numbers.
+    Float(f64),
+    /// JSON boolean.
+    Bool(bool),
+}
+
+impl FixedValue {
+    /// The JSON value sent in the action input.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Str(text) => serde_json::Value::from(*text),
+            Self::Int(value) => serde_json::Value::from(*value),
+            Self::Float(value) => serde_json::Value::from(*value),
+            Self::Bool(value) => serde_json::Value::from(*value),
+        }
+    }
+}
+
 /// One stable table definition inside a source pack.
 #[derive(Debug, Clone, Copy)]
 pub struct SourcePackTable {
@@ -34,7 +62,7 @@ pub struct SourcePackTable {
     /// default to open ones). A pushed-down filter targeting the same input
     /// field overrides the fixed value, so the table reads as the complete
     /// collection while predicates still narrow it.
-    pub fixed_inputs: &'static [(&'static str, &'static str)],
+    pub fixed_inputs: &'static [(&'static str, FixedValue)],
     /// Allowlisted filter translations.
     pub filters: &'static [FilterMapping],
     /// Expected action-contract fingerprint. When set, registration compares
@@ -156,6 +184,16 @@ mod tests {
         assert_eq!(pack.version, 1);
         assert_eq!(pack.tables.len(), 1);
         assert_eq!(pack.tables[0].id, "mock.items");
+    }
+
+    #[test]
+    fn fixed_values_convert_to_their_json_scalars() {
+        // The const-friendly stand-in must round-trip every JSON scalar a
+        // pack could pin — numeric/boolean pins are never stringified.
+        assert_eq!(FixedValue::Str("all").to_json(), serde_json::json!("all"));
+        assert_eq!(FixedValue::Int(-3).to_json(), serde_json::json!(-3));
+        assert_eq!(FixedValue::Float(2.5).to_json(), serde_json::json!(2.5));
+        assert_eq!(FixedValue::Bool(true).to_json(), serde_json::json!(true));
     }
 
     #[test]

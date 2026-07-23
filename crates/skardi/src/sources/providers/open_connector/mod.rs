@@ -54,7 +54,7 @@ pub use action_registry::{ActionMetadata, ActionRegistry};
 pub use client::OpenConnectorClient;
 pub use config::{OpenConnectorBinding, OpenConnectorConfig};
 pub use error::OpenConnectorError;
-pub use source_pack::{SourcePack, SourcePackRegistry, SourcePackTable};
+pub use source_pack::{FixedValue, SourcePack, SourcePackRegistry, SourcePackTable};
 pub use table::OpenConnectorTableProvider;
 pub use table_functions::{GatewayHandle, OpenConnectorGateways, register_open_connector_udtfs};
 

@@ -35,7 +35,9 @@ use datafusion::logical_expr::Operator;
 use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::PaginationStrategy;
-use crate::sources::providers::open_connector::source_pack::{SourcePack, SourcePackTable};
+use crate::sources::providers::open_connector::source_pack::{
+    FixedValue, SourcePack, SourcePackTable,
+};
 
 /// GitHub's maximum page size; also the short-page termination threshold.
 const GITHUB_PAGINATION: PaginationStrategy = PaginationStrategy::PageNumber {
@@ -246,7 +248,7 @@ static ISSUES: SourcePackTable = SourcePackTable {
     // GitHub lists only open issues by default; pin `state=all` so the
     // table reads as the complete collection (a pushed `state` predicate
     // overrides the pin).
-    fixed_inputs: &[("state", "all")],
+    fixed_inputs: &[("state", FixedValue::Str("all"))],
     filters: &[
         // `state` takes exactly the SQL literal (open/closed/all).
         FilterMapping {
@@ -413,7 +415,7 @@ static PULL_REQUESTS: SourcePackTable = SourcePackTable {
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo"],
     // Same open-by-default listing as issues; pin the complete collection.
-    fixed_inputs: &[("state", "all")],
+    fixed_inputs: &[("state", FixedValue::Str("all"))],
     filters: &[FilterMapping {
         column: "state",
         operator: Operator::Eq,

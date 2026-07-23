@@ -33,7 +33,7 @@ use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
 use super::pagination::{Pagination, PaginationStrategy};
 use super::row_path::RowPath;
-use super::source_pack::SourcePackTable;
+use super::source_pack::{FixedValue, SourcePackTable};
 
 /// The scanned collection's identity and pagination contract — the shape
 /// shared by YAML-bound source-pack tables and `open_connector_scan` raw
@@ -50,7 +50,7 @@ pub struct ScanTarget {
     /// Fixed action inputs sent with every request (see
     /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
     /// input is caller-supplied.
-    pub fixed_inputs: &'static [(&'static str, &'static str)],
+    pub fixed_inputs: &'static [(&'static str, FixedValue)],
     /// Source-pack version, part of the cache key (0 for raw scans, which
     /// have no pack and bypass the cache).
     pub source_pack_version: u32,
@@ -437,7 +437,7 @@ impl ScanState {
             "resource is a JSON object by construction (registration always builds Value::Object)",
         );
         for (field, value) in self.target.fixed_inputs {
-            input.insert((*field).to_string(), Value::from(*value));
+            input.insert((*field).to_string(), value.to_json());
         }
         for (field, value) in &self.filter_inputs {
             input.insert(field.clone(), value.clone());
