@@ -7,6 +7,7 @@
 use clap::Parser;
 
 mod config;
+mod output;
 mod params;
 
 /// Command-line interface for interacting with a skardi-server instance.
