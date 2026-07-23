@@ -762,6 +762,26 @@ raw_action_allowlist:
             "'gateway' must be a string literal",
         )
         .await;
+        // NULL is rejected outright for schema-determining arguments — a
+        // placeholder cannot produce a plan (strict_string_arg semantics).
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query(NULL, 'mock.items', '{}')",
+            "'gateway' must be a string literal, not NULL",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', NULL, '{}')",
+            "'table_id' must be a string literal, not NULL",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', 'mock.items', NULL)",
+            "'resource_json' must be a string literal, not NULL",
+        )
+        .await;
 
         assert_eq!(
             execute_requests(&gateway).len(),
