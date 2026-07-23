@@ -854,6 +854,67 @@ raw_action_allowlist:
     }
 
     #[tokio::test]
+    async fn scan_udtf_treats_json_null_fields_as_sql_null() {
+        // Raw scans type nested fields as opaque Json; a provider null
+        // (assignee: null and friends) must behave as SQL NULL — `IS NULL`
+        // matches it, `= 'null'` does not.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&discovery_response(Some(true), ITEMS_OUTPUT_SCHEMA));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+                return MockResponse::ok(
+                    &serde_json::json!({"output": {"items": [
+                        {"id": 1, "name": "tagged", "tags": ["t1"]},
+                        {"id": 2, "name": "untagged", "tags": null}
+                    ]}})
+                    .to_string(),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let config = parse_config(ALLOWLIST_CONFIG, "SKARDI_TEST_OC_UDTF_SCAN_JSON_NULL", 0);
+        let ctx = setup(&gateway, &config, "SKARDI_TEST_OC_UDTF_SCAN_JSON_NULL").await;
+
+        let batches = collect(
+            &ctx,
+            r#"SELECT id
+               FROM open_connector_scan('saas', 'mock.list_items',
+                                        '{"workspace":"demo"}', '$.items')
+               WHERE tags IS NULL"#,
+        )
+        .await;
+        let rendered = pretty_format_batches(&batches).unwrap().to_string();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "IS NULL must match the provider null: {rendered}"
+        );
+        assert!(
+            rendered.contains('2'),
+            "row id=2 is the null-tagged one: {rendered}"
+        );
+
+        let batches = collect(
+            &ctx,
+            r#"SELECT id
+               FROM open_connector_scan('saas', 'mock.list_items',
+                                        '{"workspace":"demo"}', '$.items')
+               WHERE tags = 'null'"#,
+        )
+        .await;
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "the string 'null' must not match a provider null"
+        );
+    }
+
+    #[tokio::test]
     async fn scan_udtf_denies_unallowlisted_actions_before_http() {
         // mock.list_items IS discovered (the binding uses it) — but raw
         // access is a separate, default-deny grant.

@@ -38,7 +38,9 @@ pub enum FieldType {
     /// JSON array of strings ↔ Arrow List\<Utf8\>.
     Utf8List,
     /// Any JSON value serialized to a JSON string ↔ Arrow Utf8. For
-    /// intentionally opaque fields (arbitrary maps, unstable unions).
+    /// intentionally opaque fields (arbitrary maps, unstable unions). A
+    /// present JSON null is SQL NULL (per the shared null rules), not the
+    /// string `"null"`.
     Json,
 }
 
@@ -243,13 +245,17 @@ impl RowConverter {
                 |v| v.as_str().map(str::to_string),
                 fail,
             )?))),
-            FieldType::Json => {
-                let values: Vec<Option<String>> = cells
-                    .iter()
-                    .map(|cell| cell.map(|v| v.to_string()))
-                    .collect();
-                Ok(Arc::new(StringArray::from(values)))
-            }
+            // Opaque values serialize to canonical JSON text, but a present
+            // JSON null is SQL NULL like everywhere else — never the 4-char
+            // string "null", which would break `IS NULL` and match
+            // `= 'null'`. Routing through collect_cells also makes a null in
+            // a non-nullable Json column a targeted per-column failure.
+            FieldType::Json => Ok(Arc::new(StringArray::from(collect_cells(
+                &cells,
+                spec,
+                |v| Some(v.to_string()),
+                fail,
+            )?))),
             FieldType::TimestampMillisUtc => Ok(Arc::new(
                 TimestampMillisecondArray::from(collect_cells(
                     &cells,
@@ -583,6 +589,48 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert!(raw.value(0).contains("nested"));
+    }
+
+    #[test]
+    fn json_null_becomes_arrow_null_not_the_string_null() {
+        // A present JSON null in a nullable Json column is SQL NULL — never
+        // the 4-char string "null", which would make `IS NULL` miss and
+        // `= 'null'` match. Raw scans type every object/array field as Json,
+        // so nullable nested SaaS fields (assignee: null) hit this arm.
+        let mut with_null = row(1, "a");
+        with_null["raw"] = Value::Null;
+        let mut absent = row(2, "b");
+        absent.as_object_mut().unwrap().remove("raw");
+
+        let batch = converter().convert(&[with_null, absent], 1).unwrap();
+        let raw = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(raw.is_null(0), "present JSON null must be Arrow null");
+        assert!(raw.is_null(1), "absent key stays Arrow null");
+    }
+
+    #[test]
+    fn json_null_fails_for_non_nullable_json_column() {
+        // Same null discipline as every other type: a required opaque field
+        // fails with a targeted per-column error, not a batch-level one.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "raw",
+            path: "raw",
+            field_type: FieldType::Json,
+            nullable: false,
+        }])
+        .unwrap();
+        let err = converter
+            .convert(&[serde_json::json!({"raw": null})], 3)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ConversionFailed { ref column, page: 3, row: 0, ref found, .. }
+                if column == "raw" && found == "null"
+        ));
     }
 
     #[test]

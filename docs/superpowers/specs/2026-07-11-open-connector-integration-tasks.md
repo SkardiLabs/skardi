@@ -108,7 +108,7 @@ do not reintroduce it here.
       model, caching, bounds, observability), ctx/UDTF examples inside it, README
       supported-sources entry (first time the source is actually queryable)
 
-**Verification**: 154 open_connector tests. `open_connector_query` asserted to return the
+**Verification**: 157 open_connector tests. `open_connector_query` asserted to return the
 same schema and values as `saas.ws.items`, replay from the table's cache entry with zero
 new gateway requests, and push the same `min_value` filter and connection alias;
 `open_connector_scan` asserted to execute exactly one POST, expose derived typed/JSON
