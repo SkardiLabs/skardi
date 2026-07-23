@@ -7,6 +7,7 @@
 
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
+use commands::pipeline::PipelineCmd;
 use config::ClientConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -33,7 +34,7 @@ struct Cli {
     command: Commands,
 }
 
-/// Subcommands. `Query` and `Run` exist so far — Tasks 8-9 add the rest.
+/// Subcommands. `Query` and `Run` exist so far — Task 9 adds the rest.
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run ad-hoc SQL against the server and print the result.
@@ -74,6 +75,21 @@ enum Commands {
         #[arg(long)]
         table: bool,
     },
+
+    /// List pipelines, or show one pipeline's definition.
+    Pipeline {
+        #[command(subcommand)]
+        cmd: PipelineCmd,
+    },
+
+    /// Show the server's data source schema.
+    Schema,
+
+    /// Show overall server health, or one pipeline's health.
+    Health {
+        /// pipeline name (omit for overall server health)
+        name: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -112,5 +128,11 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
             params,
             table,
         } => commands::run::run(&client, &name, data.as_deref(), &params, table).await,
+
+        Commands::Pipeline { cmd } => commands::pipeline::run(&client, cmd).await,
+
+        Commands::Schema => commands::schema::run(&client).await,
+
+        Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
     }
 }

@@ -99,9 +99,6 @@ impl ApiClient {
 
     /// Issue a GET request against `path` (which must start with `/`) and
     /// return the parsed JSON body, or an `ApiError` on failure.
-    // TODO(later CLI subcommand task): no subcommand issues a GET yet (only
-    // `query` exists, and it POSTs); remove this `allow` once one does.
-    #[allow(dead_code)]
     pub async fn get(&self, path: &str) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.http.get(&url);
