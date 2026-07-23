@@ -1246,6 +1246,80 @@ bindings:
         );
     }
 
+    #[tokio::test]
+    async fn numeric_yaml_resource_values_reach_the_gateway_as_numbers() {
+        // `issue_number: 42` in a YAML binding must arrive as JSON 42 — the
+        // same value an equivalent UDTF resource JSON sends — never "42".
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(
+                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                        "locally_executable": true, "connection_aliases": []}"#,
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_issue_comments/execute"
+            {
+                return MockResponse::ok(
+                    &serde_json::json!({"output": {"comments": []}}).to_string(),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_NUMERIC_RESOURCE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets, issue_number: 42 }}
+    tables: [issue_comments]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.issue_comments").await;
+        assert_eq!(rows_of(&batches), 0, "stub serves an empty collection");
+
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""issue_number":42"#)),
+            "numeric resource must stay a JSON number: {bodies:?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .all(|body| !body.contains(r#""issue_number":"42""#)),
+            "never stringified: {bodies:?}"
+        );
+    }
+
     #[test]
     fn every_table_binds_and_declares_a_complete_contract() {
         // Bind-time validation (row paths, field paths, pagination) plus the

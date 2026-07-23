@@ -253,6 +253,11 @@ pub enum OpenConnectorError {
     )]
     MissingResourceInput { binding: String, key: String },
 
+    /// A binding set a resource value to null, which would satisfy the
+    /// required-key presence check while sending `null` to the gateway.
+    #[error("Open Connector binding '{binding}' sets resource input '{key}' to null")]
+    NullResourceValue { binding: String, key: String },
+
     /// The discovered action contract does not match the source pack's
     /// expected fingerprint — the upstream action changed incompatibly.
     #[error("Open Connector source-pack table '{table}' failed its compatibility check: {reason}")]

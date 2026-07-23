@@ -49,9 +49,10 @@ WHERE state = 'open'
 LIMIT 50;
 ```
 
-Resource values from YAML bindings are forwarded as strings. If the gateway
-requires a numeric identifier (e.g. `issue_number`), the UDTF's resource
-JSON preserves JSON types: `'{"owner":"acme","repo":"widgets","issue_number":42}'`.
+Resource values keep their YAML types: `issue_number: 42` reaches the
+gateway as the JSON number 42, exactly as the UDTF's resource JSON
+(`'{"owner":"acme","repo":"widgets","issue_number":42}'`) sends it — so a
+binding and an identical UDTF invocation also share one scan-cache entry.
 
 ## Tables
 

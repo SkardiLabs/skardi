@@ -234,14 +234,7 @@ pub async fn register_open_connector_tables(
                 binding.connection_alias.clone(),
                 table,
                 pack.version,
-                Value::Object(
-                    binding
-                        .resource
-                        .clone()
-                        .into_iter()
-                        .map(|(k, v)| (k, Value::from(v)))
-                        .collect(),
-                ),
+                Value::Object(binding.resource.clone().into_iter().collect()),
                 config.max_pages,
                 config.max_rows,
                 scan_timeout,
