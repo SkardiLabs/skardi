@@ -166,7 +166,12 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
         let pack = self.packs.require(pack_name).map_err(plan_error)?;
         let table = self.packs.table(pack, table_name).map_err(plan_error)?;
 
-        let resource = parse_json_object("open_connector_query", "resource_json", &resource_json)?;
+        let resource = parse_json_object(
+            "open_connector_query",
+            "resource_json",
+            &resource_json,
+            "resource inputs",
+        )?;
         for key in table.required_resources {
             if resource.get(*key).is_none() {
                 return Err(plan_error(OpenConnectorError::MissingResourceInput {
@@ -270,7 +275,12 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             }
         }
 
-        let input = parse_json_object("open_connector_scan", "input_json", &input_json)?;
+        let input = parse_json_object(
+            "open_connector_scan",
+            "input_json",
+            &input_json,
+            "action inputs",
+        )?;
 
         let row_path = RowPath::parse(&row_path).map_err(plan_error)?;
         // Deterministic row type or planning error — derived purely from the
@@ -404,15 +414,16 @@ fn plan_error(e: OpenConnectorError) -> DataFusionError {
     DataFusionError::Plan(e.to_string())
 }
 
-/// Parse a UDTF argument that must carry a JSON object (resource / action
-/// inputs), shared by both functions so the two diagnostics stay in
-/// lockstep.
-fn parse_json_object(fn_name: &str, arg: &str, raw: &str) -> DFResult<Value> {
+/// Parse a UDTF argument that must carry a JSON object, shared by both
+/// functions so the two diagnostics stay in lockstep. `noun` names what the
+/// object holds in the caller's vocabulary ("resource inputs" / "action
+/// inputs"), so sharing the implementation doesn't flatten the context.
+fn parse_json_object(fn_name: &str, arg: &str, raw: &str, noun: &str) -> DFResult<Value> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|e| DataFusionError::Plan(format!("{fn_name}: {arg} is not valid JSON: {e}")))?;
     if !value.is_object() {
         return plan_err!(
-            "{fn_name}: {arg} must be a JSON object of input fields, \
+            "{fn_name}: {arg} must be a JSON object of {noun}, \
              e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
         );
     }
@@ -736,7 +747,7 @@ raw_action_allowlist:
         expect_plan_error(
             &ctx,
             "SELECT * FROM open_connector_query('saas', 'mock.items', '[1, 2]')",
-            "resource_json must be a JSON object",
+            "resource_json must be a JSON object of resource inputs",
         )
         .await;
         expect_plan_error(
@@ -995,7 +1006,7 @@ raw_action_allowlist:
             &ctx,
             r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
                                                  '[1, 2]', '$.items')"#,
-            "input_json must be a JSON object",
+            "input_json must be a JSON object of action inputs",
         )
         .await;
         assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");
