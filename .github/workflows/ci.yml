@@ -106,6 +106,20 @@ jobs:
           --health-timeout=10s
           --health-retries=20
 
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_DB: mydb
+          CLICKHOUSE_USER: skardi_user
+          CLICKHOUSE_PASSWORD: skardi_pass
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd="wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
       # DynamoDB Local has no in-image shell tooling for a healthcheck, so
       # readiness is polled with the AWS CLI in a dedicated step below.
       dynamodb:
@@ -124,6 +138,10 @@ jobs:
       SEEKDB_PASSWORD: ""
       INFLUXDB_URL: "http://127.0.0.1:8181"
       INFLUXDB_DATABASE: "metrics"
+      CLICKHOUSE_URL: "http://127.0.0.1:8123"
+      CLICKHOUSE_DATABASE: "mydb"
+      CLICKHOUSE_USER: skardi_user
+      CLICKHOUSE_PASSWORD: skardi_pass
       # DynamoDB Local ignores credential values but the AWS SDK requires them
       # to be present. The endpoint is supplied via the context/test config.
       AWS_ACCESS_KEY_ID: dummy
@@ -459,6 +477,53 @@ jobs:
           mem,host=host2,region=us-west used_percent=73.9 1700000000
           mem,host=host3,region=us-east used_percent=31.5 1700000000
           EOF
+
+      - name: Seed ClickHouse data
+        # The HTTP interface accepts one statement per request, so the seed
+        # script is split on blank lines and posted statement by statement.
+        run: |
+          seed() {
+            curl -fsS "http://127.0.0.1:8123/?user=skardi_user&password=skardi_pass" \
+              --data-binary "$1" > /dev/null
+          }
+          seed "CREATE TABLE mydb.users (
+              id UInt32,
+              name String,
+              email String
+          ) ENGINE = MergeTree ORDER BY id"
+          seed "INSERT INTO mydb.users VALUES
+              (1, 'Alice Smith', 'alice@example.com'),
+              (2, 'Bob Johnson', 'bob@example.com'),
+              (3, 'Carol Williams', 'carol@example.com')"
+          seed "CREATE TABLE mydb.orders (
+              id UInt32,
+              user_id UInt32,
+              product String,
+              amount Float64
+          ) ENGINE = MergeTree ORDER BY id"
+          seed "INSERT INTO mydb.orders VALUES
+              (1, 1, 'Laptop', 999.99),
+              (2, 2, 'Keyboard', 79.99),
+              (3, 3, 'Monitor', 299.99)"
+          seed "CREATE TABLE mydb.products (
+              product_id String,
+              name String,
+              category Nullable(String),
+              price Float64,
+              in_stock Bool
+          ) ENGINE = MergeTree ORDER BY product_id"
+          # PROD005 has a NULL category on purpose — exercises NULL handling.
+          seed "INSERT INTO mydb.products VALUES
+              ('PROD001', 'Laptop', 'Electronics', 999.99, true),
+              ('PROD002', 'Keyboard', 'Electronics', 79.99, true),
+              ('PROD003', 'Monitor', 'Electronics', 299.99, false),
+              ('PROD004', 'Mouse', 'Electronics', 29.99, true),
+              ('PROD005', 'Desk Chair', NULL, 199.99, true)"
+          # Deliberately left empty — exercises schema inference on empty tables.
+          seed "CREATE TABLE mydb.empty_metrics (
+              ts DateTime,
+              value Float64
+          ) ENGINE = MergeTree ORDER BY ts"
 
       - name: Seed DynamoDB data
         env:

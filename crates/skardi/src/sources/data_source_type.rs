@@ -16,8 +16,13 @@ pub enum DataSourceType {
     Lance,
     Seekdb,
     Influxdb,
+    Clickhouse,
     Documents,
     Dynamodb,
+    // Explicit rename: the `lowercase` rule would produce `openconnector`,
+    // but the public YAML spelling (and the design spec) is `open_connector`.
+    #[serde(rename = "open_connector")]
+    OpenConnector,
 }
 
 impl DataSourceType {
@@ -34,8 +39,10 @@ impl DataSourceType {
             Self::Lance => "lance",
             Self::Seekdb => "seekdb",
             Self::Influxdb => "influxdb",
+            Self::Clickhouse => "clickhouse",
             Self::Documents => "documents",
             Self::Dynamodb => "dynamodb",
+            Self::OpenConnector => "open_connector",
         }
     }
 }
@@ -58,9 +65,23 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("clickhouse").unwrap();
+        assert_eq!(t, DataSourceType::Clickhouse);
+        assert_eq!(t.as_str(), "clickhouse");
+    }
+
+    #[test]
     fn dynamodb_variant_roundtrips() {
         let t: DataSourceType = serde_yaml::from_str("dynamodb").unwrap();
         assert_eq!(t, DataSourceType::Dynamodb);
         assert_eq!(t.as_str(), "dynamodb");
+    }
+
+    #[test]
+    fn open_connector_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("open_connector").unwrap();
+        assert_eq!(t, DataSourceType::OpenConnector);
+        assert_eq!(t.as_str(), "open_connector");
     }
 }

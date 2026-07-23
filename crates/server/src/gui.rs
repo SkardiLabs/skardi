@@ -307,21 +307,7 @@ fn render_job_card(job: &JobDefinition) -> String {
 }
 
 fn data_source_type_str(t: &DataSourceType) -> &'static str {
-    match t {
-        DataSourceType::Csv => "csv",
-        DataSourceType::Parquet => "parquet",
-        DataSourceType::Postgres => "postgres",
-        DataSourceType::Mysql => "mysql",
-        DataSourceType::Iceberg => "iceberg",
-        DataSourceType::Mongo => "mongo",
-        DataSourceType::Sqlite => "sqlite",
-        DataSourceType::Lance => "lance",
-        DataSourceType::Redis => "redis",
-        DataSourceType::Seekdb => "seekdb",
-        DataSourceType::Influxdb => "influxdb",
-        DataSourceType::Documents => "documents",
-        DataSourceType::Dynamodb => "dynamodb",
-    }
+    t.as_str()
 }
 
 async fn render_semantics_card(
@@ -465,5 +451,13 @@ mod tests {
     #[test]
     fn data_source_type_str_covers_dynamodb() {
         assert_eq!(data_source_type_str(&DataSourceType::Dynamodb), "dynamodb");
+    }
+
+    #[test]
+    fn data_source_type_str_covers_open_connector() {
+        assert_eq!(
+            data_source_type_str(&DataSourceType::OpenConnector),
+            "open_connector"
+        );
     }
 }

@@ -5,12 +5,16 @@ use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+use skardi::sources::providers::clickhouse::register_clickhouse_tables;
 use skardi::sources::providers::dynamodb::register_dynamodb_tables;
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::influxdb::register_influxdb_tables;
 use skardi::sources::providers::lance::register_lance_table;
 use skardi::sources::providers::mongo::register_mongo_tables;
 use skardi::sources::providers::mysql::register_mysql_tables;
+use skardi::sources::providers::open_connector::{
+    OpenConnectorConfig, register_open_connector_tables,
+};
 use skardi::sources::providers::redis::datasource::register_redis_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
@@ -129,6 +133,11 @@ pub struct DataSource {
     /// matching entry is present in a loaded `kind: semantics` file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Typed Open Connector gateway configuration. Required when `type` is
+    /// `open_connector`, rejected for every other type: nested bindings and
+    /// resources do not fit the flat `options` map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_connector: Option<OpenConnectorConfig>,
 }
 
 /// Top-level envelope for context YAML files:
@@ -244,6 +253,27 @@ pub enum ConfigError {
         "Data source '{name}' has an empty 'allowed_tables' option. Either omit it to load all DynamoDB tables, or provide a non-empty comma-separated list such as \"products,orders\"."
     )]
     EmptyAllowedTables { name: String },
+
+    #[error(
+        "Data source '{name}' has type 'open_connector' but no 'open_connector' config block. The typed gateway configuration (runtime_token_env, bindings, …) is required."
+    )]
+    MissingOpenConnectorConfig { name: String },
+
+    #[error(
+        "Data source '{name}' sets an 'open_connector' config block but its type is '{source_type}'. The 'open_connector' field is only valid for type 'open_connector'."
+    )]
+    UnexpectedOpenConnectorConfig {
+        name: String,
+        source_type: DataSourceType,
+    },
+
+    #[error("Data source '{name}' has an invalid 'open_connector' config: {reason}")]
+    InvalidOpenConnectorConfig { name: String, reason: String },
+
+    #[error(
+        "Data source '{name}' has type 'open_connector' but does not set hierarchy_level to 'catalog'. Open Connector gateways are exposed as DataFusion catalogs; add `hierarchy_level: catalog`."
+    )]
+    OpenConnectorHierarchyRequired { name: String },
 
     #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
     NonUtf8Path { name: String, path: PathBuf },
@@ -714,6 +744,10 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     DataSourceType::Sqlite,
     DataSourceType::Seekdb,
     DataSourceType::Dynamodb,
+    DataSourceType::Clickhouse,
+    // OpenConnector is catalog-only; its tables come from typed bindings, so
+    // the same catalog-mode guards (no per-table `options`) must apply.
+    DataSourceType::OpenConnector,
 ];
 
 /// Data source types that support read_write access mode
@@ -758,11 +792,49 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
             .into());
         }
 
+        // Open Connector typed config: required for that type, rejected for
+        // every other type. `config.validate()` is pure (no network I/O), so
+        // misconfigurations surface here at config load, not at first query.
+        match (&source.source_type, &source.open_connector) {
+            (DataSourceType::OpenConnector, Some(config)) => {
+                // Hierarchy defaults to Table, so a minimal config would
+                // otherwise pass validation and fail at registration with a
+                // Debug-wrapped CatalogHierarchyRequired — catch it here.
+                if source.hierarchy_level != HierarchyLevel::Catalog {
+                    return Err(ConfigError::OpenConnectorHierarchyRequired {
+                        name: source.name.clone(),
+                    }
+                    .into());
+                }
+                config
+                    .validate()
+                    .map_err(|e| ConfigError::InvalidOpenConnectorConfig {
+                        name: source.name.clone(),
+                        reason: e.to_string(),
+                    })?;
+            }
+            (DataSourceType::OpenConnector, None) => {
+                return Err(ConfigError::MissingOpenConnectorConfig {
+                    name: source.name.clone(),
+                }
+                .into());
+            }
+            (_, Some(_)) => {
+                return Err(ConfigError::UnexpectedOpenConnectorConfig {
+                    name: source.name.clone(),
+                    source_type: source.source_type,
+                }
+                .into());
+            }
+            (_, None) => {}
+        }
+
         // Catalog mode must not mix with per-table / per-schema options
+        // ("database" is ClickHouse's schema-analog spelling)
         if CATALOG_SUPPORTED_SOURCES.contains(&source.source_type)
             && source.hierarchy_level == HierarchyLevel::Catalog
         {
-            for conflicting in &["table", "schema"] {
+            for conflicting in &["table", "schema", "database"] {
                 if source
                     .options
                     .as_ref()
@@ -821,6 +893,8 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
                 | DataSourceType::Redis
                 | DataSourceType::Seekdb
                 | DataSourceType::Influxdb
+                | DataSourceType::Clickhouse
+                | DataSourceType::OpenConnector
                 | DataSourceType::Dynamodb,
                 false,
             ) => {
@@ -995,6 +1069,8 @@ async fn register_data_source(
             | DataSourceType::Redis
             | DataSourceType::Seekdb
             | DataSourceType::Influxdb
+            | DataSourceType::Clickhouse
+            | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb,
             _,
         ) => {
@@ -1329,6 +1405,43 @@ async fn register_data_source(
                 }
             })?;
         }
+        DataSourceType::OpenConnector => {
+            tracing::info!(
+                "Registering Open Connector gateway: {} (hierarchy_level: {:?})",
+                source.name,
+                source.hierarchy_level
+            );
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            // `validate_data_sources` already guarantees the config block is
+            // present and access is read-only; the provider re-checks both so
+            // the CLI path (which has no such validation layer) is covered.
+            register_open_connector_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.open_connector.as_ref(),
+                source.access_mode.is_read_write(),
+                source.hierarchy_level,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "Open Connector registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
         DataSourceType::Redis => {
             tracing::info!("Registering Redis table: {}", source.name);
 
@@ -1378,6 +1491,40 @@ async fn register_data_source(
             .map_err(|e| {
                 tracing::error!(
                     "InfluxDB registration failed for '{}': {:?}",
+                    source.name,
+                    e
+                );
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Clickhouse => {
+            tracing::info!(
+                "Registering ClickHouse table: {} (hierarchy_level: {:?})",
+                source.name,
+                source.hierarchy_level
+            );
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            register_clickhouse_tables(
+                session_ctx,
+                &source.name,
+                connection_string,
+                source.options.as_ref(),
+                source.access_mode.is_read_write(),
+                source.hierarchy_level,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "ClickHouse registration failed for '{}': {:?}",
                     source.name,
                     e
                 );
@@ -2247,6 +2394,7 @@ options:
             access_mode,
             enable_cache: false,
             description: None,
+            open_connector: None,
         }
     }
 
@@ -2313,6 +2461,213 @@ options:
         validate_data_sources(&[source]).expect("valid DynamoDB catalog allow-list");
     }
 
+    fn open_connector_source(
+        name: &str,
+        config_yaml: Option<&str>,
+        access_mode: AccessMode,
+    ) -> DataSource {
+        let open_connector = config_yaml
+            .map(|yaml| serde_yaml::from_str(yaml).expect("parse open_connector config"));
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::OpenConnector,
+            path: PathBuf::new(),
+            connection_string: Some("http://open-connector:3000".to_string()),
+            schema: None,
+            options: None,
+            hierarchy_level: HierarchyLevel::Catalog,
+            access_mode,
+            enable_cache: false,
+            description: None,
+            open_connector,
+        }
+    }
+
+    const VALID_OPEN_CONNECTOR_CONFIG: &str = r#"
+runtime_token_env: OPEN_CONNECTOR_TOKEN
+bindings:
+  - name: github_skardi
+    source_pack: github
+    resource:
+      owner: SkardiLabs
+      repo: skardi
+    tables:
+      - issues
+"#;
+
+    #[test]
+    fn validate_accepts_open_connector_with_typed_config() {
+        let source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        validate_data_sources(&[source]).expect("valid open_connector source");
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_without_typed_config() {
+        let source = open_connector_source("saas", None, AccessMode::ReadOnly);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingOpenConnectorConfig { name } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_config_on_wrong_type() {
+        let mut source = dynamodb_source(
+            "products",
+            Some("http://localhost:8000"),
+            None,
+            AccessMode::ReadOnly,
+        );
+        source.open_connector =
+            Some(serde_yaml::from_str(VALID_OPEN_CONNECTOR_CONFIG).expect("parse config"));
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnexpectedOpenConnectorConfig { name, source_type }
+                    if name == "products" && *source_type == DataSourceType::Dynamodb
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_invalid_config() {
+        let source =
+            open_connector_source("saas", Some("runtime_token_env: ''"), AccessMode::ReadOnly);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::InvalidOpenConnectorConfig { name, .. } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_read_write() {
+        // Milestone one is strictly read-only; OpenConnector is not in
+        // WRITABLE_SOURCE_TYPES.
+        let source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadWrite,
+        );
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnsupportedWriteMode { name, source_type }
+                    if name == "saas" && *source_type == DataSourceType::OpenConnector
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_without_connection_string() {
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.connection_string = None;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingConnectionString { name } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_table_hierarchy() {
+        // hierarchy_level defaults to Table; a minimal config must fail at
+        // validation, not at registration with a wrapped provider error.
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.hierarchy_level = HierarchyLevel::Table;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::OpenConnectorHierarchyRequired { name } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_catalog_table_option() {
+        // OpenConnector is catalog-only and its tables come from typed
+        // bindings; a flat `table` option must fail as loudly as it would on
+        // postgres/dynamodb instead of being silently ignored.
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "issues".to_string());
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.options = Some(options);
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "saas" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_open_connector_catalog_empty_allowed_schemas() {
+        let mut options = HashMap::new();
+        options.insert("allowed_schemas".to_string(), " , , ".to_string());
+        let mut source = open_connector_source(
+            "saas",
+            Some(VALID_OPEN_CONNECTOR_CONFIG),
+            AccessMode::ReadOnly,
+        );
+        source.options = Some(options);
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::EmptyAllowedSchemas { name } if name == "saas"
+            ),
+            "got {config_err}"
+        );
+    }
+
     #[test]
     fn validate_rejects_dynamodb_catalog_table_option() {
         let mut options = HashMap::new();
@@ -2332,6 +2687,73 @@ options:
                 config_err,
                 ConfigError::CatalogModeConflictingOptions { name, option }
                     if name == "ddb" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    fn clickhouse_source(
+        name: &str,
+        options: Option<HashMap<String, String>>,
+        access_mode: AccessMode,
+    ) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::Clickhouse,
+            path: PathBuf::new(),
+            connection_string: Some("http://localhost:8123".to_string()),
+            schema: None,
+            options,
+            open_connector: None,
+            hierarchy_level: HierarchyLevel::default(),
+            access_mode,
+            enable_cache: false,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_clickhouse_read_write() {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "events".to_string());
+        let source = clickhouse_source("events", Some(options), AccessMode::ReadWrite);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnsupportedWriteMode { name, source_type }
+                    if name == "events" && *source_type == DataSourceType::Clickhouse
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_clickhouse_table_mode_with_database_option() {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), "events".to_string());
+        options.insert("database".to_string(), "analytics".to_string());
+        let source = clickhouse_source("events", Some(options), AccessMode::ReadOnly);
+        validate_data_sources(&[source]).expect("table mode accepts a database option");
+    }
+
+    #[test]
+    fn validate_rejects_clickhouse_catalog_database_option() {
+        // "database" is ClickHouse's schema-analog option; letting it through
+        // in catalog mode would silently change the pool's default database.
+        let mut options = HashMap::new();
+        options.insert("database".to_string(), "analytics".to_string());
+        let mut source = clickhouse_source("ch", Some(options), AccessMode::ReadOnly);
+        source.hierarchy_level = HierarchyLevel::Catalog;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "ch" && option == "database"
             ),
             "got {config_err}"
         );

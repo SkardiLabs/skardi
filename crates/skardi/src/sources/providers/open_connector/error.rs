@@ -1,0 +1,339 @@
+//! Error types for the Open Connector integration.
+
+use thiserror::Error;
+
+/// Errors surfaced while validating or registering an Open Connector gateway
+/// data source.
+///
+/// All variants are raised **before** any network I/O: a misconfigured
+/// gateway fails at config-load or registration time with a targeted message
+/// rather than an opaque failure at first query.
+///
+/// # Example
+/// ```
+/// use skardi::sources::providers::open_connector::{OpenConnectorConfig, OpenConnectorError};
+///
+/// // A config with no bindings is valid; one with a duplicate binding name is not.
+/// let yaml = r#"
+/// runtime_token_env: OPEN_CONNECTOR_TOKEN
+/// bindings:
+///   - name: github
+///     source_pack: github
+///     tables: [issues]
+///   - name: github
+///     source_pack: github
+///     tables: [commits]
+/// "#;
+/// let config: OpenConnectorConfig = serde_yaml::from_str(yaml).unwrap();
+/// let err = config.validate().unwrap_err();
+/// assert!(matches!(
+///     err,
+///     OpenConnectorError::DuplicateBindingName { ref name } if name == "github"
+/// ));
+/// ```
+#[derive(Debug, Error)]
+pub enum OpenConnectorError {
+    /// `runtime_token_env` was empty or whitespace-only.
+    #[error("Open Connector config field 'runtime_token_env' must not be empty")]
+    EmptyRuntimeTokenEnv,
+
+    /// The gateway URL (`connection_string`) was empty or whitespace-only.
+    #[error(
+        "Open Connector data source '{name}' requires a non-empty connection_string \
+         (the gateway URL, e.g. http://open-connector:3000)"
+    )]
+    EmptyGatewayUrl { name: String },
+
+    /// A binding had an empty or whitespace-only name.
+    #[error("Open Connector binding names must not be empty")]
+    EmptyBindingName,
+
+    /// Two bindings share a name; binding names become schema names in the
+    /// gateway catalog and must be unique.
+    #[error(
+        "Open Connector config has duplicate binding name '{name}'; \
+         binding names become catalog schema names and must be unique"
+    )]
+    DuplicateBindingName { name: String },
+
+    /// A binding did not name its source pack.
+    #[error("Open Connector binding '{binding}' must name a 'source_pack'")]
+    EmptySourcePack { binding: String },
+
+    /// A binding exposed no tables.
+    #[error("Open Connector binding '{binding}' must expose at least one table")]
+    EmptyTableList { binding: String },
+
+    /// A binding listed an empty table name.
+    #[error("Open Connector binding '{binding}' contains an empty table name")]
+    EmptyTableName { binding: String },
+
+    /// A binding listed the same table twice.
+    #[error("Open Connector binding '{binding}' lists table '{table}' more than once")]
+    DuplicateTableName { binding: String, table: String },
+
+    /// `raw_action_allowlist` contained an empty entry.
+    #[error("Open Connector 'raw_action_allowlist' must not contain empty entries")]
+    EmptyAllowlistEntry,
+
+    /// A safety bound (`max_pages` / `max_rows`) was set to zero, which would
+    /// make every scan fail.
+    #[error("Open Connector safety bound '{field}' must be greater than zero")]
+    ZeroSafetyBound { field: &'static str },
+
+    /// The source was registered with `hierarchy_level: table`; a gateway is
+    /// always exposed as a catalog.
+    #[error(
+        "Open Connector data source '{name}' must use hierarchy_level 'catalog' — \
+         a gateway is exposed as a DataFusion catalog, not a single table"
+    )]
+    CatalogHierarchyRequired { name: String },
+
+    /// The source requested `read_write` access; the integration is read-only
+    /// (milestone one exposes no mutating actions).
+    #[error(
+        "Open Connector data source '{name}' requests access_mode 'read_write', but \
+         Open Connector is read-only — no mutating actions are exposed"
+    )]
+    ReadWriteNotSupported { name: String },
+
+    /// The data source has no `open_connector` config block at all.
+    #[error(
+        "Open Connector data source '{name}' requires an 'open_connector' config block \
+         (runtime_token_env, bindings, …)"
+    )]
+    MissingConfig { name: String },
+
+    /// The environment variable holding the gateway runtime token was unset.
+    #[error(
+        "Environment variable '{env}' not found: it must contain the Open Connector \
+         gateway runtime token"
+    )]
+    MissingRuntimeToken { env: String },
+
+    /// The runtime token is not usable as an HTTP header value — the classic
+    /// cause is a trailing newline from `export TOKEN="$(cat token.txt)"`.
+    /// Checked at client construction so a malformed credential fails fast
+    /// with the actual cause instead of three retried "builder error"s.
+    #[error(
+        "Open Connector runtime token from '{env}' is invalid: {reason} \
+         (check for a trailing newline or other control characters)"
+    )]
+    InvalidRuntimeToken { env: String, reason: String },
+
+    /// reqwest could not build the request (e.g. an illegal header value).
+    /// A permanent client-side failure — never retried.
+    #[error("Open Connector {operation} could not build the request: {reason}")]
+    RequestBuildFailed { operation: String, reason: String },
+
+    /// The gateway URL used a non-HTTP(S) scheme or embedded credentials.
+    #[error(
+        "Open Connector gateway URL '{url}' must use http:// or https:// and must \
+         not embed credentials (the runtime token is sent as a Bearer header)"
+    )]
+    InvalidGatewayUrl { url: String },
+
+    /// The gateway URL carried a query string or fragment. Neither has any
+    /// meaning for a base URL, and query strings are a classic way to smuggle
+    /// tokens (`?token=…`, `?access_token=…`) into logs, `Debug` output, and
+    /// the data-sources API response.
+    #[error(
+        "Open Connector gateway URL '{url}' must not contain query parameters or a \
+         fragment (credentials in the URL would leak into logs and the data-sources \
+         API; the runtime token belongs in the configured environment variable)"
+    )]
+    GatewayUrlWithQueryOrFragment { url: String },
+
+    /// `reqwest::Client` construction failed.
+    #[error("Failed to build the Open Connector HTTP client: {reason}")]
+    HttpClientBuild { reason: String },
+
+    /// The gateway health check returned a terminal (non-retryable) failure.
+    #[error("Open Connector gateway health check failed for '{url}': {reason}")]
+    HealthCheckFailed { url: String, reason: String },
+
+    /// The gateway answered action discovery with 404.
+    #[error("Open Connector action '{action_id}' was not found on the gateway")]
+    ActionNotFound { action_id: String },
+
+    /// Action discovery failed for a reason other than "not found".
+    #[error("Failed to discover Open Connector action '{action_id}': {reason}")]
+    ActionDiscoveryFailed { action_id: String, reason: String },
+
+    /// The action exists but cannot execute on this gateway runtime.
+    #[error("Open Connector action '{action_id}' is not locally executable on this gateway")]
+    ActionNotLocallyExecutable { action_id: String },
+
+    /// The gateway omitted the executability flag entirely; default-deny
+    /// treats "did not say" as "not executable".
+    #[error(
+        "Open Connector action '{action_id}' does not declare whether it is locally \
+         executable; refusing to treat it as executable (default-deny)"
+    )]
+    ActionExecutabilityUnknown { action_id: String },
+
+    /// An action ID could escape the `/v1/actions/` namespace: `/` moves
+    /// path segments, and a bare `.` / `..` is resolved away by `Url::join`
+    /// even after percent-encoding (dots are preserved by the encode set).
+    #[error(
+        "Open Connector action ID '{action_id}' is invalid: {reason} \
+         (action IDs must be single path segments; '/', '.', and '..' are not allowed)"
+    )]
+    InvalidActionId { action_id: String, reason: String },
+
+    /// An action execution call returned a terminal (non-retryable) failure.
+    #[error("Open Connector action '{action_id}' execution failed: {reason}")]
+    ActionExecutionFailed { action_id: String, reason: String },
+
+    /// Retries on 429 / transient 5xx / transport errors were exhausted.
+    #[error("Open Connector {operation} failed after {attempts} attempt(s); last error: {reason}")]
+    RetriesExhausted {
+        operation: String,
+        attempts: u32,
+        reason: String,
+    },
+
+    /// A non-idempotent call (POST execute) failed with an ambiguous
+    /// transport error: the request may have reached the gateway, so the
+    /// client does not retry it — re-sending could re-execute the action
+    /// against the SaaS provider.
+    #[error(
+        "Open Connector {operation} failed with a transport error ({reason}); \
+         not retried because the request may have reached the gateway and \
+         re-execution is not safe"
+    )]
+    NonIdempotentAmbiguousFailure { operation: String, reason: String },
+
+    /// Pagination failed to advance: the gateway returned an already-seen
+    /// cursor, which would loop the scan forever.
+    #[error(
+        "Open Connector pagination loop detected: cursor '{token}' was already seen \
+         (the gateway is not advancing pagination)"
+    )]
+    PaginationLoop { token: String },
+
+    /// A binding named a source pack that is not built in.
+    #[error(
+        "Open Connector binding references unknown source pack '{name}' \
+         (built-in packs are versioned with Skardi)"
+    )]
+    SourcePackNotFound { name: String },
+
+    /// A binding exposed a table the source pack does not define.
+    #[error("Open Connector source pack '{pack}' has no table '{table}'")]
+    SourcePackTableNotFound { pack: String, table: String },
+
+    /// A binding pinned a source-pack version that is not the built-in one.
+    #[error(
+        "Open Connector source pack '{pack}' pinned to version {pinned}, \
+         but this Skardi build ships version {actual}"
+    )]
+    SourcePackVersionMismatch {
+        pack: String,
+        pinned: u32,
+        actual: u32,
+    },
+
+    /// A binding omitted a resource input the source-pack table requires.
+    #[error(
+        "Open Connector binding '{binding}' is missing required resource input '{key}' \
+         for the bound source-pack table"
+    )]
+    MissingResourceInput { binding: String, key: String },
+
+    /// The discovered action contract does not match the source pack's
+    /// expected fingerprint — the upstream action changed incompatibly.
+    #[error("Open Connector source-pack table '{table}' failed its compatibility check: {reason}")]
+    ActionContractMismatch { table: String, reason: String },
+
+    /// Assembling the DataFusion catalog/schema failed (e.g. a duplicate
+    /// registration). An internal consistency error, unrelated to the action
+    /// contract.
+    #[error("Open Connector catalog registration failed for '{name}': {reason}")]
+    CatalogRegistrationFailed { name: String, reason: String },
+
+    /// A scan hit a safety bound before the collection was exhausted, so the
+    /// result would be incomplete — fail rather than return partial rows.
+    #[error(
+        "Open Connector scan of '{table}' exceeded {bound} (limit {limit}); \
+         the result would be incomplete"
+    )]
+    ScanBoundsExceeded {
+        table: String,
+        bound: &'static str,
+        limit: u64,
+    },
+
+    /// A scan exceeded its total time budget.
+    #[error("Open Connector scan of '{table}' timed out after {seconds}s")]
+    ScanTimeout { table: String, seconds: u64 },
+
+    /// A row path was malformed (must be `$.key[.key…]` object-key segments).
+    #[error("Open Connector row path '{path}' is invalid: {reason}")]
+    InvalidRowPath { path: String, reason: String },
+
+    /// A row path segment was absent from its parent object while extracting
+    /// rows from a page. Absence is a *missing* key (nullable columns become
+    /// null) — not a structural change.
+    #[error(
+        "Open Connector row path '{path}' failed at segment '{segment}' on page {page}: \
+         the key is missing from an object"
+    )]
+    RowPathNotFound {
+        path: String,
+        segment: String,
+        page: usize,
+    },
+
+    /// A row path had to traverse into a value that is not an object — a
+    /// structural mismatch (e.g. `user` changed from object to string
+    /// upstream), which must fail even for nullable columns.
+    #[error(
+        "Open Connector row path '{path}' cannot descend into segment '{segment}' on page {page}: \
+         expected an object, found {found}"
+    )]
+    RowPathNotObject {
+        path: String,
+        segment: String,
+        page: usize,
+        found: String,
+    },
+
+    /// The row path resolved to a non-array value; relational rows must be an
+    /// array of objects.
+    #[error(
+        "Open Connector row path '{path}' on page {page} resolved to {found}, expected an array of row objects"
+    )]
+    RowPathNotArray {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
+    /// A row could not be converted to the table's fixed Arrow schema. The
+    /// `found` carries the JSON *kind* only — never the value itself, which
+    /// may contain sensitive data.
+    #[error(
+        "Open Connector conversion failed for column '{column}' (path '{path}') \
+         at page {page}, row {row}: expected {expected}, found {found}"
+    )]
+    ConversionFailed {
+        path: String,
+        column: String,
+        page: usize,
+        row: usize,
+        expected: String,
+        found: String,
+    },
+
+    /// A response body grew past the configured decoding bound.
+    #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]
+    ResponseTooLarge {
+        operation: String,
+        limit_bytes: usize,
+    },
+
+    /// A response was not the JSON shape the client contract expects.
+    #[error("Open Connector {operation} returned an invalid response: {reason}")]
+    InvalidGatewayResponse { operation: String, reason: String },
+}

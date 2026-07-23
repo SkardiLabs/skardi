@@ -17,16 +17,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = []
 onnx = ["dep:ort", "dep:ndarray", "dep:num_cpus"]
 embedding = ["onnx", "candle", "gguf", "remote-embed"]
-remote-embed = ["dep:reqwest"]
+# reqwest is a hard dependency (the Open Connector client uses it
+# unconditionally); these features now only gate their UDF code.
+remote-embed = []
 # llm_extract scalar UDF — fully independent, NO documents dependency.
-llm-extract = ["dep:reqwest", "dep:base64"]
+llm-extract = ["dep:base64"]
 gguf = ["dep:llama-cpp-4"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 chunking = ["dep:text-splitter"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
-documents = ["dep:liteparse", "dep:blake3", "dep:glob"]
+documents = ["dep:liteparse", "dep:glob"]
 
 [dependencies]
 # engine
@@ -45,7 +47,7 @@ regex = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 # model
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 base64 = { version = "0.22", optional = true }
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17.0", optional = true }
@@ -59,6 +61,9 @@ text-splitter = { version = "0.30", features = ["markdown"], optional = true }
 # sources
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1"
+# Direct dep on the same client `datafusion-table-providers` uses, so catalog
+# introspection can run one batched `system.tables` query instead of N+1.
+clickhouse = { workspace = true }
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 derivative = "2.2.0"
@@ -80,8 +85,8 @@ redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster
 # (two crates can't both `links = "lzma"`) and also forces a newer tokio. OCR is still
 # available at runtime via liteparse's HTTP OCR engine (config `ocr_server_url`).
 liteparse = { version = "2.4.0", default-features = false, optional = true }
-# stable doc_id hashing for the documents connector (also a liteparse dep).
-blake3 = { version = "1", optional = true }
+# Stable fingerprints for Open Connector contracts and document IDs.
+blake3 = "1"
 # include_globs matching for the documents connector.
 glob = { version = "0.3", optional = true }
 secrecy = "0.10"

@@ -1,0 +1,12 @@
+kind: pipeline
+
+metadata:
+  name: "query_user_by_id"
+  version: "1.0"
+  description: "Point lookup of a user by primary key (filter pushed down to ClickHouse)"
+
+# Parameters:
+#   {user_id} - ID of the user to fetch (e.g. 1)
+
+spec:
+  query: "SELECT id, name, email FROM users WHERE id = {user_id}"

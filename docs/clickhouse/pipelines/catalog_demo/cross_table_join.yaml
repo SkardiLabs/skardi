@@ -1,0 +1,19 @@
+kind: pipeline
+
+metadata:
+  name: "clickhouse-catalog-cross-table-join"
+  version: "1.0.0"
+  description: >
+    Join two ClickHouse tables through the catalog without declaring
+    per-table data sources.
+
+# Parameters:
+#   {user_id} - User whose orders to list
+
+spec:
+  query: |
+    SELECT u.name, o.product, o.amount
+    FROM ch_catalog.mydb.users u
+    JOIN ch_catalog.mydb.orders o ON u.id = o.user_id
+    WHERE u.id = {user_id}
+    ORDER BY o.amount DESC
