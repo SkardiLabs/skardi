@@ -448,6 +448,11 @@ impl ScanState {
         )
         .await
         .map_err(|_| self.timeout_error())??;
+        // Counted at fetch time on purpose: `pages_fetched` measures gateway
+        // traffic (requests actually made, rate-limit budget actually spent),
+        // not pages emitted downstream. A page that lands right at the
+        // deadline — or fails extraction/conversion below — was still a real
+        // gateway call, and the failure event should say so.
         self.pages_fetched += 1;
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
