@@ -208,6 +208,22 @@ python docs/lance/test_direct_vector_search.py
 
 ## SQL Query Patterns
 
+Once a server is running with `docs/lance/ctx_lance.yaml` loaded (see
+"Running the Example" above), any of the patterns below can be run ad hoc
+with the `skardi` CLI (see [docs/cli.md](../cli.md)) — no pipeline required:
+
+```bash
+skardi query -e "
+  SELECT knn.id, knn.item_id, knn._distance as dist
+  FROM lance_knn('sift_items', 'vector',
+    (SELECT vector FROM sift_items WHERE id = 1), 10) knn
+  WHERE knn.id != 1
+" --table
+```
+
+They can also be wrapped in a pipeline YAML for a stable, parameterized HTTP
+endpoint, as the rest of this guide demonstrates via curl.
+
 ### Basic KNN Search
 
 Find similar items using a subquery for the reference vector:
@@ -484,6 +500,13 @@ cargo run --bin skardi-server -- \
   --ctx ctx_my_vectors.yaml \
   --pipeline pipeline_my_search.yaml \
   --port 8080
+```
+
+Then call it — either with curl, as shown throughout this guide, or with the
+CLI:
+
+```bash
+skardi run my-vector-search -p query_id=1 -p k=10 --table
 ```
 
 ## Monitoring Execution

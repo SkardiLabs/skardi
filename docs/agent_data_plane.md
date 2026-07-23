@@ -44,7 +44,7 @@ flowchart TB
 
 ## 1. Semantic overlay — the agent reads what data *means*
 
-**Status: shipped.** YAML overlay loaded by the server and CLI; merged response served on `GET /data_source`. See [docs/semantics.md](semantics.md).
+**Status: shipped.** YAML overlay loaded by the server at startup; merged response served on `GET /data_source`, which the thin CLI (`skardi schema`) and any other HTTP client read directly. See [docs/semantics.md](semantics.md).
 
 The failure mode this primitive addresses is concrete. Hand an LLM a `CREATE TABLE` schema dump and it hallucinates column names that aren't there, picks the wrong one of two tables with similar shapes, treats `status` as if it were an order status when it's actually a webhook-delivery status. Schema is shape; the agent needs *meaning*. Stuffing meaning into prompt-engineered system messages doesn't scale across many tables and doesn't survive schema drift — it has to live next to the data, version-controlled with the source registration.
 
@@ -106,11 +106,11 @@ The merged view is what the agent actually consumes. It surfaces in two places:
   }
   ```
 
-- **`skardi query --schema`** — the same merged view rendered inline for human inspection during context authoring.
+- **`skardi schema`** — the thin CLI's client for the same endpoint, rendering the merged view for human inspection during context authoring.
 
 This is *the agent's prompt*. The catalog endpoint is the first thing a well-built reading agent calls in a session, and the descriptions there are what it reads before it decides which pipeline to invoke. The overlay is shipped today; an agent-callable `describe` verb (so the agent can pull a single table's overlay through a pipeline call rather than the catalog endpoint) is open on the roadmap (`6` — *agent-callable describe verb*).
 
-One known limitation: the HTTP `/data_source` endpoint emits one table per source today, so qualified `catalog.schema.table` overlays for inner tables of a catalog-mode source don't yet surface there (they do surface in the CLI). Tracked in the same doc.
+One known limitation: the HTTP `/data_source` endpoint emits one table per source today, so qualified `catalog.schema.table` overlays for inner tables of a catalog-mode source don't yet surface there — and since `skardi schema` only renders that endpoint's response, they don't surface on the CLI either. Tracked in the same doc.
 
 ---
 
@@ -240,6 +240,6 @@ The full public roadmap (with live `[x]` / `[ ]` checkboxes for what's shipped v
 - [Server](server.md) — the HTTP process that hosts both peer surfaces.
 - [Pipelines](pipelines.md) — online serving (parameterized SQL as REST).
 - [Jobs](jobs.md) — offline jobs (async batch writes to Lance or a DB).
-- [CLI](cli.md) — `skardi run`, aliases, federated SQL from the shell.
+- [CLI](cli.md) — the thin HTTP client: `skardi query`, `skardi run <pipeline>`, `skardi schema`, and friends.
 - [Semantics](semantics.md) — the agent's discovery surface.
 - [llm_wiki demo](../demo/llm_wiki/) — the fullest end-to-end demonstration of agent autonomy on Skardi.

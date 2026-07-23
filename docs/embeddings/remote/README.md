@@ -15,7 +15,7 @@ Semantic search over a small knowledge base using OpenAI's
    ```
 3. **Build Skardi with the `remote-embed` feature**:
    ```bash
-   cargo build --bin skardi-server --features remote-embed
+   cargo build -p skardi-server --features remote-embed
    ```
 
 ## Setup
@@ -34,7 +34,7 @@ This will:
 ## Start the server
 
 ```bash
-cargo run --bin skardi-server --features remote-embed -- \
+cargo run -p skardi-server --features remote-embed -- \
   --ctx docs/embeddings/remote/ctx.yaml \
   --pipeline docs/embeddings/remote/pipelines/ \
   --port 8080
@@ -42,10 +42,22 @@ cargo run --bin skardi-server --features remote-embed -- \
 
 ## Query
 
+The `semantic-search-remote` pipeline loaded above is now reachable either
+directly over HTTP or through the `skardi` CLI (a thin HTTP client — see
+[docs/cli.md](../../cli.md)). Both forms send the same request.
+
 ```bash
 curl -s "http://localhost:8080/semantic-search-remote/execute" \
   -H 'Content-Type: application/json' \
   -d '{"query": "how does semantic search work?", "k": 10}' | jq .
+```
+
+Equivalent call via the CLI:
+
+```bash
+skardi run semantic-search-remote \
+  -p query="how does semantic search work?" \
+  -p k=10
 ```
 
 **Response**:

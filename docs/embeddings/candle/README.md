@@ -85,13 +85,17 @@ Expected output:
 ## Starting the Server
 
 ```bash
-cargo run --bin skardi-server --features candle -- \
+cargo run -p skardi-server --features candle -- \
   --ctx docs/embeddings/candle/ctx.yaml \
   --pipeline docs/embeddings/candle/pipelines/ \
   --port 8080
 ```
 
 ## Running Queries
+
+The `semantic-search` pipeline loaded above is now reachable either directly
+over HTTP or through the `skardi` CLI (a thin HTTP client — see
+[docs/cli.md](../../cli.md)). Both forms send the same request.
 
 ### Semantic Search
 
@@ -102,6 +106,14 @@ curl -X POST http://localhost:8080/semantic-search/execute \
     "query": "how does similarity search work in vector databases?",
     "k": 10
   }' | jq .
+```
+
+Equivalent call via the CLI:
+
+```bash
+skardi run semantic-search \
+  -p query="how does similarity search work in vector databases?" \
+  -p k=10
 ```
 
 **Response** (truncated — returns up to `k` results):
