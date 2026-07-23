@@ -37,7 +37,7 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::plan_err;
+use datafusion::common::{plan_datafusion_err, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
@@ -420,7 +420,7 @@ fn plan_error(e: OpenConnectorError) -> DataFusionError {
 /// inputs"), so sharing the implementation doesn't flatten the context.
 fn parse_json_object(fn_name: &str, arg: &str, raw: &str, noun: &str) -> DFResult<Value> {
     let value: Value = serde_json::from_str(raw)
-        .map_err(|e| DataFusionError::Plan(format!("{fn_name}: {arg} is not valid JSON: {e}")))?;
+        .map_err(|e| plan_datafusion_err!("{fn_name}: {arg} is not valid JSON: {e}"))?;
     if !value.is_object() {
         return plan_err!(
             "{fn_name}: {arg} must be a JSON object of {noun}, \
