@@ -49,10 +49,12 @@ pub fn print_result(body: &Value, table: bool) {
 
 /// Render `rows` as a left-aligned, padded plain-text table.
 ///
-/// Columns are the first row's keys, in that map's iteration order — since
-/// the workspace `serde_json` build has no `preserve_order` feature,
-/// `Value::Object` iterates keys alphabetically, so column order is
-/// alphabetical and deterministic. Later rows are read by column name;
+/// Columns are the first row's keys, sorted alphabetically. The sort is
+/// explicit and must stay: `serde_json::Map`'s iteration order flips to
+/// insertion order whenever any crate in the same build enables serde_json's
+/// `preserve_order` feature (e.g. `bson` via the engine's mongo provider in
+/// `--all-features` workspace builds), so relying on map order would make
+/// column order depend on feature unification. Later rows are read by column name;
 /// missing keys render as empty cells, as does explicit `null`. Strings
 /// render bare (unquoted); numbers and bools use their display form; nested
 /// arrays/objects render as compact JSON.
@@ -67,7 +69,8 @@ pub fn render_table(rows: &[Value]) -> String {
         return "(no rows)\n".to_string();
     };
 
-    let columns: Vec<&str> = first.keys().map(String::as_str).collect();
+    let mut columns: Vec<&str> = first.keys().map(String::as_str).collect();
+    columns.sort_unstable();
 
     let data_rows: Vec<Vec<String>> = rows
         .iter()
