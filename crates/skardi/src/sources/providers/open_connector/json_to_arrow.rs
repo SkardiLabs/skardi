@@ -315,24 +315,62 @@ impl RowConverter {
                 .as_array()
                 .ok_or_else(|| self.failure(field, page, row_index, json_kind(value)))?;
             for item in items {
+                // A JSON null wherever an item's text would come from is an
+                // Arrow null item — the list's item field is declared
+                // nullable, and a provider null is data, not shape drift. A
+                // *missing* pluck key stays a failure: unlike columns, items
+                // carry no pack-declared nullability that authorizes reading
+                // absence as null, so a dropped upstream key fails loudly
+                // instead of silently yielding all-null lists.
                 let text = match pluck {
-                    None => item.as_str().ok_or_else(|| {
-                        self.failure(field, page, row_index, "non-string array element")
-                    })?,
-                    Some(key) => item
-                        .as_object()
-                        .and_then(|object| object.get(key))
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            self.failure(
+                    None => match item {
+                        Value::Null => None,
+                        Value::String(text) => Some(text.as_str()),
+                        other => {
+                            return Err(self.failure(
                                 field,
                                 page,
                                 row_index,
-                                "array element without the string key",
-                            )
-                        })?,
+                                &format!("{} array element", json_kind(other)),
+                            ));
+                        }
+                    },
+                    Some(key) => match item {
+                        Value::Null => None,
+                        Value::Object(object) => match object.get(key) {
+                            Some(Value::Null) => None,
+                            Some(Value::String(text)) => Some(text.as_str()),
+                            Some(other) => {
+                                return Err(self.failure(
+                                    field,
+                                    page,
+                                    row_index,
+                                    &format!("array element whose '{key}' is {}", json_kind(other)),
+                                ));
+                            }
+                            None => {
+                                return Err(self.failure(
+                                    field,
+                                    page,
+                                    row_index,
+                                    &format!("array element without key '{key}'"),
+                                ));
+                            }
+                        },
+                        other => {
+                            return Err(self.failure(
+                                field,
+                                page,
+                                row_index,
+                                &format!("{} array element", json_kind(other)),
+                            ));
+                        }
+                    },
                 };
-                builder.values().append_value(text);
+                match text {
+                    Some(text) => builder.values().append_value(text),
+                    None => builder.values().append_null(),
+                }
             }
             builder.append(true);
         }
@@ -610,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn object_list_element_without_the_key_fails() {
+    fn object_list_shape_mismatches_fail_with_the_specific_kind() {
         let converter = RowConverter::new(&[FieldMapping {
             name: "labels",
             path: "labels",
@@ -618,18 +656,84 @@ mod tests {
             nullable: true,
         }])
         .unwrap();
-        for bad in [
-            serde_json::json!({"labels": [{"color": "red"}]}), // key missing
-            serde_json::json!({"labels": [{"name": 42}]}),     // key not a string
-            serde_json::json!({"labels": ["bug"]}),            // element not an object
+        for (bad, found) in [
+            // A dropped upstream key is shape drift and must fail loudly —
+            // it must never silently become an all-null list.
+            (
+                serde_json::json!({"labels": [{"color": "red"}]}),
+                "array element without key 'name'",
+            ),
+            (
+                serde_json::json!({"labels": [{"name": 42}]}),
+                "array element whose 'name' is number",
+            ),
+            (
+                serde_json::json!({"labels": ["bug"]}),
+                "string array element",
+            ),
         ] {
             let err = converter.convert(&[bad], 1).unwrap_err();
-            assert!(matches!(
-                err,
-                OpenConnectorError::ConversionFailed { ref found, .. }
-                    if found == "array element without the string key"
-            ));
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, .. } if f == found
+                ),
+                "expected found={found}, got {err}"
+            );
         }
+    }
+
+    #[test]
+    fn json_null_list_elements_become_null_items() {
+        // The item field is declared nullable (List<Utf8> with nullable
+        // items), so an explicit provider null — a null element, or a pluck
+        // key holding null — must convert to an Arrow null item, not fail.
+        let converter = RowConverter::new(&[
+            FieldMapping {
+                name: "tags",
+                path: "tags",
+                field_type: FieldType::Utf8List,
+                nullable: true,
+            },
+            FieldMapping {
+                name: "labels",
+                path: "labels",
+                field_type: FieldType::Utf8ListFromObjectKey("name"),
+                nullable: true,
+            },
+        ])
+        .unwrap();
+        let batch = converter
+            .convert(
+                &[serde_json::json!({
+                    "tags": ["a", null, "b"],
+                    "labels": [{"name": null}, {"name": "bug"}, null]
+                })],
+                1,
+            )
+            .unwrap();
+
+        let tags = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap()
+            .value(0);
+        let tags = tags.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(tags.value(0), "a");
+        assert!(tags.is_null(1), "null element is a null item");
+        assert_eq!(tags.value(2), "b");
+
+        let labels = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap()
+            .value(0);
+        let labels = labels.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(labels.is_null(0), "pluck key holding null is a null item");
+        assert_eq!(labels.value(1), "bug");
+        assert!(labels.is_null(2), "null element is a null item");
     }
 
     #[test]
