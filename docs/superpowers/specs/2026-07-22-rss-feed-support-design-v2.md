@@ -6,7 +6,7 @@
 
 ## Summary
 
-Skardi will support RSS/Atom subscriptions as a first-class, read-only data source, `type: rss`. One configured source binds a subscription list and exposes two fixed tables: `feeds`, one row per subscription carrying fetch health, and `items`, the live union of all current entries across subscriptions. Scans fetch at query time through a per-feed TTL cache with HTTP conditional requests; each feed is an independent execution partition, so a dead feed degrades visibly instead of failing the scan.
+Skardi will support RSS/Atom subscriptions as a first-class, read-only data source, `type: rss`. One configured source binds a subscription list and exposes two fixed tables: `feeds`, one row per subscription carrying fetch health, and `items`, the live union of all current entries across subscriptions. Scans fetch at query time through a per-feed TTL cache with HTTP conditional requests; each feed is an independent execution partition, so a dead feed degrades visibly instead of failing the scan; served rows carry their window's freshness in-band via `window_status`.
 
 The design exposes one SQL surface: persistent stable tables `<name>.main.feeds` and `<name>.main.items`, registered from context YAML. The type gap between wire-faithful feed HTML and markdown-aware chunking closes inside the existing `chunk()` UDF — a new `'html'` mode converts HTML to Markdown before splitting. It is a bridge between the provider and `chunk()`, not a new user-facing function.
 
@@ -29,7 +29,7 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 - Make a subscription list queryable as ordinary Arrow-backed DataFusion tables: subscription list in, `feeds` + `items` out, zero external processes.
 - Normalize every wild-web dialect into one protocol-pinned relational representation.
 - Serve live-by-default reads with a per-feed TTL cache and HTTP conditional requests (ETag / Last-Modified).
-- Isolate faults per feed; make feed health queryable in SQL, never silent.
+- Isolate faults per feed; make feed health queryable in SQL and stale degradation visible in-band on served rows, never silent.
 - Record declared-versus-parsed dialect conformance queryably.
 - Publish the dialect → unified-schema mapping as documentation and semantics annotations.
 - Support federated joins between feed items and existing Skardi sources.
@@ -42,7 +42,7 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 - Push (WebSub). Recorded as a future extension; it is a cache-invalidation signal, not a different provider shape.
 - A write path. The source registers strictly read-only; `WRITABLE_SOURCE_TYPES` is untouched.
 - Authenticated feeds. Cookie-, token-, or basic-auth-protected feeds belong behind Open Connector or a scoped follow-up.
-- Ad-hoc scanning of unregistered feeds. An `rss_scan(url)` preview UDTF was cut at review: every feed Skardi reads is declared in configuration first. Registration is zero-I/O and the `feeds` health table covers the preview need; recorded as a future extension.
+- Ad-hoc scanning of unregistered feeds. An `rss_scan(url)` preview UDTF was cut at review: every feed Skardi reads is declared in configuration first. Registration is zero-I/O and a first `items` scan plus the `feeds` health table covers the preview need; recorded as a future extension.
 - History retention in the provider. The live window is the contract; archiving is a pipeline composition.
 - A gateway. RSS is unauthenticated public HTTP with an open wire format; a gateway adds a moving part and buys nothing.
 
@@ -60,8 +60,9 @@ The design choices, grouped by concern:
 **Freshness, execution, and failure**
 
 - Fetch at scan time through a per-feed TTL cache with HTTP conditional requests; cache only complete, successfully parsed windows.
+- Initiate fetches only from `items` scans; `feeds` is a pure, side-effect-free observation surface. Every attempt re-arms the TTL — success, 304, or failure alike (negative caching) — so a failure is a remembered result, not a gap.
 - Execute one DataFusion partition per feed.
-- Degrade per feed, visibly; a dead feed never fails the whole scan.
+- Degrade per feed, visibly; a dead feed never fails the whole scan. Stamp every `items` row with its window's freshness (`window_status`), so stale-window degradation reaches the consumer in the result stream itself, without a `feeds` lookup; a feed yielding zero rows remains visible only via `feeds` — absent rows have no in-band carrier, so a prescribed anti-join absence check covers them (see SQL Interfaces).
 - Push down only `feed`/`feed_url` equality and `IN`; stop launching fetches once `LIMIT` is satisfied.
 
 **Configuration and registration**
@@ -102,6 +103,10 @@ A provider that owns an archive database is stateful, needs retention policy, co
 ### Scan-level all-or-nothing failure for multi-feed scans
 
 One unreachable blog would render a 50-subscription news base unqueryable. The spirit of the Open Connector rule — no *silent* incompleteness — is kept while the granularity moves to the feed. Rejected.
+
+### Result-level warnings instead of row stamps
+
+The other candidate for an in-band degradation channel was a warning attached to the query result itself. DataFusion exposes no warning/notice channel and SQL defines no standard carrier for partial-result signals, so it would have to be a cross-cutting Skardi surface mechanism (CLI/server response envelope), not a provider feature. The row-level `window_status` stamp delivers the in-band signal with engine-native machinery instead; result-level warnings stay open as a future surface refinement. Neither mechanism can represent a feed that yields zero rows — absence has no in-band carrier in a relational result — which is why the `feeds` health table remains authoritative for `never`/`error` feeds.
 
 ## High-level Architecture
 
@@ -181,7 +186,7 @@ A strict `feed-rs` parse is attempted first; on failure a bounded, deterministic
 
 #### Table providers and execution plan
 
-`feeds` and `items` are fixed-`SchemaRef` `TableProvider`s over a shared execution plan that exposes one partition per subscription. A `feeds` scan reads cache/state for feeds within TTL and revalidates the rest — the cheap health check.
+`feeds` and `items` are fixed-`SchemaRef` `TableProvider`s over a shared execution plan that exposes one partition per subscription. A `feeds` scan is a pure state read — it never fetches or revalidates; all network I/O is initiated by `items` scans, so the health check is cheap by construction.
 
 #### `chunk('html')` bridge mode
 
@@ -197,11 +202,13 @@ Rendered artifacts: `ctx.yaml` (rss source + sqlite archive), a one-shot DDL scr
 
 The archive contract is two tables. `news_items` retains one wire-faithful row per entry — primary key `(feed, guid)`, plus `title`, `link`, `author`, `published`, and `content` (HTML) — and is the anti-join target for ingest. `news_chunks` holds `(feed, guid, chunk_idx, chunk_text, embedding, ingested_at)` with the fts5/vec0 mirrors attached. Ingest is two `INSERT` steps: new entries land wire-faithful in `news_items`, then are chunked and embedded from `news_items` into `news_chunks`. Search joins the two inside the archive, so results remain citable (title + link + published) after entries fall out of the live window, and history can always be re-chunked or re-embedded from retained content.
 
+`sync` ends by reporting health: the ingest pipeline's closing statement is a `SELECT` over `feeds` returning every degraded subscription (`last_status IN ('error', 'never', 'stale-error')`) with its reason (`last_error`) and as-of time (`last_fetch`) — the degradation discovered by the scan `sync` just ran surfaces in `sync`'s own output, where the agent can act on it (prune, fix, or caveat). The read is free (`feeds` is pure state, no fetches). An empty report means every feed is healthy — the rendered README states the convention — and the report never fails the run: a degraded feed changes the output, not the exit status. This three-statement pipeline (two `INSERT`s, one closing `SELECT`) requires statement sequences that return the last statement's rows as the response — a small pipeline-engine extension recorded as an M3 dependency; the two-`INSERT` ingest already needs it.
+
 ### Skill lifecycle
 
 First assembly is the five-step flow under Rollout. Afterwards, every rendered artifact except the `rss:` block is subscription-agnostic — pipelines, DDL, aliases, and semantics reference `news.main.items`, never individual feeds — so the lifecycle splits cleanly:
 
-- **Subscription add/remove (frequent):** a pure configuration action — edit the `rss:` block or OPML, reload, then verify the new feed with one `feeds` health query (`last_status`, `last_error`). No artifact is re-rendered. Removing a subscription retains its archived history by default (its rows simply stop growing); the skill offers an optional cleanup statement.
+- **Subscription add/remove (frequent):** a pure configuration action — edit the `rss:` block or OPML, reload, then scan `items` for the new feed (the scan forces the fetch) and read its `feeds` row (`last_status`, `last_error`). No artifact is re-rendered. Removing a subscription retains its archived history by default (its rows simply stop growing); the skill offers an optional cleanup statement.
 - **Parameter change (rare):** a new chunk size, overlap, or embedding model requires re-rendering the two pipelines and rebuilding `news_chunks` from the content retained in `news_items`; the skill owns this rebuild flow.
 - **Skill re-run over an existing setup:** safe by construction — idempotent DDL, diff-before-write, no blind overwrites.
 
@@ -261,6 +268,19 @@ SELECT name, last_status, dialect, item_count, last_error
 FROM news.main.feeds;
 ```
 
+Row-level freshness also travels in-band: every `items` row carries `window_status`, so a consumer that never touches `feeds` still sees when it is reading a stale window (`window_status = 'stale-error'`).
+
+The remaining gap — a feed that served no rows at all leaves no trace in `items` — is closed by the prescribed absence check, an anti-join against `feeds` run alongside any read where completeness matters:
+
+```sql
+SELECT f.name, f.last_status, f.last_error
+FROM news.main.feeds f
+LEFT JOIN news.main.items i ON i.feed = f.name
+WHERE i.feed IS NULL;
+```
+
+Absence alone is not a verdict: a feed may be legitimately empty (`last_status = 'fresh'`, `item_count = 0`) rather than dead (`'error'` / `'never'`) — `last_status` is what distinguishes them. The check never fetches — `feeds` is a pure state read — so it is cheap by construction, not by timing. Nobody polls `feeds` on a schedule; consumption is reactive — data read first, absence check alongside it.
+
 ### Chunking feed HTML in pipelines
 
 ```sql
@@ -308,9 +328,12 @@ FROM news.main.items;
 | `enclosure_type` | `Utf8` | nullable | MIME type |
 | `enclosure_length` | `UInt64` | nullable | bytes |
 | `position` | `UInt32` | not null | document order within the feed window |
+| `window_status` | `Utf8` | not null | in-band freshness of the serving window: `fresh` \| `revalidated` \| `stale-error`; window-level — identical on every row of one feed within a scan |
 | `extensions_json` | `Utf8` | nullable | non-core namespaces as JSON |
 
 In-place updates to an entry (same `guid`, new `updated`) simply reflect in the live window; versioning is an archive concern.
+
+`window_status` mirrors `feeds.last_status` restricted to row-serving states: `never` and `error` (failure with no cached window) produce zero rows and therefore cannot appear on a row — those feeds are visible only in `feeds`.
 
 ## Field Mapping
 
@@ -329,11 +352,11 @@ The normative dialect → unified-schema mapping. It ships in `docs/rss.md` and 
 | `categories` | `<category>*` | `dc:subject*` | `<category term>*` | `tags[]` |
 | `enclosure_*` | `<enclosure url/type/length>` | — | `<link rel="enclosure">` | `attachments[0]` |
 
-All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a dialect lacks are simply null — nullability in the schema *is* the dialect-coverage annotation. Anything outside this table lands in `extensions_json`.
+All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a dialect lacks are simply null — nullability in the schema *is* the dialect-coverage annotation. Anything outside this table lands in `extensions_json`. `feed`, `feed_url`, `position`, and `window_status` are provider-synthesized, not wire fields, so they do not appear in the mapping.
 
 ## Scan Execution
 
-The `feeds` and `items` tables share one scan pipeline.
+`items` scans drive this pipeline; a `feeds` scan reads the state it records, issuing no fetches of its own.
 
 ```mermaid
 sequenceDiagram
@@ -358,7 +381,7 @@ sequenceDiagram
                 TP->>TP: strict parse → sanitize+retry → conformance check → Arrow
                 TP->>C: store complete window + validators
             else fetch/parse failure
-                TP->>TP: serve stale window (marked) or zero rows;<br/>record feeds.last_status / last_error; trace warning
+                TP->>TP: serve stale window (rows stamped window_status = 'stale-error')<br/>or zero rows — no in-band carrier;<br/>record feeds.last_status / last_error; trace warning
             end
         end
     end
@@ -384,7 +407,11 @@ Live reads are the default; `ttl_seconds: 0` means always-live. Three freshness 
 
 Cache entries are per feed, not per scan, so partial hits refetch only expired feeds. The completeness invariant is adopted at feed granularity: **only a complete, successfully parsed feed window is ever cached** — a half-parsed feed is never served. Conditional requests still minimize transfer under `ttl_seconds: 0`.
 
-Caching claims no cross-feed consistency: a multi-feed scan can observe different feeds at different freshness, visible per row via `feeds.last_fetch`.
+The TTL re-arms on every attempt, not only on success: a failed fetch (retries exhausted) records its error state and re-arms the timer — negative caching — optionally with a shorter failure fuse, implementation-tuned and bounded above zero even under `ttl_seconds: 0`. A dead feed is therefore re-attempted at most once per failure window, and `Retry-After` politeness extends across scans instead of resetting with each one. `feeds` itself never fetches: health observation has no side effects, so reading it is instant at any moment, including right after a failure.
+
+Every served row is stamped with the serving window's freshness: `window_status` is `fresh` after a full 200 parse, `revalidated` after a 304, and `stale-error` when a TTL-expired refetch failed and the prior window is being served. The stamp reflects how the window was last validated and is identical across all rows of one feed within a scan.
+
+Caching claims no cross-feed consistency: a multi-feed scan can observe different feeds at different freshness, visible in-band per row via `window_status`, with fetch times in `feeds.last_fetch`.
 
 ## Parsing, Sanitation, and Conformance
 
@@ -402,14 +429,15 @@ Content is stored wire-faithful (HTML); transformation to Markdown is a query-ti
 
 | Scenario | Behavior |
 |---|---|
-| Feed down / DNS failure | Partition serves stale cached window (`stale-error`) or zero rows if never fetched; other partitions unaffected; `feeds` row records error; tracing warns |
+| Feed down / DNS failure | Partition serves stale cached window — rows stamped `window_status = 'stale-error'` — or zero rows if never fetched (no rows to stamp; `feeds` is the only signal); other partitions unaffected; `feeds` row records error; tracing warns |
 | Malformed XML | Strict parse → sanitation → retry; success traced with repairs recorded; failure sets `last_status = 'error'`, `last_error` names the parse stage |
 | Dialect misdeclaration | Parses normally; mismatch recorded in `dialect_declared` vs `dialect` and `conformance_notes` |
 | Feed omits `guid` | `link` used as guid; dedup collapses to link identity |
 | Response exceeds `max_response_bytes` | Fetch aborts with a targeted error status; never partial-parsed |
 | Slow feed | Per-request timeout isolates it; scan deadline bounds the whole query |
 | HTTP 304 | Cache re-armed without reparse; `last_status = 'revalidated'` |
-| HTTP 429 / transient 5xx | Bounded jittered retries honoring `Retry-After` within the scan deadline |
+| HTTP 429 / transient 5xx | Bounded jittered retries honoring `Retry-After` within the scan deadline; on exhaustion, degrade as feed-down: stale rows stamped `stale-error` or zero rows, `feeds` records the reason |
+| Health read after a failure | `feeds` never fetches; the failure state was recorded with its TTL re-armed (negative caching), so the read is instant and the dead feed is not re-poked |
 | `LIMIT` satisfied early | Remaining partitions never launch; incomplete scans are never cached |
 
 ## Observability
@@ -428,14 +456,14 @@ flowchart LR
     M1 --> M2 --> M3
 ```
 
-The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → reload and confirm each subscription against the `feeds` health table (registration is zero-I/O, so the first `feeds` scan is the preview), pruning dead or mis-discovered feeds → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join) and reporting per-feed health.
+The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → reload, scan `items` once to force every fetch, and confirm each subscription against the `feeds` health table (registration is zero-I/O, so that first scan is the preview), pruning dead or mis-discovered feeds → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join), with per-feed health delivered by `sync`'s own closing report.
 
 ## Testing Strategy
 
-- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown).
+- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, TTL re-arm on success and on failure (negative caching, failure fuse bounds), `window_status` stamping across freshness tiers (fresh / revalidated / stale-error), sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown).
 - **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields).
-- **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation, response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration.
-- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('html')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency; citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
+- **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation (surviving feeds' rows unaffected, stale rows stamped `stale-error`), response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration, zero-request `feeds` scans (health observation issues no HTTP, including right after a failure).
+- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('html')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency and its closing health report (a degraded feed listed with reason, a healthy run reporting empty); citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
 ## Acceptance Criteria
@@ -443,7 +471,7 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 1. A `ctx.yaml` with N subscriptions registers with zero network I/O (mock server observes no requests at startup).
 2. `SELECT * FROM news.main.items` fetches all feeds concurrently; `WHERE feed = 'x'` fetches exactly one (verified by mock request counts).
 3. Two scans within TTL cause one fetch per feed; after TTL expiry an unchanged feed takes the 304 path with no reparse.
-4. With one dead feed among N, `items` returns the other feeds' rows, `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
+4. With one dead feed among N, `items` returns the other feeds' rows; if the dead feed has a cached window, its rows are served stamped `window_status = 'stale-error'` — degradation visible in the result stream itself; `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
 5. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
 6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `chunk('html')` + `candle()`; rerunning it inserts zero new rows.
 7. `items` participates in a federated join with an existing Skardi source.
@@ -452,6 +480,8 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 10. For every fixture, `feeds.dialect` matches the known dialect; a mismatching or spec-violating fixture yields non-empty `conformance_notes` while still serving rows.
 11. After an entry falls out of the live window (mock server shrinks the feed between syncs), `skardi news` still returns its title, link, and published timestamp from the archive.
 12. Adding or removing a subscription changes only the `rss:` block/OPML; every other rendered artifact is byte-identical.
+13. A `feeds` scan issues zero network requests (mock-observed) at any moment — including immediately after a failed fetch, whose error state is recorded with its TTL re-armed rather than re-attempted.
+14. `skardi sync`'s response is the health report: with one degraded feed among N it lists that feed with `last_status` and `last_error`; with every feed healthy it is empty; a degraded feed never changes the run's exit status.
 
 ## Expected Repository Shape
 
@@ -474,11 +504,11 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, pipeline examples, troubleshooting.
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead feeds).
 - `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
-- A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance.
+- A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern, so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
-- skardi-skills: `auto_news_base` README with the five-step flow and self-verification contract.
+- skardi-skills: `auto_news_base` README with the five-step flow, the self-verification contract, and the `sync` health-report convention (empty report = all feeds healthy).
 
 ## Future Extensions
 
