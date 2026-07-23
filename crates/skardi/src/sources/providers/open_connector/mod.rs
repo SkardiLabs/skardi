@@ -7,10 +7,12 @@
 //! and limit pushdown, DataFusion registration) on top.
 //!
 //! **Status: typed config, HTTP client, action registry, source packs, the
-//! scan engine, and the two UDTFs have landed.** A configured gateway
-//! registers as a real catalog (`<gateway>.<binding>.<table>`) and is
-//! queryable today — with the synthetic `mock` source pack. Real provider
-//! packs (GitHub, Slack, Notion) land next.
+//! scan engine, the two UDTFs, and the first real provider pack (GitHub)
+//! have landed.** A configured gateway registers as a real catalog
+//! (`<gateway>.<binding>.<table>`) and is queryable today with the `github`
+//! pack (repositories, issues, pull requests, reviews, commits, workflow
+//! runs, releases) and the synthetic `mock` pack. Further provider packs
+//! (Jira, Notion, Slack) land one PR each.
 //!
 //! - [`OpenConnectorConfig`] / [`OpenConnectorBinding`] — the typed
 //!   `open_connector:` block of a `type: open_connector` data source, shared

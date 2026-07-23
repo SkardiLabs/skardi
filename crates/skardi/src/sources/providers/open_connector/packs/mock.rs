@@ -4,7 +4,7 @@
 
 use datafusion::logical_expr::Operator;
 
-use crate::sources::providers::open_connector::filters::FilterMapping;
+use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::PaginationStrategy;
 use crate::sources::providers::open_connector::source_pack::{SourcePack, SourcePackTable};
@@ -53,6 +53,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         per_page: 2,
     },
     required_resources: &["workspace"],
+    fixed_inputs: &[],
     // NOTE: only `>` is mapped — the gateway's `min_value` is strictly
     // greater-than. Mapping `>=` to the same input would be classified Exact
     // and silently drop the boundary row (provider excludes it, DataFusion
@@ -61,6 +62,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         column: "value",
         operator: Operator::Gt,
         input_field: "min_value",
+        fidelity: Fidelity::Exact,
     }],
     // The mock gateway's action schema is test-controlled, so no fingerprint
     // is pinned; real packs pin one.

@@ -1,0 +1,33 @@
+{
+  "total_count": 2,
+  "workflow_runs": [
+    {
+      "id": 12001,
+      "name": "CI",
+      "workflow_id": 33,
+      "run_number": 128,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "head_branch": "main",
+      "head_sha": "aaa1110000000000000000000000000000000000",
+      "created_at": "2026-01-05T09:10:00Z",
+      "updated_at": "2026-01-05T09:20:00Z",
+      "html_url": "https://github.com/acme/widgets/actions/runs/12001"
+    },
+    {
+      "id": 12002,
+      "name": null,
+      "workflow_id": 33,
+      "run_number": 129,
+      "event": "pull_request",
+      "status": "in_progress",
+      "conclusion": null,
+      "head_branch": "feature/dark-mode",
+      "head_sha": "ccc3330000000000000000000000000000000000",
+      "created_at": "2026-01-06T09:00:00Z",
+      "updated_at": "2026-01-06T09:01:00Z",
+      "html_url": "https://github.com/acme/widgets/actions/runs/12002"
+    }
+  ]
+}

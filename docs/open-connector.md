@@ -13,10 +13,11 @@ Provider credentials never enter Skardi. Skardi is configured with only two
 things: the gateway URL and the name of an environment variable holding the
 gateway **runtime token**.
 
-> **Status:** the shared foundation is complete and queryable end to end
-> with the synthetic `mock` source pack (used by the test suite and local
-> stub gateways). Real provider packs (GitHub, Slack, Notion, …) ship one
-> pack per release per the
+> **Status:** the shared foundation is complete, and the first real
+> provider pack — [GitHub](open-connector-github.md) (repositories, issues,
+> pull requests, reviews, commits, workflow runs, releases) — has landed
+> alongside the synthetic `mock` pack used by the test suite. Further
+> provider packs (Jira, Notion, Slack, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.

@@ -2,17 +2,32 @@
 //!
 //! Pushdown is allowlisted per column and operator by the source pack —
 //! there is no generic SQL→provider-language translation. A filter that
-//! matches a mapping is `Exact` (fully pushed into action inputs);
-//! everything else stays in DataFusion (`Unsupported`). `Inexact`
-//! (conservative pushes DataFusion must reapply) is reserved for mappings
-//! whose provider semantics are broader than the SQL predicate; no built-in
-//! mapping uses it yet.
+//! matches a mapping is pushed into action inputs and classified by the
+//! mapping's declared [`Fidelity`]: `Exact` mappings are fully handled by
+//! the provider, `Inexact` mappings narrow the fetch but DataFusion
+//! reapplies the predicate locally. Everything else stays entirely in
+//! DataFusion (`Unsupported`).
 
 use std::collections::HashSet;
 
+use chrono::{DateTime, SecondsFormat};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use serde_json::Value;
+
+/// How faithfully a mapping's provider input represents the SQL predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fidelity {
+    /// The provider filter is exactly the SQL predicate; DataFusion does not
+    /// re-evaluate it, so a wrong `Exact` claim silently drops rows.
+    Exact,
+    /// The provider filter is conservative: it may return *more* rows than
+    /// the predicate allows (fuzzy semantics, coarser timestamp granularity),
+    /// and DataFusion reapplies the predicate locally. A mapping may only be
+    /// `Inexact` if the provider can never return **fewer** matching rows —
+    /// rows the provider drops are unrecoverable, re-filtering or not.
+    Inexact,
+}
 
 /// One allowlisted pushdown rule: `column <operator> literal` → `input_field: literal`.
 ///
@@ -27,10 +42,13 @@ use serde_json::Value;
 pub struct FilterMapping {
     /// Arrow column name the predicate references.
     pub column: &'static str,
-    /// The comparison operator this mapping accepts (and exactly represents).
+    /// The comparison operator this mapping accepts.
     pub operator: Operator,
     /// Action input field the translated value is written to.
     pub input_field: &'static str,
+    /// Whether the provider input represents the predicate exactly or
+    /// conservatively (see [`Fidelity`]).
+    pub fidelity: Fidelity,
 }
 
 /// Outcome of translating the scan's filters.
@@ -49,11 +67,14 @@ pub fn translate_filters(filters: &[Expr], mappings: &[FilterMapping]) -> Transl
     for filter in filters {
         match translate_one(filter, mappings) {
             // An action input holds one value. Marking two predicates that
-            // target it as Exact would let the later insert overwrite the
-            // former while DataFusion skips reapplying both filters.
-            Some((input_field, value)) if claimed_inputs.insert(input_field.clone()) => {
+            // target it as pushed would let the later insert overwrite the
+            // former while DataFusion skips reapplying an Exact one.
+            Some((input_field, value, fidelity)) if claimed_inputs.insert(input_field.clone()) => {
                 translated.inputs.push((input_field, value));
-                translated.pushdown.push(TableProviderFilterPushDown::Exact);
+                translated.pushdown.push(match fidelity {
+                    Fidelity::Exact => TableProviderFilterPushDown::Exact,
+                    Fidelity::Inexact => TableProviderFilterPushDown::Inexact,
+                });
             }
             Some(_) | None => translated
                 .pushdown
@@ -63,8 +84,8 @@ pub fn translate_filters(filters: &[Expr], mappings: &[FilterMapping]) -> Transl
     translated
 }
 
-/// Translate one filter, returning `(input_field, value)` on an Exact match.
-fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, Value)> {
+/// Translate one filter, returning `(input_field, value, fidelity)` on a match.
+fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, Value, Fidelity)> {
     let Expr::BinaryExpr(binary) = filter else {
         return None;
     };
@@ -82,11 +103,17 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
         .find(|mapping| mapping.column == column.name && mapping.operator == operator)?;
 
     let value = scalar_to_json(literal)?;
-    Some((mapping.input_field.to_string(), value))
+    Some((mapping.input_field.to_string(), value, mapping.fidelity))
 }
 
 /// Convert a DataFusion literal to a JSON value. Nulls and types outside the
 /// JSON scalar set make the filter untranslatable.
+///
+/// Timestamps render as RFC 3339 UTC strings — the interchange form SaaS
+/// APIs take (`since=2026-01-01T00:00:00Z`). The scalar's epoch value is
+/// absolute, so any timezone annotation only affects display; a naive
+/// (timezone-less) literal is treated as UTC, matching the engine's
+/// `TimestampMillisUtc` column semantics.
 fn scalar_to_json(literal: &ScalarValue) -> Option<Value> {
     match literal {
         ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) => {
@@ -105,8 +132,24 @@ fn scalar_to_json(literal: &ScalarValue) -> Option<Value> {
             serde_json::Number::from_f64(f64::from(*v)).map(Value::Number)
         }
         ScalarValue::Float64(Some(v)) => serde_json::Number::from_f64(*v).map(Value::Number),
+        ScalarValue::TimestampSecond(Some(v), _) => DateTime::from_timestamp(*v, 0).map(rfc3339),
+        ScalarValue::TimestampMillisecond(Some(v), _) => {
+            DateTime::from_timestamp_millis(*v).map(rfc3339)
+        }
+        ScalarValue::TimestampMicrosecond(Some(v), _) => {
+            DateTime::from_timestamp_micros(*v).map(rfc3339)
+        }
+        ScalarValue::TimestampNanosecond(Some(v), _) => {
+            Some(rfc3339(DateTime::from_timestamp_nanos(*v)))
+        }
         _ => None,
     }
+}
+
+/// Render an epoch instant as an RFC 3339 UTC string, with subsecond digits
+/// only when the value has them.
+fn rfc3339(instant: DateTime<chrono::Utc>) -> Value {
+    Value::from(instant.to_rfc3339_opts(SecondsFormat::AutoSi, true))
 }
 
 #[cfg(test)]
@@ -119,16 +162,25 @@ mod tests {
             column: "value",
             operator: Operator::Gt,
             input_field: "min_value",
+            fidelity: Fidelity::Exact,
         },
         FilterMapping {
             column: "value",
             operator: Operator::GtEq,
             input_field: "min_value_inclusive",
+            fidelity: Fidelity::Exact,
         },
         FilterMapping {
             column: "name",
             operator: Operator::Eq,
             input_field: "name",
+            fidelity: Fidelity::Exact,
+        },
+        FilterMapping {
+            column: "updated_at",
+            operator: Operator::GtEq,
+            input_field: "since",
+            fidelity: Fidelity::Inexact,
         },
     ];
 
@@ -183,11 +235,13 @@ mod tests {
                 column: "value",
                 operator: Operator::Gt,
                 input_field: "min_value",
+                fidelity: Fidelity::Exact,
             },
             FilterMapping {
                 column: "value",
                 operator: Operator::Lt,
                 input_field: "max_value",
+                fidelity: Fidelity::Exact,
             },
         ];
         let gt = Expr::BinaryExpr(BinaryExpr::new(
@@ -288,6 +342,66 @@ mod tests {
                 TableProviderFilterPushDown::Exact,
                 TableProviderFilterPushDown::Unsupported
             ]
+        );
+    }
+
+    #[test]
+    fn inexact_mapping_pushes_input_but_keeps_the_filter_local() {
+        // The Inexact contract: the provider input narrows the fetch, and
+        // the Inexact classification makes DataFusion reapply the predicate
+        // — so a provider returning a superset can never leak wrong rows.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("updated_at")),
+            Operator::GtEq,
+            Box::new(lit("2026-01-01T00:00:00Z")),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("since".to_string(), Value::from("2026-01-01T00:00:00Z"))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+    }
+
+    #[test]
+    fn timestamp_literals_render_as_rfc3339_utc() {
+        // GitHub's `since` takes an ISO 8601 instant; every timestamp
+        // granularity DataFusion may coerce to must render the same way.
+        let epoch_ms = 1_767_225_600_000i64; // 2026-01-01T00:00:00Z
+        for scalar in [
+            ScalarValue::TimestampSecond(Some(epoch_ms / 1000), None),
+            ScalarValue::TimestampMillisecond(Some(epoch_ms), Some("UTC".into())),
+            ScalarValue::TimestampMicrosecond(Some(epoch_ms * 1000), None),
+            ScalarValue::TimestampNanosecond(Some(epoch_ms * 1_000_000), None),
+        ] {
+            let filter = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("updated_at")),
+                Operator::GtEq,
+                Box::new(Expr::Literal(scalar, None)),
+            ));
+            let translated = translate_filters(&[filter], MAPPINGS);
+            assert_eq!(
+                translated.inputs,
+                vec![("since".to_string(), Value::from("2026-01-01T00:00:00Z"))],
+            );
+        }
+
+        // Sub-second precision is preserved, not truncated away.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("updated_at")),
+            Operator::GtEq,
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(epoch_ms + 250), None),
+                None,
+            )),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("since".to_string(), Value::from("2026-01-01T00:00:00.250Z"))],
         );
     }
 

@@ -29,6 +29,12 @@ pub struct SourcePackTable {
     pub pagination: PaginationStrategy,
     /// Resource inputs a binding must supply (e.g. `owner`, `repo`).
     pub required_resources: &'static [&'static str],
+    /// Fixed action inputs sent with every request, e.g. `state=all` where
+    /// a provider endpoint defaults to a filtered listing (GitHub issues
+    /// default to open ones). A pushed-down filter targeting the same input
+    /// field overrides the fixed value, so the table reads as the complete
+    /// collection while predicates still narrow it.
+    pub fixed_inputs: &'static [(&'static str, &'static str)],
     /// Allowlisted filter translations.
     pub filters: &'static [FilterMapping],
     /// Expected action-contract fingerprint. When set, registration compares
@@ -60,6 +66,10 @@ impl SourcePackRegistry {
         packs.insert(
             super::packs::mock::MOCK_PACK.name,
             &super::packs::mock::MOCK_PACK,
+        );
+        packs.insert(
+            super::packs::github::GITHUB_PACK.name,
+            &super::packs::github::GITHUB_PACK,
         );
         Self { packs }
     }
@@ -128,11 +138,33 @@ mod tests {
     #[test]
     fn unknown_pack_is_a_targeted_error() {
         let registry = SourcePackRegistry::builtins();
-        let err = registry.require("github").unwrap_err();
+        let err = registry.require("jira").unwrap_err();
         assert!(matches!(
             err,
-            OpenConnectorError::SourcePackNotFound { ref name } if name == "github"
+            OpenConnectorError::SourcePackNotFound { ref name } if name == "jira"
         ));
+    }
+
+    #[test]
+    fn builtin_github_pack_is_registered() {
+        let registry = SourcePackRegistry::builtins();
+        let pack = registry.require("github").unwrap();
+        assert_eq!(pack.name, "github");
+        assert_eq!(pack.version, 1);
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "github.repositories",
+                "github.issues",
+                "github.issue_comments",
+                "github.pull_requests",
+                "github.reviews",
+                "github.commits",
+                "github.workflow_runs",
+                "github.releases",
+            ]
+        );
     }
 
     #[test]

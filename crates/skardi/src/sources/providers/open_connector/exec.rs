@@ -47,6 +47,10 @@ pub struct ScanTarget {
     pub action_id: Arc<str>,
     /// Pagination contract.
     pub pagination: PaginationStrategy,
+    /// Fixed action inputs sent with every request (see
+    /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
+    /// input is caller-supplied.
+    pub fixed_inputs: &'static [(&'static str, &'static str)],
     /// Source-pack version, part of the cache key (0 for raw scans, which
     /// have no pack and bypass the cache).
     pub source_pack_version: u32,
@@ -59,6 +63,7 @@ impl ScanTarget {
             table_id: Arc::from(table.id),
             action_id: Arc::from(table.action_id),
             pagination: table.pagination,
+            fixed_inputs: table.fixed_inputs,
             source_pack_version,
         }
     }
@@ -424,11 +429,16 @@ impl ScanState {
             });
         }
 
-        // Assemble the action input: fixed resource inputs, Exact filters,
-        // then page parameters.
+        // Assemble the action input: resource inputs, the pack's fixed
+        // inputs, pushed-down filters (which may override a fixed input —
+        // `state=all` yields to a pushed `state='open'`), then page
+        // parameters.
         let mut input = self.resource.as_object().cloned().expect(
             "resource is a JSON object by construction (registration always builds Value::Object)",
         );
+        for (field, value) in self.target.fixed_inputs {
+            input.insert((*field).to_string(), Value::from(*value));
+        }
         for (field, value) in &self.filter_inputs {
             input.insert(field.clone(), value.clone());
         }

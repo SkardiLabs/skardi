@@ -124,7 +124,32 @@ event carrying the scan identity and error.
 
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 
-- [ ] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue comments, pull requests, reviews, commits, workflow runs, releases
+- [x] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue
+      comments, pull requests, reviews, commits, workflow runs, releases — all 8 as stable
+      table definitions (`packs/github.rs`, per_page 100). Engine additions the pack
+      required, all sanctioned by the design spec: per-mapping `Fidelity` (issues
+      `updated_at >=` → `since` pushes **Inexact** and DataFusion re-applies it — verified
+      against a gateway that ignores `since` entirely; commits' strictly-after `since` is
+      deliberately NOT mapped since a dropped boundary row is unrecoverable), RFC 3339
+      rendering of timestamp filter literals, `Utf8ListFromObjectKey` for the design's
+      `$.labels[*].name` / `$.assignees[*].login` flattening, a JSON-null *parent* on a
+      nested path is absence → SQL NULL for nullable columns (GitHub `commit.author:
+      null` / `issue.user: null`), and `SourcePackTable::fixed_inputs` pinning `state=all`
+      on issues/pull_requests so `SELECT *` reads the complete collection while a pushed
+      `state` predicate overrides the pin (GitHub defaults to open-only). `issues` exposes
+      the `pull_request` marker as nullable opaque JSON (`IS NULL` → pure issues, matching
+      GitHub's issues-endpoint-returns-PRs behavior). Redacted per-table fixtures
+      (`packs/fixtures/github/`) are the build-time conversion contract (null-bearing,
+      null-parent, empty-list, nested, extra-field rows); fingerprint pins stay `None`
+      like the mock pack until validated against a live gateway's discovered contracts.
+      Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
+      visibility incl. the PR caveat, rate limits, freshness), README row updated.
+      Verification: 22 pack tests (8 fixture contract suites incl. empty pages, bind-time
+      validation of all 8 contracts, and end-to-end via mock gateway: 150-row two-page
+      scan with the `state=all` pin on every request, Exact `state` override, Inexact
+      `since` narrowing + local re-filter keeping the boundary row, `pull_request IS
+      NULL`, LIMIT stopping after one page, `open_connector_query` parity) plus new
+      filters/json_to_arrow engine tests.
 - [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate

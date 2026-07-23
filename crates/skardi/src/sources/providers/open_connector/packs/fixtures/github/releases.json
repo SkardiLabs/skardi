@@ -1,0 +1,28 @@
+{
+  "releases": [
+    {
+      "id": 15001,
+      "tag_name": "v1.2.0",
+      "name": "Widgets 1.2.0",
+      "draft": false,
+      "prerelease": false,
+      "body": "## Highlights\n- dark mode",
+      "author": { "login": "octocat" },
+      "created_at": "2026-01-08T00:00:00Z",
+      "published_at": "2026-01-08T12:00:00Z",
+      "html_url": "https://github.com/acme/widgets/releases/tag/v1.2.0"
+    },
+    {
+      "id": 15002,
+      "tag_name": "v1.3.0-draft",
+      "name": null,
+      "draft": true,
+      "prerelease": true,
+      "body": null,
+      "author": null,
+      "created_at": "2026-01-09T00:00:00Z",
+      "published_at": null,
+      "html_url": "https://github.com/acme/widgets/releases/tag/untagged-15002"
+    }
+  ]
+}

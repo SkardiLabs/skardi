@@ -306,6 +306,7 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 table_id: Arc::from(format!("raw:{action_id}")),
                 action_id: Arc::from(action_id),
                 pagination: PaginationStrategy::SinglePage,
+                fixed_inputs: &[],
                 source_pack_version: 0,
             },
             converter,
@@ -718,8 +719,8 @@ raw_action_allowlist:
         .await;
         expect_plan_error(
             &ctx,
-            "SELECT * FROM open_connector_query('saas', 'github.issues', '{}')",
-            "unknown source pack 'github'",
+            "SELECT * FROM open_connector_query('saas', 'jira.issues', '{}')",
+            "unknown source pack 'jira'",
         )
         .await;
         expect_plan_error(
