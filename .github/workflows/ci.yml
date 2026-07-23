@@ -554,6 +554,21 @@ jobs:
           # NULL-bearing row: no `category` attribute, exercising NULL handling.
           put '{"product_id":{"S":"PROD005"},"name":{"S":"Desk Chair"},"price":{"N":"199.99"},"in_stock":{"BOOL":true}}'
 
+      - name: Start skardi-server for CLI e2e smoke tests
+        run: |
+          # The CLI's #[ignore] e2e_smoke tests are integration tests whose
+          # backing service is skardi-server itself; they hit the default
+          # http://127.0.0.1:8080 (no ctx/pipelines needed). The nextest step
+          # above already compiled the server binary into the llvm-cov
+          # target dir, so this starts without rebuilding.
+          ./target/llvm-cov-target/debug/skardi-server --port 8080 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8080/health >/dev/null && exit 0
+            sleep 1
+          done
+          echo "skardi-server failed to become healthy" >&2
+          exit 1
+
       - name: Execute Integration tests
         run: cargo llvm-cov --no-report nextest --all-features -- --ignored
 
