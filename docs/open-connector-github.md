@@ -6,6 +6,9 @@ through an [Open Connector gateway](open-connector.md). GitHub credentials
 (API key / OAuth) live in Open Connector; Skardi holds only the gateway
 runtime token.
 
+For a runnable local walkthrough — stub gateway, server, all three SQL
+interfaces, federated join — see the [demo](open-connector/README.md).
+
 ## Binding
 
 ```yaml

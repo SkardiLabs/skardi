@@ -1,0 +1,14 @@
+kind: pipeline
+
+metadata:
+  name: "raw_issue_scan"
+  version: "1.0"
+  description: "Allowlisted raw action through the open_connector_scan UDTF; row type derived from the discovered output schema"
+
+spec:
+  query: |
+    SELECT number, title, state
+    FROM open_connector_scan('saas', 'github.list_repository_issues',
+                             '{"owner":"acme","repo":"widgets","state":"open"}',
+                             '$.issues')
+    ORDER BY number

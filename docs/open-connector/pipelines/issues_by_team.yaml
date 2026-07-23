@@ -1,0 +1,15 @@
+kind: pipeline
+
+metadata:
+  name: "issues_by_team"
+  version: "1.0"
+  description: "Federated join: GitHub issues (via the gateway) joined with a local CSV of team owners"
+
+spec:
+  query: |
+    SELECT t.team, count(*) AS open_issues
+    FROM saas.github_demo.issues i
+    JOIN team_owners t ON i.author_login = t.login
+    WHERE i.state = 'open' AND i.pull_request IS NULL
+    GROUP BY t.team
+    ORDER BY open_issues DESC

@@ -149,7 +149,13 @@ event carrying the scan identity and error.
       scan with the `state=all` pin on every request, Exact `state` override, Inexact
       `since` narrowing + local re-filter keeping the boundary row, `pull_request IS
       NULL`, LIMIT stopping after one page, `open_connector_query` parity) plus new
-      filters/json_to_arrow engine tests.
+      filters/json_to_arrow engine tests. Runnable local demo (`docs/open-connector/`,
+      in the db-source demo style): bundled stdlib-Python stub gateway standing in for
+      the remote service the way DynamoDB Local does, committed ctx + four pipelines
+      (stable table with pushdown, both UDTFs, federated CSV join) — every README
+      command and output executed against the real server before being written down;
+      a final section documents the real-gateway path and flags it as pending live
+      validation (same caveat as the fingerprint pins).
 - [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate

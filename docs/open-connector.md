@@ -21,6 +21,10 @@ gateway **runtime token**.
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.
+>
+> A runnable local walkthrough (bundled stub gateway, server, all three SQL
+> interfaces, federated join) lives in the
+> [GitHub pack demo](open-connector/README.md).
 
 ## Configuration
 
