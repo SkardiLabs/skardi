@@ -295,7 +295,7 @@ pub struct OpenConnectorBinding {
     /// it (and as the shared scan-cache key expects, so a binding and an
     /// identical UDTF invocation hit the same entry).
     #[serde(default)]
-    pub resource: BTreeMap<String, serde_json::Value>,
+    pub resource: BTreeMap<String, Value>,
 
     /// Source-pack tables to expose under this binding.
     pub tables: Vec<String>,
