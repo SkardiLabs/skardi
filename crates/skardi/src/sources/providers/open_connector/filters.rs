@@ -91,10 +91,12 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
     };
 
     // Normalize to `column <op> literal`, flipping the operator when the
-    // literal is on the left (`5 < col` → `col > 5`).
+    // literal is on the left (`5 < col` → `col > 5`). A cast around the
+    // *column* is never matched — `CAST(updated_at AS DATE) >= …` changes
+    // the predicate's semantics and must stay in DataFusion.
     let (column, operator, literal) = match (binary.left.as_ref(), binary.right.as_ref()) {
-        (Expr::Column(column), Expr::Literal(literal, _)) => (column, binary.op, literal),
-        (Expr::Literal(literal, _), Expr::Column(column)) => (column, binary.op.swap()?, literal),
+        (Expr::Column(column), right) => (column, binary.op, resolve_literal(right)?),
+        (left, Expr::Column(column)) => (column, binary.op.swap()?, resolve_literal(left)?),
         _ => return None,
     };
 
@@ -102,8 +104,25 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
         .iter()
         .find(|mapping| mapping.column == column.name && mapping.operator == operator)?;
 
-    let value = scalar_to_json(literal)?;
+    let value = scalar_to_json(&literal)?;
     Some((mapping.input_field.to_string(), value, mapping.fidelity))
+}
+
+/// Resolve the literal side of a predicate, folding literal-only `CAST` /
+/// `TRY_CAST` wrappers with the same Arrow cast kernel the engine would use.
+/// Type coercion wraps literals compared against typed columns (e.g.
+/// `updated_at >= '2026-01-01'` becomes a cast to timestamp), and such casts
+/// can survive into the pushdown filters. Evaluating the cast — rather than
+/// stripping it — keeps Exact semantics exact: `CAST('10' AS DOUBLE)` pushes
+/// the number 10, never the string `"10"`. A failing cast or a non-literal
+/// operand returns None (→ Unsupported, evaluated locally).
+fn resolve_literal(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(scalar, _) => Some(scalar.clone()),
+        Expr::Cast(cast) => resolve_literal(&cast.expr)?.cast_to(&cast.data_type).ok(),
+        Expr::TryCast(cast) => resolve_literal(&cast.expr)?.cast_to(&cast.data_type).ok(),
+        _ => None,
+    }
 }
 
 /// Convert a DataFusion literal to a JSON value. Nulls and types outside the
@@ -429,6 +448,96 @@ mod tests {
         assert_eq!(
             translated.inputs,
             vec![("since".to_string(), Value::from("2026-01-01T00:00:00.250Z"))],
+        );
+    }
+
+    #[test]
+    fn cast_wrapped_literals_are_folded_before_translation() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        use datafusion::logical_expr::{Cast, TryCast};
+
+        // Type coercion's shape for `updated_at >= '2026-01-01T00:00:00Z'`:
+        // the string literal arrives wrapped in a cast to the column's
+        // timestamp type.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("updated_at")),
+            Operator::GtEq,
+            Box::new(Expr::Cast(Cast::new(
+                Box::new(lit("2026-01-01T00:00:00Z")),
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            ))),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("since".to_string(), Value::from("2026-01-01T00:00:00Z"))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        // The cast is EVALUATED, not stripped: a numeric cast pushes the
+        // JSON number, never the inner string — stripping would corrupt an
+        // Exact pushdown with a wrongly-typed provider input.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("value")),
+            Operator::Gt,
+            Box::new(Expr::TryCast(TryCast::new(
+                Box::new(lit("10")),
+                DataType::Float64,
+            ))),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("min_value".to_string(), Value::from(10.0))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Exact]
+        );
+    }
+
+    #[test]
+    fn unfoldable_and_column_side_casts_stay_local() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        use datafusion::logical_expr::Cast;
+
+        let timestamp = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+
+        // A cast that cannot evaluate must classify Unsupported (DataFusion
+        // evaluates locally) — never push a garbled value.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("updated_at")),
+            Operator::GtEq,
+            Box::new(Expr::Cast(Cast::new(
+                Box::new(lit("not a timestamp")),
+                timestamp.clone(),
+            ))),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert!(translated.inputs.is_empty());
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+
+        // A cast around the COLUMN changes the predicate's semantics
+        // (`CAST(updated_at AS DATE) >= …` truncates); it must never match.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Cast(Cast::new(
+                Box::new(col("updated_at")),
+                timestamp,
+            ))),
+            Operator::GtEq,
+            Box::new(lit("2026-01-01T00:00:00Z")),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert!(translated.inputs.is_empty());
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Unsupported]
         );
     }
 
