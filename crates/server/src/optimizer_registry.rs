@@ -13,6 +13,9 @@ use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
+use skardi::sources::providers::open_connector::{
+    OpenConnectorGateways, register_open_connector_udtfs,
+};
 use skardi::sources::providers::seekdb::{register_seekdb_fts_udtf, register_seekdb_knn_udtf};
 use skardi::sources::providers::sqlite::{
     register_sqlite_fts_udtf, register_sqlite_knn_udtf, register_vec_to_binary_udf,
@@ -35,6 +38,10 @@ pub struct OptimizerRegistry {
     /// Stores both Lance datasets and Postgres entries, used by
     /// lance_knn, lance_fts, pg_knn, and pg_fts table functions.
     dataset_registry: DatasetRegistry,
+    /// Open Connector gateway state indexed by gateway (data source) name,
+    /// filled during data-source registration and used by the
+    /// open_connector_query / open_connector_scan table functions.
+    open_connector_gateways: OpenConnectorGateways,
 }
 
 impl OptimizerRegistry {
@@ -42,6 +49,7 @@ impl OptimizerRegistry {
     pub fn new() -> Self {
         Self {
             dataset_registry: Arc::new(RwLock::new(HashMap::new())),
+            open_connector_gateways: OpenConnectorGateways::default(),
         }
     }
 
@@ -107,6 +115,13 @@ impl OptimizerRegistry {
         // Register SeekDB-specific table functions
         if source_types.contains(&DataSourceType::Seekdb) {
             self.register_seekdb_functions(ctx)?;
+        }
+
+        // Register Open Connector table functions
+        if source_types.contains(&DataSourceType::OpenConnector) {
+            tracing::info!("Registering Open Connector table functions");
+            register_open_connector_udtfs(ctx, self.open_connector_gateways());
+            tracing::info!("✓ Registered open_connector_query and open_connector_scan");
         }
 
         Ok(())
@@ -204,6 +219,12 @@ impl OptimizerRegistry {
         Arc::clone(&self.dataset_registry)
     }
 
+    /// Get a clone of the Open Connector gateway map to share with
+    /// `register_open_connector_tables` and the Open Connector UDTFs.
+    pub fn open_connector_gateways(&self) -> OpenConnectorGateways {
+        Arc::clone(&self.open_connector_gateways)
+    }
+
     /// Alias for `datasets()` — used when passing to `register_postgres_tables`.
     pub fn pg_knn_pools(&self) -> DatasetRegistry {
         self.datasets()
@@ -254,6 +275,44 @@ mod tests {
 
         let result = registry.register_udfs(&mut ctx, &data_sources);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_register_udfs_with_open_connector_source() {
+        use crate::config::DataSource;
+        use std::path::PathBuf;
+
+        let registry = OptimizerRegistry::new();
+        let mut ctx = SessionContext::new();
+        let data_sources = vec![DataSource {
+            name: "saas".to_string(),
+            source_type: DataSourceType::OpenConnector,
+            path: PathBuf::new(),
+            connection_string: Some("http://open-connector:3000".to_string()),
+            schema: None,
+            options: None,
+            access_mode: crate::config::AccessMode::default(),
+            enable_cache: false,
+            hierarchy_level: Default::default(),
+            description: None,
+            open_connector: None,
+        }];
+
+        registry
+            .register_udfs(&mut ctx, &data_sources)
+            .expect("register open connector UDTFs");
+
+        // The functions are registered; with no gateway handle published
+        // (this test never ran data-source registration) planning fails with
+        // the targeted gateway error rather than "function not found".
+        let err = ctx
+            .sql("SELECT * FROM open_connector_query('saas', 'mock.items', '{}')")
+            .await
+            .expect_err("no gateway state registered");
+        assert!(
+            err.to_string().contains("gateway 'saas' is not registered"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

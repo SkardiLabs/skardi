@@ -38,7 +38,9 @@ pub enum FieldType {
     /// JSON array of strings ↔ Arrow List\<Utf8\>.
     Utf8List,
     /// Any JSON value serialized to a JSON string ↔ Arrow Utf8. For
-    /// intentionally opaque fields (arbitrary maps, unstable unions).
+    /// intentionally opaque fields (arbitrary maps, unstable unions). A
+    /// present JSON null is SQL NULL (per the shared null rules), not the
+    /// string `"null"`.
     Json,
 }
 
@@ -87,10 +89,37 @@ pub struct FieldMapping {
     pub nullable: bool,
 }
 
-/// A field mapping with its path pre-parsed.
+/// An owned [`FieldMapping`]. Source packs declare columns statically; raw
+/// scans (`open_connector_scan`) derive them at planning time from discovered
+/// action metadata, so their names cannot be `&'static str`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSpec {
+    /// Arrow column name.
+    pub name: String,
+    /// Row-relative dotted path (see [`FieldMapping::path`]).
+    pub path: String,
+    /// Column type.
+    pub field_type: FieldType,
+    /// Whether missing keys / JSON nulls become Arrow nulls (true) or fail
+    /// conversion (false).
+    pub nullable: bool,
+}
+
+impl From<&FieldMapping> for ColumnSpec {
+    fn from(mapping: &FieldMapping) -> Self {
+        Self {
+            name: mapping.name.to_string(),
+            path: mapping.path.to_string(),
+            field_type: mapping.field_type,
+            nullable: mapping.nullable,
+        }
+    }
+}
+
+/// A column spec with its path pre-parsed.
 #[derive(Debug)]
 struct CompiledField {
-    mapping: FieldMapping,
+    spec: ColumnSpec,
     path: RowPath,
 }
 
@@ -109,19 +138,21 @@ impl RowConverter {
     /// Returns [`OpenConnectorError::InvalidRowPath`] if any mapping path is
     /// not a dotted object-key path.
     pub fn new(mappings: &[FieldMapping]) -> Result<Self, OpenConnectorError> {
-        let mut fields = Vec::with_capacity(mappings.len());
-        let mut arrow_fields = Vec::with_capacity(mappings.len());
-        for mapping in mappings {
-            let path = RowPath::parse(&format!("$.{}", mapping.path))?;
+        Self::from_columns(mappings.iter().map(ColumnSpec::from).collect())
+    }
+
+    /// Compile a converter from owned column specs (the raw-scan path).
+    pub fn from_columns(columns: Vec<ColumnSpec>) -> Result<Self, OpenConnectorError> {
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut arrow_fields = Vec::with_capacity(columns.len());
+        for spec in columns {
+            let path = RowPath::parse(&format!("$.{}", spec.path))?;
             arrow_fields.push(Field::new(
-                mapping.name,
-                mapping.field_type.arrow_type(),
-                mapping.nullable,
+                &spec.name,
+                spec.field_type.arrow_type(),
+                spec.nullable,
             ));
-            fields.push(CompiledField {
-                mapping: *mapping,
-                path,
-            });
+            fields.push(CompiledField { spec, path });
         }
         Ok(Self {
             fields,
@@ -160,7 +191,7 @@ impl RowConverter {
         rows: &[Value],
         page: usize,
     ) -> Result<ArrayRef, OpenConnectorError> {
-        let mapping = &field.mapping;
+        let spec = &field.spec;
         let mut cells: Vec<Option<&Value>> = Vec::with_capacity(rows.len());
         for (row_index, row) in rows.iter().enumerate() {
             match field.path.extract(row, page) {
@@ -169,7 +200,7 @@ impl RowConverter {
                 // column. A present-but-wrong-shape value mid-path (e.g.
                 // `user` changed from object to string) is an upstream
                 // *breaking* change and must fail, per this module's contract.
-                Err(OpenConnectorError::RowPathNotFound { .. }) if mapping.nullable => {
+                Err(OpenConnectorError::RowPathNotFound { .. }) if spec.nullable => {
                     cells.push(None)
                 }
                 Err(OpenConnectorError::RowPathNotFound { .. }) => {
@@ -183,48 +214,52 @@ impl RowConverter {
         }
 
         let fail = |index: usize, found: &str| self.failure(field, page, index, found);
-        match mapping.field_type {
+        match spec.field_type {
             FieldType::Boolean => Ok(Arc::new(BooleanArray::from(collect_cells(
                 &cells,
-                mapping,
+                spec,
                 |v| v.as_bool(),
                 fail,
             )?))),
             FieldType::Int64 => Ok(Arc::new(Int64Array::from(collect_cells(
                 &cells,
-                mapping,
+                spec,
                 |v| v.as_i64(),
                 fail,
             )?))),
             FieldType::UInt64 => Ok(Arc::new(UInt64Array::from(collect_cells(
                 &cells,
-                mapping,
+                spec,
                 |v| v.as_u64(),
                 fail,
             )?))),
             FieldType::Float64 => Ok(Arc::new(Float64Array::from(collect_cells(
                 &cells,
-                mapping,
+                spec,
                 |v| v.as_f64(),
                 fail,
             )?))),
             FieldType::Utf8 => Ok(Arc::new(StringArray::from(collect_cells(
                 &cells,
-                mapping,
+                spec,
                 |v| v.as_str().map(str::to_string),
                 fail,
             )?))),
-            FieldType::Json => {
-                let values: Vec<Option<String>> = cells
-                    .iter()
-                    .map(|cell| cell.map(|v| v.to_string()))
-                    .collect();
-                Ok(Arc::new(StringArray::from(values)))
-            }
+            // Opaque values serialize to canonical JSON text, but a present
+            // JSON null is SQL NULL like everywhere else — never the 4-char
+            // string "null", which would break `IS NULL` and match
+            // `= 'null'`. Routing through collect_cells also makes a null in
+            // a non-nullable Json column a targeted per-column failure.
+            FieldType::Json => Ok(Arc::new(StringArray::from(collect_cells(
+                &cells,
+                spec,
+                |v| Some(v.to_string()),
+                fail,
+            )?))),
             FieldType::TimestampMillisUtc => Ok(Arc::new(
                 TimestampMillisecondArray::from(collect_cells(
                     &cells,
-                    mapping,
+                    spec,
                     parse_timestamp,
                     fail,
                 )?)
@@ -247,7 +282,7 @@ impl RowConverter {
                 continue;
             };
             if value.is_null() {
-                if field.mapping.nullable {
+                if field.spec.nullable {
                     builder.append(false);
                     continue;
                 }
@@ -276,10 +311,10 @@ impl RowConverter {
     ) -> OpenConnectorError {
         OpenConnectorError::ConversionFailed {
             path: field.path.as_str().to_string(),
-            column: field.mapping.name.to_string(),
+            column: field.spec.name.clone(),
             page,
             row,
-            expected: field.mapping.field_type.label().to_string(),
+            expected: field.spec.field_type.label().to_string(),
             found: found.to_string(),
         }
     }
@@ -289,7 +324,7 @@ impl RowConverter {
 /// nullable fields and failing otherwise.
 fn collect_cells<T, F, E>(
     cells: &[Option<&Value>],
-    mapping: &FieldMapping,
+    spec: &ColumnSpec,
     convert: F,
     fail: E,
 ) -> Result<Vec<Option<T>>, OpenConnectorError>
@@ -302,7 +337,7 @@ where
         match cell {
             None => out.push(None),
             Some(value) if value.is_null() => {
-                if mapping.nullable {
+                if spec.nullable {
                     out.push(None);
                 } else {
                     return Err(fail(index, "null"));
@@ -557,11 +592,70 @@ mod tests {
     }
 
     #[test]
+    fn json_null_becomes_arrow_null_not_the_string_null() {
+        // A present JSON null in a nullable Json column is SQL NULL — never
+        // the 4-char string "null", which would make `IS NULL` miss and
+        // `= 'null'` match. Raw scans type every object/array field as Json,
+        // so nullable nested SaaS fields (assignee: null) hit this arm.
+        let mut with_null = row(1, "a");
+        with_null["raw"] = Value::Null;
+        let mut absent = row(2, "b");
+        absent.as_object_mut().unwrap().remove("raw");
+
+        let batch = converter().convert(&[with_null, absent], 1).unwrap();
+        let raw = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(raw.is_null(0), "present JSON null must be Arrow null");
+        assert!(raw.is_null(1), "absent key stays Arrow null");
+    }
+
+    #[test]
+    fn json_null_fails_for_non_nullable_json_column() {
+        // Same null discipline as every other type: a required opaque field
+        // fails with a targeted per-column error, not a batch-level one.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "raw",
+            path: "raw",
+            field_type: FieldType::Json,
+            nullable: false,
+        }])
+        .unwrap();
+        let err = converter
+            .convert(&[serde_json::json!({"raw": null})], 3)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ConversionFailed { ref column, page: 3, row: 0, ref found, .. }
+                if column == "raw" && found == "null"
+        ));
+    }
+
+    #[test]
     fn empty_page_yields_empty_batch_with_schema() {
         let converter = converter();
         let batch = converter.convert(&[], 1).unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.schema().fields().len(), 7);
+    }
+
+    #[test]
+    fn owned_columns_build_the_same_converter_as_static_mappings() {
+        // The raw-scan path derives ColumnSpecs at planning time; they must
+        // produce exactly the schema and conversion the static path does.
+        let owned = RowConverter::from_columns(FIELDS.iter().map(ColumnSpec::from).collect())
+            .expect("owned converter");
+        assert_eq!(owned.schema(), converter().schema());
+
+        let batch = owned.convert(&[row(7, "seven")], 1).unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 7);
     }
 
     #[test]

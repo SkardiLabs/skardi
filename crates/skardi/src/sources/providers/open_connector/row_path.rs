@@ -57,6 +57,11 @@ impl RowPath {
         &self.raw
     }
 
+    /// The object-key segments, in traversal order.
+    pub fn segments(&self) -> impl Iterator<Item = &str> {
+        self.segments.iter().map(String::as_str)
+    }
+
     /// Walk the path inside `value`. A key absent from an object fails with
     /// [`OpenConnectorError::RowPathNotFound`]; a present non-object where
     /// the path must descend fails with

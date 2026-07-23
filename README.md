@@ -330,6 +330,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
+| Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (foundation + synthetic pack today; provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md) |
 | Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
 
 ---

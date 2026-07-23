@@ -146,18 +146,28 @@ pub struct DiscoveredAction {
     /// "the gateway said yes" — default-deny consumers (the action registry)
     /// must treat `None` as not executable.
     pub locally_executable: Option<bool>,
+    /// Whether the gateway classifies the action as a non-mutating read.
+    ///
+    /// Same `Option` discipline as `locally_executable`: `None` means the
+    /// gateway did not classify the action, and default-deny consumers (the
+    /// raw-action UDTF) must refuse to execute it. Source-pack actions are
+    /// read-only by Skardi's own review instead, so packs do not consult
+    /// this flag.
+    pub read_only: Option<bool>,
     /// Connection aliases available for this action.
     pub connection_aliases: Vec<String>,
 }
 
 /// Wire shape of the action discovery response. Unknown fields are ignored
 /// so additive gateway changes don't break discovery. `locally_executable`
-/// deliberately has no default: a missing field must stay missing.
+/// and `read_only` deliberately have no default: a missing field must stay
+/// missing.
 #[derive(Debug, Deserialize)]
 struct RawDiscoveredAction {
     input_schema: Option<Value>,
     output_schema: Option<Value>,
     locally_executable: Option<bool>,
+    read_only: Option<bool>,
     #[serde(default)]
     connection_aliases: Vec<String>,
 }
@@ -367,6 +377,7 @@ impl OpenConnectorClient {
             input_schema: raw.input_schema,
             output_schema: raw.output_schema,
             locally_executable: raw.locally_executable,
+            read_only: raw.read_only,
             connection_aliases: raw.connection_aliases,
         })
     }
@@ -377,14 +388,10 @@ impl OpenConnectorClient {
     /// Crate-internal on purpose: execution is the *dangerous* half of the
     /// gateway contract (mutating actions exist upstream), and the
     /// default-deny gating lives one layer up — `ActionRegistry::load` admits
-    /// only explicitly allowlisted, locally-executable actions, and the
-    /// future scan engine / UDTFs must check membership before calling this.
-    /// Keeping the method `pub(crate)` makes that gating structurally
-    /// un-bypassable from outside the crate.
-    ///
-    /// Only exercised by tests until the scan engine wires the production
-    /// path (registration currently stops at `ExecutionNotImplemented`).
-    #[allow(dead_code)]
+    /// only explicitly allowlisted, locally-executable actions, and the scan
+    /// engine / UDTFs check membership before calling this. Keeping the
+    /// method `pub(crate)` makes that gating structurally un-bypassable from
+    /// outside the crate.
     pub(crate) async fn execute(
         &self,
         action_id: &str,

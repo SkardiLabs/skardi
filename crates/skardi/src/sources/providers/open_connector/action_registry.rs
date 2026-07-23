@@ -30,6 +30,7 @@ pub struct ActionMetadata {
     action_id: String,
     input_schema: Option<Value>,
     output_schema: Option<Value>,
+    read_only: Option<bool>,
     connection_aliases: Vec<String>,
     fingerprint: String,
 }
@@ -43,6 +44,7 @@ impl ActionMetadata {
             action_id: action_id.to_string(),
             input_schema: discovered.input_schema,
             output_schema: discovered.output_schema,
+            read_only: discovered.read_only,
             connection_aliases: discovered.connection_aliases,
             fingerprint,
         }
@@ -61,6 +63,13 @@ impl ActionMetadata {
     /// Declared output JSON Schema, if the gateway provides one.
     pub fn output_schema(&self) -> Option<&Value> {
         self.output_schema.as_ref()
+    }
+
+    /// Whether the gateway classifies this action as a non-mutating read.
+    /// `None` means the gateway did not say — default-deny consumers (the
+    /// raw-action UDTF) must refuse to execute the action in that case.
+    pub fn read_only(&self) -> Option<bool> {
+        self.read_only
     }
 
     /// Connection aliases available for this action.
@@ -302,6 +311,26 @@ mod tests {
         );
         assert_eq!(meta.connection_aliases(), &["work".to_string()]);
         assert_eq!(meta.fingerprint().len(), 64, "BLAKE3 hash as hex");
+        assert_eq!(
+            meta.read_only(),
+            None,
+            "an absent read_only flag must stay absent (default-deny input)"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_carries_explicit_read_only_classification() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(
+                r#"{"input_schema": {}, "output_schema": {}, "locally_executable": true,
+                    "read_only": true, "connection_aliases": []}"#,
+            )
+        })
+        .await;
+        let registry = ActionRegistry::load(&client(&gateway), &["github.x".to_string()])
+            .await
+            .expect("load");
+        assert_eq!(registry.get("github.x").unwrap().read_only(), Some(true));
     }
 
     #[test]

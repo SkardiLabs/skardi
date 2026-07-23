@@ -83,15 +83,44 @@ intact. `CREATE EXTERNAL TABLE ... STORED AS OPEN_CONNECTOR` is a
 documented future extension only, gated on a DDL authorization design —
 do not reintroduce it here.
 
-- [ ] 4.1 `open_connector_query` UDTF (built-in pack definitions only)
-- [ ] 4.2 `open_connector_scan` UDTF (allowlisted raw actions only; deterministic row type or planning error)
-- [ ] 4.3 Security policy enforcement: mutating actions rejected pre-HTTP; YAML overrides cannot swap actions/row paths; default-deny allowlist
-- [ ] 4.4 Observability: scan spans/metrics (gateway, binding, action, cache hit, pages, rows, retries) without tokens or bodies
-- [ ] 4.5 Docs: `docs/open-connector.md`, ctx/UDTF examples, README supported-sources entry (first time the source is actually queryable)
+- [x] 4.1 `open_connector_query` UDTF (built-in pack definitions only): compiles into the same
+      provider/scan/cache path as the YAML-bound table (identical schema, filter allowlist,
+      fingerprint gate, shared per-gateway cache); plans against registration-time discovery,
+      so an undiscovered action is a targeted planning error, never a hidden gateway call
+- [x] 4.2 `open_connector_scan` UDTF (allowlisted raw actions only): deterministic row type
+      derived from the discovered output schema at the row path (primitives typed,
+      `["T","null"]` unions nullable, everything else opaque JSON) or a planning error
+      recommending a source pack; single-page live execution (`PaginationStrategy::SinglePage`,
+      no cache, no filter pushdown)
+- [x] 4.3 Security policy enforcement: raw actions require allowlist membership **and** an
+      explicit `read_only: true` in discovered metadata (mutating and unclassified actions
+      rejected at planning, pre-HTTP, with distinct errors); YAML overrides of pack
+      action/row_path/pagination/columns rejected by `deny_unknown_fields` (tests pin it);
+      default-deny allowlist unchanged
+- [x] 4.4 Observability: scan completion/failure tracing events (gateway, binding, table,
+      action, cache hit, pages, rows, duration); completion events carry identity and
+      counters only, failure events add the error — whose message may quote a bounded
+      (≤512-char) snippet of the gateway's *error* response and a pagination cursor for
+      diagnosability, per the design's "no tokens / credentials / authorization headers /
+      full sensitive inputs" wording — never tokens, successful-response bodies, or row
+      data; client retry warns already carried operation + status
+- [x] 4.5 Docs: `docs/open-connector.md` (config reference, three SQL interfaces, security
+      model, caching, bounds, observability), ctx/UDTF examples inside it, README
+      supported-sources entry (first time the source is actually queryable)
 
-**Verification**: both UDTFs return the stable schema and values of their
-corresponding YAML-registered tables; federated join of the mock pack
-against a local CSV.
+**Verification**: 157 open_connector tests. `open_connector_query` asserted to return the
+same schema and values as `saas.ws.items`, replay from the table's cache entry with zero
+new gateway requests, and push the same `min_value` filter and connection alias;
+`open_connector_scan` asserted to execute exactly one POST, expose derived typed/JSON
+columns, and reject unallowlisted, mutating, unclassified, and schema-indeterminate
+actions before any HTTP execute; federated join of the mock pack (via the UDTF) against a
+local CSV. Scan-completion events are emitted with the final batch (LIMIT-satisfied,
+short-final-page exhaustion, and cache-replay scans included), since a satisfied
+downstream LIMIT drops the stream without another poll; a test-only tracing capture
+(`testutil::capture_events`) pins the emitted events themselves — exactly one
+completion per scan (LIMIT-terminated stream dropped without a further poll, empty
+scan, cache replay) with the documented field values, and exactly one WARN failure
+event carrying the scan identity and error.
 
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 
@@ -108,9 +137,12 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestones 1–3 (`feature/open-connector-integration-task-3`).
-  Registration builds a queryable catalog after gateway health, action
-  discovery, source-pack validation, and fingerprint checks.
+- **Current PR**: milestone 4 (UDTFs + security/observability + docs).
+  Milestones 1–3 are merged; registration builds a queryable catalog after
+  gateway health, action discovery, source-pack validation, and fingerprint
+  checks, and now also publishes per-gateway planning state for the two
+  UDTFs (shared with the server `OptimizerRegistry` / CLI the way the
+  KNN/FTS `DatasetRegistry` is).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in
