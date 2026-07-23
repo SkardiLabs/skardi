@@ -278,6 +278,17 @@ async fn unknown_table_is_execution_error() {
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("query_execution_error"));
+    // Raw engine internals must not leak to the client: no `details`, and the
+    // offending identifier must not be echoed back in the message.
+    assert!(
+        body["details"].is_null(),
+        "details should be omitted: {body}"
+    );
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("no_such_table"),
+        "client message must not echo engine internals, got: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------

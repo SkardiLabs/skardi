@@ -169,10 +169,22 @@ fn validate_statement_strict(
     validate_statement(statement, config)?;
 
     match statement {
-        Statement::Query(_)
-        | Statement::Insert(_)
-        | Statement::Update { .. }
-        | Statement::Delete(_) => Ok(()),
+        Statement::Query(_) | Statement::Insert(_) | Statement::Update { .. } => Ok(()),
+
+        // `validate_statement` above already access-checked `delete.from`.
+        // Reject the multi-relation forms outright: `delete.tables`
+        // (`DELETE t1, t2 FROM …`) and `delete.using` reach relations beyond
+        // that single target, and the ad-hoc path must fail closed here
+        // rather than lean on DataFusion rejecting them at plan time.
+        Statement::Delete(delete) => {
+            if !delete.tables.is_empty() || delete.using.is_some() {
+                Err(SqlValidationError::StatementNotAllowed {
+                    operation: "multi-target DELETE".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
 
         // EXPLAIN wraps an inner statement that DataFusion may execute
         // (EXPLAIN ANALYZE runs the plan), so the inner statement must
@@ -826,6 +838,30 @@ mod tests {
         let config = test_config();
         let result = validate_sql("SELECT token FROM auth.sessions", &config);
         assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn test_adhoc_multi_target_delete_rejected() {
+        // `DELETE ... USING ...` (and MySQL multi-table `DELETE t1, t2 FROM`)
+        // touch relations beyond `delete.from`. The engine rejects these
+        // forms at planning; the ad-hoc validator must fail closed on its own
+        // rather than depend on that. A plain single-target DELETE against a
+        // writable source still passes.
+        let config = adhoc(test_config());
+        let result = validate_single_sql(
+            "DELETE FROM orders USING users WHERE orders.id = users.id",
+            &config,
+        );
+        assert!(
+            matches!(result, Err(SqlValidationError::StatementNotAllowed { .. })),
+            "DELETE ... USING must be rejected on the ad-hoc path, got: {:?}",
+            result
+        );
+
+        // Sanity: an ordinary single-target DELETE on a read_write source is
+        // still allowed.
+        let ok = validate_single_sql("DELETE FROM orders WHERE id = 1", &config);
+        assert!(matches!(ok, Ok(StatementKind::Other)), "got: {:?}", ok);
     }
 
     #[test]

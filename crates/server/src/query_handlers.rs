@@ -137,6 +137,9 @@ pub async fn execute_query(
     let record_batch = match result {
         Ok(batch) => batch,
         Err(e) => {
+            // Log the engine error server-side; do not echo it to the client.
+            // DataFusion errors can quote row/column values and internal
+            // schema, so the response stays generic.
             tracing::error!("Ad-hoc query execution failed: {}", e);
             tracing::debug!("Failed SQL query: {}", request.sql);
 
@@ -147,18 +150,12 @@ pub async fn execute_query(
                 "query_execution_error",
             );
 
-            let error_details = serde_json::json!({
-                "engine_error": e.to_string(),
-                "registered_tables": "Check server logs for data source registration status",
-                "suggestion": "Verify that data sources are properly registered and accessible"
-            });
-
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 create_error_response(
-                    &format!("SQL query execution failed: {}", e),
+                    "SQL query execution failed; see server logs for details",
                     "query_execution_error",
-                    Some(error_details),
+                    None,
                 ),
             ));
         }
@@ -174,7 +171,14 @@ pub async fn execute_query(
     let data = match record_batch_to_json(&record_batch) {
         Ok(json_data) => json_data,
         Err(e) => {
-            tracing::error!("Failed to convert results to JSON: {}", e);
+            // Keep the schema/error detail in the server log only; the client
+            // response must not echo internal schema back.
+            tracing::error!(
+                "Failed to convert results to JSON: {} (schema: {:?}, rows: {})",
+                e,
+                record_batch.schema(),
+                record_batch.num_rows()
+            );
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state.metrics.record_error(
@@ -183,18 +187,12 @@ pub async fn execute_query(
                 "result_conversion_error",
             );
 
-            let error_details = serde_json::json!({
-                "conversion_error": e.to_string(),
-                "record_batch_schema": format!("{:?}", record_batch.schema()),
-                "record_batch_rows": record_batch.num_rows()
-            });
-
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 create_error_response(
-                    &format!("Failed to convert query results to JSON: {}", e),
+                    "Failed to convert query results to JSON; see server logs for details",
                     "result_conversion_error",
-                    Some(error_details),
+                    None,
                 ),
             ));
         }
