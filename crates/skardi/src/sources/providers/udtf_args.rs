@@ -100,7 +100,35 @@ mod tests {
             optional_string_arg(&null_expr(), "f", "alias").unwrap(),
             None
         );
+        assert_eq!(
+            optional_string_arg(&lit("work"), "f", "alias").unwrap(),
+            Some("work".to_string())
+        );
         let err = strict_string_arg(&null_expr(), "f", "gateway").unwrap_err();
         assert!(err.to_string().contains("not NULL"), "got {err}");
+    }
+
+    #[test]
+    fn typed_null_strings_are_rejected_not_read_as_empty() {
+        // Utf8(None) / LargeUtf8(None) are typed NULLs (e.g. from
+        // CAST(NULL AS VARCHAR)), not string literals: no variant may read
+        // them as a valid "" — and only the untyped ScalarValue::Null gets
+        // the placeholder treatment, matching every provider's
+        // pre-refactor behavior.
+        for scalar in [ScalarValue::Utf8(None), ScalarValue::LargeUtf8(None)] {
+            let expr = Expr::Literal(scalar, None);
+            for helper in [string_arg, strict_string_arg] {
+                let err = helper(&expr, "f", "arg").unwrap_err();
+                assert!(
+                    err.to_string().contains("'arg' must be a string literal"),
+                    "got {err}"
+                );
+            }
+            let err = optional_string_arg(&expr, "f", "arg").unwrap_err();
+            assert!(
+                err.to_string().contains("'arg' must be a string literal"),
+                "got {err}"
+            );
+        }
     }
 }
