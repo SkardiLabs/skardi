@@ -44,7 +44,7 @@
 
 use datafusion::logical_expr::Operator;
 
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
+use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::PaginationStrategy;
 use crate::sources::providers::open_connector::source_pack::{
@@ -275,6 +275,7 @@ static ISSUES: SourcePackTable = SourcePackTable {
             operator: Operator::Eq,
             input_field: "state",
             fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Rfc3339,
         },
         // GitHub documents issue `since` as "updated at or after this
         // time" — a superset of `updated_at >= X` under any granularity
@@ -285,6 +286,7 @@ static ISSUES: SourcePackTable = SourcePackTable {
             operator: Operator::GtEq,
             input_field: "since",
             fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Rfc3339,
         },
     ],
     expected_fingerprint: None,
@@ -442,6 +444,7 @@ static PULL_REQUESTS: SourcePackTable = SourcePackTable {
         operator: Operator::Eq,
         input_field: "state",
         fidelity: Fidelity::Inexact,
+        value_format: ValueFormat::Rfc3339,
     }],
     expected_fingerprint: None,
 };

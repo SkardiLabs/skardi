@@ -52,7 +52,7 @@ WHERE NOT is_bot AND NOT deleted;
 |---|---|---|---|
 | `conversations` | `slack.list_conversations` | cursor (`limit` 200) | none |
 | `users` | `slack.list_users` | cursor (`limit` 200) | none |
-| `files` | `slack.list_files` | classic `page`/`count` (100), ends at `paging.pages` | `user_id =` → `user` (inexact, re-applied locally) |
+| `files` | `slack.list_files` | classic `page`/`count` (100), ends at `paging.pages` | `user_id =` → `user`; `created >=` → `ts_from` as epoch seconds (both inexact, re-applied locally) |
 
 Every other SQL predicate is valid — DataFusion evaluates it locally after
 the bounded fetch, and `LIMIT` stops pagination as soon as enough rows have
@@ -75,9 +75,9 @@ highlights and caveats:
   to `Timestamp(ms, UTC)` columns.
 - **Slack uses empty strings, not nulls** (`topic = ''` for an unset
   topic); those stay empty strings. Genuinely absent keys become SQL NULL.
-- **`files.created >= …` is not pushed down**: Slack's `ts_from` takes
-  epoch seconds and the filter engine renders timestamp literals as
-  RFC 3339 only. The predicate still works — locally.
+- **`files.created >= …` pushes down as epoch seconds** (`ts_from`,
+  Slack's inclusive lower bound); sub-second literals floor, which only
+  widens the fetch — the predicate is re-applied locally either way.
 
 ## Authorization and visibility
 

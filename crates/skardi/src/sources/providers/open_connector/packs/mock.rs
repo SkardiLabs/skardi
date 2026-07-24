@@ -4,7 +4,7 @@
 
 use datafusion::logical_expr::Operator;
 
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
+use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::PaginationStrategy;
 use crate::sources::providers::open_connector::source_pack::{SourcePack, SourcePackTable};
@@ -64,6 +64,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         operator: Operator::Gt,
         input_field: "min_value",
         fidelity: Fidelity::Exact,
+        value_format: ValueFormat::Rfc3339,
     }],
     // The mock gateway's action schema is test-controlled, so no fingerprint
     // is pinned; real packs pin one.

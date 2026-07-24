@@ -25,11 +25,12 @@
 //!   to the `user` query parameter as [`Fidelity::Inexact`], per the
 //!   module-wide string-push rule (an Exact claim would lean on the
 //!   provider rejecting unknown user IDs instead of silently returning its
-//!   default listing). `files.created >=` is deliberately **not** mapped to
-//!   `ts_from`: Slack takes epoch seconds there, and the filter engine
-//!   renders timestamp literals as RFC 3339 only — mapping it would send a
-//!   string Slack cannot parse. It becomes a candidate once per-mapping
-//!   value rendering exists.
+//!   default listing). `files.created >=` maps to `ts_from` with
+//!   [`ValueFormat::EpochSeconds`] — Slack takes epoch seconds there, not
+//!   the RFC 3339 default, and the format is declared on the mapping so no
+//!   pack can silently send the wrong spelling. `ts_from` is inclusive and
+//!   a lower bound, so the flooring render stays a superset under Inexact
+//!   re-filtering.
 //! - **Timestamps are epoch seconds** (`created`, `updated`), read through
 //!   [`FieldType::TimestampSecondsUtc`] — the millis reader would silently
 //!   produce January-1970 dates.
@@ -52,7 +53,7 @@
 
 use datafusion::logical_expr::Operator;
 
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
+use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::PaginationStrategy;
 use crate::sources::providers::open_connector::source_pack::{
@@ -326,17 +327,28 @@ static FILES: SourcePackTable = SourcePackTable {
     },
     required_resources: &[],
     fixed_inputs: &[],
-    // Inexact per the string-push rule: user IDs are arbitrary strings, and
-    // an Exact claim would lean on the provider rejecting unknown ones.
-    // `created >= X` → `ts_from` is deliberately NOT mapped — Slack takes
-    // epoch seconds there and the filter engine renders timestamp literals
-    // as RFC 3339 only; a candidate once per-mapping value rendering exists.
-    filters: &[FilterMapping {
-        column: "user_id",
-        operator: Operator::Eq,
-        input_field: "user",
-        fidelity: Fidelity::Inexact,
-    }],
+    filters: &[
+        // Inexact per the string-push rule: user IDs are arbitrary strings,
+        // and an Exact claim would lean on the provider rejecting unknown
+        // ones.
+        FilterMapping {
+            column: "user_id",
+            operator: Operator::Eq,
+            input_field: "user",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Rfc3339,
+        },
+        // Slack's ts_from takes epoch seconds and is inclusive
+        // (created-at-or-after) — a lower bound, so EpochSeconds' flooring
+        // only widens the fetch, and Inexact re-filtering trims it back.
+        FilterMapping {
+            column: "created",
+            operator: Operator::GtEq,
+            input_field: "ts_from",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::EpochSeconds,
+        },
+    ],
     expected_fingerprint: None,
 };
 
@@ -811,6 +823,59 @@ bindings:
         assert!(
             bodies.iter().all(|body| body.contains(r#""count":100"#)),
             "files uses classic page/count pagination: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_predicate_pushes_epoch_seconds_and_keeps_the_boundary_row() {
+        // ts_from goes out as whole epoch seconds — never the RFC 3339
+        // default — and the stub ignores it entirely (the harshest legal
+        // Inexact provider): DataFusion re-applies the predicate, keeping
+        // the boundary row and trimming older ones.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(
+                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                        "locally_executable": true, "connection_aliases": []}"#,
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_files/execute" {
+                return MockResponse::ok(
+                    &json!({"output": {"ok": true, "files": [
+                        {"id": "F0001", "created": 1735689599},
+                        {"id": "F0002", "created": 1735689600},
+                        {"id": "F0003", "created": 1735689601}
+                    ], "paging": {"count": 100, "total": 3, "page": 1, "pages": 1}}})
+                    .to_string(),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = setup(&gateway, "files", "SKARDI_TEST_OC_SLACK_TSFROM").await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.ws.files \
+             WHERE created >= TIMESTAMP '2025-01-01T00:00:00Z' ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows_of(&batches),
+            2,
+            "boundary row F0002 stays; the ignored push is re-filtered"
+        );
+
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""ts_from":1735689600"#)),
+            "pushed as whole epoch seconds, not RFC 3339: {bodies:?}"
         );
     }
 

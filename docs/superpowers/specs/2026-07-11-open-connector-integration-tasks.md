@@ -166,8 +166,10 @@ event carrying the scan identity and error.
       (a `total_pages_path` extension to `PageNumber` — short non-final pages, legal under
       permission filtering, never truncate; missing/non-numeric totals fail loudly). `types=public_channel,private_channel` pinned on
       conversations (the `state=all` move); `files.user_id =` → `user` pushed Inexact per the
-      string-push rule; `files.created >=` → `ts_from` deliberately NOT mapped (Slack takes
-      epoch seconds; the filter engine renders timestamps as RFC 3339 only). New engine
+      string-push rule; `files.created >=` → `ts_from` pushed Inexact as epoch seconds via
+      the new per-mapping `ValueFormat` (Rfc3339 default / EpochSeconds — declared on the
+      mapping so a pack can never silently send a timestamp in the wrong provider spelling;
+      flooring is lower-bound-only by documented rule). New engine
       support: `FieldType::TimestampSecondsUtc` (Slack's epoch-second `created`/`updated` —
       the millis reader would silently produce 1970 dates). No fingerprint pins yet, same
       live-validation follow-up as GitHub.

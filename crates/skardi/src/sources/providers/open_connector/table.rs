@@ -158,7 +158,9 @@ impl TableProvider for OpenConnectorTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
+    use crate::sources::providers::open_connector::filters::{
+        Fidelity, FilterMapping, ValueFormat,
+    };
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use datafusion::logical_expr::Operator;
@@ -190,6 +192,7 @@ mod tests {
                 operator: Operator::Gt,
                 input_field: "min_id",
                 fidelity: Fidelity::Exact,
+                value_format: ValueFormat::Rfc3339,
             }],
             expected_fingerprint: None,
         }))
