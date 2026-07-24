@@ -1298,6 +1298,146 @@ bindings:
         );
     }
 
+    /// Register one non-issues table against a stub gateway that serves the
+    /// given rows for `action_id` under `row_key`, recording every request.
+    async fn setup_table(
+        table: &'static str,
+        action_id: &'static str,
+        row_key: &'static str,
+        rows: Vec<Value>,
+        token_env: &'static str,
+    ) -> (MockGateway, SessionContext) {
+        let served = std::sync::Arc::new(rows);
+        let gateway = {
+            let served = std::sync::Arc::clone(&served);
+            MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path == format!("/v1/actions/{action_id}") {
+                    return MockResponse::ok(
+                        r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                            "locally_executable": true, "connection_aliases": []}"#,
+                    );
+                }
+                if req.method == "POST" && req.path == format!("/v1/actions/{action_id}/execute") {
+                    return MockResponse::ok(
+                        &json!({"output": {row_key: served.as_slice()}}).to_string(),
+                    );
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await
+        };
+
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [{table}]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        (gateway, ctx)
+    }
+
+    #[tokio::test]
+    async fn commits_time_predicate_is_never_pushed_as_since() {
+        // The pack deliberately does NOT map committed_at to the commits
+        // endpoint's `since`: GitHub documents it as commits strictly
+        // *after* the date, so pushing a `>=` predicate could drop the
+        // boundary commit unrecoverably. This guards the decision — if a
+        // future mapping is added by accident, the body assertion fails.
+        let commit =
+            |sha: &str, date: &str| json!({"sha": sha, "commit": {"committer": {"date": date}}});
+        let rows = vec![
+            commit("aaa", "2026-01-01T00:00:00Z"),
+            commit("bbb", "2026-01-02T00:00:00Z"),
+            commit("ccc", "2026-01-03T00:00:00Z"),
+        ];
+        let (gateway, ctx) = setup_table(
+            "commits",
+            "github.list_commits",
+            "commits",
+            rows,
+            "SKARDI_TEST_OC_GITHUB_COMMITS_SINCE",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT sha FROM saas.gh.commits \
+             WHERE committed_at >= TIMESTAMP '2026-01-02T00:00:00Z'",
+        )
+        .await;
+        assert_eq!(
+            rows_of(&batches),
+            2,
+            "DataFusion filters locally: boundary commit bbb stays"
+        );
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies.iter().all(|body| !body.contains("since")),
+            "committed_at must never reach the strictly-after `since`: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_runs_status_predicate_is_never_pushed() {
+        // `status` is deliberately unmapped: GitHub's status parameter also
+        // matches conclusion values, so an Exact claim would be unfaithful.
+        // Guard the decision the same way as commits/since.
+        let run = |id: u64, status: &str| json!({"id": id, "status": status});
+        let rows = vec![
+            run(1, "completed"),
+            run(2, "in_progress"),
+            run(3, "completed"),
+        ];
+        let (gateway, ctx) = setup_table(
+            "workflow_runs",
+            "github.list_workflow_runs",
+            "workflow_runs",
+            rows,
+            "SKARDI_TEST_OC_GITHUB_RUNS_STATUS",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.workflow_runs WHERE status = 'completed'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 2, "DataFusion filters locally");
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies.iter().all(|body| !body.contains("status")),
+            "the status predicate must never reach the provider: {bodies:?}"
+        );
+    }
+
     #[tokio::test]
     async fn pull_request_marker_separates_issues_from_prs() {
         let fixture: Value =
