@@ -1439,6 +1439,86 @@ bindings:
     }
 
     #[tokio::test]
+    async fn wrapped_envelope_with_total_count_paginates_and_terminates() {
+        // workflow_runs is the pack's one structurally different response
+        // shape: the row array sits beside a sibling `total_count`
+        // (GitHub's actual envelope). Pagination and short-page termination
+        // must run end to end against that shape — the sibling key is
+        // ignored by the row path and must never confuse the scan.
+        let total = 150usize;
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/github.list_workflow_runs" {
+                return MockResponse::ok(
+                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                        "locally_executable": true, "connection_aliases": []}"#,
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_workflow_runs/execute" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let input = body.get("input").cloned().unwrap_or_default();
+                let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
+                let per_page = input.get("per_page").and_then(Value::as_u64).unwrap_or(30) as usize;
+                let slice: Vec<Value> = (1..=total)
+                    .map(|id| json!({"id": id, "status": "completed"}))
+                    .skip((page - 1) * per_page)
+                    .take(per_page)
+                    .collect();
+                return MockResponse::ok(
+                    &json!({"output": {"total_count": total, "workflow_runs": slice}}).to_string(),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_RUNS_ENVELOPE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [workflow_runs]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.workflow_runs").await;
+        assert_eq!(rows_of(&batches), 150, "the sibling total_count is inert");
+
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "150 runs at per_page=100: a full page, then a short page that terminates"
+        );
+        assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
+        assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
+    }
+
+    #[tokio::test]
     async fn pull_request_marker_separates_issues_from_prs() {
         let fixture: Value =
             serde_json::from_str(include_str!("fixtures/github/issues.json")).unwrap();
