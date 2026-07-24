@@ -382,6 +382,7 @@ mod tests {
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
+                query_log: None,
             },
         };
         let session_ctx = Arc::new(SessionContext::new());
@@ -428,6 +429,7 @@ mod tests {
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
+                query_log: None,
             },
         };
         let session_ctx = Arc::new(SessionContext::new());

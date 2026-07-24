@@ -63,6 +63,12 @@ fn data_source(name: &str, access_mode: AccessMode) -> DataSource {
 
 /// AppState with `products` (read_only) and `scratch` (read_write) MemTables.
 fn make_state() -> AppState {
+    make_state_with_query_log(None)
+}
+
+/// Same as [`make_state`] but wires an operator `--query-log` file when a path
+/// is given, so tests can assert what does (and does not) land in it.
+fn make_state_with_query_log(query_log: Option<std::path::PathBuf>) -> AppState {
     let ctx = Arc::new(SessionContext::new());
     ctx.register_batch("products", products_batch()).unwrap();
     ctx.register_batch("scratch", scratch_batch()).unwrap();
@@ -82,6 +88,7 @@ fn make_state() -> AppState {
             ctx_file: None,
             semantics_path: None,
             port: 0,
+            query_log,
         },
     };
     AppState::new(config, engine, ctx, AuthLayer::None, None)
@@ -386,4 +393,74 @@ async fn prepare_insert_into_read_only_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("sql_validation_error"));
+}
+
+// ---------------------------------------------------------------------------
+// purpose field
+
+#[tokio::test]
+async fn purpose_field_is_accepted() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT id FROM products", "purpose": "weekly pricing dashboard"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["success"], json!(true));
+}
+
+#[tokio::test]
+async fn over_long_purpose_rejected() {
+    let long_purpose = "x".repeat(2001);
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "purpose": long_purpose}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+// ---------------------------------------------------------------------------
+// operator query-log file
+
+#[tokio::test]
+async fn query_log_records_raw_sql_and_purpose_when_configured() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let state = make_state_with_query_log(Some(tmp.path().to_path_buf()));
+
+    let resp = post_query(
+        state,
+        json!({
+            "sql": "SELECT id FROM products WHERE brand = 'Apple'",
+            "purpose": "brand audit",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let contents = std::fs::read_to_string(tmp.path()).unwrap();
+    assert!(
+        contents.contains("SELECT id FROM products WHERE brand = 'Apple'"),
+        "query log should record the raw SQL: {contents}"
+    );
+    assert!(
+        contents.contains("brand audit"),
+        "query log should record the purpose: {contents}"
+    );
+}
+
+#[tokio::test]
+async fn no_query_log_file_written_when_not_configured() {
+    // Default state has no --query-log; the request must still succeed and
+    // nothing is expected to be persisted. (Regression guard: recording is
+    // strictly opt-in.)
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT id FROM products WHERE brand = 'Apple'"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

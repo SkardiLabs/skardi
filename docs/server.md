@@ -109,6 +109,7 @@ and updates automatically when pipelines, jobs, or semantics reload.
 | `/pipeline/:name` | GET | Metadata for one pipeline. |
 | `/health/:name` | GET | Per-pipeline health check (includes upstream data-source status). |
 | `/:name/execute` | POST | Execute a pipeline by name. Body is the JSON param map. See [pipelines.md](pipelines.md). |
+| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "purpose": "..." }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
 | `/jobs` | GET | List all registered jobs with destinations. |
 | `/jobs/:name/run` | POST | Submit a new job run. Body is the JSON param map. See [jobs.md](jobs.md). |
 | `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
@@ -119,6 +120,31 @@ Request / response bodies for pipeline execution are documented in
 [pipelines.md § Response format](pipelines.md#response-format); job run
 submission and the run lifecycle are documented in
 [jobs.md § HTTP endpoints](jobs.md#http-endpoints).
+
+### Ad-hoc queries
+
+`POST /query` runs a single SQL statement against the registered data sources.
+DDL/COPY are always rejected; DML is allowed only against `access_mode:
+read_write` sources. Results are capped at `max_rows` (default 1000) and the
+response carries a `truncated` flag.
+
+Request fields:
+
+- `sql` (string, required) — one SQL statement.
+- `max_rows` (positive integer, optional, default 1000) — result row cap.
+- `purpose` (string, optional, ≤ 2000 chars) — free-text reason the caller is
+  running the query (typically an agent documenting intent). Recorded for
+  context; never executed. Over the cap → `400 parameter_validation_error`.
+
+**Query logging.** By default the raw SQL is **never written to logs or
+traces** — because callers may inline literal secrets/PII, only a value-free
+marker (`purpose`, `max_rows`, statement kind, timing) is emitted. To keep a
+full audit trail, start the server with `--query-log <path>`: every executed
+statement is appended to that local file as one JSON line (raw `sql`,
+`purpose`, `max_rows`, timestamp). That file contains sensitive query text, so
+**securing, rotating, and retaining it is the operator's responsibility**. The
+sink is a dedicated local file, never the OTLP/tracing pipeline, so enabling it
+does not push query text to external collectors.
 
 ---
 

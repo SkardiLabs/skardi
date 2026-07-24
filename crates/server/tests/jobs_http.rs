@@ -103,6 +103,7 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 0,
+            query_log: None,
         },
     };
     let state = AppState::new(config, engine, Arc::clone(&ctx), AuthLayer::None, executor);

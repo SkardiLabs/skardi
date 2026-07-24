@@ -90,6 +90,7 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
             ctx_file: None,
             semantics_path: None,
             port: 0,
+            query_log: None,
         },
     };
     AppState::new(config, engine, Arc::clone(&ctx), AuthLayer::None, None)

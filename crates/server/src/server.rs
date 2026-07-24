@@ -37,6 +37,7 @@ use crate::pipeline_handlers::{
     pipeline_health_check,
 };
 use crate::query_handlers::execute_query;
+use crate::query_log::QueryLog;
 #[cfg(test)]
 use crate::semantics::SemanticsRegistry;
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
@@ -60,6 +61,10 @@ pub struct AppState {
     /// [`crate::config::adhoc_policy_from_sources`] for why a snapshot is
     /// safe (no runtime writer mutates access modes).
     pub adhoc_policy: Arc<AdhocSqlPolicy>,
+    /// Optional sink that appends raw `/query` SQL to a local file. `Some` only
+    /// when the operator passed `--query-log`. `None` means raw SQL is never
+    /// written anywhere. See [`crate::query_log`].
+    pub query_log: Option<Arc<QueryLog>>,
 }
 
 impl AppState {
@@ -77,6 +82,24 @@ impl AppState {
         let adhoc_policy = Arc::new(crate::config::adhoc_policy_from_sources(
             &config.data_sources,
         ));
+        // Open the raw-SQL sink if the operator asked for one. A failure to
+        // open the file must not take the server down — warn and run without
+        // the audit file (raw SQL simply won't be recorded).
+        let query_log =
+            config
+                .args
+                .query_log
+                .as_ref()
+                .and_then(|path| match QueryLog::open(path) {
+                    Ok(log) => Some(Arc::new(log)),
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to open --query-log file {}: {e}; raw SQL will not be recorded",
+                            path.display()
+                        );
+                        None
+                    }
+                });
         Self {
             config: Arc::new(RwLock::new(config)),
             engine,
@@ -85,6 +108,7 @@ impl AppState {
             auth_layer,
             jobs,
             adhoc_policy,
+            query_log,
         }
     }
 }
@@ -426,6 +450,7 @@ spec:
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
+                query_log: None,
             },
         };
 
@@ -449,6 +474,7 @@ spec:
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
+                query_log: None,
             },
         }
     }

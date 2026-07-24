@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod optimizer_registry;
 pub mod pipeline_handlers;
 pub mod query_handlers;
+pub mod query_log;
 pub mod remote_storage;
 pub mod response;
 pub mod server;

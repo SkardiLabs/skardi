@@ -27,6 +27,10 @@ const DEFAULT_MAX_ROWS: usize = 1000;
 /// Metrics label for ad-hoc queries (pipelines record under their own name).
 const QUERY_METRICS_LABEL: &str = "query";
 
+/// Upper bound on the `purpose` field length (characters). Callers document
+/// intent, not payloads; the cap keeps a runaway string out of the logs.
+const MAX_PURPOSE_CHARS: usize = 2000;
+
 /// Request structure for ad-hoc query execution
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
@@ -34,6 +38,9 @@ pub struct QueryRequest {
     pub sql: String,
     /// Result row cap; defaults to [`DEFAULT_MAX_ROWS`]. Must be >= 1.
     pub max_rows: Option<usize>,
+    /// Free-text reason the caller (typically an agent) is running this query.
+    /// Recorded for context; never executed. Capped at [`MAX_PURPOSE_CHARS`].
+    pub purpose: Option<String>,
 }
 
 /// Execute ad-hoc SQL endpoint - POST /query
@@ -68,11 +75,37 @@ pub async fn execute_query(
         None => DEFAULT_MAX_ROWS,
     };
 
+    // `purpose` is caller-supplied intent, not a payload; keep it bounded so a
+    // runaway string can't bloat the marker log or the query-log file.
+    if request
+        .purpose
+        .as_ref()
+        .is_some_and(|p| p.chars().count() > MAX_PURPOSE_CHARS)
+    {
+        let elapsed_ms = start_time.elapsed().as_millis() as f64;
+        app_state.metrics.record_error(
+            QUERY_METRICS_LABEL,
+            elapsed_ms,
+            "parameter_validation_error",
+        );
+
+        return Err((
+            StatusCode::BAD_REQUEST,
+            create_error_response(
+                &format!("purpose must be at most {MAX_PURPOSE_CHARS} characters"),
+                "parameter_validation_error",
+                None,
+            ),
+        ));
+    }
+
     let statement_kind = match validate_single_sql(&request.sql, &app_state.adhoc_policy) {
         Ok(kind) => kind,
         Err(e) => {
+            // The rejection reason is logged, but never the SQL text itself:
+            // it may inline literal secrets/PII. Raw SQL goes only to the
+            // opt-in `--query-log` file, and only for statements we execute.
             tracing::info!("Rejected ad-hoc query: {}", e);
-            tracing::debug!("Rejected SQL: {}", request.sql);
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state
@@ -103,14 +136,22 @@ pub async fn execute_query(
         }
     };
 
-    // Audit trail: every statement this endpoint hands to the engine is
-    // recorded before execution, so a crash mid-query still leaves a record.
+    // Audit marker: value-free by design. The raw SQL is *not* logged here —
+    // it may inline secrets/PII and this line fans out to any OTLP collector.
+    // Only `purpose` (caller intent) and non-sensitive metadata are recorded.
     tracing::info!(
-        sql = %request.sql,
         max_rows,
         kind = ?statement_kind,
+        purpose = request.purpose.as_deref().unwrap_or(""),
         "Executing ad-hoc query"
     );
+
+    // Raw SQL goes only to the opt-in operator query-log file, which the
+    // operator is responsible for securing. Recorded before execution so a
+    // crash mid-query still leaves a record.
+    if let Some(query_log) = &app_state.query_log {
+        query_log.record(&request.sql, request.purpose.as_deref(), max_rows);
+    }
 
     // Queries get the row cap pushed into the plan (fetch cap + 1 so
     // truncation is detectable). Writes and other statements return small
@@ -139,9 +180,9 @@ pub async fn execute_query(
         Err(e) => {
             // Log the engine error server-side; do not echo it to the client.
             // DataFusion errors can quote row/column values and internal
-            // schema, so the response stays generic.
+            // schema, so the response stays generic. The SQL text is not
+            // logged here — it lives only in the opt-in `--query-log` file.
             tracing::error!("Ad-hoc query execution failed: {}", e);
-            tracing::debug!("Failed SQL query: {}", request.sql);
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state.metrics.record_error(

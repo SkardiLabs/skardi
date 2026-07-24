@@ -834,6 +834,7 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
+            query_log: None,
         };
 
         let config = ServerConfig {
@@ -918,6 +919,7 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
+            query_log: None,
         };
 
         let config = ServerConfig {
