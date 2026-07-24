@@ -728,6 +728,28 @@ mod tests {
     }
 
     #[test]
+    fn all_files_failing_to_parse_is_a_hard_error() {
+        // Wholesale-failure guard: a non-empty listing where *every* matched file
+        // fails to parse must be a hard error, not a silent empty result (which
+        // would masquerade as an empty corpus). Two `.pdf` files of non-PDF
+        // garbage make liteparse error on each, so total>0 && ok_files==0.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.pdf"), b"not a real pdf at all").unwrap();
+        std::fs::write(dir.path().join("b.pdf"), b"also garbage bytes").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.pdf".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+        let err = parse_source(dir.path().to_str().unwrap(), &opts).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to fetch/parse"),
+            "expected wholesale-failure hard error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn glob_match_basics() {
         assert!(glob_match("*.pdf", "a.pdf"));
         assert!(glob_match("*.pdf", "DIR.PDF"));

@@ -169,12 +169,7 @@ impl S3Storage {
             let bucket = parse_bucket(img, source_name)?;
             let (store, region) = build_bucket_store(&bucket, source_name)?;
             let base = s3_key_prefix(img);
-            let probe_key = if base.is_empty() {
-                ".skardi-write-probe".to_string()
-            } else {
-                format!("{}/.skardi-write-probe", base.trim_end_matches('/'))
-            };
-            let probe = ObjectPath::from(probe_key);
+            let probe = ObjectPath::from(write_probe_key(&base));
             store
                 .put(&probe, PutPayload::from_static(b"skardi-write-probe"))
                 .await
@@ -210,12 +205,47 @@ fn parse_bucket(s3_uri: &str, source_name: &str) -> Result<String> {
         })
 }
 
+/// Build the write-probe object key placed under an `image_store` prefix during
+/// the write preflight. An empty prefix probes the bucket root; otherwise the
+/// probe sits directly under the (single-slash-normalized) prefix.
+fn write_probe_key(base: &str) -> String {
+    if base.is_empty() {
+        ".skardi-write-probe".to_string()
+    } else {
+        format!("{}/.skardi-write-probe", base.trim_end_matches('/'))
+    }
+}
+
 /// The key/prefix portion of an `s3://bucket/key` URI (no leading `/`).
 fn s3_key_prefix(s3_uri: &str) -> String {
     url::Url::parse(s3_uri)
         .ok()
         .map(|u| u.path().trim_start_matches('/').to_string())
         .unwrap_or_default()
+}
+
+/// Validate that a region and some credential source are present, returning the
+/// resolved region. Pure over its inputs (the caller reads the env), so the
+/// missing-config branches are unit-testable without mutating process-global
+/// env vars.
+fn require_s3_region_and_creds(
+    region: Option<String>,
+    has_access_key: bool,
+    has_profile: bool,
+    source_name: &str,
+) -> Result<String> {
+    let region = region.ok_or_else(|| ConfigError::MissingAwsConfig {
+        name: source_name.to_string(),
+        field: "AWS_REGION or AWS_DEFAULT_REGION environment variable".to_string(),
+    })?;
+    if !has_access_key && !has_profile {
+        return Err(ConfigError::MissingAwsConfig {
+            name: source_name.to_string(),
+            field: "AWS_ACCESS_KEY_ID environment variable or AWS_PROFILE".to_string(),
+        }
+        .into());
+    }
+    Ok(region)
 }
 
 /// Build an S3 object store for `bucket` using env/IAM credentials and the
@@ -229,19 +259,11 @@ fn build_bucket_store(
     use object_store::aws::AmazonS3Builder;
 
     let region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .map_err(|_| ConfigError::MissingAwsConfig {
-            name: source_name.to_string(),
-            field: "AWS_REGION or AWS_DEFAULT_REGION environment variable".to_string(),
-        })?;
-
-    if std::env::var("AWS_ACCESS_KEY_ID").is_err() && std::env::var("AWS_PROFILE").is_err() {
-        return Err(ConfigError::MissingAwsConfig {
-            name: source_name.to_string(),
-            field: "AWS_ACCESS_KEY_ID environment variable or AWS_PROFILE".to_string(),
-        }
-        .into());
-    }
+        .ok()
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok());
+    let has_access_key = std::env::var("AWS_ACCESS_KEY_ID").is_ok();
+    let has_profile = std::env::var("AWS_PROFILE").is_ok();
+    let region = require_s3_region_and_creds(region, has_access_key, has_profile, source_name)?;
 
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
@@ -634,6 +656,63 @@ options:
 
     fn documents_source(yaml: &str) -> DataSource {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn s3_key_prefix_extracts_path_without_leading_slash() {
+        assert_eq!(s3_key_prefix("s3://bucket/in/corpus"), "in/corpus");
+        assert_eq!(s3_key_prefix("s3://bucket/in/corpus/"), "in/corpus/");
+        assert_eq!(s3_key_prefix("s3://bucket"), "");
+        assert_eq!(s3_key_prefix("s3://bucket/"), "");
+    }
+
+    #[test]
+    fn parse_bucket_extracts_bucket_or_errors() {
+        assert_eq!(
+            parse_bucket("s3://my-bucket/key", "src").unwrap(),
+            "my-bucket"
+        );
+        assert_eq!(parse_bucket("s3://my-bucket", "src").unwrap(), "my-bucket");
+        // No host → bucketless → error.
+        assert!(parse_bucket("s3:///key-only", "src").is_err());
+    }
+
+    #[test]
+    fn write_probe_key_scopes_under_prefix_or_bucket_root() {
+        // Empty prefix probes the bucket root.
+        assert_eq!(write_probe_key(""), ".skardi-write-probe");
+        // A prefix (with or without trailing slash) sits the probe directly
+        // under it, never doubling the separator.
+        assert_eq!(write_probe_key("crops"), "crops/.skardi-write-probe");
+        assert_eq!(
+            write_probe_key("out/crops/"),
+            "out/crops/.skardi-write-probe"
+        );
+    }
+
+    #[test]
+    fn require_s3_region_and_creds_branches() {
+        // Missing region → error names the region env vars.
+        let err = require_s3_region_and_creds(None, true, false, "src").unwrap_err();
+        assert!(err.to_string().contains("AWS_REGION"), "unexpected: {err}");
+
+        // Region present but neither access key nor profile → credential error.
+        let err =
+            require_s3_region_and_creds(Some("us-east-1".into()), false, false, "src").unwrap_err();
+        assert!(
+            err.to_string().contains("AWS_ACCESS_KEY_ID"),
+            "unexpected: {err}"
+        );
+
+        // Region + access key, or region + profile → ok, returns the region.
+        assert_eq!(
+            require_s3_region_and_creds(Some("us-east-1".into()), true, false, "src").unwrap(),
+            "us-east-1"
+        );
+        assert_eq!(
+            require_s3_region_and_creds(Some("eu-west-2".into()), false, true, "src").unwrap(),
+            "eu-west-2"
+        );
     }
 
     #[test]
