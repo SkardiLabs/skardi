@@ -2,14 +2,14 @@
 //! or one pipeline's health via `GET /health/<name>`, and pretty-print the
 //! response.
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, encode_component};
 use anyhow::Result;
 
 /// Run `skardi health [name]`: `GET /health` when `name` is `None`, or
 /// `GET /health/<name>` otherwise, and pretty-print the response.
 pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
     let path = match name {
-        Some(name) => format!("/health/{name}"),
+        Some(name) => format!("/health/{}", encode_component(name)),
         None => "/health".to_string(),
     };
 

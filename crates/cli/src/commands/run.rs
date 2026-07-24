@@ -1,7 +1,7 @@
 //! `skardi run <name>` — execute a named server pipeline via
 //! `POST /{name}/execute` and render the result.
 
-use crate::client::{ApiClient, ApiError};
+use crate::client::{ApiClient, ApiError, encode_component};
 use crate::output::print_result;
 use crate::params::build_body;
 use anyhow::{Result, anyhow};
@@ -22,7 +22,7 @@ pub async fn run(
     table: bool,
 ) -> Result<()> {
     let body = build_body(data, param_flags)?;
-    let path = format!("/{name}/execute");
+    let path = format!("/{}/execute", encode_component(name));
 
     match client.post(&path, &Value::Object(body)).await {
         Ok(response) => {
@@ -135,5 +135,25 @@ mod tests {
             message.contains("skardi pipeline list"),
             "error was: {message}"
         );
+    }
+
+    // -- 4. reserved characters in the name cannot change the route ------
+
+    #[tokio::test]
+    async fn name_with_reserved_characters_is_percent_encoded_in_path() {
+        let server = MockServer::start().await;
+        // wiremock matches on the raw (still-encoded) request path: a name
+        // like "a/b c" must arrive as one encoded segment, not as the
+        // two-segment path `/a/b c/execute`.
+        Mock::given(method("POST"))
+            .and(path("/a%2Fb%20c/execute"))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_envelope()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        run(&client, "a/b c", None, &[], false).await.unwrap();
     }
 }

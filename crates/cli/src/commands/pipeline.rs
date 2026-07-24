@@ -2,7 +2,7 @@
 //! definition via `GET /pipelines` / `GET /pipeline/<name>`, and pretty-print
 //! the server's JSON response.
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, encode_component};
 use anyhow::Result;
 use clap::Subcommand;
 
@@ -24,7 +24,7 @@ pub enum PipelineCmd {
 pub async fn run(client: &ApiClient, cmd: PipelineCmd) -> Result<()> {
     let path = match &cmd {
         PipelineCmd::List => "/pipelines".to_string(),
-        PipelineCmd::Show { name } => format!("/pipeline/{name}"),
+        PipelineCmd::Show { name } => format!("/pipeline/{}", encode_component(name)),
     };
 
     let response = client.get(&path).await?;

@@ -9409,6 +9409,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs 5.0.1",
+ "percent-encoding",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

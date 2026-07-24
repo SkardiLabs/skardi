@@ -5,7 +5,7 @@
 //! the shared [`ApiClient`] and pretty-prints (or otherwise renders) the JSON
 //! response.
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, encode_component};
 use crate::params::build_body;
 use anyhow::Result;
 use clap::Subcommand;
@@ -62,7 +62,7 @@ pub async fn run(client: &ApiClient, cmd: JobCmd) -> Result<()> {
     match cmd {
         JobCmd::Run { job, params } => {
             let body = build_body(None, &params)?;
-            let path = format!("/jobs/{job}/run");
+            let path = format!("/jobs/{}/run", encode_component(&job));
             let response = client.post(&path, &Value::Object(body)).await?;
             let resp: RunIdResponse = serde_json::from_value(response)?;
             println!(
@@ -72,20 +72,20 @@ pub async fn run(client: &ApiClient, cmd: JobCmd) -> Result<()> {
             );
         }
         JobCmd::Status { run_id } => {
-            let path = format!("/jobs/runs/{run_id}");
+            let path = format!("/jobs/runs/{}", encode_component(&run_id));
             let response = client.get(&path).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         JobCmd::List { job, limit } => {
             let mut path = format!("/jobs/runs?limit={limit}");
             if let Some(job) = job {
-                path.push_str(&format!("&job={}", urlencode(&job)));
+                path.push_str(&format!("&job={}", encode_component(&job)));
             }
             let response = client.get(&path).await?;
             print_run_list(&response);
         }
         JobCmd::Cancel { run_id } => {
-            let path = format!("/jobs/runs/{run_id}/cancel");
+            let path = format!("/jobs/runs/{}/cancel", encode_component(&run_id));
             let response = client.post(&path, &Value::Object(Map::new())).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
@@ -96,14 +96,6 @@ pub async fn run(client: &ApiClient, cmd: JobCmd) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Minimal url-encoding: only escape the characters most likely to appear in
-/// a job name (`/`, `&`, `?`). Good enough for a CLI.
-fn urlencode(s: &str) -> String {
-    s.replace('&', "%26")
-        .replace('?', "%3F")
-        .replace('/', "%2F")
 }
 
 /// Render `GET /jobs/runs`'s `{"runs": [...]}` response as a columnar list;
