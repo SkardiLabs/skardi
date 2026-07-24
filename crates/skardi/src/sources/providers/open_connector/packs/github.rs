@@ -1155,6 +1155,119 @@ bindings:
     }
 
     #[tokio::test]
+    async fn pull_requests_state_pin_and_override_run_end_to_end() {
+        // pull_requests is the second (and only other) table declaring the
+        // state=all pin plus an Exact state filter; its pin/override path
+        // must run through the real scan engine, not ride on the issues
+        // coverage alone.
+        let rows: Vec<Value> = (1..=4)
+            .map(|number| {
+                json!({
+                    "id": number * 10,
+                    "number": number,
+                    "title": format!("pr-{number}"),
+                    "state": if number % 2 == 1 { "open" } else { "closed" }
+                })
+            })
+            .collect();
+        let served = std::sync::Arc::new(rows);
+        let gateway = {
+            let served = std::sync::Arc::clone(&served);
+            MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path == "/v1/actions/github.list_pull_requests" {
+                    return MockResponse::ok(
+                        r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                            "locally_executable": true, "connection_aliases": []}"#,
+                    );
+                }
+                if req.method == "POST"
+                    && req.path == "/v1/actions/github.list_pull_requests/execute"
+                {
+                    let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    let input = body.get("input").cloned().unwrap_or_default();
+                    let state = input
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("open")
+                        .to_string();
+                    let slice: Vec<_> = served
+                        .iter()
+                        .filter(|row| {
+                            state == "all"
+                                || row.get("state").and_then(Value::as_str) == Some(&state)
+                        })
+                        .cloned()
+                        .collect();
+                    return MockResponse::ok(
+                        &json!({"output": {"pull_requests": slice}}).to_string(),
+                    );
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await
+        };
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_PR_STATE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [pull_requests]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        // Without a predicate, the state=all pin reads the complete
+        // collection (GitHub's endpoint defaults to open PRs only).
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.pull_requests").await;
+        assert_eq!(rows_of(&batches), 4, "the pin exposes closed PRs too");
+        assert!(
+            execute_bodies(&gateway)
+                .iter()
+                .all(|body| body.contains(r#""state":"all""#)),
+            "the fixed input rides every request"
+        );
+
+        // An Exact state predicate replaces the pin in the action input.
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.pull_requests WHERE state = 'open'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 2, "PRs 1 and 3 are open");
+        let bodies = execute_bodies(&gateway);
+        let last = bodies.last().expect("an execute call");
+        assert!(
+            last.contains(r#""state":"open""#) && !last.contains(r#""state":"all""#),
+            "the pushed Exact predicate replaces the state=all pin: {last}"
+        );
+    }
+
+    #[tokio::test]
     async fn since_pushdown_is_inexact_and_reapplied_locally() {
         // The gateway ignores `since` entirely — the harshest legal Inexact
         // provider (a full superset). DataFusion must trim it back to the
