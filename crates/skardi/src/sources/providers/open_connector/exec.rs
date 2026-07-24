@@ -308,6 +308,13 @@ impl ScanState {
                 .map(|f| f.name().clone())
                 .collect(),
         };
+        // Key parts follow the design's cache-key list, with two deliberate
+        // wrinkles: `limit` IS in the key (that membership is what makes
+        // caching a LIMIT-satisfied scan safe — see the store sites below),
+        // and `fixed_inputs` is absent because pack-pinned inputs are
+        // functionally determined by (action_id, source_pack_version), both
+        // already keyed. If fixed inputs ever become binding-configurable or
+        // vary within a pack version, they must join the key.
         let cache_key = scan_cache_key(&ScanKeyParts {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),

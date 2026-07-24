@@ -777,6 +777,67 @@ bindings:
     }
 
     #[tokio::test]
+    async fn full_scan_after_limited_scan_never_replays_the_truncated_entry() {
+        // LIMIT's membership in the cache key is the load-bearing invariant
+        // that makes caching LIMIT-satisfied scans safe (design doc, caching
+        // section). If limit ever falls out of the key, the full scan below
+        // replays 2 truncated rows instead of fetching 5 — and this fails.
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_LIMIT_FULL, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_LIMIT_FULL, 60)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_LIMIT_FULL);
+        }
+
+        // Warm the cache with a LIMIT-satisfied (truncated) scan.
+        let df = ctx
+            .sql("SELECT id FROM saas.ws.items LIMIT 2")
+            .await
+            .expect("plan");
+        let rows: usize = df
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2);
+        let live_pages = execute_requests(&gateway).len();
+
+        // The fuller query computes a different key: live fetch, all rows.
+        let df = ctx.sql("SELECT id FROM saas.ws.items").await.expect("plan");
+        let rows: usize = df
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(
+            rows, 5,
+            "the truncated entry must never serve a fuller query"
+        );
+        assert!(
+            execute_requests(&gateway).len() > live_pages,
+            "the full scan fetched live"
+        );
+    }
+
+    #[tokio::test]
     async fn cached_empty_scan_replays_without_new_requests() {
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 0)).await;
 
@@ -880,6 +941,9 @@ bindings:
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_EMPTY_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_EMPTY_CACHE";
+
+    #[cfg(test)]
+    const TOKEN_ENV_CATALOG_LIMIT_FULL: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_LIMIT_FULL";
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_TIMEOUT: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_TIMEOUT";
