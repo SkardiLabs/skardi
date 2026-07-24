@@ -86,6 +86,11 @@ The design choices, grouped by concern:
 - Keep every rendered artifact except the `rss:` block subscription-agnostic; subscription edits are configuration-only and re-render nothing.
 - Render idempotently: `IF NOT EXISTS` DDL, diff-before-write, never blind-overwrite a user-edited file.
 
+**Security and trust boundary**
+
+- Treat agent-authored feed URLs as untrusted egress: the fetcher default-denies private, loopback, link-local, CGNAT, and unique-local targets (SSRF guard), keeping the policy local to the RSS fetcher's choke point rather than reusing the scheme-based `llm_extract` image guard, which does not filter by address.
+- Store item content wire-faithful and place the HTML-sanitization obligation on the consumer; Skardi never executes or sanitizes stored feed HTML.
+
 ## Alternatives Considered
 
 ### Per-feed tables
@@ -173,6 +178,8 @@ Eight components in four layers: configuration (boot-time, zero network), the en
 #### Fetcher
 
 The fetcher owns bounded HTTP: per-request timeout, total scan deadline, response-size cap, bounded jittered retries honoring `Retry-After`, cancellation, and conditional GET with stored ETag / Last-Modified validators. Concurrency is capped by `max_concurrent`, which doubles as the per-host politeness bound. A self-identifying `User-Agent` is sent by default — feed servers routinely ban anonymous clients.
+
+Feed URLs are agent-authored configuration, i.e. attacker-influenceable input, so the fetcher also enforces a default-deny egress policy at this single choke point (SSRF guard): it resolves each host and refuses any target resolving to a loopback, link-local, private (RFC 1918), CGNAT (`100.64/10`), or unique-local (`fc00::/7`) address, re-checks the policy on every redirect hop, and connects to the already-validated IP so a rebinding DNS answer cannot substitute an internal address after the check. Only globally-routable public addresses are fetched; a blocked URL degrades that feed exactly like an unreachable one (see Failure Modes). This is new logic kept local to the RSS provider — no existing helper filters by resolved IP — and ships with no opt-in to reach private targets (see Security and Future Extensions).
 
 #### Cache
 
@@ -423,13 +430,14 @@ Caching claims no cross-feed consistency: a multi-feed scan can observe differen
 4. **Documented tolerance floor.** Feeds that still fail are visible via `feeds.last_status = 'error'` with `last_error` naming the parse stage; `docs/rss.md` states plainly what Skardi does not salvage.
 5. **Evidence loop.** Live-feed failures extend the sanitation pass and the corpus; the parser choice is revisited only if the gap versus `feedparser` proves structural rather than case-by-case.
 
-Content is stored wire-faithful (HTML); transformation to Markdown is a query-time choice inside `chunk('html', …)`.
+Content is stored wire-faithful (HTML); transformation to Markdown is a query-time choice inside `chunk('html', …)`. Because that stored HTML is attacker-influenceable and Skardi neither executes nor sanitizes it, the sanitization obligation sits with the consumer: any surface that renders `content` (or the archived `news_items.content`) as HTML must escape or sanitize it first. `docs/rss.md` states this contract.
 
 ## Failure Modes
 
 | Scenario | Behavior |
 |---|---|
 | Feed down / DNS failure | Partition serves stale cached window — rows stamped `window_status = 'stale-error'` — or zero rows if never fetched (no rows to stamp; `feeds` is the only signal); other partitions unaffected; `feeds` row records error; tracing warns |
+| URL blocked by egress policy | Host resolves to a reserved range (loopback/link-local/private/CGNAT/ULA), or a redirect targets one; fetch refused before connect; `feeds.last_status = 'error'`, `last_error` names the egress block; zero rows in `items`; other feeds unaffected |
 | Malformed XML | Strict parse → sanitation → retry; success traced with repairs recorded; failure sets `last_status = 'error'`, `last_error` names the parse stage |
 | Dialect misdeclaration | Parses normally; mismatch recorded in `dialect_declared` vs `dialect` and `conformance_notes` |
 | Feed omits `guid` | `link` used as guid; dedup collapses to link identity |
@@ -443,6 +451,14 @@ Content is stored wire-faithful (HTML); transformation to Markdown is a query-ti
 ## Observability
 
 Each scan records structured tracing fields and metrics for: source and feed names, cache hit/revalidation/miss per feed, HTTP status, bytes received, retries and rate-limit waits, sanitation repairs applied, conformance deviations, rows emitted, scan duration, and terminal error category. Feed URLs are safe to log; response bodies are not logged.
+
+## Security
+
+Feed URLs are agent-authored configuration — the `auto_news_base` skill manages subscriptions from what an agent reads — so a subscription URL is attacker-influenceable input: a prompt-injected agent could add an internal or cloud-metadata address as a "feed." Two trust-boundary properties follow, both kept local to the RSS provider.
+
+**Egress (SSRF).** Server-side fetches are default-deny by destination; the fetcher refuses any host that resolves into a reserved range (loopback, link-local incl. `169.254.169.254`, private, CGNAT, unique-local), re-validates on redirects, and connects to the validated IP against DNS rebinding — mechanism in Fetcher, behavior in Failure Modes. This is new logic, not a reuse: no existing helper filters by resolved IP (the `llm_extract` image fetch gates by scheme and an opt-in flag, not by address). No opt-in to reach private targets ships initially (see Future Extensions).
+
+**Stored content.** Item `content` is wire-faithful, attacker-influenceable HTML that Skardi neither executes nor sanitizes; the sanitization obligation sits with any consumer that renders it (see Parsing, Sanitation, and Conformance).
 
 ## Rollout Plan
 
@@ -460,9 +476,9 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 
 ## Testing Strategy
 
-- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, TTL re-arm on success and on failure (negative caching, failure fuse bounds), `window_status` stamping across freshness tiers (fresh / revalidated / stale-error), sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown).
+- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, TTL re-arm on success and on failure (negative caching, failure fuse bounds), `window_status` stamping across freshness tiers (fresh / revalidated / stale-error), sanitation determinism, feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown), egress policy decision (each reserved range refused via an injectable resolver, a public address allowed, a redirect target re-checked).
 - **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields).
-- **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation (surviving feeds' rows unaffected, stale rows stamped `stale-error`), response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration, zero-request `feeds` scans (health observation issues no HTTP, including right after a failure).
+- **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation (surviving feeds' rows unaffected, stale rows stamped `stale-error`), response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration, zero-request `feeds` scans (health observation issues no HTTP, including right after a failure); a redirect whose `Location` resolves to a private address refused before connect.
 - **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('html')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency and its closing health report (a degraded feed listed with reason, a healthy run reporting empty); citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
@@ -482,6 +498,7 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 12. Adding or removing a subscription changes only the `rss:` block/OPML; every other rendered artifact is byte-identical.
 13. A `feeds` scan issues zero network requests (mock-observed) at any moment — including immediately after a failed fetch, whose error state is recorded with its TTL re-armed rather than re-attempted.
 14. `skardi sync`'s response is the health report: with one degraded feed among N it lists that feed with `last_status` and `last_error`; with every feed healthy it is empty; a degraded feed never changes the run's exit status.
+15. A subscription whose URL resolves to a reserved range (loopback/link-local/private/CGNAT/ULA), or that redirects to one, is refused before connecting; `feeds.last_status = 'error'` with `last_error` naming the egress block, `items` yields zero rows for it, and other feeds are unaffected.
 
 ## Expected Repository Shape
 
@@ -489,7 +506,7 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 crates/skardi/src/sources/providers/rss/
 ├── mod.rs        # register_rss_tables(), feature-gated
 ├── config.rs     # typed RssConfig: feeds/opml, ttl, bounds, user_agent
-├── fetch.rs      # HTTP client, conditional GET, retries, bounds
+├── fetch.rs      # HTTP client, conditional GET, retries, bounds, egress policy (default-deny reserved IPs)
 ├── cache.rs      # per-feed TTL cache behind a swap-friendly trait
 ├── parse.rs      # sanitation pre-pass + conformance check + feed-rs → Arrow
 ├── table.rs      # feeds/items TableProviders (fixed SchemaRef)
@@ -504,7 +521,7 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead feeds).
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and the consumer HTML-sanitization contract, pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead feeds).
 - `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
 - A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern, so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
@@ -513,6 +530,7 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Future Extensions
 
 - An ad-hoc `rss_scan(url)` preview UDTF over the same fetch/sanitize/parse path, if a registration-free surface proves necessary; cut from initial scope at review.
+- An egress allowlist (explicit CIDR/host entries) permitting intentionally-internal feeds past the default-deny SSRF guard; deferred — default-deny fits the public-news use case, and until then there is no way to reach private targets. Revisit when subscribing to an internal feed is required.
 - WebSub (push) as a cache-invalidation signal; requires a resident server; the live-window contract is unchanged.
 - Persistent / shared cache behind the existing cache trait; enables serve-stale across restarts.
 - Scheduled snapshot materialization when a scheduler primitive exists.
