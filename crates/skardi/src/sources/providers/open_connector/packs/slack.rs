@@ -663,6 +663,23 @@ bindings:
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
+    /// The `id` column of collected batches, in emission order.
+    fn ids_of(batches: &[RecordBatch]) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 ids")
+                    .clone();
+                (0..ids.len()).map(move |i| ids.value(i).to_string())
+            })
+            .collect()
+    }
+
     fn execute_bodies(gateway: &MockGateway) -> Vec<String> {
         gateway
             .requests()
@@ -844,9 +861,9 @@ bindings:
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.files WHERE user_id = 'U0001'").await;
         assert_eq!(
-            rows_of(&batches),
-            1,
-            "the ignoring provider's extra row is trimmed"
+            ids_of(&batches),
+            vec!["F0001"],
+            "exactly U0001's file survives; the ignoring provider's extra row is trimmed"
         );
 
         let bodies = execute_bodies(&gateway);
@@ -899,9 +916,9 @@ bindings:
         )
         .await;
         assert_eq!(
-            rows_of(&batches),
-            2,
-            "boundary row F0002 stays; the ignored push is re-filtered"
+            ids_of(&batches),
+            vec!["F0002", "F0003"],
+            "boundary row F0002 stays, F0001 is re-filtered out"
         );
 
         let bodies = execute_bodies(&gateway);
