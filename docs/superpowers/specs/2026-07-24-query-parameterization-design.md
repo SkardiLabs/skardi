@@ -51,6 +51,53 @@ Two improvements address this:
    query), logged as structured context so intent accumulates on the existing
    audit path.
 
+## Why parameterize (and not just redact the log)
+
+Redacting the INFO line would hide values from logs but leave every other reason
+to separate values from SQL unsolved. A separate `params` channel is worth the
+work because it fixes all of the following at once:
+
+- **SQL injection.** Today an agent must string-build final SQL. Any value
+  containing a quote or clause (`x' OR '1'='1`, `'; DROP TABLE ...`) becomes
+  executable syntax. Callers are LLM agents assembling SQL from tool output and
+  user text — the highest-risk possible source of injection. Routing values
+  through `params` means each value is rendered exactly once, quote-escaped by
+  `scalar_to_sql`, and can only ever be data, never syntax. The injection class
+  is closed by construction rather than by every caller remembering to escape.
+- **PII / secret protection.** With values inside the SQL string, the audit
+  trail is a values log — emails, tokens, and IDs land at INFO and fan out to
+  every OTLP collector and log sink. Storing only the template keeps sensitive
+  literals out of observability entirely, while still preserving a useful,
+  greppable record of *what shape* of query ran.
+- **Type accuracy.** Inline SQL forces callers to hand-format every value:
+  quoting strings, formatting numbers/booleans, `NULL` vs `'NULL'`, arrays into
+  vector/tuple literals. Each is a chance to emit a wrong-typed or malformed
+  literal that the database then mis-coerces or rejects. A typed JSON `params`
+  value maps deterministically to the correct SQL literal through one shared,
+  tested renderer — the same one pipelines already rely on.
+- **No ad-hoc (de)serialization / escaping.** Every caller building final SQL
+  re-implements the same escaping and array-flattening logic, inconsistently.
+  Centralizing it in `substitute_sql_params` removes that duplicated, error-prone
+  code from the caller side and gives one place to fix bugs and add shapes.
+- **Cleaner audit & analytics.** Templates are stable keys: the same logical
+  query always produces the same template regardless of its arguments, so we can
+  group, count, and reason about query patterns over time — which is exactly what
+  the `purpose` field is meant to enrich.
+
+## Scope of this version: store the template only
+
+This version **stores only the query template** — the string with `{name}`
+placeholders exactly as the caller sent it. The `params` values are used solely
+to build the SQL handed to the engine and are **never** written to any log,
+trace span, metric, or store. Concretely:
+
+- The INFO audit line logs `request.sql` (the template) and `purpose` only.
+- The DEBUG diagnostic lines log the template, never the substituted SQL.
+- No `params` value appears in any observability output on any code path.
+
+Persisting parameter values (encrypted, redacted, or otherwise) is explicitly a
+future decision, not part of this work.
+
 ## API Contract
 
 ### Request
