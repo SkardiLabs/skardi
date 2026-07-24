@@ -146,7 +146,7 @@ event carrying the scan identity and error.
       visibility incl. the PR caveat, rate limits, freshness), README row updated.
       Verification: 22 pack tests (8 fixture contract suites incl. empty pages, bind-time
       validation of all 8 contracts, and end-to-end via mock gateway: 150-row two-page
-      scan with the `state=all` pin on every request, Exact `state` override, Inexact
+      scan with the `state=all` pin on every request, pushed `state` override (Inexact — faithful only inside the provider's enum domain), Inexact
       `since` narrowing + local re-filter keeping the boundary row, `pull_request IS
       NULL`, LIMIT stopping after one page, `open_connector_query` parity) plus new
       filters/json_to_arrow engine tests. Runnable local demo (`docs/open-connector/`,

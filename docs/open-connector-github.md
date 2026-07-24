@@ -64,9 +64,9 @@ end-of-collection signal), so every scan is complete and bounded by
 | Table | Action | Resources | Filter pushdown |
 |---|---|---|---|
 | `repositories` | `github.list_repositories` | — (connected account) | none |
-| `issues` | `github.list_repository_issues` | `owner`, `repo` | `state =` (exact); `updated_at >=` → `since` (inexact, re-applied locally) |
+| `issues` | `github.list_repository_issues` | `owner`, `repo` | `state =` (inexact, re-applied locally); `updated_at >=` → `since` (inexact, re-applied locally) |
 | `issue_comments` | `github.list_issue_comments` | `owner`, `repo`, `issue_number` | none |
-| `pull_requests` | `github.list_pull_requests` | `owner`, `repo` | `state =` (exact) |
+| `pull_requests` | `github.list_pull_requests` | `owner`, `repo` | `state =` (inexact, re-applied locally) |
 | `reviews` | `github.list_pull_request_reviews` | `owner`, `repo`, `pull_number` | none |
 | `commits` | `github.list_commits` | `owner`, `repo` | none (see below) |
 | `workflow_runs` | `github.list_workflow_runs` | `owner`, `repo` | none |

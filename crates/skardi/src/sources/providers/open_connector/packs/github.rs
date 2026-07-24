@@ -7,9 +7,13 @@
 //! - **Page-number pagination everywhere** (`page`/`per_page`, 100 per page
 //!   — GitHub's maximum). A short or empty page terminates the scan, which
 //!   is GitHub's documented end-of-collection signal.
-//! - **Filters are allowlisted only where faithful.** `issues.state` and
-//!   `pull_requests.state` translate exactly. `issues.updated_at >=` maps
-//!   to `since` as [`Fidelity::Inexact`]: GitHub documents issue `since` as
+//! - **Filters are allowlisted only where faithful — and every string-enum
+//!   push is Inexact.** `issues.state` / `pull_requests.state` narrow the
+//!   fetch but DataFusion re-applies them: the translation is faithful only
+//!   inside GitHub's enum domain (open/closed/all), and an Exact claim
+//!   would lean on the provider rejecting out-of-domain literals rather
+//!   than silently returning its default listing. `issues.updated_at >=`
+//!   maps to `since` as [`Fidelity::Inexact`]: GitHub documents issue `since` as
 //!   "updated at *or after*" (a superset of the predicate under any
 //!   timestamp-granularity fuzz), so DataFusion reapplies the predicate
 //!   locally. The commits endpoint's `since` is documented as commits
@@ -250,12 +254,18 @@ static ISSUES: SourcePackTable = SourcePackTable {
     // overrides the pin).
     fixed_inputs: &[("state", FixedValue::Str("all"))],
     filters: &[
-        // `state` takes exactly the SQL literal (open/closed/all).
+        // `state` takes the SQL literal verbatim, but is Inexact on
+        // purpose: the push is faithful only inside GitHub's enum domain
+        // (open/closed/all), and an Exact claim would lean on the provider
+        // 422-ing out-of-domain values — a provider that silently ignored
+        // `state = 'merged'` and returned its default listing would hand
+        // back open rows as the "exact" answer to an empty query. The
+        // `state` column is in every row, so the local re-check is free.
         FilterMapping {
             column: "state",
             operator: Operator::Eq,
             input_field: "state",
-            fidelity: Fidelity::Exact,
+            fidelity: Fidelity::Inexact,
         },
         // GitHub documents issue `since` as "updated at or after this
         // time" — a superset of `updated_at >= X` under any granularity
@@ -416,11 +426,13 @@ static PULL_REQUESTS: SourcePackTable = SourcePackTable {
     required_resources: &["owner", "repo"],
     // Same open-by-default listing as issues; pin the complete collection.
     fixed_inputs: &[("state", FixedValue::Str("all"))],
+    // Inexact for the same reason as issues.state: faithful only inside
+    // the provider's enum domain, and the local re-check is free.
     filters: &[FilterMapping {
         column: "state",
         operator: Operator::Eq,
         input_field: "state",
-        fidelity: Fidelity::Exact,
+        fidelity: Fidelity::Inexact,
     }],
     expected_fingerprint: None,
 };
@@ -1150,14 +1162,14 @@ bindings:
             execute_bodies(&gateway).iter().all(
                 |body| body.contains(r#""state":"open""#) && !body.contains(r#""state":"all""#)
             ),
-            "the pushed Exact predicate replaces the state=all pin"
+            "the pushed state predicate replaces the state=all pin"
         );
     }
 
     #[tokio::test]
     async fn pull_requests_state_pin_and_override_run_end_to_end() {
         // pull_requests is the second (and only other) table declaring the
-        // state=all pin plus an Exact state filter; its pin/override path
+        // state=all pin plus a pushed state filter; its pin/override path
         // must run through the real scan engine, not ride on the issues
         // coverage alone.
         let rows: Vec<Value> = (1..=4)
@@ -1252,7 +1264,7 @@ bindings:
             "the fixed input rides every request"
         );
 
-        // An Exact state predicate replaces the pin in the action input.
+        // A pushed state predicate replaces the pin in the action input.
         let batches = collect(
             &ctx,
             "SELECT id FROM saas.gh.pull_requests WHERE state = 'open'",
@@ -1263,7 +1275,7 @@ bindings:
         let last = bodies.last().expect("an execute call");
         assert!(
             last.contains(r#""state":"open""#) && !last.contains(r#""state":"all""#),
-            "the pushed Exact predicate replaces the state=all pin: {last}"
+            "the pushed state predicate replaces the state=all pin: {last}"
         );
     }
 
@@ -1611,6 +1623,48 @@ bindings:
         );
         assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
         assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn out_of_domain_state_yields_empty_not_the_provider_default() {
+        // The motivating case for classifying `state` as Inexact: a provider
+        // that silently ignores an out-of-domain enum ('merged') and returns
+        // its default listing. Under Exact those rows would leak back as the
+        // "exact" answer; Inexact re-applies the predicate locally, so the
+        // query is correctly empty. setup_table's stub is exactly such a
+        // provider — it serves its rows regardless of the state input.
+        let rows = vec![
+            json!({"id": 1, "number": 1, "title": "a", "state": "open"}),
+            json!({"id": 2, "number": 2, "title": "b", "state": "open"}),
+        ];
+        let (gateway, ctx) = setup_table(
+            "pull_requests",
+            "github.list_pull_requests",
+            "pull_requests",
+            rows,
+            "SKARDI_TEST_OC_GITHUB_PR_OOD_STATE",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.pull_requests WHERE state = 'merged'",
+        )
+        .await;
+        assert_eq!(
+            rows_of(&batches),
+            0,
+            "the provider's default listing must not leak into an empty query"
+        );
+        // The predicate still narrows the fetch on providers that honor it.
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""state":"merged""#)),
+            "the push still happens: {bodies:?}"
+        );
     }
 
     #[tokio::test]
