@@ -174,7 +174,7 @@ event carrying the scan identity and error.
       the millis reader would silently produce 1970 dates). No fingerprint pins yet, same
       live-validation follow-up as GitHub.
 
-      **Verification**: 212 open_connector tests (32 new): per-table fixture contract tests
+      **Verification**: 219 open_connector tests (20 new, review-round fixes included; counted by `cargo test -p skardi --lib sources::providers::open_connector` against the 5.1 branch point): per-table fixture contract tests
       (nested `topic.value`/`profile.*`, scope-gated `email`, deleted users, empty channel
       lists, Slack's empty-string convention, epoch-seconds columns, empty pages); e2e via
       mock gateway — multi-page cursor scan (no cursor on page 1, token afterwards, `limit`
