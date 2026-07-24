@@ -687,14 +687,24 @@ bindings:
 
         let bodies = execute_bodies(&gateway);
         assert_eq!(bodies.len(), 3, "three cursor pages");
-        assert!(!bodies[0].contains("cursor"), "page 1 sends no cursor");
-        assert!(bodies[1].contains(r#""cursor":"cur-2""#), "{}", bodies[1]);
-        assert!(bodies[2].contains(r#""cursor":"cur-4""#), "{}", bodies[2]);
-        for body in &bodies {
-            assert!(body.contains(r#""limit":200"#), "page-size hint: {body}");
-            assert!(
-                body.contains(r#""types":"public_channel,private_channel""#),
-                "the types pin rides every request: {body}"
+        let inputs: Vec<Value> = bodies
+            .iter()
+            .map(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"].clone()
+            })
+            .collect();
+        assert!(
+            inputs[0].get("cursor").is_none(),
+            "page 1 sends no cursor: {}",
+            inputs[0]
+        );
+        assert_eq!(inputs[1]["cursor"], "cur-2");
+        assert_eq!(inputs[2]["cursor"], "cur-4");
+        for input in &inputs {
+            assert_eq!(input["limit"], 200, "page-size hint: {input}");
+            assert_eq!(
+                input["types"], "public_channel,private_channel",
+                "the types pin rides every request: {input}"
             );
         }
     }

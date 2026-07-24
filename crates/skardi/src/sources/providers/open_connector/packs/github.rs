@@ -1427,7 +1427,11 @@ bindings:
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
         assert!(
-            bodies.iter().all(|body| !body.contains("since")),
+            bodies.iter().all(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"]
+                    .get("since")
+                    .is_none()
+            }),
             "committed_at must never reach the strictly-after `since`: {bodies:?}"
         );
     }
@@ -1461,7 +1465,11 @@ bindings:
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
         assert!(
-            bodies.iter().all(|body| !body.contains("status")),
+            bodies.iter().all(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"]
+                    .get("status")
+                    .is_none()
+            }),
             "the status predicate must never reach the provider: {bodies:?}"
         );
     }
