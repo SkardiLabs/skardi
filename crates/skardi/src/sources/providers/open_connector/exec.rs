@@ -529,10 +529,18 @@ impl ScanState {
             self.store_cache();
         }
 
-        let more = self.pagination.advance(&envelope, rows.len())?;
-        if !more {
-            self.done = true;
-            self.store_cache();
+        // Pagination advances only while the scan is still going. After a
+        // LIMIT-satisfied page there is no next request to prepare — and
+        // advance() also parses and validates continuation state, so a
+        // repeated cursor or a missing/malformed page total on that final
+        // page would fail a scan whose result is already complete for its
+        // key.
+        if !self.done {
+            let more = self.pagination.advance(&envelope, rows.len())?;
+            if !more {
+                self.done = true;
+                self.store_cache();
+            }
         }
 
         // A terminal empty page is completion, not output.

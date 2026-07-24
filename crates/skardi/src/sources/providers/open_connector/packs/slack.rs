@@ -754,6 +754,31 @@ bindings:
     }
 
     #[tokio::test]
+    async fn limit_satisfied_on_a_repeated_cursor_page_still_succeeds() {
+        // The stuck stub repeats its cursor on every page — page 2's advance
+        // would trip loop detection. But LIMIT 4 is satisfied ON page 2, and
+        // a complete-for-its-key result must not be failed by continuation
+        // state the scan will never use: pagination does not advance once
+        // the scan is done.
+        let rows: Vec<Value> = (1..=6).map(channel).collect();
+        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::Stuck)).await;
+        let ctx = setup(
+            &gateway,
+            "conversations",
+            "SKARDI_TEST_OC_SLACK_LIMIT_STUCK",
+        )
+        .await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.ws.conversations LIMIT 4").await;
+        assert_eq!(rows_of(&batches), 4, "the satisfied LIMIT wins");
+        assert_eq!(
+            execute_bodies(&gateway).len(),
+            2,
+            "two pages of two rows; no third request"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_workspace_yields_an_empty_scan() {
         let gateway =
             MockGateway::start(conversations_gateway(Vec::new(), Terminal::EmptyCursor)).await;
