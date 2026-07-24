@@ -5,7 +5,10 @@
 - **Date:** 2026-07-23
 - **Scope:** S3 read path for the source `path`, and S3 write path for `image_store`.
   All four combinations of `{local, s3://}` source × `{local, s3://}` image store
-  are supported. Predicate/prefix pushdown (issue question 2) is **out of scope**.
+  are supported, with one constraint: when **both** `path` and `image_store` are
+  `s3://` they must reference the **same bucket** (see §4 — a single registered
+  store, region, and credential set can only serve one bucket). Predicate/prefix
+  pushdown (issue question 2) is **out of scope**.
 
 ## 1. Motivation
 
@@ -89,25 +92,40 @@ spec:
         # Credentials/region come from env / IAM role.
 ```
 
-The `path` and `image_store` values are **independent** — either may be local or
-`s3://`, and they may live in **different buckets**. All 2×2 combinations are
-valid.
+The `path` and `image_store` values are **independent in scheme** — either may be
+local or `s3://`, so all four scheme combinations are valid. **Constraint:** when
+both are `s3://`, they must resolve to the **same bucket**. A single S3 object
+store is built per bucket from one region (`AWS_REGION`/`AWS_DEFAULT_REGION`) and
+one credential set (`remote_storage.rs:135`); it cannot serve a second bucket in a
+different region or account (S3 answers with a 301 `PermanentRedirect` /
+`AccessDenied`). Mismatched buckets are **rejected at registration** with a clear
+message. Cross-bucket read/write (per-bucket region + credential resolution) is a
+tracked follow-up.
 
 ### Registration flow (`config.rs`, `DataSourceType::Documents` arm)
 
 Before registering the `DocumentsTable`:
 
 1. Collect the S3 buckets referenced by `path` and (if set) `options.image_store`.
-2. For each source whose `path` is `s3://`, call
-   `S3Storage::validate_configuration(source)` so the credential-rejection rule
-   applies to `documents` exactly as it does to CSV/Parquet.
-3. For each **distinct** bucket, build and register an object store via a new
+2. **Same-bucket check.** If both `path` and `image_store` are `s3://` and their
+   buckets differ, fail registration (see §4 constraint). This bounds the design
+   to a single registered store / region / credential set.
+3. **Credential rejection.** Run the `aws_*`-key rejection whenever *either*
+   `path` **or** `image_store` is `s3://`. `S3Storage::validate_configuration`
+   today only fires when `source.path` is `s3://` (`remote_storage.rs:58`), so a
+   local-`path` + `s3://`-image_store source would otherwise skip the check and
+   silently accept credentials in `options`. Either generalize
+   `validate_configuration` to take the S3 URI(s) to inspect, or add an explicit
+   options scan for the image-store-only case.
+4. Build and register the object store for the (single) bucket via a new
    `S3Storage::setup_object_store_for_bucket` (a refactor of the existing
    `setup_object_store` that separates "build + register a bucket store" from
    "connectivity-test a single object" — see below). Registration is idempotent
    per bucket for the session.
-4. Run a **prefix-aware connectivity check** (see §7) instead of the object
-   `head` test.
+5. Run a **prefix-aware connectivity check** (see §7) instead of the object
+   `head` test. When `image_store` is `s3://`, also run a **write preflight**
+   (put + delete a probe key) so a missing `s3:PutObject` fails loudly at
+   registration rather than silently dropping crops mid-scan (§7).
 
 `register_documents_tables` gains no new required parameter; the table pulls its
 store handles from `runtime_env` at scan time via `TaskContext`.
@@ -134,6 +152,13 @@ enum BlobStore {
 impl BlobStore {
     /// List every object/file under `prefix` (honoring `recursive`), returning
     /// (loc, rel_key) pairs where rel_key is relative to the prefix.
+    ///
+    /// The S3 prefix is **normalized to a trailing `/`** before listing, so
+    /// `s3://b/corpus` does not spuriously match `corpus-2/…` (object listing is
+    /// string-prefix, unlike the local walk's real directory boundaries).
+    /// `rel_key` is the object key with that normalized prefix stripped, using
+    /// `/` separators — identical to the local `strip_prefix(root)` result so
+    /// `doc_id = blake3(rel_path)` and the `path` column match across backends.
     async fn list(&self, prefix: &Loc, recursive: bool) -> Result<Vec<(Loc, String)>>;
 
     /// Fetch the full bytes of one object/file.
@@ -157,8 +182,20 @@ fn resolve(uri: &str, rt: &RuntimeEnv) -> Result<(BlobStore, Loc)>;
     (recursive) or a delimiter-scoped list (non-recursive).
   - `parse_file()` signature changes from `(abs_path, rel_path, opts)` to
     `(bytes, rel_path, file_type, opts, write_store, image_loc_base)`. It calls
-    `parser.parse_input(PdfInput::Bytes(bytes))` and, for page renders,
-    `parser.screenshot_input(PdfInput::Bytes(bytes), …)`.
+    `parser.parse_input(PdfInput::Bytes(bytes))`, `parser.screenshot_input(
+    PdfInput::Bytes(bytes), …)` for page renders, **and** the OCR-Auto probe
+    `parser.is_complex(PdfInput::Bytes(bytes))` — the probe at `parse.rs:312`
+    currently passes `PdfInput::Path` and must switch to `Bytes` (the API accepts
+    it). To avoid re-decoding the same bytes for each call, clone the `Vec<u8>`
+    into each `PdfInput` as needed.
+  - **Routing-semantics note.** Feeding `PdfInput::Bytes` routes *all* inputs
+    (including local) through liteparse's content sniff (`conversion.rs:115`),
+    whereas the current local path routes by file **extension**
+    (`conversion.rs:99`). For a correctly-named corpus these agree; a *mislabeled*
+    file (e.g. `report.pdf` that is really DOCX) will parse under S3/bytes but
+    fails today under local/extension. This is an intentional, documented
+    behavior change — the §9 "byte-for-byte" regression claim is corrected
+    accordingly. `file_type` remains derived from the `rel_path` extension.
   - `write_image_crop()` is replaced by `write_store.put(loc, bytes)`. The
     `s3://` no-op branch is **deleted**; both local and S3 now perform a real
     write. `file_type` is derived from the `rel_path` extension (unchanged
@@ -176,10 +213,24 @@ fn resolve(uri: &str, rt: &RuntimeEnv) -> Result<(BlobStore, Loc)>;
 `parse_source` already runs its blocking loop on a **dedicated OS thread that
 owns a current-thread tokio runtime** (because DataFusion calls the scan from a
 tokio worker and liteparse is async). The same runtime `block_on`s the
-`BlobStore` async calls (`list` / `get` / `put`). The `Arc<dyn ObjectStore>`
-handles are `Send + Sync`, so they are moved into that thread. `parse_source`
-gains the resolved `BlobStore`s as parameters; it stays a synchronous call from
+`BlobStore` async calls (`list` / `get` / `put`). `parse_source` gains the
+resolved `BlobStore`s as parameters; it stays a synchronous call from
 DataFusion's perspective.
+
+**Cross-runtime hazard — build the S3 client inside the parse thread.** The
+`object_store::aws` client wraps a `reqwest` client whose connection pool is
+bound to the tokio reactor it was **created on**. If we build the store at config
+time (server's multi-threaded runtime) and then `block_on` it from the parse
+thread's *separate* current-thread runtime, requests can hang or fail
+("dispatch task is gone"). So `resolve()` must **construct the `AmazonS3Builder`
+store lazily on the parse thread's runtime**, not reuse the config-time handle
+from `runtime_env`. Concretely: register the store on `runtime_env` for
+CSV/Parquet-style consumers as before, but for the documents scan resolve
+credentials/region/bucket into a small `S3StoreSpec` (plain `Send` data) that is
+moved into the parse thread and turned into an `ObjectStore` there. This also
+keeps the §9 tests honest — an `InMemory` store is synchronous and cannot catch
+this, so a test against an HTTP-backed mock (localstack / `httpmock`) is required
+(§9).
 
 ## 6. Data flow
 
@@ -200,9 +251,23 @@ DataFusion's perspective.
    (`{image_store}/{relpath_underscored}_{id}.png`). This URI is recorded in the
    `image_refs` / `page_image_ref` output columns.
 3. `write_store.put(loc, bytes)` writes the crop. For `Local` this is the current
-   `create_dir_all` + `std::fs::write`; for S3 it is `ObjectStore::put`.
+   `create_dir_all` + `std::fs::write`; for S3 it is `ObjectStore::put` with
+   `PutOptions`/attributes setting `Content-Type: image/png`, so consumers that
+   read crops by HTTP content-type (not just the `.png` extension) get the right
+   MIME type instead of `application/octet-stream`.
 4. On a per-image write failure the ref is dropped and a warning logged — the
-   existing local behavior, now applied uniformly to S3.
+   existing local behavior, now applied uniformly to S3. (A wholesale write
+   failure, e.g. missing `s3:PutObject`, is caught earlier by the §4 write
+   preflight rather than silently dropping every crop here.)
+
+**Self-ingestion guard.** The default globs include image extensions
+(`*.png, *.jpg …`), so if `image_store` sits **inside** the source prefix
+(e.g. `path=s3://b/corpus/`, `image_store=s3://b/corpus/crops/`) the crops
+written on one scan are re-listed and re-parsed on the next. Same-bucket
+read+write is the headline capability, so this is easy to hit. `list_docs`
+therefore **excludes any entry under the resolved `image_store` prefix** (a cheap
+prefix check on `rel_key`); local and S3 apply the same rule. This also makes an
+`image_store` nested under `path` safe by construction rather than a footgun.
 
 ## 7. Reliability & error handling
 
@@ -217,10 +282,20 @@ DataFusion's perspective.
   fails the scan loudly rather than looking like an empty corpus). For S3, a
   `list` that fails on auth/permission/network errors fails the scan with a clear
   message; a successful list returning zero objects yields zero rows.
-- **Per-file fault isolation (unchanged).** A `get` or parse failure for one
-  object is logged (`tracing::warn`) and skipped; remaining objects still produce
-  rows. This already exists for local parse errors and now also covers per-object
-  fetch failures.
+- **Write preflight (S3 `image_store`).** The connectivity check above only
+  exercises `list`/`get` (read). A missing `s3:PutObject` would otherwise surface
+  only mid-scan as a per-image `warn` + dropped ref (`parse.rs:394`), so the query
+  *succeeds* with silently missing crops. When `image_store` is `s3://`,
+  registration additionally writes and deletes a small probe object under the
+  image-store prefix, turning a permission gap into a loud registration error.
+- **Per-file fault isolation (unchanged, but bounded).** A `get` or parse failure
+  for one object is logged (`tracing::warn`) and skipped; remaining objects still
+  produce rows. This already exists for local parse errors and now also covers
+  per-object fetch failures. **Guard against silent wholesale failure:** if the
+  `list` succeeded with N ≥ 1 objects but *every* `get` fails (e.g. credentials
+  expired after listing), the scan fails loudly rather than returning zero rows
+  that look like an empty corpus. (Threshold: all-fail is a hard error; partial
+  failures stay warn-and-skip.)
 - **Pagination.** `ObjectStore::list` returns a paginated stream; the backend
   drains it fully, so large prefixes are enumerated completely.
 - **Memory.** v1 fetches each object fully into memory (`get` → `Vec<u8>`), then
@@ -256,20 +331,44 @@ DataFusion's perspective.
   bucket URL, seed a small PDF fixture, and assert `SELECT path, page FROM
   documents` yields the expected rows — proving the `list`→`get`→`parse_input`
   path without a live AWS dependency.
+- **Integration — S3 read over a real HTTP mock (required, not just `InMemory`):**
+  drive the actual `object_store::aws` client against an HTTP-backed mock
+  (localstack or `httpmock`) **from the parse thread's own runtime**, to catch the
+  cross-runtime reqwest-affinity hazard (§5) that a synchronous `InMemory` store
+  cannot surface.
 - **Integration — S3 write:** with `image_mode=embedded` over an in-memory store,
-  assert crops are `put` under the derived keys and the refs are recorded.
-- **Regression — local unchanged:** all existing `parse.rs` / `table.rs` tests
-  must pass unmodified (the `Local` backend preserves current behavior byte for
-  byte).
+  assert crops are `put` under the derived keys, the refs are recorded, and the
+  written object carries `Content-Type: image/png`.
+- **Regression — local behavior:** all existing `parse.rs` / `table.rs` tests must
+  pass unmodified. Note the routing change in §5: local input now goes through
+  content-sniff rather than extension, so add a test pinning the *new* documented
+  behavior for a mislabeled file (extension ≠ content) rather than asserting
+  byte-for-byte identity.
+- **Prefix normalization:** a bucket seeded with `corpus/a.pdf` and
+  `corpus-2/b.pdf` scanned with prefix `s3://b/corpus` yields only `a.pdf`
+  (trailing-`/` normalization), and `rel_path`/`doc_id` match the local walk.
+- **Self-ingestion guard:** with `image_store` nested under `path`, a second scan
+  does not re-ingest the crops written by the first.
+- **Same-bucket enforcement:** `path` and `image_store` in *different* S3 buckets
+  is rejected at registration with a clear message.
 - **Connectivity check:** unit-test that the prefix-aware check treats an empty
-  prefix as OK and an auth/network error as a hard failure.
+  prefix as OK and an auth/network error as a hard failure; and that the
+  `image_store` write preflight fails registration when `PutObject` is denied.
 - **Credential rejection:** assert an `aws_secret_access_key` under a documents
-  source's `options` is rejected at registration.
+  source's `options` is rejected at registration — covering **both** the `s3://`
+  `path` case and the local-`path` + `s3://`-`image_store` case (§4).
+- **Wholesale fetch failure:** a non-empty `list` followed by all-`get`-fail is a
+  hard scan error, not an empty result set.
 
 ## 10. Rollout / follow-ups
 
-- No schema change; the output columns are identical. Existing local sources are
-  unaffected (they resolve to the `Local` backend).
+- No schema change; the output columns are identical. Existing local sources
+  resolve to the `Local` backend and are unaffected **except** for the
+  extension→content-sniff routing change in §5, which only alters behavior for
+  mislabeled files (extension ≠ content) — documented and tested, not silent.
+- Follow-up: **cross-bucket (and thus cross-region / cross-account) S3** for
+  `path` vs `image_store`, lifting the §4 same-bucket constraint via per-bucket
+  region + credential resolution.
 - Follow-up (issue question 2): prefix/predicate + `limit` pushdown and per-file
   streaming, which also reduces the whole-prefix memory/latency cost.
 - Follow-up (optional): generalize the backend to `gs://` / `az://` via
