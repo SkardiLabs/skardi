@@ -555,8 +555,8 @@ pub fn parse_source(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPage>> 
 /// this thread, so any S3 `object_store` client is built on the same runtime it
 /// is polled from (avoids reqwest connection-pool cross-runtime hazards).
 fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPage>> {
-    let (read_store, prefix_loc) =
-        BlobStore::resolve(root).with_context(|| format!("documents: resolving source path {root}"))?;
+    let (read_store, prefix_loc) = BlobStore::resolve(root)
+        .with_context(|| format!("documents: resolving source path {root}"))?;
 
     let (write_store, image_base) = match opts.image_store.as_deref() {
         Some(s) => {
@@ -572,8 +572,12 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
         .build()
         .context("failed to build tokio runtime for documents parse")?;
 
-    let entries =
-        runtime.block_on(list_docs(&read_store, &prefix_loc, opts, image_base.as_ref()))?;
+    let entries = runtime.block_on(list_docs(
+        &read_store,
+        &prefix_loc,
+        opts,
+        image_base.as_ref(),
+    ))?;
     let total = entries.len();
 
     let mut rows = Vec::new();
@@ -938,10 +942,7 @@ mod tests {
                 key: "k".into()
             }
         ));
-        assert!(!loc_is_under(
-            &Loc::Local("/x".into()),
-            &e("corpus")
-        ));
+        assert!(!loc_is_under(&Loc::Local("/x".into()), &e("corpus")));
     }
 
     #[test]

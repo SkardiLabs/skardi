@@ -249,7 +249,10 @@ fn build_bucket_store(
         .build()
         .map_err(|e| ConfigError::S3ObjectStoreRegistrationFailed {
             name: source_name.to_string(),
-            error: format!("Failed to build S3 object store for bucket '{}': {}", bucket, e),
+            error: format!(
+                "Failed to build S3 object store for bucket '{}': {}",
+                bucket, e
+            ),
         })?;
     Ok((Arc::new(store), region))
 }
@@ -676,10 +679,7 @@ path: "s3://corpus-bucket/in/"
                 &src,
             )
             .unwrap_err();
-        assert!(
-            err.to_string().contains("same bucket"),
-            "unexpected: {err}"
-        );
+        assert!(err.to_string().contains("same bucket"), "unexpected: {err}");
     }
 
     #[test]
@@ -698,14 +698,11 @@ options:
 "#,
         );
         let err = s3
-            .validate_documents_configuration(
-                "/data/corpus",
-                Some("s3://crops-bucket/out/"),
-                &src,
-            )
+            .validate_documents_configuration("/data/corpus", Some("s3://crops-bucket/out/"), &src)
             .unwrap_err();
         assert!(
-            err.to_string().contains("must not be stored in configuration files"),
+            err.to_string()
+                .contains("must not be stored in configuration files"),
             "unexpected: {err}"
         );
     }
@@ -725,7 +722,10 @@ options:
         let err = s3
             .validate_documents_configuration("s3://corpus-bucket/in/", None, &src)
             .unwrap_err();
-        assert!(err.to_string().contains("AWS configuration"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("AWS configuration"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

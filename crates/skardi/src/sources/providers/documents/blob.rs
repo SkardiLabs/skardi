@@ -18,7 +18,10 @@ use object_store::{Attribute, Attributes, ObjectStore, PutOptions, PutPayload};
 pub enum Loc {
     Local(PathBuf),
     /// `key` never has a leading `/`.
-    S3 { bucket: String, key: String },
+    S3 {
+        bucket: String,
+        key: String,
+    },
 }
 
 impl Loc {
@@ -116,7 +119,10 @@ impl BlobStore {
                     .get(&OsPath::from(key.as_str()))
                     .await
                     .with_context(|| format!("s3 get {key}"))?;
-                let bytes = res.bytes().await.with_context(|| format!("s3 read body {key}"))?;
+                let bytes = res
+                    .bytes()
+                    .await
+                    .with_context(|| format!("s3 read body {key}"))?;
                 Ok(bytes.to_vec())
             }
             _ => anyhow::bail!("documents: BlobStore/Loc backend mismatch in get()"),
@@ -143,7 +149,11 @@ impl BlobStore {
                     ..Default::default()
                 };
                 store
-                    .put_opts(&OsPath::from(key.as_str()), PutPayload::from(bytes.to_vec()), opts)
+                    .put_opts(
+                        &OsPath::from(key.as_str()),
+                        PutPayload::from(bytes.to_vec()),
+                        opts,
+                    )
                     .await
                     .with_context(|| format!("s3 put {key}"))?;
                 Ok(())
