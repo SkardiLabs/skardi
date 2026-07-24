@@ -1363,8 +1363,10 @@ bindings:
 
     #[tokio::test]
     async fn numeric_yaml_resource_values_reach_the_gateway_as_numbers() {
-        // `issue_number: 42` in a YAML binding must arrive as JSON 42 — the
-        // same value an equivalent UDTF resource JSON sends — never "42".
+        // A YAML binding's numeric resource must arrive as a JSON number —
+        // the same value an equivalent UDTF resource JSON sends — never a
+        // string. Both numeric-resource consumers are covered: issue_comments
+        // (issue_number) and reviews (pull_number).
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -1379,6 +1381,13 @@ bindings:
             {
                 return MockResponse::ok(
                     &serde_json::json!({"output": {"comments": []}}).to_string(),
+                );
+            }
+            if req.method == "POST"
+                && req.path == "/v1/actions/github.list_pull_request_reviews/execute"
+            {
+                return MockResponse::ok(
+                    &serde_json::json!({"output": {"reviews": []}}).to_string(),
                 );
             }
             MockResponse::new(404, "{}")
@@ -1397,6 +1406,10 @@ bindings:
     source_pack: github
     resource: {{ owner: acme, repo: widgets, issue_number: 42 }}
     tables: [issue_comments]
+  - name: ghr
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets, pull_number: 7 }}
+    tables: [reviews]
 "#
         ))
         .expect("parse config");
@@ -1418,21 +1431,40 @@ bindings:
 
         let batches = collect(&ctx, "SELECT id FROM saas.gh.issue_comments").await;
         assert_eq!(rows_of(&batches), 0, "stub serves an empty collection");
+        let batches = collect(&ctx, "SELECT id FROM saas.ghr.reviews").await;
+        assert_eq!(rows_of(&batches), 0, "stub serves an empty collection");
 
-        let bodies = execute_bodies(&gateway);
-        assert!(!bodies.is_empty());
-        assert!(
-            bodies
-                .iter()
-                .all(|body| body.contains(r#""issue_number":42"#)),
-            "numeric resource must stay a JSON number: {bodies:?}"
-        );
-        assert!(
-            bodies
-                .iter()
-                .all(|body| !body.contains(r#""issue_number":"42""#)),
-            "never stringified: {bodies:?}"
-        );
+        let bodies_for = |action: &str| -> Vec<String> {
+            gateway
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.path.contains(action))
+                .map(|r| r.body)
+                .collect()
+        };
+        for (action, number_json, stringified) in [
+            (
+                "github.list_issue_comments",
+                r#""issue_number":42"#,
+                r#""issue_number":"42""#,
+            ),
+            (
+                "github.list_pull_request_reviews",
+                r#""pull_number":7"#,
+                r#""pull_number":"7""#,
+            ),
+        ] {
+            let bodies = bodies_for(action);
+            assert!(!bodies.is_empty(), "{action} was executed");
+            assert!(
+                bodies.iter().all(|body| body.contains(number_json)),
+                "{action}: numeric resource must stay a JSON number: {bodies:?}"
+            );
+            assert!(
+                bodies.iter().all(|body| !body.contains(stringified)),
+                "{action}: never stringified: {bodies:?}"
+            );
+        }
     }
 
     #[test]
