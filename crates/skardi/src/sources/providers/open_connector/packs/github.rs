@@ -642,6 +642,10 @@ static WORKFLOW_RUNS: SourcePackTable = SourcePackTable {
     fixed_inputs: &[],
     // GitHub's `status` query parameter matches status OR conclusion values
     // interchangeably — not a faithful translation of either column.
+    // Follow-up candidates (fetch-reduction only; local filtering already
+    // gives correct results): `event` and `head_branch` → the `branch`
+    // query parameter — both as Inexact per the string-enum push rule in
+    // the module docs.
     filters: &[],
     expected_fingerprint: None,
 };
