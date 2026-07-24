@@ -1439,6 +1439,71 @@ bindings:
     }
 
     #[tokio::test]
+    async fn binding_missing_a_required_resource_fails_before_discovery() {
+        // owner/repo are the pack's declared resource contract; a binding
+        // without `repo` must fail registration with the targeted error —
+        // and before any action-discovery request leaves the process. This
+        // is also the registration-time MissingResourceInput path's only
+        // direct pin (the UDTF path asserts it separately).
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_MISSING_RESOURCE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme }}
+    tables: [issues]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        let result = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let err = result
+            .unwrap_err()
+            .downcast::<crate::sources::providers::open_connector::OpenConnectorError>()
+            .unwrap();
+        assert!(matches!(
+            err,
+            crate::sources::providers::open_connector::OpenConnectorError::MissingResourceInput {
+                ref binding,
+                ref key,
+            } if binding == "gh" && key == "repo"
+        ));
+        assert!(
+            gateway
+                .requests()
+                .iter()
+                .all(|request| request.path == "/v1/health"),
+            "resource enforcement precedes every discovery call"
+        );
+    }
+
+    #[tokio::test]
     async fn wrapped_envelope_with_total_count_paginates_and_terminates() {
         // workflow_runs is the pack's one structurally different response
         // shape: the row array sits beside a sibling `total_count`
