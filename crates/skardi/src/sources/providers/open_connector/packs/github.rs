@@ -1503,14 +1503,13 @@ bindings:
         );
     }
 
-    #[tokio::test]
-    async fn wrapped_envelope_with_total_count_paginates_and_terminates() {
-        // workflow_runs is the pack's one structurally different response
-        // shape: the row array sits beside a sibling `total_count`
-        // (GitHub's actual envelope). Pagination and short-page termination
-        // must run end to end against that shape — the sibling key is
-        // ignored by the row path and must never confuse the scan.
-        let total = 150usize;
+    /// Register `workflow_runs` against a stub serving `total` runs through
+    /// GitHub's wrapped envelope (`{total_count, workflow_runs}`), sliced by
+    /// page/per_page.
+    async fn setup_workflow_runs(
+        total: usize,
+        token_env: &'static str,
+    ) -> (MockGateway, SessionContext) {
         let gateway = MockGateway::start(move |req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -1539,7 +1538,6 @@ bindings:
         })
         .await;
 
-        let token_env = "SKARDI_TEST_OC_GITHUB_RUNS_ENVELOPE";
         unsafe {
             std::env::set_var(token_env, "test-token");
         }
@@ -1569,6 +1567,17 @@ bindings:
         unsafe {
             std::env::remove_var(token_env);
         }
+        (gateway, ctx)
+    }
+
+    #[tokio::test]
+    async fn wrapped_envelope_with_total_count_paginates_and_terminates() {
+        // workflow_runs is the pack's one structurally different response
+        // shape: the row array sits beside a sibling `total_count`
+        // (GitHub's actual envelope). Pagination and short-page termination
+        // must run end to end against that shape — the sibling key is
+        // ignored by the row path and must never confuse the scan.
+        let (gateway, ctx) = setup_workflow_runs(150, "SKARDI_TEST_OC_GITHUB_RUNS_ENVELOPE").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.gh.workflow_runs").await;
         assert_eq!(rows_of(&batches), 150, "the sibling total_count is inert");
@@ -1578,6 +1587,27 @@ bindings:
             bodies.len(),
             2,
             "150 runs at per_page=100: a full page, then a short page that terminates"
+        );
+        assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
+        assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn exact_page_boundary_terminates_on_the_empty_page() {
+        // 100 rows == per_page: GitHub cannot signal completion on the full
+        // page, so the engine must spend one more request and terminate on
+        // the EMPTY page — the realistic large-repo path, previously covered
+        // only by the pagination unit tests, never through a pack scan.
+        let (gateway, ctx) = setup_workflow_runs(100, "SKARDI_TEST_OC_GITHUB_RUNS_BOUNDARY").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.workflow_runs").await;
+        assert_eq!(rows_of(&batches), 100, "every boundary row is emitted");
+
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "a full page cannot terminate: the empty page 2 is fetched and ends the scan"
         );
         assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
         assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
