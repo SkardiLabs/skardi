@@ -79,6 +79,9 @@ impl OpenConnectorTableProvider {
         // Same bind-time guarantee as the row path: a malformed pack-authored
         // pagination path fails here at registration, not mid-scan.
         table.pagination.validate()?;
+        if let Some(error_path) = table.error_path {
+            RowPath::parse(error_path)?;
+        }
         Ok(Self {
             client,
             cache,
@@ -194,6 +197,7 @@ mod tests {
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
             }],
+            error_path: None,
             expected_fingerprint: None,
         }))
     }

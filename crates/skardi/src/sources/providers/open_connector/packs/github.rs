@@ -160,6 +160,7 @@ static REPOSITORIES: SourcePackTable = SourcePackTable {
     required_resources: &[],
     fixed_inputs: &[],
     filters: &[],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -289,6 +290,7 @@ static ISSUES: SourcePackTable = SourcePackTable {
             value_format: ValueFormat::Rfc3339,
         },
     ],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -339,6 +341,7 @@ static ISSUE_COMMENTS: SourcePackTable = SourcePackTable {
     required_resources: &["owner", "repo", "issue_number"],
     fixed_inputs: &[],
     filters: &[],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -446,6 +449,7 @@ static PULL_REQUESTS: SourcePackTable = SourcePackTable {
         fidelity: Fidelity::Inexact,
         value_format: ValueFormat::Rfc3339,
     }],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -502,6 +506,7 @@ static REVIEWS: SourcePackTable = SourcePackTable {
     required_resources: &["owner", "repo", "pull_number"],
     fixed_inputs: &[],
     filters: &[],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -566,6 +571,7 @@ static COMMITS: SourcePackTable = SourcePackTable {
     // drops is unrecoverable — so no time filter is mapped (the mock pack's
     // `>=` rule, applied here).
     filters: &[],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -659,6 +665,7 @@ static WORKFLOW_RUNS: SourcePackTable = SourcePackTable {
     // query parameter — both as Inexact per the string-enum push rule in
     // the module docs.
     filters: &[],
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -733,6 +740,7 @@ static RELEASES: SourcePackTable = SourcePackTable {
     required_resources: &["owner", "repo"],
     fixed_inputs: &[],
     filters: &[],
+    error_path: None,
     expected_fingerprint: None,
 };
 

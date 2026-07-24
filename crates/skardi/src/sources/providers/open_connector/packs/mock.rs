@@ -68,6 +68,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
     }],
     // The mock gateway's action schema is test-controlled, so no fingerprint
     // is pinned; real packs pin one.
+    error_path: None,
     expected_fingerprint: None,
 };
 

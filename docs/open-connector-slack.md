@@ -75,6 +75,10 @@ highlights and caveats:
   to `Timestamp(ms, UTC)` columns.
 - **Slack uses empty strings, not nulls** (`topic = ''` for an unset
   topic); those stay empty strings. Genuinely absent keys become SQL NULL.
+- **Slack's in-band errors surface as themselves**: an HTTP-200
+  `ok: false` envelope fails the scan with Slack's own error code
+  (`missing_scope`, `not_authed`, …) and the action name — never a
+  misleading missing-row-array error.
 - **`files.created >= …` pushes down as epoch seconds** (`ts_from`,
   Slack's inclusive lower bound); sub-second literals floor, which only
   widens the fetch — the predicate is re-applied locally either way.

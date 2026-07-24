@@ -155,6 +155,8 @@ static CONVERSATIONS: SourcePackTable = SourcePackTable {
     // are message-shaped and deliberately out of a channels table.
     fixed_inputs: &[("types", FixedValue::Str("public_channel,private_channel"))],
     filters: &[],
+    // Slack reports application errors in-band (HTTP 200, `ok: false`).
+    error_path: Some("$.error"),
     expected_fingerprint: None,
 };
 
@@ -237,6 +239,8 @@ static USERS: SourcePackTable = SourcePackTable {
     required_resources: &[],
     fixed_inputs: &[],
     filters: &[],
+    // Slack reports application errors in-band (HTTP 200, `ok: false`).
+    error_path: Some("$.error"),
     expected_fingerprint: None,
 };
 
@@ -349,6 +353,8 @@ static FILES: SourcePackTable = SourcePackTable {
             value_format: ValueFormat::EpochSeconds,
         },
     ],
+    // Slack reports application errors in-band (HTTP 200, `ok: false`).
+    error_path: Some("$.error"),
     expected_fingerprint: None,
 };
 
@@ -802,6 +808,49 @@ bindings:
             execute_bodies(&gateway).len(),
             2,
             "two pages of two rows; no third request"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_band_slack_error_surfaces_the_provider_code() {
+        // Slack reports application errors as HTTP 200 + ok:false + error.
+        // The user must see Slack's own code — not the misleading
+        // RowPathNotFound the missing `channels` array would raise.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(
+                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                        "locally_executable": true, "connection_aliases": []}"#,
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations/execute" {
+                return MockResponse::ok(
+                    &json!({"output": {"ok": false, "error": "missing_scope"}}).to_string(),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = setup(&gateway, "conversations", "SKARDI_TEST_OC_SLACK_OKFALSE").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.ws.conversations")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("the provider error must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing_scope") && message.contains("slack.list_conversations"),
+            "the provider's own code and the action are named: {message}"
+        );
+        assert!(
+            !message.contains("row path"),
+            "never the misleading row-path error: {message}"
         );
     }
 

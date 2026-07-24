@@ -65,6 +65,11 @@ pub struct SourcePackTable {
     pub fixed_inputs: &'static [(&'static str, FixedValue)],
     /// Allowlisted filter translations.
     pub filters: &'static [FilterMapping],
+    /// Row-path of an in-band provider error code in an otherwise
+    /// successful envelope (Slack's HTTP-200 `ok: false` + `error`
+    /// pattern). When declared and present in a page, the scan fails with
+    /// the provider's own code instead of a misleading row-path error.
+    pub error_path: Option<&'static str>,
     /// Expected action-contract fingerprint. When set, registration compares
     /// it with the discovered action's fingerprint and fails on mismatch.
     pub expected_fingerprint: Option<&'static str>,
@@ -315,6 +320,7 @@ mod tests {
             required_resources: &[],
             fixed_inputs: &[],
             filters: &[],
+            error_path: None,
             expected_fingerprint: None,
         }
     }

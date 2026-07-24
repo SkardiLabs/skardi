@@ -204,6 +204,20 @@ pub enum OpenConnectorError {
     )]
     NonIdempotentAmbiguousFailure { operation: String, reason: String },
 
+    /// The provider reported an in-band error inside an otherwise
+    /// successful response envelope — Slack's HTTP-200 `ok: false` +
+    /// `error` pattern. The code is a short provider-authored identifier
+    /// (`missing_scope`, `not_authed`), bounded before display.
+    #[error(
+        "Open Connector action '{action_id}' page {page}: the provider reported \
+         error '{code}'"
+    )]
+    ProviderReportedError {
+        action_id: String,
+        page: usize,
+        code: String,
+    },
+
     /// A declared total-pages location resolved to a non-numeric value, so
     /// the scan cannot know when the collection ends.
     #[error(

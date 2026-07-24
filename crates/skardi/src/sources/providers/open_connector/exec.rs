@@ -47,6 +47,9 @@ pub struct ScanTarget {
     pub action_id: Arc<str>,
     /// Pagination contract.
     pub pagination: PaginationStrategy,
+    /// In-band provider-error location (see `SourcePackTable::error_path`);
+    /// `None` for raw scans and packs whose providers error at HTTP level.
+    pub error_path: Option<&'static str>,
     /// Fixed action inputs sent with every request (see
     /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
     /// input is caller-supplied.
@@ -63,6 +66,7 @@ impl ScanTarget {
             table_id: Arc::from(table.id),
             action_id: Arc::from(table.action_id),
             pagination: table.pagination,
+            error_path: table.error_path,
             fixed_inputs: table.fixed_inputs,
             source_pack_version,
         }
@@ -274,6 +278,9 @@ struct ScanState {
     scan_timeout: Duration,
     deadline: Instant,
     pagination: Pagination,
+    /// Pre-parsed in-band provider-error path, checked before each page's
+    /// row extraction.
+    error_path: Option<RowPath>,
     rows_emitted: u64,
     /// Cached batches to replay (non-empty only on a cache hit).
     replay: VecDeque<RecordBatch>,
@@ -358,6 +365,7 @@ impl ScanState {
             scan_timeout: exec.scan_timeout,
             deadline: Instant::now() + exec.scan_timeout,
             pagination: Pagination::new(exec.target.pagination)?,
+            error_path: exec.target.error_path.map(RowPath::parse).transpose()?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
@@ -473,6 +481,26 @@ impl ScanState {
         self.pages_fetched += 1;
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
+        }
+        // Providers like Slack report application errors in-band (HTTP 200,
+        // `ok: false` + `error`). Surface the provider's own code instead of
+        // the misleading row-path error the missing row array would raise.
+        if let Some(error_path) = &self.error_path
+            && let Ok(code) = error_path.extract(&envelope, page)
+            && !code.is_null()
+        {
+            let code = match code.as_str() {
+                Some(text) => text.chars().take(128).collect(),
+                None => format!(
+                    "<{}>",
+                    crate::sources::providers::open_connector::row_path::json_kind(code)
+                ),
+            };
+            return Err(OpenConnectorError::ProviderReportedError {
+                action_id: self.target.action_id.to_string(),
+                page,
+                code,
+            });
         }
         let rows = self.row_path.rows(&envelope, page)?;
         let batch = self.converter.convert(rows, page)?;
