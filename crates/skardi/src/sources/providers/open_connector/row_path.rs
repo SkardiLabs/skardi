@@ -114,7 +114,7 @@ impl RowPath {
 }
 
 /// Short human-readable kind of a JSON value, for error messages.
-fn json_kind(value: &Value) -> String {
+pub(crate) fn json_kind(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(_) => "a boolean".to_string(),

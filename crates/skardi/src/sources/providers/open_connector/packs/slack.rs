@@ -12,7 +12,10 @@
 //!   The engine's repeated-cursor detection turns a non-advancing gateway
 //!   into a targeted `PaginationLoop` error instead of an infinite scan.
 //!   `files` uses Slack's classic `page`/`count` pagination — that endpoint
-//!   never adopted cursors.
+//!   never adopted cursors — terminated by the envelope's authoritative
+//!   `paging.pages`, not the short-page heuristic: permission filtering can
+//!   legally shorten non-final pages, which the heuristic would misread as
+//!   end-of-collection and silently truncate.
 //! - **`types` is pinned on conversations** so the table reads as every
 //!   channel the bot can see (`public_channel,private_channel`), not
 //!   Slack's public-only default — the `state=all` move from the GitHub
@@ -311,10 +314,15 @@ static FILES: SourcePackTable = SourcePackTable {
         },
     ],
     // files.list never adopted cursors; classic page/count pagination.
+    // Slack's envelope carries an authoritative `paging.pages`, so the scan
+    // trusts it instead of the short-page heuristic: permission filtering
+    // can legally shorten non-final pages, which the heuristic would read
+    // as end-of-collection and silently truncate.
     pagination: PaginationStrategy::PageNumber {
         page_param: "page",
         per_page_param: "count",
         per_page: 100,
+        total_pages_path: Some("$.paging.pages"),
     },
     required_resources: &[],
     fixed_inputs: &[],
@@ -771,7 +779,7 @@ bindings:
                 &json!({"output": {"ok": true, "files": [
                     {"id": "F0001", "user": "U0001", "name": "roadmap.pdf"},
                     {"id": "F0002", "user": "U0002", "name": "notes.txt"}
-                ]}})
+                ], "paging": {"count": 100, "total": 2, "page": 1, "pages": 1}}})
                 .to_string(),
             );
         }
@@ -803,6 +811,66 @@ bindings:
         assert!(
             bodies.iter().all(|body| body.contains(r#""count":100"#)),
             "files uses classic page/count pagination: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_middle_pages_do_not_truncate_a_total_pages_scan() {
+        // The motivating case for trusting Slack's authoritative
+        // `paging.pages`: permission filtering can legally shorten a
+        // non-final page, which the short-page heuristic would read as
+        // end-of-collection and silently truncate. Three pages of sizes
+        // 2 / 1 / 2 — the short middle page must not end the scan.
+        let pages: Vec<Vec<Value>> = vec![
+            vec![
+                json!({"id": "F0001", "user": "U0001"}),
+                json!({"id": "F0002", "user": "U0001"}),
+            ],
+            vec![json!({"id": "F0003", "user": "U0001"})],
+            vec![
+                json!({"id": "F0004", "user": "U0001"}),
+                json!({"id": "F0005", "user": "U0001"}),
+            ],
+        ];
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(
+                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
+                        "locally_executable": true, "connection_aliases": []}"#,
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_files/execute" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let page = body
+                    .get("input")
+                    .and_then(|input| input.get("page"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1) as usize;
+                let slice = pages.get(page - 1).cloned().unwrap_or_default();
+                return MockResponse::ok(
+                    &json!({"output": {"ok": true, "files": slice,
+                        "paging": {"count": 100, "total": 5, "page": page, "pages": 3}}})
+                    .to_string(),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = setup(&gateway, "files", "SKARDI_TEST_OC_SLACK_SHORT_MIDDLE").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.ws.files ORDER BY id").await;
+        assert_eq!(
+            rows_of(&batches),
+            5,
+            "the short middle page must not truncate the scan"
+        );
+        assert_eq!(
+            execute_bodies(&gateway).len(),
+            3,
+            "all three pages fetched, ending at paging.pages"
         );
     }
 

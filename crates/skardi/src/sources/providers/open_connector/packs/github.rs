@@ -56,6 +56,7 @@ const GITHUB_PAGINATION: PaginationStrategy = PaginationStrategy::PageNumber {
     page_param: "page",
     per_page_param: "per_page",
     per_page: 100,
+    total_pages_path: None,
 };
 
 /// Repositories visible to the connected account.

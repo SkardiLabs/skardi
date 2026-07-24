@@ -204,6 +204,18 @@ pub enum OpenConnectorError {
     )]
     NonIdempotentAmbiguousFailure { operation: String, reason: String },
 
+    /// A declared total-pages location resolved to a non-numeric value, so
+    /// the scan cannot know when the collection ends.
+    #[error(
+        "Open Connector pagination total at '{path}' on page {page} is {found}, \
+         expected a non-negative integer"
+    )]
+    PaginationTotalInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// Pagination failed to advance: the gateway returned an already-seen
     /// cursor, which would loop the scan forever.
     #[error(

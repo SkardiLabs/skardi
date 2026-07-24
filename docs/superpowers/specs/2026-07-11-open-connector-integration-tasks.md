@@ -162,7 +162,9 @@ event carrying the scan identity and error.
       pagination (`cursor` / `$.response_metadata.next_cursor`, `limit` 200) terminates on
       both end-of-collection spellings (empty-string cursor and absent `response_metadata`)
       and fails as `PaginationLoop` on a non-advancing gateway; `files` uses Slack's classic
-      `page`/`count` pagination. `types=public_channel,private_channel` pinned on
+      `page`/`count` pagination terminated by the envelope's authoritative `paging.pages`
+      (a `total_pages_path` extension to `PageNumber` — short non-final pages, legal under
+      permission filtering, never truncate; missing/non-numeric totals fail loudly). `types=public_channel,private_channel` pinned on
       conversations (the `state=all` move); `files.user_id =` → `user` pushed Inexact per the
       string-push rule; `files.created >=` → `ts_from` deliberately NOT mapped (Slack takes
       epoch seconds; the filter engine renders timestamps as RFC 3339 only). New engine

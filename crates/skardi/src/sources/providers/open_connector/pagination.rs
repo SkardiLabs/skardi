@@ -10,13 +10,21 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 use super::error::OpenConnectorError;
-use super::row_path::RowPath;
+use super::row_path::{RowPath, json_kind};
 
 /// How a source-pack table paginates.
 #[derive(Debug, Clone, Copy)]
 pub enum PaginationStrategy {
     /// Page-number pagination: the request carries a 1-based page number and
-    /// a page size; a short or empty page ends the scan.
+    /// a page size.
+    ///
+    /// Termination: when `total_pages_path` is declared, the scan trusts the
+    /// provider's authoritative page count and only ends once
+    /// `page >= total pages` — a short or even empty non-final page keeps
+    /// going, because providers that filter rows *after* paginating
+    /// (permission checks, deletions) can legally return short middle pages.
+    /// Without a declared path, the short/empty-page heuristic ends the scan
+    /// — the only signal providers like GitHub give.
     PageNumber {
         /// Action input field for the page number.
         page_param: &'static str,
@@ -24,6 +32,10 @@ pub enum PaginationStrategy {
         per_page_param: &'static str,
         /// Page size to request (also the limit-pushdown ceiling).
         per_page: u32,
+        /// Row-path-style location of the provider's total page count in the
+        /// response envelope (e.g. Slack's `$.paging.pages`). `None` falls
+        /// back to short/empty-page termination.
+        total_pages_path: Option<&'static str>,
     },
     /// Cursor pagination: the request carries the previous page's cursor
     /// (absent on the first page); the response carries the next cursor at a
@@ -59,17 +71,27 @@ pub struct Pagination {
     /// Pre-parsed next-cursor path (Cursor only) — parsed once at
     /// construction instead of on every page.
     cursor_path: Option<RowPath>,
+    /// Pre-parsed total-pages path (PageNumber only), same discipline.
+    total_pages_path: Option<RowPath>,
 }
 
 impl PaginationStrategy {
     /// Validate any embedded paths. Called at binding time so a malformed
     /// pack-authored path fails at registration, not mid-scan.
     pub fn validate(&self) -> Result<(), OpenConnectorError> {
-        if let PaginationStrategy::Cursor {
-            next_cursor_path, ..
-        } = self
-        {
-            RowPath::parse(next_cursor_path)?;
+        match self {
+            PaginationStrategy::Cursor {
+                next_cursor_path, ..
+            } => {
+                RowPath::parse(next_cursor_path)?;
+            }
+            PaginationStrategy::PageNumber {
+                total_pages_path: Some(path),
+                ..
+            } => {
+                RowPath::parse(path)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -92,12 +114,20 @@ impl Pagination {
             } => Some(RowPath::parse(next_cursor_path)?),
             PaginationStrategy::PageNumber { .. } | PaginationStrategy::SinglePage => None,
         };
+        let total_pages_path = match &strategy {
+            PaginationStrategy::PageNumber {
+                total_pages_path: Some(path),
+                ..
+            } => Some(RowPath::parse(path)?),
+            _ => None,
+        };
         Ok(Self {
             strategy,
             page: 1,
             next_token,
             seen_tokens: HashSet::new(),
             cursor_path,
+            total_pages_path,
         })
     }
 
@@ -113,6 +143,7 @@ impl Pagination {
                 page_param,
                 per_page_param,
                 per_page,
+                ..
             } => {
                 let page: u64 = self
                     .next_token
@@ -151,9 +182,28 @@ impl Pagination {
     ) -> Result<bool, OpenConnectorError> {
         match &self.strategy {
             PaginationStrategy::PageNumber { per_page, .. } => {
-                // Short or empty page → last page. Page numbers advance by
-                // construction, so no loop detection is needed here.
-                let more = rows_in_page >= *per_page as usize;
+                // Page numbers advance by construction, so no loop detection
+                // is needed here.
+                let more = match &self.total_pages_path {
+                    // Authoritative total: only page >= pages ends the scan.
+                    // A short or empty non-final page keeps going — providers
+                    // that filter rows after paginating can legally return
+                    // them, and the heuristic would silently truncate.
+                    Some(path) => {
+                        let total = path.extract(envelope, self.page)?;
+                        let total = total.as_u64().ok_or_else(|| {
+                            OpenConnectorError::PaginationTotalInvalid {
+                                path: path.as_str().to_string(),
+                                page: self.page,
+                                found: json_kind(total),
+                            }
+                        })?;
+                        (self.page as u64) < total
+                    }
+                    // Heuristic: short or empty page → last page (all the
+                    // signal providers like GitHub give).
+                    None => rows_in_page >= *per_page as usize,
+                };
                 if more {
                     self.page += 1;
                     self.next_token = Some(self.page.to_string());
@@ -198,6 +248,7 @@ mod tests {
             page_param: "page",
             per_page_param: "per_page",
             per_page,
+            total_pages_path: None,
         })
         .unwrap()
     }
@@ -305,6 +356,88 @@ mod tests {
         assert!(matches!(
             err,
             OpenConnectorError::PaginationLoop { ref token } if token == "same"
+        ));
+    }
+
+    fn page_number_with_total(per_page: u32) -> Pagination {
+        Pagination::new(PaginationStrategy::PageNumber {
+            page_param: "page",
+            per_page_param: "count",
+            per_page,
+            total_pages_path: Some("$.paging.pages"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn total_pages_termination_survives_short_and_empty_middle_pages() {
+        // Providers that filter rows after paginating can legally return
+        // short — even empty — non-final pages; with an authoritative page
+        // count the scan must keep going until page >= pages.
+        let mut pagination = page_number_with_total(2);
+        let envelope = json!({"paging": {"pages": 3}});
+        assert!(pagination.advance(&envelope, 2).unwrap(), "full page 1");
+        assert!(
+            pagination.advance(&envelope, 1).unwrap(),
+            "short page 2 continues"
+        );
+        assert!(
+            !pagination.advance(&envelope, 0).unwrap(),
+            "page 3 is the last"
+        );
+
+        let mut pagination = page_number_with_total(2);
+        assert!(
+            pagination
+                .advance(&json!({"paging": {"pages": 2}}), 0)
+                .unwrap(),
+            "an empty non-final page continues"
+        );
+
+        // pages: 0 (empty collection) stops immediately.
+        let mut pagination = page_number_with_total(2);
+        assert!(
+            !pagination
+                .advance(&json!({"paging": {"pages": 0}}), 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_or_non_numeric_totals_fail_the_scan() {
+        // A declared total-pages location is a contract: silence or a wrong
+        // kind must fail loudly, never fall back to the truncating
+        // heuristic.
+        let mut pagination = page_number_with_total(2);
+        let err = pagination.advance(&json!({"ok": true}), 2).unwrap_err();
+        assert!(matches!(err, OpenConnectorError::RowPathNotFound { .. }));
+
+        let mut pagination = page_number_with_total(2);
+        let err = pagination
+            .advance(&json!({"paging": {"pages": "three"}}), 2)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::PaginationTotalInvalid { ref found, page: 1, .. }
+                if found == "a string"
+        ));
+    }
+
+    #[test]
+    fn malformed_total_pages_path_fails_at_bind_time() {
+        let strategy = PaginationStrategy::PageNumber {
+            page_param: "page",
+            per_page_param: "count",
+            per_page: 2,
+            total_pages_path: Some("not-a-path"),
+        };
+        assert!(matches!(
+            strategy.validate(),
+            Err(OpenConnectorError::InvalidRowPath { .. })
+        ));
+        assert!(matches!(
+            Pagination::new(strategy),
+            Err(OpenConnectorError::InvalidRowPath { .. })
         ));
     }
 

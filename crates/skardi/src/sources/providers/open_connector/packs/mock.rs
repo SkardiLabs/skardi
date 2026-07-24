@@ -51,6 +51,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         page_param: "page",
         per_page_param: "per_page",
         per_page: 2,
+        total_pages_path: None,
     },
     required_resources: &["workspace"],
     fixed_inputs: &[],

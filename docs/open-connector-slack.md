@@ -52,14 +52,16 @@ WHERE NOT is_bot AND NOT deleted;
 |---|---|---|---|
 | `conversations` | `slack.list_conversations` | cursor (`limit` 200) | none |
 | `users` | `slack.list_users` | cursor (`limit` 200) | none |
-| `files` | `slack.list_files` | classic `page`/`count` (100) | `user_id =` → `user` (inexact, re-applied locally) |
+| `files` | `slack.list_files` | classic `page`/`count` (100), ends at `paging.pages` | `user_id =` → `user` (inexact, re-applied locally) |
 
 Every other SQL predicate is valid — DataFusion evaluates it locally after
 the bounded fetch, and `LIMIT` stops pagination as soon as enough rows have
 been emitted. Cursor scans terminate on both of Slack's end-of-collection
 spellings (`next_cursor: ""` or no `response_metadata` at all), and a
 gateway that repeats a cursor fails the scan as a detected pagination loop
-instead of spinning.
+instead of spinning. `files` scans trust the envelope's authoritative
+`paging.pages` count, so a short non-final page (permission filtering can
+legally produce one) never truncates the scan.
 
 Column references live in the pack definition
 (`crates/skardi/src/sources/providers/open_connector/packs/slack.rs`);
