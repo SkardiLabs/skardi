@@ -29,8 +29,9 @@ use std::any::Any;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
+use super::expr_to_sqlite_sql;
 use super::fts_exec::SqliteFtsExec;
-use super::{expr_to_sqlite_sql, extract_string};
+use crate::sources::providers::udtf_args::string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit.
@@ -59,9 +60,9 @@ impl TableFunctionImpl for SqliteFtsTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let text_col = extract_string(&exprs[1], "text_col")?;
-        let query = extract_string(&exprs[2], "query")?;
+        let table_name = string_arg(&exprs[0], "sqlite_fts", "table")?;
+        let text_col = string_arg(&exprs[1], "sqlite_fts", "text_col")?;
+        let query = string_arg(&exprs[2], "sqlite_fts", "query")?;
         // `extract_int` returns `None` for NULL literals (placeholder mode used
         // by pipeline validation) and `Some(v)` for a real value, which is
         // already guaranteed positive. In placeholder mode, substitute a stub

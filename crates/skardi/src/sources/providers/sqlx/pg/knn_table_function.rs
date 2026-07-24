@@ -27,7 +27,7 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{Result as DFResult, ScalarValue, plan_err};
+use datafusion::common::{Result as DFResult, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -41,6 +41,7 @@ use std::sync::Arc;
 use super::knn_exec::{DistanceMetric, PgKnnExec, PgVectorFetchExec};
 use super::utils::expr_to_pg_sql;
 use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
+use crate::sources::providers::udtf_args::{optional_string_arg, strict_string_arg};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered Postgres table.
@@ -79,19 +80,22 @@ impl TableFunctionImpl for PgKnnTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let vector_col = extract_string(&exprs[1], "vector_col")?;
+        let table_name = strict_string_arg(&exprs[0], "pg_knn", "table")?;
+        let vector_col = strict_string_arg(&exprs[1], "pg_knn", "vector_col")?;
 
         let metric = {
-            let s = extract_string(&exprs[3], "metric")?;
+            let s = strict_string_arg(&exprs[3], "pg_knn", "metric")?;
             s.parse::<DistanceMetric>()
                 .map_err(datafusion::error::DataFusionError::Plan)?
         };
 
         let k = extract_k(&exprs[4], "pg_knn")?;
 
+        // NULL means "no filter" (the pipeline placeholder); anything else
+        // that isn't a string literal is an error — the previous `.ok()`
+        // silently dropped a malformed filter, returning unfiltered rows.
         let inline_filter = if exprs.len() == 6 {
-            extract_string(&exprs[5], "filter").ok()
+            optional_string_arg(&exprs[5], "pg_knn", "filter")?
         } else {
             None
         };
@@ -433,6 +437,54 @@ mod tests {
         ));
         assert!(build_vector_fetch_sql(&expr).is_err());
     }
+
+    fn knn_args(filter: Expr) -> Vec<Expr> {
+        use datafusion::logical_expr::lit;
+        vec![
+            lit("items"),
+            lit("embedding"),
+            lit("placeholder"), // vector arg is resolved after the filter
+            lit("<->"),
+            lit(5i64),
+            filter,
+        ]
+    }
+
+    #[test]
+    fn malformed_inline_filter_is_an_error_not_silently_dropped() {
+        // A filter the planner can't read must fail the query — the old
+        // `.ok()` swallowed it and returned unfiltered rows.
+        use datafusion::logical_expr::lit;
+        let function = PgKnnTableFunction::new(Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )));
+        let err = function.call(&knn_args(lit(42i64))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pg_knn: 'filter' must be a string literal"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn null_inline_filter_means_no_filter() {
+        // NULL is the pipeline placeholder for "not provided": argument
+        // extraction passes and planning proceeds to the registry lookup
+        // (which fails here only because the test registry is empty).
+        let function = PgKnnTableFunction::new(Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )));
+        let err = function
+            .call(&knn_args(Expr::Literal(
+                datafusion::common::ScalarValue::Null,
+                None,
+            )))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found in registry"),
+            "NULL filter must not fail extraction; got {err}"
+        );
+    }
 }
 
 fn pg_type_to_arrow(
@@ -461,15 +513,5 @@ fn pg_type_to_arrow(
         "boolean" => DataType::Boolean,
         // Everything else (text, varchar, uuid, json, jsonb, timestamp, date, …)
         _ => DataType::Utf8,
-    }
-}
-
-// ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        _ => plan_err!("pg_knn: '{}' must be a string literal", name),
     }
 }
