@@ -39,6 +39,219 @@ impl S3Storage {
     pub fn new() -> Self {
         Self
     }
+
+    /// Reject `aws_*` credential/region keys in a source's `options` — these must
+    /// come from the environment / IAM, never from a config file.
+    fn reject_credential_options(source: &DataSource) -> Result<()> {
+        let Some(options) = &source.options else {
+            return Ok(());
+        };
+        let forbidden_keys = [
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "aws_region", // Also reject aws_region since it should come from env vars
+        ];
+        for key in &forbidden_keys {
+            if options.contains_key(*key) {
+                return Err(ConfigError::S3ObjectStoreRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!(
+                        "AWS configuration ('{}') must not be stored in configuration files. \
+                         Please use environment variables instead:\n\
+                         - Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for credentials\n\
+                         - Set AWS_REGION or AWS_DEFAULT_REGION for region configuration\n\
+                         - Or use AWS_PROFILE to specify an AWS credentials profile\n\
+                         - Or use IAM roles/instance profiles on AWS infrastructure",
+                        key
+                    ),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate S3 configuration for a `documents` source, where the source
+    /// `path` and the `image_store` option may **each independently** be a local
+    /// directory or an `s3://` prefix.
+    ///
+    /// - Rejects `aws_*` credential keys in `options` when *either* side is
+    ///   `s3://` (closing the gap where [`validate_configuration`] only fires for
+    ///   an `s3://` `path`, letting a local-`path` + `s3://`-`image_store` source
+    ///   smuggle credentials into `options`).
+    /// - When **both** are `s3://`, requires the **same bucket**: a single
+    ///   registered store / region / credential set cannot serve two buckets
+    ///   (see design doc §4). Cross-bucket support is a tracked follow-up.
+    ///
+    /// [`validate_configuration`]: RemoteStorage::validate_configuration
+    pub fn validate_documents_configuration(
+        &self,
+        path: &str,
+        image_store: Option<&str>,
+        source: &DataSource,
+    ) -> Result<()> {
+        let path_is_s3 = path.starts_with("s3://");
+        let image_is_s3 = image_store.is_some_and(|s| s.starts_with("s3://"));
+
+        if !path_is_s3 && !image_is_s3 {
+            return Ok(()); // fully local — nothing S3 to validate
+        }
+
+        // Once any side is S3, credentials must not live in config.
+        Self::reject_credential_options(source)?;
+
+        let path_bucket = if path_is_s3 {
+            Some(parse_bucket(path, &source.name)?)
+        } else {
+            None
+        };
+        let image_bucket = if image_is_s3 {
+            Some(parse_bucket(image_store.unwrap(), &source.name)?)
+        } else {
+            None
+        };
+
+        if let (Some(pb), Some(ib)) = (&path_bucket, &image_bucket) {
+            if pb != ib {
+                return Err(ConfigError::S3ObjectStoreRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!(
+                        "documents: `path` bucket '{pb}' and `image_store` bucket '{ib}' differ. \
+                         When both are s3://, they must be in the same bucket — a single object \
+                         store / region / credential set cannot serve two buckets. Cross-bucket \
+                         (cross-region/account) support is a tracked follow-up."
+                    ),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Registration-time reachability checks for a `documents` source's S3
+    /// endpoints (no-op for local paths):
+    ///
+    /// - **Read connectivity** — a *prefix-aware* `list` of the source `path`
+    ///   (the object `head` used for CSV/Parquet returns `NotFound` for a
+    ///   prefix). An empty-but-reachable prefix is OK; auth/network errors fail.
+    /// - **Write preflight** — put+delete a probe object under `image_store` so a
+    ///   missing `s3:PutObject` fails loudly here rather than silently dropping
+    ///   crops mid-scan.
+    pub async fn preflight_documents_s3(
+        &self,
+        path: &str,
+        image_store: Option<&str>,
+        source_name: &str,
+    ) -> Result<()> {
+        use object_store::PutPayload;
+        use object_store::path::Path as ObjectPath;
+
+        if path.starts_with("s3://") {
+            let bucket = parse_bucket(path, source_name)?;
+            let (store, region) = build_bucket_store(&bucket, source_name)?;
+            let prefix = s3_key_prefix(path);
+            let op = (!prefix.is_empty()).then(|| ObjectPath::from(prefix.as_str()));
+            store.list_with_delimiter(op.as_ref()).await.map_err(|e| {
+                ConfigError::S3ObjectStoreRegistrationFailed {
+                    name: source_name.to_string(),
+                    error: format!(
+                        "documents: S3 read connectivity check failed for '{}' (region '{}'): {}\n\
+                         Ensure s3:ListBucket + s3:GetObject on the bucket/prefix and that \
+                         credentials/region are configured via the environment.",
+                        path, region, e
+                    ),
+                }
+            })?;
+        }
+
+        if let Some(img) = image_store.filter(|s| s.starts_with("s3://")) {
+            let bucket = parse_bucket(img, source_name)?;
+            let (store, region) = build_bucket_store(&bucket, source_name)?;
+            let base = s3_key_prefix(img);
+            let probe_key = if base.is_empty() {
+                ".skardi-write-probe".to_string()
+            } else {
+                format!("{}/.skardi-write-probe", base.trim_end_matches('/'))
+            };
+            let probe = ObjectPath::from(probe_key);
+            store
+                .put(&probe, PutPayload::from_static(b"skardi-write-probe"))
+                .await
+                .map_err(|e| ConfigError::S3ObjectStoreRegistrationFailed {
+                    name: source_name.to_string(),
+                    error: format!(
+                        "documents: image_store write preflight failed for '{}' (region '{}'): {}\n\
+                         Ensure s3:PutObject on the image_store bucket/prefix.",
+                        img, region, e
+                    ),
+                })?;
+            // Best-effort cleanup — a leftover probe object is harmless.
+            let _ = store.delete(&probe).await;
+        }
+        Ok(())
+    }
+}
+
+/// Extract the bucket name from an `s3://bucket/key` URI.
+fn parse_bucket(s3_uri: &str, source_name: &str) -> Result<String> {
+    let url = url::Url::parse(s3_uri).map_err(|e| ConfigError::InvalidS3Path {
+        path: format!("Invalid S3 URL '{}': {}", s3_uri, e),
+    })?;
+    url.host_str()
+        .map(|h| h.to_string())
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            ConfigError::S3ObjectStoreRegistrationFailed {
+                name: source_name.to_string(),
+                error: format!("No bucket name found in S3 URL: {}", s3_uri),
+            }
+            .into()
+        })
+}
+
+/// The key/prefix portion of an `s3://bucket/key` URI (no leading `/`).
+fn s3_key_prefix(s3_uri: &str) -> String {
+    url::Url::parse(s3_uri)
+        .ok()
+        .map(|u| u.path().trim_start_matches('/').to_string())
+        .unwrap_or_default()
+}
+
+/// Build an S3 object store for `bucket` using env/IAM credentials and the
+/// `AWS_REGION`/`AWS_DEFAULT_REGION` region. Returns the store and the region
+/// (for error messages). Mirrors the credential contract of
+/// [`S3Storage::setup_object_store`].
+fn build_bucket_store(
+    bucket: &str,
+    source_name: &str,
+) -> Result<(Arc<dyn object_store::ObjectStore>, String)> {
+    use object_store::aws::AmazonS3Builder;
+
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .map_err(|_| ConfigError::MissingAwsConfig {
+            name: source_name.to_string(),
+            field: "AWS_REGION or AWS_DEFAULT_REGION environment variable".to_string(),
+        })?;
+
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err() && std::env::var("AWS_PROFILE").is_err() {
+        return Err(ConfigError::MissingAwsConfig {
+            name: source_name.to_string(),
+            field: "AWS_ACCESS_KEY_ID environment variable or AWS_PROFILE".to_string(),
+        }
+        .into());
+    }
+
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_region(&region)
+        .build()
+        .map_err(|e| ConfigError::S3ObjectStoreRegistrationFailed {
+            name: source_name.to_string(),
+            error: format!("Failed to build S3 object store for bucket '{}': {}", bucket, e),
+        })?;
+    Ok((Arc::new(store), region))
 }
 
 #[async_trait::async_trait]
@@ -63,32 +276,7 @@ impl RemoteStorage for S3Storage {
         }
 
         // Security check: Reject credentials in configuration file if options exist
-        if let Some(options) = &source.options {
-            let forbidden_keys = [
-                "aws_access_key_id",
-                "aws_secret_access_key",
-                "aws_session_token",
-                "aws_region", // Also reject aws_region since it should come from env vars
-            ];
-
-            for key in &forbidden_keys {
-                if options.contains_key(*key) {
-                    return Err(ConfigError::S3ObjectStoreRegistrationFailed {
-                        name: source.name.clone(),
-                        error: format!(
-                            "AWS configuration ('{}') must not be stored in configuration files. \
-                             Please use environment variables instead:\n\
-                             - Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for credentials\n\
-                             - Set AWS_REGION or AWS_DEFAULT_REGION for region configuration\n\
-                             - Or use AWS_PROFILE to specify an AWS credentials profile\n\
-                             - Or use IAM roles/instance profiles on AWS infrastructure",
-                            key
-                        ),
-                    }
-                    .into());
-                }
-            }
-        }
+        Self::reject_credential_options(source)?;
 
         tracing::debug!(
             "S3 configuration validated for data source: {}",
@@ -439,6 +627,105 @@ options:
         assert!(error.to_string().contains("AWS configuration"));
         assert!(error.to_string().contains("aws_region"));
         assert!(error.to_string().contains("environment variables"));
+    }
+
+    fn documents_source(yaml: &str) -> DataSource {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn documents_fully_local_needs_no_s3_validation() {
+        let s3 = S3Storage::new();
+        let src = documents_source(
+            r#"
+name: "docs"
+type: "documents"
+path: "/data/corpus"
+"#,
+        );
+        assert!(
+            s3.validate_documents_configuration("/data/corpus", Some("/data/crops"), &src)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn documents_same_bucket_ok_different_bucket_rejected() {
+        let s3 = S3Storage::new();
+        let src = documents_source(
+            r#"
+name: "docs"
+type: "documents"
+path: "s3://corpus-bucket/in/"
+"#,
+        );
+        // Same bucket for path + image_store → ok.
+        assert!(
+            s3.validate_documents_configuration(
+                "s3://corpus-bucket/in/",
+                Some("s3://corpus-bucket/crops/"),
+                &src
+            )
+            .is_ok()
+        );
+        // Different buckets → rejected with a clear message.
+        let err = s3
+            .validate_documents_configuration(
+                "s3://corpus-bucket/in/",
+                Some("s3://other-bucket/crops/"),
+                &src,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("same bucket"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn documents_rejects_credentials_when_only_image_store_is_s3() {
+        // The gap-closer: local `path` + s3 `image_store` must still reject
+        // aws_* keys in options (validate_configuration alone would skip this).
+        let s3 = S3Storage::new();
+        let src = documents_source(
+            r#"
+name: "docs"
+type: "documents"
+path: "/data/corpus"
+options:
+  image_store: "s3://crops-bucket/out/"
+  aws_secret_access_key: "should_be_rejected"
+"#,
+        );
+        let err = s3
+            .validate_documents_configuration(
+                "/data/corpus",
+                Some("s3://crops-bucket/out/"),
+                &src,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be stored in configuration files"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn documents_rejects_credentials_when_path_is_s3() {
+        let s3 = S3Storage::new();
+        let src = documents_source(
+            r#"
+name: "docs"
+type: "documents"
+path: "s3://corpus-bucket/in/"
+options:
+  aws_access_key_id: "nope"
+"#,
+        );
+        let err = s3
+            .validate_documents_configuration("s3://corpus-bucket/in/", None, &src)
+            .unwrap_err();
+        assert!(err.to_string().contains("AWS configuration"), "unexpected: {err}");
     }
 
     #[test]

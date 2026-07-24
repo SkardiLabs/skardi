@@ -6,11 +6,14 @@
 //! consumes the source's output through SQL, not this module.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use liteparse::config::ImageMode as LpImageMode;
+use liteparse::types::PdfInput;
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat};
+
+use super::blob::{BlobStore, Loc};
 
 /// How raster images on a page are surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,46 +228,60 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// Collect candidate files under `root`, honoring `recursive` + `include_globs`.
+/// List the documents to parse under `prefix`, honoring `recursive` +
+/// `include_globs`, and excluding anything under the `image_store` location so
+/// crops written by a prior scan are never re-ingested (self-ingestion guard).
 ///
-/// A missing/unreadable *root* is a configuration error (typo'd path, bad
-/// permissions) and fails the scan loudly rather than silently returning an
-/// empty corpus. Subdirectories hit during the recursive descent are more
-/// lenient (existing behavior): a permission error on one subdirectory logs
-/// a warning and is skipped rather than failing the whole scan.
-fn collect_files(root: &Path, opts: &ParseOptions) -> Result<Vec<PathBuf>> {
-    std::fs::read_dir(root)
-        .with_context(|| format!("documents: cannot read root directory {}", root.display()))?;
-
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("documents: cannot read dir {}: {}", dir.display(), e);
-                continue;
+/// Backed by [`BlobStore::list`]; a missing/unreadable local root fails the scan
+/// loudly (see `list_local`). Glob matching is on the entry's basename.
+async fn list_docs(
+    store: &BlobStore,
+    prefix: &Loc,
+    opts: &ParseOptions,
+    image_store: Option<&Loc>,
+) -> Result<Vec<(Loc, String)>> {
+    let entries = store.list(prefix, opts.recursive).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|(loc, rel)| {
+            let name = rel.rsplit('/').next().unwrap_or(rel);
+            if !matches_globs(name, &opts.include_globs) {
+                return false;
             }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if opts.recursive {
-                    stack.push(path);
+            if let Some(base) = image_store {
+                if loc_is_under(loc, base) {
+                    return false;
                 }
-                continue;
             }
-            let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if matches_globs(file_name, &opts.include_globs) {
-                out.push(path);
+            true
+        })
+        .collect())
+}
+
+/// Whether `entry` lives under the `base` location — used to exclude the
+/// `image_store` prefix from listing when it overlaps the source. Cross-backend
+/// (local vs S3) or cross-bucket pairs never overlap.
+fn loc_is_under(entry: &Loc, base: &Loc) -> bool {
+    match (entry, base) {
+        (Loc::Local(e), Loc::Local(b)) => e.starts_with(b),
+        (
+            Loc::S3 {
+                bucket: eb,
+                key: ek,
+            },
+            Loc::S3 {
+                bucket: bb,
+                key: bk,
+            },
+        ) => {
+            if eb != bb {
+                return false;
             }
+            let trimmed = bk.trim_end_matches('/');
+            trimmed.is_empty() || ek == trimmed || ek.starts_with(&format!("{trimmed}/"))
         }
+        _ => false,
     }
-    out.sort();
-    Ok(out)
 }
 
 /// Build the liteparse config for a parse run.
@@ -289,17 +306,19 @@ fn build_config(opts: &ParseOptions) -> LiteParseConfig {
     cfg
 }
 
-/// Parse a single file into its pages. Errors propagate to the caller, which
-/// isolates them per-file.
+/// Parse a single file (given its raw bytes) into its pages. Errors propagate to
+/// the caller, which isolates them per-file. `write_store` is the resolved
+/// `image_store` backend (present when `image_store` is configured); crops/page
+/// renders are written through it for both local and S3 targets.
+///
+/// Inputs are fed to liteparse as `PdfInput::Bytes`, so routing to LibreOffice
+/// for non-PDF inputs is by content sniff (see the design doc), not extension.
 async fn parse_file(
-    abs_path: &Path,
+    bytes: &[u8],
     rel_path: &str,
     opts: &ParseOptions,
+    write_store: Option<&BlobStore>,
 ) -> Result<Vec<ParsedPage>> {
-    let path_str = abs_path
-        .to_str()
-        .with_context(|| format!("non-UTF-8 path: {}", abs_path.display()))?;
-
     let mut cfg = build_config(opts);
 
     // OCR Auto: ask liteparse which pages need OCR and only enable it when at
@@ -308,10 +327,7 @@ async fn parse_file(
     // when no OCR engine is reachable — enabling OCR would hard-fail the parse.
     if matches!(opts.ocr, OcrMode::Auto) && ocr_engine_available(opts) {
         let probe = LiteParse::new(cfg.clone());
-        match probe
-            .is_complex(liteparse::types::PdfInput::Path(path_str.to_string()))
-            .await
-        {
+        match probe.is_complex(PdfInput::Bytes(bytes.to_vec())).await {
             Ok(stats) => {
                 if stats.iter().any(|s| s.needs_ocr) {
                     cfg.ocr_enabled = true;
@@ -325,11 +341,11 @@ async fn parse_file(
 
     let parser = LiteParse::new(cfg.clone());
     let result = parser
-        .parse(path_str)
+        .parse_input(PdfInput::Bytes(bytes.to_vec()))
         .await
         .with_context(|| format!("liteparse failed for {}", rel_path))?;
 
-    let file_type = file_type_for(abs_path);
+    let file_type = file_type_for(Path::new(rel_path));
     let doc_id = doc_id_for(rel_path);
 
     // Optionally render full-page images for `page_image_ref` (multimodal use,
@@ -338,12 +354,15 @@ async fn parse_file(
     // non-PDF inputs, same as parsing. Map page_num -> written/ref URI.
     let mut page_image_refs: HashMap<u32, String> = HashMap::new();
     if opts.render_page_images {
-        match parser.screenshot(path_str, None).await {
+        match parser
+            .screenshot_input(PdfInput::Bytes(bytes.to_vec()), None)
+            .await
+        {
             Ok(shots) => {
                 for shot in shots {
                     let uri = page_image_uri(opts.image_store.as_deref(), rel_path, shot.page_num);
-                    if let Some(store) = opts.image_store.as_deref() {
-                        if let Err(e) = write_image_crop(store, &uri, &shot.image_bytes) {
+                    if let Some(store) = write_store {
+                        if let Err(e) = write_crop(store, &uri, &shot.image_bytes).await {
                             tracing::warn!(
                                 "documents: failed to write page image {}: {:#}",
                                 uri,
@@ -383,26 +402,23 @@ async fn parse_file(
         // `image_store` is configured we also write the crop bytes there and
         // record only the refs for crops we could materialize.
         let image_refs: Vec<String> = if opts.image_mode == ImageMode::Embedded {
-            result
+            let mut refs = Vec::new();
+            for img in result
                 .images
                 .iter()
                 .filter(|img| img.page as usize == page.page_number)
-                .filter_map(|img| {
-                    let uri =
-                        image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id, &img.format);
-                    if let Some(store) = opts.image_store.as_deref() {
-                        if let Err(e) = write_image_crop(store, &uri, &img.bytes) {
-                            tracing::warn!(
-                                "documents: failed to write image crop {}: {:#}",
-                                uri,
-                                e
-                            );
-                            return None;
-                        }
+            {
+                let uri =
+                    image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id, &img.format);
+                if let Some(store) = write_store {
+                    if let Err(e) = write_crop(store, &uri, &img.bytes).await {
+                        tracing::warn!("documents: failed to write image crop {}: {:#}", uri, e);
+                        continue;
                     }
-                    Some(uri)
-                })
-                .collect()
+                }
+                refs.push(uri);
+            }
+            refs
         } else {
             Vec::new()
         };
@@ -450,22 +466,12 @@ fn page_image_uri(store: Option<&str>, rel_path: &str, page: u32) -> String {
     }
 }
 
-/// Write an extracted image crop to a local `image_store`. Remote stores
-/// (`s3://…`, etc.) are not written here in v1 — the ref is still recorded so a
-/// later object-store pass can upload (spec §7 open item). Returns `Ok` for the
-/// remote-store no-op so the ref is kept.
-fn write_image_crop(store: &str, uri: &str, bytes: &[u8]) -> Result<()> {
-    if store.contains("://") {
-        // Remote object store: defer the actual upload.
-        return Ok(());
-    }
-    let path = Path::new(uri);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating image_store dir {}", parent.display()))?;
-    }
-    std::fs::write(path, bytes).with_context(|| format!("writing image crop {}", uri))?;
-    Ok(())
+/// Write an extracted image crop / page render to the resolved `image_store`
+/// backend. The ref URI is parsed into a [`Loc`] and handed to
+/// [`BlobStore::put`], so both local and S3 targets perform a real write.
+async fn write_crop(store: &BlobStore, uri: &str, bytes: &[u8]) -> Result<()> {
+    let loc = Loc::parse(uri).with_context(|| format!("parsing image_store uri {uri}"))?;
+    store.put(&loc, bytes).await
 }
 
 /// Lift GFM pipe tables out of page markdown into a JSON array. Each table is
@@ -544,29 +550,62 @@ pub fn parse_source(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPage>> 
 }
 
 /// The actual blocking parse loop, run on a thread that owns a tokio runtime.
+///
+/// The read `path` and write `image_store` backends are resolved **here**, on
+/// this thread, so any S3 `object_store` client is built on the same runtime it
+/// is polled from (avoids reqwest connection-pool cross-runtime hazards).
 fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPage>> {
-    let root_path = Path::new(root);
-    let files = collect_files(root_path, opts)?;
+    let (read_store, prefix_loc) =
+        BlobStore::resolve(root).with_context(|| format!("documents: resolving source path {root}"))?;
+
+    let (write_store, image_base) = match opts.image_store.as_deref() {
+        Some(s) => {
+            let (ws, loc) = BlobStore::resolve(s)
+                .with_context(|| format!("documents: resolving image_store {s}"))?;
+            (Some(ws), Some(loc))
+        }
+        None => (None, None),
+    };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime for documents parse")?;
 
-    let mut rows = Vec::new();
-    for file in files {
-        let rel_path = file
-            .strip_prefix(root_path)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+    let entries =
+        runtime.block_on(list_docs(&read_store, &prefix_loc, opts, image_base.as_ref()))?;
+    let total = entries.len();
 
-        match runtime.block_on(parse_file(&file, &rel_path, opts)) {
-            Ok(mut page_rows) => rows.append(&mut page_rows),
+    let mut rows = Vec::new();
+    let mut ok_files = 0usize;
+    for (loc, rel_path) in entries {
+        let bytes = match runtime.block_on(read_store.get(&loc)) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("documents: fetch failed for {}: {:#}", rel_path, e);
+                continue;
+            }
+        };
+        match runtime.block_on(parse_file(&bytes, &rel_path, opts, write_store.as_ref())) {
+            Ok(mut page_rows) => {
+                ok_files += 1;
+                rows.append(&mut page_rows);
+            }
             Err(e) => {
                 tracing::warn!("documents: skipping {}: {:#}", rel_path, e);
             }
         }
+    }
+
+    // Wholesale-failure guard: a non-empty listing where *every* object failed to
+    // fetch/parse (e.g. credentials expired after listing) is a hard error, not a
+    // silent empty result that looks like an empty corpus. An empty listing
+    // (total == 0) stays a valid, currently-empty corpus.
+    if total > 0 && ok_files == 0 {
+        anyhow::bail!(
+            "documents: all {total} matched object(s) failed to fetch/parse — treating as a \
+             hard error rather than an empty result (check credentials/permissions)"
+        );
     }
 
     Ok(rows)
@@ -796,30 +835,113 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collect_files_recurses_into_subdirectories_when_enabled() {
+    #[tokio::test]
+    async fn list_docs_filters_by_glob_and_respects_recursive() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("top.pdf"), b"x").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), b"x").unwrap();
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("nested.pdf"), b"x").unwrap();
+
+        let store = BlobStore::Local;
+        let prefix = Loc::Local(dir.path().to_path_buf());
 
         let opts = ParseOptions {
             recursive: true,
             include_globs: vec!["*.pdf".into()],
             ..ParseOptions::default()
         };
-        let files = collect_files(dir.path(), &opts).unwrap();
-        assert_eq!(files.len(), 2);
+        let rels: Vec<String> = list_docs(&store, &prefix, &opts, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(rels, vec!["sub/nested.pdf", "top.pdf"]); // .txt filtered out
 
-        let opts_non_recursive = ParseOptions {
+        let opts_flat = ParseOptions {
             recursive: false,
-            include_globs: vec!["*.pdf".into()],
+            ..opts.clone()
+        };
+        let rels: Vec<String> = list_docs(&store, &prefix, &opts_flat, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(rels, vec!["top.pdf"]);
+    }
+
+    #[tokio::test]
+    async fn list_docs_excludes_image_store_prefix() {
+        // A crop written under a nested image_store must not be re-ingested.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.pdf"), b"x").unwrap();
+        let crops = dir.path().join("crops");
+        std::fs::create_dir(&crops).unwrap();
+        std::fs::write(crops.join("a.pdf_img0.png"), b"x").unwrap();
+
+        let store = BlobStore::Local;
+        let prefix = Loc::Local(dir.path().to_path_buf());
+        let image_store = Loc::Local(crops.clone());
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into(), "*.png".into()],
             ..ParseOptions::default()
         };
-        let files = collect_files(dir.path(), &opts_non_recursive).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].file_name().unwrap(), "top.pdf");
+
+        // Without exclusion the crop would appear; with it, only the source doc.
+        let with_excl: Vec<String> = list_docs(&store, &prefix, &opts, Some(&image_store))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(with_excl, vec!["a.pdf"]);
+
+        let without_excl: Vec<String> = list_docs(&store, &prefix, &opts, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(without_excl, vec!["a.pdf", "crops/a.pdf_img0.png"]);
+    }
+
+    #[test]
+    fn loc_is_under_matches_backends() {
+        // Local nesting.
+        assert!(loc_is_under(
+            &Loc::Local("/root/crops/x.png".into()),
+            &Loc::Local("/root/crops".into())
+        ));
+        assert!(!loc_is_under(
+            &Loc::Local("/root/a.pdf".into()),
+            &Loc::Local("/root/crops".into())
+        ));
+        // S3 same bucket, prefix-scoped.
+        let e = |k: &str| Loc::S3 {
+            bucket: "b".into(),
+            key: k.into(),
+        };
+        assert!(loc_is_under(&e("corpus/crops/x.png"), &e("corpus/crops")));
+        assert!(!loc_is_under(&e("corpus/a.pdf"), &e("corpus/crops")));
+        // Different bucket / backend never overlap.
+        assert!(!loc_is_under(
+            &Loc::S3 {
+                bucket: "b1".into(),
+                key: "k".into()
+            },
+            &Loc::S3 {
+                bucket: "b2".into(),
+                key: "k".into()
+            }
+        ));
+        assert!(!loc_is_under(
+            &Loc::Local("/x".into()),
+            &e("corpus")
+        ));
     }
 
     #[test]
@@ -855,19 +977,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_image_crop_writes_local_file() {
+    #[tokio::test]
+    async fn write_crop_writes_local_file() {
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/sub/crop_p1_0.png", dir.path().display());
-        write_image_crop(dir.path().to_str().unwrap(), &uri, b"\x89PNGfake").unwrap();
-        let written = std::fs::read(&uri).unwrap();
-        assert_eq!(written, b"\x89PNGfake");
-    }
-
-    #[test]
-    fn write_image_crop_skips_remote_store() {
-        // Remote stores are a no-op (deferred upload) but must not error.
-        write_image_crop("s3://bucket/prefix", "s3://bucket/prefix/x.png", b"data").unwrap();
+        write_crop(&BlobStore::Local, &uri, b"\x89PNGfake")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&uri).unwrap(), b"\x89PNGfake");
     }
 
     #[test]

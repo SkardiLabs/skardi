@@ -4,6 +4,7 @@
 //! into queryable `(file, page)` rows via the pure-Rust `liteparse` crate.
 //! Everything here is behind the `documents` Cargo feature.
 
+mod blob;
 mod parse;
 mod table;
 

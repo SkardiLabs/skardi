@@ -9350,6 +9350,7 @@ dependencies = [
  "mysql_async",
  "ndarray 0.17.2",
  "num_cpus",
+ "object_store",
  "ort",
  "percent-encoding",
  "pgvector",
