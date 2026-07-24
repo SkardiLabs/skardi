@@ -33,6 +33,14 @@
 //!   contract, and this pack has not been validated against one. The
 //!   bundled fixtures (see tests) are the build-time conversion contract;
 //!   pins land when the pack is validated against a live catalog.
+//!   Operational consequence until then: incompatible upstream drift (a
+//!   removed required field, a mapped field changing type) is caught only
+//!   at scan time as a terminal `ConversionFailed` — for every query on
+//!   the table, since conversion builds all declared columns before
+//!   projection — and bindings deliberately cannot patch schemas, so the
+//!   fix is a pack version bump. Follow-up: validate against a live
+//!   gateway (endpoint-contract check included) and pin the fingerprints
+//!   so drift fails fast at registration instead.
 
 use datafusion::logical_expr::Operator;
 
