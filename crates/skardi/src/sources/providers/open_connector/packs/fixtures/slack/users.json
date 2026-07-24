@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "members": [
+    {
+      "id": "U0001",
+      "team_id": "T0001",
+      "name": "ada",
+      "deleted": false,
+      "real_name": "Ada Lovelace",
+      "tz": "Europe/London",
+      "profile": {
+        "display_name": "ada",
+        "real_name": "Ada Lovelace",
+        "email": "ada@acme.example",
+        "image_72": "https://files.example/ada.png"
+      },
+      "is_admin": true,
+      "is_bot": false,
+      "updated": 1735689600
+    },
+    {
+      "id": "U0002",
+      "team_id": "T0001",
+      "name": "deploybot",
+      "deleted": false,
+      "real_name": "Deploy Bot",
+      "profile": { "display_name": "" },
+      "is_admin": false,
+      "is_bot": true,
+      "updated": 1735776000
+    },
+    {
+      "id": "U0003",
+      "team_id": "T0001",
+      "name": "former.employee",
+      "deleted": true,
+      "profile": { "display_name": "former" },
+      "is_bot": false,
+      "updated": 1704067200
+    }
+  ],
+  "response_metadata": { "next_cursor": "" }
+}

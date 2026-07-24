@@ -2,3 +2,4 @@
 
 pub mod github;
 pub mod mock;
+pub mod slack;

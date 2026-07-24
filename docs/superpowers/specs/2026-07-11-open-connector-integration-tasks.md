@@ -156,7 +156,28 @@ event carrying the scan identity and error.
       command and output executed against the real server before being written down;
       a final section documents the real-gateway path and flags it as pending live
       validation (same caveat as the fingerprint pins).
-- [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
+- [x] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users,
+      and files, per the design's Slack caveat — message/thread tables stay gated on upstream
+      complete message-cursor handling and are explicitly documented as absent. Cursor
+      pagination (`cursor` / `$.response_metadata.next_cursor`, `limit` 200) terminates on
+      both end-of-collection spellings (empty-string cursor and absent `response_metadata`)
+      and fails as `PaginationLoop` on a non-advancing gateway; `files` uses Slack's classic
+      `page`/`count` pagination. `types=public_channel,private_channel` pinned on
+      conversations (the `state=all` move); `files.user_id =` → `user` pushed Inexact per the
+      string-push rule; `files.created >=` → `ts_from` deliberately NOT mapped (Slack takes
+      epoch seconds; the filter engine renders timestamps as RFC 3339 only). New engine
+      support: `FieldType::TimestampSecondsUtc` (Slack's epoch-second `created`/`updated` —
+      the millis reader would silently produce 1970 dates). No fingerprint pins yet, same
+      live-validation follow-up as GitHub.
+
+      **Verification**: 212 open_connector tests (32 new): per-table fixture contract tests
+      (nested `topic.value`/`profile.*`, scope-gated `email`, deleted users, empty channel
+      lists, Slack's empty-string convention, epoch-seconds columns, empty pages); e2e via
+      mock gateway — multi-page cursor scan (no cursor on page 1, token afterwards, `limit`
+      hint + `types` pin on every request), both termination spellings, pagination-loop
+      detection bounded at the first repeated cursor, LIMIT early stop, empty workspace,
+      `user_id` pushed and re-applied against an ignoring provider, multi-table binding with
+      zero required resources, UDTF parity for `slack.users`.
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
 

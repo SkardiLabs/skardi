@@ -35,6 +35,12 @@ pub enum FieldType {
     Utf8,
     /// RFC 3339 string or epoch-millis number ↔ Arrow Timestamp(Millisecond, UTC).
     TimestampMillisUtc,
+    /// JSON integer epoch **seconds** ↔ Arrow Timestamp(Millisecond, UTC).
+    /// For Slack-style APIs whose `created` / `updated` fields are whole
+    /// seconds — reading those through [`FieldType::TimestampMillisUtc`]
+    /// would silently misparse them as millis (dates in January 1970).
+    /// Strictly integers: fractional or string values fail with their kind.
+    TimestampSecondsUtc,
     /// JSON array of strings ↔ Arrow List\<Utf8\>.
     Utf8List,
     /// JSON array of objects, each contributing the string under the given
@@ -57,7 +63,7 @@ impl FieldType {
             Self::UInt64 => DataType::UInt64,
             Self::Float64 => DataType::Float64,
             Self::Utf8 | Self::Json => DataType::Utf8,
-            Self::TimestampMillisUtc => {
+            Self::TimestampMillisUtc | Self::TimestampSecondsUtc => {
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
             }
             Self::Utf8List | Self::Utf8ListFromObjectKey(_) => {
@@ -74,6 +80,7 @@ impl FieldType {
             Self::Float64 => "number",
             Self::Utf8 => "string",
             Self::TimestampMillisUtc => "RFC 3339 timestamp or epoch millis",
+            Self::TimestampSecondsUtc => "epoch-seconds timestamp",
             Self::Utf8List => "array of strings",
             Self::Utf8ListFromObjectKey(_) => "array of objects each carrying a string key",
             Self::Json => "any JSON value",
@@ -293,6 +300,15 @@ impl RowConverter {
                     &cells,
                     spec,
                     parse_timestamp,
+                    fail,
+                )?)
+                .with_timezone("UTC"),
+            )),
+            FieldType::TimestampSecondsUtc => Ok(Arc::new(
+                TimestampMillisecondArray::from(collect_cells(
+                    &cells,
+                    spec,
+                    |v| v.as_i64().and_then(|seconds| seconds.checked_mul(1000)),
                     fail,
                 )?)
                 .with_timezone("UTC"),
@@ -821,6 +837,58 @@ mod tests {
             .downcast_ref::<TimestampMillisecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1767225600000);
+    }
+
+    #[test]
+    fn epoch_seconds_convert_to_millis_and_reject_other_shapes() {
+        // Slack-style `created`/`updated` are whole epoch seconds; the
+        // seconds variant scales to millis, and anything that is not an
+        // integer fails with its kind — a fractional or string timestamp
+        // must never be misread.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "created",
+            path: "created",
+            field_type: FieldType::TimestampSecondsUtc,
+            nullable: true,
+        }])
+        .unwrap();
+
+        let batch = converter
+            .convert(
+                &[
+                    serde_json::json!({"created": 1735689600}), // 2025-01-01T00:00:00Z
+                    serde_json::json!({"created": null}),
+                    serde_json::json!({}),
+                ],
+                1,
+            )
+            .unwrap();
+        let created = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(created.value(0), 1_735_689_600_000);
+        assert!(created.is_null(1), "JSON null stays NULL");
+        assert!(created.is_null(2), "absent key stays NULL");
+
+        for (bad, found) in [
+            (serde_json::json!({"created": 1735689600.5}), "number"),
+            (
+                serde_json::json!({"created": "2025-01-01T00:00:00Z"}),
+                "string",
+            ),
+        ] {
+            let err = converter.convert(&[bad], 1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
+                        if f == found && expected == "epoch-seconds timestamp"
+                ),
+                "got {err}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "channels": [
+    {
+      "id": "C0001",
+      "name": "general",
+      "is_channel": true,
+      "is_private": false,
+      "is_archived": false,
+      "is_general": true,
+      "is_shared": false,
+      "is_member": true,
+      "creator": "U0001",
+      "num_members": 42,
+      "topic": { "value": "Company-wide announcements", "creator": "U0001", "last_set": 1735689600 },
+      "purpose": { "value": "This channel is for workspace-wide communication." },
+      "created": 1735689600,
+      "unlinked": 0
+    },
+    {
+      "id": "C0002",
+      "name": "eng-private",
+      "is_private": true,
+      "is_archived": false,
+      "is_member": true,
+      "creator": "U0002",
+      "topic": { "value": "" },
+      "created": 1735776000
+    },
+    {
+      "id": "C0003",
+      "name": "old-project",
+      "is_private": false,
+      "is_archived": true,
+      "is_general": false,
+      "num_members": 0,
+      "topic": { "value": "Archived 2025" },
+      "purpose": { "value": "" },
+      "created": 1704067200
+    }
+  ],
+  "response_metadata": { "next_cursor": "" }
+}

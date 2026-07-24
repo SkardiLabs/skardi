@@ -99,6 +99,10 @@ impl SourcePackRegistry {
             super::packs::github::GITHUB_PACK.name,
             &super::packs::github::GITHUB_PACK,
         );
+        packs.insert(
+            super::packs::slack::SLACK_PACK.name,
+            &super::packs::slack::SLACK_PACK,
+        );
         Self { packs }
     }
 
@@ -282,7 +286,7 @@ mod tests {
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
         let registry = SourcePackRegistry::builtins();
-        for name in ["mock", "github"] {
+        for name in ["mock", "github", "slack"] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for table in pack.tables {
