@@ -305,10 +305,15 @@ impl RowConverter {
                 .with_timezone("UTC"),
             )),
             FieldType::TimestampSecondsUtc => Ok(Arc::new(
-                TimestampMillisecondArray::from(collect_cells(
+                TimestampMillisecondArray::from(collect_cells_described(
                     &cells,
                     spec,
-                    |v| v.as_i64().and_then(|seconds| seconds.checked_mul(1000)),
+                    |v| {
+                        let seconds = v.as_i64().ok_or_else(|| json_kind(v).to_string())?;
+                        seconds.checked_mul(1000).ok_or_else(|| {
+                            "an epoch second out of range for millisecond timestamps".to_string()
+                        })
+                    },
                     fail,
                 )?)
                 .with_timezone("UTC"),
@@ -428,7 +433,8 @@ impl RowConverter {
 }
 
 /// Project `cells` through `convert`, mapping JSON null to Arrow null for
-/// nullable fields and failing otherwise.
+/// nullable fields and failing otherwise — for the common case where a type
+/// mismatch is the only failure mode, described by the value's JSON kind.
 fn collect_cells<T, F, E>(
     cells: &[Option<&Value>],
     spec: &ColumnSpec,
@@ -437,6 +443,27 @@ fn collect_cells<T, F, E>(
 ) -> Result<Vec<Option<T>>, OpenConnectorError>
 where
     F: Fn(&Value) -> Option<T>,
+    E: Fn(usize, &str) -> OpenConnectorError,
+{
+    collect_cells_described(
+        cells,
+        spec,
+        |value| convert(value).ok_or_else(|| json_kind(value).to_string()),
+        fail,
+    )
+}
+
+/// [`collect_cells`] with converter-described failures, for conversions
+/// with more than one failure mode — an out-of-range epoch second must not
+/// masquerade as "found: number" when the value *is* a number.
+fn collect_cells_described<T, F, E>(
+    cells: &[Option<&Value>],
+    spec: &ColumnSpec,
+    convert: F,
+    fail: E,
+) -> Result<Vec<Option<T>>, OpenConnectorError>
+where
+    F: Fn(&Value) -> Result<T, String>,
     E: Fn(usize, &str) -> OpenConnectorError,
 {
     let mut out = Vec::with_capacity(cells.len());
@@ -451,8 +478,8 @@ where
                 }
             }
             Some(value) => match convert(value) {
-                Some(converted) => out.push(Some(converted)),
-                None => return Err(fail(index, json_kind(value))),
+                Ok(converted) => out.push(Some(converted)),
+                Err(found) => return Err(fail(index, &found)),
             },
         }
     }
@@ -877,6 +904,12 @@ mod tests {
             (
                 serde_json::json!({"created": "2025-01-01T00:00:00Z"}),
                 "string",
+            ),
+            // Overflow is its own diagnosis — "found: number" would
+            // contradict the expected type, which is also a number.
+            (
+                serde_json::json!({"created": i64::MAX}),
+                "an epoch second out of range for millisecond timestamps",
             ),
         ] {
             let err = converter.convert(&[bad], 1).unwrap_err();
