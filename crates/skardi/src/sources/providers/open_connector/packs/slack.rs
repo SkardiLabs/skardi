@@ -996,7 +996,22 @@ bindings:
         // One binding exposes all three tables (no required resources — a
         // pack first), and the query UDTF returns exactly the bound table.
         let gateway = MockGateway::start(workspace_gateway).await;
-        let ctx = setup(&gateway, "users, files", "SKARDI_TEST_OC_SLACK_MULTI").await;
+        let ctx = setup(
+            &gateway,
+            "conversations, users, files",
+            "SKARDI_TEST_OC_SLACK_MULTI",
+        )
+        .await;
+
+        // All three tables registered under the binding schema.
+        let mut tables = ctx
+            .catalog("saas")
+            .expect("gateway catalog")
+            .schema("ws")
+            .expect("binding schema")
+            .table_names();
+        tables.sort();
+        assert_eq!(tables, vec!["conversations", "files", "users"]);
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.users WHERE is_bot").await;
         assert_eq!(rows_of(&batches), 1);
