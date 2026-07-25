@@ -28,6 +28,10 @@ pub enum FixedValue {
     Float(f64),
     /// JSON boolean.
     Bool(bool),
+    /// JSON array of strings — e.g. Slack's `types:
+    /// ["public_channel", "private_channel"]`, whose action schema takes an
+    /// array, not a comma-joined string.
+    StrList(&'static [&'static str]),
 }
 
 impl FixedValue {
@@ -38,6 +42,9 @@ impl FixedValue {
             Self::Int(value) => serde_json::Value::from(*value),
             Self::Float(value) => serde_json::Value::from(*value),
             Self::Bool(value) => serde_json::Value::from(*value),
+            Self::StrList(items) => {
+                serde_json::Value::from(items.iter().map(|s| *s).collect::<Vec<_>>())
+            }
         }
     }
 }
@@ -219,6 +226,10 @@ mod tests {
         assert_eq!(FixedValue::Int(-3).to_json(), serde_json::json!(-3));
         assert_eq!(FixedValue::Float(2.5).to_json(), serde_json::json!(2.5));
         assert_eq!(FixedValue::Bool(true).to_json(), serde_json::json!(true));
+        assert_eq!(
+            FixedValue::StrList(&["public_channel", "private_channel"]).to_json(),
+            serde_json::json!(["public_channel", "private_channel"])
+        );
     }
 
     #[test]

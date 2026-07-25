@@ -67,9 +67,14 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         fidelity: Fidelity::Exact,
         value_format: ValueFormat::Rfc3339,
     }],
+    // The synthetic pack models the in-band error mechanism (an `error`
+    // key in otherwise-2xx action output fails the scan as a provider
+    // error); the real packs so far don't need it — Open Connector's
+    // GitHub executor throws and its Slack executor consumes `ok:false`
+    // itself, so in-band errors never reach their action output.
+    error_path: Some("$.error"),
     // The mock gateway's action schema is test-controlled, so no fingerprint
     // is pinned; real packs pin one.
-    error_path: None,
     expected_fingerprint: None,
 };
 

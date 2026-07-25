@@ -1,43 +1,37 @@
 {
-  "ok": true,
-  "members": [
+  "users": [
     {
-      "id": "U0001",
-      "team_id": "T0001",
-      "name": "ada",
-      "deleted": false,
-      "real_name": "Ada Lovelace",
-      "tz": "Europe/London",
-      "profile": {
-        "display_name": "ada",
-        "real_name": "Ada Lovelace",
-        "email": "ada@acme.example",
-        "image_72": "https://files.example/ada.png"
-      },
-      "is_admin": true,
-      "is_bot": false,
-      "updated": 1735689600
+      "userId": "U0001",
+      "username": "ada",
+      "realName": "Ada Lovelace",
+      "displayName": "ada",
+      "isBot": false,
+      "isDeleted": false,
+      "isAdmin": true,
+      "isOwner": true,
+      "locale": "en-GB"
     },
     {
-      "id": "U0002",
-      "team_id": "T0001",
-      "name": "deploybot",
-      "deleted": false,
-      "real_name": "Deploy Bot",
-      "profile": { "display_name": "" },
-      "is_admin": false,
-      "is_bot": true,
-      "updated": 1735776000
+      "userId": "U0002",
+      "username": "deploybot",
+      "realName": "Deploy Bot",
+      "displayName": "",
+      "isBot": true,
+      "isDeleted": false,
+      "isAdmin": false,
+      "isOwner": false
     },
     {
-      "id": "U0003",
-      "team_id": "T0001",
-      "name": "former.employee",
-      "deleted": true,
-      "profile": { "display_name": "former" },
-      "is_bot": false,
-      "updated": 1704067200
+      "userId": "U0003",
+      "username": "former.employee",
+      "realName": null,
+      "displayName": "former",
+      "isBot": false,
+      "isDeleted": true,
+      "isAdmin": null,
+      "isOwner": null,
+      "locale": "en-US"
     }
   ],
-  "response_metadata": { "next_cursor": "" }
+  "nextCursor": null
 }

@@ -1,55 +1,75 @@
 //! Slack source pack: stable relational contracts over the Open Connector
 //! `slack.*` read actions (OAuth bot token, cursor pagination).
 //!
+//! **The wire contract is Open Connector's, not Slack's raw Web API.**
+//! Unlike the GitHub executors (raw passthrough), OC's Slack executors
+//! normalize: conversation and user rows are rebuilt with camelCase fields
+//! (`channelId`, `isArchived`, `realName`, …), the next cursor moves from
+//! Slack's `response_metadata.next_cursor` to a top-level `nextCursor`
+//! (`null` at end-of-collection), row arrays live under `conversations` /
+//! `users` (not `channels` / `members`), and Slack's in-band `ok:false` /
+//! `error` envelope is consumed by the executor and surfaced as a gateway
+//! failure envelope — it never appears in action output. File rows are the
+//! raw Slack file object *plus* normalized aliases (`fileId`,
+//! `urlPrivate`), so raw fields like epoch-seconds `created` survive.
+//! Everything below is reconciled against a live gateway (v1.3.1) and the
+//! OC provider source.
+//!
 //! Design decisions, per the integration design spec and the source-pack
 //! admission gate:
 //!
-//! - **Cursor pagination for conversations and users** — Slack's
-//!   `cursor` / `response_metadata.next_cursor` contract, the pagination
-//!   mode this pack exists to validate. Termination is complete on both of
-//!   Slack's end-of-collection spellings: a final page carrying
-//!   `next_cursor: ""` and a final page with no `response_metadata` at all.
-//!   The engine's repeated-cursor detection turns a non-advancing gateway
-//!   into a targeted `PaginationLoop` error instead of an infinite scan.
-//!   `files` uses Slack's classic `page`/`count` pagination — that endpoint
-//!   never adopted cursors — terminated by the envelope's authoritative
-//!   `paging.pages`, not the short-page heuristic: permission filtering can
-//!   legally shorten non-final pages, which the heuristic would misread as
-//!   end-of-collection and silently truncate.
+//! - **Cursor pagination for conversations and users** — `cursor` in,
+//!   top-level `nextCursor` out, the pagination mode this pack exists to
+//!   validate. Termination is complete on both end-of-collection
+//!   spellings: a final page carrying `nextCursor: null` (what the OC
+//!   executor emits) and a final page omitting the key entirely. The
+//!   engine's repeated-cursor detection turns a non-advancing gateway into
+//!   a targeted `PaginationLoop` error instead of an infinite scan.
+//!   `files` uses Slack's classic `page`/`count` pagination — that
+//!   endpoint never adopted cursors — terminated by the envelope's
+//!   authoritative `paging.pages`, not the short-page heuristic:
+//!   permission filtering can legally shorten non-final pages, which the
+//!   heuristic would misread as end-of-collection and silently truncate.
 //! - **`types` is pinned on conversations** so the table reads as every
-//!   channel the bot can see (`public_channel,private_channel`), not
-//!   Slack's public-only default — the `state=all` move from the GitHub
-//!   pack. IMs and MPIMs are deliberately out: they have no name and belong
-//!   to a message-shaped table, not a channels table.
-//! - **Filters are allowlisted only where faithful.** `files.user_id` maps
-//!   to the `user` query parameter as [`Fidelity::Inexact`], per the
+//!   channel the bot can see (`["public_channel", "private_channel"]` —
+//!   the action schema takes an array, `additionalProperties: false`
+//!   strict), not Slack's public-only default — the `state=all` move from
+//!   the GitHub pack. IMs and MPIMs are deliberately out: they have no
+//!   name and belong to a message-shaped table, not a channels table.
+//! - **`includeLocale` is pinned on users** so the `locale` column the
+//!   normalized contract declares is actually populated — Slack omits the
+//!   field without the flag, which would leave a permanently NULL column.
+//! - **Filters are allowlisted only where faithful.** `files.user_id`
+//!   maps to the `userId` input as [`Fidelity::Inexact`], per the
 //!   module-wide string-push rule (an Exact claim would lean on the
-//!   provider rejecting unknown user IDs instead of silently returning its
-//!   default listing). `files.created >=` maps to `ts_from` with
-//!   [`ValueFormat::EpochSeconds`] — Slack takes epoch seconds there, not
-//!   the RFC 3339 default, and the format is declared on the mapping so no
-//!   pack can silently send the wrong spelling. `ts_from` is inclusive and
-//!   a lower bound, so the flooring render stays a superset under Inexact
-//!   re-filtering.
-//! - **Timestamps are epoch seconds** (`created`, `updated`), read through
-//!   [`FieldType::TimestampSecondsUtc`] — the millis reader would silently
-//!   produce January-1970 dates.
+//!   provider rejecting unknown user IDs instead of silently returning
+//!   its default listing). The previous `created >= → ts_from` push is
+//!   **gone**: OC's `slack.list_files` contract declares no time input at
+//!   all, and its strict schema would 400 any request carrying one — time
+//!   predicates are evaluated by DataFusion after the bounded fetch.
+//! - **`files.created` is epoch seconds**, read through
+//!   [`FieldType::TimestampSecondsUtc`] — the millis reader would
+//!   silently produce January-1970 dates. (The normalized conversation
+//!   and user rows carry no timestamps at all.)
+//! - **`files` may be scoped to one channel** with the optional
+//!   `channelId` resource — declared as an optional resource so a shared
+//!   binding's key reaches only this table.
 //! - **No message or thread tables**, per the design's Slack caveat:
 //!   Open Connector does not yet provide complete message-history cursor
 //!   handling, and an incomplete message table would violate the admission
 //!   gate's complete-pagination requirement. They land in a later pack
 //!   version once upstream support exists; until then `open_connector_scan`
 //!   can reach allowlisted read actions ad hoc.
-//! - **Nullability is conservative**: only `id` is non-null on every table.
-//!   Slack leans on empty strings rather than nulls (`topic.value: ""`),
-//!   which surface as empty strings, not NULL; genuinely absent keys
-//!   (e.g. `num_members` on some shapes) become NULL.
-//! - **`users.email` requires the `users:read.email` bot scope**; without
-//!   it Slack omits the field and the column is NULL. Deleted users stay in
-//!   the table with `deleted = true`, matching `users.list`.
+//! - **Nullability is conservative**: only `id` is non-null on every
+//!   table. The normalizer emits explicit `null`s for absent strings and
+//!   booleans and *omits* `memberCount` when Slack didn't send a number;
+//!   both surface as SQL NULL. Slack's empty-string convention
+//!   (`topic: ""`) stays an empty string, never NULL. Deleted users stay
+//!   in the table with `deleted = true`, matching `users.list`.
 //! - **No fingerprint pins yet** (`expected_fingerprint: None`) — same
-//!   rationale, operational consequence, and live-validation follow-up as
-//!   the GitHub pack (see the comment block in `github.rs`).
+//!   rationale and operational consequence as the GitHub pack (see the
+//!   comment block in `github.rs`); like GitHub, the action IDs, input
+//!   keys, and row paths here are live-reconciled, the pins are not.
 
 use datafusion::logical_expr::Operator;
 
@@ -60,187 +80,176 @@ use crate::sources::providers::open_connector::source_pack::{
     FixedValue, SourcePack, SourcePackTable,
 };
 
-/// Slack cursor pagination: `cursor` in, `response_metadata.next_cursor`
-/// out, 200 rows per page (Slack's recommended ceiling).
+/// Slack cursor pagination through Open Connector: `cursor` in, top-level
+/// `nextCursor` out (`null` at end-of-collection), 200 rows per page
+/// (Slack's recommended ceiling, sent as the `limit` input).
 const SLACK_CURSOR_PAGINATION: PaginationStrategy = PaginationStrategy::Cursor {
     cursor_param: "cursor",
-    next_cursor_path: "$.response_metadata.next_cursor",
+    next_cursor_path: "$.nextCursor",
     page_size_param: Some("limit"),
     page_size: 200,
 };
 
 /// Channels the bot can see (public, plus private ones it is a member of).
+/// Rows are Open Connector's normalized conversation shape, not Slack's
+/// raw `conversations.list` objects.
 static CONVERSATIONS: SourcePackTable = SourcePackTable {
     id: "slack.conversations",
     action_id: "slack.list_conversations",
-    row_path: "$.channels",
+    row_path: "$.conversations",
     fields: &[
         FieldMapping {
             name: "id",
-            path: "id",
+            path: "channelId",
             field_type: FieldType::Utf8,
             nullable: false,
         },
         FieldMapping {
             name: "name",
             path: "name",
+            field_type: FieldType::Utf8,
+            nullable: true,
+        },
+        // The normalizer's classification: public_channel / private_channel
+        // (im/mpim never appear here — the types pin excludes them).
+        FieldMapping {
+            name: "type",
+            path: "type",
             field_type: FieldType::Utf8,
             nullable: true,
         },
         FieldMapping {
             name: "is_private",
-            path: "is_private",
+            path: "isPrivate",
             field_type: FieldType::Boolean,
             nullable: true,
         },
         FieldMapping {
             name: "is_archived",
-            path: "is_archived",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_general",
-            path: "is_general",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_shared",
-            path: "is_shared",
+            path: "isArchived",
             field_type: FieldType::Boolean,
             nullable: true,
         },
         FieldMapping {
             name: "is_member",
-            path: "is_member",
+            path: "isMember",
             field_type: FieldType::Boolean,
             nullable: true,
         },
+        // Omitted (not null) by the normalizer when Slack sends no number.
         FieldMapping {
-            name: "creator",
-            path: "creator",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "num_members",
-            path: "num_members",
+            name: "member_count",
+            path: "memberCount",
             field_type: FieldType::UInt64,
             nullable: true,
         },
         FieldMapping {
             name: "topic",
-            path: "topic.value",
+            path: "topic",
             field_type: FieldType::Utf8,
             nullable: true,
         },
         FieldMapping {
             name: "purpose",
-            path: "purpose.value",
+            path: "purpose",
             field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created",
-            path: "created",
-            field_type: FieldType::TimestampSecondsUtc,
             nullable: true,
         },
     ],
     pagination: SLACK_CURSOR_PAGINATION,
     required_resources: &[],
+    optional_resources: &[],
     // Slack lists public channels only by default; pin both channel kinds so
     // the table reads as the complete collection the bot can see. IMs/MPIMs
-    // are message-shaped and deliberately out of a channels table.
-    fixed_inputs: &[("types", FixedValue::Str("public_channel,private_channel"))],
+    // are message-shaped and deliberately out of a channels table. The
+    // action schema takes an array of enum strings.
+    fixed_inputs: &[(
+        "types",
+        FixedValue::StrList(&["public_channel", "private_channel"]),
+    )],
     filters: &[],
-    // Slack reports application errors in-band (HTTP 200, `ok: false`).
-    error_path: Some("$.error"),
+    // Slack's in-band ok:false envelope is consumed by the OC executor and
+    // surfaced as a gateway failure — it never reaches action output.
+    error_path: None,
     expected_fingerprint: None,
 };
 
 /// Workspace members, including bots and deleted users (`deleted = true`).
+/// Rows are Open Connector's normalized user shape — profile fields are
+/// already flattened (`realName`, `displayName`), and Slack extras the
+/// normalizer drops (email, tz, team_id, updated) are not part of the
+/// contract.
 static USERS: SourcePackTable = SourcePackTable {
     id: "slack.users",
     action_id: "slack.list_users",
-    row_path: "$.members",
+    row_path: "$.users",
     fields: &[
         FieldMapping {
             name: "id",
-            path: "id",
+            path: "userId",
             field_type: FieldType::Utf8,
             nullable: false,
         },
         FieldMapping {
-            name: "team_id",
-            path: "team_id",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
             name: "name",
-            path: "name",
+            path: "username",
             field_type: FieldType::Utf8,
             nullable: true,
         },
         FieldMapping {
             name: "real_name",
-            path: "real_name",
+            path: "realName",
             field_type: FieldType::Utf8,
             nullable: true,
         },
         FieldMapping {
             name: "display_name",
-            path: "profile.display_name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        // NULL without the `users:read.email` bot scope (Slack omits the
-        // field entirely).
-        FieldMapping {
-            name: "email",
-            path: "profile.email",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "tz",
-            path: "tz",
+            path: "displayName",
             field_type: FieldType::Utf8,
             nullable: true,
         },
         FieldMapping {
             name: "is_bot",
-            path: "is_bot",
+            path: "isBot",
             field_type: FieldType::Boolean,
             nullable: true,
         },
         FieldMapping {
             name: "is_admin",
-            path: "is_admin",
+            path: "isAdmin",
+            field_type: FieldType::Boolean,
+            nullable: true,
+        },
+        FieldMapping {
+            name: "is_owner",
+            path: "isOwner",
             field_type: FieldType::Boolean,
             nullable: true,
         },
         FieldMapping {
             name: "deleted",
-            path: "deleted",
+            path: "isDeleted",
             field_type: FieldType::Boolean,
             nullable: true,
         },
+        // Populated only because includeLocale is pinned below — Slack
+        // omits the field without the flag.
         FieldMapping {
-            name: "updated",
-            path: "updated",
-            field_type: FieldType::TimestampSecondsUtc,
+            name: "locale",
+            path: "locale",
+            field_type: FieldType::Utf8,
             nullable: true,
         },
     ],
     pagination: SLACK_CURSOR_PAGINATION,
     required_resources: &[],
-    fixed_inputs: &[],
+    optional_resources: &[],
+    // Without the flag Slack omits locale entirely and the declared column
+    // would be permanently NULL.
+    fixed_inputs: &[("includeLocale", FixedValue::Bool(true))],
     filters: &[],
-    // Slack reports application errors in-band (HTTP 200, `ok: false`).
-    error_path: Some("$.error"),
+    // In-band errors are consumed by the OC executor (see CONVERSATIONS).
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -330,31 +339,28 @@ static FILES: SourcePackTable = SourcePackTable {
         total_pages_path: Some("$.paging.pages"),
     },
     required_resources: &[],
+    // A binding may scope the listing to one channel; declared here so a
+    // shared binding's channelId reaches only this table.
+    optional_resources: &["channelId"],
     fixed_inputs: &[],
     filters: &[
         // Inexact per the string-push rule: user IDs are arbitrary strings,
         // and an Exact claim would lean on the provider rejecting unknown
-        // ones.
+        // ones. The OC input key is userId (camelCase, strict schema).
+        //
+        // No time filter is mapped: the OC list_files contract declares no
+        // ts_from/ts_to inputs, and its strict schema would 400 a request
+        // carrying one. Time predicates run in DataFusion.
         FilterMapping {
             column: "user_id",
             operator: Operator::Eq,
-            input_field: "user",
+            input_field: "userId",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::Rfc3339,
         },
-        // Slack's ts_from takes epoch seconds and is inclusive
-        // (created-at-or-after) — a lower bound, so EpochSeconds' flooring
-        // only widens the fetch, and Inexact re-filtering trims it back.
-        FilterMapping {
-            column: "created",
-            operator: Operator::GtEq,
-            input_field: "ts_from",
-            fidelity: Fidelity::Inexact,
-            value_format: ValueFormat::EpochSeconds,
-        },
     ],
-    // Slack reports application errors in-band (HTTP 200, `ok: false`).
-    error_path: Some("$.error"),
+    // In-band errors are consumed by the OC executor (see CONVERSATIONS).
+    error_path: None,
     expected_fingerprint: None,
 };
 
@@ -373,7 +379,7 @@ mod tests {
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err, envelope_ok,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -431,58 +437,60 @@ mod tests {
     }
 
     #[test]
-    fn conversations_fixture_converts_with_nested_and_absent_fields() {
+    fn conversations_fixture_converts_with_null_and_absent_fields() {
         let batch = convert_fixture(
             &CONVERSATIONS,
             include_str!("fixtures/slack/conversations.json"),
         );
         assert_eq!(batch.num_rows(), 3);
 
+        // The normalized shape: channelId feeds the id column.
         let ids = utf8(&batch, "id");
         assert_eq!(ids.value(0), "C0001");
+        assert_eq!(utf8(&batch, "type").value(1), "private_channel");
 
-        // Nested topic.value; Slack's empty-string convention stays an
-        // empty string, never NULL.
+        // Slack's empty-string convention stays an empty string, never NULL.
         let topics = utf8(&batch, "topic");
         assert_eq!(topics.value(0), "Company-wide announcements");
         assert_eq!(topics.value(1), "");
 
-        // Absent keys become NULL: purpose on row 2, num_members on row 2,
-        // creator on row 3, is_general on row 2.
+        // The normalizer emits explicit nulls for absent strings/booleans
+        // (purpose, isMember) and OMITS memberCount without a number —
+        // both must land as SQL NULL.
         assert!(utf8(&batch, "purpose").is_null(1));
-        assert!(
-            batch
-                .column_by_name("num_members")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .is_null(1)
-        );
-        assert!(utf8(&batch, "creator").is_null(2));
-        assert!(boolean(&batch, "is_general").is_null(1));
+        assert!(boolean(&batch, "is_member").is_null(2));
+        let member_counts = batch
+            .column_by_name("member_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert!(member_counts.is_null(1), "omitted memberCount is NULL");
+        assert_eq!(member_counts.value(0), 42);
         assert!(boolean(&batch, "is_private").value(1));
-
-        // Epoch seconds scaled to millis.
-        assert_eq!(timestamp(&batch, "created").value(0), 1_735_689_600_000);
     }
 
     #[test]
-    fn users_fixture_converts_with_scope_gated_and_deleted_rows() {
+    fn users_fixture_converts_with_flattened_profile_and_deleted_rows() {
         let batch = convert_fixture(&USERS, include_str!("fixtures/slack/users.json"));
         assert_eq!(batch.num_rows(), 3);
 
-        // Email present only where the users:read.email scope exposed it.
-        let emails = utf8(&batch, "email");
-        assert_eq!(emails.value(0), "ada@acme.example");
-        assert!(emails.is_null(1), "bot profile has no email field");
-        assert!(emails.is_null(2), "deleted profile has no email field");
+        // The normalized shape is already flat: userId/username/realName.
+        assert_eq!(utf8(&batch, "id").value(0), "U0001");
+        assert_eq!(utf8(&batch, "name").value(1), "deploybot");
+        assert_eq!(utf8(&batch, "real_name").value(0), "Ada Lovelace");
+        assert!(utf8(&batch, "real_name").is_null(2), "explicit null");
 
         assert!(boolean(&batch, "is_bot").value(1));
+        assert!(boolean(&batch, "is_owner").value(0));
         assert!(boolean(&batch, "deleted").value(2));
-        assert!(utf8(&batch, "tz").is_null(2), "deleted users lose tz");
+        assert!(boolean(&batch, "is_admin").is_null(2), "explicit null");
         assert_eq!(utf8(&batch, "display_name").value(1), "");
-        assert_eq!(timestamp(&batch, "updated").value(2), 1_704_067_200_000);
+
+        // locale rides only with the includeLocale pin; a row without it
+        // (the bot) is NULL.
+        assert_eq!(utf8(&batch, "locale").value(0), "en-GB");
+        assert!(utf8(&batch, "locale").is_null(1));
     }
 
     #[test]
@@ -504,6 +512,9 @@ mod tests {
         );
 
         assert_eq!(utf8(&batch, "user_id").value(0), "U0001");
+        // Raw Slack epoch seconds survive the normalizer's spread and are
+        // scaled to millis by TimestampSecondsUtc.
+        assert_eq!(timestamp(&batch, "created").value(0), 1_735_689_600_000);
         assert!(utf8(&batch, "title").is_null(1));
         assert!(utf8(&batch, "mimetype").is_null(2));
         assert!(
@@ -522,9 +533,9 @@ mod tests {
     #[test]
     fn empty_pages_preserve_every_table_schema() {
         for (table, empty) in [
-            (&CONVERSATIONS, r#"{"ok":true,"channels":[]}"#),
-            (&USERS, r#"{"ok":true,"members":[]}"#),
-            (&FILES, r#"{"ok":true,"files":[]}"#),
+            (&CONVERSATIONS, r#"{"conversations":[],"nextCursor":null}"#),
+            (&USERS, r#"{"users":[],"nextCursor":null}"#),
+            (&FILES, r#"{"files":[],"paging":{"pages":0}}"#),
         ] {
             let batch = convert_fixture(table, empty);
             assert_eq!(batch.num_rows(), 0);
@@ -555,10 +566,12 @@ mod tests {
     /// How the stub ends (or refuses to end) its cursor sequence.
     #[derive(Clone, Copy, PartialEq)]
     enum Terminal {
-        /// Final page carries `next_cursor: ""` (Slack's usual spelling).
-        EmptyCursor,
-        /// Final page omits `response_metadata` entirely.
-        NoMetadata,
+        /// Final page carries `nextCursor: null` — what the OC executor
+        /// emits at end-of-collection.
+        NullCursor,
+        /// Final page omits `nextCursor` entirely (a lenient reading of
+        /// the same contract).
+        Omitted,
         /// Every page returns the same cursor — a non-advancing gateway.
         Stuck,
     }
@@ -575,12 +588,9 @@ mod tests {
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                        "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations/execute" {
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
                 let input = body.get("input").cloned().unwrap_or_default();
                 let start = input
@@ -590,35 +600,37 @@ mod tests {
                     .and_then(|n| n.parse::<usize>().ok())
                     .unwrap_or(0);
                 let slice: Vec<Value> = rows.iter().skip(start).take(2).cloned().collect();
-                let mut output = json!({"ok": true, "channels": slice});
+                let mut output = json!({"conversations": slice});
                 let next = start + 2;
                 match terminal {
                     Terminal::Stuck => {
-                        output["response_metadata"] = json!({"next_cursor": "cur-stuck"});
+                        output["nextCursor"] = json!("cur-stuck");
                     }
-                    Terminal::EmptyCursor => {
-                        let cursor = if next < rows.len() {
-                            format!("cur-{next}")
+                    Terminal::NullCursor => {
+                        output["nextCursor"] = if next < rows.len() {
+                            json!(format!("cur-{next}"))
                         } else {
-                            String::new()
+                            Value::Null
                         };
-                        output["response_metadata"] = json!({"next_cursor": cursor});
                     }
-                    Terminal::NoMetadata => {
+                    Terminal::Omitted => {
                         if next < rows.len() {
-                            output["response_metadata"] =
-                                json!({"next_cursor": format!("cur-{next}")});
+                            output["nextCursor"] = json!(format!("cur-{next}"));
                         }
                     }
                 }
-                return MockResponse::ok(&json!({"output": output}).to_string());
+                return MockResponse::ok(&envelope_ok(&output.to_string()));
             }
             MockResponse::new(404, "{}")
         }
     }
 
     fn channel(id: usize) -> Value {
-        json!({"id": format!("C{id:04}"), "name": format!("chan-{id}"), "created": 1735689600})
+        json!({
+            "channelId": format!("C{id:04}"),
+            "name": format!("chan-{id}"),
+            "type": "public_channel"
+        })
     }
 
     /// Register `saas` with the given binding tables against `gateway`.
@@ -696,13 +708,13 @@ bindings:
     }
 
     #[tokio::test]
-    async fn cursor_scan_paginates_and_terminates_on_the_empty_cursor() {
-        // 5 channels at 2 per stub page → 3 pages, ended by `next_cursor:
-        // ""`. The first request carries no cursor; every later one carries
-        // the stub's token; the `limit` hint and the `types` pin ride every
-        // request.
+    async fn cursor_scan_paginates_and_terminates_on_the_null_cursor() {
+        // 5 channels at 2 per stub page → 3 pages, ended by `nextCursor:
+        // null` (the OC executor's end-of-collection spelling). The first
+        // request carries no cursor; every later one carries the stub's
+        // token; the `limit` hint and the `types` pin ride every request.
         let rows: Vec<Value> = (1..=5).map(channel).collect();
-        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::EmptyCursor)).await;
+        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::NullCursor)).await;
         let ctx = setup(&gateway, "conversations", "SKARDI_TEST_OC_SLACK_CURSOR").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.conversations ORDER BY id").await;
@@ -726,18 +738,19 @@ bindings:
         for input in &inputs {
             assert_eq!(input["limit"], 200, "page-size hint: {input}");
             assert_eq!(
-                input["types"], "public_channel,private_channel",
-                "the types pin rides every request: {input}"
+                input["types"],
+                json!(["public_channel", "private_channel"]),
+                "the types pin rides every request as the schema's array: {input}"
             );
         }
     }
 
     #[tokio::test]
-    async fn cursor_scan_terminates_when_response_metadata_is_absent() {
-        // Slack's other end-of-collection spelling: no response_metadata at
-        // all on the final page.
+    async fn cursor_scan_terminates_when_next_cursor_is_absent() {
+        // The lenient spelling of the same contract: the final page omits
+        // `nextCursor` entirely.
         let rows: Vec<Value> = (1..=3).map(channel).collect();
-        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::NoMetadata)).await;
+        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::Omitted)).await;
         let ctx = setup(&gateway, "conversations", "SKARDI_TEST_OC_SLACK_NOMETA").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.conversations").await;
@@ -774,7 +787,7 @@ bindings:
     #[tokio::test]
     async fn limit_stops_cursor_pagination_early() {
         let rows: Vec<Value> = (1..=5).map(channel).collect();
-        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::EmptyCursor)).await;
+        let gateway = MockGateway::start(conversations_gateway(rows, Terminal::NullCursor)).await;
         let ctx = setup(&gateway, "conversations", "SKARDI_TEST_OC_SLACK_LIMIT").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.conversations LIMIT 2").await;
@@ -812,23 +825,26 @@ bindings:
     }
 
     #[tokio::test]
-    async fn in_band_slack_error_surfaces_the_provider_code() {
-        // Slack reports application errors as HTTP 200 + ok:false + error.
-        // The user must see Slack's own code — not the misleading
-        // RowPathNotFound the missing `channels` array would raise.
+    async fn slack_ok_false_arrives_as_the_gateway_failure_it_becomes() {
+        // Slack reports application errors as HTTP 200 + ok:false + error —
+        // but the OC executor consumes that envelope and the gateway
+        // returns a *failure* envelope with a provider-derived message.
+        // The user must see that message, not a row-path error. (The
+        // pack-level error_path mechanism stays for providers whose
+        // executors pass in-band errors through; Slack's does not, so
+        // these tables declare none — see the mock-pack test for the
+        // engine feature itself.)
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                        "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations/execute" {
-                return MockResponse::ok(
-                    &json!({"output": {"ok": false, "error": "missing_scope"}}).to_string(),
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
+                return MockResponse::new(
+                    502,
+                    &envelope_err("provider_error", "slack error: missing_scope"),
                 );
             }
             MockResponse::new(404, "{}")
@@ -857,7 +873,7 @@ bindings:
     #[tokio::test]
     async fn empty_workspace_yields_an_empty_scan() {
         let gateway =
-            MockGateway::start(conversations_gateway(Vec::new(), Terminal::EmptyCursor)).await;
+            MockGateway::start(conversations_gateway(Vec::new(), Terminal::NullCursor)).await;
         let ctx = setup(&gateway, "conversations", "SKARDI_TEST_OC_SLACK_EMPTY").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.conversations").await;
@@ -866,35 +882,32 @@ bindings:
     }
 
     /// Stub for users + files alongside conversations: users cursor-paged
-    /// in one page; files classic-paged, IGNORING the pushed `user` filter
-    /// (the Inexact contract's hostile-provider case).
+    /// in one page; files classic-paged, IGNORING the pushed `userId`
+    /// filter (the Inexact contract's hostile-provider case).
     fn workspace_gateway(req: &RecordedRequest) -> MockResponse {
         if req.method == "GET" && req.path == "/v1/health" {
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-            return MockResponse::ok(
-                r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                    "locally_executable": true, "connection_aliases": []}"#,
-            );
+            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
         }
-        if req.method == "POST" && req.path == "/v1/actions/slack.list_users/execute" {
-            return MockResponse::ok(
-                &json!({"output": {"ok": true, "members": [
-                    {"id": "U0001", "name": "ada", "is_bot": false},
-                    {"id": "U0002", "name": "deploybot", "is_bot": true}
-                ], "response_metadata": {"next_cursor": ""}}})
+        if req.method == "POST" && req.path == "/v1/actions/slack.list_users" {
+            return MockResponse::ok(&envelope_ok(
+                &json!({"users": [
+                    {"userId": "U0001", "username": "ada", "isBot": false},
+                    {"userId": "U0002", "username": "deploybot", "isBot": true}
+                ], "nextCursor": null})
                 .to_string(),
-            );
+            ));
         }
-        if req.method == "POST" && req.path == "/v1/actions/slack.list_files/execute" {
-            return MockResponse::ok(
-                &json!({"output": {"ok": true, "files": [
+        if req.method == "POST" && req.path == "/v1/actions/slack.list_files" {
+            return MockResponse::ok(&envelope_ok(
+                &json!({"files": [
                     {"id": "F0001", "user": "U0001", "name": "roadmap.pdf"},
                     {"id": "F0002", "user": "U0002", "name": "notes.txt"}
-                ], "paging": {"count": 100, "total": 2, "page": 1, "pages": 1}}})
+                ], "paging": {"count": 100, "total": 2, "page": 1, "pages": 1}})
                 .to_string(),
-            );
+            ));
         }
         MockResponse::new(404, "{}")
     }
@@ -918,8 +931,10 @@ bindings:
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
         assert!(
-            bodies.iter().all(|body| body.contains(r#""user":"U0001""#)),
-            "the predicate is pushed as Slack's user parameter: {bodies:?}"
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""userId":"U0001""#)),
+            "the predicate is pushed as OC's userId input: {bodies:?}"
         );
         assert!(
             bodies.iter().all(|body| body.contains(r#""count":100"#)),
@@ -928,35 +943,32 @@ bindings:
     }
 
     #[tokio::test]
-    async fn created_predicate_pushes_epoch_seconds_and_keeps_the_boundary_row() {
-        // ts_from goes out as whole epoch seconds — never the RFC 3339
-        // default — and the stub ignores it entirely (the harshest legal
-        // Inexact provider): DataFusion re-applies the predicate, keeping
-        // the boundary row and trimming older ones.
+    async fn created_predicate_is_evaluated_locally_and_never_pushed() {
+        // Negative-space guard: OC's list_files contract declares no time
+        // input (its strict schema would 400 one), so a `created`
+        // predicate must run in DataFusion — correct rows out, and no
+        // invented time key in any request.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                        "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/slack.list_files/execute" {
-                return MockResponse::ok(
-                    &json!({"output": {"ok": true, "files": [
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_files" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"files": [
                         {"id": "F0001", "created": 1735689599},
                         {"id": "F0002", "created": 1735689600},
                         {"id": "F0003", "created": 1735689601}
-                    ], "paging": {"count": 100, "total": 3, "page": 1, "pages": 1}}})
+                    ], "paging": {"count": 100, "total": 3, "page": 1, "pages": 1}})
                     .to_string(),
-                );
+                ));
             }
             MockResponse::new(404, "{}")
         })
         .await;
-        let ctx = setup(&gateway, "files", "SKARDI_TEST_OC_SLACK_TSFROM").await;
+        let ctx = setup(&gateway, "files", "SKARDI_TEST_OC_SLACK_TSLOCAL").await;
 
         let batches = collect(
             &ctx,
@@ -967,17 +979,21 @@ bindings:
         assert_eq!(
             ids_of(&batches),
             vec!["F0002", "F0003"],
-            "boundary row F0002 stays, F0001 is re-filtered out"
+            "the boundary row stays; the older row is filtered locally"
         );
 
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
-        assert!(
-            bodies
-                .iter()
-                .all(|body| body.contains(r#""ts_from":1735689600"#)),
-            "pushed as whole epoch seconds, not RFC 3339: {bodies:?}"
-        );
+        for body in &bodies {
+            let input =
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"].clone();
+            assert!(
+                input.get("ts_from").is_none()
+                    && input.get("tsFrom").is_none()
+                    && input.get("created").is_none(),
+                "no time key may reach the strict schema: {input}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1003,12 +1019,9 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                        "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/slack.list_files/execute" {
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_files" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
                 let page = body
                     .get("input")
@@ -1016,11 +1029,11 @@ bindings:
                     .and_then(Value::as_u64)
                     .unwrap_or(1) as usize;
                 let slice = pages.get(page - 1).cloned().unwrap_or_default();
-                return MockResponse::ok(
-                    &json!({"output": {"ok": true, "files": slice,
-                        "paging": {"count": 100, "total": 5, "page": page, "pages": 3}}})
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"files": slice,
+                        "paging": {"count": 100, "total": 5, "page": page, "pages": 3}})
                     .to_string(),
-                );
+                ));
             }
             MockResponse::new(404, "{}")
         })

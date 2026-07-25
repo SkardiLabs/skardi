@@ -612,6 +612,66 @@ bindings:
     }
 
     #[tokio::test]
+    async fn in_band_error_key_fails_the_scan_as_a_provider_error() {
+        // The mock pack declares `error_path: $.error` — the engine's
+        // in-band error mechanism for providers whose gateway executors
+        // pass application errors through inside 2xx action output. The
+        // scan must fail naming the provider's own code and the action,
+        // never the misleading row-path error the missing row array would
+        // raise.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&envelope_ok(r#"{"error": "missing_scope"}"#));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_INBAND_ERROR";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(token_env, 0)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let err = ctx
+            .sql("SELECT id FROM saas.ws.items")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("the in-band error must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing_scope") && message.contains("mock.list_items"),
+            "the provider's own code and the action are named: {message}"
+        );
+        assert!(
+            !message.contains("row path"),
+            "never the misleading row-path error: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn scan_deadline_bounds_retry_waits() {
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {

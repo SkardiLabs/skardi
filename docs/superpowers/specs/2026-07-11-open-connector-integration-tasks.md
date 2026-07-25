@@ -158,29 +158,41 @@ event carrying the scan identity and error.
       validation (same caveat as the fingerprint pins).
 - [x] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users,
       and files, per the design's Slack caveat — message/thread tables stay gated on upstream
-      complete message-cursor handling and are explicitly documented as absent. Cursor
-      pagination (`cursor` / `$.response_metadata.next_cursor`, `limit` 200) terminates on
-      both end-of-collection spellings (empty-string cursor and absent `response_metadata`)
-      and fails as `PaginationLoop` on a non-advancing gateway; `files` uses Slack's classic
-      `page`/`count` pagination terminated by the envelope's authoritative `paging.pages`
-      (a `total_pages_path` extension to `PageNumber` — short non-final pages, legal under
-      permission filtering, never truncate; missing/non-numeric totals fail loudly). `types=public_channel,private_channel` pinned on
-      conversations (the `state=all` move); `files.user_id =` → `user` pushed Inexact per the
-      string-push rule; `files.created >=` → `ts_from` pushed Inexact as epoch seconds via
-      the new per-mapping `ValueFormat` (Rfc3339 default / EpochSeconds — declared on the
-      mapping so a pack can never silently send a timestamp in the wrong provider spelling;
-      flooring is lower-bound-only by documented rule). New engine
-      support: `FieldType::TimestampSecondsUtc` (Slack's epoch-second `created`/`updated` —
-      the millis reader would silently produce 1970 dates). No fingerprint pins yet, same
-      live-validation follow-up as GitHub.
+      complete message-cursor handling and are explicitly documented as absent. The wire
+      contract is Open Connector's normalized one, reconciled against a live gateway
+      (v1.3.1) and the OC provider source: camelCase rows (`channelId`, `realName`, …),
+      row arrays under `conversations`/`users`, top-level `nextCursor` (null at end), and
+      Slack's in-band `ok:false` consumed by the executor (so the tables declare no
+      `error_path`; the engine mechanism is modeled by the mock pack). Cursor pagination
+      (`cursor` / `$.nextCursor`, `limit` 200) terminates on both end-of-collection
+      spellings (null cursor and absent key) and fails as `PaginationLoop` on a
+      non-advancing gateway; `files` uses Slack's classic `page`/`count` pagination
+      terminated by the envelope's authoritative `paging.pages` (a `total_pages_path`
+      extension to `PageNumber` — short non-final pages, legal under permission filtering,
+      never truncate; missing/non-numeric totals fail loudly).
+      `types: ["public_channel","private_channel"]` pinned on conversations as the schema's
+      array (the `state=all` move, via the new `FixedValue::StrList`); `includeLocale`
+      pinned on users so the declared `locale` column is populated; `files.user_id =` →
+      `userId` pushed Inexact per the string-push rule; **no time filter is pushed** — the
+      OC `list_files` contract declares no `ts_from` input and its strict schema would 400
+      one, so `created` predicates run in DataFusion (the engine's per-mapping
+      `ValueFormat` stays for future packs). Engine support:
+      `FieldType::TimestampSecondsUtc` (Slack's epoch-second `files.created` — the millis
+      reader would silently produce 1970 dates); `files` optionally scopes to one channel
+      via the `channelId` optional resource. No fingerprint pins yet, same follow-up as
+      GitHub. Live-verified: all three tables' generated inputs pass the gateway's strict
+      action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 219 open_connector tests (20 new, review-round fixes included; counted by `cargo test -p skardi --lib sources::providers::open_connector` against the 5.1 branch point): per-table fixture contract tests
-      (nested `topic.value`/`profile.*`, scope-gated `email`, deleted users, empty channel
-      lists, Slack's empty-string convention, epoch-seconds columns, empty pages); e2e via
-      mock gateway — multi-page cursor scan (no cursor on page 1, token afterwards, `limit`
-      hint + `types` pin on every request), both termination spellings, pagination-loop
-      detection bounded at the first repeated cursor, LIMIT early stop, empty workspace,
-      `user_id` pushed and re-applied against an ignoring provider, multi-table binding with
+      **Verification**: 224 open_connector tests (counted by `cargo test -p skardi --lib
+      sources::providers::open_connector`): per-table fixture contract tests against the
+      normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
+      deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty
+      pages); e2e via mock gateway speaking the real envelope — multi-page cursor scan (no
+      cursor on page 1, token afterwards, `limit` hint + `types` array pin on every
+      request), both termination spellings, pagination-loop detection bounded at the first
+      repeated cursor, LIMIT early stop, empty workspace, `userId` pushed and re-applied
+      against an ignoring provider, the negative-space guard that no time key ever reaches
+      the wire, gateway-failure surfacing of Slack's `ok:false`, multi-table binding with
       zero required resources, UDTF parity for `slack.users`.
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
