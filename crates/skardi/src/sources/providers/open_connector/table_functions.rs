@@ -439,7 +439,7 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::register_open_connector_tables;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::prelude::CsvReadOptions;
@@ -449,14 +449,7 @@ mod tests {
     /// read-only classification and an output schema matching the items the
     /// mock gateway serves.
     fn discovery_response(read_only: Option<bool>, output_schema: &str) -> String {
-        let read_only = match read_only {
-            Some(flag) => format!(r#""read_only": {flag},"#),
-            None => String::new(),
-        };
-        format!(
-            r#"{{"input_schema": {{}}, "output_schema": {output_schema},
-                "locally_executable": true, {read_only} "connection_aliases": ["work"]}}"#
-        )
+        discovery_ok("{}", output_schema, true, read_only)
     }
 
     /// Output schema describing the mock item rows.
@@ -508,7 +501,7 @@ mod tests {
         if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
             return MockResponse::ok(&discovery_response(read_only, output_schema));
         }
-        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             let input = body.get("input").cloned().unwrap_or_default();
             let page = input
@@ -527,9 +520,9 @@ mod tests {
                 .skip((page - 1) * 2)
                 .take(2)
                 .collect();
-            return MockResponse::ok(
-                &serde_json::json!({ "output": { "items": slice } }).to_string(),
-            );
+            return MockResponse::ok(&envelope_ok(
+                &serde_json::json!({ "items": slice }).to_string(),
+            ));
         }
         MockResponse::new(404, "{}")
     }
@@ -669,7 +662,7 @@ raw_action_allowlist:
         assert!(
             executes
                 .iter()
-                .all(|r| r.header("x-openconnector-connection-alias").as_deref() == Some("work")),
+                .all(|r| r.header("x-oo-connector-alias").as_deref() == Some("work")),
             "explicit connection alias sent on every execute"
         );
     }
@@ -874,14 +867,14 @@ raw_action_allowlist:
             if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
                 return MockResponse::ok(&discovery_response(Some(true), ITEMS_OUTPUT_SCHEMA));
             }
-            if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
-                return MockResponse::ok(
-                    &serde_json::json!({"output": {"items": [
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&envelope_ok(
+                    &serde_json::json!({"items": [
                         {"id": 1, "name": "tagged", "tags": ["t1"]},
                         {"id": 2, "name": "untagged", "tags": null}
-                    ]}})
+                    ]})
                     .to_string(),
-                );
+                ));
             }
             MockResponse::new(404, "{}")
         })

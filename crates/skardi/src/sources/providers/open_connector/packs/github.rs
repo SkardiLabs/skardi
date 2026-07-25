@@ -22,27 +22,28 @@
 //!   *after* the date — strictly-after cannot guarantee a superset of a
 //!   `>=` predicate (the boundary row would be unrecoverable), so it is
 //!   deliberately **not** mapped, exactly like the mock pack's `>=` note.
-//! - **`issues` includes pull requests**, because GitHub's issues endpoint
-//!   does. The stable schema exposes the `pull_request` marker as an opaque
-//!   nullable JSON column: `WHERE pull_request IS NULL` selects pure
-//!   issues.
+//! - **`issues` is pure issues.** GitHub's raw issues endpoint mixes pull
+//!   requests in, but the Open Connector action filters them out before
+//!   returning (`"Pull requests are filtered out from the response"`), so
+//!   the table declares no `pull_request` marker column — it could never
+//!   be non-NULL. Pull requests live in their own table.
 //! - **Nullability is conservative**: only identity fields (`id`, `number`,
 //!   `sha`, `tag_name`, …) are non-null. GitHub nulls out whole objects
 //!   (`commit.author: null`, `issue.user: null`); nullable columns under
 //!   them become SQL NULL per the converter's null-parent rule.
 //! - **No fingerprint pins yet** (`expected_fingerprint: None`), same as
 //!   the mock pack: a pin must be taken from a live gateway's discovered
-//!   contract, and this pack has not been validated against one. The
-//!   bundled fixtures (see tests) are the build-time conversion contract;
-//!   pins land when the pack is validated against a live catalog.
+//!   contract. The action IDs, input keys, row paths, and endpoint
+//!   contract of every table here HAVE been reconciled against a live
+//!   Open Connector gateway (v1.3.1) and its provider source; the
+//!   fingerprints themselves are still unpinned. The bundled fixtures
+//!   (see tests) are the build-time conversion contract; pins land next.
 //!   Operational consequence until then: incompatible upstream drift (a
 //!   removed required field, a mapped field changing type) is caught only
 //!   at scan time as a terminal `ConversionFailed` — for every query on
 //!   the table, since conversion builds all declared columns before
 //!   projection — and bindings deliberately cannot patch schemas, so the
-//!   fix is a pack version bump. Follow-up: validate against a live
-//!   gateway (endpoint-contract check included) and pin the fingerprints
-//!   so drift fails fast at registration instead.
+//!   fix is a pack version bump.
 
 use datafusion::logical_expr::Operator;
 
@@ -68,7 +69,7 @@ const GITHUB_PAGINATION: PaginationStrategy = PaginationStrategy::PageNumber {
 /// Repositories visible to the connected account.
 static REPOSITORIES: SourcePackTable = SourcePackTable {
     id: "github.repositories",
-    action_id: "github.list_repositories",
+    action_id: "github.list_my_repositories",
     row_path: "$.repositories",
     fields: &[
         FieldMapping {
@@ -169,9 +170,8 @@ static REPOSITORIES: SourcePackTable = SourcePackTable {
     expected_fingerprint: None,
 };
 
-/// Issues of one repository. GitHub's issues endpoint also returns pull
-/// requests; the nullable `pull_request` JSON marker distinguishes them
-/// (`IS NULL` → pure issues).
+/// Issues of one repository — pure issues: the Open Connector action
+/// filters out the pull requests GitHub's raw issues endpoint mixes in.
 static ISSUES: SourcePackTable = SourcePackTable {
     id: "github.issues",
     action_id: "github.list_repository_issues",
@@ -247,12 +247,6 @@ static ISSUES: SourcePackTable = SourcePackTable {
             name: "closed_at",
             path: "closed_at",
             field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "pull_request",
-            path: "pull_request",
-            field_type: FieldType::Json,
             nullable: true,
         },
         FieldMapping {
@@ -340,7 +334,7 @@ static ISSUE_COMMENTS: SourcePackTable = SourcePackTable {
         },
     ],
     pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo", "issue_number"],
+    required_resources: &["owner", "repo", "issueNumber"],
     fixed_inputs: &[],
     filters: &[],
     expected_fingerprint: None,
@@ -502,7 +496,7 @@ static REVIEWS: SourcePackTable = SourcePackTable {
         },
     ],
     pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo", "pull_number"],
+    required_resources: &["owner", "repo", "pullNumber"],
     fixed_inputs: &[],
     filters: &[],
     expected_fingerprint: None,
@@ -836,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn issues_fixture_converts_with_nulls_lists_and_pr_marker() {
+    fn issues_fixture_converts_with_nulls_and_lists() {
         let batch = convert_fixture(&ISSUES, include_str!("fixtures/github/issues.json"));
         assert_eq!(batch.num_rows(), 3);
 
@@ -869,13 +863,6 @@ mod tests {
         );
         assert!(timestamps(&batch, "closed_at").is_null(0));
         assert!(!timestamps(&batch, "closed_at").is_null(1));
-
-        // The pull_request marker: absent for issues (NULL), opaque JSON
-        // for pull requests — `WHERE pull_request IS NULL` → pure issues.
-        let markers = strings(&batch, "pull_request");
-        assert!(markers.is_null(0));
-        assert!(markers.is_null(1));
-        assert!(markers.value(2).contains("pulls/3"));
     }
 
     #[test]
@@ -994,7 +981,7 @@ mod tests {
 
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -1024,12 +1011,9 @@ mod tests {
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path == "/v1/actions/github.list_repository_issues" {
-            return MockResponse::ok(
-                r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                    "locally_executable": true, "connection_aliases": []}"#,
-            );
+            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
         }
-        if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
             let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
             let input = body.get("input").cloned().unwrap_or_default();
             let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -1048,7 +1032,7 @@ mod tests {
                 .take(per_page)
                 .cloned()
                 .collect();
-            return MockResponse::ok(&json!({"output": {"issues": slice}}).to_string());
+            return MockResponse::ok(&envelope_ok(&json!({"issues": slice}).to_string()));
         }
         MockResponse::new(404, "{}")
     }
@@ -1209,14 +1193,14 @@ bindings:
                     return MockResponse::ok("{}");
                 }
                 if req.method == "GET" && req.path == "/v1/actions/github.list_pull_requests" {
-                    return MockResponse::ok(
-                        r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                            "locally_executable": true, "connection_aliases": []}"#,
-                    );
+                    return MockResponse::ok(&discovery_ok(
+                        "{}",
+                        r#"{"type": "object"}"#,
+                        true,
+                        None,
+                    ));
                 }
-                if req.method == "POST"
-                    && req.path == "/v1/actions/github.list_pull_requests/execute"
-                {
+                if req.method == "POST" && req.path == "/v1/actions/github.list_pull_requests" {
                     let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
                     let input = body.get("input").cloned().unwrap_or_default();
                     let state = input
@@ -1232,9 +1216,9 @@ bindings:
                         })
                         .cloned()
                         .collect();
-                    return MockResponse::ok(
-                        &json!({"output": {"pull_requests": slice}}).to_string(),
-                    );
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({"pull_requests": slice}).to_string(),
+                    ));
                 }
                 MockResponse::new(404, "{}")
             })
@@ -1346,15 +1330,17 @@ bindings:
                     return MockResponse::ok("{}");
                 }
                 if req.method == "GET" && req.path == format!("/v1/actions/{action_id}") {
-                    return MockResponse::ok(
-                        r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                            "locally_executable": true, "connection_aliases": []}"#,
-                    );
+                    return MockResponse::ok(&discovery_ok(
+                        "{}",
+                        r#"{"type": "object"}"#,
+                        true,
+                        None,
+                    ));
                 }
-                if req.method == "POST" && req.path == format!("/v1/actions/{action_id}/execute") {
-                    return MockResponse::ok(
-                        &json!({"output": {row_key: served.as_slice()}}).to_string(),
-                    );
+                if req.method == "POST" && req.path == format!("/v1/actions/{action_id}") {
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({row_key: served.as_slice()}).to_string(),
+                    ));
                 }
                 MockResponse::new(404, "{}")
             })
@@ -1546,12 +1532,9 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path == "/v1/actions/github.list_workflow_runs" {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                        "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/github.list_workflow_runs/execute" {
+            if req.method == "POST" && req.path == "/v1/actions/github.list_workflow_runs" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
                 let input = body.get("input").cloned().unwrap_or_default();
                 let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -1561,9 +1544,9 @@ bindings:
                     .skip((page - 1) * per_page)
                     .take(per_page)
                     .collect();
-                return MockResponse::ok(
-                    &json!({"output": {"total_count": total, "workflow_runs": slice}}).to_string(),
-                );
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"total_count": total, "workflow_runs": slice}).to_string(),
+                ));
             }
             MockResponse::new(404, "{}")
         })
@@ -1686,26 +1669,17 @@ bindings:
         );
     }
 
-    #[tokio::test]
-    async fn pull_request_marker_separates_issues_from_prs() {
-        let fixture: Value =
-            serde_json::from_str(include_str!("fixtures/github/issues.json")).unwrap();
-        let rows = fixture["issues"].as_array().unwrap().clone();
-        let (_gateway, ctx) = setup(rows, "SKARDI_TEST_OC_GITHUB_PR_MARKER").await;
-
-        let batches = collect(
-            &ctx,
-            "SELECT number FROM saas.gh.issues WHERE pull_request IS NULL ORDER BY number",
-        )
-        .await;
-        assert_eq!(rows_of(&batches), 2, "rows 1 and 2 are pure issues");
-
-        let batches = collect(
-            &ctx,
-            "SELECT number FROM saas.gh.issues WHERE pull_request IS NOT NULL",
-        )
-        .await;
-        assert_eq!(rows_of(&batches), 1, "row 3 is the pull request");
+    #[test]
+    fn issues_declares_no_pull_request_marker() {
+        // Negative-space guard: the Open Connector action already filters
+        // pull requests out of `list_repository_issues`, so a `pull_request`
+        // marker column could never be non-NULL — the table must not
+        // declare one, and PRs are reached through their own table.
+        assert!(
+            ISSUES.fields.iter().all(|f| f.name != "pull_request"),
+            "issues is pure issues under the OC contract; a marker column \
+             would be permanently NULL"
+        );
     }
 
     #[tokio::test]
@@ -1754,29 +1728,23 @@ bindings:
         // A YAML binding's numeric resource must arrive as a JSON number —
         // the same value an equivalent UDTF resource JSON sends — never a
         // string. Both numeric-resource consumers are covered: issue_comments
-        // (issue_number) and reviews (pull_number).
+        // (issueNumber) and reviews (pullNumber).
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                        "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/github.list_issue_comments/execute"
-            {
-                return MockResponse::ok(
-                    &serde_json::json!({"output": {"comments": []}}).to_string(),
-                );
+            if req.method == "POST" && req.path == "/v1/actions/github.list_issue_comments" {
+                return MockResponse::ok(&envelope_ok(
+                    &serde_json::json!({"comments": []}).to_string(),
+                ));
             }
-            if req.method == "POST"
-                && req.path == "/v1/actions/github.list_pull_request_reviews/execute"
-            {
-                return MockResponse::ok(
-                    &serde_json::json!({"output": {"reviews": []}}).to_string(),
-                );
+            if req.method == "POST" && req.path == "/v1/actions/github.list_pull_request_reviews" {
+                return MockResponse::ok(&envelope_ok(
+                    &serde_json::json!({"reviews": []}).to_string(),
+                ));
             }
             MockResponse::new(404, "{}")
         })
@@ -1792,11 +1760,11 @@ runtime_token_env: {token_env}
 bindings:
   - name: gh
     source_pack: github
-    resource: {{ owner: acme, repo: widgets, issue_number: 42 }}
+    resource: {{ owner: acme, repo: widgets, issueNumber: 42 }}
     tables: [issue_comments]
   - name: ghr
     source_pack: github
-    resource: {{ owner: acme, repo: widgets, pull_number: 7 }}
+    resource: {{ owner: acme, repo: widgets, pullNumber: 7 }}
     tables: [reviews]
 "#
         ))
@@ -1833,13 +1801,13 @@ bindings:
         for (action, number_json, stringified) in [
             (
                 "github.list_issue_comments",
-                r#""issue_number":42"#,
-                r#""issue_number":"42""#,
+                r#""issueNumber":42"#,
+                r#""issueNumber":"42""#,
             ),
             (
                 "github.list_pull_request_reviews",
-                r#""pull_number":7"#,
-                r#""pull_number":"7""#,
+                r#""pullNumber":7"#,
+                r#""pullNumber":"7""#,
             ),
         ] {
             let bodies = bodies_for(action);

@@ -166,10 +166,15 @@ Raw scans are deliberately narrow:
 
 - **Default-deny.** The action must be in the gateway's
   `raw_action_allowlist`, *and* its discovered metadata must classify it as
-  a non-mutating read (`read_only: true`). A missing or ambiguous
+  a non-mutating read (`execution.readOnly`). A missing or ambiguous
   classification is refused with an error naming the gap — the allowlist
   alone never grants execution. Both checks fire at planning time, before
-  any HTTP request.
+  any HTTP request. **Current-gateway caveat:** Open Connector does not yet
+  publish a read/write classification in its action metadata (verified
+  against v1.3.1), so raw scans against today's real gateway are refused by
+  this gate; built-in pack tables — read-only by Skardi's own review — are
+  unaffected. The parse site is forward-compatible for when the upstream
+  grows the field.
 - **Deterministic row type or planning error.** The Arrow schema is derived
   from the discovered action output schema at the row path: declared
   primitives (`string`, `integer`, `number`, `boolean`, including

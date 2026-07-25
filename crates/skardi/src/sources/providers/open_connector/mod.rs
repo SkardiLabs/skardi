@@ -286,7 +286,7 @@ pub async fn register_open_connector_tables(
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
 
     const TOKEN_ENV_HEALTH_FAIL: &str = "SKARDI_TEST_OC_REGISTER_TOKEN_HEALTH_FAIL";
@@ -601,12 +601,9 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                       "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
                 // The client would wait two seconds before retrying this 429,
                 // but the one-second scan deadline must cut that wait short.
                 return MockResponse::new(429, "{}").with_header("retry-after", "2");
@@ -988,12 +985,9 @@ bindings:
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
-            return MockResponse::ok(
-                r#"{"input_schema": {}, "output_schema": {"type": "object"},
-               "locally_executable": true, "connection_aliases": []}"#,
-            );
+            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
         }
-        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             let input = body.get("input").cloned().unwrap_or_default();
             let page = input
@@ -1014,9 +1008,9 @@ bindings:
                 .skip(start)
                 .take(2)
                 .collect();
-            return MockResponse::ok(
-                &serde_json::json!({ "output": { "items": slice } }).to_string(),
-            );
+            return MockResponse::ok(&envelope_ok(
+                &serde_json::json!({ "items": slice }).to_string(),
+            ));
         }
         MockResponse::new(404, "{}")
     }

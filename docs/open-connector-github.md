@@ -49,25 +49,26 @@ WHERE state = 'open'
 LIMIT 50;
 ```
 
-Resource values keep their YAML types: `issue_number: 42` reaches the
+Resource values keep their YAML types: `issueNumber: 42` reaches the
 gateway as the JSON number 42, exactly as the UDTF's resource JSON
-(`'{"owner":"acme","repo":"widgets","issue_number":42}'`) sends it — so a
+(`'{"owner":"acme","repo":"widgets","issueNumber":42}'`) sends it — so a
 binding and an identical UDTF invocation also share one scan-cache entry.
 
 ## Tables
 
-All tables use GitHub's page-number pagination at the 100-row maximum; a
-short or empty page terminates the scan (GitHub's documented
-end-of-collection signal), so every scan is complete and bounded by
-`max_pages` / `max_rows`.
+All tables use page-number pagination at GitHub's 100-row maximum, sent as
+the gateway's camelCase `page`/`perPage` inputs (Open Connector's action
+schemas are strict — snake_case keys are rejected); a short or empty page
+terminates the scan (GitHub's documented end-of-collection signal), so
+every scan is complete and bounded by `max_pages` / `max_rows`.
 
 | Table | Action | Resources | Filter pushdown |
 |---|---|---|---|
-| `repositories` | `github.list_repositories` | — (connected account) | none |
+| `repositories` | `github.list_my_repositories` | — (connected account) | none |
 | `issues` | `github.list_repository_issues` | `owner`, `repo` | `state =` (inexact, re-applied locally); `updated_at >=` → `since` (inexact, re-applied locally) |
-| `issue_comments` | `github.list_issue_comments` | `owner`, `repo`, `issue_number` | none |
+| `issue_comments` | `github.list_issue_comments` | `owner`, `repo`, `issueNumber` | none |
 | `pull_requests` | `github.list_pull_requests` | `owner`, `repo` | `state =` (inexact, re-applied locally) |
-| `reviews` | `github.list_pull_request_reviews` | `owner`, `repo`, `pull_number` | none |
+| `reviews` | `github.list_pull_request_reviews` | `owner`, `repo`, `pullNumber` | none |
 | `commits` | `github.list_commits` | `owner`, `repo` | none (see below) |
 | `workflow_runs` | `github.list_workflow_runs` | `owner`, `repo` | none |
 | `releases` | `github.list_releases` | `owner`, `repo` | none |
@@ -80,9 +81,10 @@ Column references live in the pack definition
 (`crates/skardi/src/sources/providers/open_connector/packs/github.rs`);
 highlights and caveats:
 
-- **`issues` includes pull requests**, because GitHub's issues endpoint
-  does. The nullable `pull_request` column carries the PR marker as opaque
-  JSON: `WHERE pull_request IS NULL` selects pure issues.
+- **`issues` is pure issues.** GitHub's raw issues endpoint mixes pull
+  requests in, but the Open Connector action filters them out before
+  returning, so no `pull_request` marker column exists (it could never be
+  non-NULL). Pull requests live in the `pull_requests` table.
 - **`issues` and `pull_requests` read the complete collection.** GitHub
   lists only open items by default; the pack pins `state=all` on every
   request, and a pushed `state` predicate overrides the pin — so `SELECT *`

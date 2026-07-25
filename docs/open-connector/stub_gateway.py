@@ -8,11 +8,13 @@ contract for the `github` pack:
 
     GET  /v1/health
     GET  /v1/actions/<action_id>
-    POST /v1/actions/<action_id>/execute
+    POST /v1/actions/<action_id>
 
-and serves a fictional `acme/widgets` repository with GitHub-shaped rows
-(page-number pagination, `state` filtering, inclusive `since`). Any
-non-empty Bearer token is accepted. Standard library only.
+with the real gateway's uniform response envelope
+(`{"success": …, "message": …, "data": …, "meta": …}`), and serves a
+fictional `acme/widgets` repository with GitHub-shaped rows (page-number
+pagination via `page`/`perPage`, `state` filtering, inclusive `since`).
+Any non-empty Bearer token is accepted. Standard library only.
 
 Run against a real Open Connector deployment instead by following the
 "Running against a real Open Connector gateway" section of the README.
@@ -45,16 +47,15 @@ ISSUES = [
         "html_url": "https://github.com/acme/widgets/issues/2",
     },
     {
-        # GitHub's issues endpoint also returns pull requests, marked by the
-        # `pull_request` key — `WHERE pull_request IS NULL` filters them out.
+        # Pure issues only: the real Open Connector action filters out the
+        # pull requests GitHub's raw issues endpoint would mix in.
         "id": 103, "number": 3, "title": "Add dark mode", "state": "open",
-        "body": "Implements the dark palette.",
+        "body": "Tracking issue for the dark palette.",
         "user": {"login": "hubot"},
         "assignees": [], "labels": [{"name": "enhancement"}], "comments": 1,
         "created_at": "2026-01-05T00:00:00Z", "updated_at": "2026-01-06T00:00:00Z",
         "closed_at": None,
-        "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/3"},
-        "html_url": "https://github.com/acme/widgets/pull/3",
+        "html_url": "https://github.com/acme/widgets/issues/3",
     },
     {
         "id": 104, "number": 4, "title": "Flaky retry test", "state": "open",
@@ -157,43 +158,54 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _ok(self, data):
+        # The gateway's uniform success envelope.
+        self._reply(200, {"success": True, "message": "OK", "data": data, "meta": {}})
+
+    def _err(self, status, error_code, message):
+        # The gateway's uniform failure envelope.
+        self._reply(status, {
+            "success": False, "message": message, "data": None,
+            "errorCode": error_code, "meta": {},
+        })
+
     def _authorized(self):
         header = self.headers.get("authorization", "")
         if header.startswith("Bearer ") and len(header) > len("Bearer "):
             return True
-        self._reply(401, {"message": "missing runtime token"})
+        self._err(401, "unauthorized", "missing runtime token")
         return False
 
     def do_GET(self):
         if not self._authorized():
             return
         if self.path == "/v1/health":
-            return self._reply(200, {})
+            return self._ok({"ok": True})
         if self.path.startswith("/v1/actions/"):
             action_id = self.path.removeprefix("/v1/actions/")
             if action_id in ACTIONS:
                 _, _, schema = ACTIONS[action_id]
-                return self._reply(200, {
-                    "input_schema": {},
-                    "output_schema": schema,
-                    "locally_executable": True,
-                    "read_only": True,
-                    "connection_aliases": [],
+                return self._ok({
+                    "inputSchema": {},
+                    "outputSchema": schema,
+                    # The real gateway publishes no readOnly classification
+                    # (yet); the stub does, so the raw-scan demo can run.
+                    "execution": {"locallyExecutable": True, "readOnly": True},
                 })
-        self._reply(404, {"message": "not found"})
+        self._err(404, "not_found", "unknown action")
 
     def do_POST(self):
         if not self._authorized():
             return
-        prefix, suffix = "/v1/actions/", "/execute"
-        if self.path.startswith(prefix) and self.path.endswith(suffix):
-            action_id = self.path[len(prefix):-len(suffix)]
+        prefix = "/v1/actions/"
+        if self.path.startswith(prefix):
+            action_id = self.path.removeprefix(prefix)
             if action_id in ACTIONS:
                 length = int(self.headers.get("content-length", 0))
                 envelope = json.loads(self.rfile.read(length) or b"{}")
                 params = envelope.get("input", {})
-                return self._reply(200, {"output": execute(action_id, params)})
-        self._reply(404, {"message": "not found"})
+                return self._ok(execute(action_id, params))
+        self._err(404, "not_found", "unknown action")
 
     def log_message(self, fmt, *args):  # quieter demo output
         print(f"[stub-gateway] {self.command} {self.path}")
