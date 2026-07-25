@@ -143,7 +143,8 @@ def execute(action_id, params):
     if since:  # inclusive, like GitHub's issues `since`
         rows = [r for r in rows if r["updated_at"] >= since]
     page = int(params.get("page", 1))
-    per_page = int(params.get("per_page", 30))
+    # Open Connector action inputs are camelCase (and strict about it).
+    per_page = int(params.get("perPage", 30))
     return {row_key: rows[(page - 1) * per_page : page * per_page]}
 
 

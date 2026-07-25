@@ -4,9 +4,11 @@
 //! Design decisions, per the integration design spec and the source-pack
 //! admission gate:
 //!
-//! - **Page-number pagination everywhere** (`page`/`per_page`, 100 per page
-//!   — GitHub's maximum). A short or empty page terminates the scan, which
-//!   is GitHub's documented end-of-collection signal.
+//! - **Page-number pagination everywhere** (`page`/`perPage`, 100 per page
+//!   — GitHub's maximum; the camelCase keys are Open Connector's strict
+//!   action-input contract, not GitHub's raw REST parameters). A short or
+//!   empty page terminates the scan, which is GitHub's documented
+//!   end-of-collection signal.
 //! - **Filters are allowlisted only where faithful — and every string-enum
 //!   push is Inexact.** `issues.state` / `pull_requests.state` narrow the
 //!   fetch but DataFusion re-applies them: the translation is faithful only
@@ -52,9 +54,14 @@ use crate::sources::providers::open_connector::source_pack::{
 };
 
 /// GitHub's maximum page size; also the short-page termination threshold.
+///
+/// The input keys follow Open Connector's action contracts, which are
+/// camelCase and strict (`additionalProperties` rejected): the live gateway
+/// returns HTTP 400 for `per_page` and accepts `perPage`, matching the
+/// `perPage`/`page` inputs in the actions' published contracts.
 const GITHUB_PAGINATION: PaginationStrategy = PaginationStrategy::PageNumber {
     page_param: "page",
-    per_page_param: "per_page",
+    per_page_param: "perPage",
     per_page: 100,
     total_pages_path: None,
 };
@@ -1021,7 +1028,7 @@ mod tests {
     }
 
     /// Mock gateway serving `github.list_repository_issues` over `rows`:
-    /// honors `state` exactly, pages at `per_page`, and deliberately
+    /// honors `state` exactly, pages at `perPage`, and deliberately
     /// IGNORES `since` — returning a superset is exactly what an Inexact
     /// mapping permits, and DataFusion must trim it.
     fn issues_handler(req: &RecordedRequest, rows: &[Value]) -> MockResponse {
@@ -1038,7 +1045,7 @@ mod tests {
             let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
             let input = body.get("input").cloned().unwrap_or_default();
             let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let per_page = input.get("per_page").and_then(Value::as_u64).unwrap_or(30) as usize;
+            let per_page = input.get("perPage").and_then(Value::as_u64).unwrap_or(30) as usize;
             let state = input
                 .get("state")
                 .and_then(Value::as_str)
@@ -1149,8 +1156,8 @@ bindings:
         );
 
         let bodies = execute_bodies(&gateway);
-        assert_eq!(bodies.len(), 2, "150 rows at per_page=100 → 2 pages");
-        assert!(bodies[0].contains(r#""page":1"#) && bodies[0].contains(r#""per_page":100"#));
+        assert_eq!(bodies.len(), 2, "150 rows at perPage=100 → 2 pages");
+        assert!(bodies[0].contains(r#""page":1"#) && bodies[0].contains(r#""perPage":100"#));
         assert!(bodies[1].contains(r#""page":2"#));
         assert!(
             bodies.iter().all(|body| body.contains(r#""state":"all""#)),
@@ -1549,7 +1556,7 @@ bindings:
 
     /// Register `workflow_runs` against a stub serving `total` runs through
     /// GitHub's wrapped envelope (`{total_count, workflow_runs}`), sliced by
-    /// page/per_page.
+    /// page/perPage.
     async fn setup_workflow_runs(
         total: usize,
         token_env: &'static str,
@@ -1568,7 +1575,7 @@ bindings:
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
                 let input = body.get("input").cloned().unwrap_or_default();
                 let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
-                let per_page = input.get("per_page").and_then(Value::as_u64).unwrap_or(30) as usize;
+                let per_page = input.get("perPage").and_then(Value::as_u64).unwrap_or(30) as usize;
                 let slice: Vec<Value> = (1..=total)
                     .map(|id| json!({"id": id, "status": "completed"}))
                     .skip((page - 1) * per_page)
@@ -1630,7 +1637,7 @@ bindings:
         assert_eq!(
             bodies.len(),
             2,
-            "150 runs at per_page=100: a full page, then a short page that terminates"
+            "150 runs at perPage=100: a full page, then a short page that terminates"
         );
         assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
         assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
