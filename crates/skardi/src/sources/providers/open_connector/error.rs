@@ -258,6 +258,17 @@ pub enum OpenConnectorError {
     #[error("Open Connector binding '{binding}' sets resource input '{key}' to null")]
     NullResourceValue { binding: String, key: String },
 
+    /// A binding supplied a resource key that none of its bound tables
+    /// declare. Requests carry only declared keys (the gateway's strict
+    /// action schemas reject the rest), so an unconsumed key is dead
+    /// configuration — most likely a typo — and fails registration.
+    #[error(
+        "Open Connector binding '{binding}' supplies resource key '{key}' that none of its \
+         bound tables declare; each table's requests carry only the resource inputs its \
+         action contract lists"
+    )]
+    UnknownResourceKey { binding: String, key: String },
+
     /// The discovered action contract does not match the source pack's
     /// expected fingerprint — the upstream action changed incompatibly.
     #[error("Open Connector source-pack table '{table}' failed its compatibility check: {reason}")]

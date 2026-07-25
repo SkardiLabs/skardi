@@ -88,6 +88,12 @@ Notes:
 - Unknown keys anywhere in the block are rejected at load time — a
   misspelled `source_pack_versions` fails loudly instead of silently
   disabling the pin it was meant to set.
+- One binding can serve tables with different resource needs: each table's
+  requests carry only the resource keys its contract declares (Open
+  Connector's strict action schemas reject undeclared inputs), so binding
+  `repositories` alongside `issues` under one `owner`/`repo` resource map
+  just works. A resource key that *no* bound table declares fails
+  registration as a probable typo.
 - The gateway URL must be plain `http(s)://` with no embedded credentials,
   query string, or fragment; the runtime token travels only as a Bearer
   header.

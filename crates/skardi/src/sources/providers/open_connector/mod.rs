@@ -177,6 +177,7 @@ pub async fn register_open_connector_tables(
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;
         SourcePackRegistry::check_version_pin(pack, binding.source_pack_version)?;
+        let mut tables = Vec::with_capacity(binding.tables.len());
         for table_name in &binding.tables {
             let table = pack_registry.table(pack, table_name)?;
             action_ids.push(table.action_id.to_string());
@@ -188,6 +189,21 @@ pub async fn register_open_connector_tables(
                     }
                     .into());
                 }
+            }
+            tables.push(table);
+        }
+        // Every supplied resource key must be declared by at least one bound
+        // table: each table's requests carry only the keys it declares (see
+        // `OpenConnectorTableProvider::new`), so a key no table consumes is
+        // dead configuration — most likely a typo — and fails loudly here
+        // instead of being silently dropped from every request.
+        for key in binding.resource.keys() {
+            if !tables.iter().any(|table| table.declares_resource(key)) {
+                return Err(OpenConnectorError::UnknownResourceKey {
+                    binding: binding.name.clone(),
+                    key: key.clone(),
+                }
+                .into());
             }
         }
     }

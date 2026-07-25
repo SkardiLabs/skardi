@@ -53,6 +53,9 @@ Resource values keep their YAML types: `issueNumber: 42` reaches the
 gateway as the JSON number 42, exactly as the UDTF's resource JSON
 (`'{"owner":"acme","repo":"widgets","issueNumber":42}'`) sends it — so a
 binding and an identical UDTF invocation also share one scan-cache entry.
+Each table's requests carry only the resource keys its contract declares:
+`repositories` (which takes none) can share a binding with the
+repo-scoped tables without tripping the gateway's strict input schemas.
 
 ## Tables
 

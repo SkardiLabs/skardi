@@ -57,6 +57,13 @@ pub struct SourcePackTable {
     pub pagination: PaginationStrategy,
     /// Resource inputs a binding must supply (e.g. `owner`, `repo`).
     pub required_resources: &'static [&'static str],
+    /// Resource inputs a binding *may* supply (e.g. a Slack `channelId`
+    /// scoping a file listing). Everything else in the binding's resource
+    /// map is withheld from this table's requests: Open Connector's action
+    /// schemas reject undeclared input keys (`additionalProperties:
+    /// false`), so one binding can serve tables with different resource
+    /// needs — each table receives exactly the keys it declares.
+    pub optional_resources: &'static [&'static str],
     /// Fixed action inputs sent with every request, e.g. `state=all` where
     /// a provider endpoint defaults to a filtered listing (GitHub issues
     /// default to open ones). A pushed-down filter targeting the same input
@@ -68,6 +75,15 @@ pub struct SourcePackTable {
     /// Expected action-contract fingerprint. When set, registration compares
     /// it with the discovered action's fingerprint and fails on mismatch.
     pub expected_fingerprint: Option<&'static str>,
+}
+
+impl SourcePackTable {
+    /// Whether this table's action declares `key` as a resource input
+    /// (required or optional). Undeclared keys must never reach the wire:
+    /// Open Connector's strict action schemas reject them.
+    pub fn declares_resource(&self, key: &str) -> bool {
+        self.required_resources.contains(&key) || self.optional_resources.contains(&key)
+    }
 }
 
 /// A versioned set of stable table definitions for one provider.
@@ -309,6 +325,7 @@ mod tests {
             fields: &[],
             pagination: PaginationStrategy::SinglePage,
             required_resources: &[],
+            optional_resources: &[],
             fixed_inputs: &[],
             filters: &[],
             expected_fingerprint: None,

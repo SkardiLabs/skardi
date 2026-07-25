@@ -184,6 +184,20 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                 }));
             }
         }
+        // One table, so undeclared keys are rejected outright (the YAML
+        // path allows a shared binding's keys to be consumed by *another*
+        // bound table; here there is no other table to consume them, and
+        // the gateway's strict action schema would 400 the whole scan).
+        if let Value::Object(map) = &resource {
+            for key in map.keys() {
+                if !table.declares_resource(key) {
+                    return Err(plan_error(OpenConnectorError::UnknownResourceKey {
+                        binding: format!("open_connector_query('{gateway}', '{table_id}')"),
+                        key: key.clone(),
+                    }));
+                }
+            }
+        }
 
         // Same discovery and compatibility gates as YAML registration: the
         // action must have been discovered when the gateway registered, and
@@ -738,6 +752,16 @@ raw_action_allowlist:
             &ctx,
             "SELECT * FROM open_connector_query('saas', 'mock.items', 'not json')",
             "resource_json is not valid JSON",
+        )
+        .await;
+        // Undeclared resource keys are rejected at planning: the gateway's
+        // strict action schemas (additionalProperties: false) would 400
+        // every request that carried them.
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_query('saas', 'mock.items',
+                                                  '{"workspace":"demo","workspce":"typo"}')"#,
+            "resource key 'workspce'",
         )
         .await;
         expect_plan_error(

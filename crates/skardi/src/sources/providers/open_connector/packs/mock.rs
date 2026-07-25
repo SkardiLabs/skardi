@@ -53,6 +53,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         per_page: 2,
     },
     required_resources: &["workspace"],
+    optional_resources: &[],
     fixed_inputs: &[],
     // NOTE: only `>` is mapped — the gateway's `min_value` is strictly
     // greater-than. Mapping `>=` to the same input would be classified Exact

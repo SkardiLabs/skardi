@@ -165,6 +165,7 @@ static REPOSITORIES: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &[],
+    optional_resources: &[],
     fixed_inputs: &[],
     filters: &[],
     expected_fingerprint: None,
@@ -258,6 +259,7 @@ static ISSUES: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo"],
+    optional_resources: &[],
     // GitHub lists only open issues by default; pin `state=all` so the
     // table reads as the complete collection (a pushed `state` predicate
     // overrides the pin).
@@ -335,6 +337,7 @@ static ISSUE_COMMENTS: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo", "issueNumber"],
+    optional_resources: &[],
     fixed_inputs: &[],
     filters: &[],
     expected_fingerprint: None,
@@ -433,6 +436,7 @@ static PULL_REQUESTS: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo"],
+    optional_resources: &[],
     // Same open-by-default listing as issues; pin the complete collection.
     fixed_inputs: &[("state", FixedValue::Str("all"))],
     // Inexact for the same reason as issues.state: faithful only inside
@@ -497,6 +501,7 @@ static REVIEWS: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo", "pullNumber"],
+    optional_resources: &[],
     fixed_inputs: &[],
     filters: &[],
     expected_fingerprint: None,
@@ -556,6 +561,7 @@ static COMMITS: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo"],
+    optional_resources: &[],
     fixed_inputs: &[],
     // NOTE: GitHub's commits `since`/`until` are documented as commits
     // *after*/*before* the date. Strictly-after cannot represent
@@ -648,6 +654,7 @@ static WORKFLOW_RUNS: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo"],
+    optional_resources: &[],
     fixed_inputs: &[],
     // GitHub's `status` query parameter matches status OR conclusion values
     // interchangeably — not a faithful translation of either column.
@@ -728,6 +735,7 @@ static RELEASES: SourcePackTable = SourcePackTable {
     ],
     pagination: GITHUB_PAGINATION,
     required_resources: &["owner", "repo"],
+    optional_resources: &[],
     fixed_inputs: &[],
     filters: &[],
     expected_fingerprint: None,
@@ -1720,6 +1728,149 @@ bindings:
             arrow::util::pretty::pretty_format_batches(&from_udtf)
                 .unwrap()
                 .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_binding_sends_each_table_only_its_declared_resources() {
+        // Live-gateway-confirmed failure mode: a binding's resource map must
+        // NOT be forwarded wholesale. `github.list_my_repositories` declares
+        // no resource inputs and its strict schema rejects `owner`/`repo`
+        // (`additionalProperties: false`) — yet repositories must be able to
+        // share one binding with the repo-scoped tables. Each table's
+        // requests carry exactly the keys it declares.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_my_repositories" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let input = body.get("input").cloned().unwrap_or_default();
+                // Mirror the live gateway's strictness so a regression fails
+                // this test the way it fails production: HTTP 400.
+                if input.get("owner").is_some() || input.get("repo").is_some() {
+                    return MockResponse::new(
+                        400,
+                        &crate::sources::providers::open_connector::testutil::envelope_err(
+                            "invalid_input",
+                            "Action input does not match the action schema.",
+                        ),
+                    );
+                }
+                return MockResponse::ok(&envelope_ok(r#"{"repositories": []}"#));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
+                return MockResponse::ok(&envelope_ok(r#"{"issues": []}"#));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_SHARED_BINDING";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [repositories, issues]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("owner/repo are consumed by issues, so the binding is valid");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let batches = collect(&ctx, "SELECT name FROM saas.gh.repositories").await;
+        assert_eq!(rows_of(&batches), 0, "strict stub accepted the request");
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.issues").await;
+        assert_eq!(rows_of(&batches), 0);
+
+        let input_for = |action: &str| -> Value {
+            let body = gateway
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "POST" && r.path.contains(action))
+                .unwrap_or_else(|| panic!("{action} was executed"))
+                .body;
+            serde_json::from_str::<Value>(&body).expect("JSON body")["input"].clone()
+        };
+        let repos_input = input_for("github.list_my_repositories");
+        assert!(
+            repos_input.get("owner").is_none() && repos_input.get("repo").is_none(),
+            "repositories declares no resources, so none are sent: {repos_input}"
+        );
+        let issues_input = input_for("github.list_repository_issues");
+        assert_eq!(issues_input.get("owner"), Some(&Value::from("acme")));
+        assert_eq!(issues_input.get("repo"), Some(&Value::from("widgets")));
+    }
+
+    #[tokio::test]
+    async fn unconsumed_resource_key_fails_registration() {
+        // A key no bound table declares is dead configuration (requests
+        // never carry it) — almost certainly a typo, so registration fails
+        // loudly instead of silently dropping it.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_UNKNOWN_KEY";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets, ownr: typo }}
+    tables: [issues]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect_err("unconsumed key must fail registration");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("resource key 'ownr'") && message.contains("'gh'"),
+            "error names the binding and the dead key: {message}"
         );
     }
 
