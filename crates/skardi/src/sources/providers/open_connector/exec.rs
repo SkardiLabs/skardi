@@ -595,7 +595,7 @@ mod tests {
     use super::*;
     use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
     use crate::sources::providers::open_connector::testutil::{
-        CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events,
+        CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
     };
     use futures::StreamExt;
     use serde_json::json;
@@ -639,7 +639,7 @@ mod tests {
     /// Execute-only mock gateway for `mock.list_items` (per_page = 2), the
     /// only call `ScanState` makes (discovery/health happen at registration).
     fn items_handler(req: &RecordedRequest, total: usize) -> MockResponse {
-        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             let page = body
                 .get("input")
@@ -651,7 +651,7 @@ mod tests {
                 .skip((page - 1) * 2)
                 .take(2)
                 .collect();
-            return MockResponse::ok(&json!({"output": {"items": items}}).to_string());
+            return MockResponse::ok(&envelope_ok(&json!({"items": items}).to_string()));
         }
         MockResponse::new(404, "{}")
     }

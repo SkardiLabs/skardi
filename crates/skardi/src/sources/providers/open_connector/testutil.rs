@@ -64,6 +64,39 @@ impl MockResponse {
     }
 }
 
+/// Wrap executor output (or any `data` payload) in the gateway's uniform
+/// success envelope, exactly as `POST /v1/actions/{id}` returns it.
+pub(crate) fn envelope_ok(data: &str) -> String {
+    format!(r#"{{"success":true,"message":"OK","data":{data},"meta":{{}}}}"#)
+}
+
+/// A failed gateway envelope with an `errorCode`, as the gateway returns
+/// alongside a 4xx/5xx status.
+pub(crate) fn envelope_err(error_code: &str, message: &str) -> String {
+    format!(
+        r#"{{"success":false,"message":"{message}","data":null,"errorCode":"{error_code}","meta":{{}}}}"#
+    )
+}
+
+/// A discovery envelope (`GET /v1/actions/{{id}}`) whose `data` carries the
+/// given schemas and execution block. `read_only` renders the
+/// forward-compatible `execution.readOnly` field when present — today's
+/// gateway omits it.
+pub(crate) fn discovery_ok(
+    input_schema: &str,
+    output_schema: &str,
+    locally_executable: bool,
+    read_only: Option<bool>,
+) -> String {
+    let read_only = match read_only {
+        Some(value) => format!(r#","readOnly":{value}"#),
+        None => String::new(),
+    };
+    envelope_ok(&format!(
+        r#"{{"inputSchema":{input_schema},"outputSchema":{output_schema},"execution":{{"locallyExecutable":{locally_executable}{read_only}}}}}"#
+    ))
+}
+
 type Handler = Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync>;
 
 /// A running mock gateway. Dropping it aborts the accept loop.

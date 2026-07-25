@@ -51,8 +51,8 @@ INFO skardi_server::optimizer_registry: ✓ Registered open_connector_query and 
 `saas.github_demo.issues` — the binding in
 [ctx_github_demo.yaml](ctx_github_demo.yaml) became a schema in the `saas`
 catalog. `state = {state}` is pushed into the gateway call as GitHub's
-`state` parameter; `pull_request IS NULL` drops the pull requests GitHub's
-issues endpoint mixes in.
+`state` parameter. (The rows are pure issues — the Open Connector action
+filters out the pull requests GitHub's raw issues endpoint mixes in.)
 
 ```bash
 curl -s -X POST http://localhost:8080/open_issues/execute \
@@ -62,8 +62,9 @@ curl -s -X POST http://localhost:8080/open_issues/execute \
 ```json
 {"success":true,"data":[
   {"number":1,"title":"Scan panics on empty page","author_login":"octocat","labels":["bug","p1"],"comments":3},
+  {"number":3,"title":"Add dark mode","author_login":"hubot","labels":["enhancement"],"comments":1},
   {"number":4,"title":"Flaky retry test","author_login":"octocat","labels":["bug"],"comments":7}
-],"rows":2}
+],"rows":3}
 ```
 
 ### 2. `open_connector_query` — the same table, ad hoc
@@ -90,7 +91,7 @@ curl -s -X POST http://localhost:8080/adhoc_issues/execute \
 ### 3. `open_connector_scan` — allowlisted raw action
 
 Executes `github.list_repository_issues` directly. The action must be in
-the context's `raw_action_allowlist` **and** classified `read_only: true`
+the context's `raw_action_allowlist` **and** classified read-only (`execution.readOnly`)
 by the gateway's discovery metadata; the row type is derived from the
 discovered output schema at `$.issues`. Provider-side filters (here
 `"state":"open"`) travel in the input JSON.
@@ -143,12 +144,13 @@ any connection attempt.
 
 ## Running against a real Open Connector gateway
 
-> **Status:** the `github` pack was built against the bundled contract
-> fixtures (see `packs/fixtures/github/` and the pack's admission notes);
-> validation against a live [Open Connector](https://github.com/oomol-lab/open-connector)
-> deployment — after which the pack pins action-contract fingerprints — is
-> tracked as an ops follow-up. Expect `ActionContractMismatch` /
-> conversion errors to be the signal if the live contract differs, never
+> **Status:** the pack's action IDs, input keys, row paths, and the HTTP
+> protocol (endpoint paths, response envelope, alias header) have been
+> reconciled against a live
+> [Open Connector](https://github.com/oomol-lab/open-connector) gateway
+> (v1.3.1) and its provider source. Action-contract fingerprint pins are
+> the remaining follow-up. Expect `ActionContractMismatch` / conversion
+> errors to be the signal if a future live contract differs, never
 > silently wrong rows.
 
 The Skardi side is identical; what changes is who answers the HTTP calls:

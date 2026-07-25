@@ -82,6 +82,20 @@ impl OpenConnectorTableProvider {
         if let Some(error_path) = table.error_path {
             RowPath::parse(error_path)?;
         }
+        // Withhold resource keys this table's action does not declare: Open
+        // Connector's action schemas are strict (`additionalProperties:
+        // false`), so a shared binding's extra keys — another table's
+        // `issueNumber`, or `owner`/`repo` reaching the resource-less
+        // repositories listing — would 400 every request. Registration has
+        // already rejected keys no bound table consumes.
+        let resource = match resource {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .filter(|(key, _)| table.declares_resource(key))
+                    .collect(),
+            ),
+            other => other,
+        };
         Ok(Self {
             client,
             cache,
@@ -189,6 +203,7 @@ mod tests {
             }],
             pagination,
             required_resources: &[],
+            optional_resources: &[],
             fixed_inputs: &[],
             filters: &[FilterMapping {
                 column: "id",

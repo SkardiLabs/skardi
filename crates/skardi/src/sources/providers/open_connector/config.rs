@@ -290,7 +290,7 @@ pub struct OpenConnectorBinding {
     /// for GitHub). Required keys are defined by the pack and checked when
     /// the binding is registered against a real source-pack registry.
     ///
-    /// Values keep their YAML types — `issue_number: 42` reaches the gateway
+    /// Values keep their YAML types — `issueNumber: 42` reaches the gateway
     /// as the JSON number 42, exactly as the UDTFs' resource JSON would send
     /// it (and as the shared scan-cache key expects, so a binding and an
     /// identical UDTF invocation hit the same entry).
@@ -415,7 +415,7 @@ bindings:
 
     #[test]
     fn resource_values_keep_their_yaml_types() {
-        // `issue_number: 42` must reach the gateway as JSON 42, not "42" —
+        // `issueNumber: 42` must reach the gateway as JSON 42, not "42" —
         // the same value the UDTFs' resource JSON sends, so a binding and an
         // identical UDTF invocation also share one scan-cache key.
         let config = parse(
@@ -424,14 +424,14 @@ runtime_token_env: T
 bindings:
   - name: gh
     source_pack: github
-    resource: { owner: acme, repo: widgets, issue_number: 42 }
+    resource: { owner: acme, repo: widgets, issueNumber: 42 }
     tables: [issue_comments]
 "#,
         );
         config.validate().expect("typed resources are valid");
         let resource = &config.bindings[0].resource;
         assert_eq!(resource.get("owner"), Some(&Value::from("acme")));
-        assert_eq!(resource.get("issue_number"), Some(&Value::from(42)));
+        assert_eq!(resource.get("issueNumber"), Some(&Value::from(42)));
     }
 
     #[test]

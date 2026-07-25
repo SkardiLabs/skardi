@@ -10,6 +10,6 @@ spec:
     SELECT t.team, count(*) AS open_issues
     FROM saas.github_demo.issues i
     JOIN team_owners t ON i.author_login = t.login
-    WHERE i.state = 'open' AND i.pull_request IS NULL
+    WHERE i.state = 'open'
     GROUP BY t.team
     ORDER BY open_issues DESC

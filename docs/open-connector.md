@@ -90,6 +90,12 @@ Notes:
 - Unknown keys anywhere in the block are rejected at load time — a
   misspelled `source_pack_versions` fails loudly instead of silently
   disabling the pin it was meant to set.
+- One binding can serve tables with different resource needs: each table's
+  requests carry only the resource keys its contract declares (Open
+  Connector's strict action schemas reject undeclared inputs), so binding
+  `repositories` alongside `issues` under one `owner`/`repo` resource map
+  just works. A resource key that *no* bound table declares fails
+  registration as a probable typo.
 - The gateway URL must be plain `http(s)://` with no embedded credentials,
   query string, or fragment; the runtime token travels only as a Bearer
   header.
@@ -168,10 +174,15 @@ Raw scans are deliberately narrow:
 
 - **Default-deny.** The action must be in the gateway's
   `raw_action_allowlist`, *and* its discovered metadata must classify it as
-  a non-mutating read (`read_only: true`). A missing or ambiguous
+  a non-mutating read (`execution.readOnly`). A missing or ambiguous
   classification is refused with an error naming the gap — the allowlist
   alone never grants execution. Both checks fire at planning time, before
-  any HTTP request.
+  any HTTP request. **Current-gateway caveat:** Open Connector does not yet
+  publish a read/write classification in its action metadata (verified
+  against v1.3.1), so raw scans against today's real gateway are refused by
+  this gate; built-in pack tables — read-only by Skardi's own review — are
+  unaffected. The parse site is forward-compatible for when the upstream
+  grows the field.
 - **Deterministic row type or planning error.** The Arrow schema is derived
   from the discovered action output schema at the row path: declared
   primitives (`string`, `integer`, `number`, `boolean`, including

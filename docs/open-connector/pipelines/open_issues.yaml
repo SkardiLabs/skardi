@@ -9,5 +9,5 @@ spec:
   query: |
     SELECT number, title, author_login, labels, comments
     FROM saas.github_demo.issues
-    WHERE state = {state} AND pull_request IS NULL
+    WHERE state = {state}
     ORDER BY number
