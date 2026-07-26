@@ -177,13 +177,15 @@ Eight components in four layers: configuration (boot-time, zero network), the en
 
 #### Fetcher
 
-The fetcher owns bounded HTTP: per-request timeout, total scan deadline, a response-size cap enforced on the decompressed body (so a compressed payload cannot inflate past it), bounded jittered retries honoring `Retry-After`, cancellation, and conditional GET with stored ETag / Last-Modified validators. Concurrency is capped by `max_concurrent`, which doubles as the per-host politeness bound. A self-identifying `User-Agent` is sent by default — feed servers routinely ban anonymous clients.
+The fetcher owns bounded HTTP: per-request timeout, total scan deadline, a response-size cap enforced on the decompressed body (so a compressed payload cannot inflate past it), bounded jittered retries honoring `Retry-After`, cancellation, and conditional GET with stored ETag / Last-Modified validators. Concurrency is capped by `max_concurrent`, which doubles as the per-host politeness bound — scoped to a single process: each replica counts independently, so N replicas (or a crash/restart loop) can present a feed host with up to N× this bound. A self-identifying `User-Agent` is sent by default — feed servers routinely ban anonymous clients.
 
 Feed URLs are agent-authored configuration, i.e. attacker-influenceable input, so the fetcher also enforces a default-deny egress policy at this single choke point (SSRF guard): it resolves each host and refuses any target resolving to a loopback, link-local, private (RFC 1918), CGNAT (`100.64/10`), or unique-local (`fc00::/7`) address, re-checks the policy on every redirect hop, and connects to the already-validated IP so a rebinding DNS answer cannot substitute an internal address after the check. Only globally-routable public addresses are fetched; a blocked URL degrades that feed exactly like an unreachable one (see Failure Modes). This is new logic kept local to the RSS provider — no existing helper filters by resolved IP — and ships with no opt-in to reach private targets (see Security and Future Extensions).
 
 #### Cache
 
 A per-feed, in-memory, bounded (bytes + entries, LRU) TTL cache behind a small trait so a persistent implementation can be swapped in later without touching the table providers. An entry stores parsed Arrow batches, ETag / Last-Modified validators, and fetch metadata. Only complete, successfully parsed feed windows are ever stored.
+
+The cache — validators included — is process-lifetime state: a restart empties it, so the first post-restart scan presents no validators and re-fetches every feed as a full `200`, never a `304`. The conditional-GET savings therefore vanish exactly when a fleet redeploys, and extend across restarts only once the persistent cache lands (see Future Extensions).
 
 #### Parser and conformance checker
 
@@ -245,7 +247,7 @@ spec:
           - url: https://this-week-in-rust.org/rss.xml
         # or: opml: subscriptions.opml # mutually exclusive with feeds:
         ttl_seconds: 900               # 0 = always live
-        max_concurrent: 6              # fetch parallelism and per-host politeness bound
+        max_concurrent: 6              # fetch parallelism and per-host politeness bound (per process)
         request_timeout_seconds: 10
         max_response_bytes: 5242880
         user_agent: "skardi-rss/<version> (+https://github.com/SkardiLabs/skardi)"
@@ -432,7 +434,7 @@ Caching claims no cross-feed consistency: a multi-feed scan can observe differen
 
 **Resource-bounded by construction.** The parser cannot be turned into a DoS amplifier: its input is already size-capped on the decompressed stream by the fetcher, and the parse runs with DTD/entity expansion disabled, so a small document cannot expand into a large one (billion-laughs class). `feed-rs`'s `quick-xml` backend does not expand custom entities by default; the design pins that as a requirement, not an incidental default.
 
-Content is stored wire-faithful (HTML); transformation to Markdown is a query-time choice inside `chunk('html', …)`. Because that stored HTML is attacker-influenceable and Skardi neither executes nor sanitizes it, the sanitization obligation sits with the consumer: any surface that renders `content` (or the archived `news_items.content`) as HTML must escape or sanitize it first. `docs/rss.md` states this contract.
+Content is stored wire-faithful (HTML); transformation to Markdown is a query-time choice inside `chunk('html', …)`. Skardi neither executes nor sanitizes that HTML; a consumer that renders `content` (or the archived `news_items.content`) applies contextual output encoding at the render point — the standard XSS defense. `docs/rss.md` states this contract.
 
 ## Failure Modes
 
@@ -461,9 +463,9 @@ Feed URLs are agent-authored configuration — the `auto_news_base` skill manage
 
 **Egress (SSRF).** Server-side fetches are default-deny by destination; the fetcher refuses any host that resolves into a reserved range (loopback, link-local incl. `169.254.169.254`, private, CGNAT, unique-local), re-validates on redirects, and connects to the validated IP against DNS rebinding — mechanism in Fetcher, behavior in Failure Modes. This is new logic, not a reuse: no existing helper filters by resolved IP (the `llm_extract` image fetch gates by scheme and an opt-in flag, not by address). No opt-in to reach private targets ships initially (see Future Extensions). The provider stores enclosure and `link` URLs but never fetches them; any future feature that does (e.g. full-article extraction) must route through this same egress policy.
 
-**Stored content.** Item `content` is wire-faithful, attacker-influenceable HTML that Skardi neither executes nor sanitizes; the sanitization obligation sits with any consumer that renders it (see Parsing, Sanitation, and Conformance).
+**Rendering.** Stored `content` is wire-faithful HTML (kept for fidelity and re-processing). XSS is neutralized the standard way — contextual output encoding at the point of render — a sink-dependent, render-time operation the provider cannot perform for the consumer; a consumer that renders `content` escapes it with its framework's encoder, as for any HTML (see Parsing, Sanitation, and Conformance).
 
-**LLM consumption.** Feed content is untrusted input to any agent that reads `items` or `news_chunks`; an entry can carry a prompt-injection payload aimed at the reasoning agent. The provider cannot prevent this — faithful delivery is its contract, and the data/instruction boundary lives in the consumer's model — so mitigation is the consumer/harness's: treat retrieved content as data, not instructions; keep the news-reading agent least-privileged; gate side-effectful actions (including subscription edits) behind deterministic checks or human confirmation. Skardi's contribution is on consequences, not prevention — the egress policy caps a hijacked agent's network reach, and subscription changes are configuration-only and human-visible (diff-before-write).
+**LLM consumption.** Prompt injection via feed content has no complete fix at any layer today, so the defense is containment, not prevention: keep the reading agent least-privileged and gate side effects deterministically. Skardi supplies two of those rails — the egress policy caps a hijacked agent's network reach, and subscription edits are configuration-only and human-visible (diff-before-write).
 
 **Content authenticity.** `guid`, `link`, `author`, and `published` are feed-asserted and unverifiable — a feed can forge them (a `link` pointing at an attacker page is still a well-formed feed), so downstream citations inherit the feed's own trust level. Item identity is scoped by the `feed` discriminator and archive ingest is anti-join/append-only on `(feed, guid)`, so a feed can neither collide with another feed's items nor rewrite an already-archived entry by reusing a `guid`.
 
@@ -528,9 +530,9 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and the consumer HTML-sanitization contract and untrusted-content guidance for LLM consumers (prompt injection is the consumer's to mitigate), pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead feeds).
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and content-handling guidance (contextual escaping at render; least-privilege and gated actions for LLM consumers), pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead feeds).
 - `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
-- A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance, the `window_status` freshness semantics, and an untrusted-content flag on `content`/`summary` (sanitize before rendering; treat as data, not instructions, before feeding an LLM), and whose table descriptions carry the absence-check pattern, so an agent discovers the health signals — stale rows and absent feeds — and the content trust boundary from the schema alone.
+- A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern, so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
 - skardi-skills: `auto_news_base` README with the five-step flow, the self-verification contract, and the `sync` health-report convention (empty report = all feeds healthy).
 
