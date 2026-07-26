@@ -14,7 +14,7 @@ The provider is deliberately a pure protocol adapter. History retention, chunkin
 
 ## Motivation
 
-Agents need continuously updating external information — industry news, competitor blogs, arXiv categories, CVE announcements, GitHub releases — as *retrievable, citable context* rather than one-shot web searches. RSS/Atom is the only open, machine-readable standard for this class of content, and it remains ubiquitous.
+Agents need continuously updating external information — industry news, competitor blogs, arXiv categories, CVE announcements, GitHub releases — as *retrievable, citable context* rather than one-shot web searches. RSS/Atom is the only open, machine-readable standard for this class of content, and it remains ubiquitous. The continuity is caller-supplied: the provider fetches only when read, so unattended freshness — and archive capture — depends on a scheduled `skardi sync` (cron or a recurring agent session); nothing self-refreshes (see Non-goals).
 
 The engine already contains almost every needed primitive: pipelines can `INSERT`, `chunk()` and `candle()` run inline in SQL, `sqlite_knn`/`sqlite_fts` power hybrid search, aliases expose short verbs, and semantics overlays make tables agent-discoverable. What is missing is the protocol translation — feed XML to relational rows — and the packaging that lets a user get from "the blogs I read" to "my agent can search them" in one conversation.
 
@@ -452,6 +452,7 @@ Content is stored wire-faithful (HTML), where wire-faithful means faithful to th
 | HTTP 429 / transient 5xx | Bounded jittered retries honoring `Retry-After` within the scan deadline; on exhaustion, degrade as feed-down: stale rows stamped `stale-error` or zero rows, `feeds` records the reason |
 | Health read after a failure | `feeds` never fetches; the failure state was recorded with its TTL re-armed (negative caching), so the read is instant and the dead feed is not re-poked |
 | `LIMIT` satisfied early | Remaining partitions never launch — neither fetched nor health-refreshed (see Execution rules); incomplete scans are never cached |
+| No scan within a feed's window roll (no `sync` scheduled) | Entries scroll out of the live window unobserved and are never archived — a permanent capture gap with no in-band trace (no scan ran to stamp anything); diagnosed by aging `feeds.last_fetch`; prevention is caller cadence, not provider action |
 
 ## Observability
 
@@ -481,7 +482,7 @@ flowchart LR
     M1 --> M2 --> M3
 ```
 
-The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → reload, scan `items` once to force every fetch, and confirm each subscription against the `feeds` health table (registration is zero-I/O, so that first scan is the preview), pruning dead or mis-discovered feeds → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join), with per-feed health delivered by `sync`'s own closing report.
+The `auto_news_base` flow (M3): collect a natural-language subscription list or OPML → autodiscover feed URLs from site HTML → render `ctx.yaml`, the two-table archive DDL (`news_items` + `news_chunks`), ingest/search pipelines, aliases (`sync`, `news`), semantics overlay → reload, scan `items` once to force every fetch, and confirm each subscription against the `feeds` health table (registration is zero-I/O, so that first scan is the preview), pruning dead or mis-discovered feeds → self-verify by running `skardi sync` then `skardi news "<probe>"`, asserting non-empty citable results served from the archive itself (no live-window join), with per-feed health delivered by `sync`'s own closing report. Steady state is externally paced: `skardi sync` runs on the caller's schedule — cron, CI, or a recurring agent session — at a cadence faster than the fastest feed's window roll; the provider never fetches unbidden.
 
 ## Testing Strategy
 
@@ -535,7 +536,7 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 - `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
 - A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern and the bare-`LIMIT` caveat (no `ORDER BY` = nondeterministic feed sample; completeness needs `ORDER BY` or no `LIMIT`), so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
-- skardi-skills: `auto_news_base` README with the five-step flow, the self-verification contract, and the `sync` health-report convention (empty report = all feeds healthy).
+- skardi-skills: `auto_news_base` README with the five-step flow, the self-verification contract, the `sync` health-report convention (empty report = all feeds healthy), and the scheduling note: continuity is the user's cadence — entries that scroll out of a feed's window between syncs are never captured.
 
 ## Future Extensions
 
