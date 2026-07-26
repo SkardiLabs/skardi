@@ -313,9 +313,9 @@ FROM news.main.items;
 | `http_status` | `UInt16` | nullable | last HTTP response code |
 | `last_error` | `Utf8` | nullable | fetch/parse error, redacted |
 | `etag` / `last_modified` | `Utf8` | nullable | conditional-request state |
-| `dialect` | `Utf8` | nullable | parsed dialect: `rss-0.9x` \| `rss-1.0` \| `rss-2.0` \| `atom-0.3` \| `atom-1.0` \| `json-feed-1.x` |
-| `dialect_declared` | `Utf8` | nullable | what the document claimed (root element + version attr; Content-Type corroborates) |
-| `conformance_notes` | `Utf8` | nullable | JSON array: declared/parsed mismatch, missing spec-required fields, sanitation repairs; `[]` = clean |
+| `dialect` | `Utf8` | nullable | parsed dialect, a direct mapping of `feed-rs`'s `FeedType`: `rss-0.9x` \| `rss-1.0` \| `rss-2.0` \| `atom` \| `json-feed-1.x` |
+| `dialect_declared` | `Utf8` | nullable | what the document claimed (root element + version attr; Content-Type corroborates); keeps version detail `feed-rs` collapses, e.g. `atom-0.3` vs `atom-1.0` |
+| `conformance_notes` | `Utf8` | nullable | JSON array: Content-Type vs parsed-family mismatch, missing spec-required fields, sanitation repairs; `[]` = clean |
 | `item_count` | `UInt64` | nullable | entries in current window |
 
 `<name>.main.items` — the live union across subscriptions; primary key `(feed, guid)`:
@@ -427,7 +427,7 @@ Caching claims no cross-feed consistency: a multi-feed scan can observe differen
 `feed-rs` parses RSS 0.9x/1.0/2.0, Atom 0.3/1.0, and JSON Feed 1.0/1.1. The tolerance strategy:
 
 1. **Sanitation pre-pass, on failure only.** A strict parse is attempted first. On failure, a bounded, deterministic sanitation pass runs — encoding sniff (BOM / XML declaration / `encoding_rs`), re-encode to UTF-8, strip control characters, repair naked ampersands — and the parse is retried once. Both attempts and applied repairs are traced and recorded in `conformance_notes`.
-2. **Conformance check, after every successful parse.** Detect the declared dialect from the document itself (root element + version attribute; Content-Type as corroboration), compare with what `feed-rs` parsed, and verify the dialect's spec-required fields (e.g. RSS 2.0 channel `title`/`link`/`description`). Deviations populate `feeds.dialect_declared` / `dialect` / `conformance_notes`; they never reject a feed that parsed — the check converts silent tolerance into queryable evidence.
+2. **Conformance check, after every successful parse.** Record the declared dialect sniffed from the document itself (root element + version attribute — keeping version detail `feed-rs` collapses, e.g. `atom-0.3` vs `atom-1.0`) and the parsed dialect as a direct mapping of `feed-rs`'s `Feed.feed_type` (`RSS0` / `RSS1` / `RSS2` / `Atom` / `JSON`). The two cannot disagree in-band: `feed-rs` dispatches its XML parsers on exactly root element + version attribute, so a document either parses as what it declares or fails outright. The mismatch check therefore compares the HTTP Content-Type against the parsed family (e.g. an Atom document served as `application/rss+xml`) and verifies the dialect's spec-required fields (e.g. RSS 2.0 channel `title`/`link`/`description`). Deviations populate `feeds.dialect_declared` / `dialect` / `conformance_notes`; they never reject a feed that parsed — the check converts silent tolerance into queryable evidence.
 3. **Fixture corpus as a regression ratchet.** `providers/rss/fixtures/` holds real-world feed documents across dialects plus every failure case encountered during development and in the field. Contract tests assert that every fixture either parses or degrades per-feed with a recorded reason — never a panic, never a silent skip. The corpus only grows.
 4. **Documented tolerance floor.** Feeds that still fail are visible via `feeds.last_status = 'error'` with `last_error` naming the parse stage; `docs/rss.md` states plainly what Skardi does not salvage.
 5. **Evidence loop.** Live-feed failures extend the sanitation pass and the corpus; the parser choice is revisited only if the gap versus `feedparser` proves structural rather than case-by-case.
@@ -443,7 +443,7 @@ Content is stored wire-faithful (HTML); transformation to Markdown is a query-ti
 | Feed down / DNS failure | Partition serves stale cached window — rows stamped `window_status = 'stale-error'` — or zero rows if never fetched (no rows to stamp; `feeds` is the only signal); other partitions unaffected; `feeds` row records error; tracing warns |
 | URL blocked by egress policy | Host resolves to a reserved range (loopback/link-local/private/CGNAT/ULA), or a redirect targets one; fetch refused before connect; `feeds.last_status = 'error'`, `last_error` names the egress block; zero rows in `items`; other feeds unaffected |
 | Malformed XML | Strict parse → sanitation → retry; success traced with repairs recorded; failure sets `last_status = 'error'`, `last_error` names the parse stage |
-| Dialect misdeclaration | Parses normally; mismatch recorded in `dialect_declared` vs `dialect` and `conformance_notes` |
+| Dialect misdeclaration | Parses normally; Content-Type vs parsed-family mismatch recorded in `conformance_notes`; `dialect_declared` / `dialect` stay queryable |
 | Feed omits `guid` | `link` used as guid; dedup collapses to link identity |
 | Response exceeds `max_response_bytes` (measured on the decompressed stream) | Fetch aborts with a targeted error status; never partial-parsed |
 | Compression / entity-expansion bomb | Decompressed-size cap plus disabled DTD/entity expansion bound the blow-up — a small payload cannot inflate into a large parse; aborted, `feeds.last_status = 'error'` |
