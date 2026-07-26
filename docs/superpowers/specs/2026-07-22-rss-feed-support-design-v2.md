@@ -401,7 +401,7 @@ Execution rules:
 
 - Each feed is one DataFusion partition: parallel fetching without a bespoke pool, streaming batches (fast feeds emit before slow ones), and a natural fault boundary.
 - `feed`/`feed_url` equality and `IN` predicates prune partitions before any fetch and are reported `Exact`; all other predicates remain in DataFusion — RSS has no query parameters, so nothing else can reach the wire.
-- `LIMIT` stops launching further partitions once satisfied; items have no global order (documented).
+- `LIMIT` stops launching further partitions once satisfied, and items have no global order, so a bare `LIMIT` (no `ORDER BY`) serves a nondeterministic subset of feeds — two identical queries can touch different feeds and do different amounts of work. Because fetch and health refresh ride on the scan, pruning also bounds the side effects: un-launched feeds are not fetched, and their `feeds` observations keep aging past the one-TTL bound a full scan restores. This is requested truncation, not concealed failure: the result's `feed` column is the scan's coverage manifest, absentees are diagnosed in `feeds` as usual, and completeness-sensitive reads — the absence check, `sync`'s ingest — use no bare `LIMIT` (`ORDER BY … LIMIT` is Top-K: it consumes every partition and prunes nothing).
 - Cancellation aborts in-flight requests and prevents further partitions.
 - Every scan is bounded by request timeout, total scan deadline, response-size cap, and `max_concurrent`.
 - Incomplete scans are never cached.
@@ -451,7 +451,7 @@ Content is stored wire-faithful (HTML); transformation to Markdown is a query-ti
 | HTTP 304 | Cache re-armed without reparse; `last_status = 'revalidated'` |
 | HTTP 429 / transient 5xx | Bounded jittered retries honoring `Retry-After` within the scan deadline; on exhaustion, degrade as feed-down: stale rows stamped `stale-error` or zero rows, `feeds` records the reason |
 | Health read after a failure | `feeds` never fetches; the failure state was recorded with its TTL re-armed (negative caching), so the read is instant and the dead feed is not re-poked |
-| `LIMIT` satisfied early | Remaining partitions never launch; incomplete scans are never cached |
+| `LIMIT` satisfied early | Remaining partitions never launch — neither fetched nor health-refreshed (see Execution rules); incomplete scans are never cached |
 
 ## Observability
 
@@ -530,9 +530,9 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and content-handling guidance (contextual escaping at render; least-privilege and gated actions for LLM consumers), pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead feeds).
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and content-handling guidance (contextual escaping at render; least-privilege and gated actions for LLM consumers), pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead vs not-scanned — pruned by the query's own bare `LIMIT`).
 - `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
-- A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern, so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
+- A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern and the bare-`LIMIT` caveat (no `ORDER BY` = nondeterministic feed sample; completeness needs `ORDER BY` or no `LIMIT`), so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
 - skardi-skills: `auto_news_base` README with the five-step flow, the self-verification contract, and the `sync` health-report convention (empty report = all feeds healthy).
 
