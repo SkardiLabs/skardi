@@ -85,6 +85,7 @@ The design choices, grouped by concern:
 - Archive in two tables: `news_items` keeps one wire-faithful row per entry and is the anti-join target; `news_chunks` holds chunks and embeddings — so citations and re-processing survive the live window.
 - Keep every rendered artifact except the `rss:` block subscription-agnostic; subscription edits are configuration-only and re-render nothing.
 - Render idempotently: `IF NOT EXISTS` DDL, diff-before-write, never blind-overwrite a user-edited file.
+- Version the engine↔skill surface: `feeds`/`items` evolve additively under an integer `rss` surface version — surfaced at registration, stamped into rendered artifacts, checked at pipeline load (see Skill lifecycle).
 
 **Security and trust boundary**
 
@@ -220,6 +221,15 @@ First assembly is the five-step flow under Rollout. Afterwards, every rendered a
 - **Subscription add/remove (frequent):** a pure configuration action — edit the `rss:` block or OPML, reload, then scan `items` for the new feed (the scan forces the fetch) and read its `feeds` row (`last_status`, `last_error`). No artifact is re-rendered. Removing a subscription retains its archived history by default (its rows simply stop growing); the skill offers an optional cleanup statement.
 - **Parameter change (rare):** a new chunk size, overlap, or embedding model requires re-rendering the two pipelines and rebuilding `news_chunks` from the content retained in `news_items`; the skill owns this rebuild flow.
 - **Skill re-run over an existing setup:** safe by construction — idempotent DDL, diff-before-write, no blind overwrites.
+
+**Engine↔skill schema contract.** Rendered artifacts embed `feeds`/`items` column names, the two halves live in repositories with independent release cadences, and a rendered pipeline, once in a user's context, outlives both. The contract is therefore versioned and checked, in four parts:
+
+- **Declared surface (v1).** `feeds`/`items` form a stable public interface: the column set evolves additively; removing, renaming, or retyping a column, tightening nullability, repurposing an enum domain (`last_status`, `window_status`), or changing `(feed, guid)` identity or window semantics is a breaking change and bumps an integer `rss` surface version.
+- **Visible at registration (v1).** Registration logs the active surface version and carries it in table metadata — an upgrade that changes it is visible rather than silent, the Open Connector convention.
+- **Pinned consumer fixture (v1).** A canonical render of the skill's artifacts (archive DDL, both pipelines), provenance-stamped with the skill version that produced it, is vendored into the engine's fixture corpus as a representative consumer exercising every contract point. Acceptance criteria 6 and 11 run against it in engine CI, so an engine change that breaks the rendered surface fails in-repo, with no cross-repo plumbing. It refreshes when the contract changes, not when the skill does; the skill repository conversely tests its render against a pinned engine release.
+- **Load-time handshake (M3, with the skill).** The skill stamps `requires: rss/<version>` into each rendered pipeline's metadata; the pipeline loader checks equality and refuses a mismatch with an error naming both versions and the remedy — re-run `auto_news_base` to re-render. This lands with the skill and the statement-sequence extension rather than as a deferred extension, because unlike Open Connector's compiled-in source packs, rendered artifacts live in user space: version skew is this design's default failure mode, not an edge case.
+
+Standing cross-repo CI was considered and rejected: it exercises only HEAD×HEAD, protecting neither released pairings nor already-rendered artifacts, at the cost of the heaviest plumbing.
 
 ## Catalog Namespace
 
@@ -489,6 +499,7 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 - **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, TTL re-arm on success and on failure (negative caching, failure fuse bounds), `window_status` stamping across freshness tiers (fresh / revalidated / stale-error), sanitation determinism, sanitation conservativeness (each repair rung a byte-level no-op on well-formed documents — CDATA with legal ampersands, predefined entities, numeric character references — and the ladder stopping at the first rung that parses), feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown), egress policy decision (each reserved range refused via an injectable resolver, a public address allowed, a redirect target re-checked).
 - **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields) and a billion-laughs / entity-expansion document that must be rejected rather than expanded; fixtures rescued by sanitation pin their expected extracted content, so the ratchet asserts what parsed, not merely that it parsed.
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation (surviving feeds' rows unaffected, stale rows stamped `stale-error`), response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration, zero-request `feeds` scans (health observation issues no HTTP, including right after a failure); a redirect whose `Location` resolves to a private address refused before connect; a gzip-compressed bomb rejected by the decompressed-size cap.
+- **Pinned consumer fixture:** the vendored canonical render (archive DDL + ingest/search pipelines) runs under the mock-HTTP server in engine CI; acceptance criteria 6 and 11 execute against it, so a `feeds`/`items` change that breaks the rendered surface fails in-repo.
 - **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('html')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency and its closing health report (a degraded feed listed with reason, a healthy run reporting empty); citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
@@ -499,17 +510,18 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 3. Two scans within TTL cause one fetch per feed; after TTL expiry an unchanged feed takes the 304 path with no reparse.
 4. With one dead feed among N, `items` returns the other feeds' rows; if the dead feed has a cached window, its rows are served stamped `window_status = 'stale-error'` — degradation visible in the result stream itself; `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
 5. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
-6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `chunk('html')` + `candle()`; rerunning it inserts zero new rows.
+6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `chunk('html')` + `candle()`; rerunning it inserts zero new rows (in engine CI, executed against the vendored canonical render).
 7. `items` participates in a federated join with an existing Skardi source.
 8. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
 9. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
 10. For every fixture, `feeds.dialect` matches the known dialect; a mismatching or spec-violating fixture yields non-empty `conformance_notes` while still serving rows.
-11. After an entry falls out of the live window (mock server shrinks the feed between syncs), `skardi news` still returns its title, link, and published timestamp from the archive.
+11. After an entry falls out of the live window (mock server shrinks the feed between syncs), `skardi news` still returns its title, link, and published timestamp from the archive — in engine CI, against the vendored render.
 12. Adding or removing a subscription changes only the `rss:` block/OPML; every other rendered artifact is byte-identical.
 13. A `feeds` scan issues zero network requests (mock-observed) at any moment — including immediately after a failed fetch, whose error state is recorded with its TTL re-armed rather than re-attempted.
 14. `skardi sync`'s response is the health report: with one degraded feed among N it lists that feed with `last_status` and `last_error`; with every feed healthy it is empty; a degraded feed never changes the run's exit status.
 15. A subscription whose URL resolves to a reserved range (loopback/link-local/private/CGNAT/ULA), or that redirects to one, is refused before connecting; `feeds.last_status = 'error'` with `last_error` naming the egress block, `items` yields zero rows for it, and other feeds are unaffected.
 16. Sanitation is conservative by contract: each repair rung is a byte-level no-op on well-formed fixtures (including CDATA containing legal ampersands, predefined entities, and numeric character references); the ladder stops at the first rung that parses, with `conformance_notes` recording exactly the rungs applied; fixtures rescued by sanitation assert their pinned extracted content.
+17. Registration surfaces the `rss` surface version (log + table metadata); with the M3 pipeline-metadata support, a rendered pipeline whose `requires` stamp mismatches the engine's surface version is refused at load with an error naming both versions and the re-render remedy.
 
 ## Expected Repository Shape
 
