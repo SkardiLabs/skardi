@@ -379,7 +379,8 @@ mod tests {
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err, envelope_ok,
+        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err,
+        envelope_ok,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorError, OpenConnectorGateways,
@@ -677,9 +678,9 @@ mod tests {
 
     /// Register `saas` with the given binding tables against `gateway`.
     async fn setup(gateway: &MockGateway, tables: &str, token_env: &str) -> SessionContext {
-        unsafe {
-            std::env::set_var(token_env, "test-token");
-        }
+        // Registration reads the token from the environment; the guard
+        // restores the prior state when setup returns (or panics).
+        let _token = EnvVarGuard::set(token_env, "test-token");
         let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
             r#"
 runtime_token_env: {token_env}
@@ -703,9 +704,6 @@ bindings:
         )
         .await
         .expect("gateway registration succeeds");
-        unsafe {
-            std::env::remove_var(token_env);
-        }
         register_open_connector_udtfs(&ctx, gateways);
         ctx
     }

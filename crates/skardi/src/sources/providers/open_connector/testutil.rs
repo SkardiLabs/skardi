@@ -356,6 +356,39 @@ impl tracing::Subscriber for CaptureSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+/// Set an environment variable for the guard's lifetime and restore the
+/// previous state — prior value or absence — on drop, including on panic,
+/// so a failing test cannot leak its variable into tests that run later.
+///
+/// `set_var`/`remove_var` are unsafe because mutating the process
+/// environment is not thread-safe; what keeps the tests sound is what
+/// always has — per-test-unique variable names — and the guard adds
+/// restore-on-drop on top, not thread safety.
+pub(crate) struct EnvVarGuard {
+    name: String,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    pub(crate) fn set(name: &str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, value) };
+        Self {
+            name: name.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(&self.name, value) },
+            None => unsafe { std::env::remove_var(&self.name) },
+        }
+    }
+}
+
 /// Capture every tracing event emitted on the current thread while the
 /// returned guard lives. `#[tokio::test]` bodies run on a single-threaded
 /// runtime, so scan events land on the test thread and parallel tests stay
