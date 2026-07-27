@@ -407,15 +407,19 @@ feeds:
 
     #[test]
     fn unknown_fields_are_rejected() {
-        // Unknown top-level field.
-        assert!(serde_yaml::from_str::<RssConfig>("feeds: []\nbogus: 1\n").is_err());
+        // Unknown top-level field: the error must name the offending field,
+        // not just fail generically (a misspelled key must fail loudly with
+        // a targeted message, per the same bar `open_connector/config.rs`
+        // holds its own `deny_unknown_fields` tests to).
+        let err = serde_yaml::from_str::<RssConfig>("feeds: []\nbogus: 1\n").unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
 
-        // Unknown field within a feed subscription entry.
-        assert!(
-            serde_yaml::from_str::<RssConfig>(
-                "feeds:\n  - url: https://a.example/f.xml\n    bogus: 1\n"
-            )
-            .is_err()
-        );
+        // Unknown field within a feed subscription entry — same bar applies
+        // one level down.
+        let err = serde_yaml::from_str::<RssConfig>(
+            "feeds:\n  - url: https://a.example/f.xml\n    bogus: 1\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 }
