@@ -143,16 +143,19 @@ event carrying the scan identity and error.
       never be non-NULL) and a negative-space guard test
       (`issues_declares_no_pull_request_marker`) pins that absence. Redacted per-table
       fixtures (`packs/fixtures/github/`) are the build-time conversion contract
-      (null-bearing, null-parent, empty-list, nested, extra-field rows); the action IDs,
+      (null-bearing, null-parent, empty-list, nested, extra-field rows, and a
+      schema-mismatch page whose targeted (column, page, row, expected, found-kind)
+      error the contract test asserts, per the admission gate); the action IDs,
       input keys, row paths, and HTTP protocol are reconciled against a live gateway,
       while fingerprint pins stay `None` like the mock pack until taken from a live
       gateway's discovered contracts (follow-up).
       Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
       visibility incl. the pure-issues note, rate limits, freshness), README row updated.
-      Verification: 26 pack tests (counted by
+      Verification: 27 pack tests (counted by
       `cargo test -p skardi --lib sources::providers::open_connector::packs::github`;
-      202 open_connector tests total) — 8 fixture contract suites incl. empty pages,
-      bind-time validation of all 8 contracts, the no-marker negative-space guard, and
+      203 open_connector tests total) — 8 fixture contract suites incl. empty pages
+      and the schema-mismatch page, bind-time validation of all 8 contracts, the
+      no-marker negative-space guard, and
       end-to-end via mock gateway: 150-row two-page scan with the `state=all` pin on
       every request, pushed `state` override (Inexact — faithful only inside the
       provider's enum domain), Inexact `since` narrowing + local re-filter keeping the
