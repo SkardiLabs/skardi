@@ -8,7 +8,7 @@
 
 Skardi will support RSS/Atom subscriptions as a first-class, read-only data source, `type: rss`. One configured source binds a subscription list and exposes two fixed tables: `feeds`, one row per subscription carrying fetch health, and `items`, the live union of all current entries across subscriptions. Scans fetch at query time through a per-feed TTL cache with HTTP conditional requests; each feed is an independent execution partition, so a dead feed degrades visibly instead of failing the scan; served rows carry their window's freshness in-band via `window_status`.
 
-The design exposes one SQL surface: persistent stable tables `<name>.main.feeds` and `<name>.main.items`, registered from context YAML. The type gap between wire-faithful feed HTML and markdown-aware chunking closes inside the existing `chunk()` UDF — a new `'html'` mode converts HTML to Markdown before splitting. It is a bridge between the provider and `chunk()`, not a new user-facing function.
+The design exposes one SQL surface: persistent stable tables `<name>.main.feeds` and `<name>.main.items`, registered from context YAML. Item content is stored as Markdown: the provider converts each entry's extracted HTML once, at extraction time, through a deterministic internal HTML→Markdown pass — so query results drop into prompts as-is, chunking uses the existing `'markdown'` mode, and no engine surface changes outside the provider.
 
 The provider is deliberately a pure protocol adapter. History retention, chunking, embedding, and hybrid retrieval compose from existing primitives — anti-join `INSERT` pipelines, `chunk()`, `candle()`, `sqlite_knn`/`sqlite_fts`. An `auto_news_base` skill renders and self-verifies that composition end to end.
 
@@ -28,6 +28,7 @@ Feeds routinely misdescribe themselves: Atom documents served with an `applicati
 
 - Make a subscription list queryable as ordinary Arrow-backed DataFusion tables: subscription list in, `feeds` + `items` out, zero external processes.
 - Normalize every wild-web dialect into one protocol-pinned relational representation.
+- Serve item content LLM-ready: Markdown, converted once at extraction — prompt-ready query results, tag-free text for fts5 and embeddings, no per-consumer conversion.
 - Serve live-by-default reads with a per-feed TTL cache and HTTP conditional requests (ETag / Last-Modified).
 - Isolate faults per feed; make feed health queryable in SQL and stale degradation visible in-band on served rows, never silent.
 - Record declared-versus-parsed dialect conformance queryably.
@@ -76,13 +77,13 @@ The design choices, grouped by concern:
 
 - Parse with `feed-rs` behind an `rss` Cargo feature, hardened by a sanitation pre-pass and a fixture corpus.
 - Detect dialect and record declared-versus-parsed conformance queryably.
-- Store content wire-faithful (HTML); bridge it into chunking with an `'html'` mode on the existing `chunk()` UDF rather than a new scalar UDF.
+- Store item content as Markdown: a deterministic HTML→Markdown conversion runs inside the provider at extraction time, so chunking uses the existing `'markdown'` mode — no new chunk mode, no new UDF, no engine change outside the provider.
 - Pin stable columns for the RSS/Atom core plus enclosures; collapse other namespaces into `extensions_json`.
 - Publish the dialect → unified-schema mapping in docs and as semantics-overlay column descriptions.
 
 **Downstream contract**
 
-- Archive in two tables: `news_items` keeps one wire-faithful row per entry and is the anti-join target; `news_chunks` holds chunks and embeddings — so citations and re-processing survive the live window.
+- Archive in two tables: `news_items` keeps one row per entry, content exactly as `items` served it (Markdown), and is the anti-join target; `news_chunks` holds chunks and embeddings — so citations and re-processing survive the live window.
 - Keep every rendered artifact except the `rss:` block subscription-agnostic; subscription edits are configuration-only and re-render nothing.
 - Render idempotently: `IF NOT EXISTS` DDL, diff-before-write, never blind-overwrite a user-edited file.
 - Version the engine↔skill surface: `feeds`/`items` evolve additively under an integer `rss` surface version — surfaced at registration, stamped into rendered artifacts, checked at pipeline load (see Skill lifecycle).
@@ -90,7 +91,7 @@ The design choices, grouped by concern:
 **Security and trust boundary**
 
 - Treat agent-authored feed URLs as untrusted egress: the fetcher default-denies private, loopback, link-local, CGNAT, and unique-local targets (SSRF guard), keeping the policy local to the RSS fetcher's choke point rather than reusing the scheme-based `llm_extract` image guard, which does not filter by address.
-- Store item content wire-faithful — faithful to the extracted HTML fragment; the sanitation pre-pass repairs the XML document before extraction, never the fragment (defined in Parsing, Sanitation, and Conformance) — and place the HTML-sanitization obligation on the consumer; Skardi never executes or sanitizes stored feed HTML.
+- Store item content as Markdown produced by the provider's own conversion, whose output contains no raw HTML (`<script>`/`<style>` dropped, markup without a Markdown equivalent reduced to its text content) — so stored content carries no executable markup. Rendering it remains a consumer decision about untrusted text: inline HTML off, link schemes filtered (see Security).
 
 ## Alternatives Considered
 
@@ -101,6 +102,10 @@ Discovery-style catalogs (sqlite) exist because table structure is unknown ahead
 ### A generic `type: xml` source
 
 XML is syntax, not a data contract: a generic XML source cannot declare a fixed schema without a user-authored XPath mapping layer, which is a different and much larger product. RSS/Atom is a protocol with known fields — exactly what a `TableProvider`'s fixed `SchemaRef` wants. Rejected.
+
+### Wire-faithful HTML storage with query-time conversion
+
+An earlier revision stored `content`/`summary` as wire-faithful HTML and bridged into chunking with a new `'html'` mode on `chunk()`. That kept the original markup — a future, better converter could re-render history — at the price of making every consumer pay for HTML on every read: prompts ingest tag noise (wasted tokens), fts5 and embeddings index markup instead of text, every chunking pipeline needs the bridge mode (an engine change), and each re-read or re-embed re-runs the same conversion. In practice the consumer of item content is retrieval and LLM context — nobody renders feed HTML — so markup fidelity served no live consumer while its costs recurred on every read. Reversed in favor of converting once at extraction and storing Markdown: prompt-ready results, clean text for fts5/embeddings, the already-shipped `'markdown'` chunk mode, one deterministic conversion instead of N query-time ones, and a narrower rendering surface (no stored executable markup). The accepted loss: source HTML is not retained, so history cannot be re-converted with a future converter; re-chunking and re-embedding from stored Markdown remain possible.
 
 ### History or archive inside the provider
 
@@ -151,8 +156,8 @@ flowchart LR
         Prov["type: rss provider<br/>fetch / cache / parse<br/>partition per feed"] --> Items["items live window"]
     end
     subgraph UserSpace["user-space composition (rendered by auto_news_base)"]
-        P["archive pipeline<br/>anti-join INSERT +<br/>chunk('html') + candle"]
-        A["sqlite archive<br/>news_items: wire-faithful rows<br/>news_chunks: chunks + embeddings<br/>(fts5 / vec0 mirrors)"]
+        P["archive pipeline<br/>anti-join INSERT +<br/>chunk('markdown') + candle"]
+        A["sqlite archive<br/>news_items: item rows (Markdown)<br/>news_chunks: chunks + embeddings<br/>(fts5 / vec0 mirrors)"]
         News["skardi news<br/>hybrid search, citable results"]
         P --> A --> News
     end
@@ -162,7 +167,7 @@ flowchart LR
 
 ## Components
 
-Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the stable tables and the `'html'` chunk mode), and packaging (user space, outside the provider).
+Eight components in four layers: configuration (boot-time, zero network), the engine (together, the shared fetch/parse engine of the architecture diagram), the SQL surface (the stable tables), and packaging (user space, outside the provider).
 
 ### Configuration layer
 
@@ -192,15 +197,15 @@ The cache — validators included — is process-lifetime state: a restart empti
 
 A strict `feed-rs` parse is attempted first; on failure a bounded, deterministic sanitation ladder applies repairs cumulatively, re-parsing after each rung and stopping at the first success. After every successful parse, a conformance check records the declared dialect, the parsed dialect, and any deviations. Details in "Parsing, Sanitation, and Conformance".
 
+#### Markdown converter
+
+After parse and field extraction, each entry's `content` and `summary` pass through a pure-Rust HTML→Markdown conversion (`htmd`/`html2md` class, selected at implementation) before Arrow conversion. The pass applies to HTML-typed values; plain-text values (JSON Feed `content_text`, Atom `type="text"`) pass through unchanged. The conversion is deterministic — identical fragment in, byte-identical Markdown out — and its output contains no raw HTML: elements with Markdown equivalents convert (headings, lists, links, emphasis, code, tables, images), `<script>`/`<style>` and comments are dropped wholesale, and remaining markup is reduced to its text content. It never fails a feed: pathological HTML degrades to text content, not to an error. The fixture corpus pins converted output byte-for-byte, so the contract binds whichever crate is chosen and a crate upgrade that changes output is a reviewed, fixture-visible change. The converter is provider-internal, behind the `rss` feature; the chunking module is untouched (see Alternatives Considered for the superseded `chunk('html')` bridge).
+
 ### SQL layer
 
 #### Table providers and execution plan
 
 `feeds` and `items` are fixed-`SchemaRef` `TableProvider`s over a shared execution plan that exposes one partition per subscription. A `feeds` scan is a pure state read — it never fetches or revalidates; all network I/O is initiated by `items` scans, so the health check is cheap by construction.
-
-#### `chunk('html')` bridge mode
-
-The existing `chunk()` UDF gains an `'html'` mode: a pure-Rust HTML→Markdown conversion (`htmd`/`html2md` class, selected at implementation) runs as a pre-pass, then the markdown-aware splitter proceeds exactly as in `'markdown'` mode. No new function is registered — the bridge between provider HTML and chunking lives inside the mode dispatch that already exists for `'character'`/`'markdown'`, and it works for any HTML-bearing column, not just RSS.
 
 ### Packaging layer
 
@@ -210,7 +215,7 @@ Lives in skardi-skills; this spec defines the contract it renders against. It ho
 
 Rendered artifacts: `ctx.yaml` (rss source + sqlite archive), a one-shot DDL script for the archive, `pipelines/archive_ingest.yaml`, `pipelines/search_hybrid.yaml`, `aliases.yaml` (`sync`, `news`), and a semantics overlay. Render rules: the DDL is idempotent (`CREATE TABLE IF NOT EXISTS`); re-rendering shows a diff before writing and never blind-overwrites a user-edited file.
 
-The archive contract is two tables. `news_items` retains one wire-faithful row per entry — primary key `(feed, guid)`, plus `title`, `link`, `author`, `published`, and `content` (HTML) — and is the anti-join target for ingest. `news_chunks` holds `(feed, guid, chunk_idx, chunk_text, embedding, ingested_at)` with the fts5/vec0 mirrors attached. Ingest is two `INSERT` steps: new entries land wire-faithful in `news_items`, then are chunked and embedded from `news_items` into `news_chunks`. Search joins the two inside the archive, so results remain citable (title + link + published) after entries fall out of the live window, and history can always be re-chunked or re-embedded from retained content.
+The archive contract is two tables. `news_items` retains one row per entry exactly as `items` served it — primary key `(feed, guid)`, plus `title`, `link`, `author`, `published`, and `content` (Markdown) — and is the anti-join target for ingest. `news_chunks` holds `(feed, guid, chunk_idx, chunk_text, embedding, ingested_at)` with the fts5/vec0 mirrors attached. Ingest is two `INSERT` steps: new entries land verbatim in `news_items`, then are chunked and embedded from `news_items` into `news_chunks`. Search joins the two inside the archive, so results remain citable (title + link + published) after entries fall out of the live window, and history can always be re-chunked or re-embedded from retained content.
 
 `sync` ends by reporting health: the ingest pipeline's closing statement is a `SELECT` over `feeds` returning every degraded subscription (`last_status IN ('error', 'never', 'stale-error')`) with its reason (`last_error`) and as-of time (`last_fetch`) — the degradation discovered by the scan `sync` just ran surfaces in `sync`'s own output, where the agent can act on it (prune, fix, or caveat). The read is free (`feeds` is pure state, no fetches). An empty report means every feed is healthy — the rendered README states the convention — and the report never fails the run: a degraded feed changes the output, not the exit status. This three-statement pipeline (two `INSERT`s, one closing `SELECT`) requires statement sequences that return the last statement's rows as the response — a small pipeline-engine extension recorded as an M3 dependency; the two-`INSERT` ingest already needs it.
 
@@ -300,10 +305,12 @@ WHERE i.feed IS NULL;
 
 Absence alone is not a verdict: a feed may be legitimately empty (`last_status = 'fresh'`, `item_count = 0`) rather than dead (`'error'` / `'never'`) — `last_status` is what distinguishes them. The check never fetches — `feeds` is a pure state read — so it is cheap by construction, not by timing. Nobody polls `feeds` on a schedule; consumption is reactive — data read first, absence check alongside it.
 
-### Chunking feed HTML in pipelines
+### Chunking feed content in pipelines
+
+Item content is already Markdown, so the existing mode applies directly:
 
 ```sql
-SELECT chunk('html', COALESCE(content, summary), 1200, 120)
+SELECT chunk('markdown', COALESCE(content, summary), 1200, 120)
 FROM news.main.items;
 ```
 
@@ -340,8 +347,8 @@ FROM news.main.items;
 | `author` | `Utf8` | nullable | |
 | `published` | `Timestamp(ms, UTC)` | nullable | |
 | `updated` | `Timestamp(ms, UTC)` | nullable | |
-| `content` | `Utf8` | nullable | wire-faithful HTML (full content when present) |
-| `summary` | `Utf8` | nullable | wire-faithful HTML |
+| `content` | `Utf8` | nullable | Markdown, converted at extraction (full content when present) |
+| `summary` | `Utf8` | nullable | Markdown, same conversion |
 | `categories` | `List<Utf8>` | nullable | |
 | `enclosure_url` | `Utf8` | nullable | podcast/media support |
 | `enclosure_type` | `Utf8` | nullable | MIME type |
@@ -371,7 +378,7 @@ The normative dialect → unified-schema mapping. It ships in `docs/rss.md` and 
 | `categories` | `<category>*` | `dc:subject*` | `<category term>*` | `tags[]` |
 | `enclosure_*` | `<enclosure url/type/length>` | — | `<link rel="enclosure">` | `attachments[0]` |
 
-All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a dialect lacks are simply null — nullability in the schema *is* the dialect-coverage annotation. Anything outside this table lands in `extensions_json`. `feed`, `feed_url`, `position`, and `window_status` are provider-synthesized, not wire fields, so they do not appear in the mapping.
+All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a dialect lacks are simply null — nullability in the schema *is* the dialect-coverage annotation. Anything outside this table lands in `extensions_json`. `feed`, `feed_url`, `position`, and `window_status` are provider-synthesized, not wire fields, so they do not appear in the mapping. For `content` and `summary` the table names the wire field the value comes from; HTML-typed values are then converted to Markdown at extraction (see Markdown converter), plain-text values pass through unchanged.
 
 ## Scan Execution
 
@@ -397,7 +404,7 @@ sequenceDiagram
                 C-->>TP: cached Arrow batches
             else 200 OK
                 W-->>TP: feed document
-                TP->>TP: strict parse → sanitize+retry → conformance check → Arrow
+                TP->>TP: strict parse → sanitize+retry → conformance check<br/>→ HTML→Markdown conversion → Arrow
                 TP->>C: store complete window + validators
             else fetch/parse failure
                 TP->>TP: serve stale window (rows stamped window_status = 'stale-error')<br/>or zero rows — no in-band carrier;<br/>record feeds.last_status / last_error; trace warning
@@ -444,7 +451,7 @@ Caching claims no cross-feed consistency: a multi-feed scan can observe differen
 
 **Resource-bounded by construction.** The parser cannot be turned into a DoS amplifier: its input is already size-capped on the decompressed stream by the fetcher, and the parse runs with DTD/entity expansion disabled, so a small document cannot expand into a large one (billion-laughs class). `feed-rs`'s `quick-xml` backend does not expand custom entities by default; the design pins that as a requirement, not an incidental default.
 
-Content is stored wire-faithful (HTML), where wire-faithful means faithful to the HTML fragment the parser extracted: XML transport encoding (entity references, CDATA wrapping) is removed at extraction; sanitation repairs, when any ran, happened to the XML document before extraction and are queryable in `conformance_notes`; after extraction nothing is altered. It is a fragment-level fidelity claim, not byte-identity with the transport stream, and it covers `items.content`/`summary` and the archived `news_items` rows alike. Transformation to Markdown is a query-time choice inside `chunk('html', …)`. Skardi neither executes nor sanitizes that HTML; a consumer that renders `content` (or the archived `news_items.content`) applies contextual output encoding at the render point — the standard XSS defense. `docs/rss.md` states this contract.
+Content is stored as Markdown. The chain from wire to storage: XML transport encoding (entity references, CDATA wrapping) is removed at extraction; sanitation repairs, when any ran, happened to the XML document before extraction and are queryable in `conformance_notes`; the extracted HTML fragment then passes through the provider's deterministic HTML→Markdown conversion (see Markdown converter) and the result is stored unaltered. The fidelity claim is therefore extraction-plus-conversion faithful, not wire-faithful: document structure and text survive (headings, lists, links, emphasis, code), the original markup does not, and because the source HTML is not retained, a future improved converter cannot re-render history — an accepted trade (see Alternatives Considered); re-chunking and re-embedding from stored Markdown remain possible. The claim covers `items.content`/`summary` and the archived `news_items` rows alike. Stored Markdown contains no raw HTML by the converter's contract; a consumer that renders it still treats it as untrusted input (see Security). `docs/rss.md` states this contract.
 
 ## Failure Modes
 
@@ -474,7 +481,7 @@ Feed URLs are agent-authored configuration — the `auto_news_base` skill manage
 
 **Egress (SSRF).** Server-side fetches are default-deny by destination; the fetcher refuses any host that resolves into a reserved range (loopback, link-local incl. `169.254.169.254`, private, CGNAT, unique-local), re-validates on redirects, and connects to the validated IP against DNS rebinding — mechanism in Fetcher, behavior in Failure Modes. This is new logic, not a reuse: no existing helper filters by resolved IP (the `llm_extract` image fetch gates by scheme and an opt-in flag, not by address). No opt-in to reach private targets ships initially (see Future Extensions). The provider stores enclosure and `link` URLs but never fetches them; any future feature that does (e.g. full-article extraction) must route through this same egress policy.
 
-**Rendering.** Stored `content` is wire-faithful HTML (kept for fidelity and re-processing). XSS is neutralized the standard way — contextual output encoding at the point of render — a sink-dependent, render-time operation the provider cannot perform for the consumer; a consumer that renders `content` escapes it with its framework's encoder, as for any HTML (see Parsing, Sanitation, and Conformance).
+**Rendering.** Stored `content`/`summary` is Markdown that contains no raw HTML — `<script>`/`<style>` are dropped and markup without a Markdown equivalent is reduced to its text content at conversion (see Markdown converter) — so the stored value is inert text, not an executable document. Rendering it is still a consumer decision about untrusted input: a consumer that renders the Markdown to HTML keeps raw/inline HTML disabled in its renderer and filters link destinations to safe schemes (a feed can write `[x](javascript:…)`); one that displays it as plain text has nothing to do. The XSS surface narrows from "escape arbitrary attacker HTML at every sink" to those two renderer settings; it does not disappear.
 
 **LLM consumption.** Prompt injection via feed content has no complete fix at any layer today, so the defense is containment, not prevention: keep the reading agent least-privileged and gate side effects deterministically. Skardi supplies two of those rails — the egress policy caps a hijacked agent's network reach, and subscription edits are configuration-only and human-visible (diff-before-write).
 
@@ -487,7 +494,7 @@ Three milestones, independently reviewable; each gets its own implementation pla
 ```mermaid
 flowchart LR
     M1["M1 — provider core<br/>config, fetch/cache, parse+conformance,<br/>both tables, partitioned exec, pushdown,<br/>fixtures + mock-HTTP suite"]
-    M2["M2 — surfaces<br/>chunk 'html' mode,<br/>docs/rss.md, README row"]
+    M2["M2 — surfaces<br/>docs/rss.md, README row"]
     M3["M3 — skill<br/>auto_news_base rendering<br/>+ self-verification"]
     M1 --> M2 --> M3
 ```
@@ -496,11 +503,11 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 
 ## Testing Strategy
 
-- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, TTL re-arm on success and on failure (negative caching, failure fuse bounds), `window_status` stamping across freshness tiers (fresh / revalidated / stale-error), sanitation determinism, sanitation conservativeness (each repair rung a byte-level no-op on well-formed documents — CDATA with legal ampersands, predefined entities, numeric character references — and the ladder stopping at the first rung that parses), feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, `'html'` chunk-mode conversion (tags stripped, headings/lists/links preserved as Markdown), egress policy decision (each reserved range refused via an injectable resolver, a public address allowed, a redirect target re-checked).
-- **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields) and a billion-laughs / entity-expansion document that must be rejected rather than expanded; fixtures rescued by sanitation pin their expected extracted content, so the ratchet asserts what parsed, not merely that it parsed.
+- **Unit:** typed config parsing/validation (inline vs OPML, bounds), cache keying/TTL/eviction/completeness invariant, TTL re-arm on success and on failure (negative caching, failure fuse bounds), `window_status` stamping across freshness tiers (fresh / revalidated / stale-error), sanitation determinism, sanitation conservativeness (each repair rung a byte-level no-op on well-formed documents — CDATA with legal ampersands, predefined entities, numeric character references — and the ladder stopping at the first rung that parses), feed-rs → Arrow conversion (nulls, timestamps, categories, enclosures, extensions_json), guid fallback, dialect detection, HTML→Markdown conversion (deterministic — identical input, byte-identical output; headings/lists/links/code preserved as Markdown; `<script>`/`<style>` dropped; unknown markup reduced to its text content; no raw HTML in output; plain-text content passes through unchanged), egress policy decision (each reserved range refused via an injectable resolver, a public address allowed, a redirect target re-checked).
+- **Fixture corpus contract tests:** every fixture parses or degrades visibly; row-value assertions per dialect following the Field Mapping table; dialect and `conformance_notes` asserted per fixture, including deliberate liars (Atom served as `rss+xml`, RSS 2.0 missing required channel fields) and a billion-laughs / entity-expansion document that must be rejected rather than expanded; fixtures rescued by sanitation pin their expected stored Markdown, so the ratchet asserts what parsed, not merely that it parsed; hostile-markup fixtures (`<script>`/`<style>`, unknown tags, `javascript:` hrefs) pin converted output demonstrating the no-raw-HTML contract.
 - **Mock-HTTP integration:** a local server exercises TTL tiers (fresh / 304 / 200), request counting for partition pruning, dead-feed isolation (surviving feeds' rows unaffected, stale rows stamped `stale-error`), response-size cap, timeout, retry/`Retry-After`, cancellation, zero-network registration, zero-request `feeds` scans (health observation issues no HTTP, including right after a failure); a redirect whose `Location` resolves to a private address refused before connect; a gzip-compressed bomb rejected by the decompressed-size cap.
 - **Pinned consumer fixture:** the vendored canonical render (archive DDL + ingest/search pipelines) runs under the mock-HTTP server in engine CI; acceptance criteria 6 and 11 execute against it, so a `feeds`/`items` change that breaks the rendered surface fails in-repo.
-- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('html')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency and its closing health report (a degraded feed listed with reason, a healthy run reporting empty); citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
+- **End-to-end:** ctx.yaml registration; `items` × sqlite federated join; the full archive pipeline (`chunk('markdown')` → `candle` → INSERT into `news_items` + `news_chunks`) with rerun idempotency and its closing health report (a degraded feed listed with reason, a healthy run reporting empty); citability after window expiry (mock feed window shrinks between syncs, archived entries stay citable); subscription add/remove touching only the `rss:` block; parameter-change rebuild of `news_chunks` from `news_items`.
 - **Live tests:** opt-in, ignored by default, never in ordinary CI.
 
 ## Acceptance Criteria
@@ -510,7 +517,7 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 3. Two scans within TTL cause one fetch per feed; after TTL expiry an unchanged feed takes the 304 path with no reparse.
 4. With one dead feed among N, `items` returns the other feeds' rows; if the dead feed has a cached window, its rows are served stamped `window_status = 'stale-error'` — degradation visible in the result stream itself; `feeds.last_status`/`last_error` reflect the failure, and a tracing warning is emitted — nothing silent.
 5. Every corpus fixture parses or degrades per-feed with a recorded reason; no fixture panics.
-6. The archive pipeline INSERTs wire-faithful rows into `news_items` and chunk/embedding rows into `news_chunks` via `chunk('html')` + `candle()`; rerunning it inserts zero new rows (in engine CI, executed against the vendored canonical render).
+6. The archive pipeline INSERTs item rows verbatim into `news_items` and chunk/embedding rows into `news_chunks` via `chunk('markdown')` + `candle()`; rerunning it inserts zero new rows (in engine CI, executed against the vendored canonical render).
 7. `items` participates in a federated join with an existing Skardi source.
 8. On a clean machine, `auto_news_base` takes a natural-language subscription list to a working news base and its self-verification passes; an unmodified agent session drives `sync`/`news` using only README + `--help`.
 9. Timestamps surface as typed Arrow timestamps; enclosures, categories, and `extensions_json` populate per fixtures.
@@ -520,8 +527,9 @@ The `auto_news_base` flow (M3): collect a natural-language subscription list or 
 13. A `feeds` scan issues zero network requests (mock-observed) at any moment — including immediately after a failed fetch, whose error state is recorded with its TTL re-armed rather than re-attempted.
 14. `skardi sync`'s response is the health report: with one degraded feed among N it lists that feed with `last_status` and `last_error`; with every feed healthy it is empty; a degraded feed never changes the run's exit status.
 15. A subscription whose URL resolves to a reserved range (loopback/link-local/private/CGNAT/ULA), or that redirects to one, is refused before connecting; `feeds.last_status = 'error'` with `last_error` naming the egress block, `items` yields zero rows for it, and other feeds are unaffected.
-16. Sanitation is conservative by contract: each repair rung is a byte-level no-op on well-formed fixtures (including CDATA containing legal ampersands, predefined entities, and numeric character references); the ladder stops at the first rung that parses, with `conformance_notes` recording exactly the rungs applied; fixtures rescued by sanitation assert their pinned extracted content.
+16. Sanitation is conservative by contract: each repair rung is a byte-level no-op on well-formed fixtures (including CDATA containing legal ampersands, predefined entities, and numeric character references); the ladder stops at the first rung that parses, with `conformance_notes` recording exactly the rungs applied; fixtures rescued by sanitation assert their pinned stored Markdown.
 17. Registration surfaces the `rss` surface version (log + table metadata); with the M3 pipeline-metadata support, a rendered pipeline whose `requires` stamp mismatches the engine's surface version is refused at load with an error naming both versions and the re-render remedy.
+18. Stored `content`/`summary` is Markdown with no raw HTML: fixtures carrying `<script>`/`<style>`, unknown tags, and `javascript:` links pin converted output showing script/style dropped, unknown markup reduced to its text content, and structure (headings, lists, links) preserved; identical input converts to byte-identical output; plain-text content (JSON Feed `content_text`) passes through unchanged.
 
 ## Expected Repository Shape
 
@@ -532,10 +540,10 @@ crates/skardi/src/sources/providers/rss/
 ├── fetch.rs      # HTTP client, conditional GET, retries, bounds, egress policy (default-deny reserved IPs)
 ├── cache.rs      # per-feed TTL cache behind a swap-friendly trait
 ├── parse.rs      # sanitation pre-pass + conformance check + feed-rs → Arrow
+├── convert.rs    # HTML→Markdown conversion (deterministic, no raw HTML in output)
 ├── table.rs      # feeds/items TableProviders (fixed SchemaRef)
 ├── exec.rs       # partition-per-feed ExecutionPlan
 └── fixtures/     # compatibility corpus (tests only)
-crates/skardi/src/model/chunking/          # gains the 'html' mode (HTML→Markdown pre-pass)
 docs/rss.md
 ```
 
@@ -544,8 +552,7 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Documentation Commitments
 
 - README supported-sources table row and architecture mention.
-- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and content-handling guidance (contextual escaping at render; least-privilege and gated actions for LLM consumers), pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead vs not-scanned — pruned by the query's own bare `LIMIT`).
-- `docs/chunk.md`: the `'html'` mode row and a feed-HTML pipeline example.
+- `docs/rss.md`: configuration reference, freshness/caching semantics, politeness defaults, the Field Mapping table, conformance-check semantics, tolerance floor, the egress policy (which address ranges are refused and why) and content-handling guidance (the Markdown storage contract — converted once at extraction, no raw HTML stored, original HTML not retained; renderers keep inline HTML disabled and filter link schemes; least-privilege and gated actions for LLM consumers), pipeline examples, troubleshooting (including absence diagnosis: legitimately-empty vs dead vs not-scanned — pruned by the query's own bare `LIMIT`).
 - A bundled semantics overlay snippet whose column descriptions carry per-dialect provenance and the `window_status` freshness semantics, and whose table descriptions carry the absence-check pattern and the bare-`LIMIT` caveat (no `ORDER BY` = nondeterministic feed sample; completeness needs `ORDER BY` or no `LIMIT`), so an agent discovers both health signals — stale rows and absent feeds — from the schema alone.
 - Example `ctx.yaml` under `docs/sample_data` or equivalent.
 - skardi-skills: `auto_news_base` README with the five-step flow, the self-verification contract, the `sync` health-report convention (empty report = all feeds healthy), and the scheduling note: continuity is the user's cadence — entries that scroll out of a feed's window between syncs are never captured.
@@ -553,6 +560,7 @@ Directional rather than a filename mandate; the boundaries — HTTP, caching, pa
 ## Future Extensions
 
 - An ad-hoc `rss_scan(url)` preview UDTF over the same fetch/sanitize/parse path, if a registration-free surface proves necessary; cut from initial scope at review.
+- A general `chunk('html')` mode for HTML-bearing columns; cut when item storage moved to Markdown — the RSS pipeline no longer consumes it and no other in-repo HTML column does yet.
 - An egress allowlist (explicit CIDR/host entries) permitting intentionally-internal feeds past the default-deny SSRF guard; deferred — default-deny fits the public-news use case, and until then there is no way to reach private targets. Revisit when subscribing to an internal feed is required.
 - WebSub (push) as a cache-invalidation signal; requires a resident server; the live-window contract is unchanged.
 - Persistent / shared cache behind the existing cache trait; enables serve-stale across restarts.
