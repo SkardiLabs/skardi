@@ -124,7 +124,52 @@ event carrying the scan identity and error.
 
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 
-- [ ] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue comments, pull requests, reviews, commits, workflow runs, releases
+- [x] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue
+      comments, pull requests, reviews, commits, workflow runs, releases — all 8 as stable
+      table definitions (`packs/github.rs`, `perPage` 100 — Open Connector's camelCase
+      action-input contract, reconciled against a live gateway). Engine additions the pack
+      required, all sanctioned by the design spec: per-mapping `Fidelity` (issues
+      `updated_at >=` → `since` pushes **Inexact** and DataFusion re-applies it — verified
+      against a gateway that ignores `since` entirely; commits' strictly-after `since` is
+      deliberately NOT mapped since a dropped boundary row is unrecoverable), RFC 3339
+      rendering of timestamp filter literals, `Utf8ListFromObjectKey` for the design's
+      `$.labels[*].name` / `$.assignees[*].login` flattening, a JSON-null *parent* on a
+      nested path is absence → SQL NULL for nullable columns (GitHub `commit.author:
+      null` / `issue.user: null`), and `SourcePackTable::fixed_inputs` pinning `state=all`
+      on issues/pull_requests so `SELECT *` reads the complete collection while a pushed
+      `state` predicate overrides the pin (GitHub defaults to open-only). `issues` is
+      pure issues: the Open Connector action filters out the pull requests GitHub's raw
+      endpoint mixes in, so the table declares no `pull_request` marker column (it could
+      never be non-NULL) and a negative-space guard test
+      (`issues_declares_no_pull_request_marker`) pins that absence. Redacted per-table
+      fixtures (`packs/fixtures/github/`) are the build-time conversion contract
+      (null-bearing, null-parent, empty-list, nested, extra-field rows, and a
+      schema-mismatch page whose targeted (column, page, row, expected, found-kind)
+      error the contract test asserts, per the admission gate); the action IDs,
+      input keys, row paths, and HTTP protocol are reconciled against a live gateway,
+      while fingerprint pins stay `None` like the mock pack until taken from a live
+      gateway's discovered contracts (follow-up).
+      Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
+      visibility incl. the pure-issues note, rate limits, freshness), README row updated.
+      Verification: 27 pack tests (counted by
+      `cargo test -p skardi --lib sources::providers::open_connector::packs::github`;
+      203 open_connector tests total) — 8 fixture contract suites incl. empty pages
+      and the schema-mismatch page, bind-time validation of all 8 contracts, the
+      no-marker negative-space guard, and
+      end-to-end via mock gateway: 150-row two-page scan with the `state=all` pin on
+      every request, pushed `state` override (Inexact — faithful only inside the
+      provider's enum domain), Inexact `since` narrowing + local re-filter keeping the
+      boundary row, LIMIT stopping after one page, `open_connector_query` parity — plus
+      new filters/json_to_arrow engine tests. Runnable local demo (`docs/open-connector/`,
+      in the db-source demo style): bundled stdlib-Python stub gateway standing in for
+      the remote service the way DynamoDB Local does — speaking the gateway's real
+      protocol (uniform `{success, message, data, meta}` envelope, `POST
+      /v1/actions/:id`, camelCase inputs) — committed ctx + four pipelines
+      (stable table with pushdown, both UDTFs, federated CSV join) — every README
+      command and output executed against the real server before being written down;
+      a final section documents the real-gateway path, whose protocol and action
+      contracts have since been reconciled live (fingerprint pins remain the open
+      follow-up).
 - [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate

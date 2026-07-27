@@ -32,6 +32,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
 use super::error::OpenConnectorError;
@@ -288,8 +289,13 @@ pub struct OpenConnectorBinding {
     /// Resource inputs required by the source pack (e.g. `owner` / `repo`
     /// for GitHub). Required keys are defined by the pack and checked when
     /// the binding is registered against a real source-pack registry.
+    ///
+    /// Values keep their YAML types — `issueNumber: 42` reaches the gateway
+    /// as the JSON number 42, exactly as the UDTFs' resource JSON would send
+    /// it (and as the shared scan-cache key expects, so a binding and an
+    /// identical UDTF invocation hit the same entry).
     #[serde(default)]
-    pub resource: BTreeMap<String, String>,
+    pub resource: BTreeMap<String, Value>,
 
     /// Source-pack tables to expose under this binding.
     pub tables: Vec<String>,
@@ -311,6 +317,17 @@ impl OpenConnectorBinding {
             return Err(OpenConnectorError::EmptyTableList {
                 binding: self.name.clone(),
             });
+        }
+        // A null resource value would pass the required-key presence check
+        // while sending `null` to the gateway — meaningless at best,
+        // misrouted at worst.
+        for (key, value) in &self.resource {
+            if value.is_null() {
+                return Err(OpenConnectorError::NullResourceValue {
+                    binding: self.name.clone(),
+                    key: key.clone(),
+                });
+            }
         }
         let mut tables = HashSet::with_capacity(self.tables.len());
         for table in &self.tables {
@@ -374,8 +391,8 @@ bindings:
         assert_eq!(binding.connection_alias.as_deref(), Some("work"));
         assert_eq!(binding.source_pack_version, None);
         assert_eq!(
-            binding.resource.get("owner").map(String::as_str),
-            Some("SkardiLabs")
+            binding.resource.get("owner"),
+            Some(&Value::from("SkardiLabs"))
         );
         assert_eq!(binding.tables, vec!["issues", "pull_requests", "commits"]);
     }
@@ -394,6 +411,48 @@ bindings:
         assert_eq!(config.cache_ttl_seconds, 0);
         assert!(config.raw_action_allowlist.is_empty());
         assert!(config.bindings.is_empty());
+    }
+
+    #[test]
+    fn resource_values_keep_their_yaml_types() {
+        // `issueNumber: 42` must reach the gateway as JSON 42, not "42" —
+        // the same value the UDTFs' resource JSON sends, so a binding and an
+        // identical UDTF invocation also share one scan-cache key.
+        let config = parse(
+            r#"
+runtime_token_env: T
+bindings:
+  - name: gh
+    source_pack: github
+    resource: { owner: acme, repo: widgets, issueNumber: 42 }
+    tables: [issue_comments]
+"#,
+        );
+        config.validate().expect("typed resources are valid");
+        let resource = &config.bindings[0].resource;
+        assert_eq!(resource.get("owner"), Some(&Value::from("acme")));
+        assert_eq!(resource.get("issueNumber"), Some(&Value::from(42)));
+    }
+
+    #[test]
+    fn validate_rejects_null_resource_values() {
+        // A null value would satisfy the required-key presence check while
+        // sending `null` to the gateway.
+        let config = parse(
+            r#"
+runtime_token_env: T
+bindings:
+  - name: gh
+    source_pack: github
+    resource: { owner: acme, repo: ~ }
+    tables: [issues]
+"#,
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(OpenConnectorError::NullResourceValue { ref binding, ref key })
+                if binding == "gh" && key == "repo"
+        ));
     }
 
     #[test]

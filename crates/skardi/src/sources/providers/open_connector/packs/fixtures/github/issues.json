@@ -1,0 +1,50 @@
+{
+  "issues": [
+    {
+      "id": 101,
+      "number": 1,
+      "title": "Scan panics on empty page",
+      "state": "open",
+      "body": "Steps to reproduce: run a scan against an empty collection.",
+      "user": { "login": "octocat", "id": 583231 },
+      "assignees": [{ "login": "octocat" }, { "login": "hubot" }],
+      "labels": [{ "name": "bug", "color": "d73a4a" }, { "name": "p1" }],
+      "comments": 3,
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-02T10:30:00Z",
+      "closed_at": null,
+      "html_url": "https://github.com/acme/widgets/issues/1",
+      "reactions": { "+1": 2, "url": "https://api.github.com/repos/acme/widgets/issues/1/reactions" }
+    },
+    {
+      "id": 102,
+      "number": 2,
+      "title": "Docs typo in quick start",
+      "state": "closed",
+      "body": null,
+      "user": null,
+      "assignees": [],
+      "labels": [],
+      "comments": 0,
+      "created_at": "2026-01-03T00:00:00Z",
+      "updated_at": "2026-01-04T00:00:00Z",
+      "closed_at": "2026-01-04T00:00:00Z",
+      "html_url": "https://github.com/acme/widgets/issues/2"
+    },
+    {
+      "id": 103,
+      "number": 3,
+      "title": "Add dark mode",
+      "state": "open",
+      "body": "Tracking issue for the dark palette.",
+      "user": { "login": "hubot" },
+      "assignees": [],
+      "labels": [{ "name": "enhancement" }],
+      "comments": 1,
+      "created_at": "2026-01-05T00:00:00Z",
+      "updated_at": "2026-01-06T00:00:00Z",
+      "closed_at": null,
+      "html_url": "https://github.com/acme/widgets/issues/3"
+    }
+  ]
+}

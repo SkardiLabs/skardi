@@ -223,6 +223,18 @@ pub enum OpenConnectorError {
     #[error("Open Connector source pack '{pack}' has no table '{table}'")]
     SourcePackTableNotFound { pack: String, table: String },
 
+    /// A short table name matched more than one table in the pack;
+    /// first-match would silently bind the wrong relational contract.
+    #[error(
+        "Open Connector source pack '{pack}' has multiple tables matching '{table}' \
+         ({candidates}); use the full table ID"
+    )]
+    SourcePackTableAmbiguous {
+        pack: String,
+        table: String,
+        candidates: String,
+    },
+
     /// A binding pinned a source-pack version that is not the built-in one.
     #[error(
         "Open Connector source pack '{pack}' pinned to version {pinned}, \
@@ -240,6 +252,22 @@ pub enum OpenConnectorError {
          for the bound source-pack table"
     )]
     MissingResourceInput { binding: String, key: String },
+
+    /// A binding set a resource value to null, which would satisfy the
+    /// required-key presence check while sending `null` to the gateway.
+    #[error("Open Connector binding '{binding}' sets resource input '{key}' to null")]
+    NullResourceValue { binding: String, key: String },
+
+    /// A binding supplied a resource key that none of its bound tables
+    /// declare. Requests carry only declared keys (the gateway's strict
+    /// action schemas reject the rest), so an unconsumed key is dead
+    /// configuration — most likely a typo — and fails registration.
+    #[error(
+        "Open Connector binding '{binding}' supplies resource key '{key}' that none of its \
+         bound tables declare; each table's requests carry only the resource inputs its \
+         action contract lists"
+    )]
+    UnknownResourceKey { binding: String, key: String },
 
     /// The discovered action contract does not match the source pack's
     /// expected fingerprint — the upstream action changed incompatibly.

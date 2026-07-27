@@ -1,0 +1,13 @@
+kind: pipeline
+
+metadata:
+  name: "open_issues"
+  version: "1.0"
+  description: "Issues from the stable catalog table; `state` is pushed into the GitHub API call"
+
+spec:
+  query: |
+    SELECT number, title, author_login, labels, comments
+    FROM saas.github_demo.issues
+    WHERE state = {state}
+    ORDER BY number

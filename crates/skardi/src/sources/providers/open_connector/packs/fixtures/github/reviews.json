@@ -1,0 +1,22 @@
+{
+  "reviews": [
+    {
+      "id": 801,
+      "state": "APPROVED",
+      "user": { "login": "octocat" },
+      "body": "LGTM",
+      "commit_id": "aaa111",
+      "submitted_at": "2026-01-06T12:00:00Z",
+      "html_url": "https://github.com/acme/widgets/pull/3#pullrequestreview-801"
+    },
+    {
+      "id": 802,
+      "state": "COMMENTED",
+      "user": null,
+      "body": null,
+      "commit_id": null,
+      "submitted_at": null,
+      "html_url": "https://github.com/acme/widgets/pull/3#pullrequestreview-802"
+    }
+  ]
+}
