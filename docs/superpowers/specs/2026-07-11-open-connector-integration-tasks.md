@@ -197,11 +197,14 @@ event carrying the scan identity and error.
       GitHub. Live-verified: all three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 224 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 226 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty
-      pages); e2e via mock gateway speaking the real envelope — multi-page cursor scan (no
+      pages, and a schema-mismatch page whose targeted (column, page, row, expected,
+      found-kind) error the contract test asserts, per the admission gate — distinct
+      from the legitimate omitted-`memberCount` NULL path); e2e via mock gateway
+      speaking the real envelope — multi-page cursor scan (no
       cursor on page 1, token afterwards, `limit` hint + `types` array pin on every
       request), both termination spellings, pagination-loop detection bounded at the first
       repeated cursor, LIMIT early stop, empty workspace, `userId` pushed and re-applied

@@ -1,0 +1,26 @@
+{
+  "conversations": [
+    {
+      "channelId": "C0001",
+      "name": "general",
+      "type": "public_channel",
+      "isArchived": false,
+      "isPrivate": false,
+      "isMember": true,
+      "memberCount": 42,
+      "topic": "Company-wide announcements",
+      "purpose": "This channel is for workspace-wide communication."
+    },
+    {
+      "channelId": "C0002",
+      "name": "eng-private",
+      "type": "private_channel",
+      "isArchived": false,
+      "isPrivate": true,
+      "isMember": true,
+      "memberCount": "7",
+      "topic": "",
+      "purpose": null
+    }
+  ]
+}
