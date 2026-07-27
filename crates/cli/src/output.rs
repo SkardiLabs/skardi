@@ -77,16 +77,20 @@ pub fn render_table(rows: &[Value]) -> String {
         .map(|row| columns.iter().map(|col| cell_text(row.get(*col))).collect())
         .collect();
 
+    // Widths are measured in characters, not bytes, to match the unit
+    // `format!("{:<width$}")` pads by — byte lengths misalign any non-ASCII
+    // cell. (Char count still isn't terminal display width for double-wide
+    // CJK glyphs, but it is consistent with how the padding is applied.)
     let widths: Vec<usize> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
             data_rows
                 .iter()
-                .map(|row| row[i].len())
+                .map(|row| row[i].chars().count())
                 .max()
                 .unwrap_or(0)
-                .max(col.len())
+                .max(col.chars().count())
         })
         .collect();
 
@@ -178,6 +182,23 @@ mod tests {
         let rows: Vec<serde_json::Value> = vec![];
 
         assert_eq!(render_table(&rows), "(no rows)\n");
+    }
+
+    #[test]
+    fn render_table_aligns_multibyte_cells_by_char_count() {
+        // "São Paulo" is 10 bytes but 9 chars; byte-based widths would pad
+        // the column to 10 and shift every separator after it.
+        let rows = vec![
+            json!({"city": "São Paulo", "n": 1}),
+            json!({"city": "NYC", "n": 22}),
+        ];
+
+        let expected = "city      | n\n\
+                        ----------+---\n\
+                        São Paulo | 1\n\
+                        NYC       | 22\n";
+
+        assert_eq!(render_table(&rows), expected);
     }
 
     #[test]

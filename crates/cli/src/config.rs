@@ -75,6 +75,12 @@ struct ConfigManifest {
 /// Pure per-field precedence resolution: flag > env > file > default.
 /// No I/O and no env reads — everything needed is passed in — so this is
 /// the unit-testable core of `ClientConfig::resolve`.
+///
+/// Empty strings count as unset at every level: an exported-but-empty
+/// `SKARDI_SERVER_URL=` (typical of wrapper scripts that export vars
+/// unconditionally) must fall through to the config file / default instead
+/// of producing an empty base URL, and an empty token must not become an
+/// empty `Authorization: Bearer` header.
 fn resolve_from(
     flag_server: Option<String>,
     flag_token: Option<String>,
@@ -87,13 +93,21 @@ fn resolve_from(
         None => (None, None),
     };
 
-    let server = flag_server
-        .or(env_server)
-        .or(file_server)
+    let server = non_empty(flag_server)
+        .or(non_empty(env_server))
+        .or(non_empty(file_server))
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
-    let token = flag_token.or(env_token).or(file_token);
+    let token = non_empty(flag_token)
+        .or(non_empty(env_token))
+        .or(non_empty(file_token));
 
     ClientConfig { server, token }
+}
+
+/// Treat an empty (or whitespace-only) string as unset for precedence
+/// purposes.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.trim().is_empty())
 }
 
 /// Load and parse `path` as a config manifest, returning its `spec` block.
@@ -172,6 +186,33 @@ mod tests {
 
         assert_eq!(resolved.server, "http://env-server:9000");
         assert_eq!(resolved.token, Some("env-token".to_string()));
+    }
+
+    #[test]
+    fn resolve_from_empty_strings_count_as_unset() {
+        // Exported-but-empty env vars (SKARDI_SERVER_URL=) fall through to
+        // the file value instead of yielding an empty base URL.
+        let resolved = resolve_from(
+            None,
+            None,
+            Some(String::new()),
+            Some("  ".to_string()),
+            Some(file_config("http://file-server:9000", "file-token")),
+        );
+        assert_eq!(resolved.server, "http://file-server:9000");
+        assert_eq!(resolved.token, Some("file-token".to_string()));
+
+        // Empty at every level → default server, no token (never an empty
+        // `Authorization: Bearer` header).
+        let resolved = resolve_from(
+            Some(String::new()),
+            Some(String::new()),
+            Some(String::new()),
+            None,
+            None,
+        );
+        assert_eq!(resolved.server, DEFAULT_SERVER_URL);
+        assert_eq!(resolved.token, None);
     }
 
     #[test]
