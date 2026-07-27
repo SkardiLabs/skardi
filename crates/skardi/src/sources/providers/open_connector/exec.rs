@@ -482,9 +482,13 @@ impl ScanState {
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
         }
-        // Providers like Slack report application errors in-band (HTTP 200,
-        // `ok: false` + `error`). Surface the provider's own code instead of
-        // the misleading row-path error the missing row array would raise.
+        // Some gateways forward a provider's in-band application errors
+        // unchanged (Slack-style HTTP 200, `ok: false` + `error`). Packs
+        // targeting such a gateway declare `error_path` so the provider's
+        // own code surfaces instead of the misleading row-path error the
+        // missing row array would raise. (Open Connector's own executors
+        // consume Slack's `ok:false` and return a failure envelope, so its
+        // slack pack declares none — the mock pack models this mechanism.)
         if let Some(error_path) = &self.error_path
             && let Ok(code) = error_path.extract(&envelope, page)
             && !code.is_null()

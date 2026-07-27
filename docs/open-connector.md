@@ -259,6 +259,17 @@ loop instead of spinning forever. Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
 *kind*, never the value.
 
+Provider errors reported *in-band* (Slack-style HTTP 200 with `ok: false`
++ `error`) are handled at one of two layers. Open Connector's own
+executors consume them and return the gateway's failure envelope
+(non-2xx), which Skardi surfaces with the provider's message — this is
+the path the built-in slack pack relies on. For a gateway that instead
+forwards such envelopes unchanged, a pack table must declare an
+`error_path`; the scan checks it before row extraction and fails with the
+provider's own code (bounded, value-free), never the misleading
+missing-row-array error. A pack whose gateway does neither would
+otherwise report `RowPathNotFound` on an in-band error page.
+
 ## Compatibility and schema drift
 
 Each pack table pins the full relational contract and an expected
