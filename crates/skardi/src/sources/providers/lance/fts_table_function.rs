@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use super::fts_exec::LanceFtsExec;
 use super::utils::expr_to_lance_sql;
+use crate::sources::providers::udtf_args::{optional_string_arg, string_arg};
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Table function that creates full-text search on Lance tables
@@ -62,9 +63,9 @@ impl TableFunctionImpl for LanceFtsTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table_name")?;
-        let text_column = extract_string(&exprs[1], "text_column")?;
-        let query = extract_string_or_null(&exprs[2], "query")?;
+        let table_name = string_arg(&exprs[0], "lance_fts", "table_name")?;
+        let text_column = string_arg(&exprs[1], "lance_fts", "text_column")?;
+        let query = optional_string_arg(&exprs[2], "lance_fts", "query")?;
         let limit = extract_int(&exprs[3], "limit")?;
 
         // Get dataset from registry
@@ -308,24 +309,6 @@ impl TableProvider for LanceFtsProvider {
 }
 
 // Helper functions for argument extraction
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        // Accept NULL as placeholder during pipeline validation/schema inference.
-        // The inferencer replaces {param} with NULL before plan creation.
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!("lance_fts: {} must be a string literal", name),
-    }
-}
-
-fn extract_string_or_null(expr: &Expr, name: &str) -> DFResult<Option<String>> {
-    match expr {
-        Expr::Literal(ScalarValue::Null, _) => Ok(None),
-        other => extract_string(other, name).map(Some),
-    }
-}
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
     match expr {

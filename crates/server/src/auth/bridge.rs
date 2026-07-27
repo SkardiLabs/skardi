@@ -178,8 +178,15 @@ impl TableProvider for AuthSessionsTable {
 // Registration helper
 // ---------------------------------------------------------------------------
 
+/// Schema the auth virtual tables (`users`, `sessions`) register under.
+///
+/// Single source of truth for the reserved schema name: the ad-hoc `/query`
+/// policy denies exactly this schema (see `config::adhoc_policy_from_sources`),
+/// so the two must never drift apart.
+pub const AUTH_SCHEMA: &str = "auth";
+
 /// Register `auth.users` and `auth.sessions` virtual tables into the given
-/// DataFusion `SessionContext` under a dedicated `auth` schema.
+/// DataFusion `SessionContext` under the [`AUTH_SCHEMA`] schema.
 pub fn register_auth_tables(
     ctx: &mut SessionContext,
     auth: Arc<BetterAuth<DieselSqliteAdapter>>,
@@ -204,12 +211,14 @@ pub fn register_auth_tables(
         .catalog("datafusion")
         .ok_or_else(|| anyhow::anyhow!("Default catalog 'datafusion' not found"))?;
 
-    if catalog.schema("auth").is_some() {
-        return Err(anyhow::anyhow!("Auth schema 'auth' is already registered"));
+    if catalog.schema(AUTH_SCHEMA).is_some() {
+        return Err(anyhow::anyhow!(
+            "Auth schema '{AUTH_SCHEMA}' is already registered"
+        ));
     }
 
     catalog
-        .register_schema("auth", schema)
+        .register_schema(AUTH_SCHEMA, schema)
         .map_err(|e| anyhow::anyhow!("Failed to register auth schema: {}", e))?;
 
     tracing::info!("Registered DataFusion tables: auth.users, auth.sessions");

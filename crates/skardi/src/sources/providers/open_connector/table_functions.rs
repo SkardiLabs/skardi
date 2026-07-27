@@ -37,7 +37,7 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{ScalarValue, plan_err};
+use datafusion::common::{plan_datafusion_err, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
@@ -57,6 +57,7 @@ use super::raw_schema::derive_raw_columns;
 use super::row_path::RowPath;
 use super::source_pack::SourcePackRegistry;
 use super::table::OpenConnectorTableProvider;
+use crate::sources::providers::udtf_args::strict_string_arg;
 
 /// Planning-time state of one registered gateway, captured by
 /// `register_open_connector_tables` and shared with both UDTFs.
@@ -143,12 +144,12 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                 exprs.len()
             );
         }
-        let gateway = literal_string("open_connector_query", &exprs[0], "gateway")?;
-        let table_id = literal_string("open_connector_query", &exprs[1], "table_id")?;
-        let resource_json = literal_string("open_connector_query", &exprs[2], "resource_json")?;
+        let gateway = strict_string_arg(&exprs[0], "open_connector_query", "gateway")?;
+        let table_id = strict_string_arg(&exprs[1], "open_connector_query", "table_id")?;
+        let resource_json = strict_string_arg(&exprs[2], "open_connector_query", "resource_json")?;
         let alias = exprs
             .get(3)
-            .map(|expr| literal_string("open_connector_query", expr, "connection_alias"))
+            .map(|expr| strict_string_arg(expr, "open_connector_query", "connection_alias"))
             .transpose()?;
 
         let handle = lookup_gateway(&self.gateways, &gateway)?;
@@ -165,17 +166,12 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
         let pack = self.packs.require(pack_name).map_err(plan_error)?;
         let table = self.packs.table(pack, table_name).map_err(plan_error)?;
 
-        let resource: Value = serde_json::from_str(&resource_json).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "open_connector_query: resource_json is not valid JSON: {e}"
-            ))
-        })?;
-        if !resource.is_object() {
-            return plan_err!(
-                "open_connector_query: resource_json must be a JSON object of resource \
-                 inputs, e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
-            );
-        }
+        let resource = parse_json_object(
+            "open_connector_query",
+            "resource_json",
+            &resource_json,
+            "resource inputs",
+        )?;
         for key in table.required_resources {
             if resource.get(*key).is_none() {
                 return Err(plan_error(OpenConnectorError::MissingResourceInput {
@@ -256,13 +252,13 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 exprs.len()
             );
         }
-        let gateway = literal_string("open_connector_scan", &exprs[0], "gateway")?;
-        let action_id = literal_string("open_connector_scan", &exprs[1], "action_id")?;
-        let input_json = literal_string("open_connector_scan", &exprs[2], "input_json")?;
-        let row_path = literal_string("open_connector_scan", &exprs[3], "row_path")?;
+        let gateway = strict_string_arg(&exprs[0], "open_connector_scan", "gateway")?;
+        let action_id = strict_string_arg(&exprs[1], "open_connector_scan", "action_id")?;
+        let input_json = strict_string_arg(&exprs[2], "open_connector_scan", "input_json")?;
+        let row_path = strict_string_arg(&exprs[3], "open_connector_scan", "row_path")?;
         let alias = exprs
             .get(4)
-            .map(|expr| literal_string("open_connector_scan", expr, "connection_alias"))
+            .map(|expr| strict_string_arg(expr, "open_connector_scan", "connection_alias"))
             .transpose()?;
 
         let handle = lookup_gateway(&self.gateways, &gateway)?;
@@ -293,17 +289,12 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             }
         }
 
-        let input: Value = serde_json::from_str(&input_json).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "open_connector_scan: input_json is not valid JSON: {e}"
-            ))
-        })?;
-        if !input.is_object() {
-            return plan_err!(
-                "open_connector_scan: input_json must be a JSON object of action inputs, \
-                 e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
-            );
-        }
+        let input = parse_json_object(
+            "open_connector_scan",
+            "input_json",
+            &input_json,
+            "action inputs",
+        )?;
 
         let row_path = RowPath::parse(&row_path).map_err(plan_error)?;
         // Deterministic row type or planning error — derived purely from the
@@ -439,13 +430,20 @@ fn plan_error(e: OpenConnectorError) -> DataFusionError {
     DataFusionError::Plan(e.to_string())
 }
 
-/// Extract one string-literal argument.
-fn literal_string(function: &str, expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        _ => plan_err!("{function}: {name} must be a string literal"),
+/// Parse a UDTF argument that must carry a JSON object, shared by both
+/// functions so the two diagnostics stay in lockstep. `noun` names what the
+/// object holds in the caller's vocabulary ("resource inputs" / "action
+/// inputs"), so sharing the implementation doesn't flatten the context.
+fn parse_json_object(fn_name: &str, arg: &str, raw: &str, noun: &str) -> DFResult<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| plan_datafusion_err!("{fn_name}: {arg} is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        return plan_err!(
+            "{fn_name}: {arg} must be a JSON object of {noun}, \
+             e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
+        );
     }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -767,6 +765,12 @@ raw_action_allowlist:
         .await;
         expect_plan_error(
             &ctx,
+            "SELECT * FROM open_connector_query('saas', 'mock.items', '[1, 2]')",
+            "resource_json must be a JSON object of resource inputs",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
             "SELECT * FROM open_connector_query('saas', 'mock.items')",
             "expects 3-4 arguments",
         )
@@ -774,7 +778,27 @@ raw_action_allowlist:
         expect_plan_error(
             &ctx,
             "SELECT * FROM open_connector_query(1, 'mock.items', '{}')",
-            "gateway must be a string literal",
+            "'gateway' must be a string literal",
+        )
+        .await;
+        // NULL is rejected outright for schema-determining arguments — a
+        // placeholder cannot produce a plan (strict_string_arg semantics).
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query(NULL, 'mock.items', '{}')",
+            "'gateway' must be a string literal, not NULL",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', NULL, '{}')",
+            "'table_id' must be a string literal, not NULL",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', 'mock.items', NULL)",
+            "'resource_json' must be a string literal, not NULL",
         )
         .await;
 
@@ -1015,6 +1039,13 @@ raw_action_allowlist:
             r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
                                                  '{"workspace":"demo"}', 'items')"#,
             "must start with '$.'",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
+                                                 '[1, 2]', '$.items')"#,
+            "input_json must be a JSON object of action inputs",
         )
         .await;
         assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");

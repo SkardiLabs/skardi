@@ -39,7 +39,7 @@ use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, ScalarValue, plan_err};
+use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -791,23 +791,6 @@ pub(crate) fn quote_seekdb_table(tbl: &TableReference) -> String {
 pub(crate) fn expr_to_seekdb_sql(expr: &Expr) -> Option<String> {
     let unparser = Unparser::new(&MySqlDialect {});
     unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
-}
-
-/// Extract a string-literal argument from a table-function `Expr`. Shared by
-/// `seekdb_fts` and `seekdb_knn` so they can emit consistent error messages
-/// prefixed with the caller's UDTF name (`fn_name`). NULL is accepted as a
-/// placeholder during pipeline schema inference and returns the empty string.
-pub(crate) fn extract_string_arg(
-    expr: &Expr,
-    fn_name: &str,
-    arg: &str,
-) -> DataFusionResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!("{fn_name}: '{arg}' must be a string literal"),
-    }
 }
 
 // ─── Execution plan for DELETE / UPDATE results ─────────────────────────────

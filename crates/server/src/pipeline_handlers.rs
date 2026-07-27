@@ -11,7 +11,6 @@
 //! * `POST /:name/execute`  — run a pipeline's SELECT with bound parameters
 
 use anyhow::Result;
-use arrow::record_batch::RecordBatch;
 use axum::{
     Json,
     extract::{Path, State},
@@ -25,7 +24,11 @@ use skardi::pipeline::pipeline::Pipeline;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::auth::routes::require_session;
 use crate::config::DataSourceType;
+use crate::response::{
+    ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
+};
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
 
@@ -46,21 +49,6 @@ pub struct ExecuteResponse {
     pub rows: usize,
     /// Execution time in milliseconds
     pub execution_time_ms: u64,
-}
-
-/// Error response structure for API endpoints
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    /// Whether the operation was successful
-    pub success: bool,
-    /// Error message
-    pub error: String,
-    /// Error category/type
-    pub error_type: String,
-    /// Additional error details
-    pub details: Option<Value>,
-    /// Timestamp when error occurred
-    pub timestamp: String,
 }
 
 /// Field information for table schema
@@ -104,32 +92,6 @@ pub struct DataSourceResponse {
     pub url: Option<String>,
     /// Registered tables with their schemas
     pub tables: Vec<TableInfo>,
-}
-
-/// Helper function to create error responses
-fn create_error_response(
-    error_msg: &str,
-    error_type: &str,
-    details: Option<Value>,
-) -> Json<ErrorResponse> {
-    Json(ErrorResponse {
-        success: false,
-        error: error_msg.to_string(),
-        error_type: error_type.to_string(),
-        details,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    })
-}
-
-/// Helper function to create success response with data
-fn create_success_response(data: Vec<Value>, rows: usize, execution_time_ms: u64) -> Json<Value> {
-    Json(serde_json::json!({
-        "success": true,
-        "data": data,
-        "rows": rows,
-        "execution_time_ms": execution_time_ms,
-        "timestamp": chrono::Utc::now().to_rfc3339()
-    }))
 }
 
 /// Get table schema from SessionContext
@@ -648,17 +610,8 @@ pub async fn execute_pipeline_by_name(
     Path(pipeline_name): Path<String>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    if let Err(unauth_response) = crate::auth::routes::verify_session(&app_state, &headers).await {
-        let status = unauth_response.status();
-        let body_bytes = axum::body::to_bytes(unauth_response.into_body(), 512)
-            .await
-            .unwrap_or_default();
-        let msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Authentication required".to_string());
-        return Err((status, create_error_response(&msg, "unauthorized", None)));
-    }
+    require_session(&app_state, &headers).await?;
+
     let start_time = Instant::now();
 
     tracing::info!(
@@ -701,7 +654,7 @@ pub async fn execute_pipeline_by_name(
         let mut expected_params: Vec<String> = request_schema.fields.keys().cloned().collect();
         // Sort longest-first so a shorter name (e.g. `{user}`) cannot corrupt a longer one
         // (`{user_id}`) during str::replace when both appear in the same SQL template.
-        expected_params.sort_by(|a, b| b.len().cmp(&a.len()));
+        expected_params.sort_by_key(|b| std::cmp::Reverse(b.len()));
         (query_def.sql.clone(), expected_params)
     };
 
@@ -815,40 +768,18 @@ pub async fn execute_pipeline_by_name(
         execution_time
     );
 
-    Ok(create_success_response(data, row_count, execution_time))
-}
-
-/// Convert Arrow RecordBatch to JSON array using arrow_json
-fn record_batch_to_json(batch: &RecordBatch) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    use arrow_json::{WriterBuilder, writer::JsonArray};
-    use serde_json::Map;
-
-    // Write the record batch to JSON using arrow_json with null value inclusion
-    let buf = Vec::new();
-    let mut writer = WriterBuilder::new()
-        .with_explicit_nulls(true) // Include null values in JSON output
-        .build::<_, JsonArray>(buf);
-    writer.write_batches(&vec![batch])?;
-    writer.finish()?;
-    let json_data = writer.into_inner();
-
-    // Parse the JSON array string into serde_json::Value objects
-    let json_rows: Vec<Map<String, Value>> = serde_json::from_reader(json_data.as_slice())?;
-
-    // Convert Map objects to Value objects
-    let values: Vec<Value> = json_rows
-        .into_iter()
-        .map(|map| Value::Object(map))
-        .collect();
-
-    Ok(values)
+    Ok(create_success_response(
+        data,
+        row_count,
+        execution_time,
+        None,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{CliArgs, DataSource, DataSourceType, ServerConfig};
-    use crate::metrics::PipelineMetrics;
     use crate::server::AppState;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -859,7 +790,7 @@ mod tests {
     use skardi::sources::AccessMode;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn create_test_pipeline_with_params() -> StandardPipeline {
@@ -917,14 +848,13 @@ spec:
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
 
-        AppState {
-            config: Arc::new(RwLock::new(config)),
+        AppState::new(
+            config,
             engine,
             session_ctx,
-            metrics: PipelineMetrics::new(),
-            auth_layer: crate::auth::layer::AuthLayer::None,
-            jobs: None,
-        }
+            crate::auth::layer::AuthLayer::None,
+            None,
+        )
     }
 
     fn create_test_record_batch() -> RecordBatch {
@@ -1007,14 +937,13 @@ spec:
         let session_ctx_arc = Arc::new(session_ctx);
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx_arc.clone()));
 
-        let app_state = AppState {
-            config: Arc::new(RwLock::new(config)),
+        let app_state = AppState::new(
+            config,
             engine,
-            session_ctx: session_ctx_arc,
-            metrics: PipelineMetrics::new(),
-            auth_layer: crate::auth::layer::AuthLayer::None,
-            jobs: None,
-        };
+            session_ctx_arc,
+            crate::auth::layer::AuthLayer::None,
+            None,
+        );
 
         let request = ExecuteRequest {
             parameters: {
@@ -1231,7 +1160,7 @@ spec:
 
     fn sorted_keys(map: &HashMap<String, Value>) -> Vec<String> {
         let mut v: Vec<String> = map.keys().cloned().collect();
-        v.sort_by(|a, b| b.len().cmp(&a.len()));
+        v.sort_by_key(|b| std::cmp::Reverse(b.len()));
         v
     }
 

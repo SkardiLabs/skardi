@@ -30,6 +30,7 @@ use std::sync::Arc;
 use super::knn_exec::LanceKnnExec;
 use super::utils::expr_to_lance_sql;
 use crate::sources::providers::knn_utils::extract_k;
+use crate::sources::providers::udtf_args::strict_string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Table function that creates KNN search on Lance tables
@@ -54,11 +55,11 @@ impl TableFunctionImpl for LanceKnnTableFunction {
         }
 
         // Extract string arguments
-        let table_name = extract_string(&exprs[0], "table_name")?;
-        let vector_column = extract_string(&exprs[1], "vector_column")?;
+        let table_name = strict_string_arg(&exprs[0], "lance_knn", "table_name")?;
+        let vector_column = strict_string_arg(&exprs[1], "lance_knn", "vector_column")?;
         let k = extract_k(&exprs[3], "lance_knn")?;
         let filter = if exprs.len() == 5 {
-            Some(extract_string(&exprs[4], "filter")?)
+            Some(strict_string_arg(&exprs[4], "lance_knn", "filter")?)
         } else {
             None
         };
@@ -229,14 +230,6 @@ impl TableProvider for LanceKnnProvider {
 }
 
 // Helper functions for argument extraction
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
-        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        _ => plan_err!("lance_knn: {} must be a string literal", name),
-    }
-}
 
 fn try_extract_vector(expr: &Expr) -> DFResult<Option<ArrayRef>> {
     match expr {
