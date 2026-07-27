@@ -331,7 +331,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
 | Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), Slack pack (conversations, users, files — [guide](docs/open-connector-slack.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
-| Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
+| Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories or S3 prefixes; `documents` feature) | [docs/documents.md](docs/documents.md) |
 
 ---
 

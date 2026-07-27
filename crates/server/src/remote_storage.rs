@@ -228,6 +228,14 @@ fn s3_key_prefix(s3_uri: &str) -> String {
 /// resolved region. Pure over its inputs (the caller reads the env), so the
 /// missing-config branches are unit-testable without mutating process-global
 /// env vars.
+///
+/// `AWS_PROFILE` satisfies this check for parity with
+/// [`S3Storage::setup_object_store`], but `object_store` never reads `~/.aws/`
+/// profiles — with only `AWS_PROFILE` set, request signing has no credentials
+/// and the preflight list/put in [`S3Storage::preflight_documents_s3`] fails at
+/// startup with the underlying S3 error. Exporting real env credentials
+/// (`aws configure export-credentials --format env`) is the working path; see
+/// docs/documents.md § "S3 / object store".
 fn require_s3_region_and_creds(
     region: Option<String>,
     has_access_key: bool,
