@@ -29,6 +29,8 @@ chunking = ["dep:text-splitter"]
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
 documents = ["dep:liteparse", "dep:glob"]
+# rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
+rss = []
 
 [dependencies]
 # engine
