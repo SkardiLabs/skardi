@@ -772,6 +772,7 @@ pub static GITHUB_PACK: SourcePack = SourcePack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::providers::open_connector::error::OpenConnectorError;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use arrow::array::{
@@ -780,8 +781,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     // ── Contract tests: bundled redacted fixtures are the build-time
-    // conversion contract (null-bearing, nested, empty, and extra upstream
-    // fields per the source-pack admission gate). ───────────────────────
+    // conversion contract (null-bearing, nested, empty, extra upstream
+    // fields, and a schema mismatch per the source-pack admission gate). ─
 
     /// Convert one bundled fixture page through a table's declared contract.
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
@@ -883,6 +884,46 @@ mod tests {
         );
         assert!(timestamps(&batch, "closed_at").is_null(0));
         assert!(!timestamps(&batch, "closed_at").is_null(1));
+    }
+
+    #[test]
+    fn issues_mismatch_fixture_fails_with_the_targeted_error() {
+        // Admission-gate schema-mismatch fixture: upstream turning a declared
+        // integer into a string is incompatible drift and must fail the scan
+        // with the full (column, page, row, expected, found-kind) identity —
+        // never a quiet null, and never the offending value itself.
+        let page: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/github/issues_type_mismatch.json"))
+                .expect("fixture parses");
+        let rows = RowPath::parse(ISSUES.row_path)
+            .expect("row path")
+            .rows(&page, 1)
+            .expect("row array");
+        let err = RowConverter::new(ISSUES.fields)
+            .expect("converter")
+            .convert(rows, 1)
+            .expect_err("a string where UInt64 is declared must fail conversion");
+        match err {
+            OpenConnectorError::ConversionFailed {
+                column,
+                path,
+                page,
+                row,
+                expected,
+                found,
+            } => {
+                assert_eq!(column, "number");
+                assert_eq!(path, "$.number");
+                assert_eq!(page, 1);
+                assert_eq!(
+                    row, 1,
+                    "the valid first row converts; the error names the bad row"
+                );
+                assert_eq!(expected, "non-negative integer");
+                assert_eq!(found, "string");
+            }
+            other => panic!("expected ConversionFailed, got {other}"),
+        }
     }
 
     #[test]
