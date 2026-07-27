@@ -197,7 +197,7 @@ event carrying the scan identity and error.
       GitHub. Live-verified: all three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 226 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 227 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty
@@ -210,7 +210,9 @@ event carrying the scan identity and error.
       repeated cursor, LIMIT early stop, empty workspace, `userId` pushed and re-applied
       against an ignoring provider, the negative-space guard that no time key ever reaches
       the wire, gateway-failure surfacing of Slack's `ok:false`, multi-table binding with
-      zero required resources, UDTF parity for `slack.users`.
+      zero required resources, UDTF parity for `slack.users`, and a two-page
+      users cursor scan pinning that table's own wire declarations (`$.users`
+      row path, `cursor`/`limit` inputs) independently of conversations'.
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
 
@@ -222,12 +224,12 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 4 (UDTFs + security/observability + docs).
-  Milestones 1–3 are merged; registration builds a queryable catalog after
-  gateway health, action discovery, source-pack validation, and fingerprint
-  checks, and now also publishes per-gateway planning state for the two
-  UDTFs (shared with the server `OptimizerRegistry` / CLI the way the
-  KNN/FTS `DatasetRegistry` is).
+- **Current PR**: milestone 5.2 (Slack pack — conversations, users, files).
+  Milestones 1–4 and 5.1 (GitHub pack) are merged; this PR adds the second
+  real source pack against Open Connector's normalized Slack contract
+  (reconciled live), plus the engine extensions it required
+  (`total_pages_path` on PageNumber, per-mapping `ValueFormat`,
+  `FieldType::TimestampSecondsUtc`, `FixedValue::StrList`).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

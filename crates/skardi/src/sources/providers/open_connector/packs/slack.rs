@@ -1134,4 +1134,60 @@ bindings:
                 .to_string()
         );
     }
+
+    #[tokio::test]
+    async fn users_cursor_scan_pages_with_its_own_declared_inputs() {
+        // The multi-page cursor path is pinned end-to-end for conversations;
+        // users shares the strategy CONSTANT but not the wire declarations.
+        // This scan pins USERS' own row path ($.users) and inputs (cursor /
+        // limit 200) across two pages, so a drifted declaration on either
+        // table cannot hide behind the other's coverage.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_users" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let page = match body["input"].get("cursor").and_then(Value::as_str) {
+                    None => json!({"users": [
+                        {"userId": "U0001", "username": "ada", "isBot": false},
+                        {"userId": "U0002", "username": "deploybot", "isBot": true}
+                    ], "nextCursor": "users-page-2"}),
+                    Some("users-page-2") => json!({"users": [
+                        {"userId": "U0003", "username": "grace", "isBot": false}
+                    ], "nextCursor": null}),
+                    Some(other) => {
+                        return MockResponse::new(400, &format!("unexpected cursor {other}"));
+                    }
+                };
+                return MockResponse::ok(&envelope_ok(&page.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = setup(&gateway, "users", "SKARDI_TEST_OC_SLACK_USERS_CURSOR").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.ws.users ORDER BY id").await;
+        assert_eq!(ids_of(&batches), vec!["U0001", "U0002", "U0003"]);
+
+        let inputs: Vec<Value> = execute_bodies(&gateway)
+            .iter()
+            .map(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"].clone()
+            })
+            .collect();
+        assert_eq!(inputs.len(), 2, "two cursor pages");
+        assert!(
+            inputs[0].get("cursor").is_none(),
+            "page 1 sends no cursor: {}",
+            inputs[0]
+        );
+        assert_eq!(inputs[1]["cursor"], "users-page-2");
+        for input in &inputs {
+            assert_eq!(input["limit"], 200, "the users page-size hint: {input}");
+        }
+    }
 }
