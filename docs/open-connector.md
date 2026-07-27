@@ -275,13 +275,19 @@ otherwise report `RowPathNotFound` on an in-band error page.
 
 ## Compatibility and schema drift
 
-Each pack table pins the full relational contract and an expected
-action-contract fingerprint (a canonicalized hash of the discovered output
-schema). An Open Connector upgrade that changes an action incompatibly
-fails registration with a targeted error instead of silently changing a
-table's schema; additive upstream fields are ignored. Bindings may pin
-`source_pack_version` so a Skardi upgrade cannot silently change a bound
-table's schema either.
+Each pack table pins the full relational contract and, once captured from
+a live gateway, an expected action-contract fingerprint (a canonicalized
+BLAKE3 hash of the discovered output schema; the slack pack is pinned
+against v1.3.1 with the captured schemas committed next to the pack, the
+github pack's pins are a pending follow-up). At registration a pinned
+table's fingerprint is compared against the discovered contract and any
+difference — breaking or additive, since a hash cannot tell them apart —
+fails with a targeted error instead of silently changing a table's
+schema; upgrading the gateway means re-capturing the contract and
+re-pinning. (Additive upstream fields in *row data* are still simply
+ignored by conversion — the fingerprint gates the declared schema, not
+the rows.) Bindings may pin `source_pack_version` so a Skardi upgrade
+cannot silently change a bound table's schema either.
 
 ## Observability
 

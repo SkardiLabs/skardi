@@ -97,6 +97,13 @@ highlights and caveats:
   contract declares no `ts_from`-style input (its strict schema would
   reject one), so `created` predicates are evaluated by DataFusion after
   the bounded fetch.
+- **Action-contract fingerprints are pinned** against a live gateway
+  (v1.3.1). Registration compares each pinned fingerprint with the
+  discovered output schema and refuses a differing contract with
+  `ActionContractMismatch` — schema drift fails at startup, never as
+  silently reshaped rows mid-query. Upgrading Open Connector may change
+  these schemas (even compatibly); the pack then needs its captured
+  contracts re-taken and pins refreshed.
 
 ## Authorization and visibility
 

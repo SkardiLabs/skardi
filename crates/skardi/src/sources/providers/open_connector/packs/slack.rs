@@ -66,10 +66,15 @@
 //!   both surface as SQL NULL. Slack's empty-string convention
 //!   (`topic: ""`) stays an empty string, never NULL. Deleted users stay
 //!   in the table with `deleted = true`, matching `users.list`.
-//! - **No fingerprint pins yet** (`expected_fingerprint: None`) — same
-//!   rationale and operational consequence as the GitHub pack (see the
-//!   comment block in `github.rs`); like GitHub, the action IDs, input
-//!   keys, and row paths here are live-reconciled, the pins are not.
+//! - **Fingerprints are pinned** from a live gateway (v1.3.1): each
+//!   `expected_fingerprint` is the BLAKE3 hash of the canonicalized
+//!   output schema captured into `fixtures/slack/contracts/`, and a test
+//!   keeps pin and captured contract locked together. Registration
+//!   compares the pin against the discovered contract and fails with
+//!   `ActionContractMismatch` on drift — including additive or
+//!   doc-comment-only schema changes, which is the designed tradeoff
+//!   (re-capture the contract and re-pin on upstream upgrades). The
+//!   GitHub pack's pins remain a follow-up.
 
 use datafusion::logical_expr::Operator;
 
@@ -171,7 +176,7 @@ static CONVERSATIONS: SourcePackTable = SourcePackTable {
     // Slack's in-band ok:false envelope is consumed by the OC executor and
     // surfaced as a gateway failure — it never reaches action output.
     error_path: None,
-    expected_fingerprint: None,
+    expected_fingerprint: Some("2d4e5cee7cf87f146ab7848849f97a559ba44ff09350295e0dc50b75abf0ef84"),
 };
 
 /// Workspace members, including bots and deleted users (`deleted = true`).
@@ -250,7 +255,7 @@ static USERS: SourcePackTable = SourcePackTable {
     filters: &[],
     // In-band errors are consumed by the OC executor (see CONVERSATIONS).
     error_path: None,
-    expected_fingerprint: None,
+    expected_fingerprint: Some("77f3f0f41d30b9095875b1c02d5f93f31b948f4a666fdfc820192348e5e1b18f"),
 };
 
 /// Files visible to the bot.
@@ -361,7 +366,7 @@ static FILES: SourcePackTable = SourcePackTable {
     ],
     // In-band errors are consumed by the OC executor (see CONVERSATIONS).
     error_path: None,
-    expected_fingerprint: None,
+    expected_fingerprint: Some("54f3b15b426612c2d0bd0291d2cabb1cbf18c5f5061bce13b53e93fa1bba4ac2"),
 };
 
 /// The Slack source pack (version 1): conversations, users, files. Message
@@ -376,6 +381,7 @@ pub static SLACK_PACK: SourcePack = SourcePack {
 mod tests {
     use super::*;
     use crate::sources::hierarchy::HierarchyLevel;
+    use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::testutil::{
@@ -392,6 +398,110 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
+
+    /// Discovery response carrying the live-captured output schema for the
+    /// three slack actions (`fixtures/slack/contracts/`), so every mock
+    /// registration exercises the same fingerprint gate the real gateway
+    /// does — a stub schema would fail the pinned tables at registration.
+    fn slack_discovery(path: &str) -> MockResponse {
+        let output_schema = if path.ends_with("slack.list_conversations") {
+            include_str!("fixtures/slack/contracts/list_conversations.json")
+        } else if path.ends_with("slack.list_users") {
+            include_str!("fixtures/slack/contracts/list_users.json")
+        } else if path.ends_with("slack.list_files") {
+            include_str!("fixtures/slack/contracts/list_files.json")
+        } else {
+            r#"{"type": "object"}"#
+        };
+        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+    }
+
+    #[test]
+    fn pinned_fingerprints_match_the_reconciled_contracts() {
+        // Each pin is the BLAKE3 hash of the canonicalized output schema
+        // captured from a live gateway (v1.3.1) into
+        // `fixtures/slack/contracts/`. This test locks pin and captured
+        // contract together: refreshing one without the other fails here,
+        // and drift in the live gateway fails registration with
+        // `ActionContractMismatch` instead of surfacing at scan time.
+        let mut mismatches = Vec::new();
+        for (table, contract) in [
+            (
+                &CONVERSATIONS,
+                include_str!("fixtures/slack/contracts/list_conversations.json"),
+            ),
+            (
+                &USERS,
+                include_str!("fixtures/slack/contracts/list_users.json"),
+            ),
+            (
+                &FILES,
+                include_str!("fixtures/slack/contracts/list_files.json"),
+            ),
+        ] {
+            let schema: Value = serde_json::from_str(contract).expect("contract fixture parses");
+            let actual = fingerprint_schema(Some(&schema));
+            if table.expected_fingerprint != Some(actual.as_str()) {
+                mismatches.push(format!(
+                    "{}: pinned {:?}, contract fixture hashes to {actual}",
+                    table.id, table.expected_fingerprint
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn drifted_contract_fails_registration_not_the_scan() {
+        // The other half of the pin: a gateway whose discovered output
+        // schema differs from the captured contract must be refused at
+        // REGISTRATION with the table and action named — before any scan
+        // could return silently reshaped data. (Every other test in this
+        // module proves the pass side: their stubs serve the captured
+        // contracts and register successfully.)
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                // A drifted contract: not the captured schema.
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_SLACK_DRIFT", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_SLACK_DRIFT
+bindings:
+  - name: ws
+    source_pack: slack
+    tables: [conversations]
+"#,
+        )
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("a drifted contract must fail registration");
+        let message = err.to_string();
+        assert!(
+            message.contains("slack.conversations")
+                && message.contains("slack.list_conversations")
+                && message.contains("fingerprint mismatch"),
+            "the table, action, and mismatch are named: {message}"
+        );
+    }
 
     // ── Contract tests: bundled redacted fixtures are the build-time
     // conversion contract (null-bearing, nested, empty, extra upstream
@@ -631,7 +741,7 @@ mod tests {
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return slack_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -879,7 +989,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return slack_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
                 return MockResponse::new(
@@ -921,7 +1031,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return slack_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
                 return MockResponse::ok(&envelope_ok(
@@ -969,7 +1079,7 @@ bindings:
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            return slack_discovery(&req.path);
         }
         if req.method == "POST" && req.path == "/v1/actions/slack.list_users" {
             return MockResponse::ok(&envelope_ok(
@@ -1033,7 +1143,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return slack_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/slack.list_files" {
                 return MockResponse::ok(&envelope_ok(
@@ -1099,7 +1209,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return slack_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/slack.list_files" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1187,7 +1297,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return slack_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/slack.list_users" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();

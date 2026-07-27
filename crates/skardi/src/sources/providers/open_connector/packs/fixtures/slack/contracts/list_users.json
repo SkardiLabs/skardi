@@ -1,0 +1,128 @@
+{
+  "type": "object",
+  "properties": {
+    "users": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "userId": {
+            "type": "string",
+            "description": "The unique identifier of the user."
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The username of the user."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realName": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The real name of the user."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "displayName": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The display name of the user."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isBot": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the user is a bot user."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isDeleted": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the user is deleted."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isAdmin": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the user is an admin."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isOwner": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the user is an owner."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "locale": {
+            "type": "string",
+            "description": "The locale returned by Slack when requested."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "userId",
+          "username",
+          "realName",
+          "displayName",
+          "isBot",
+          "isDeleted",
+          "isAdmin",
+          "isOwner"
+        ],
+        "description": "A normalized Slack user record."
+      },
+      "description": "The list of Slack users."
+    },
+    "nextCursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The cursor for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "users",
+    "nextCursor"
+  ],
+  "description": "The output payload for this action."
+}

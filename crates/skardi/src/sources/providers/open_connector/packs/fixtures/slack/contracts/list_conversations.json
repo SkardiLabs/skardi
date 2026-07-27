@@ -1,0 +1,136 @@
+{
+  "type": "object",
+  "properties": {
+    "conversations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "channelId": {
+            "type": "string",
+            "description": "The unique identifier of the conversation."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The name of the conversation when available."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "public_channel",
+              "private_channel",
+              "im",
+              "mpim",
+              "unknown"
+            ],
+            "description": "The normalized Slack conversation type."
+          },
+          "isArchived": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the conversation is archived."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isPrivate": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the conversation is private."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "isMember": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "description": "Whether the bot user is a member."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "memberCount": {
+            "type": "integer",
+            "description": "The member count when Slack provides it."
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The conversation topic."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "purpose": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The conversation purpose."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "userId": {
+            "type": "string",
+            "description": "The linked user identifier for IM conversations."
+          },
+          "locale": {
+            "type": "string",
+            "description": "The locale returned by Slack when requested."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "channelId",
+          "name",
+          "type",
+          "isArchived",
+          "isPrivate",
+          "isMember",
+          "topic",
+          "purpose"
+        ],
+        "description": "A normalized Slack conversation record."
+      },
+      "description": "The list of Slack conversations."
+    },
+    "nextCursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The cursor for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "conversations",
+    "nextCursor"
+  ],
+  "description": "The output payload for this action."
+}

@@ -196,11 +196,18 @@ event carrying the scan identity and error.
       `ValueFormat` stays for future packs). Engine support:
       `FieldType::TimestampSecondsUtc` (Slack's epoch-second `files.created` — the millis
       reader would silently produce 1970 dates); `files` optionally scopes to one channel
-      via the `channelId` optional resource. No fingerprint pins yet, same follow-up as
-      GitHub. Live-verified: all three tables' generated inputs pass the gateway's strict
+      via the `channelId` optional resource. **Fingerprints are pinned** (a pack
+      first): each `expected_fingerprint` is the BLAKE3 hash of the canonicalized
+      output schema captured from the live gateway into
+      `packs/fixtures/slack/contracts/`; a sync test locks pin ↔ captured contract,
+      every mock registration serves the captured contracts (so the pass side of the
+      gate is exercised by the whole suite), and a drift e2e proves a differing
+      discovered schema fails registration as `ActionContractMismatch` naming the
+      table and action. GitHub's pins remain the open follow-up. Live-verified: all
+      three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 230 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 232 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty
