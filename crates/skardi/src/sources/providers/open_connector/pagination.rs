@@ -219,8 +219,25 @@ impl Pagination {
                 })?;
                 let next = match path.extract(envelope, self.page) {
                     Ok(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-                    // Missing, null, or empty cursor → scan complete.
-                    _ => None,
+                    // Null or empty-string cursor → scan complete (the two
+                    // in-band end-of-collection spellings).
+                    Ok(Value::String(_)) | Ok(Value::Null) => None,
+                    // A cursor that is present but not a string is contract
+                    // drift, not termination — reading it as end-of-collection
+                    // would silently truncate the scan.
+                    Ok(other) => {
+                        return Err(OpenConnectorError::PaginationCursorInvalid {
+                            path: path.as_str().to_string(),
+                            page: self.page,
+                            found: json_kind(other),
+                        });
+                    }
+                    // An entirely absent cursor (any missing segment) is the
+                    // omitted end-of-collection spelling.
+                    Err(OpenConnectorError::RowPathNotFound { .. }) => None,
+                    // Structural failures — traversing through a non-object —
+                    // are drift and propagate as themselves.
+                    Err(e) => return Err(e),
                 };
 
                 let Some(next) = next else {
@@ -333,12 +350,72 @@ mod tests {
     }
 
     #[test]
-    fn cursor_ends_on_missing_or_empty_next() {
+    fn cursor_ends_on_missing_null_or_empty_next() {
         let mut pagination = cursor();
         assert!(!pagination.advance(&json!({}), 50).unwrap());
 
         let mut pagination = cursor();
         assert!(!pagination.advance(&json!({"next_cursor": ""}), 50).unwrap());
+
+        let mut pagination = cursor();
+        assert!(
+            !pagination
+                .advance(&json!({"next_cursor": null}), 50)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn non_string_cursors_fail_instead_of_terminating() {
+        // `next_cursor: 123` (or an object) is contract drift: reading it as
+        // end-of-collection would return a truncated scan as success.
+        for (envelope, kind) in [
+            (json!({"next_cursor": 123}), "a number"),
+            (json!({"next_cursor": {}}), "an object"),
+            (json!({"next_cursor": true}), "a boolean"),
+        ] {
+            let mut pagination = cursor();
+            let err = pagination.advance(&envelope, 50).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::PaginationCursorInvalid { page: 1, ref found, .. }
+                        if found == kind
+                ),
+                "{envelope} should fail with kind {kind}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_cursor_path_failures_propagate() {
+        // A non-object where the cursor path must descend is drift, not the
+        // omitted end-of-collection spelling.
+        let mut pagination = Pagination::new(PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "$.meta.next",
+            page_size_param: None,
+            page_size: 50,
+        })
+        .unwrap();
+        let err = pagination
+            .advance(&json!({"meta": [1, 2]}), 50)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::RowPathNotObject { ref segment, .. } if segment == "next"
+        ));
+
+        // A missing PARENT segment stays a termination: Slack's raw shape
+        // omits the whole `response_metadata` object on the last page.
+        let mut pagination = Pagination::new(PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "$.meta.next",
+            page_size_param: None,
+            page_size: 50,
+        })
+        .unwrap();
+        assert!(!pagination.advance(&json!({"other": 1}), 50).unwrap());
     }
 
     #[test]

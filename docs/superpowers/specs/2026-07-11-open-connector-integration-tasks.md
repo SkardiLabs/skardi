@@ -178,9 +178,12 @@ event carrying the scan identity and error.
       row arrays under `conversations`/`users`, top-level `nextCursor` (null at end), and
       Slack's in-band `ok:false` consumed by the executor (so the tables declare no
       `error_path`; the engine mechanism is modeled by the mock pack). Cursor pagination
-      (`cursor` / `$.nextCursor`, `limit` 200) terminates on both end-of-collection
-      spellings (null cursor and absent key) and fails as `PaginationLoop` on a
-      non-advancing gateway; `files` uses Slack's classic `page`/`count` pagination
+      (`cursor` / `$.nextCursor`, `limit` 200) terminates ONLY on the end-of-collection
+      spellings (null, empty-string, or absent cursor); a present non-string cursor
+      fails as `PaginationCursorInvalid` (kind-only, never the value) instead of
+      silently truncating, structural path failures propagate as themselves, and a
+      non-advancing gateway fails as `PaginationLoop`; `files` uses Slack's classic
+      `page`/`count` pagination
       terminated by the envelope's authoritative `paging.pages` (a `total_pages_path`
       extension to `PageNumber` — short non-final pages, legal under permission filtering,
       never truncate; missing/non-numeric totals fail loudly).
@@ -197,7 +200,7 @@ event carrying the scan identity and error.
       GitHub. Live-verified: all three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 227 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 230 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty

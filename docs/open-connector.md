@@ -255,7 +255,10 @@ calls (health, discovery) retry `429`/transient `5xx` with capped
 exponential backoff honoring `Retry-After`; non-idempotent execute calls
 retry only a pre-execution `429` and never re-send a request that may have
 already run. Cursor pagination that stops advancing fails as a detected
-loop instead of spinning forever. Conversion errors report the action, row
+loop instead of spinning forever; a continuation cursor of the wrong JSON
+type fails the scan as itself (only an absent, `null`, or empty-string
+cursor means end-of-collection — anything else would silently truncate).
+Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
 *kind*, never the value.
 

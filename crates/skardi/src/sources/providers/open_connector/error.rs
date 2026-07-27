@@ -230,6 +230,20 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// A continuation cursor was present at the declared path but was not a
+    /// string. Treating it as end-of-collection would silently truncate the
+    /// scan, so it fails instead. Carries the JSON *kind* only, never the
+    /// value.
+    #[error(
+        "Open Connector pagination cursor at '{path}' on page {page} is {found}, \
+         not a string; refusing to treat it as end-of-collection"
+    )]
+    PaginationCursorInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// Pagination failed to advance: the gateway returned an already-seen
     /// cursor, which would loop the scan forever.
     #[error(

@@ -911,6 +911,46 @@ bindings:
     }
 
     #[tokio::test]
+    async fn non_string_cursor_fails_the_scan_instead_of_truncating() {
+        // A gateway that hands back `nextCursor: 123` has broken the cursor
+        // contract. The page's rows must NOT be returned as a complete
+        // result — that would silently truncate the collection — and the
+        // error must name the cursor path, not a row problem.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"conversations": [
+                        {"channelId": "C0001", "name": "general", "type": "public_channel"}
+                    ], "nextCursor": 123})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = setup(&gateway, "conversations", "SKARDI_TEST_OC_SLACK_BAD_CURSOR").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.ws.conversations")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a non-string cursor must fail the scan, not truncate it");
+        let message = err.to_string();
+        assert!(
+            message.contains("$.nextCursor") && message.contains("not a string"),
+            "the cursor path and the type problem are named: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_workspace_yields_an_empty_scan() {
         let gateway =
             MockGateway::start(conversations_gateway(Vec::new(), Terminal::NullCursor)).await;
