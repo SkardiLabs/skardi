@@ -28,6 +28,8 @@ Copied from the spec; every task's requirements implicitly include these.
 - **Config defaults (exact values):** `ttl_seconds: 900`, `max_concurrent: 6`, `request_timeout_seconds: 10`, `scan_timeout_seconds: 60`, `max_response_bytes: 5242880`, `user_agent: "skardi-rss/<CARGO_PKG_VERSION> (+https://github.com/SkardiLabs/skardi)"`. `ttl_seconds: 0` is valid (always-live). All bounds ≥ 1 except `ttl_seconds` (0 allowed).
 - **Failure fuse:** on a failed attempt the TTL re-arms to `clamp(ttl_seconds / 4, 30, 300)` seconds — bounded above zero even under `ttl_seconds: 0`.
 - **Every commit compiles and its tests pass** with `--features rss` and without (the workspace must stay green when the feature is off). Run `cargo fmt --all` before every commit (CI gates on it).
+- **Negative tests assert the reason, not just the failure.** Every test that expects an error asserts on a substring identifying *that* error (the offending field name, the failing stage, the blocked range). A bare `assert!(result.is_err())` passes when an unrelated error fires and is treated as a test that asserts nothing — the bar `open_connector/config.rs:607-619` sets.
+- **Toolchain note (this machine):** `cargo` is not on the default PATH. Prefix every invocation with `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`.
 
 ### Decisions made by this plan (approved with the plan; deviations from spec flagged)
 
@@ -169,9 +171,17 @@ fn empty_user_agent_is_rejected() { /* user_agent: "" → err names user_agent *
 
 #[test]
 fn unknown_fields_are_rejected() {
-    // "feeds: [...]\nttl_secondsss: 5\n" → serde error (deny_unknown_fields),
-    // both on RssConfig and on FeedSubscription entries.
-    assert!(serde_yaml::from_str::<RssConfig>("feeds: []\nbogus: 1\n").is_err());
+    // deny_unknown_fields must fire on both RssConfig and FeedSubscription
+    // entries. Assert the error NAMES the offending key — a bare is_err()
+    // would also pass if some unrelated parse error fired instead
+    // (the bar open_connector/config.rs:607-619 sets).
+    let err = serde_yaml::from_str::<RssConfig>("feeds: []\nbogus: 1\n").unwrap_err();
+    assert!(err.to_string().contains("bogus"), "{err}");
+    let err = serde_yaml::from_str::<RssConfig>(
+        "feeds:\n  - url: https://a.example/f.xml\n    nam: x\n",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("nam"), "{err}");
 }
 ```
 
