@@ -96,6 +96,13 @@ by the gateway's discovery metadata; the row type is derived from the
 discovered output schema at `$.issues`. Provider-side filters (here
 `"state":"open"`) travel in the input JSON.
 
+> **Stub-only for now.** The bundled stub declares `execution.readOnly:
+> true`, which is why this pipeline runs here — today's real Open
+> Connector publishes no read/write classification at all, so this
+> example is refused live under default-deny. See
+> [the real-gateway section](#running-against-a-real-open-connector-gateway)
+> before expecting it to work outside this demo.
+
 ```bash
 curl -s -X POST http://localhost:8080/raw_issue_scan/execute \
   -H 'Content-Type: application/json' -d '{}'
@@ -165,6 +172,26 @@ The Skardi side is identical; what changes is who answers the HTTP calls:
    `owner`/`repo` under `resource:`, and — if the gateway hosts several
    GitHub connections — add `connection_alias:` to the binding.
 4. Start the server exactly as above.
+
+What carries over from the demo, and what doesn't:
+
+- **Stable catalog tables and `open_connector_query` work live.** Without
+  a GitHub connection they degrade gracefully to the gateway's credential
+  wall (`authorization_failed: Configure github credentials first.`);
+  configure the connection and the same pipelines return real rows.
+- **The `raw_issue_scan` pipeline is stub-only for now.** It runs in this
+  demo because the bundled stub declares `execution.readOnly: true`, but
+  today's real Open Connector publishes **no read/write classification**
+  in its action metadata, so `open_connector_scan` refuses every raw
+  action live with `RawActionReadOnlyUnknown` ("does not declare a
+  read-only classification … default-deny — the allowlist alone does not
+  grant execution"). That refusal is the designed conservative outcome,
+  not a bug; the raw-scan interface becomes live-usable only once the
+  gateway publishes a classification (or Skardi grows an explicit
+  operator attestation — an open design follow-up). Remove
+  `raw_action_allowlist` and the `raw_issue_scan` pipeline from a
+  real-gateway context to avoid the registration-time discovery of an
+  action you cannot execute anyway.
 
 Rate limits and authorization are enforced by GitHub and the gateway;
 Skardi's own bounds (`max_pages`, `max_rows`, timeouts, bounded retries
