@@ -3,11 +3,40 @@
 //! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
 pub mod config;
 pub mod error;
+// Reads OPML files and pulls in `quick-xml`; gated so the config/error types
+// above stay parseable — and `ResolvedSubscription` below stays nameable —
+// in builds that omit the `rss` feature.
+#[cfg(feature = "rss")]
+pub mod opml;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
+#[cfg(feature = "rss")]
+pub use opml::resolve_subscriptions;
 
 /// Integer version of the `feeds`/`items` public surface. Bumped only by
 /// breaking changes (column removal/rename/retype, nullability tightening,
 /// enum-domain repurposing, identity/window semantics changes).
 pub const RSS_SURFACE_VERSION: u32 = 1;
+
+/// One subscription, fully resolved from either of [`RssConfig`]'s two
+/// mutually exclusive input forms — an inline `feeds:` entry or an
+/// `<outline>` pulled from an `opml:` file.
+///
+/// This is the convergence point the rest of the provider is built on:
+/// every later stage — the fetcher, the TTL cache, the freshness state
+/// machine, the partition-per-feed execution plan — consumes only a
+/// `Vec<ResolvedSubscription>` and never looks at `RssConfig`'s input shape
+/// again. It is a plain data struct with no parsing logic of its own, so
+/// unlike [`opml`] (which requires the `rss` feature for `quick-xml`) it
+/// stays nameable in featureless builds — the server and CLI can hold it
+/// in a typed field regardless of which features a given build enables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSubscription {
+    /// Effective subscription name: an explicit `name`/`text`/`title`, or
+    /// the feed's URL when none was given. Unique across the whole
+    /// resolved list.
+    pub name: String,
+    /// Feed URL; already checked to be `http://` or `https://`.
+    pub url: String,
+}
