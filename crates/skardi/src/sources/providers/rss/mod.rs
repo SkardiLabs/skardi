@@ -2,6 +2,10 @@
 //!
 //! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
 pub mod config;
+#[cfg(feature = "rss")]
+pub mod conformance;
+#[cfg(feature = "rss")]
+pub mod convert;
 pub mod error;
 // Reads OPML files and pulls in `quick-xml`; gated so the config/error types
 // above stay parseable — and `ResolvedSubscription` below stays nameable —
@@ -28,6 +32,16 @@ mod fetch;
 // its only consumer, `fetch`'s test module, is.
 #[cfg(all(test, feature = "rss"))]
 pub(crate) mod testutil;
+// The parsing chain: byte-level sanitation rungs, the feed-rs parse driver
+// that applies them, and the fixed Arrow schemas the providers serve. These
+// were built on a parallel branch (Tasks 5-9) alongside the fetch chain
+// above, which is why they land as one merge rather than task by task.
+#[cfg(feature = "rss")]
+pub mod parse;
+#[cfg(feature = "rss")]
+pub mod sanitize;
+#[cfg(feature = "rss")]
+pub mod schema;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
