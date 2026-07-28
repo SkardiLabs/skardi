@@ -2,6 +2,8 @@
 //!
 //! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
 pub mod config;
+#[cfg(feature = "rss")]
+pub mod convert;
 pub mod error;
 #[cfg(feature = "rss")]
 pub mod sanitize;
