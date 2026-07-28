@@ -68,7 +68,10 @@ Match the strategy to what the executor actually emits (phase 1):
   returning its default listing; DataFusion re-applying the predicate is
   cheap insurance. Reserve `Exact` for mappings faithful across the
   whole value domain.
-- `ValueFormat` per mapping (`Rfc3339` / `EpochSeconds`). `EpochSeconds`
+- `ValueFormat` per mapping: `Verbatim` for non-timestamp inputs (it
+  also refuses to push a timestamp literal in a guessed spelling — the
+  predicate stays local), `Rfc3339` / `EpochSeconds` for genuine
+  timestamp inputs. `EpochSeconds`
   floors sub-second literals — only map it to lower-bound parameters so
   the boundary row can never be dropped. Never map `>=` onto a provider
   parameter with strictly-greater semantics (same boundary-row rule).
