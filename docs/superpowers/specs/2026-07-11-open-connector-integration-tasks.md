@@ -147,8 +147,9 @@ event carrying the scan identity and error.
       schema-mismatch page whose targeted (column, page, row, expected, found-kind)
       error the contract test asserts, per the admission gate); the action IDs,
       input keys, row paths, and HTTP protocol are reconciled against a live gateway,
-      while fingerprint pins stay `None` like the mock pack until taken from a live
-      gateway's discovered contracts (follow-up).
+      and fingerprint pins are now taken from live-captured contracts
+      (`fixtures/github/contracts/`, landed alongside 5.2's pinning recipe: sync
+      test, contract-serving mocks, drift-refusal e2e).
       Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
       visibility incl. the pure-issues note, rate limits, freshness), README row updated.
       Verification: 27 pack tests (counted by
@@ -223,7 +224,7 @@ event carrying the scan identity and error.
       targeted `SourcePackAssetInvalid` registration/UDTF-setup diagnostic —
       never a panic — with a parse-all test keeping shipped assets valid.
 
-      **Verification**: 238 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 240 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty

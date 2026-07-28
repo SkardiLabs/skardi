@@ -72,6 +72,157 @@ mod tests {
     };
     use arrow::record_batch::RecordBatch;
 
+    /// Discovery responses serve the CAPTURED live contracts, so every e2e
+    /// registration exercises the fingerprint gate's pass side.
+    fn github_discovery(path: &str) -> MockResponse {
+        let contracts: &[(&str, &str)] = &[
+            (
+                "github.list_my_repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+            ),
+            (
+                "github.list_repository_issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+            ),
+            (
+                "github.list_issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+            ),
+            (
+                "github.list_pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+            ),
+            (
+                "github.list_pull_request_reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+            ),
+            (
+                "github.list_commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+            ),
+            (
+                "github.list_workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+            ),
+            (
+                "github.list_releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+            ),
+        ];
+        let output_schema = contracts
+            .iter()
+            .find(|(action, _)| path.ends_with(action))
+            .map(|(_, schema)| *schema)
+            .unwrap_or(r#"{"type": "object"}"#);
+        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+    }
+
+    #[test]
+    fn pinned_fingerprints_match_the_reconciled_contracts() {
+        // Pin <-> captured-contract lock, through the SAME function
+        // registration uses. On mismatch this prints the actual hashes —
+        // which is also how the pins are (re)taken after an upstream
+        // upgrade.
+        use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
+        let contracts = [
+            (
+                "repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+            ),
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+            ),
+            (
+                "issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+            ),
+            (
+                "reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+            ),
+            (
+                "commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+            ),
+            (
+                "workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+            ),
+            (
+                "releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (short, contract) in contracts {
+            let schema: Value = serde_json::from_str(contract).expect("contract fixture parses");
+            let actual = fingerprint_schema(Some(&schema));
+            let t = table(short);
+            if t.expected_fingerprint != Some(actual.as_str()) {
+                mismatches.push(format!(
+                    "{}: pinned {:?}, contract fixture hashes to {actual}",
+                    t.id, t.expected_fingerprint
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn drifted_contract_fails_registration_not_the_scan() {
+        // The pin's refusal side: a gateway whose discovered output schema
+        // differs from the captured contract must be refused at
+        // REGISTRATION, table and action named. (Every other e2e proves
+        // the pass side via github_discovery's captured contracts.)
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = testutil::EnvVarGuard::set("SKARDI_TEST_OC_GITHUB_DRIFT", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_GITHUB_DRIFT
+bindings:
+  - name: gh
+    source_pack: github
+    resource: { owner: acme, repo: widgets }
+    tables: [issues]
+"#,
+        )
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("a drifted contract must fail registration");
+        let message = err.to_string();
+        assert!(
+            message.contains("github.issues")
+                && message.contains("github.list_repository_issues")
+                && message.contains("fingerprint mismatch"),
+            "table, action, and cause are named: {message}"
+        );
+    }
+
     /// Look up a table by short name; the assets are test-pinned to parse.
     fn table(
         short: &str,
@@ -354,6 +505,7 @@ mod tests {
     // the PR marker, LIMIT, and UDTF parity. ─────────────────────────────
 
     use crate::sources::hierarchy::HierarchyLevel;
+    use crate::sources::providers::open_connector::testutil;
     use crate::sources::providers::open_connector::testutil::{
         MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
@@ -385,7 +537,7 @@ mod tests {
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path == "/v1/actions/github.list_repository_issues" {
-            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            return github_discovery(&req.path);
         }
         if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
             let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -567,12 +719,7 @@ bindings:
                     return MockResponse::ok("{}");
                 }
                 if req.method == "GET" && req.path == "/v1/actions/github.list_pull_requests" {
-                    return MockResponse::ok(&discovery_ok(
-                        "{}",
-                        r#"{"type": "object"}"#,
-                        true,
-                        None,
-                    ));
+                    return github_discovery(&req.path);
                 }
                 if req.method == "POST" && req.path == "/v1/actions/github.list_pull_requests" {
                     let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -704,12 +851,7 @@ bindings:
                     return MockResponse::ok("{}");
                 }
                 if req.method == "GET" && req.path == format!("/v1/actions/{action_id}") {
-                    return MockResponse::ok(&discovery_ok(
-                        "{}",
-                        r#"{"type": "object"}"#,
-                        true,
-                        None,
-                    ));
+                    return github_discovery(&req.path);
                 }
                 if req.method == "POST" && req.path == format!("/v1/actions/{action_id}") {
                     return MockResponse::ok(&envelope_ok(
@@ -914,7 +1056,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path == "/v1/actions/github.list_workflow_runs" {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return github_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_workflow_runs" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1121,7 +1263,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return github_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_my_repositories" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1262,7 +1404,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return github_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_issue_comments" {
                 return MockResponse::ok(&envelope_ok(

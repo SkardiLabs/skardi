@@ -1,0 +1,96 @@
+{
+  "type": "object",
+  "properties": {
+    "commits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sha": {
+            "type": "string"
+          },
+          "html_url": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+            "description": "A GitHub API object."
+          },
+          "author": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "login": {
+                "type": "string"
+              },
+              "avatar_url": {
+                "type": "string"
+              },
+              "html_url": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "committer": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "login": {
+                "type": "string"
+              },
+              "avatar_url": {
+                "type": "string"
+              },
+              "html_url": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "parents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true,
+              "description": "A GitHub API object."
+            }
+          },
+          "stats": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+            "description": "A GitHub API object."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true,
+              "description": "A GitHub API object."
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

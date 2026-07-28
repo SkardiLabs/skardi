@@ -1,0 +1,58 @@
+{
+  "type": "object",
+  "properties": {
+    "total_count": {
+      "type": "integer"
+    },
+    "workflow_runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "display_title": {
+            "type": "string"
+          },
+          "workflow_id": {
+            "type": "integer"
+          },
+          "event": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "conclusion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "head_branch": {
+            "type": "string"
+          },
+          "head_sha": {
+            "type": "string"
+          },
+          "html_url": {
+            "type": "string"
+          },
+          "run_number": {
+            "type": "integer"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

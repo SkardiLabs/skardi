@@ -137,8 +137,12 @@ pagination guarantees.
 ## Compatibility
 
 The pack is version 1; bindings may pin `source_pack_version: 1` so a
-Skardi upgrade cannot silently change bound schemas. Contract fingerprints
-are not yet pinned (the pack has not been validated against a live
-gateway's discovered contracts); the bundled fixtures under
-`packs/fixtures/github/` are the build-time conversion contract, and pins
-land once a live catalog validates them.
+Skardi upgrade cannot silently change bound schemas. **Action-contract
+fingerprints are pinned** against a live gateway: registration compares
+each pin with the discovered output schema and refuses a differing
+contract with `ActionContractMismatch` — schema drift fails at startup,
+never as silently reshaped rows mid-query. The captured contracts live
+under `packs/fixtures/github/contracts/`; upgrading Open Connector may
+change these schemas (even compatibly), and the pack then needs its
+contracts re-captured and pins refreshed. The bundled fixtures under
+`packs/fixtures/github/` remain the build-time conversion contract.

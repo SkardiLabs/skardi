@@ -9,6 +9,7 @@ version: 1
 tables:
   repositories:
     action: github.list_my_repositories
+    fingerprint: 5750340fb193cedf64c9de89ba1ab607b1e226065720a34b91659c87d9a01bb9
     row_path: "$.repositories"
     pagination:
       strategy: page_number
@@ -34,6 +35,7 @@ tables:
 
   issues:
     action: github.list_repository_issues
+    fingerprint: 45fbef8622d90702e536b9b2e0ade6bcc7da61f7cb654d62a90b2e36df13c64b
     row_path: "$.issues"
     pagination:
       strategy: page_number
@@ -67,6 +69,7 @@ tables:
 
   issue_comments:
     action: github.list_issue_comments
+    fingerprint: ec1d7d49193859304fdf2ba1da1c1ab978af44dc01fdf4cbb2c0e7f3e1e473f2
     row_path: "$.comments"
     pagination:
       strategy: page_number
@@ -85,6 +88,7 @@ tables:
 
   pull_requests:
     action: github.list_pull_requests
+    fingerprint: 36535ca2ae1b3a111eca4eba071d8c48090590dd46b96fc96d321f05dad5c31a
     row_path: "$.pull_requests"
     pagination:
       strategy: page_number
@@ -115,6 +119,7 @@ tables:
 
   reviews:
     action: github.list_pull_request_reviews
+    fingerprint: 1cafff54dcb0eec5edd8db25c2bc6dbd93152fb3d6fe9969a91bda5c6a515fa9
     row_path: "$.reviews"
     pagination:
       strategy: page_number
@@ -134,6 +139,7 @@ tables:
 
   commits:
     action: github.list_commits
+    fingerprint: 313eb7e1672baa4db524aff81656a04f7f39d359dc3fa915f6866eb814e90630
     row_path: "$.commits"
     pagination:
       strategy: page_number
@@ -153,6 +159,7 @@ tables:
 
   workflow_runs:
     action: github.list_workflow_runs
+    fingerprint: 015e71ce757d68892ab3d5f012b51efb1ccd27fc1689e2611cff6e17ff92a688
     row_path: "$.workflow_runs"
     pagination:
       strategy: page_number
@@ -177,6 +184,7 @@ tables:
 
   releases:
     action: github.list_releases
+    fingerprint: a160bc70b84ba531cd44419c4242406bf273bba5facc5e8c3c4c1ec6b0b47575
     row_path: "$.releases"
     pagination:
       strategy: page_number
