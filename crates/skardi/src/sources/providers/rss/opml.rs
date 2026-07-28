@@ -7,9 +7,9 @@
 //! module actually reads that file — on the registration path, not the
 //! validate path — every check `validate()` already performs for the
 //! inline `feeds:` form has to be re-run against whatever the file
-//! contains: nothing about name defaulting, effective-name uniqueness, or
-//! http/https scheme validation was visible before now. [`finalize`]
-//! applies all three uniformly to both input forms so there is exactly one
+//! contains: non-emptiness, name defaulting, effective-name uniqueness, and
+//! http/https scheme validation were all invisible before now. [`finalize`]
+//! applies all four uniformly to both input forms so there is exactly one
 //! place either one's invariants are enforced.
 //!
 //! Gated behind the `rss` feature: this is the only file in the provider
@@ -125,10 +125,9 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
                     })
             };
             // The OPML 2.0 spec (http://opml.org/spec2.opml) names this
-            // attribute `xmlUrl`, but some real-world exports (seen in a
-            // handful of Feedly/NewsBlur OPML dumps) lowercase it to
-            // `xmlurl`; accept both rather than silently dropping those
-            // subscriptions.
+            // attribute `xmlUrl`, but some real-world OPML exports lowercase
+            // it to `xmlurl`; accept both rather than silently dropping
+            // those subscriptions.
             match attr.key.as_ref() {
                 b"xmlUrl" | b"xmlurl" => xml_url = Some(decode()?),
                 b"text" => text_attr = Some(decode()?),
@@ -145,29 +144,37 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
         }
     }
 
-    if subs.is_empty() {
-        return Err(invalid(format!(
-            "OPML file '{}' has no <outline xmlUrl=\"…\"> elements: at least one subscription is required",
-            path.display()
-        )));
-    }
-
+    // Not checked here: an OPML file with zero `xmlUrl` outlines is
+    // structurally fine XML, just an empty subscription list — `finalize`
+    // rejects that uniformly for both input forms, so an inline `feeds: []`
+    // reached without `validate()` having run first gets the same check
+    // instead of silently resolving to zero subscriptions.
     Ok(subs)
 }
 
 /// Apply the checks [`RssConfig::validate`] already performs on the inline
-/// `feeds:` form — name defaulting, http/https scheme validation, and
-/// effective-name uniqueness — to a flat `(url, name)` list from either
-/// input form.
+/// `feeds:` form — a non-empty list, name defaulting, http/https scheme
+/// validation, and effective-name uniqueness — to a flat `(url, name)` list
+/// from either input form.
 ///
 /// Running this uniformly for both forms (rather than only the OPML path)
 /// keeps there being exactly one place either one's invariants are
-/// enforced, and gives the inline path a second, cheap check for free if
-/// this function is ever called ahead of `validate()`.
+/// enforced. Without the non-empty check here, `resolve_subscriptions`
+/// called with an empty inline `feeds: []` ahead of `validate()` would
+/// silently resolve to zero subscriptions instead of erroring the way the
+/// equivalent empty-OPML case already does — an asymmetry that would trap
+/// whichever later caller hit it first.
 fn finalize(
     name: &str,
     raw: Vec<(String, Option<String>)>,
 ) -> Result<Vec<ResolvedSubscription>, RssError> {
+    if raw.is_empty() {
+        return Err(RssError::InvalidConfig {
+            name: name.to_string(),
+            reason: "at least one subscription is required".to_string(),
+        });
+    }
+
     let mut seen_names = HashSet::with_capacity(raw.len());
     let mut resolved = Vec::with_capacity(raw.len());
 
@@ -296,19 +303,35 @@ mod tests {
     fn malformed_opml_is_invalid_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.opml");
-        std::fs::write(&path, "not xml at all").unwrap();
+        // Genuinely ill-formed XML: the `<outline>` here is opened with a
+        // start tag (not self-closed) and never gets a matching `</outline>`
+        // before `</body>` appears — an end-tag mismatch quick-xml's
+        // tokenizer rejects. Plain non-XML text (e.g. "not xml at all") is
+        // *not* a regression case for this branch: quick-xml is a
+        // non-validating tokenizer with no root-element requirement, so
+        // text with zero `<` bytes parses as one `Text` event followed by
+        // `Eof` — no error — and would only exercise the (already covered
+        // elsewhere) empty-subscription-list path instead.
+        std::fs::write(
+            &path,
+            r#"<opml><body><outline xmlUrl="https://a.example/f.xml"></body>"#,
+        )
+        .unwrap();
         let config = RssConfig {
             opml: Some(path),
             ..inline_config(vec![])
         };
         let err = resolve_subscriptions("news", &config).unwrap_err();
         match err {
-            RssError::InvalidConfig { reason, .. } => {
-                assert!(
-                    reason.contains("OPML"),
-                    "reason should mention OPML: {reason}"
-                )
-            }
+            // "well-formed XML" is unique to this branch — the
+            // empty-subscription-list message (asserted in
+            // `opml_without_any_xmlurl_is_rejected`) says "at least one
+            // subscription" instead, so this can't pass by accidentally
+            // matching that other branch.
+            RssError::InvalidConfig { reason, .. } => assert!(
+                reason.contains("well-formed XML"),
+                "reason should flag the XML syntax error: {reason}"
+            ),
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
     }
@@ -332,6 +355,26 @@ mod tests {
             opml: Some(path),
             ..inline_config(vec![])
         };
+        let err = resolve_subscriptions("news", &config).unwrap_err();
+        match err {
+            RssError::InvalidConfig { reason, .. } => assert!(
+                reason.contains("at least one subscription"),
+                "reason should require at least one subscription: {reason}"
+            ),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_empty_feed_list_is_rejected_by_resolve_too() {
+        // RssConfig::validate() already rejects an empty inline `feeds: []`
+        // with zero I/O, so this path is unreachable through the normal
+        // validate-then-resolve registration flow. It covers `finalize`'s
+        // own non-empty check directly, so `resolve_subscriptions` doesn't
+        // silently resolve to zero subscriptions if it is ever reached
+        // ahead of `validate()` — the same invariant
+        // `opml_without_any_xmlurl_is_rejected` covers for the OPML form.
+        let config = inline_config(vec![]);
         let err = resolve_subscriptions("news", &config).unwrap_err();
         match err {
             RssError::InvalidConfig { reason, .. } => assert!(
