@@ -437,8 +437,8 @@ mod tests {
             // (wrongly) keep matching past this address.
             ("100.127.255.255", BlockedRange::Cgnat),
             // Upper boundary of fe80::/10 (fe80::-febf:...): pins the mask
-            // against a narrower one like `& 0xff80` (which would shrink
-            // the range to a /9 and wrongly exclude this address).
+            // against one that is too narrow (longer than /10, e.g.
+            // `& 0xffe0`), which would wrongly exclude this address.
             ("febf::1", BlockedRange::LinkLocal),
             // Upper boundary of fc00::/7 (fc00::-fdff:...): pins the mask
             // against a narrower one like `& 0xff00` (which would shrink
