@@ -30,7 +30,7 @@ rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
 documents = ["dep:liteparse", "dep:glob"]
 # rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
-rss = ["dep:encoding_rs", "dep:htmd"]
+rss = ["dep:encoding_rs", "dep:htmd", "dep:feed-rs"]
 
 [dependencies]
 # engine
@@ -95,6 +95,8 @@ glob = { version = "0.3", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 # Deterministic HTML→Markdown for rss item content.
 htmd = { version = "0.5.5", optional = true }
+# RSS 0.9x/1.0/2.0, Atom, and JSON Feed parsing into one model.
+feed-rs = { version = "2.4", optional = true }
 secrecy = "0.10"
 pgvector = { version = "0.4", features = ["sqlx"] }
 sqlx = { workspace = true }

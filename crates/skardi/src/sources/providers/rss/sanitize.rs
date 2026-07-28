@@ -35,7 +35,7 @@ impl Repair {
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// First index of `needle` in `haystack`.
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(super) fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
