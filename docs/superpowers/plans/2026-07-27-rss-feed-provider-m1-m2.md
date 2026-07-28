@@ -20,7 +20,7 @@ Copied from the spec; every task's requirements implicitly include these.
 - **Enum domains (exact strings):** `feeds.last_status` ∈ `never | fresh | revalidated | stale-error | error`; `items.window_status` ∈ `fresh | revalidated | stale-error`; `feeds.dialect` ∈ `rss-0.9x | rss-1.0 | rss-2.0 | atom | json-feed-1.x` (direct `feed-rs` `FeedType` mapping).
 - **Pushdown:** only `feed`/`feed_url` equality and `IN` on `items`, reported `Exact`; everything else `Unsupported`. Pruned partitions are neither fetched nor health-refreshed. `LIMIT` stops *launching* fetches once satisfied.
 - **Cache invariants:** only complete, successfully parsed feed windows are stored; the TTL re-arms on *every* attempt (success, 304, failure — negative caching); a feed's health observation survives window eviction; `feeds` scans never fetch.
-- **Egress (SSRF) default-deny:** refuse loopback, link-local (incl. `169.254.169.254`), RFC 1918 private, CGNAT `100.64/10`, unique-local `fc00::/7` (plus other non-globally-routable: unspecified, multicast, broadcast, and their IPv4-mapped-IPv6 forms). Re-check every redirect hop; connect only to validated IPs (rebinding-safe). No production opt-in.
+- **Egress (SSRF) default-deny:** refuse loopback, link-local (incl. `169.254.169.254`), RFC 1918 private, CGNAT `100.64/10`, unique-local `fc00::/7` (plus other non-globally-routable: unspecified, multicast, broadcast, documentation, and every embedded-IPv4 IPv6 form — IPv4-mapped `::ffff:`, IPv4-compatible `::a.b.c.d`, and NAT64 `64:ff9b::/96`, each classified by its embedded v4 address). Re-check on **every redirect hop**, including hops whose host is an IP literal: reqwest's connector resolves IP-literal hosts without consulting the custom DNS resolver, so the resolver-based guard alone does not see them. Connect only to validated IPs (rebinding-safe). No production opt-in — the loopback-relaxing test constructor is `#[cfg(test)] pub(crate)`, absent from non-test builds, so every suite that needs it lives in-crate.
 - **Markdown conversion:** deterministic (identical input → byte-identical output), applied to HTML-typed `content`/`summary` only; plain-text passes through unchanged; output contains no raw HTML (`<script>`/`<style>` dropped wholesale; markup without a Markdown equivalent reduced to its text content); never fails a feed.
 - **Parse-time DoS bounds:** response-size cap measured on the *decompressed* body; documents with an internal DTD subset are refused (entity-expansion class); no custom entity expansion ever.
 - **Sanitation is conservative by contract:** each repair rung is a byte-level no-op on well-formed input; rungs apply cumulatively; the ladder stops at the first rung that parses; applied rungs are recorded in `conformance_notes`.
@@ -29,6 +29,7 @@ Copied from the spec; every task's requirements implicitly include these.
 - **Failure fuse:** on a failed attempt the TTL re-arms to `clamp(ttl_seconds / 4, 30, 300)` seconds — bounded above zero even under `ttl_seconds: 0`.
 - **Every commit compiles and its tests pass** with `--features rss` and without (the workspace must stay green when the feature is off). Run `cargo fmt --all` before every commit (CI gates on it).
 - **Negative tests assert the reason, not just the failure.** Every test that expects an error asserts on a substring identifying *that* error (the offending field name, the failing stage, the blocked range). A bare `assert!(result.is_err())` passes when an unrelated error fires and is treated as a test that asserts nothing — the bar `open_connector/config.rs:607-619` sets.
+- **A comment may not state a technical claim its author has not verified.** Three review findings in Tasks 2-3 were comments asserting checkable specifics that turned out false: a stdlib predicate described as unstable when it has been stable since Rust 1.7, a design choice attributed to named vendors' OPML exports nobody had looked at, and a test case said to discriminate against a bitmask that in fact still matches it. Either verify the claim (compile it, read the crate source, probe the arithmetic) or write the weaker sentence that is true — in security- and protocol-facing code a wrong comment outlives the reader who could have caught it, and is worse than a shorter one.
 - **Toolchain note (this machine):** `cargo` is not on the default PATH. Prefix every invocation with `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`.
 
 ### Decisions made by this plan (approved with the plan; deviations from spec flagged)
@@ -82,7 +83,7 @@ crates/cli/src/main.rs                          # LocalDataSource.rss, "rss" arm
 README.md                                       # supported-sources row               (Task 20)
 
 New tests / docs:
-crates/skardi/tests/rss_composition.rs          # federated join + archive e2e        (Task 19)
+rss/composition_tests.rs (test-only)            # federated join + archive e2e        (Task 19)
 docs/rss.md                                     # M2 reference doc                    (Task 20)
 docs/sample_data/rss_context.yaml               # example ctx                         (Task 20)
 docs/rss/semantics.yaml                         # bundled semantics overlay snippet   (Task 20)
@@ -453,7 +454,8 @@ Plus (each a full test in the file):
 - `oversized_body_aborts_with_too_large` — 2 MiB body, 1 MiB cap → `FetchError::TooLarge { limit }`; and a **gzip bomb**: `flate2`-free approach — pre-gzip a 4 MiB zero body in the test via a tiny in-test gzip writer? No new dev-dep: store a pre-compressed fixture `fixtures/bomb.xml.gz` (Task 17 adds it; here generate bytes with `MockResponse` from a `const` embedded via `include_bytes!` once Task 17 lands — for THIS task, cover the uncompressed cap; the gzip variant is added in Task 18's integration pass where the fixture exists).
 - `redirect_is_followed_and_validated` — 302 with `location: /moved` → second request served, `Fetched` returned; `server.requests().len() == 2`.
 - `too_many_redirects_errors` — handler always 302 → `TooManyRedirects { hops: 5 }` after 6 requests… (assert `requests().len() as u32 == MAX_REDIRECT_HOPS + 1`).
-- `redirect_to_blocked_range_is_refused_before_connect` — `location: http://10.255.255.1/f` → `FetchError::Egress(e)` with `e.range == BlockedRange::Private`; `requests().len() == 1` (no second connect anywhere).
+- `redirect_to_blocked_range_is_refused_before_connect` — `location: http://10.255.255.1/f` → `FetchError::Egress(e)` with `e.range == BlockedRange::Private`; `requests().len() == 1` (no second connect anywhere). This is the IP-literal redirect path, which the custom resolver never sees — the per-hop check in step 1 is what refuses it.
+- `redirect_to_cloud_metadata_is_refused` — the same mechanism against the address the guard exists for: `location: http://169.254.169.254/latest/meta-data/iam/security-credentials/` → `FetchError::Egress(e)` with `e.range == BlockedRange::LinkLocal`, one request recorded. Kept as its own named test so a regression reads as what it is.
 - `retryable_statuses_retry_with_retry_after` — handler scripted via `AtomicUsize`: 429 + `retry-after: 1`, then 200 → success; `requests().len() == 2`; elapsed ≥ 1s.
 - `retries_exhaust_to_status_error` — always 503 → `FetchError::Status { status: 503 }` after `MAX_ATTEMPTS` requests.
 - `non_retryable_status_fails_immediately` — 404 → `Status { 404 }`, 1 request.
@@ -468,7 +470,7 @@ Plus (each a full test in the file):
   2. Redirect loop up to `MAX_REDIRECT_HOPS`: per hop, attempt loop up to `MAX_ATTEMPTS`:
      - Build GET with `If-None-Match`/`If-Modified-Since` (only on the **original** URL's first hop — validators do not follow redirects), send.
      - Connect errors: downcast source chain for `EgressBlocked` (→ `Egress`, non-retryable), `is_timeout()` (→ retryable), else `Transport` (retryable).
-     - Status 304 (validators sent) → `NotModified`. Status 3xx with `Location` → resolve relative, next hop (re-enters resolver, IP-literal pre-check again). 429/500/502/503/504 → retryable. Other non-2xx → `Status` (final).
+     - Status 304 (validators sent) → `NotModified`. Status 3xx with `Location` → resolve relative against the current hop's URL, then **re-run step 1's checks on the resolved target before the next request**: scheme allowlist, and `policy.check_ip` when the host is an IP literal. Hostname targets re-enter `PolicyDns` on their own; IP-literal targets do not — reqwest's connector (hyper-util `HttpConnector`) calls `SocketAddrs::try_parse(host, port)` first and never consults the custom resolver when the host parses as an address, bracketed IPv6 included. This per-hop check is the only thing standing between a public feed's `302` and `http://169.254.169.254/`. 429/500/502/503/504 → retryable. Other non-2xx → `Status` (final).
      - Retry wait: `max(parse_retry_after(&resp), backoff)` where backoff = `RETRY_BASE_BACKOFF_MS * 2^attempt` ± 50% jitter (reuse the open_connector client's jitter helper pattern — see `open_connector/client.rs`; if it is private, copy the two-line implementation, do not refactor OC in this task).
      - 2xx → stream body via `resp.bytes_stream()`, accumulating with a running total; exceeding `max_response_bytes` → `TooLarge` (this measures **decompressed** bytes: reqwest's gzip layer decompresses before the stream yields). Capture `etag`/`last-modified`/`content-type` headers first.
   3. Timeout per request comes from the client default; the total scan deadline is enforced by the engine (Task 11), not here.
@@ -1503,10 +1505,10 @@ Test list (each is a full `#[tokio::test]`; AC = spec acceptance criterion it re
 ### Task 19: End-to-end composition (federated join + archive pipeline)
 
 **Files:**
-- Create: `crates/skardi/tests/rss_composition.rs` (`#![cfg(all(feature = "rss", feature = "chunking"))]`)
+- Create: `#[cfg(all(test, feature = "rss", feature = "chunking"))] mod composition_tests` in `crates/skardi/src/sources/providers/rss/mod.rs` (or a sibling test-only `composition_tests.rs` declared from it). **In-crate, not `crates/skardi/tests/`** — the egress test seam is `#[cfg(test)] pub(crate)` and an external test crate cannot reach it. Repo precedent: `open_connector`'s entire suite, mock HTTP included, is in-crate `#[cfg(test)]`.
 
 **Interfaces:**
-- Consumes: `register_rss_tables_with_policy` — **problem:** it is `pub(crate)` and this is an external integration test. Resolution: expose a public, documented test-support constructor gated on the feature combination used only by in-repo tests: `#[doc(hidden)] pub fn register_rss_tables_for_tests(…, allow_loopback: bool)` in `rss/mod.rs` (mirrors how `documents` tests reach internals; keep `#[doc(hidden)]` + a comment). Also consumes `register_sqlite_tables` (writable sqlite), `ChunkingRegistry::register_chunk_udf`, and — in the `#[ignore]` variant — `CandleModelRegistry`.
+- Consumes: `register_rss_tables_with_policy` (Task 14's `#[cfg(test)] pub(crate)` seam), `MockFeedServer`, `register_sqlite_tables` (writable sqlite), `ChunkingRegistry::register_chunk_udf`, and — in the `#[ignore]` variant — `CandleModelRegistry`. Because the seam is `#[cfg(test)] pub(crate)`, this suite lives **in-crate**, not in `crates/skardi/tests/` (a separate crate, which cannot reach it). No `pub` test-support constructor is exposed: a public entry point taking `allow_loopback` would be exactly the production-reachable private-network switch the Global Constraints forbid.
 - Produces: the M1 e2e coverage listed in the spec's Testing Strategy.
 
 Tests:
@@ -1564,7 +1566,7 @@ Tests:
 6. `#[ignore = "live: requires SKARDI_TEST_EMBED_MODEL pointing at a local embedding model dir"]` `archive_ingest_with_candle_embeddings` — statement B with `candle('<env model dir>', c.chunk_text)` in place of NULL; asserts non-null embedding blobs. (`#[cfg(feature = "candle")]` additionally.)
 
 - [ ] **Step 1: Write tests 1-3 failing** — `cargo test -p skardi --features "rss chunking" --test rss_composition` → red.
-- [ ] **Step 2: Implement the `#[doc(hidden)]` test-support registration + make 1-3 green.** (Any engine-side bug this stage uncovers — e.g. timestamp typing across the sqlite INSERT — is fixed here.)
+- [ ] **Step 2: Wire the suite to Task 14's `#[cfg(test)] pub(crate)` seam and make 1-3 green.** (Any engine-side bug this stage uncovers — e.g. timestamp typing across the sqlite INSERT — is fixed here.)
 - [ ] **Step 3: Add 4-6, green.**
 - [ ] **Step 4: Full suite both ways** — `cargo test -p skardi --features "rss chunking" && cargo test -p skardi --features rss && cargo check --all`.
 - [ ] **Step 5: Commit** — `git commit -m "test(sources): rss end-to-end composition — federated join, idempotent archive, citability after window roll"`
