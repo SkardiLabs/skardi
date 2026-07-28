@@ -11,12 +11,23 @@ pub mod opml;
 // The fetcher's SSRF egress guard: resolves a feed host and refuses
 // loopback/link-local/private/CGNAT/unique-local targets before reqwest
 // connects (see the module doc for why). Not `pub` — it is an internal
-// implementation detail of the fetch engine (Task 4 consumes it via
+// implementation detail of the fetch engine (`fetch` consumes it via
 // `super::egress`), not part of this provider's public surface. Gated
 // behind `rss` alongside the rest of the fetch/parse engine, even though its
 // own dependencies (reqwest, tokio) are already unconditional crate deps.
 #[cfg(feature = "rss")]
 mod egress;
+// The bounded HTTP fetcher (conditional GET, retries, egress enforcement)
+// built on top of `egress`. Not `pub` for the same reason `egress` isn't:
+// it is an implementation detail of the engine a later task builds on top,
+// not part of this provider's public surface.
+#[cfg(feature = "rss")]
+mod fetch;
+// Hand-rolled mock feed server the fetcher's tests drive. Test-only (never
+// compiled into a release build) and additionally gated behind `rss` since
+// its only consumer, `fetch`'s test module, is.
+#[cfg(all(test, feature = "rss"))]
+pub(crate) mod testutil;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;

@@ -65,13 +65,6 @@
 //! handled means adding a check inside `check_v4`/`check_v6` themselves,
 //! not changing anything about how or when they're called.
 
-// Task 4 (the fetcher) is this module's only consumer and hasn't landed
-// yet, so outside of this module's own tests almost everything here is
-// currently unreferenced — `cargo check`/`cargo test` would otherwise flag
-// the whole file. Remove this once the fetcher wires `PolicyDns`/
-// `EgressPolicy` in.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;

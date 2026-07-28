@@ -47,4 +47,16 @@ pub enum RssError {
         path: String,
         reason: String,
     },
+
+    /// The fetcher's underlying `reqwest::Client` failed to build.
+    /// Reachable in practice when the configured `user_agent` is not a
+    /// legal HTTP header value (a control character, say) —
+    /// `RssConfig::validate` only checks it is non-empty after trimming,
+    /// not that it survives `reqwest::header::HeaderValue`'s stricter
+    /// validation. Unlike this enum's other variants, there is no source
+    /// name to attribute this to: the fetcher is constructed once from
+    /// typed parameters, not from one named data source's registration
+    /// path.
+    #[error("failed to build the rss fetcher's HTTP client: {reason}")]
+    HttpClientBuild { reason: String },
 }
