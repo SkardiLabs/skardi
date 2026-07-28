@@ -298,7 +298,7 @@ fn opml_outlines_resolve_to_subscriptions() {
 Plus (one-line specs, each a real `#[test]` with exact inputs):
 - `inline_feeds_resolve_without_io` — inline config, no OPML file touched; names default to URL.
 - `missing_opml_file_is_opml_unreadable` — nonexistent path → `RssError::OpmlUnreadable` naming the path.
-- `malformed_opml_is_invalid_config` — `not xml at all` → `InvalidConfig` with reason containing "OPML".
+- `malformed_opml_is_invalid_config` — genuinely ill-formed XML → `InvalidConfig` whose reason names the well-formedness failure. Use an unclosed or mismatched tag (`<opml><body><outline xmlUrl="https://a.example/f.xml"></body>`, or `<a></b>`); **not** plain text like `not xml at all`, which quick-xml tokenizes as `Ok(Event::Text)` + `Ok(Eof)` — it is a non-validating parser with no root-element requirement, so text with zero `<` bytes never errors and the test would silently land on the empty-subscription branch instead. Assert a substring unique to the well-formedness branch, not the "OPML" prefix both messages share.
 - `opml_without_any_xmlurl_is_rejected` — valid OPML, zero `xmlUrl` outlines → "at least one subscription".
 - `duplicate_names_across_opml_rejected` — two outlines with same `text` → "duplicate subscription name".
 - `opml_bad_scheme_rejected` — `xmlUrl="ftp://…"` → "http or https".
