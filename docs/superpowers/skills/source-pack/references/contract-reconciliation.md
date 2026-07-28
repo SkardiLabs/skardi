@@ -47,8 +47,9 @@ These facts cost a full client rewrite to learn; do not regress them:
   raw-scan gate (`open_connector_scan`) refuses by default-deny against
   today's gateway. Pack tables are unaffected (read-only by Skardi's
   review).
-- Input validation runs BEFORE credential lookup, which enables the
-  no-credential trick below.
+- Input schema validation runs BEFORE any credential is used, which
+  enables the no-credential trick below — with the default-connection
+  caveat explained there.
 
 Skardi's client (`open_connector/client.rs`) and `testutil.rs` mocks
 already speak this protocol; if the live gateway ever disagrees with
@@ -97,8 +98,16 @@ executors. This is the only reliable answer to:
 
 ## 5. Validate generated inputs without provider credentials
 
-The gateway validates input against the action schema BEFORE touching
-credentials, so a wrong key is distinguishable from a missing login:
+Schema validation fires before any credential is used, so a wrong key is
+distinguishable from a missing login. Why this works (verified in source
+AND live, v1.3.1): for the **default** connection,
+`connection-service.ts#resolveForExecution` does not throw when nothing
+is configured — it returns a connection whose credential resolves lazily
+— so the runner reaches `core/execution.ts#executeAction`, whose first
+step is `validateActionInput`. Invalid input → `invalid_input` before
+credentials exist; valid input → the executor runs, asks for the
+credential, and `provider-runtime.ts` raises "Configure <service>
+credentials first."
 
 ```bash
 # Wrong key → HTTP 400, errorCode invalid_input, names the bad property:
@@ -111,7 +120,22 @@ curl -s -X POST -H "$TOK" -H 'content-type: application/json' \
   http://localhost:3000/v1/actions/github.list_repository_issues
 ```
 
-Reaching the credential wall proves the pack's generated inputs
+Preconditions for the discrimination to be valid:
+
+- **Probe the default connection only** — no `x-oo-connector-alias`
+  header, no `?alias=`, no `connectionName`. A NAMED connection that
+  does not exist fails as `connection_not_found` BEFORE validation, so
+  valid and invalid inputs become indistinguishable.
+- **No action policy blocking the action**
+  (`OOMOL_CONNECT_ALLOWED_ACTIONS` / `OOMOL_CONNECT_BLOCKED_ACTIONS`) —
+  policy denials also precede validation.
+- **Calibrate once per session**: send one known-bad key and one
+  known-good input first and confirm you get the two DIFFERENT responses
+  (400 `invalid_input` naming the property vs 403
+  `authorization_failed`). If both come back identical, stop and find
+  out why instead of treating either as schema evidence.
+
+Reaching the credential wall then proves the pack's generated inputs
 (pagination params, fixed inputs, filter keys, resource keys) pass the
 strict schema. Do this for every table's input set. Row-data validation
 additionally needs a configured connection
