@@ -204,10 +204,23 @@ pub fn extract(feed: Feed) -> ExtractedFeed {
     }
 }
 
-/// The link a reader should follow: the first `rel`-less or `alternate` link.
+/// Whether a link is an attachment to download rather than a page to visit.
+///
+/// Atom marks these `rel="enclosure"`. `feed-rs` turns JSON Feed attachments into
+/// `rel`-less links instead, which is also how a JSON item's own URL arrives — the
+/// `media_type` is what separates them, since `util::handle_link` (the RSS 0.9x/1.0/
+/// 2.0 and JSON url path) sets only `href`. Without this distinction an audio
+/// attachment can be promoted to the item's link, and from there to its `guid`.
+fn is_attachment(link: &Link) -> bool {
+    link.rel.as_deref() == Some("enclosure") || (link.rel.is_none() && link.media_type.is_some())
+}
+
+/// The link a reader should follow: the first non-attachment `rel`-less or
+/// `alternate` link.
 fn preferred_link(links: &[Link]) -> Option<&Link> {
     links
         .iter()
+        .filter(|l| !is_attachment(l))
         .find(|l| matches!(l.rel.as_deref(), None | Some("alternate")))
 }
 
@@ -215,7 +228,7 @@ fn preferred_link(links: &[Link]) -> Option<&Link> {
 /// cannot be null, so such an entry is skipped and counted.
 fn extract_entry(entry: &Entry) -> Option<ItemRow> {
     let link = preferred_link(&entry.links)
-        .or_else(|| entry.links.first())
+        .or_else(|| entry.links.iter().find(|l| !is_attachment(l)))
         .map(|l| l.href.clone());
 
     let guid = match entry.id.trim() {
@@ -307,9 +320,7 @@ fn enclosure(entry: &Entry) -> Enclosure {
         };
     }
 
-    if let Some(link) = entry.links.iter().find(|l| {
-        l.rel.as_deref() == Some("enclosure") || (l.rel.is_none() && l.media_type.is_some())
-    }) {
+    if let Some(link) = entry.links.iter().find(|l| is_attachment(l)) {
         return Enclosure {
             url: Some(link.href.clone()),
             content_type: link.media_type.clone(),
@@ -510,6 +521,23 @@ mod tests {
         // The declared sniff still works on garbage.
         assert_eq!(err.dialect_declared.as_deref(), Some("rss-2.0"));
         assert!(!err.reason.is_empty(), "the last feed-rs error is carried");
+    }
+
+    /// `last_error` must carry no response-body content (global constraint). The
+    /// 512-char cap in the engine bounds length but does not redact, so the
+    /// guarantee has to come from `feed-rs` not echoing character data. If a future
+    /// version starts quoting it, this fails and a redaction filter is needed.
+    #[test]
+    fn parse_failure_reason_never_echoes_character_data() {
+        // Truncated mid-element, with a sentinel sitting in character data.
+        let doc = b"<rss version=\"2.0\"><channel><title>SHOULD-NOT-LEAK secret prose";
+        let err = parse_with_ladder(doc).unwrap_err();
+        assert_eq!(err.stage, "strict-parse");
+        assert!(
+            !err.reason.contains("SHOULD-NOT-LEAK"),
+            "parse error echoed character data into last_error: {}",
+            err.reason
+        );
     }
 
     #[test]
@@ -765,6 +793,23 @@ mod tests {
                 .iter()
                 .any(|n| n == "entries-without-identity: 1")
         );
+    }
+
+    /// An attachment is something to download, not the page to visit. feed-rs puts
+    /// JSON Feed attachments in `entry.links` `rel`-less, which is also how the
+    /// item's own URL arrives — so without care an audio file becomes the item's
+    /// link, and (via the identity fallback) its `guid`.
+    #[test]
+    fn a_json_attachment_is_never_mistaken_for_the_item_link() {
+        let doc = br#"{"version":"https://jsonfeed.org/version/1.1","title":"C",
+"items":[{"id":"only-id","title":"T",
+"attachments":[{"url":"https://e.com/a.mp3","mime_type":"audio/mpeg","size_in_bytes":7}]}]}"#;
+        let parsed = parse_feed_document(doc, None).unwrap();
+        let it = &parsed.items[0];
+        assert_eq!(it.guid, "only-id");
+        assert_eq!(it.link, None, "an attachment is not a link to the item");
+        assert_eq!(it.enclosure_url.as_deref(), Some("https://e.com/a.mp3"));
+        assert_eq!(it.enclosure_length, Some(7));
     }
 
     #[test]
