@@ -11,6 +11,8 @@ pub mod error;
 pub mod parse;
 #[cfg(feature = "rss")]
 pub mod sanitize;
+#[cfg(feature = "rss")]
+pub mod schema;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
