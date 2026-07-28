@@ -8,6 +8,15 @@ pub mod error;
 // in builds that omit the `rss` feature.
 #[cfg(feature = "rss")]
 pub mod opml;
+// The fetcher's SSRF egress guard: resolves a feed host and refuses
+// loopback/link-local/private/CGNAT/unique-local targets before reqwest
+// connects (see the module doc for why). Not `pub` — it is an internal
+// implementation detail of the fetch engine (Task 4 consumes it via
+// `super::egress`), not part of this provider's public surface. Gated
+// behind `rss` alongside the rest of the fetch/parse engine, even though its
+// own dependencies (reqwest, tokio) are already unconditional crate deps.
+#[cfg(feature = "rss")]
+mod egress;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
