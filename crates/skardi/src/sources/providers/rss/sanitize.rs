@@ -2,9 +2,12 @@
 //! are *almost* well-formed.
 //!
 //! Each rung is a pure byte transform and, by contract (spec AC16), a byte-level
-//! no-op on well-formed input. Rungs are applied cumulatively and the ladder
-//! stops at the first rung whose output parses — that *driving* logic lives in
-//! `parse.rs` (it interleaves with `feed-rs` parse attempts), not here.
+//! no-op on well-formed input. `parse.rs` applies every applicable rung
+//! cumulatively and then parses the result *once* — it does not stop at the
+//! first rung whose output parses, and it does not retry per rung. See
+//! `parse_with_ladder`'s own doc for why: `feed-rs` does not error on
+//! malformed lexis, it silently drops the offending element, so there is no
+//! per-rung parse failure for a retry loop to react to.
 
 /// Which document family a feed body belongs to, decided lexically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +115,7 @@ pub fn refuse_internal_dtd(bytes: &[u8]) -> Result<(), String> {
         if rest.starts_with(b"<?") {
             return Ok(());
         }
-        if rest.starts_with(b"<!DOCTYPE") {
+        if starts_with_ignore_ascii_case(rest, b"<!DOCTYPE") {
             // Walk the declaration; `[` before its closing `>` opens a subset.
             let mut j = "<!DOCTYPE".len();
             let mut quote: Option<u8> = None;
@@ -139,6 +142,12 @@ pub fn refuse_internal_dtd(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `haystack` starts with `needle`, ASCII case-insensitively (e.g. a
+/// lowercase `<!doctype` must be recognized exactly like `<!DOCTYPE`).
+fn starts_with_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
+}
+
 /// Length to skip past a `open … close` region, if `rest` opens one and it terminates.
 fn skip_delimited(rest: &[u8], open: &[u8], close: &[u8]) -> Option<usize> {
     if !rest.starts_with(open) {
@@ -158,9 +167,21 @@ pub fn rung_reencode_utf8(input: &[u8]) -> (Vec<u8>, bool) {
 
     let (body, had_bom) = strip_utf8_bom(input);
 
-    // Already valid UTF-8: only a BOM counts as a repair. This is what keeps the
-    // rung a byte-level no-op on well-formed input, whatever the decl claims.
-    if std::str::from_utf8(body).is_ok() {
+    // Already valid UTF-8. A missing declaration, or one that already says
+    // UTF-8, needs no repair beyond a leading BOM — that is what keeps the
+    // rung a byte-level no-op on well-formed input. A declaration naming some
+    // *other* encoding, though, is lying about bytes that are, in fact,
+    // already UTF-8 — a common real-world shape (content re-encoded to UTF-8
+    // without updating the declaration) that would otherwise mojibake for any
+    // consumer that trusts the decl. Point the token at UTF-8 too, same as the
+    // transcoding path below already does.
+    if let Ok(text) = std::str::from_utf8(body) {
+        let names_other_encoding = xml_decl_encoding_label(body)
+            .and_then(|label| encoding_rs::Encoding::for_label(&label))
+            .is_some_and(|enc| enc != encoding_rs::UTF_8);
+        if names_other_encoding {
+            return (rewrite_decl_encoding(text), true);
+        }
         return (body.to_vec(), had_bom);
     }
 
@@ -331,6 +352,13 @@ fn valid_reference_len(rest: &[u8]) -> Option<usize> {
     }
 
     // `&#[0-9]{1,7};` or `&#x[0-9A-Fa-f]{1,6};` (XML allows only a lowercase `x`).
+    // The digit caps bound how far this scans looking for the terminating
+    // `;`, but they are a byte-count cap, not a leading-zero-aware one: a
+    // well-formed reference with leading zeros past the cap (e.g. the 11
+    // digits of `&#00000169;`) is treated as unterminated within the window
+    // and its `&` gets escaped to `&amp;`, corrupting an otherwise-valid
+    // reference. Accepted tradeoff: a fixed, cheap-to-check cap over a
+    // leading-zero-stripping scan.
     let digits = tail.strip_prefix(b"#")?;
     let (body, max, is_digit): (&[u8], usize, fn(&u8) -> bool) = match digits.strip_prefix(b"x") {
         Some(hex) => (hex, 6, u8::is_ascii_hexdigit),
@@ -369,6 +397,10 @@ mod tests {
             r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>&#169; &#x2014; &lt;ok&gt;</title></feed>"#,
             "<!-- a & naked amp in a comment --><rss version=\"2.0\"/>",
             "<?pi with & inside?><rss version=\"2.0\"/>",
+            // All five predefined entities (the brief's own fixture list
+            // names them): `apos;`/`quot;` were the two `valid_reference_len`
+            // arms no test exercised before this.
+            r#"<x a='&apos;&quot;'>&apos; &quot;</x>"#,
         ];
         for doc in wellformed {
             let b = doc.as_bytes();
@@ -390,6 +422,14 @@ mod tests {
     }
 
     #[test]
+    fn trailing_ampersand_at_end_of_input_is_escaped_without_panicking() {
+        let input = b"<x>a &";
+        let (out, changed) = rung_escape_naked_ampersands(input);
+        assert!(changed);
+        assert_eq!(out, b"<x>a &amp;");
+    }
+
+    #[test]
     fn latin1_bytes_reencode_to_utf8() {
         // decl claims iso-8859-1 and the bytes are: caf<0xE9>
         let mut doc = br#"<?xml version="1.0" encoding="iso-8859-1"?><x>caf"#.to_vec();
@@ -403,6 +443,36 @@ mod tests {
             !s.contains("iso-8859-1"),
             "decl encoding token rewritten: {s}"
         );
+    }
+
+    #[test]
+    fn lying_non_utf8_decl_over_valid_utf8_bytes_is_corrected() {
+        // decl claims iso-8859-1, but the bytes are already valid UTF-8 (café
+        // encoded as UTF-8's 2-byte é, not Latin-1's single byte) — a common
+        // real-world shape: content converted to UTF-8 without updating the
+        // declaration. Previously a byte-level no-op (per the old "whatever
+        // the decl claims" comment); now the decl is corrected in place.
+        let doc = "<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><x>café</x>".as_bytes();
+        let (out, changed) = rung_reencode_utf8(doc);
+        assert!(changed);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("café"), "{s}");
+        assert!(!s.contains("iso-8859-1"), "decl encoding token rewritten: {s}");
+    }
+
+    #[test]
+    fn utf8_decl_over_utf8_bytes_stays_a_noop() {
+        // The no-op contract for a decl that already tells the truth (or is
+        // absent) must survive the I3 fix above.
+        let doc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><x>café</x>".as_bytes();
+        let (out, changed) = rung_reencode_utf8(doc);
+        assert!(!changed);
+        assert_eq!(out, doc);
+
+        let no_decl = "<x>café</x>".as_bytes();
+        let (out, changed) = rung_reencode_utf8(no_decl);
+        assert!(!changed);
+        assert_eq!(out, no_decl);
     }
 
     #[test]
