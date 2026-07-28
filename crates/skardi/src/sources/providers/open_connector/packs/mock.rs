@@ -65,7 +65,7 @@ static MOCK_ITEMS: SourcePackTable = SourcePackTable {
         operator: Operator::Gt,
         input_field: "min_value",
         fidelity: Fidelity::Exact,
-        value_format: ValueFormat::Rfc3339,
+        value_format: ValueFormat::Verbatim,
     }],
     // The synthetic pack models the in-band error mechanism (an `error`
     // key in otherwise-2xx action output fails the scan as a provider

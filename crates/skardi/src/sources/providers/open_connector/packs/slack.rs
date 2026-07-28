@@ -361,7 +361,7 @@ static FILES: SourcePackTable = SourcePackTable {
             operator: Operator::Eq,
             input_field: "userId",
             fidelity: Fidelity::Inexact,
-            value_format: ValueFormat::Rfc3339,
+            value_format: ValueFormat::Verbatim,
         },
     ],
     // In-band errors are consumed by the OC executor (see CONVERSATIONS).

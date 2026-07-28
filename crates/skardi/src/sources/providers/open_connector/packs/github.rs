@@ -279,7 +279,7 @@ static ISSUES: SourcePackTable = SourcePackTable {
             operator: Operator::Eq,
             input_field: "state",
             fidelity: Fidelity::Inexact,
-            value_format: ValueFormat::Rfc3339,
+            value_format: ValueFormat::Verbatim,
         },
         // GitHub documents issue `since` as "updated at or after this
         // time" — a superset of `updated_at >= X` under any granularity
@@ -452,7 +452,7 @@ static PULL_REQUESTS: SourcePackTable = SourcePackTable {
         operator: Operator::Eq,
         input_field: "state",
         fidelity: Fidelity::Inexact,
-        value_format: ValueFormat::Rfc3339,
+        value_format: ValueFormat::Verbatim,
     }],
     error_path: None,
     expected_fingerprint: None,

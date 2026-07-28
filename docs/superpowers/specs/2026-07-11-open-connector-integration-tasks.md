@@ -193,7 +193,9 @@ event carrying the scan identity and error.
       `userId` pushed Inexact per the string-push rule; **no time filter is pushed** — the
       OC `list_files` contract declares no `ts_from` input and its strict schema would 400
       one, so `created` predicates run in DataFusion (the engine's per-mapping
-      `ValueFormat` stays for future packs). Engine support:
+      `ValueFormat` stays for future packs; non-timestamp mappings declare
+      `ValueFormat::Verbatim`, which also refuses to push a timestamp literal in a
+      guessed spelling). Engine support:
       `FieldType::TimestampSecondsUtc` (Slack's epoch-second `files.created` — the millis
       reader would silently produce 1970 dates); `files` optionally scopes to one channel
       via the `channelId` optional resource. **Fingerprints are pinned** (a pack
@@ -207,7 +209,7 @@ event carrying the scan identity and error.
       three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 232 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 233 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty

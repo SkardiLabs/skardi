@@ -31,12 +31,19 @@ pub enum Fidelity {
 
 /// How a mapping's literal renders into the provider input. Timestamps are
 /// the polymorphic case: JSON has no timestamp type and providers disagree
-/// — GitHub's `since` takes RFC 3339, Slack's `ts_from` takes epoch
+/// — GitHub's `since` takes RFC 3339, Slack-style inputs take epoch
 /// seconds. Making the format part of the mapping keeps a future pack from
 /// silently sending the wrong spelling. Non-timestamp scalars render
-/// identically under every format.
+/// identically under every format, so `Verbatim` exists to *say* that no
+/// timestamp spelling applies rather than lean on that coincidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueFormat {
+    /// The literal's natural JSON rendering, for non-timestamp inputs
+    /// (strings, numbers, booleans). A timestamp literal reaching a
+    /// Verbatim mapping does NOT translate — the mapping never declared a
+    /// timestamp spelling, and guessing one risks sending the wrong
+    /// format, so the predicate stays local instead.
+    Verbatim,
     /// Timestamps render as RFC 3339 UTC strings (`2026-01-01T00:00:00Z`).
     Rfc3339,
     /// Timestamps render as whole epoch seconds, flooring sub-second
@@ -174,19 +181,26 @@ fn scalar_to_json(literal: &ScalarValue, format: ValueFormat) -> Option<Value> {
             serde_json::Number::from_f64(f64::from(*v)).map(Value::Number)
         }
         ScalarValue::Float64(Some(v)) => serde_json::Number::from_f64(*v).map(Value::Number),
+        // Verbatim arms return None on purpose: the mapping declared no
+        // timestamp spelling, so the predicate stays local rather than
+        // being pushed in a guessed format.
         ScalarValue::TimestampSecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => DateTime::from_timestamp(*v, 0).map(rfc3339),
             ValueFormat::EpochSeconds => Some(Value::from(*v)),
         },
         ScalarValue::TimestampMillisecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => DateTime::from_timestamp_millis(*v).map(rfc3339),
             ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1000))),
         },
         ScalarValue::TimestampMicrosecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => DateTime::from_timestamp_micros(*v).map(rfc3339),
             ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000))),
         },
         ScalarValue::TimestampNanosecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => Some(rfc3339(DateTime::from_timestamp_nanos(*v))),
             ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000_000))),
         },
@@ -211,21 +225,21 @@ mod tests {
             operator: Operator::Gt,
             input_field: "min_value",
             fidelity: Fidelity::Exact,
-            value_format: ValueFormat::Rfc3339,
+            value_format: ValueFormat::Verbatim,
         },
         FilterMapping {
             column: "value",
             operator: Operator::GtEq,
             input_field: "min_value_inclusive",
             fidelity: Fidelity::Exact,
-            value_format: ValueFormat::Rfc3339,
+            value_format: ValueFormat::Verbatim,
         },
         FilterMapping {
             column: "name",
             operator: Operator::Eq,
             input_field: "name",
             fidelity: Fidelity::Exact,
-            value_format: ValueFormat::Rfc3339,
+            value_format: ValueFormat::Verbatim,
         },
         FilterMapping {
             column: "updated_at",
@@ -608,6 +622,51 @@ mod tests {
                 vec![TableProviderFilterPushDown::Inexact]
             );
         }
+    }
+
+    #[test]
+    fn verbatim_mappings_push_plain_scalars_and_keep_timestamps_local() {
+        // Non-timestamp literals through Verbatim mappings push their
+        // natural JSON rendering — the fixture's numeric and string
+        // mappings above all declare Verbatim and every other test rides
+        // them. The distinctive arm: a timestamp literal reaching a
+        // Verbatim mapping does NOT translate (no declared spelling means
+        // no guessing), so the predicate stays local.
+        let translated = translate_filters(&[gt("value", 20)], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("min_value".to_string(), Value::from(20))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Exact]
+        );
+
+        let verbatim_timestamp: &[FilterMapping] = &[FilterMapping {
+            column: "created",
+            operator: Operator::GtEq,
+            input_field: "ts_from",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Verbatim,
+        }];
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("created")),
+            Operator::GtEq,
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(1_767_225_600_000), Some("UTC".into())),
+                None,
+            )),
+        ));
+        let translated = translate_filters(&[filter], verbatim_timestamp);
+        assert!(
+            translated.inputs.is_empty(),
+            "a timestamp under Verbatim must not reach the wire: {:?}",
+            translated.inputs
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
     }
 
     #[test]
