@@ -1,5 +1,31 @@
 # Phases 2–3 — Designing and implementing the pack
 
+## Engine baseline — verify before relying
+
+This guide references engine capabilities that landed with milestone 5.2
+(PR #172); a base branch that predates it lacks ALL of them. Before
+designing anything, verify your baseline:
+
+```bash
+git grep -l "PaginationCursorInvalid\|total_pages_path\|ValueFormat\|TimestampSecondsUtc\|EnvVarGuard" \
+  crates/skardi/src/sources/providers/open_connector/
+```
+
+Zero hits means the base still has the pre-5.2 engine, where — most
+dangerously — a non-string cursor and every row-path failure read as
+"scan complete": a drifted gateway truncates results silently. In that
+case, bringing the engine up to this baseline (with its regression
+tests) is a PREREQUISITE step of your milestone, not an assumption to
+inherit. More generally: every safety invariant this guide names is a
+claim about code — verify it exists (and its failure-mode test passes)
+on YOUR branch before leaning on it. Documentation snapshots go stale;
+`git grep` does not.
+
+The 5.2 baseline features referenced below: `total_pages_path` on
+`PageNumber`, `PaginationCursorInvalid`, per-mapping `ValueFormat`,
+`FieldType::TimestampSecondsUtc`, `FixedValue::StrList`,
+`SourcePackTable::error_path`, `testutil::EnvVarGuard`.
+
 ## Design
 
 ### Table selection

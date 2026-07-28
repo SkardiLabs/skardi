@@ -15,7 +15,11 @@ The worst failure class: wrong results with a green status.
       end-of-collection spellings. Anything else that stops a scan —
       wrong-typed continuation state, structural traversal failure —
       fails loudly (`PaginationCursorInvalid`, `PaginationTotalInvalid`,
-      propagated row-path errors), never reads as "done".
+      propagated row-path errors), never reads as "done". These
+      guardrails are the 5.2 engine baseline — VERIFY they exist on your
+      branch (implementation.md §Engine baseline); on a pre-5.2 base,
+      adding them (with regression tests) is prerequisite work, not a
+      checkbox to assume.
 - [ ] Short/empty non-final pages cannot truncate: if the envelope has
       an authoritative total, the strategy declares `total_pages_path`;
       if not, the heuristic's limits are documented.

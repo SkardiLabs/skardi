@@ -102,7 +102,11 @@ Engine extensions are allowed when the pack genuinely needs them (5.1
 added `Fidelity` and list plucking; 5.2 added `total_pages_path`,
 `ValueFormat`, `TimestampSecondsUtc`) — keep them backward-compatible
 (optional fields, `None` defaults) and test them at both the engine and
-the pack level.
+the pack level. Before relying on any engine invariant this skill
+names, verify it exists on your base branch — see the implementation
+reference's **Engine baseline** section; a base predating milestone 5.2
+lacks the cursor/total safety guardrails entirely, and adding them is
+then prerequisite work.
 
 ## Phase 4 — Self-review before any PR
 
