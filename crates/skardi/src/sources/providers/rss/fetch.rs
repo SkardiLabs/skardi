@@ -44,8 +44,33 @@
 //! and other transport errors — an egress refusal is not, since it can
 //! never succeed on retry. The wait between attempts is whichever is longer
 //! of the response's `Retry-After` and an exponential backoff with jitter
-//! (see [`backoff`]). Redirects are not retries: following one always
-//! starts a new hop with a fresh attempt budget.
+//! (see [`backoff`]), capped at [`MAX_RETRY_WAIT`] either way —
+//! `crate::util::http::parse_retry_after`'s own doc contract is that callers
+//! apply their own cap, and an uncapped `Retry-After` is a one-header attack:
+//! a hostile or misconfigured server parks the whole fetch for however long
+//! it names. Redirects are not retries: following one always starts a new
+//! hop with a fresh attempt budget.
+//!
+//! ## An unconditional `304` is a protocol error, not a cache hit
+//!
+//! `304 Not Modified` is only meaningful as an answer to a conditional
+//! request — it tells the caller "the copy behind the validator you sent is
+//! still current," which presupposes a validator was actually sent. A `304`
+//! answering a hop that sent none (the very first fetch of a feed the cache
+//! has nothing for yet, or any hop past the first redirect — see above) has
+//! no cached copy for [`FetchOutcome::NotModified`] to refer to, so
+//! [`FeedFetcher::attempt_hop`] tracks whether *this* hop's request actually
+//! carried `If-None-Match`/`If-Modified-Since` and maps an unconditional
+//! `304` to [`FetchError::Status`] instead of silently handing the engine an
+//! outcome it cannot honor.
+
+// `FeedFetcher` has no production caller yet — Task 11 (the engine) is the
+// first one, and hasn't landed. Until then, everything here outside of this
+// module's own tests is unreferenced from a build that excludes test code
+// (and, transitively, so is `egress.rs`, whose only consumer is this
+// module), and `cargo check`/`cargo build` would otherwise flag both files.
+// Remove this once Task 11 wires `FeedFetcher` into the engine.
+#![allow(dead_code)]
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -76,6 +101,17 @@ pub(crate) const MAX_ATTEMPTS: u32 = 3;
 /// Base delay for the exponential-backoff component of the retry wait —
 /// see [`backoff`].
 pub(crate) const RETRY_BASE_BACKOFF_MS: u64 = 250;
+
+/// Upper bound on a single wait between attempts, whether the wait came
+/// from a response's `Retry-After` or from [`backoff`]. Without this,
+/// `Retry-After` is a one-header denial of service:
+/// `crate::util::http::parse_retry_after` deliberately applies no cap of
+/// its own ("callers apply their own fallback and cap"), and a hostile or
+/// merely misconfigured server naming an absurd value would otherwise park
+/// the fetch for exactly as long as it names. Mirrors
+/// `open_connector/client.rs`'s `MAX_RETRY_WAIT` (same 10s value, same
+/// role), which the brief pointed to as this task's precedent.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// HTTP statuses a hop retries rather than treating as terminal: rate
 /// limiting plus the transient server errors.
@@ -291,12 +327,19 @@ impl FeedFetcher {
 
         for attempt in 0..MAX_ATTEMPTS {
             let mut req = self.http.get(url.clone());
+            // Tracked independently of `validators.is_some()`: a `Validators`
+            // with both fields `None` attaches no header either, and a `304`
+            // is only a cache hit relative to a validator this specific
+            // request actually sent — see the module doc.
+            let mut sent_validator = false;
             if let Some(v) = validators {
                 if let Some(etag) = &v.etag {
                     req = req.header(IF_NONE_MATCH, etag);
+                    sent_validator = true;
                 }
                 if let Some(last_modified) = &v.last_modified {
                     req = req.header(IF_MODIFIED_SINCE, last_modified);
+                    sent_validator = true;
                 }
             }
 
@@ -304,9 +347,16 @@ impl FeedFetcher {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.as_u16() == 304 {
-                        return Ok(HopOutcome::Done(FetchOutcome::NotModified {
-                            http_status: 304,
-                        }));
+                        if sent_validator {
+                            return Ok(HopOutcome::Done(FetchOutcome::NotModified {
+                                http_status: 304,
+                            }));
+                        }
+                        // An unconditional `304` has no validator behind it
+                        // to confirm — treat it as the terminal, non-retryable
+                        // status it actually is rather than fabricating a
+                        // cache hit the caller never asked for.
+                        return Err(FetchError::Status { status: 304 });
                     }
                     if status.is_redirection()
                         && let Some(location) = resp.headers().get(LOCATION)
@@ -409,22 +459,28 @@ fn is_retryable_status(status: StatusCode) -> bool {
     RETRYABLE_STATUSES.contains(&status.as_u16())
 }
 
-/// `max(Retry-After, backoff)` — see the module doc's Retries section.
+/// `max(Retry-After, backoff)`, capped at [`MAX_RETRY_WAIT`] — see the
+/// module doc's Retries section.
 fn retry_wait(resp: &Response, attempt: u32) -> Duration {
     let computed = backoff(attempt);
-    match parse_retry_after(resp) {
+    let wait = match parse_retry_after(resp) {
         Some(from_header) => from_header.max(computed),
         None => computed,
-    }
+    };
+    wait.min(MAX_RETRY_WAIT)
 }
 
 /// Exponential backoff — `RETRY_BASE_BACKOFF_MS * 2^attempt` — randomized
 /// within +/-50% of that value using the system clock's sub-second
-/// nanoseconds as the source of variation. This is the same jitter source
-/// `open_connector/client.rs`'s own backoff helper uses (chosen there, and
-/// reused here, to decorrelate concurrent retries without an added
-/// randomness dependency); the +/-50% spread itself is wider than that
-/// helper's flat 0-100ms addition, per this fetcher's own spec.
+/// nanoseconds as the source of variation, capped at [`MAX_RETRY_WAIT`]. The
+/// jitter source is the same one `open_connector/client.rs`'s own backoff
+/// helper uses (chosen there, and reused here, to decorrelate concurrent
+/// retries without an added randomness dependency); the +/-50% spread itself
+/// is wider than that helper's flat 0-100ms addition, per this fetcher's own
+/// spec. The cap matters here independent of [`retry_wait`]'s own: `shift`
+/// only clamps at 6 (`RETRY_BASE_BACKOFF_MS * 2^6` = 16s), so a future
+/// increase to [`MAX_ATTEMPTS`] alone would otherwise be enough to exceed
+/// [`MAX_RETRY_WAIT`] without ever touching a `Retry-After` header.
 fn backoff(attempt: u32) -> Duration {
     let shift = attempt.min(6);
     let base_ms = RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << shift);
@@ -436,7 +492,7 @@ fn backoff(attempt: u32) -> Duration {
     let span = half.saturating_mul(2).saturating_add(1);
     let jitter = (nanos % span) as i64 - half as i64;
     let wait_ms = (base_ms as i64 + jitter).max(0) as u64;
-    Duration::from_millis(wait_ms)
+    Duration::from_millis(wait_ms).min(MAX_RETRY_WAIT)
 }
 
 /// Read one header as an owned `String`, or `None` if absent or not valid
@@ -558,6 +614,66 @@ mod tests {
         assert_eq!(
             req.header("if-modified-since").as_deref(),
             Some("Mon, 20 Jul 2026 10:00:00 GMT")
+        );
+    }
+
+    #[tokio::test]
+    async fn unconditional_304_without_validators_is_a_status_error() {
+        // A first-ever fetch of a feed the cache has nothing for yet: no
+        // validators to send, so a `304` cannot mean "still current" — it
+        // must surface as the terminal status it is, not a fabricated cache
+        // hit `FetchOutcome::NotModified` has no cached body to back up.
+        let server = MockFeedServer::start(|_req| MockResponse::status(304)).await;
+        let f = test_fetcher();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Status { status: 304 }),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validators_are_not_resent_after_redirect() {
+        // The module doc devotes a section to "validators cover only the
+        // first hop"; pin it directly rather than relying on
+        // `redirect_is_followed_and_validated` (which passes no validators
+        // at all and so cannot distinguish "never sent" from "suppressed").
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                assert!(
+                    req.header("if-none-match").is_none(),
+                    "validators must not be resent past the first hop"
+                );
+                MockResponse::xml("<rss/>")
+            } else {
+                MockResponse::status(302).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let v = Validators {
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let out = f
+            .fetch(&format!("{}/feed.xml", server.url()), Some(&v))
+            .await
+            .unwrap();
+        assert!(matches!(out, FetchOutcome::Fetched { .. }));
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].header("if-none-match").as_deref(),
+            Some("\"v1\""),
+            "the first hop must still send the validator"
+        );
+        assert!(
+            requests[1].header("if-none-match").is_none(),
+            "the redirect hop must not resend it"
         );
     }
 
@@ -689,6 +805,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_after_is_capped_at_max_retry_wait() {
+        // A `Retry-After` naming ~11.5 days is a one-header denial of
+        // service if honored literally; the fetch must still complete in
+        // well under that, bounded by MAX_RETRY_WAIT rather than the
+        // header's value.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let server = MockFeedServer::start(move |_req| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                MockResponse::status(429).with_header("retry-after", "999999")
+            } else {
+                MockResponse::xml("<rss/>")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let start = Instant::now();
+        let out = f.fetch(&format!("{}/f", server.url()), None).await.unwrap();
+        assert!(matches!(out, FetchOutcome::Fetched { .. }));
+        assert_eq!(server.requests().len(), 2);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "elapsed {:?}, expected the 999999s retry-after to be capped, not honored literally",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn retries_exhaust_to_status_error() {
         let server = MockFeedServer::start(|_req| MockResponse::status(503)).await;
         let f = test_fetcher();
@@ -755,6 +899,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hostname_resolving_to_loopback_is_refused_via_policy_dns() {
+        // Every other egress test targets an IP-literal host, caught by
+        // `check_hop_target`'s direct `check_ip` call before any connection
+        // is attempted — `PolicyDns` (the client's DNS resolver) never gets
+        // involved. This drives the other half of the chain: a *hostname*
+        // that resolves to a blocked address, recovered from the connect
+        // error by `find_egress_blocked`. `localhost` resolves to
+        // `127.0.0.1` through the system resolver on every platform this
+        // repo already binds mock servers on — no DNS control needed, and
+        // no dependency on the mock server actually being reached.
+        //
+        // Uses `default_deny()`, not the loopback-allowing test policy:
+        // loopback must still be refused for a *hostname* target exactly as
+        // it is for an IP literal, so this also confirms `PolicyDns` enforces
+        // the same policy `check_hop_target` does, not a looser one.
+        let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
+        let localhost_url = server.url().replace("127.0.0.1", "localhost");
+        let f = FeedFetcher::new(
+            Arc::new(EgressPolicy::default_deny()),
+            Duration::from_secs(2),
+            1024 * 1024,
+            "skardi-test".to_string(),
+        )
+        .expect("build fetcher");
+        let err = f
+            .fetch(&format!("{localhost_url}/f"), None)
+            .await
+            .unwrap_err();
+        match err {
+            FetchError::Egress(e) => assert_eq!(e.range, BlockedRange::Loopback, "got {e}"),
+            other => panic!("expected Egress, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn https_and_http_only() {
         let f = test_fetcher();
         let err = f
@@ -762,5 +941,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::InvalidUrl { .. }), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn invalid_user_agent_fails_client_construction() {
+        // RssError::HttpClientBuild: a contractual error variant, reachable
+        // from caller-supplied config (RssConfig::validate only checks
+        // user_agent is non-empty, not that it survives HeaderValue's
+        // stricter validation), otherwise unexercised.
+        let err = FeedFetcher::new(
+            Arc::new(EgressPolicy::allowing_loopback_for_tests()),
+            Duration::from_secs(2),
+            1024 * 1024,
+            "bad\nua".to_string(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RssError::HttpClientBuild { .. }), "got {err}");
     }
 }

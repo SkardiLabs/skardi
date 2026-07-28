@@ -34,6 +34,16 @@ documents = ["dep:liteparse", "dep:glob"]
 # (the response-size cap is measured on the decoded stream), which needs the
 # builder's `.gzip(true)` — behind reqwest's own `gzip` Cargo feature, off by
 # default alongside the crate's other unconditional reqwest features.
+#
+# This flag is crate-wide, not scoped to the fetcher: reqwest defaults gzip
+# decoding to on for every `reqwest::Client` built anywhere in this crate
+# once the Cargo feature is compiled in, so enabling `rss` also gives Open
+# Connector's client (open_connector/client.rs, which never asks for it)
+# transparent gzip decoding and an `accept-encoding: gzip` header on its own
+# requests. That does not weaken its response-size bound — the bound is
+# enforced again while streaming the body regardless — but it does mean its
+# `content_length()`-based early reject no longer reflects a compressed
+# response's decoded size, since that header still describes the wire size.
 rss = ["dep:quick-xml", "reqwest/gzip"]
 
 [dependencies]
