@@ -394,6 +394,12 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// An embedded source-pack asset failed to parse or validate. A build
+    /// defect (assets ship inside the binary), surfaced as a registration /
+    /// UDTF-setup diagnostic instead of a panic.
+    #[error("embedded source pack asset '{asset}' is invalid: {reason}")]
+    SourcePackAssetInvalid { asset: String, reason: String },
+
     /// A response body grew past the configured decoding bound.
     #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]
     ResponseTooLarge {

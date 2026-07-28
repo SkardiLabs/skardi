@@ -4,13 +4,14 @@
 
 use std::sync::OnceLock;
 
+use crate::sources::providers::open_connector::error::OpenConnectorError;
 use crate::sources::providers::open_connector::source_pack::SourcePack;
 
 use super::loader;
 
-static PACK: OnceLock<SourcePack> = OnceLock::new();
+static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
 
 /// The synthetic mock pack, parsed once from the embedded YAML asset.
-pub fn pack() -> &'static SourcePack {
+pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
     loader::builtin("mock.yaml", include_str!("mock.yaml"), &PACK)
 }

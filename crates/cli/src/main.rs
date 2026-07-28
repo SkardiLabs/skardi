@@ -483,7 +483,7 @@ impl UrlTableFactory for SkardiUrlTableFactory {
 
 /// Create a new SessionContext with custom URL table support (built-in files + Lance)
 /// and the `lance_knn` / `pg_knn` / Open Connector UDTFs registered.
-fn new_session_context() -> (SessionContext, DatasetRegistry, OpenConnectorGateways) {
+fn new_session_context() -> Result<(SessionContext, DatasetRegistry, OpenConnectorGateways)> {
     let dataset_registry: DatasetRegistry = Arc::new(RwLock::new(HashMap::new()));
     let open_connector_gateways = OpenConnectorGateways::default();
     let session_store = SessionStore::new();
@@ -522,7 +522,7 @@ fn new_session_context() -> (SessionContext, DatasetRegistry, OpenConnectorGatew
     register_vec_to_binary_udf(&mut ctx);
     // Open Connector UDTFs plan against the gateway state that
     // register_open_connector_tables fills in during ctx registration.
-    register_open_connector_udtfs(&ctx, Arc::clone(&open_connector_gateways));
+    register_open_connector_udtfs(&ctx, Arc::clone(&open_connector_gateways))?;
 
     // Embedding UDFs (gated by feature flags, lazy model loading on first call).
     #[cfg(feature = "onnx")]
@@ -551,7 +551,7 @@ fn new_session_context() -> (SessionContext, DatasetRegistry, OpenConnectorGatew
         registry.register_chunk_udf(&mut ctx);
     }
 
-    (ctx, dataset_registry, open_connector_gateways)
+    Ok((ctx, dataset_registry, open_connector_gateways))
 }
 
 /// Resolve a path string: if relative (and not remote), resolve against cwd.
@@ -1237,7 +1237,7 @@ async fn show_schema(
     table_filter: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let (mut session_ctx, dataset_registry, oc_gateways) = new_session_context();
+    let (mut session_ctx, dataset_registry, oc_gateways) = new_session_context()?;
     let config =
         load_and_register_all(ctx_path, &mut session_ctx, &dataset_registry, &oc_gateways).await?;
 
@@ -1384,7 +1384,7 @@ fn source_name_for<'a>(
 /// data sources first. If no context file is found, run the query in a bare session with
 /// URL table support (allowing direct file/lance paths in SQL).
 async fn run_query(ctx_override: Option<PathBuf>, sql: &str) -> Result<()> {
-    let (mut session_ctx, dataset_registry, oc_gateways) = new_session_context();
+    let (mut session_ctx, dataset_registry, oc_gateways) = new_session_context()?;
 
     // Try to load context file, but don't fail if not found when no explicit --ctx was given
     match resolve_ctx_path(ctx_override.as_deref()) {
@@ -1542,7 +1542,7 @@ async fn run_pipeline_with_params(
         .with_context(|| format!("Failed to render SQL for pipeline '{}'", pipeline_name))?;
 
     // 3. Build a SessionContext with ctx data sources registered, then execute.
-    let (mut session_ctx, dataset_registry, oc_gateways) = new_session_context();
+    let (mut session_ctx, dataset_registry, oc_gateways) = new_session_context()?;
     if let Some(p) = &ctx_path_for_load {
         load_and_register_all(p, &mut session_ctx, &dataset_registry, &oc_gateways).await?;
     }
@@ -2896,7 +2896,8 @@ spec:
 
         #[tokio::test]
         async fn errors_without_connection_string() {
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let err = register_source(
                 &mut session_ctx,
                 &dynamodb_source(None),
@@ -2914,7 +2915,8 @@ spec:
 
         #[tokio::test]
         async fn errors_without_options() {
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let source = dynamodb_source(Some("http://localhost:8000"));
             let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
                 .await
@@ -2949,7 +2951,8 @@ spec:
 
         #[tokio::test]
         async fn errors_without_connection_string() {
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let err = register_source(
                 &mut session_ctx,
                 &clickhouse_source(None),
@@ -2970,7 +2973,8 @@ spec:
             // The provider is the single enforcement point for the read-only
             // invariant — the CLI must reject read_write exactly like the
             // server's UnsupportedWriteMode.
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let mut source = clickhouse_source(Some("http://127.0.0.1:1"));
             source.access_mode = Some("read_write".to_string());
             let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
@@ -3015,7 +3019,8 @@ bindings:
 
         #[tokio::test]
         async fn errors_without_connection_string() {
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let source = open_connector_source(None, Some(VALID_CONFIG));
             let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
                 .await
@@ -3031,7 +3036,8 @@ bindings:
         async fn errors_with_table_hierarchy() {
             // hierarchy_level defaults to Table; the CLI must reject it with
             // a clear message, not the provider's wrapped error.
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let mut source =
                 open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
             source.hierarchy_level = HierarchyLevel::Table;
@@ -3047,7 +3053,8 @@ bindings:
 
         #[tokio::test]
         async fn errors_without_typed_config() {
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let source = open_connector_source(Some("http://localhost:3000"), None);
             let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
                 .await
@@ -3065,7 +3072,8 @@ bindings:
             // The provider is the single enforcement point for the
             // read-only invariant — the CLI must reject read_write exactly
             // like the server's UnsupportedWriteMode.
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let mut source =
                 open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
             source.access_mode = Some("read_write".to_string());
@@ -3078,7 +3086,8 @@ bindings:
 
         #[tokio::test]
         async fn errors_when_typed_config_on_wrong_type() {
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let mut source =
                 open_connector_source(Some("http://localhost:3000"), Some(VALID_CONFIG));
             source.source_type = "csv".to_string();
@@ -3096,7 +3105,8 @@ bindings:
         async fn errors_when_token_env_missing() {
             // With the config valid, the next failure is the unset runtime
             // token — before any network call to the (unroutable) gateway.
-            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let (mut session_ctx, registry, oc_gateways) =
+                new_session_context().expect("session context");
             let config =
                 VALID_CONFIG.replace("OPEN_CONNECTOR_TOKEN", "SKARDI_CLI_TEST_OC_TOKEN_UNSET");
             let source = open_connector_source(Some("http://127.0.0.1:1"), Some(config.as_str()));

@@ -217,10 +217,13 @@ event carrying the scan identity and error.
       directory). The contract boundary is unchanged: packs stay inside the binary,
       versioned, fingerprint-gated, never user-editable. Parsing is strict
       (`deny_unknown_fields` end to end), table order is deterministic (BTreeMap),
-      and a parse-all + structural-validation test keeps the loader's
-      malformed-asset panic unreachable in released binaries.
+      the loader cross-validates each document (duplicate columns, filters
+      referencing undeclared columns, resource/fixed-input/pagination key
+      collisions) before converting it, and a malformed asset surfaces as a
+      targeted `SourcePackAssetInvalid` registration/UDTF-setup diagnostic —
+      never a panic — with a parse-all test keeping shipped assets valid.
 
-      **Verification**: 237 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 238 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty

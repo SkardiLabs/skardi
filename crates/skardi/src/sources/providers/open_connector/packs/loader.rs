@@ -14,10 +14,14 @@
 //! process-lifetime allocation replacing what used to be `static` data.
 //! Parsing is strict (`deny_unknown_fields` everywhere) so a misspelled
 //! key in an asset fails loudly instead of silently disabling what it was
-//! meant to set. A malformed embedded asset is a build defect, not a
-//! runtime condition: the `builtin` entry point panics with the asset
-//! name and error, and the parse-all test below keeps that panic
-//! unreachable in released binaries.
+//! meant to set, and the loader cross-validates the document (duplicate
+//! columns, filters referencing undeclared columns, input-key collisions)
+//! before converting it to runtime objects. A malformed embedded asset is
+//! a build defect, but it surfaces as a targeted
+//! [`OpenConnectorError::SourcePackAssetInvalid`] at registration / UDTF
+//! setup — never a panic — so a generated pack that slips past review
+//! produces a startup diagnostic, and the parse-all test below keeps
+//! shipped assets valid in the first place.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -25,27 +29,32 @@ use std::sync::OnceLock;
 use datafusion::logical_expr::Operator;
 use serde::Deserialize;
 
+use crate::sources::providers::open_connector::error::OpenConnectorError;
 use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
+use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
     FixedValue, SourcePack, SourcePackTable,
 };
 
 /// Parse an embedded pack asset, memoized in `cell`.
 ///
-/// Panics on a malformed asset: embedded packs are build artifacts, and
-/// `builtin_assets_parse_and_validate` pins every shipped asset as
-/// parseable, so this panic cannot fire in a released binary.
+/// A malformed asset yields [`OpenConnectorError::SourcePackAssetInvalid`]
+/// on every access — a registration/startup diagnostic, not a panic.
+/// `builtin_assets_parse_and_validate` pins every shipped asset as valid.
 pub(crate) fn builtin(
     asset: &'static str,
     yaml: &'static str,
-    cell: &'static OnceLock<SourcePack>,
-) -> &'static SourcePack {
-    cell.get_or_init(|| {
-        parse_pack(yaml)
-            .unwrap_or_else(|e| panic!("embedded source pack asset '{asset}' is invalid: {e}"))
-    })
+    cell: &'static OnceLock<Result<SourcePack, String>>,
+) -> Result<&'static SourcePack, OpenConnectorError> {
+    cell.get_or_init(|| parse_pack(yaml))
+        .as_ref()
+        .map_err(|reason| OpenConnectorError::SourcePackAssetInvalid {
+            asset: asset.to_string(),
+            reason: reason.clone(),
+        })
 }
 
 /// Parse one pack document into the engine's static shapes.
@@ -92,7 +101,7 @@ fn convert_table(
         .into_iter()
         .map(|(key, value)| (leak_str(key), value.into_fixed()))
         .collect::<Vec<_>>();
-    Ok(SourcePackTable {
+    let table = SourcePackTable {
         id,
         action_id: leak_str(doc.action),
         row_path: leak_str(doc.row_path),
@@ -104,7 +113,85 @@ fn convert_table(
         filters: leak_slice(filters),
         error_path: doc.error_path.map(leak_str),
         expected_fingerprint: doc.fingerprint.map(leak_str),
-    })
+    };
+    validate_table(&table)?;
+    Ok(table)
+}
+
+/// Cross-field validation, run before the document becomes a runtime
+/// object. Serde guarantees shape; these are the semantic invariants the
+/// engine assumes but does not re-check per scan.
+fn validate_table(table: &SourcePackTable) -> Result<(), String> {
+    let id = table.id;
+    // Structural pieces the engine parses lazily elsewhere fail HERE so a
+    // generated asset gets one complete diagnostic pass.
+    RowPath::parse(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+    if let Some(path) = table.error_path {
+        RowPath::parse(path).map_err(|e| format!("{id}: {e}"))?;
+    }
+    table
+        .pagination
+        .validate()
+        .map_err(|e| format!("{id}: {e}"))?;
+    RowConverter::new(table.fields).map_err(|e| format!("{id}: {e}"))?;
+
+    let mut columns = std::collections::HashSet::new();
+    for field in table.fields {
+        if !columns.insert(field.name) {
+            return Err(format!("{id}: duplicate column '{}'", field.name));
+        }
+    }
+    let mut mappings = std::collections::HashSet::new();
+    for filter in table.filters {
+        if !columns.contains(filter.column) {
+            return Err(format!(
+                "{id}: filter references undeclared column '{}'",
+                filter.column
+            ));
+        }
+        if !mappings.insert((filter.column, format!("{:?}", filter.operator))) {
+            return Err(format!(
+                "{id}: duplicate filter mapping for column '{}' and operator {:?}",
+                filter.column, filter.operator
+            ));
+        }
+    }
+    for required in table.required_resources {
+        if table.optional_resources.contains(required) {
+            return Err(format!(
+                "{id}: resource '{required}' is declared both required and optional"
+            ));
+        }
+    }
+    let pagination_params: Vec<&str> = match table.pagination {
+        PaginationStrategy::PageNumber {
+            page_param,
+            per_page_param,
+            ..
+        } => vec![page_param, per_page_param],
+        PaginationStrategy::Cursor {
+            cursor_param,
+            page_size_param,
+            ..
+        } => std::iter::once(cursor_param)
+            .chain(page_size_param)
+            .collect(),
+        PaginationStrategy::SinglePage => Vec::new(),
+    };
+    for (key, _) in table.fixed_inputs {
+        if table.declares_resource(key) {
+            return Err(format!(
+                "{id}: fixed input '{key}' collides with a declared resource — the \
+                 request would carry an ambiguous value"
+            ));
+        }
+        if pagination_params.contains(key) {
+            return Err(format!(
+                "{id}: fixed input '{key}' collides with a pagination input"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn convert_column(table_id: &str, doc: ColumnDoc) -> Result<FieldMapping, String> {
@@ -377,8 +464,6 @@ enum FormatDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-    use crate::sources::providers::open_connector::row_path::RowPath;
 
     /// Every shipped asset parses AND passes the same structural checks
     /// binding performs — this is what keeps `builtin`'s panic
@@ -390,19 +475,10 @@ mod tests {
             ("github.yaml", include_str!("github.yaml")),
             ("slack.yaml", include_str!("slack.yaml")),
         ] {
+            // parse_pack performs the full structural + cross-field
+            // validation pass itself; parsing IS the gate.
             let pack = parse_pack(yaml).unwrap_or_else(|e| panic!("{asset}: {e}"));
             assert!(!pack.tables.is_empty(), "{asset}: no tables");
-            for table in pack.tables {
-                RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
-                RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
-                table
-                    .pagination
-                    .validate()
-                    .unwrap_or_else(|e| panic!("{}: {e}", table.id));
-                if let Some(path) = table.error_path {
-                    RowPath::parse(path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
-                }
-            }
         }
     }
 
@@ -477,5 +553,98 @@ tables:
         )
         .unwrap_err();
         assert!(err.contains("bare name"), "{err}");
+    }
+
+    /// One minimal valid table, with a substitution point per invariant.
+    fn pack_with(table_body: &str) -> Result<SourcePack, String> {
+        parse_pack(&format!(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+{table_body}
+"#
+        ))
+    }
+
+    #[test]
+    fn semantic_invariants_are_rejected_with_targeted_errors() {
+        // (yaml, expected fragment) — each row violates exactly one
+        // cross-field invariant the engine assumes but never re-checks.
+        for (body, expected) in [
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: id, path: other, type: utf8, nullable: true }"#,
+                "duplicate column 'id'",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+    filters:
+      - { column: missing, op: eq, input: q, fidelity: inexact }"#,
+                "undeclared column 'missing'",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+    filters:
+      - { column: id, op: eq, input: a, fidelity: inexact }
+      - { column: id, op: eq, input: b, fidelity: inexact }"#,
+                "duplicate filter mapping",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { required: [owner], optional: [owner] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "both required and optional",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { required: [owner] }
+    fixed_inputs:
+      owner: acme
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "collides with a declared resource",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      page: 1
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "collides with a pagination input",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "must start with '$.'",
+            ),
+        ] {
+            let err = pack_with(body).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
     }
 }

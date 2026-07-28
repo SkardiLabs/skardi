@@ -78,14 +78,15 @@
 
 use std::sync::OnceLock;
 
+use crate::sources::providers::open_connector::error::OpenConnectorError;
 use crate::sources::providers::open_connector::source_pack::SourcePack;
 
 use super::loader;
 
-static PACK: OnceLock<SourcePack> = OnceLock::new();
+static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
 
 /// The Slack pack, parsed once from the embedded YAML asset.
-pub fn pack() -> &'static SourcePack {
+pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
     loader::builtin("slack.yaml", include_str!("slack.yaml"), &PACK)
 }
 
@@ -117,6 +118,7 @@ mod tests {
         short: &str,
     ) -> &'static crate::sources::providers::open_connector::source_pack::SourcePackTable {
         pack()
+            .expect("embedded asset is test-pinned to parse")
             .tables
             .iter()
             .find(|t| t.id.rsplit('.').next() == Some(short))
@@ -425,7 +427,7 @@ bindings:
 
     #[test]
     fn every_table_binds_and_declares_a_complete_contract() {
-        for table in pack().tables {
+        for table in pack().expect("embedded asset parses").tables {
             RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             table
@@ -438,7 +440,11 @@ bindings:
                 table.id
             );
         }
-        assert_eq!(pack().tables.len(), 3, "messages/threads stay gated");
+        assert_eq!(
+            pack().expect("embedded asset parses").tables.len(),
+            3,
+            "messages/threads stay gated"
+        );
     }
 
     // ── Integration: the pack against a mock gateway, end to end. ───────

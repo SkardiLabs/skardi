@@ -1,7 +1,7 @@
 //! Built-in source packs: stable relational contracts for SaaS providers.
 //!
 //! A source pack is a Skardi-maintained declarative asset — embedded YAML
-//! compiled into the binary and parsed once at startup (see
+//! compiled into the binary and parsed once at first registry access (see
 //! `packs::loader`), never user-editable configuration. Each
 //! table definition pins the full relational contract — action, row path,
 //! fixed schema, pagination strategy, allowlisted filters, required
@@ -119,16 +119,22 @@ pub struct SourcePackRegistry {
 
 impl SourcePackRegistry {
     /// The built-in packs shipped with this Skardi build.
-    pub fn builtins() -> Self {
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::SourcePackAssetInvalid`] when an embedded pack
+    /// asset fails to parse or validate — a build defect surfaced as a
+    /// registration diagnostic (the parse-all test pins shipped assets as
+    /// valid).
+    pub fn builtins() -> Result<Self, OpenConnectorError> {
         let mut packs = HashMap::new();
         for pack in [
-            super::packs::mock::pack(),
-            super::packs::github::pack(),
-            super::packs::slack::pack(),
+            super::packs::mock::pack()?,
+            super::packs::github::pack()?,
+            super::packs::slack::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }
-        Self { packs }
+        Ok(Self { packs })
     }
 
     /// Look up a pack by provider name.
@@ -207,7 +213,7 @@ mod tests {
 
     #[test]
     fn builtin_mock_pack_is_registered() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
         assert_eq!(pack.name, "mock");
         assert_eq!(pack.version, 1);
@@ -231,7 +237,7 @@ mod tests {
 
     #[test]
     fn unknown_pack_is_a_targeted_error() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let err = registry.require("jira").unwrap_err();
         assert!(matches!(
             err,
@@ -241,7 +247,7 @@ mod tests {
 
     #[test]
     fn builtin_github_pack_is_registered() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("github").unwrap();
         assert_eq!(pack.name, "github");
         assert_eq!(pack.version, 1);
@@ -266,7 +272,7 @@ mod tests {
 
     #[test]
     fn unknown_table_is_a_targeted_error() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
         let err = registry.table(pack, "users").unwrap_err();
         assert!(matches!(
@@ -278,7 +284,7 @@ mod tests {
 
     #[test]
     fn full_table_ids_resolve_exactly() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("github").unwrap();
         let by_short = registry.table(pack, "issues").unwrap();
         let by_full = registry.table(pack, "github.issues").unwrap();
@@ -299,7 +305,7 @@ mod tests {
             tables: Box::leak(tables.into_boxed_slice()),
         }));
 
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let err = registry.table(pack, "comments").unwrap_err();
         assert!(matches!(
             err,
@@ -317,7 +323,7 @@ mod tests {
         // every built-in pack keeps `<pack>.<table>` IDs with unique last
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         for name in ["mock", "github", "slack"] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
@@ -355,7 +361,7 @@ mod tests {
 
     #[test]
     fn version_pin_enforcement() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
         SourcePackRegistry::check_version_pin(pack, None).unwrap();
         SourcePackRegistry::check_version_pin(pack, Some(1)).unwrap();

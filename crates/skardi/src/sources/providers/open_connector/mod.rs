@@ -173,7 +173,7 @@ pub async fn register_open_connector_tables(
 
     // Resolve bindings to pack table definitions first, so discovery covers
     // the allowlist *and* every action a bound table needs.
-    let pack_registry = SourcePackRegistry::builtins();
+    let pack_registry = SourcePackRegistry::builtins()?;
     let mut action_ids = config.raw_action_allowlist.clone();
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;

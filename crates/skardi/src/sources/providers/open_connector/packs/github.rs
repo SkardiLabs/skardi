@@ -47,14 +47,15 @@
 
 use std::sync::OnceLock;
 
+use crate::sources::providers::open_connector::error::OpenConnectorError;
 use crate::sources::providers::open_connector::source_pack::SourcePack;
 
 use super::loader;
 
-static PACK: OnceLock<SourcePack> = OnceLock::new();
+static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
 
 /// The GitHub pack, parsed once from the embedded YAML asset.
-pub fn pack() -> &'static SourcePack {
+pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
     loader::builtin("github.yaml", include_str!("github.yaml"), &PACK)
 }
 
@@ -76,6 +77,7 @@ mod tests {
         short: &str,
     ) -> &'static crate::sources::providers::open_connector::source_pack::SourcePackTable {
         pack()
+            .expect("embedded asset is test-pinned to parse")
             .tables
             .iter()
             .find(|t| t.id.rsplit('.').next() == Some(short))
@@ -334,7 +336,7 @@ mod tests {
 
     #[test]
     fn every_table_converts_an_empty_page_and_keeps_its_schema() {
-        for table in pack().tables {
+        for table in pack().expect("embedded asset parses").tables {
             let converter = RowConverter::new(table.fields).expect("converter");
             let batch = converter.convert(&[], 1).expect("empty page");
             assert_eq!(batch.num_rows(), 0, "{}", table.id);
@@ -1354,7 +1356,7 @@ bindings:
         // Bind-time validation (row paths, field paths, pagination) plus the
         // admission-gate basics: page-number pagination that terminates, and
         // owner/repo-style resources spelled out.
-        for table in pack().tables {
+        for table in pack().expect("embedded asset parses").tables {
             RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             table

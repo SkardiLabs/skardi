@@ -611,7 +611,7 @@ mod tests {
         limit: Option<usize>,
         source_pack_version: u32,
     ) -> OpenConnectorExec {
-        let table = &mock::pack().tables[0];
+        let table = &mock::pack().expect("embedded asset parses").tables[0];
         OpenConnectorExec::new(
             client,
             cache,
