@@ -678,6 +678,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unconditional_304_after_redirect_is_a_status_error() {
+        // The path a hostile server would actually use: unlike
+        // `unconditional_304_without_validators_is_a_status_error`, the
+        // caller *did* pass validators — hop 0 sends them and gets a
+        // redirect, so hop 1 (the one that answers `304`) sends none,
+        // because validators do not follow redirects. Same rule, reached
+        // from the other direction.
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                MockResponse::status(304)
+            } else {
+                MockResponse::status(302).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let v = Validators {
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let err = f
+            .fetch(&format!("{}/feed.xml", server.url()), Some(&v))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Status { status: 304 }),
+            "got {err}"
+        );
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn oversized_body_aborts_with_too_large() {
         // Covers only the uncompressed cap: the gzip-bomb variant needs the
         // pre-compressed fixture Task 17 adds under fixtures/, so that case
@@ -810,6 +842,21 @@ mod tests {
         // service if honored literally; the fetch must still complete in
         // well under that, bounded by MAX_RETRY_WAIT rather than the
         // header's value.
+        //
+        // This is a real-time test, not `#[tokio::test(start_paused =
+        // true)]`: tried it first, and it fails spuriously — with time
+        // paused, tokio's auto-advance races the virtual clock ahead of the
+        // mock server's real socket round-trip for the *first* request,
+        // and reqwest's own per-request timeout (also driven by the paused
+        // clock) fires before that real response ever arrives, so the test
+        // fails with `Timeout { seconds: 2 }` on every run, not just a
+        // regression. Two things compensate for going back to real time:
+        // an explicit `tokio::time::timeout` around the fetch so a
+        // regressed (unclamped) wait fails an assertion in ~20s rather than
+        // hanging for ~11.5 days, and a tight elapsed window (rather than a
+        // loose "well under 30s") so the assertion actually discriminates
+        // the clamped case from an unclamped one instead of just from a
+        // hang.
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = Arc::clone(&calls);
         let server = MockFeedServer::start(move |_req| {
@@ -822,13 +869,24 @@ mod tests {
         .await;
         let f = test_fetcher();
         let start = Instant::now();
-        let out = f.fetch(&format!("{}/f", server.url()), None).await.unwrap();
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            f.fetch(&format!("{}/f", server.url()), None),
+        )
+        .await
+        .expect(
+            "fetch did not complete within 20s — the Retry-After clamp appears to have \
+             regressed (an uncapped 999999s wait would hang far longer than this)",
+        )
+        .unwrap();
         assert!(matches!(out, FetchOutcome::Fetched { .. }));
         assert_eq!(server.requests().len(), 2);
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "elapsed {:?}, expected the 999999s retry-after to be capped, not honored literally",
-            start.elapsed()
+            elapsed >= Duration::from_secs(9) && elapsed <= Duration::from_secs(12),
+            "elapsed {elapsed:?}, expected close to MAX_RETRY_WAIT (10s) — \
+             a 999999s retry-after honored literally would fail the 20s timeout above instead, \
+             but this window is what actually pins the clamp to ~10s rather than merely \"fast\"",
         );
     }
 
