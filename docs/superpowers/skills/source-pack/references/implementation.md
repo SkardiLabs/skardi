@@ -109,7 +109,10 @@ Work module by module; the reference packs are the style guide.
    - a sync test asserting
      `fingerprint_schema(Some(&fixture)) == expected_fingerprint` for
      every table (collect all mismatches, print actual hashes — that is
-     also how you obtain them the first time);
+     also how you obtain them the first time). The helper is
+     `pub(crate)` for exactly this caller — import it as
+     `use crate::sources::providers::open_connector::action_registry::fingerprint_schema;`
+     from the pack's test module;
    - mock discovery serves the captured contracts (a shared
      `<provider>_discovery(path)` helper), so every e2e registration
      exercises the gate's pass side;
