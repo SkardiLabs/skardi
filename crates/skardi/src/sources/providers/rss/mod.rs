@@ -1,6 +1,6 @@
 //! RSS/Atom subscriptions as a read-only data source (`type: rss`).
 //!
-//! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design-v2.md`.
+//! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
 pub mod config;
 pub mod error;
 

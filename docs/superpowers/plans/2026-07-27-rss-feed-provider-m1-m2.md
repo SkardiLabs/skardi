@@ -4,7 +4,7 @@
 
 **Goal:** Implement `type: rss` as a first-class read-only data source — one configured subscription list exposed as `<name>.main.feeds` + `<name>.main.items` with scan-time fetching, per-feed TTL cache, dialect conformance, Markdown item content, per-feed fault isolation — plus the M2 documentation surfaces.
 
-**Spec:** `docs/superpowers/specs/2026-07-22-rss-feed-support-design-v2.md` (normative). This plan implements milestones M1 (provider core) and M2 (docs). M3 (auto_news_base skill, statement-sequence pipeline extension, `requires:` handshake, vendored consumer render) is a separate follow-up plan.
+**Spec:** `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md` (normative). This plan implements milestones M1 (provider core) and M2 (docs). M3 (auto_news_base skill, statement-sequence pipeline extension, `requires:` handshake, vendored consumer render) is a separate follow-up plan.
 
 **Architecture:** A self-contained provider under `crates/skardi/src/sources/providers/rss/`. A shared `RssEngine` (config + fetcher + cache + politeness semaphore) is built once at registration; two fixed-schema `TableProvider`s dispatch into a shared `RssScanExec` with one DataFusion partition per feed. `items` scans drive fetch/parse/convert through the cache; `feeds` scans are pure state reads. Everything is modeled on the `open_connector` provider (typed config, hand-rolled mock HTTP test server, inline `#[cfg(test)]` modules) and the `documents` provider (Cargo feature gating).
 
@@ -220,7 +220,7 @@ pub enum RssError {
 ```rust
 //! RSS/Atom subscriptions as a read-only data source (`type: rss`).
 //!
-//! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design-v2.md`.
+//! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
 pub mod config;
 pub mod error;
 

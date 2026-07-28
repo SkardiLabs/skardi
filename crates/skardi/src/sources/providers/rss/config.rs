@@ -10,7 +10,7 @@
 //! tasks on top of it.
 //!
 //! The YAML shape matches the design spec
-//! (`docs/superpowers/specs/2026-07-22-rss-feed-support-design-v2.md`):
+//! (`docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`):
 //!
 //! ```yaml
 //! rss:
