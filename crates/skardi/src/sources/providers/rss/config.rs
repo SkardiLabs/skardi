@@ -422,4 +422,15 @@ feeds:
         .unwrap_err();
         assert!(err.to_string().contains("bogus"), "{err}");
     }
+
+    #[test]
+    fn opml_only_config_validates_without_reading_the_file() {
+        // validate() performs zero I/O, so a path that does not exist on
+        // disk must still pass — OPML reading happens at registration time.
+        let config: RssConfig =
+            serde_yaml::from_str("opml: does-not-exist.opml\n").expect("opml-only config parses");
+        config
+            .validate()
+            .expect("opml-only config validates without touching the path");
+    }
 }
