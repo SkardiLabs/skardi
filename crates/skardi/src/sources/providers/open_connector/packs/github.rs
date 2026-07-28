@@ -15,7 +15,7 @@
 //!   inside GitHub's enum domain (open/closed/all), and an Exact claim
 //!   would lean on the provider rejecting out-of-domain literals rather
 //!   than silently returning its default listing. `issues.updated_at >=`
-//!   maps to `since` as [`Fidelity::Inexact`]: GitHub documents issue `since` as
+//!   maps to `since` as [`Fidelity::Inexact`](crate::sources::providers::open_connector::filters::Fidelity::Inexact): GitHub documents issue `since` as
 //!   "updated at *or after*" (a superset of the predicate under any
 //!   timestamp-granularity fuzz), so DataFusion reapplies the predicate
 //!   locally. The commits endpoint's `since` is documented as commits
@@ -31,19 +31,17 @@
 //!   `sha`, `tag_name`, …) are non-null. GitHub nulls out whole objects
 //!   (`commit.author: null`, `issue.user: null`); nullable columns under
 //!   them become SQL NULL per the converter's null-parent rule.
-//! - **No fingerprint pins yet** (`expected_fingerprint: None`), same as
-//!   the mock pack: a pin must be taken from a live gateway's discovered
-//!   contract. The action IDs, input keys, row paths, and endpoint
-//!   contract of every table here HAVE been reconciled against a live
-//!   Open Connector gateway (v1.3.1) and its provider source; the
-//!   fingerprints themselves are still unpinned. The bundled fixtures
-//!   (see tests) are the build-time conversion contract; pins land next.
-//!   Operational consequence until then: incompatible upstream drift (a
-//!   removed required field, a mapped field changing type) is caught only
-//!   at scan time as a terminal `ConversionFailed` — for every query on
-//!   the table, since conversion builds all declared columns before
-//!   projection — and bindings deliberately cannot patch schemas, so the
-//!   fix is a pack version bump.
+//! - **Fingerprints are pinned** from a live gateway: each table's
+//!   `fingerprint` in `github.yaml` is the BLAKE3 hash of the canonicalized
+//!   output schema captured into `fixtures/github/contracts/`, and a test
+//!   keeps pin and captured contract locked together. Registration
+//!   compares the pin against the discovered contract and fails with
+//!   `ActionContractMismatch` on drift — including additive schema
+//!   changes, which is the designed tradeoff (re-capture and re-pin on
+//!   upstream upgrades). The action IDs, input keys, row paths, and
+//!   endpoint contract are likewise reconciled against the live gateway
+//!   and its provider source; the bundled fixtures (see tests) remain the
+//!   build-time conversion contract.
 
 use std::sync::OnceLock;
 

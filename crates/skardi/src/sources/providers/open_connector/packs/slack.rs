@@ -40,7 +40,7 @@
 //!   normalized contract declares is actually populated — Slack omits the
 //!   field without the flag, which would leave a permanently NULL column.
 //! - **Filters are allowlisted only where faithful.** `files.user_id`
-//!   maps to the `userId` input as [`Fidelity::Inexact`], per the
+//!   maps to the `userId` input as [`Fidelity::Inexact`](crate::sources::providers::open_connector::filters::Fidelity::Inexact), per the
 //!   module-wide string-push rule (an Exact claim would lean on the
 //!   provider rejecting unknown user IDs instead of silently returning
 //!   its default listing). The previous `created >= → ts_from` push is
@@ -48,7 +48,7 @@
 //!   all, and its strict schema would 400 any request carrying one — time
 //!   predicates are evaluated by DataFusion after the bounded fetch.
 //! - **`files.created` is epoch seconds**, read through
-//!   [`FieldType::TimestampSecondsUtc`] — the millis reader would
+//!   [`FieldType::TimestampSecondsUtc`](crate::sources::providers::open_connector::json_to_arrow::FieldType::TimestampSecondsUtc) — the millis reader would
 //!   silently produce January-1970 dates. (The normalized conversation
 //!   and user rows carry no timestamps at all.)
 //! - **`files` may be scoped to one channel** with the optional
@@ -74,7 +74,7 @@
 //!   `ActionContractMismatch` on drift — including additive or
 //!   doc-comment-only schema changes, which is the designed tradeoff
 //!   (re-capture the contract and re-pin on upstream upgrades). The
-//!   GitHub pack's pins remain a follow-up.
+//!   GitHub pack pins the same way.
 
 use std::sync::OnceLock;
 
