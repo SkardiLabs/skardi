@@ -80,6 +80,15 @@ Every other SQL predicate is valid — DataFusion evaluates it locally after
 the bounded fetch. `LIMIT` always stops pagination as soon as enough rows
 have been emitted.
 
+The default safety bounds put a hard ceiling on an unfiltered scan: with
+`max_pages: 100` at 100 rows per page, any table reaches at most 10,000
+rows before the scan **fails** with `ScanBoundsExceeded` — per the
+fail-don't-truncate rule, a larger collection surfaces as an error, never
+as a silently partial result. Raise `max_pages` (and `max_rows`, default
+100,000) in the gateway's `open_connector:` block, or push a narrowing
+predicate/`LIMIT`; the knobs are documented in
+[the integration guide](open-connector.md#bounds-retries-and-errors).
+
 Column references live in the pack definition
 (`crates/skardi/src/sources/providers/open_connector/packs/github.rs`);
 highlights and caveats:
