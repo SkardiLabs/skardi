@@ -209,7 +209,18 @@ event carrying the scan identity and error.
       three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
-      **Verification**: 233 open_connector tests (counted by `cargo test -p skardi --lib
+      **Pack format**: all built-in packs (mock, github, slack) are now
+      declarative **embedded YAML assets** (`packs/*.yaml`, `include_str!`-compiled,
+      parsed once at first registry access via `packs/loader.rs` and leaked into the
+      engine's `&'static` shapes) — the design doc's illustrative pack format, and
+      the groundwork for its deferred second tier (user-authored packs from a
+      directory). The contract boundary is unchanged: packs stay inside the binary,
+      versioned, fingerprint-gated, never user-editable. Parsing is strict
+      (`deny_unknown_fields` end to end), table order is deterministic (BTreeMap),
+      and a parse-all + structural-validation test keeps the loader's
+      malformed-asset panic unreachable in released binaries.
+
+      **Verification**: 237 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty

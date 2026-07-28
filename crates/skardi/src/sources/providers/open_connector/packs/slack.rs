@@ -76,306 +76,18 @@
 //!   (re-capture the contract and re-pin on upstream upgrades). The
 //!   GitHub pack's pins remain a follow-up.
 
-use datafusion::logical_expr::Operator;
+use std::sync::OnceLock;
 
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
-use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
-use crate::sources::providers::open_connector::pagination::PaginationStrategy;
-use crate::sources::providers::open_connector::source_pack::{
-    FixedValue, SourcePack, SourcePackTable,
-};
+use crate::sources::providers::open_connector::source_pack::SourcePack;
 
-/// Slack cursor pagination through Open Connector: `cursor` in, top-level
-/// `nextCursor` out (`null` at end-of-collection), 200 rows per page
-/// (Slack's recommended ceiling, sent as the `limit` input).
-const SLACK_CURSOR_PAGINATION: PaginationStrategy = PaginationStrategy::Cursor {
-    cursor_param: "cursor",
-    next_cursor_path: "$.nextCursor",
-    page_size_param: Some("limit"),
-    page_size: 200,
-};
+use super::loader;
 
-/// Channels the bot can see (public, plus private ones it is a member of).
-/// Rows are Open Connector's normalized conversation shape, not Slack's
-/// raw `conversations.list` objects.
-static CONVERSATIONS: SourcePackTable = SourcePackTable {
-    id: "slack.conversations",
-    action_id: "slack.list_conversations",
-    row_path: "$.conversations",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "channelId",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        // The normalizer's classification: public_channel / private_channel
-        // (im/mpim never appear here — the types pin excludes them).
-        FieldMapping {
-            name: "type",
-            path: "type",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_private",
-            path: "isPrivate",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_archived",
-            path: "isArchived",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_member",
-            path: "isMember",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        // Omitted (not null) by the normalizer when Slack sends no number.
-        FieldMapping {
-            name: "member_count",
-            path: "memberCount",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "topic",
-            path: "topic",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "purpose",
-            path: "purpose",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: SLACK_CURSOR_PAGINATION,
-    required_resources: &[],
-    optional_resources: &[],
-    // Slack lists public channels only by default; pin both channel kinds so
-    // the table reads as the complete collection the bot can see. IMs/MPIMs
-    // are message-shaped and deliberately out of a channels table. The
-    // action schema takes an array of enum strings.
-    fixed_inputs: &[(
-        "types",
-        FixedValue::StrList(&["public_channel", "private_channel"]),
-    )],
-    filters: &[],
-    // Slack's in-band ok:false envelope is consumed by the OC executor and
-    // surfaced as a gateway failure — it never reaches action output.
-    error_path: None,
-    expected_fingerprint: Some("2d4e5cee7cf87f146ab7848849f97a559ba44ff09350295e0dc50b75abf0ef84"),
-};
+static PACK: OnceLock<SourcePack> = OnceLock::new();
 
-/// Workspace members, including bots and deleted users (`deleted = true`).
-/// Rows are Open Connector's normalized user shape — profile fields are
-/// already flattened (`realName`, `displayName`), and Slack extras the
-/// normalizer drops (email, tz, team_id, updated) are not part of the
-/// contract.
-static USERS: SourcePackTable = SourcePackTable {
-    id: "slack.users",
-    action_id: "slack.list_users",
-    row_path: "$.users",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "userId",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "username",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "real_name",
-            path: "realName",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "display_name",
-            path: "displayName",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_bot",
-            path: "isBot",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_admin",
-            path: "isAdmin",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_owner",
-            path: "isOwner",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "deleted",
-            path: "isDeleted",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        // Populated only because includeLocale is pinned below — Slack
-        // omits the field without the flag.
-        FieldMapping {
-            name: "locale",
-            path: "locale",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: SLACK_CURSOR_PAGINATION,
-    required_resources: &[],
-    optional_resources: &[],
-    // Without the flag Slack omits locale entirely and the declared column
-    // would be permanently NULL.
-    fixed_inputs: &[("includeLocale", FixedValue::Bool(true))],
-    filters: &[],
-    // In-band errors are consumed by the OC executor (see CONVERSATIONS).
-    error_path: None,
-    expected_fingerprint: Some("77f3f0f41d30b9095875b1c02d5f93f31b948f4a666fdfc820192348e5e1b18f"),
-};
-
-/// Files visible to the bot.
-static FILES: SourcePackTable = SourcePackTable {
-    id: "slack.files",
-    action_id: "slack.list_files",
-    row_path: "$.files",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "title",
-            path: "title",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "filetype",
-            path: "filetype",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "mimetype",
-            path: "mimetype",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "size",
-            path: "size",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "user_id",
-            path: "user",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        // Channel IDs the file is shared into — a plain string array.
-        FieldMapping {
-            name: "channels",
-            path: "channels",
-            field_type: FieldType::Utf8List,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "is_public",
-            path: "is_public",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created",
-            path: "created",
-            field_type: FieldType::TimestampSecondsUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "permalink",
-            path: "permalink",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    // files.list never adopted cursors; classic page/count pagination.
-    // Slack's envelope carries an authoritative `paging.pages`, so the scan
-    // trusts it instead of the short-page heuristic: permission filtering
-    // can legally shorten non-final pages, which the heuristic would read
-    // as end-of-collection and silently truncate.
-    pagination: PaginationStrategy::PageNumber {
-        page_param: "page",
-        per_page_param: "count",
-        per_page: 100,
-        total_pages_path: Some("$.paging.pages"),
-    },
-    required_resources: &[],
-    // A binding may scope the listing to one channel; declared here so a
-    // shared binding's channelId reaches only this table.
-    optional_resources: &["channelId"],
-    fixed_inputs: &[],
-    filters: &[
-        // Inexact per the string-push rule: user IDs are arbitrary strings,
-        // and an Exact claim would lean on the provider rejecting unknown
-        // ones. The OC input key is userId (camelCase, strict schema).
-        //
-        // No time filter is mapped: the OC list_files contract declares no
-        // ts_from/ts_to inputs, and its strict schema would 400 a request
-        // carrying one. Time predicates run in DataFusion.
-        FilterMapping {
-            column: "user_id",
-            operator: Operator::Eq,
-            input_field: "userId",
-            fidelity: Fidelity::Inexact,
-            value_format: ValueFormat::Verbatim,
-        },
-    ],
-    // In-band errors are consumed by the OC executor (see CONVERSATIONS).
-    error_path: None,
-    expected_fingerprint: Some("54f3b15b426612c2d0bd0291d2cabb1cbf18c5f5061bce13b53e93fa1bba4ac2"),
-};
-
-/// The Slack source pack (version 1): conversations, users, files. Message
-/// and thread tables are gated on upstream cursor support (module docs).
-pub static SLACK_PACK: SourcePack = SourcePack {
-    name: "slack",
-    version: 1,
-    tables: &[CONVERSATIONS, USERS, FILES],
-};
+/// The Slack pack, parsed once from the embedded YAML asset.
+pub fn pack() -> &'static SourcePack {
+    loader::builtin("slack.yaml", include_str!("slack.yaml"), &PACK)
+}
 
 #[cfg(test)]
 mod tests {
@@ -384,6 +96,7 @@ mod tests {
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
     use crate::sources::providers::open_connector::row_path::RowPath;
+    use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
         EnvVarGuard, MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err,
         envelope_ok,
@@ -398,6 +111,17 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
+
+    /// Look up a table by short name; the assets are test-pinned to parse.
+    fn table(
+        short: &str,
+    ) -> &'static crate::sources::providers::open_connector::source_pack::SourcePackTable {
+        pack()
+            .tables
+            .iter()
+            .find(|t| t.id.rsplit('.').next() == Some(short))
+            .unwrap_or_else(|| panic!("table {short}"))
+    }
 
     /// Discovery response carrying the live-captured output schema for the
     /// three slack actions (`fixtures/slack/contracts/`), so every mock
@@ -427,15 +151,15 @@ mod tests {
         let mut mismatches = Vec::new();
         for (table, contract) in [
             (
-                &CONVERSATIONS,
+                table("conversations"),
                 include_str!("fixtures/slack/contracts/list_conversations.json"),
             ),
             (
-                &USERS,
+                table("users"),
                 include_str!("fixtures/slack/contracts/list_users.json"),
             ),
             (
-                &FILES,
+                table("files"),
                 include_str!("fixtures/slack/contracts/list_files.json"),
             ),
         ] {
@@ -550,7 +274,7 @@ bindings:
     #[test]
     fn conversations_fixture_converts_with_null_and_absent_fields() {
         let batch = convert_fixture(
-            &CONVERSATIONS,
+            table("conversations"),
             include_str!("fixtures/slack/conversations.json"),
         );
         assert_eq!(batch.num_rows(), 3);
@@ -592,11 +316,11 @@ bindings:
             "fixtures/slack/conversations_type_mismatch.json"
         ))
         .expect("fixture parses");
-        let rows = RowPath::parse(CONVERSATIONS.row_path)
+        let rows = RowPath::parse(table("conversations").row_path)
             .expect("row path")
             .rows(&page, 1)
             .expect("row array");
-        let err = RowConverter::new(CONVERSATIONS.fields)
+        let err = RowConverter::new(table("conversations").fields)
             .expect("converter")
             .convert(rows, 1)
             .expect_err("a string where UInt64 is declared must fail conversion");
@@ -625,7 +349,7 @@ bindings:
 
     #[test]
     fn users_fixture_converts_with_flattened_profile_and_deleted_rows() {
-        let batch = convert_fixture(&USERS, include_str!("fixtures/slack/users.json"));
+        let batch = convert_fixture(table("users"), include_str!("fixtures/slack/users.json"));
         assert_eq!(batch.num_rows(), 3);
 
         // The normalized shape is already flat: userId/username/realName.
@@ -648,7 +372,7 @@ bindings:
 
     #[test]
     fn files_fixture_converts_with_channel_lists_and_absent_fields() {
-        let batch = convert_fixture(&FILES, include_str!("fixtures/slack/files.json"));
+        let batch = convert_fixture(table("files"), include_str!("fixtures/slack/files.json"));
         assert_eq!(batch.num_rows(), 3);
 
         let channels = batch
@@ -686,9 +410,12 @@ bindings:
     #[test]
     fn empty_pages_preserve_every_table_schema() {
         for (table, empty) in [
-            (&CONVERSATIONS, r#"{"conversations":[],"nextCursor":null}"#),
-            (&USERS, r#"{"users":[],"nextCursor":null}"#),
-            (&FILES, r#"{"files":[],"paging":{"pages":0}}"#),
+            (
+                table("conversations"),
+                r#"{"conversations":[],"nextCursor":null}"#,
+            ),
+            (table("users"), r#"{"users":[],"nextCursor":null}"#),
+            (table("files"), r#"{"files":[],"paging":{"pages":0}}"#),
         ] {
             let batch = convert_fixture(table, empty);
             assert_eq!(batch.num_rows(), 0);
@@ -698,7 +425,7 @@ bindings:
 
     #[test]
     fn every_table_binds_and_declares_a_complete_contract() {
-        for table in SLACK_PACK.tables {
+        for table in pack().tables {
             RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             table
@@ -711,7 +438,7 @@ bindings:
                 table.id
             );
         }
-        assert_eq!(SLACK_PACK.tables.len(), 3, "messages/threads stay gated");
+        assert_eq!(pack().tables.len(), 3, "messages/threads stay gated");
     }
 
     // ── Integration: the pack against a mock gateway, end to end. ───────

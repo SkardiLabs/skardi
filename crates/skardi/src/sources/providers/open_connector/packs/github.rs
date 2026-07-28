@@ -45,740 +45,42 @@
 //!   projection — and bindings deliberately cannot patch schemas, so the
 //!   fix is a pack version bump.
 
-use datafusion::logical_expr::Operator;
+use std::sync::OnceLock;
 
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
-use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
-use crate::sources::providers::open_connector::pagination::PaginationStrategy;
-use crate::sources::providers::open_connector::source_pack::{
-    FixedValue, SourcePack, SourcePackTable,
-};
+use crate::sources::providers::open_connector::source_pack::SourcePack;
 
-/// GitHub's maximum page size; also the short-page termination threshold.
-///
-/// The input keys follow Open Connector's action contracts, which are
-/// camelCase and strict (`additionalProperties` rejected): the live gateway
-/// returns HTTP 400 for `per_page` and accepts `perPage`, matching the
-/// `perPage`/`page` inputs in the actions' published contracts.
-const GITHUB_PAGINATION: PaginationStrategy = PaginationStrategy::PageNumber {
-    page_param: "page",
-    per_page_param: "perPage",
-    per_page: 100,
-    total_pages_path: None,
-};
+use super::loader;
 
-/// Repositories visible to the connected account.
-static REPOSITORIES: SourcePackTable = SourcePackTable {
-    id: "github.repositories",
-    action_id: "github.list_my_repositories",
-    row_path: "$.repositories",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "full_name",
-            path: "full_name",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "private",
-            path: "private",
-            field_type: FieldType::Boolean,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "description",
-            path: "description",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "default_branch",
-            path: "default_branch",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "language",
-            path: "language",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "stargazers_count",
-            path: "stargazers_count",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "forks_count",
-            path: "forks_count",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "open_issues_count",
-            path: "open_issues_count",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "archived",
-            path: "archived",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "pushed_at",
-            path: "pushed_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &[],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    error_path: None,
-    expected_fingerprint: None,
-};
+static PACK: OnceLock<SourcePack> = OnceLock::new();
 
-/// Issues of one repository — pure issues: the Open Connector action
-/// filters out the pull requests GitHub's raw issues endpoint mixes in.
-static ISSUES: SourcePackTable = SourcePackTable {
-    id: "github.issues",
-    action_id: "github.list_repository_issues",
-    row_path: "$.issues",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "number",
-            path: "number",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "title",
-            path: "title",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "state",
-            path: "state",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "assignees",
-            path: "assignees",
-            field_type: FieldType::Utf8ListFromObjectKey("login"),
-            nullable: true,
-        },
-        FieldMapping {
-            name: "labels",
-            path: "labels",
-            field_type: FieldType::Utf8ListFromObjectKey("name"),
-            nullable: true,
-        },
-        FieldMapping {
-            name: "comments",
-            path: "comments",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "closed_at",
-            path: "closed_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    // GitHub lists only open issues by default; pin `state=all` so the
-    // table reads as the complete collection (a pushed `state` predicate
-    // overrides the pin).
-    fixed_inputs: &[("state", FixedValue::Str("all"))],
-    filters: &[
-        // `state` takes the SQL literal verbatim, but is Inexact on
-        // purpose: the push is faithful only inside GitHub's enum domain
-        // (open/closed/all), and an Exact claim would lean on the provider
-        // 422-ing out-of-domain values — a provider that silently ignored
-        // `state = 'merged'` and returned its default listing would hand
-        // back open rows as the "exact" answer to an empty query. The
-        // `state` column is in every row, so the local re-check is free.
-        FilterMapping {
-            column: "state",
-            operator: Operator::Eq,
-            input_field: "state",
-            fidelity: Fidelity::Inexact,
-            value_format: ValueFormat::Verbatim,
-        },
-        // GitHub documents issue `since` as "updated at or after this
-        // time" — a superset of `updated_at >= X` under any granularity
-        // fuzz — so the push narrows the fetch and DataFusion reapplies
-        // the predicate (Inexact).
-        FilterMapping {
-            column: "updated_at",
-            operator: Operator::GtEq,
-            input_field: "since",
-            fidelity: Fidelity::Inexact,
-            value_format: ValueFormat::Rfc3339,
-        },
-    ],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// Comments of one issue (or pull request — GitHub shares issue comments).
-static ISSUE_COMMENTS: SourcePackTable = SourcePackTable {
-    id: "github.issue_comments",
-    action_id: "github.list_issue_comments",
-    row_path: "$.comments",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo", "issueNumber"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// Pull requests of one repository.
-static PULL_REQUESTS: SourcePackTable = SourcePackTable {
-    id: "github.pull_requests",
-    action_id: "github.list_pull_requests",
-    row_path: "$.pull_requests",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "number",
-            path: "number",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "title",
-            path: "title",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "state",
-            path: "state",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "draft",
-            path: "draft",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "head_ref",
-            path: "head.ref",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "base_ref",
-            path: "base.ref",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "closed_at",
-            path: "closed_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "merged_at",
-            path: "merged_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    // Same open-by-default listing as issues; pin the complete collection.
-    fixed_inputs: &[("state", FixedValue::Str("all"))],
-    // Inexact for the same reason as issues.state: faithful only inside
-    // the provider's enum domain, and the local re-check is free.
-    filters: &[FilterMapping {
-        column: "state",
-        operator: Operator::Eq,
-        input_field: "state",
-        fidelity: Fidelity::Inexact,
-        value_format: ValueFormat::Verbatim,
-    }],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// Reviews of one pull request.
-static REVIEWS: SourcePackTable = SourcePackTable {
-    id: "github.reviews",
-    action_id: "github.list_pull_request_reviews",
-    row_path: "$.reviews",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "state",
-            path: "state",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "commit_id",
-            path: "commit_id",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "submitted_at",
-            path: "submitted_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo", "pullNumber"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// Commits of one repository. `author` (the GitHub account) is routinely
-/// JSON null when no account is linked to the commit email — the nullable
-/// `author_login` becomes SQL NULL, while the git-level name and dates
-/// under `commit.*` stay available.
-static COMMITS: SourcePackTable = SourcePackTable {
-    id: "github.commits",
-    action_id: "github.list_commits",
-    row_path: "$.commits",
-    fields: &[
-        FieldMapping {
-            name: "sha",
-            path: "sha",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "message",
-            path: "commit.message",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "author.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_name",
-            path: "commit.author.name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "authored_at",
-            path: "commit.author.date",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "committed_at",
-            path: "commit.committer.date",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    // NOTE: GitHub's commits `since`/`until` are documented as commits
-    // *after*/*before* the date. Strictly-after cannot represent
-    // `committed_at >= X` even as Inexact — a boundary commit the provider
-    // drops is unrecoverable — so no time filter is mapped (the mock pack's
-    // `>=` rule, applied here).
-    filters: &[],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// Workflow runs (GitHub Actions) of one repository. `conclusion` is JSON
-/// null while a run is in progress.
-static WORKFLOW_RUNS: SourcePackTable = SourcePackTable {
-    id: "github.workflow_runs",
-    action_id: "github.list_workflow_runs",
-    row_path: "$.workflow_runs",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "workflow_id",
-            path: "workflow_id",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "run_number",
-            path: "run_number",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "event",
-            path: "event",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "status",
-            path: "status",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "conclusion",
-            path: "conclusion",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "head_branch",
-            path: "head_branch",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "head_sha",
-            path: "head_sha",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    // GitHub's `status` query parameter matches status OR conclusion values
-    // interchangeably — not a faithful translation of either column.
-    // Follow-up candidates (fetch-reduction only; local filtering already
-    // gives correct results): `event` and `head_branch` → the `branch`
-    // query parameter — both as Inexact per the string-enum push rule in
-    // the module docs.
-    filters: &[],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// Releases of one repository. `published_at` is JSON null for drafts.
-static RELEASES: SourcePackTable = SourcePackTable {
-    id: "github.releases",
-    action_id: "github.list_releases",
-    row_path: "$.releases",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "tag_name",
-            path: "tag_name",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "draft",
-            path: "draft",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "prerelease",
-            path: "prerelease",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "author.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "published_at",
-            path: "published_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    error_path: None,
-    expected_fingerprint: None,
-};
-
-/// The GitHub source pack (version 1).
-pub static GITHUB_PACK: SourcePack = SourcePack {
-    name: "github",
-    version: 1,
-    tables: &[
-        REPOSITORIES,
-        ISSUES,
-        ISSUE_COMMENTS,
-        PULL_REQUESTS,
-        REVIEWS,
-        COMMITS,
-        WORKFLOW_RUNS,
-        RELEASES,
-    ],
-};
+/// The GitHub pack, parsed once from the embedded YAML asset.
+pub fn pack() -> &'static SourcePack {
+    loader::builtin("github.yaml", include_str!("github.yaml"), &PACK)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::error::OpenConnectorError;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use crate::sources::providers::open_connector::row_path::RowPath;
+    use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use arrow::array::{
         Array, BooleanArray, ListArray, StringArray, TimestampMillisecondArray, UInt64Array,
     };
     use arrow::record_batch::RecordBatch;
+
+    /// Look up a table by short name; the assets are test-pinned to parse.
+    fn table(
+        short: &str,
+    ) -> &'static crate::sources::providers::open_connector::source_pack::SourcePackTable {
+        pack()
+            .tables
+            .iter()
+            .find(|t| t.id.rsplit('.').next() == Some(short))
+            .unwrap_or_else(|| panic!("table {short}"))
+    }
 
     // ── Contract tests: bundled redacted fixtures are the build-time
     // conversion contract (null-bearing, nested, empty, extra upstream
@@ -852,7 +154,7 @@ mod tests {
 
     #[test]
     fn issues_fixture_converts_with_nulls_and_lists() {
-        let batch = convert_fixture(&ISSUES, include_str!("fixtures/github/issues.json"));
+        let batch = convert_fixture(table("issues"), include_str!("fixtures/github/issues.json"));
         assert_eq!(batch.num_rows(), 3);
 
         assert_eq!(u64s(&batch, "id").value(0), 101);
@@ -895,11 +197,11 @@ mod tests {
         let page: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/github/issues_type_mismatch.json"))
                 .expect("fixture parses");
-        let rows = RowPath::parse(ISSUES.row_path)
+        let rows = RowPath::parse(table("issues").row_path)
             .expect("row path")
             .rows(&page, 1)
             .expect("row array");
-        let err = RowConverter::new(ISSUES.fields)
+        let err = RowConverter::new(table("issues").fields)
             .expect("converter")
             .convert(rows, 1)
             .expect_err("a string where UInt64 is declared must fail conversion");
@@ -929,7 +231,7 @@ mod tests {
     #[test]
     fn repositories_fixture_converts_with_nullable_metadata() {
         let batch = convert_fixture(
-            &REPOSITORIES,
+            table("repositories"),
             include_str!("fixtures/github/repositories.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -946,7 +248,7 @@ mod tests {
     #[test]
     fn issue_comments_fixture_converts_with_null_author() {
         let batch = convert_fixture(
-            &ISSUE_COMMENTS,
+            table("issue_comments"),
             include_str!("fixtures/github/issue_comments.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -958,7 +260,7 @@ mod tests {
     #[test]
     fn pull_requests_fixture_converts_with_nested_refs_and_merge_state() {
         let batch = convert_fixture(
-            &PULL_REQUESTS,
+            table("pull_requests"),
             include_str!("fixtures/github/pull_requests.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -971,7 +273,10 @@ mod tests {
 
     #[test]
     fn reviews_fixture_converts_with_null_bearing_row() {
-        let batch = convert_fixture(&REVIEWS, include_str!("fixtures/github/reviews.json"));
+        let batch = convert_fixture(
+            table("reviews"),
+            include_str!("fixtures/github/reviews.json"),
+        );
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(strings(&batch, "state").value(0), "APPROVED");
         assert!(strings(&batch, "author_login").is_null(1));
@@ -984,7 +289,10 @@ mod tests {
         // The classic GitHub shape: `author` (the account) is JSON null for
         // unlinked commit emails, while git-level identity under `commit.*`
         // stays available.
-        let batch = convert_fixture(&COMMITS, include_str!("fixtures/github/commits.json"));
+        let batch = convert_fixture(
+            table("commits"),
+            include_str!("fixtures/github/commits.json"),
+        );
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(strings(&batch, "author_login").value(0), "octocat");
         assert!(strings(&batch, "author_login").is_null(1));
@@ -996,7 +304,7 @@ mod tests {
     #[test]
     fn workflow_runs_fixture_converts_with_in_progress_run() {
         let batch = convert_fixture(
-            &WORKFLOW_RUNS,
+            table("workflow_runs"),
             include_str!("fixtures/github/workflow_runs.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -1012,7 +320,10 @@ mod tests {
 
     #[test]
     fn releases_fixture_converts_with_unpublished_draft() {
-        let batch = convert_fixture(&RELEASES, include_str!("fixtures/github/releases.json"));
+        let batch = convert_fixture(
+            table("releases"),
+            include_str!("fixtures/github/releases.json"),
+        );
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(strings(&batch, "tag_name").value(0), "v1.2.0");
         assert!(bools(&batch, "draft").value(1));
@@ -1023,7 +334,7 @@ mod tests {
 
     #[test]
     fn every_table_converts_an_empty_page_and_keeps_its_schema() {
-        for table in GITHUB_PACK.tables {
+        for table in pack().tables {
             let converter = RowConverter::new(table.fields).expect("converter");
             let batch = converter.convert(&[], 1).expect("empty page");
             assert_eq!(batch.num_rows(), 0, "{}", table.id);
@@ -1745,7 +1056,10 @@ bindings:
         // marker column could never be non-NULL — the table must not
         // declare one, and PRs are reached through their own table.
         assert!(
-            ISSUES.fields.iter().all(|f| f.name != "pull_request"),
+            table("issues")
+                .fields
+                .iter()
+                .all(|f| f.name != "pull_request"),
             "issues is pure issues under the OC contract; a marker column \
              would be permanently NULL"
         );
@@ -2040,7 +1354,7 @@ bindings:
         // Bind-time validation (row paths, field paths, pagination) plus the
         // admission-gate basics: page-number pagination that terminates, and
         // owner/repo-style resources spelled out.
-        for table in GITHUB_PACK.tables {
+        for table in pack().tables {
             RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             table

@@ -1,0 +1,198 @@
+# GitHub source pack. Wire contract reconciled against a live Open
+# Connector gateway (v1.3.1): camelCase strict action inputs
+# (page/perPage), Open Connector action IDs, and executor-passthrough
+# rows. Design rationale lives in the module docs of packs/github.rs.
+kind: pack
+pack: github
+version: 1
+
+tables:
+  repositories:
+    action: github.list_my_repositories
+    row_path: "$.repositories"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: false }
+      - { name: full_name, path: full_name, type: utf8, nullable: false }
+      - { name: private, path: private, type: boolean, nullable: false }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: default_branch, path: default_branch, type: utf8, nullable: true }
+      - { name: language, path: language, type: utf8, nullable: true }
+      - { name: stargazers_count, path: stargazers_count, type: uint64, nullable: true }
+      - { name: forks_count, path: forks_count, type: uint64, nullable: true }
+      - { name: open_issues_count, path: open_issues_count, type: uint64, nullable: true }
+      - { name: archived, path: archived, type: boolean, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_utc, nullable: true }
+      - { name: pushed_at, path: pushed_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+
+  issues:
+    action: github.list_repository_issues
+    row_path: "$.issues"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo]
+    fixed_inputs:
+      state: all
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: number, path: number, type: uint64, nullable: false }
+      - { name: title, path: title, type: utf8, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: false }
+      - { name: body, path: body, type: utf8, nullable: true }
+      - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: assignees, path: assignees, type: utf8_list_from_object_key, key: login, nullable: true }
+      - { name: labels, path: labels, type: utf8_list_from_object_key, key: name, nullable: true }
+      - { name: comments, path: comments, type: uint64, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_utc, nullable: true }
+      - { name: closed_at, path: closed_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+    filters:
+      # Both pushes are Inexact: `state` is faithful only inside the
+      # provider's enum domain, and `since` means "updated at or after"
+      # under any granularity fuzz — DataFusion re-applies both.
+      - { column: state, op: eq, input: state, fidelity: inexact }
+      - { column: updated_at, op: gt_eq, input: since, fidelity: inexact, format: rfc3339 }
+
+  issue_comments:
+    action: github.list_issue_comments
+    row_path: "$.comments"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo, issueNumber]
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: body, path: body, type: utf8, nullable: true }
+      - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+
+  pull_requests:
+    action: github.list_pull_requests
+    row_path: "$.pull_requests"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo]
+    fixed_inputs:
+      state: all
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: number, path: number, type: uint64, nullable: false }
+      - { name: title, path: title, type: utf8, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: false }
+      - { name: body, path: body, type: utf8, nullable: true }
+      - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: draft, path: draft, type: boolean, nullable: true }
+      - { name: head_ref, path: head.ref, type: utf8, nullable: true }
+      - { name: base_ref, path: base.ref, type: utf8, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_utc, nullable: true }
+      - { name: closed_at, path: closed_at, type: timestamp_ms_utc, nullable: true }
+      - { name: merged_at, path: merged_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+    filters:
+      - { column: state, op: eq, input: state, fidelity: inexact }
+
+  reviews:
+    action: github.list_pull_request_reviews
+    row_path: "$.reviews"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo, pullNumber]
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: false }
+      - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: body, path: body, type: utf8, nullable: true }
+      - { name: commit_id, path: commit_id, type: utf8, nullable: true }
+      - { name: submitted_at, path: submitted_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+
+  commits:
+    action: github.list_commits
+    row_path: "$.commits"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo]
+    columns:
+      - { name: sha, path: sha, type: utf8, nullable: false }
+      - { name: message, path: commit.message, type: utf8, nullable: true }
+      - { name: author_login, path: author.login, type: utf8, nullable: true }
+      - { name: author_name, path: commit.author.name, type: utf8, nullable: true }
+      - { name: authored_at, path: commit.author.date, type: timestamp_ms_utc, nullable: true }
+      - { name: committed_at, path: commit.committer.date, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+
+  workflow_runs:
+    action: github.list_workflow_runs
+    row_path: "$.workflow_runs"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo]
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: workflow_id, path: workflow_id, type: uint64, nullable: true }
+      - { name: run_number, path: run_number, type: uint64, nullable: true }
+      - { name: event, path: event, type: utf8, nullable: true }
+      - { name: status, path: status, type: utf8, nullable: true }
+      - { name: conclusion, path: conclusion, type: utf8, nullable: true }
+      - { name: head_branch, path: head_branch, type: utf8, nullable: true }
+      - { name: head_sha, path: head_sha, type: utf8, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }
+
+  releases:
+    action: github.list_releases
+    row_path: "$.releases"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 100
+    resources:
+      required: [owner, repo]
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: tag_name, path: tag_name, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: draft, path: draft, type: boolean, nullable: true }
+      - { name: prerelease, path: prerelease, type: boolean, nullable: true }
+      - { name: body, path: body, type: utf8, nullable: true }
+      - { name: author_login, path: author.login, type: utf8, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+      - { name: published_at, path: published_at, type: timestamp_ms_utc, nullable: true }
+      - { name: html_url, path: html_url, type: utf8, nullable: true }

@@ -1,6 +1,8 @@
 //! Built-in source packs: stable relational contracts for SaaS providers.
 //!
-//! A source pack is Skardi-maintained Rust code (never user YAML). Each
+//! A source pack is a Skardi-maintained declarative asset — embedded YAML
+//! compiled into the binary and parsed once at startup (see
+//! `packs::loader`), never user-editable configuration. Each
 //! table definition pins the full relational contract — action, row path,
 //! fixed schema, pagination strategy, allowlisted filters, required
 //! resources — so users bind packs to concrete resources without being able
@@ -119,18 +121,13 @@ impl SourcePackRegistry {
     /// The built-in packs shipped with this Skardi build.
     pub fn builtins() -> Self {
         let mut packs = HashMap::new();
-        packs.insert(
-            super::packs::mock::MOCK_PACK.name,
-            &super::packs::mock::MOCK_PACK,
-        );
-        packs.insert(
-            super::packs::github::GITHUB_PACK.name,
-            &super::packs::github::GITHUB_PACK,
-        );
-        packs.insert(
-            super::packs::slack::SLACK_PACK.name,
-            &super::packs::slack::SLACK_PACK,
-        );
+        for pack in [
+            super::packs::mock::pack(),
+            super::packs::github::pack(),
+            super::packs::slack::pack(),
+        ] {
+            packs.insert(pack.name, pack);
+        }
         Self { packs }
     }
 
@@ -248,18 +245,21 @@ mod tests {
         let pack = registry.require("github").unwrap();
         assert_eq!(pack.name, "github");
         assert_eq!(pack.version, 1);
+        // Sorted by table name: the loader stores tables in a BTreeMap so
+        // registry (and catalog) order is deterministic regardless of how
+        // the YAML asset is laid out.
         let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
         assert_eq!(
             ids,
             vec![
-                "github.repositories",
-                "github.issues",
-                "github.issue_comments",
-                "github.pull_requests",
-                "github.reviews",
                 "github.commits",
-                "github.workflow_runs",
+                "github.issue_comments",
+                "github.issues",
+                "github.pull_requests",
                 "github.releases",
+                "github.repositories",
+                "github.reviews",
+                "github.workflow_runs",
             ]
         );
     }

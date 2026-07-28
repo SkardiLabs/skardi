@@ -597,7 +597,7 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
+    use crate::sources::providers::open_connector::packs::mock;
     use crate::sources::providers::open_connector::testutil::{
         CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
     };
@@ -611,7 +611,7 @@ mod tests {
         limit: Option<usize>,
         source_pack_version: u32,
     ) -> OpenConnectorExec {
-        let table = &MOCK_PACK.tables[0];
+        let table = &mock::pack().tables[0];
         OpenConnectorExec::new(
             client,
             cache,

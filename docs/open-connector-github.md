@@ -90,7 +90,8 @@ predicate/`LIMIT`; the knobs are documented in
 [the integration guide](open-connector.md#bounds-retries-and-errors).
 
 Column references live in the pack definition
-(`crates/skardi/src/sources/providers/open_connector/packs/github.rs`);
+(`crates/skardi/src/sources/providers/open_connector/packs/github.yaml`,
+the pack's embedded declarative definition);
 highlights and caveats:
 
 - **`issues` is pure issues.** GitHub's raw issues endpoint mixes pull
