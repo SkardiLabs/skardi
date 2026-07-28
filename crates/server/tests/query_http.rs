@@ -396,13 +396,20 @@ async fn prepare_insert_into_read_only_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// purpose field
+// ai_context field
 
 #[tokio::test]
-async fn purpose_field_is_accepted() {
+async fn ai_context_is_accepted() {
     let resp = post_query(
         make_state(),
-        json!({"sql": "SELECT id FROM products", "purpose": "weekly pricing dashboard"}),
+        json!({
+            "sql": "SELECT id FROM products",
+            "ai_context": {
+                "purpose": "weekly pricing dashboard",
+                "session_id": "sess-1",
+                "agent_id": "pricing-bot",
+            },
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -411,11 +418,103 @@ async fn purpose_field_is_accepted() {
 }
 
 #[tokio::test]
-async fn over_long_purpose_rejected() {
-    let long_purpose = "x".repeat(2001);
+async fn ai_context_omitted_is_accepted() {
+    // Application/console queries omit ai_context entirely.
+    let resp = post_query(make_state(), json!({"sql": "SELECT id FROM products"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["success"], json!(true));
+}
+
+#[tokio::test]
+async fn ai_context_not_an_object_rejected() {
+    for bad in [json!("just a string"), json!(["a", "b"]), json!(42)] {
+        let resp = post_query(make_state(), json!({"sql": "SELECT 1", "ai_context": bad})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "ai_context: {bad}");
+        let body = body_to_json(resp).await;
+        assert_eq!(body["error_type"], json!("parameter_validation_error"));
+    }
+}
+
+#[tokio::test]
+async fn ai_context_missing_purpose_rejected() {
     let resp = post_query(
         make_state(),
-        json!({"sql": "SELECT 1", "purpose": long_purpose}),
+        json!({"sql": "SELECT 1", "ai_context": {"session_id": "sess-1"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn ai_context_missing_session_id_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "ai_context": {"purpose": "audit"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn ai_context_empty_purpose_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "ai_context": {"purpose": "", "session_id": "sess-1"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn over_long_purpose_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT 1",
+            "ai_context": {"purpose": "x".repeat(2001), "session_id": "sess-1"},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn over_long_session_id_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT 1",
+            "ai_context": {"purpose": "audit", "session_id": "x".repeat(201)},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn over_size_ai_context_rejected() {
+    // A free-form key large enough to push the serialized object past 4096 B.
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT 1",
+            "ai_context": {
+                "purpose": "audit",
+                "session_id": "sess-1",
+                "blob": "x".repeat(5000),
+            },
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -427,7 +526,7 @@ async fn over_long_purpose_rejected() {
 // operator query-log file
 
 #[tokio::test]
-async fn query_log_records_raw_sql_and_purpose_when_configured() {
+async fn query_log_records_raw_sql_and_ai_context_when_configured() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let state = make_state_with_query_log(Some(tmp.path().to_path_buf()));
 
@@ -435,7 +534,7 @@ async fn query_log_records_raw_sql_and_purpose_when_configured() {
         state,
         json!({
             "sql": "SELECT id FROM products WHERE brand = 'Apple'",
-            "purpose": "brand audit",
+            "ai_context": {"purpose": "brand audit", "session_id": "sess-42"},
         }),
     )
     .await;
@@ -447,8 +546,8 @@ async fn query_log_records_raw_sql_and_purpose_when_configured() {
         "query log should record the raw SQL: {contents}"
     );
     assert!(
-        contents.contains("brand audit"),
-        "query log should record the purpose: {contents}"
+        contents.contains("brand audit") && contents.contains("sess-42"),
+        "query log should record the ai_context: {contents}"
     );
 }
 

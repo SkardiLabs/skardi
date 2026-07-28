@@ -31,6 +31,15 @@ const QUERY_METRICS_LABEL: &str = "query";
 /// intent, not payloads; the cap keeps a runaway string out of the logs.
 const MAX_PURPOSE_CHARS: usize = 2000;
 
+/// Upper bound on the `session_id` field length (characters). It is an opaque
+/// grouping key, not a payload.
+const MAX_SESSION_ID_CHARS: usize = 200;
+
+/// Upper bound on the serialized size of the whole `ai_context` object (bytes).
+/// The object is free-form beyond its two required fields; the cap keeps a
+/// runaway blob out of the logs.
+const MAX_AI_CONTEXT_BYTES: usize = 4096;
+
 /// Request structure for ad-hoc query execution
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
@@ -38,9 +47,61 @@ pub struct QueryRequest {
     pub sql: String,
     /// Result row cap; defaults to [`DEFAULT_MAX_ROWS`]. Must be >= 1.
     pub max_rows: Option<usize>,
-    /// Free-text reason the caller (typically an agent) is running this query.
-    /// Recorded for context; never executed. Capped at [`MAX_PURPOSE_CHARS`].
-    pub purpose: Option<String>,
+    /// Optional agent-supplied context describing and grouping this query.
+    /// Application/console queries omit it. When present it must be a JSON
+    /// object carrying a non-empty `purpose` and `session_id` (see
+    /// [`validate_ai_context`]); other keys are free-form. Recorded for
+    /// observability; never executed.
+    pub ai_context: Option<Value>,
+}
+
+/// Validate an optional `ai_context`. `Ok(())` when absent or well-formed;
+/// `Err(msg)` (a client-safe message) when present but malformed.
+///
+/// Rules, first failure wins: must be a JSON object; serialized size within
+/// [`MAX_AI_CONTEXT_BYTES`]; a non-empty string `purpose` within
+/// [`MAX_PURPOSE_CHARS`]; a non-empty string `session_id` within
+/// [`MAX_SESSION_ID_CHARS`].
+fn validate_ai_context(ai_context: Option<&Value>) -> Result<(), String> {
+    let Some(value) = ai_context else {
+        return Ok(());
+    };
+
+    let Some(object) = value.as_object() else {
+        return Err("ai_context must be a JSON object".to_string());
+    };
+
+    // Serialized length bounds the whole free-form object, required fields
+    // included. `to_string` on a serde value cannot fail.
+    if value.to_string().len() > MAX_AI_CONTEXT_BYTES {
+        return Err(format!(
+            "ai_context must serialize to at most {MAX_AI_CONTEXT_BYTES} bytes"
+        ));
+    }
+
+    validate_context_string(object.get("purpose"), "purpose", MAX_PURPOSE_CHARS)?;
+    validate_context_string(object.get("session_id"), "session_id", MAX_SESSION_ID_CHARS)?;
+
+    Ok(())
+}
+
+/// Require a context field to be present, a string, non-empty, and within
+/// `max_chars`.
+fn validate_context_string(
+    field: Option<&Value>,
+    name: &str,
+    max_chars: usize,
+) -> Result<(), String> {
+    match field.and_then(Value::as_str) {
+        None => Err(format!(
+            "ai_context.{name} is required and must be a non-empty string"
+        )),
+        Some("") => Err(format!("ai_context.{name} must not be empty")),
+        Some(s) if s.chars().count() > max_chars => Err(format!(
+            "ai_context.{name} must be at most {max_chars} characters"
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Execute ad-hoc SQL endpoint - POST /query
@@ -75,13 +136,10 @@ pub async fn execute_query(
         None => DEFAULT_MAX_ROWS,
     };
 
-    // `purpose` is caller-supplied intent, not a payload; keep it bounded so a
-    // runaway string can't bloat the marker log or the query-log file.
-    if request
-        .purpose
-        .as_ref()
-        .is_some_and(|p| p.chars().count() > MAX_PURPOSE_CHARS)
-    {
+    // `ai_context` is caller-supplied metadata, not a payload. Enforce its
+    // minimum structure and keep it bounded so a runaway blob can't bloat the
+    // marker log or the query-log file.
+    if let Err(message) = validate_ai_context(request.ai_context.as_ref()) {
         let elapsed_ms = start_time.elapsed().as_millis() as f64;
         app_state.metrics.record_error(
             QUERY_METRICS_LABEL,
@@ -91,11 +149,7 @@ pub async fn execute_query(
 
         return Err((
             StatusCode::BAD_REQUEST,
-            create_error_response(
-                &format!("purpose must be at most {MAX_PURPOSE_CHARS} characters"),
-                "parameter_validation_error",
-                None,
-            ),
+            create_error_response(&message, "parameter_validation_error", None),
         ));
     }
 
@@ -138,11 +192,15 @@ pub async fn execute_query(
 
     // Audit marker: value-free by design. The raw SQL is *not* logged here —
     // it may inline secrets/PII and this line fans out to any OTLP collector.
-    // Only `purpose` (caller intent) and non-sensitive metadata are recorded.
+    // Only `ai_context` (caller metadata) and non-sensitive fields are recorded.
     tracing::info!(
         max_rows,
         kind = ?statement_kind,
-        purpose = request.purpose.as_deref().unwrap_or(""),
+        ai_context = request
+            .ai_context
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
         "Executing ad-hoc query"
     );
 
@@ -150,7 +208,7 @@ pub async fn execute_query(
     // operator is responsible for securing. Recorded before execution so a
     // crash mid-query still leaves a record.
     if let Some(query_log) = &app_state.query_log {
-        query_log.record(&request.sql, request.purpose.as_deref(), max_rows);
+        query_log.record(&request.sql, request.ai_context.as_ref(), max_rows);
     }
 
     // Queries get the row cap pushed into the plan (fetch cap + 1 so

@@ -3,7 +3,7 @@
 //!
 //! Off unless the operator sets `--query-log <path>`. When enabled, every
 //! statement the `/query` endpoint hands to the engine is appended here as one
-//! JSON line (raw SQL, caller `purpose`, `max_rows`, timestamp).
+//! JSON line (raw SQL, caller `ai_context`, `max_rows`, timestamp).
 //!
 //! Because this file records **raw SQL** — which may embed literal secrets or
 //! PII — securing, rotating, and retaining it is the **operator's
@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Append-only sink for raw ad-hoc SQL. Constructed once at startup when the
 /// operator supplies a path; cloned across requests behind an `Arc`.
@@ -35,11 +35,11 @@ impl QueryLog {
 
     /// Append one JSON line recording an executed statement. A write failure is
     /// logged and swallowed — a broken audit file must never fail the query.
-    pub fn record(&self, sql: &str, purpose: Option<&str>, max_rows: usize) {
+    pub fn record(&self, sql: &str, ai_context: Option<&Value>, max_rows: usize) {
         let line = json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "sql": sql,
-            "purpose": purpose,
+            "ai_context": ai_context,
             "max_rows": max_rows,
         });
         let mut guard = self.file.lock().unwrap_or_else(|p| p.into_inner());
@@ -56,15 +56,12 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn record_appends_sql_and_purpose() {
+    fn record_appends_sql_and_ai_context() {
         let tmp = NamedTempFile::new().unwrap();
         let log = QueryLog::open(tmp.path()).unwrap();
 
-        log.record(
-            "SELECT * FROM t WHERE ssn = '123-45-6789'",
-            Some("kyc"),
-            100,
-        );
+        let ctx = json!({"purpose": "kyc", "session_id": "sess-1"});
+        log.record("SELECT * FROM t WHERE ssn = '123-45-6789'", Some(&ctx), 100);
 
         let contents = fs::read_to_string(tmp.path()).unwrap();
         assert!(
@@ -72,8 +69,8 @@ mod tests {
             "raw SQL should be recorded: {contents}"
         );
         assert!(
-            contents.contains("kyc"),
-            "purpose should be recorded: {contents}"
+            contents.contains("kyc") && contents.contains("sess-1"),
+            "ai_context should be recorded: {contents}"
         );
     }
 

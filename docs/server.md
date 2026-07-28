@@ -109,7 +109,7 @@ and updates automatically when pipelines, jobs, or semantics reload.
 | `/pipeline/:name` | GET | Metadata for one pipeline. |
 | `/health/:name` | GET | Per-pipeline health check (includes upstream data-source status). |
 | `/:name/execute` | POST | Execute a pipeline by name. Body is the JSON param map. See [pipelines.md](pipelines.md). |
-| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "purpose": "..." }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
+| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "ai_context": { "purpose": "...", "session_id": "..." } }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
 | `/jobs` | GET | List all registered jobs with destinations. |
 | `/jobs/:name/run` | POST | Submit a new job run. Body is the JSON param map. See [jobs.md](jobs.md). |
 | `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
@@ -132,16 +132,21 @@ Request fields:
 
 - `sql` (string, required) — one SQL statement.
 - `max_rows` (positive integer, optional, default 1000) — result row cap.
-- `purpose` (string, optional, ≤ 2000 chars) — free-text reason the caller is
-  running the query (typically an agent documenting intent). Recorded for
-  context; never executed. Over the cap → `400 parameter_validation_error`.
+- `ai_context` (object, optional) — agent-supplied context describing and
+  grouping the query. Application/console queries omit it. When present it must
+  be a JSON object carrying two required non-empty strings — `purpose`
+  (≤ 2000 chars, why the query runs) and `session_id` (≤ 200 chars, groups
+  queries from one agent session) — plus any free-form keys of the caller's
+  choosing. The whole object must serialize to ≤ 4096 bytes. Recorded for
+  observability; never executed. Any violation → `400
+  parameter_validation_error`.
 
 **Query logging.** By default the raw SQL is **never written to logs or
 traces** — because callers may inline literal secrets/PII, only a value-free
-marker (`purpose`, `max_rows`, statement kind, timing) is emitted. To keep a
+marker (`ai_context`, `max_rows`, statement kind, timing) is emitted. To keep a
 full audit trail, start the server with `--query-log <path>`: every executed
 statement is appended to that local file as one JSON line (raw `sql`,
-`purpose`, `max_rows`, timestamp). That file contains sensitive query text, so
+`ai_context`, `max_rows`, timestamp). That file contains sensitive query text, so
 **securing, rotating, and retaining it is the operator's responsibility**. The
 sink is a dedicated local file, never the OTLP/tracing pipeline, so enabling it
 does not push query text to external collectors.
