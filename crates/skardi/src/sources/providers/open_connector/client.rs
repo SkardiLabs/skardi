@@ -18,17 +18,28 @@
 //!
 //! ## Gateway HTTP contract
 //!
-//! The paths below are centralized in private constants — they are the one
-//! place to reconcile if the upstream Open Connector API evolves:
+//! Verified against a live Open Connector gateway (v1.3.1) and its source.
+//! Every `/v1` response uses one uniform JSON envelope:
 //!
-//! - `GET {base}/v1/health` — any 2xx is healthy.
-//! - `GET {base}/v1/actions/{action_id}` — action metadata:
-//!   `{ "input_schema": …, "output_schema": …, "locally_executable": bool,
-//!      "connection_aliases": […] }` (all fields optional but the last two).
-//! - `POST {base}/v1/actions/{action_id}/execute` — body `{"input": …}`;
-//!   the response envelope's `output` field is returned. An **object**
-//!   without an `output` field is rejected as an error/async envelope; a
-//!   non-object body (bare array/scalar) is returned as the output itself.
+//! ```json
+//! { "success": true, "message": "OK", "data": …, "meta": {} }
+//! ```
+//!
+//! Failures carry `success: false`, a human-readable `message`, a stable
+//! `errorCode` (e.g. `invalid_input`, `authorization_failed`), and
+//! `meta.executionId` once execution started. The paths below are
+//! centralized in private constants — they are the one place to reconcile
+//! if the upstream API evolves again:
+//!
+//! - `GET {base}/v1/health` — any 2xx is healthy (the Bearer token is
+//!   required whenever the gateway has runtime auth configured).
+//! - `GET {base}/v1/actions/{action_id}` — action metadata under `data`:
+//!   `{ "inputSchema": …, "outputSchema": …,
+//!      "execution": { "locallyExecutable": bool, … } }`.
+//! - `POST {base}/v1/actions/{action_id}` — body `{"input": …}`; on
+//!   success `data` is the action output. There is **no** `/execute`
+//!   suffix, and a named connection is selected with the
+//!   `x-oo-connector-alias` header.
 
 use std::time::Duration;
 
@@ -46,17 +57,14 @@ use crate::util::http::parse_retry_after;
 
 /// Health endpoint path (relative to the gateway base URL).
 const HEALTH_PATH: &str = "v1/health";
-/// Action metadata endpoint prefix; the percent-encoded action ID is appended.
+/// Action endpoint prefix; the percent-encoded action ID is appended.
+/// `GET` fetches metadata, `POST` executes — same path, no suffix.
 const ACTIONS_PATH: &str = "v1/actions";
-/// Suffix for the action execution endpoint.
-/// Only exercised by tests until the scan engine wires the production path.
-#[allow(dead_code)]
-const EXECUTE_SUFFIX: &str = "execute";
 
-/// Header carrying the Open Connector connection alias on execute calls.
-/// Only exercised by tests until the scan engine wires the production path.
-#[allow(dead_code)]
-const CONNECTION_ALIAS_HEADER: &str = "x-openconnector-connection-alias";
+/// Header selecting a named Open Connector connection on execute calls.
+/// (`x-oomol-connector-alias` is an accepted alias; the gateway checks
+/// this spelling second, and its docs use it.)
+const CONNECTION_ALIAS_HEADER: &str = "x-oo-connector-alias";
 
 /// Maximum attempts for one call (including the first) before
 /// [`OpenConnectorError::RetriesExhausted`] is raised. Also the serde
@@ -146,20 +154,84 @@ pub struct DiscoveredAction {
     /// "the gateway said yes" — default-deny consumers (the action registry)
     /// must treat `None` as not executable.
     pub locally_executable: Option<bool>,
-    /// Connection aliases available for this action.
-    pub connection_aliases: Vec<String>,
+    /// Whether the gateway classifies the action as a non-mutating read.
+    ///
+    /// Same `Option` discipline as `locally_executable`: `None` means the
+    /// gateway did not classify the action, and default-deny consumers (the
+    /// raw-action UDTF) must refuse to execute it. Source-pack actions are
+    /// read-only by Skardi's own review instead, so packs do not consult
+    /// this flag.
+    ///
+    /// Today's Open Connector publishes **no** read/write classification
+    /// (verified against the gateway and its source), so this is always
+    /// `None` against a real gateway and raw scans are refused; the parse
+    /// site (`execution.readOnly`) is forward-compatible for when the
+    /// upstream grows one.
+    pub read_only: Option<bool>,
 }
 
-/// Wire shape of the action discovery response. Unknown fields are ignored
-/// so additive gateway changes don't break discovery. `locally_executable`
-/// deliberately has no default: a missing field must stay missing.
+/// Uniform `/v1` response envelope. Unknown fields (`meta`, additive keys)
+/// are ignored; `success` has no default so a body that isn't an envelope
+/// fails to parse instead of masquerading as a failed one.
+#[derive(Debug, Deserialize)]
+struct GatewayEnvelope {
+    success: bool,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    data: Option<Value>,
+    #[serde(default, rename = "errorCode")]
+    error_code: Option<String>,
+    #[serde(default)]
+    meta: Option<Value>,
+}
+
+impl GatewayEnvelope {
+    /// Render a failed envelope as `"<errorCode>: <message> (execution
+    /// <id>)"`, bounded — the pieces the gateway's own audit log keys on.
+    fn failure_reason(&self) -> String {
+        const MAX_MESSAGE: usize = 512;
+        let code = self.error_code.as_deref().unwrap_or("error");
+        let message: String = self
+            .message
+            .as_deref()
+            .unwrap_or("(no message)")
+            .chars()
+            .take(MAX_MESSAGE)
+            .collect();
+        match self
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("executionId"))
+            .and_then(Value::as_str)
+        {
+            Some(id) => format!("{code}: {message} (execution {id})"),
+            None => format!("{code}: {message}"),
+        }
+    }
+}
+
+/// Wire shape of the discovery envelope's `data`. Unknown fields are
+/// ignored so additive gateway changes don't break discovery;
+/// `locallyExecutable` deliberately has no default: a missing field must
+/// stay missing.
 #[derive(Debug, Deserialize)]
 struct RawDiscoveredAction {
+    #[serde(rename = "inputSchema")]
     input_schema: Option<Value>,
+    #[serde(rename = "outputSchema")]
     output_schema: Option<Value>,
+    execution: Option<RawExecution>,
+}
+
+/// The discovery `execution` block: runtime executability plus the
+/// (not-yet-published) read-only classification.
+#[derive(Debug, Deserialize)]
+struct RawExecution {
+    #[serde(rename = "locallyExecutable")]
     locally_executable: Option<bool>,
-    #[serde(default)]
-    connection_aliases: Vec<String>,
+    #[serde(rename = "readOnly")]
+    read_only: Option<bool>,
 }
 
 /// Execute request envelope. Borrowing `input` lets reqwest serialize the
@@ -333,7 +405,7 @@ impl OpenConnectorClient {
         // Boundary check before URL construction: a dot segment would be
         // resolved by Url::join and escape the /v1/actions/ namespace.
         validate_action_id(action_id)?;
-        let url = self.action_url(action_id, None);
+        let url = self.action_url(action_id);
         let operation = format!("discover action '{action_id}'");
         let response = self
             .send_with_retry(
@@ -356,35 +428,44 @@ impl OpenConnectorClient {
             .await?;
 
         let body = self.read_body_bounded(response, &operation).await?;
-        let raw: RawDiscoveredAction = serde_json::from_str(&body).map_err(|e| {
+        let envelope = parse_envelope(&body, &operation)?;
+        if !envelope.success {
+            return Err(OpenConnectorError::ActionDiscoveryFailed {
+                action_id: action_id.to_string(),
+                reason: envelope.failure_reason(),
+            });
+        }
+        let data = envelope
+            .data
+            .ok_or_else(|| OpenConnectorError::InvalidGatewayResponse {
+                operation: operation.clone(),
+                reason: "successful discovery envelope has no 'data'".to_string(),
+            })?;
+        let raw: RawDiscoveredAction = serde_json::from_value(data).map_err(|e| {
             OpenConnectorError::InvalidGatewayResponse {
                 operation: operation.clone(),
-                reason: format!("action metadata is not valid JSON: {e}"),
+                reason: format!("action metadata does not match the discovery shape: {e}"),
             }
         })?;
 
         Ok(DiscoveredAction {
             input_schema: raw.input_schema,
             output_schema: raw.output_schema,
-            locally_executable: raw.locally_executable,
-            connection_aliases: raw.connection_aliases,
+            locally_executable: raw.execution.as_ref().and_then(|e| e.locally_executable),
+            read_only: raw.execution.as_ref().and_then(|e| e.read_only),
         })
     }
 
-    /// `POST /v1/actions/{action_id}/execute` — execute one action and return
-    /// the response envelope's `output` value.
+    /// `POST /v1/actions/{action_id}` — execute one action and return the
+    /// response envelope's `data` value (the executor output).
     ///
     /// Crate-internal on purpose: execution is the *dangerous* half of the
     /// gateway contract (mutating actions exist upstream), and the
     /// default-deny gating lives one layer up — `ActionRegistry::load` admits
-    /// only explicitly allowlisted, locally-executable actions, and the
-    /// future scan engine / UDTFs must check membership before calling this.
-    /// Keeping the method `pub(crate)` makes that gating structurally
-    /// un-bypassable from outside the crate.
-    ///
-    /// Only exercised by tests until the scan engine wires the production
-    /// path (registration currently stops at `ExecutionNotImplemented`).
-    #[allow(dead_code)]
+    /// only explicitly allowlisted, locally-executable actions, and the scan
+    /// engine / UDTFs check membership before calling this. Keeping the
+    /// method `pub(crate)` makes that gating structurally un-bypassable from
+    /// outside the crate.
     pub(crate) async fn execute(
         &self,
         action_id: &str,
@@ -393,7 +474,7 @@ impl OpenConnectorClient {
     ) -> Result<Value, OpenConnectorError> {
         // Same namespace-escape guard as discover_action.
         validate_action_id(action_id)?;
-        let url = self.action_url(action_id, Some(EXECUTE_SUFFIX));
+        let url = self.action_url(action_id);
         let operation = format!("execute action '{action_id}'");
         // Borrowing envelope: reqwest serializes it directly, so the caller's
         // input Value is not deep-cloned into an intermediate `json!` value.
@@ -420,34 +501,19 @@ impl OpenConnectorClient {
             .await?;
 
         let text = self.read_body_bounded(response, &operation).await?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| {
-            OpenConnectorError::InvalidGatewayResponse {
-                operation: operation.clone(),
-                reason: format!("execution envelope is not valid JSON: {e}"),
-            }
-        })?;
-
-        // The contract wraps results in an `output` field. An object without
-        // one is an envelope we don't understand (error body, async job
-        // handle) — failing loudly keeps contract violations out of Arrow
-        // rows. `map.remove` moves the value out instead of cloning the
-        // whole envelope (the eager `unwrap_or(value.clone())` cloned up to
-        // the 16 MiB bound even when `output` was present).
-        //
-        // A non-object body (bare array/scalar) can't be confused with an
-        // error envelope, so it is returned as the output itself.
-        match value {
-            Value::Object(mut map) => match map.remove("output") {
-                Some(output) => Ok(output),
-                None => Err(OpenConnectorError::InvalidGatewayResponse {
-                    operation: operation.clone(),
-                    reason: "object response has no 'output' field; it looks like an error \
-                             or async envelope, not action output"
-                        .to_string(),
-                }),
-            },
-            other => Ok(other),
+        // A 2xx body that isn't a gateway envelope is a contract violation —
+        // failing loudly keeps it out of Arrow rows. A 2xx envelope with
+        // `success: false` should not occur (failures come with 4xx/5xx),
+        // but a gateway that did send one must surface as the failure it
+        // reports, never as action output.
+        let envelope = parse_envelope(&text, &operation)?;
+        if !envelope.success {
+            return Err(OpenConnectorError::ActionExecutionFailed {
+                action_id: action_id.to_string(),
+                reason: envelope.failure_reason(),
+            });
         }
+        Ok(envelope.data.unwrap_or(Value::Null))
     }
 
     /// Join a relative path onto the gateway base URL.
@@ -458,13 +524,10 @@ impl OpenConnectorClient {
             .to_string()
     }
 
-    /// Build the URL for one action, optionally with a path suffix (`execute`).
-    fn action_url(&self, action_id: &str, suffix: Option<&str>) -> String {
+    /// Build the URL for one action (`GET` discovers, `POST` executes).
+    fn action_url(&self, action_id: &str) -> String {
         let encoded = utf8_percent_encode(action_id, ACTION_ID_SET);
-        match suffix {
-            Some(suffix) => self.endpoint(&format!("{ACTIONS_PATH}/{encoded}/{suffix}")),
-            None => self.endpoint(&format!("{ACTIONS_PATH}/{encoded}")),
-        }
+        self.endpoint(&format!("{ACTIONS_PATH}/{encoded}"))
     }
 
     /// Send one request with bounded retries. `terminal_error` maps a
@@ -608,10 +671,26 @@ async fn read_snippet(response: Response, limit: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Render a terminal HTTP failure as `"HTTP <status>: <truncated body>"`.
-/// Bodies are truncated so a noisy gateway can't flood the error chain.
+/// Parse a body as the uniform gateway envelope, mapping a non-envelope
+/// body to [`OpenConnectorError::InvalidGatewayResponse`].
+fn parse_envelope(body: &str, operation: &str) -> Result<GatewayEnvelope, OpenConnectorError> {
+    serde_json::from_str(body).map_err(|e| OpenConnectorError::InvalidGatewayResponse {
+        operation: operation.to_string(),
+        reason: format!("response is not a gateway envelope: {e}"),
+    })
+}
+
+/// Render a terminal HTTP failure. A body that parses as a failed gateway
+/// envelope is rendered structurally (`HTTP 403: authorization_failed: …`);
+/// anything else is truncated raw so a noisy gateway can't flood the error
+/// chain.
 fn terminal_reason(status: StatusCode, body: &str) -> String {
     const MAX_BODY: usize = 512;
+    if let Ok(envelope) = serde_json::from_str::<GatewayEnvelope>(body)
+        && !envelope.success
+    {
+        return format!("HTTP {}: {}", status.as_u16(), envelope.failure_reason());
+    }
     let trimmed: String = body.chars().take(MAX_BODY).collect();
     format!("HTTP {}: {}", status.as_u16(), trimmed)
 }
@@ -644,7 +723,7 @@ fn retry_after(response: &Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err, envelope_ok,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -966,17 +1045,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_action_parses_metadata() {
+    async fn discover_action_parses_the_envelope_metadata() {
+        // The live gateway's discovery shape: camelCase schemas and the
+        // execution block, all inside the uniform envelope's `data`.
         let gateway = MockGateway::start(|req| {
             if req.path == "/v1/actions/github.list_repository_issues" {
-                MockResponse::ok(
-                    r#"{
-                        "input_schema": {"type": "object"},
-                        "output_schema": {"type": "object", "properties": {"issues": {"type": "array"}}},
-                        "locally_executable": true,
-                        "connection_aliases": ["work", "personal"]
-                    }"#,
-                )
+                MockResponse::ok(&discovery_ok(
+                    r#"{"type": "object"}"#,
+                    r#"{"type": "object", "properties": {"issues": {"type": "array"}}}"#,
+                    true,
+                    None,
+                ))
             } else {
                 MockResponse::new(404, "{}")
             }
@@ -988,9 +1067,27 @@ mod tests {
             .await
             .expect("discover");
         assert_eq!(action.locally_executable, Some(true));
-        assert_eq!(action.connection_aliases, vec!["work", "personal"]);
+        assert_eq!(
+            action.read_only, None,
+            "today's gateway publishes no read-only classification"
+        );
         assert!(action.input_schema.is_some());
         assert!(action.output_schema.is_some());
+    }
+
+    #[tokio::test]
+    async fn discover_action_forward_compatible_read_only_is_parsed() {
+        // If a future gateway publishes execution.readOnly, the client picks
+        // it up without changes; until then the field stays None (above).
+        let gateway =
+            MockGateway::start(|_| MockResponse::ok(&discovery_ok("{}", "{}", true, Some(true))))
+                .await;
+
+        let action = test_client(&gateway, 3)
+            .discover_action("github.x")
+            .await
+            .expect("discover");
+        assert_eq!(action.read_only, Some(true));
     }
 
     #[tokio::test]
@@ -998,7 +1095,7 @@ mod tests {
         // The client must not invent a default: "gateway did not say" is
         // preserved as None so default-deny consumers can reject it.
         let gateway = MockGateway::start(|_| {
-            MockResponse::ok(r#"{"input_schema": {}, "output_schema": {}}"#)
+            MockResponse::ok(&envelope_ok(r#"{"inputSchema": {}, "outputSchema": {}}"#))
         })
         .await;
 
@@ -1053,10 +1150,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_returns_output_and_sends_alias_header() {
+    async fn execute_returns_envelope_data_and_sends_alias_header() {
         let gateway = MockGateway::start(|req| {
             assert_eq!(req.method, "POST");
-            MockResponse::ok(r#"{"output": {"issues": [1, 2, 3]}}"#)
+            MockResponse::ok(&envelope_ok(r#"{"issues": [1, 2, 3]}"#))
         })
         .await;
 
@@ -1073,13 +1170,11 @@ mod tests {
         let requests = gateway.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].path,
-            "/v1/actions/github.list_repository_issues/execute"
+            requests[0].path, "/v1/actions/github.list_repository_issues",
+            "execute posts to the action path itself — the gateway has no /execute suffix"
         );
         assert_eq!(
-            requests[0]
-                .header("x-openconnector-connection-alias")
-                .as_deref(),
+            requests[0].header("x-oo-connector-alias").as_deref(),
             Some("work")
         );
         assert!(
@@ -1092,14 +1187,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_object_without_output_field_is_invalid_response() {
-        // An object without `output` is an envelope we don't understand
-        // (error body, async job handle) — it must fail loudly rather than
-        // flow downstream as action output.
+    async fn execute_non_envelope_body_is_invalid_response() {
+        // A 2xx body without the uniform envelope (no `success` bool) is a
+        // contract violation — it must fail loudly rather than flow
+        // downstream as action output. Bare arrays included: the real
+        // gateway always wraps output in the envelope's `data`.
         for body in [
-            r#"{"error": "rate limited"}"#,
+            r#"{"output": {"issues": []}}"#,
             r#"{"status": "pending", "job_id": "j-1"}"#,
-            r#"{"rows": []}"#,
+            r#"[{"id": 1}, {"id": 2}]"#,
         ] {
             let owned = body.to_string();
             let gateway = MockGateway::start(move |_| MockResponse::ok(&owned)).await;
@@ -1115,29 +1211,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_bare_array_body_is_returned_whole() {
-        // A non-object body can't be confused with an error envelope, so a
-        // bare array is a legitimate action result.
-        let gateway = MockGateway::start(|_| MockResponse::ok(r#"[{"id": 1}, {"id": 2}]"#)).await;
-        let value = test_client(&gateway, 3)
-            .execute("github.x", &serde_json::json!({}), None)
-            .await
-            .expect("execute");
-        assert_eq!(value, serde_json::json!([{"id": 1}, {"id": 2}]));
-    }
-
-    #[tokio::test]
-    async fn execute_400_is_terminal_without_retry() {
-        let gateway =
-            MockGateway::start(|_| MockResponse::new(400, r#"{"error": "bad input"}"#)).await;
+    async fn execute_2xx_failed_envelope_surfaces_the_error_code() {
+        // Failures normally arrive with a 4xx/5xx status, but a 2xx
+        // `success: false` envelope must still surface as the failure it
+        // reports, never as action output.
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(&envelope_err("provider_error", "GitHub said no"))
+        })
+        .await;
         let err = test_client(&gateway, 3)
             .execute("github.x", &serde_json::json!({}), None)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            OpenConnectorError::ActionExecutionFailed { ref reason, .. } if reason.contains("400")
-        ));
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ActionExecutionFailed { ref reason, .. }
+                    if reason.contains("provider_error") && reason.contains("GitHub said no")
+            ),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_400_is_terminal_and_renders_the_envelope_error() {
+        // The live gateway rejects schema-invalid input with HTTP 400 and a
+        // failed envelope; the error must carry its errorCode and message,
+        // not a raw JSON dump.
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(
+                400,
+                &envelope_err(
+                    "invalid_input",
+                    "Action input does not match the action schema.",
+                ),
+            )
+        })
+        .await;
+        let err = test_client(&gateway, 3)
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ActionExecutionFailed { ref reason, .. }
+                    if reason.contains("400")
+                        && reason.contains("invalid_input")
+                        && reason.contains("does not match the action schema")
+            ),
+            "got {err}"
+        );
         assert_eq!(gateway.requests().len(), 1);
     }
 
@@ -1171,7 +1295,7 @@ mod tests {
             if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
                 MockResponse::new(429, "{}").with_header("retry-after", "1")
             } else {
-                MockResponse::ok(r#"{"output": {"ok": true}}"#)
+                MockResponse::ok(&envelope_ok(r#"{"ok": true}"#))
             }
         })
         .await;

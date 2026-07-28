@@ -83,19 +83,93 @@ intact. `CREATE EXTERNAL TABLE ... STORED AS OPEN_CONNECTOR` is a
 documented future extension only, gated on a DDL authorization design —
 do not reintroduce it here.
 
-- [ ] 4.1 `open_connector_query` UDTF (built-in pack definitions only)
-- [ ] 4.2 `open_connector_scan` UDTF (allowlisted raw actions only; deterministic row type or planning error)
-- [ ] 4.3 Security policy enforcement: mutating actions rejected pre-HTTP; YAML overrides cannot swap actions/row paths; default-deny allowlist
-- [ ] 4.4 Observability: scan spans/metrics (gateway, binding, action, cache hit, pages, rows, retries) without tokens or bodies
-- [ ] 4.5 Docs: `docs/open-connector.md`, ctx/UDTF examples, README supported-sources entry (first time the source is actually queryable)
+- [x] 4.1 `open_connector_query` UDTF (built-in pack definitions only): compiles into the same
+      provider/scan/cache path as the YAML-bound table (identical schema, filter allowlist,
+      fingerprint gate, shared per-gateway cache); plans against registration-time discovery,
+      so an undiscovered action is a targeted planning error, never a hidden gateway call
+- [x] 4.2 `open_connector_scan` UDTF (allowlisted raw actions only): deterministic row type
+      derived from the discovered output schema at the row path (primitives typed,
+      `["T","null"]` unions nullable, everything else opaque JSON) or a planning error
+      recommending a source pack; single-page live execution (`PaginationStrategy::SinglePage`,
+      no cache, no filter pushdown)
+- [x] 4.3 Security policy enforcement: raw actions require allowlist membership **and** an
+      explicit `read_only: true` in discovered metadata (mutating and unclassified actions
+      rejected at planning, pre-HTTP, with distinct errors); YAML overrides of pack
+      action/row_path/pagination/columns rejected by `deny_unknown_fields` (tests pin it);
+      default-deny allowlist unchanged
+- [x] 4.4 Observability: scan completion/failure tracing events (gateway, binding, table,
+      action, cache hit, pages, rows, duration); completion events carry identity and
+      counters only, failure events add the error — whose message may quote a bounded
+      (≤512-char) snippet of the gateway's *error* response and a pagination cursor for
+      diagnosability, per the design's "no tokens / credentials / authorization headers /
+      full sensitive inputs" wording — never tokens, successful-response bodies, or row
+      data; client retry warns already carried operation + status
+- [x] 4.5 Docs: `docs/open-connector.md` (config reference, three SQL interfaces, security
+      model, caching, bounds, observability), ctx/UDTF examples inside it, README
+      supported-sources entry (first time the source is actually queryable)
 
-**Verification**: both UDTFs return the stable schema and values of their
-corresponding YAML-registered tables; federated join of the mock pack
-against a local CSV.
+**Verification**: 157 open_connector tests. `open_connector_query` asserted to return the
+same schema and values as `saas.ws.items`, replay from the table's cache entry with zero
+new gateway requests, and push the same `min_value` filter and connection alias;
+`open_connector_scan` asserted to execute exactly one POST, expose derived typed/JSON
+columns, and reject unallowlisted, mutating, unclassified, and schema-indeterminate
+actions before any HTTP execute; federated join of the mock pack (via the UDTF) against a
+local CSV. Scan-completion events are emitted with the final batch (LIMIT-satisfied,
+short-final-page exhaustion, and cache-replay scans included), since a satisfied
+downstream LIMIT drops the stream without another poll; a test-only tracing capture
+(`testutil::capture_events`) pins the emitted events themselves — exactly one
+completion per scan (LIMIT-terminated stream dropped without a further poll, empty
+scan, cache replay) with the documented field values, and exactly one WARN failure
+event carrying the scan identity and error.
 
 ## Milestone 5+ — Real source packs (one PR each, per design rollout)
 
-- [ ] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue comments, pull requests, reviews, commits, workflow runs, releases
+- [x] 5.1 GitHub pack (API-key auth, page-number pagination): repositories, issues, issue
+      comments, pull requests, reviews, commits, workflow runs, releases — all 8 as stable
+      table definitions (`packs/github.rs`, `perPage` 100 — Open Connector's camelCase
+      action-input contract, reconciled against a live gateway). Engine additions the pack
+      required, all sanctioned by the design spec: per-mapping `Fidelity` (issues
+      `updated_at >=` → `since` pushes **Inexact** and DataFusion re-applies it — verified
+      against a gateway that ignores `since` entirely; commits' strictly-after `since` is
+      deliberately NOT mapped since a dropped boundary row is unrecoverable), RFC 3339
+      rendering of timestamp filter literals, `Utf8ListFromObjectKey` for the design's
+      `$.labels[*].name` / `$.assignees[*].login` flattening, a JSON-null *parent* on a
+      nested path is absence → SQL NULL for nullable columns (GitHub `commit.author:
+      null` / `issue.user: null`), and `SourcePackTable::fixed_inputs` pinning `state=all`
+      on issues/pull_requests so `SELECT *` reads the complete collection while a pushed
+      `state` predicate overrides the pin (GitHub defaults to open-only). `issues` is
+      pure issues: the Open Connector action filters out the pull requests GitHub's raw
+      endpoint mixes in, so the table declares no `pull_request` marker column (it could
+      never be non-NULL) and a negative-space guard test
+      (`issues_declares_no_pull_request_marker`) pins that absence. Redacted per-table
+      fixtures (`packs/fixtures/github/`) are the build-time conversion contract
+      (null-bearing, null-parent, empty-list, nested, extra-field rows, and a
+      schema-mismatch page whose targeted (column, page, row, expected, found-kind)
+      error the contract test asserts, per the admission gate); the action IDs,
+      input keys, row paths, and HTTP protocol are reconciled against a live gateway,
+      while fingerprint pins stay `None` like the mock pack until taken from a live
+      gateway's discovered contracts (follow-up).
+      Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
+      visibility incl. the pure-issues note, rate limits, freshness), README row updated.
+      Verification: 27 pack tests (counted by
+      `cargo test -p skardi --lib sources::providers::open_connector::packs::github`;
+      203 open_connector tests total) — 8 fixture contract suites incl. empty pages
+      and the schema-mismatch page, bind-time validation of all 8 contracts, the
+      no-marker negative-space guard, and
+      end-to-end via mock gateway: 150-row two-page scan with the `state=all` pin on
+      every request, pushed `state` override (Inexact — faithful only inside the
+      provider's enum domain), Inexact `since` narrowing + local re-filter keeping the
+      boundary row, LIMIT stopping after one page, `open_connector_query` parity — plus
+      new filters/json_to_arrow engine tests. Runnable local demo (`docs/open-connector/`,
+      in the db-source demo style): bundled stdlib-Python stub gateway standing in for
+      the remote service the way DynamoDB Local does — speaking the gateway's real
+      protocol (uniform `{success, message, data, meta}` envelope, `POST
+      /v1/actions/:id`, camelCase inputs) — committed ctx + four pipelines
+      (stable table with pushdown, both UDTFs, federated CSV join) — every README
+      command and output executed against the real server before being written down;
+      a final section documents the real-gateway path, whose protocol and action
+      contracts have since been reconciled live (fingerprint pins remain the open
+      follow-up).
 - [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
@@ -108,9 +182,12 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestones 1–3 (`feature/open-connector-integration-task-3`).
-  Registration builds a queryable catalog after gateway health, action
-  discovery, source-pack validation, and fingerprint checks.
+- **Current PR**: milestone 4 (UDTFs + security/observability + docs).
+  Milestones 1–3 are merged; registration builds a queryable catalog after
+  gateway health, action discovery, source-pack validation, and fingerprint
+  checks, and now also publishes per-gateway planning state for the two
+  UDTFs (shared with the server `OptimizerRegistry` / CLI the way the
+  KNN/FTS `DatasetRegistry` is).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

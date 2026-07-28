@@ -31,18 +31,53 @@ use super::cache::{ScanCache, ScanKeyParts, scan_cache_key, schema_fingerprint};
 use super::client::OpenConnectorClient;
 use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
-use super::pagination::Pagination;
+use super::pagination::{Pagination, PaginationStrategy};
 use super::row_path::RowPath;
-use super::source_pack::SourcePackTable;
+use super::source_pack::{FixedValue, SourcePackTable};
+
+/// The scanned collection's identity and pagination contract — the shape
+/// shared by YAML-bound source-pack tables and `open_connector_scan` raw
+/// actions, which have no static [`SourcePackTable`] to point at.
+#[derive(Debug, Clone)]
+pub struct ScanTarget {
+    /// Stable table ID (`mock.items`) or a raw-action label, for errors and
+    /// tracing.
+    pub table_id: Arc<str>,
+    /// Open Connector action to execute.
+    pub action_id: Arc<str>,
+    /// Pagination contract.
+    pub pagination: PaginationStrategy,
+    /// Fixed action inputs sent with every request (see
+    /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
+    /// input is caller-supplied.
+    pub fixed_inputs: &'static [(&'static str, FixedValue)],
+    /// Source-pack version, part of the cache key (0 for raw scans, which
+    /// have no pack and bypass the cache).
+    pub source_pack_version: u32,
+}
+
+impl ScanTarget {
+    /// The target of a bound source-pack table.
+    pub fn from_pack_table(table: &SourcePackTable, source_pack_version: u32) -> Self {
+        Self {
+            table_id: Arc::from(table.id),
+            action_id: Arc::from(table.action_id),
+            pagination: table.pagination,
+            fixed_inputs: table.fixed_inputs,
+            source_pack_version,
+        }
+    }
+}
 
 /// Everything a scan needs, bound once at planning time.
 pub struct OpenConnectorExec {
     client: Arc<OpenConnectorClient>,
     cache: Option<Arc<ScanCache>>,
     gateway: String,
+    /// Binding (catalog schema) name for tracing; `None` for UDTF scans.
+    binding: Option<String>,
     connection_alias: Option<String>,
-    table: &'static SourcePackTable,
-    source_pack_version: u32,
+    target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
     resource: Value,
@@ -59,8 +94,8 @@ pub struct OpenConnectorExec {
 impl fmt::Debug for OpenConnectorExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenConnectorExec")
-            .field("table", &self.table.id)
-            .field("action", &self.table.action_id)
+            .field("table", &self.target.table_id)
+            .field("action", &self.target.action_id)
             .field("limit", &self.limit)
             .field("projection", &self.projection)
             .finish()
@@ -76,9 +111,9 @@ impl OpenConnectorExec {
         client: Arc<OpenConnectorClient>,
         cache: Option<Arc<ScanCache>>,
         gateway: String,
+        binding: Option<String>,
         connection_alias: Option<String>,
-        table: &'static SourcePackTable,
-        source_pack_version: u32,
+        target: ScanTarget,
         converter: Arc<RowConverter>,
         row_path: RowPath,
         resource: Value,
@@ -104,9 +139,9 @@ impl OpenConnectorExec {
             client,
             cache,
             gateway,
+            binding,
             connection_alias,
-            table,
-            source_pack_version,
+            target,
             converter,
             row_path,
             resource,
@@ -127,7 +162,7 @@ impl DisplayAs for OpenConnectorExec {
         write!(
             f,
             "OpenConnectorExec: table={} action={} limit={:?}",
-            self.table.id, self.table.action_id, self.limit
+            self.target.table_id, self.target.action_id, self.limit
         )
     }
 }
@@ -190,7 +225,26 @@ impl ExecutionPlan for OpenConnectorExec {
             match state.next_page().await {
                 Ok(Some(batch)) => Ok(Some((batch, state))),
                 Ok(None) => Ok(None),
-                Err(e) => Err(DataFusionError::External(Box::new(e))),
+                Err(e) => {
+                    // The scan-failure counterpart of the completion event in
+                    // `next_page` — same identifying fields plus the error.
+                    // The error display may quote a bounded (≤512-char)
+                    // snippet of the gateway's *error* response and a
+                    // pagination cursor; it never carries tokens,
+                    // authorization headers, successful-response bodies, or
+                    // row data (conversion and row-path failures report JSON
+                    // *kinds* only).
+                    tracing::warn!(
+                        gateway = %state.gateway,
+                        binding = state.binding.as_deref().unwrap_or("<udtf>"),
+                        table = %state.target.table_id,
+                        action = %state.target.action_id,
+                        pages_fetched = state.pages_fetched,
+                        error = %e,
+                        "Open Connector scan failed"
+                    );
+                    Err(DataFusionError::External(Box::new(e)))
+                }
             }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -205,8 +259,10 @@ struct ScanState {
     client: Arc<OpenConnectorClient>,
     cache: Option<Arc<ScanCache>>,
     cache_key: String,
+    gateway: String,
+    binding: Option<String>,
     connection_alias: Option<String>,
-    table: &'static SourcePackTable,
+    target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
     resource: Value,
@@ -227,6 +283,12 @@ struct ScanState {
     /// Idempotence guard for the two store sites (LIMIT-satisfied and
     /// exhaustion), which can both fire on the same page.
     cache_stored: bool,
+    // Observability (see `log_completion`).
+    started: Instant,
+    cache_hit: bool,
+    pages_fetched: u32,
+    rows_returned: u64,
+    completion_logged: bool,
 }
 
 impl ScanState {
@@ -246,11 +308,18 @@ impl ScanState {
                 .map(|f| f.name().clone())
                 .collect(),
         };
+        // Key parts follow the design's cache-key list, with two deliberate
+        // wrinkles: `limit` IS in the key (that membership is what makes
+        // caching a LIMIT-satisfied scan safe — see the store sites below),
+        // and `fixed_inputs` is absent because pack-pinned inputs are
+        // functionally determined by (action_id, source_pack_version), both
+        // already keyed. If fixed inputs ever become binding-configurable or
+        // vary within a pack version, they must join the key.
         let cache_key = scan_cache_key(&ScanKeyParts {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),
-            action_id: exec.table.action_id,
-            source_pack_version: exec.source_pack_version,
+            action_id: &exec.target.action_id,
+            source_pack_version: exec.target.source_pack_version,
             resource: &exec.resource,
             filter_inputs: &exec.filter_inputs,
             projection: &projection_names,
@@ -274,8 +343,10 @@ impl ScanState {
             client: exec.client.clone(),
             cache: exec.cache.clone(),
             cache_key,
+            gateway: exec.gateway.clone(),
+            binding: exec.binding.clone(),
             connection_alias: exec.connection_alias.clone(),
-            table: exec.table,
+            target: exec.target.clone(),
             converter: exec.converter.clone(),
             row_path: exec.row_path.clone(),
             resource: exec.resource.clone(),
@@ -286,12 +357,17 @@ impl ScanState {
             max_rows: exec.max_rows,
             scan_timeout: exec.scan_timeout,
             deadline: Instant::now() + exec.scan_timeout,
-            pagination: Pagination::new(exec.table.pagination)?,
+            pagination: Pagination::new(exec.target.pagination)?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
             done,
             cache_stored: false,
+            started: Instant::now(),
+            cache_hit: done,
+            pages_fetched: 0,
+            rows_returned: 0,
+            completion_logged: false,
         })
     }
 
@@ -307,18 +383,46 @@ impl ScanState {
 
     fn timeout_error(&self) -> OpenConnectorError {
         OpenConnectorError::ScanTimeout {
-            table: self.table.id.to_string(),
+            table: self.target.table_id.to_string(),
             seconds: self.scan_timeout.as_secs(),
         }
+    }
+
+    /// Emit the scan-completion event exactly once. Identifying fields and
+    /// counters only — never tokens, headers, inputs, or row values.
+    fn log_completion(&mut self) {
+        if self.completion_logged {
+            return;
+        }
+        self.completion_logged = true;
+        tracing::info!(
+            gateway = %self.gateway,
+            binding = self.binding.as_deref().unwrap_or("<udtf>"),
+            table = %self.target.table_id,
+            action = %self.target.action_id,
+            cache_hit = self.cache_hit,
+            pages = self.pages_fetched,
+            rows = self.rows_returned,
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            "Open Connector scan completed"
+        );
     }
 
     /// Fetch and convert one page; returns None when the scan is complete.
     async fn next_page(&mut self) -> Result<Option<RecordBatch>, OpenConnectorError> {
         if let Some(batch) = self.replay.pop_front() {
+            self.rows_returned += batch.num_rows() as u64;
+            // The last replayed batch may satisfy a downstream LIMIT, which
+            // drops this stream without ever polling again — log with the
+            // final batch, not on a poll that may never come.
+            if self.replay.is_empty() {
+                self.log_completion();
+            }
             return Ok(Some(batch));
         }
         if self.done || self.limit_remaining == Some(0) {
             self.done = true;
+            self.log_completion();
             return Ok(None);
         }
         if Instant::now() >= self.deadline {
@@ -326,17 +430,22 @@ impl ScanState {
         }
         if self.pagination.page() > self.max_pages as usize {
             return Err(OpenConnectorError::ScanBoundsExceeded {
-                table: self.table.id.to_string(),
+                table: self.target.table_id.to_string(),
                 bound: "max_pages",
                 limit: u64::from(self.max_pages),
             });
         }
 
-        // Assemble the action input: fixed resource inputs, Exact filters,
-        // then page parameters.
+        // Assemble the action input: resource inputs, the pack's fixed
+        // inputs, pushed-down filters (which may override a fixed input —
+        // `state=all` yields to a pushed `state='open'`), then page
+        // parameters.
         let mut input = self.resource.as_object().cloned().expect(
             "resource is a JSON object by construction (registration always builds Value::Object)",
         );
+        for (field, value) in self.target.fixed_inputs {
+            input.insert((*field).to_string(), value.to_json());
+        }
         for (field, value) in &self.filter_inputs {
             input.insert(field.clone(), value.clone());
         }
@@ -349,13 +458,19 @@ impl ScanState {
         let envelope = tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
             self.client.execute(
-                self.table.action_id,
+                &self.target.action_id,
                 &Value::Object(input),
                 self.connection_alias.as_deref(),
             ),
         )
         .await
         .map_err(|_| self.timeout_error())??;
+        // Counted at fetch time on purpose: `pages_fetched` measures gateway
+        // traffic (requests actually made, rate-limit budget actually spent),
+        // not pages emitted downstream. A page that lands right at the
+        // deadline — or fails extraction/conversion below — was still a real
+        // gateway call, and the failure event should say so.
+        self.pages_fetched += 1;
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
         }
@@ -395,7 +510,7 @@ impl ScanState {
         self.rows_emitted += batch.num_rows() as u64;
         if self.rows_emitted > self.max_rows {
             return Err(OpenConnectorError::ScanBoundsExceeded {
-                table: self.table.id.to_string(),
+                table: self.target.table_id.to_string(),
                 bound: "max_rows",
                 limit: self.max_rows,
             });
@@ -422,7 +537,18 @@ impl ScanState {
 
         // A terminal empty page is completion, not output.
         if batch.num_rows() == 0 && self.done {
+            self.log_completion();
             return Ok(None);
+        }
+        self.rows_returned += batch.num_rows() as u64;
+        // A completing scan must log with its final batch: a satisfied
+        // downstream LIMIT drops this stream immediately (DataFusion's
+        // LimitStream clears its input), so the `self.done` early return
+        // above may never run — the same reason the LIMIT-satisfied cache
+        // store is eager. Logged after the row count so the event carries
+        // the full total.
+        if self.done {
+            self.log_completion();
         }
         Ok(Some(batch))
     }
@@ -432,32 +558,299 @@ impl ScanState {
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
+    use crate::sources::providers::open_connector::testutil::{
+        CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
+    };
+    use futures::StreamExt;
     use serde_json::json;
+    use std::sync::Mutex;
 
-    fn exec_with_version(source_pack_version: u32) -> OpenConnectorExec {
+    fn build_exec(
+        client: Arc<OpenConnectorClient>,
+        cache: Option<Arc<ScanCache>>,
+        limit: Option<usize>,
+        source_pack_version: u32,
+    ) -> OpenConnectorExec {
         let table = &MOCK_PACK.tables[0];
-        let client = Arc::new(
-            OpenConnectorClient::new("http://127.0.0.1:1", "t", Duration::from_secs(1))
-                .expect("build client"),
-        );
         OpenConnectorExec::new(
             client,
-            None,
+            cache,
             "saas".to_string(),
+            Some("ws".to_string()),
             None,
-            table,
-            source_pack_version,
+            ScanTarget::from_pack_table(table, source_pack_version),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse(table.row_path).expect("row path"),
             json!({}),
             vec![],
             None,
-            None,
+            limit,
             10,
             1000,
             Duration::from_secs(30),
         )
         .expect("build exec")
+    }
+
+    fn exec_with_version(source_pack_version: u32) -> OpenConnectorExec {
+        let client = Arc::new(
+            OpenConnectorClient::new("http://127.0.0.1:1", "t", Duration::from_secs(1))
+                .expect("build client"),
+        );
+        build_exec(client, None, None, source_pack_version)
+    }
+
+    /// Execute-only mock gateway for `mock.list_items` (per_page = 2), the
+    /// only call `ScanState` makes (discovery/health happen at registration).
+    fn items_handler(req: &RecordedRequest, total: usize) -> MockResponse {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            let page = body
+                .get("input")
+                .and_then(|input| input.get("page"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as usize;
+            let items: Vec<_> = (1..=total)
+                .map(|id| json!({"id": id, "name": format!("item-{id}")}))
+                .skip((page - 1) * 2)
+                .take(2)
+                .collect();
+            return MockResponse::ok(&envelope_ok(&json!({"items": items}).to_string()));
+        }
+        MockResponse::new(404, "{}")
+    }
+
+    async fn online_client(gateway: &MockGateway) -> Arc<OpenConnectorClient> {
+        Arc::new(
+            OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5))
+                .expect("build client"),
+        )
+    }
+
+    #[tokio::test]
+    async fn limit_satisfied_scan_logs_completion_with_the_final_batch() {
+        // A satisfied downstream LIMIT drops the stream without another poll
+        // (DataFusion's LimitStream clears its input), so the completion
+        // event must be emitted together with the final batch — the
+        // early-return branch at the top of next_page is never reached.
+        let gateway = MockGateway::start(|req| items_handler(req, 5)).await;
+        let exec = build_exec(online_client(&gateway).await, None, Some(1), 1);
+
+        let mut state = ScanState::new(&exec).expect("state");
+        let batch = state.next_page().await.expect("page").expect("batch");
+        assert_eq!(batch.num_rows(), 1);
+        assert!(
+            state.completion_logged,
+            "LIMIT-satisfied scan must log completion on its final batch, \
+             not on a poll that never comes"
+        );
+        assert_eq!(
+            state.rows_returned, 1,
+            "the event must count the final batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_scan_logs_completion_with_a_nonempty_final_page() {
+        // 3 items at per_page = 2: page 2 is short (1 row), so the scan
+        // completes while still returning a batch — the event must not
+        // depend on the consumer polling once more for the None.
+        let gateway = MockGateway::start(|req| items_handler(req, 3)).await;
+        let exec = build_exec(online_client(&gateway).await, None, None, 1);
+
+        let mut state = ScanState::new(&exec).expect("state");
+        state.next_page().await.expect("page 1").expect("full page");
+        assert!(
+            !state.completion_logged,
+            "scan is still running after page 1"
+        );
+        state
+            .next_page()
+            .await
+            .expect("page 2")
+            .expect("short page");
+        assert!(
+            state.completion_logged,
+            "exhaustion must log with the final batch"
+        );
+        assert_eq!(state.rows_returned, 3);
+    }
+
+    #[tokio::test]
+    async fn cached_replay_logs_completion_with_the_last_replayed_batch() {
+        let gateway = MockGateway::start(|req| items_handler(req, 3)).await;
+        let cache = Arc::new(ScanCache::new(Duration::from_secs(60), usize::MAX));
+        let exec = build_exec(online_client(&gateway).await, Some(cache), None, 1);
+
+        // Live scan to completion populates the cache.
+        let mut state = ScanState::new(&exec).expect("live state");
+        while state.next_page().await.expect("live page").is_some() {}
+
+        // The replayed scan must log once its queue drains — a satisfied
+        // downstream LIMIT would never poll again, exactly as in the live
+        // case (LIMIT queries are cached; LIMIT is part of the key).
+        let mut state = ScanState::new(&exec).expect("replay state");
+        assert!(state.cache_hit, "second identical scan replays from cache");
+        let batches = state.replay.len();
+        assert!(batches > 0);
+        for index in 1..=batches {
+            state
+                .next_page()
+                .await
+                .expect("replayed page")
+                .expect("batch");
+            assert_eq!(
+                state.completion_logged,
+                index == batches,
+                "completion logs exactly when the replay queue drains"
+            );
+        }
+        assert_eq!(state.rows_returned, 3);
+    }
+
+    // ── Emitted-event assertions ─────────────────────────────────────────
+    // The flag tests above pin the state machine; these pin the actual
+    // tracing output — exactly one event per scan, with the documented
+    // fields — by consuming the real `execute()` stream.
+
+    const COMPLETED: &str = "Open Connector scan completed";
+    const FAILED: &str = "Open Connector scan failed";
+
+    /// Captured events with the given message, in emission order.
+    fn events_with_message(
+        events: &Arc<Mutex<Vec<CapturedEvent>>>,
+        message: &str,
+    ) -> Vec<CapturedEvent> {
+        events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|event| event.message == message)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn limit_satisfied_stream_emits_exactly_one_completion_event() {
+        let gateway = MockGateway::start(|req| items_handler(req, 5)).await;
+        let exec = build_exec(online_client(&gateway).await, None, Some(1), 1);
+        let (_guard, events) = capture_events();
+
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("stream");
+        let batch = stream.next().await.expect("a batch").expect("no error");
+        assert_eq!(batch.num_rows(), 1);
+        // A satisfied LimitStream drops its input without polling again.
+        drop(stream);
+
+        let completed = events_with_message(&events, COMPLETED);
+        assert_eq!(completed.len(), 1, "exactly one completion event");
+        let event = &completed[0];
+        assert_eq!(event.level, tracing::Level::INFO);
+        assert_eq!(event.field("gateway"), Some("saas"));
+        assert_eq!(event.field("binding"), Some("ws"));
+        assert_eq!(event.field("table"), Some("mock.items"));
+        assert_eq!(event.field("action"), Some("mock.list_items"));
+        assert_eq!(event.field("cache_hit"), Some("false"));
+        assert_eq!(event.field("pages"), Some("1"));
+        assert_eq!(event.field("rows"), Some("1"));
+        assert!(event.fields.contains_key("duration_ms"));
+        assert!(events_with_message(&events, FAILED).is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_scan_emits_exactly_one_completion_event() {
+        let gateway = MockGateway::start(|req| items_handler(req, 0)).await;
+        let exec = build_exec(online_client(&gateway).await, None, None, 1);
+        let (_guard, events) = capture_events();
+
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("stream");
+        assert!(
+            stream.next().await.is_none(),
+            "empty scan yields no batches"
+        );
+        assert!(stream.next().await.is_none(), "stream stays terminated");
+
+        let completed = events_with_message(&events, COMPLETED);
+        assert_eq!(completed.len(), 1, "exactly one completion event");
+        assert_eq!(completed[0].field("rows"), Some("0"));
+        assert_eq!(completed[0].field("pages"), Some("1"));
+        assert_eq!(completed[0].field("cache_hit"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn cache_replay_emits_exactly_one_completion_event_marked_cache_hit() {
+        let gateway = MockGateway::start(|req| items_handler(req, 3)).await;
+        let cache = Arc::new(ScanCache::new(Duration::from_secs(60), usize::MAX));
+        let exec = build_exec(online_client(&gateway).await, Some(cache), None, 1);
+        let (_guard, events) = capture_events();
+
+        for round in 1..=2 {
+            let mut stream = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("stream");
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                rows += batch.expect("no error").num_rows();
+            }
+            assert_eq!(rows, 3, "round {round}");
+        }
+
+        let completed = events_with_message(&events, COMPLETED);
+        assert_eq!(
+            completed.len(),
+            2,
+            "one completion event per scan, replay included"
+        );
+        assert_eq!(completed[0].field("cache_hit"), Some("false"));
+        assert_eq!(completed[0].field("pages"), Some("2"));
+        assert_eq!(completed[1].field("cache_hit"), Some("true"));
+        assert_eq!(
+            completed[1].field("pages"),
+            Some("0"),
+            "a replay fetches no live pages"
+        );
+        assert_eq!(completed[1].field("rows"), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn failed_scan_emits_one_failure_event_and_no_completion() {
+        let gateway = MockGateway::start(|req| {
+            if req.method == "POST" {
+                // 5xx is terminal for the non-idempotent execute: no retry.
+                MockResponse::new(500, r#"{"message":"boom"}"#)
+            } else {
+                MockResponse::new(404, "{}")
+            }
+        })
+        .await;
+        let exec = build_exec(online_client(&gateway).await, None, None, 1);
+        let (_guard, events) = capture_events();
+
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("stream");
+        let result = stream.next().await.expect("one item");
+        assert!(result.is_err(), "scan must fail");
+
+        let failed = events_with_message(&events, FAILED);
+        assert_eq!(failed.len(), 1, "exactly one failure event");
+        let event = &failed[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.field("gateway"), Some("saas"));
+        assert_eq!(event.field("binding"), Some("ws"));
+        assert_eq!(event.field("table"), Some("mock.items"));
+        assert_eq!(event.field("action"), Some("mock.list_items"));
+        assert_eq!(event.field("pages_fetched"), Some("0"));
+        let error = event.field("error").expect("error field");
+        assert!(
+            error.contains("HTTP 500"),
+            "error carries the terminal status: {error}"
+        );
+        assert!(events_with_message(&events, COMPLETED).is_empty());
     }
 
     #[test]

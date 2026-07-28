@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use super::cache::ScanCache;
 use super::client::OpenConnectorClient;
-use super::exec::OpenConnectorExec;
+use super::exec::{OpenConnectorExec, ScanTarget};
 use super::filters::translate_filters;
 use super::json_to_arrow::RowConverter;
 use super::row_path::RowPath;
@@ -29,6 +29,9 @@ pub struct OpenConnectorTableProvider {
     client: Arc<OpenConnectorClient>,
     cache: Option<Arc<ScanCache>>,
     gateway: String,
+    /// Binding (catalog schema) name for tracing; `None` for UDTF-planned
+    /// tables, which have no persistent binding.
+    binding: Option<String>,
     connection_alias: Option<String>,
     table: &'static SourcePackTable,
     source_pack_version: u32,
@@ -62,6 +65,7 @@ impl OpenConnectorTableProvider {
         client: Arc<OpenConnectorClient>,
         cache: Option<Arc<ScanCache>>,
         gateway: String,
+        binding: Option<String>,
         connection_alias: Option<String>,
         table: &'static SourcePackTable,
         source_pack_version: u32,
@@ -75,10 +79,25 @@ impl OpenConnectorTableProvider {
         // Same bind-time guarantee as the row path: a malformed pack-authored
         // pagination path fails here at registration, not mid-scan.
         table.pagination.validate()?;
+        // Withhold resource keys this table's action does not declare: Open
+        // Connector's action schemas are strict (`additionalProperties:
+        // false`), so a shared binding's extra keys — another table's
+        // `issueNumber`, or `owner`/`repo` reaching the resource-less
+        // repositories listing — would 400 every request. Registration has
+        // already rejected keys no bound table consumes.
+        let resource = match resource {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .filter(|(key, _)| table.declares_resource(key))
+                    .collect(),
+            ),
+            other => other,
+        };
         Ok(Self {
             client,
             cache,
             gateway,
+            binding,
             connection_alias,
             table,
             source_pack_version,
@@ -129,9 +148,9 @@ impl TableProvider for OpenConnectorTableProvider {
             Arc::clone(&self.client),
             self.cache.clone(),
             self.gateway.clone(),
+            self.binding.clone(),
             self.connection_alias.clone(),
-            self.table,
-            self.source_pack_version,
+            ScanTarget::from_pack_table(self.table, self.source_pack_version),
             Arc::clone(&self.converter),
             self.row_path.clone(),
             self.resource.clone(),
@@ -153,7 +172,7 @@ impl TableProvider for OpenConnectorTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::filters::FilterMapping;
+    use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use datafusion::logical_expr::Operator;
@@ -179,10 +198,13 @@ mod tests {
             }],
             pagination,
             required_resources: &[],
+            optional_resources: &[],
+            fixed_inputs: &[],
             filters: &[FilterMapping {
                 column: "id",
                 operator: Operator::Gt,
                 input_field: "min_id",
+                fidelity: Fidelity::Exact,
             }],
             expected_fingerprint: None,
         }))
@@ -202,6 +224,7 @@ mod tests {
             offline_client(),
             None,
             "saas".to_string(),
+            None,
             None,
             table,
             1,
@@ -229,6 +252,7 @@ mod tests {
             offline_client(),
             None,
             "saas".to_string(),
+            None,
             None,
             table,
             1,

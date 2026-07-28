@@ -5,6 +5,8 @@
 
 use super::Engine;
 use anyhow::Result;
+use arrow::compute::concat_batches;
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::prelude::*;
@@ -83,6 +85,30 @@ impl DataFusionEngine {
     pub fn session_context_arc(&self) -> Arc<SessionContext> {
         self.ctx.clone()
     }
+
+    /// Execute a SQL query with a row-count cap pushed into the query plan.
+    ///
+    /// Applies `LIMIT fetch` on top of the query's logical plan before
+    /// collecting, so at most `fetch` rows are materialized. Only meaningful
+    /// for query statements (SELECT/...); DML plans should go through
+    /// [`Engine::execute`] instead.
+    pub async fn execute_with_limit(&self, sql: &str, fetch: usize) -> Result<RecordBatch> {
+        let dataframe = self
+            .ctx
+            .sql(sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to execute SQL query: {}", e))?
+            .limit(0, Some(fetch))
+            .map_err(|e| anyhow::anyhow!("Failed to apply row limit: {}", e))?;
+
+        let schema = dataframe.schema().inner().clone();
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to collect query results: {}", e))?;
+
+        batches_to_single(schema, batches)
+    }
 }
 
 #[async_trait]
@@ -124,28 +150,74 @@ impl Engine for DataFusionEngine {
             );
         }
 
-        // Handle the result based on the number of batches returned
-        match batches.len() {
-            0 => {
-                // No results - create an empty RecordBatch with the query's schema
-                let empty_batch = RecordBatch::new_empty(schema);
-                Ok(empty_batch)
-            }
-            1 => {
-                // Single batch - return it directly
-                Ok(batches
-                    .into_iter()
-                    .next()
-                    .expect("len == 1 guarantees first element"))
-            }
-            _ => {
-                // Multiple batches - concatenate them into a single RecordBatch
-                use arrow::compute::concat_batches;
-                let batch_schema = batches[0].schema();
-                let concatenated = concat_batches(&batch_schema, &batches)
-                    .map_err(|e| anyhow::anyhow!("Failed to concatenate result batches: {}", e))?;
-                Ok(concatenated)
-            }
+        batches_to_single(schema, batches)
+    }
+}
+
+/// Concatenate collected batches into a single RecordBatch, producing an
+/// empty batch with the query's schema when there are no results.
+fn batches_to_single(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    match batches.len() {
+        0 => Ok(RecordBatch::new_empty(schema)),
+        1 => Ok(batches
+            .into_iter()
+            .next()
+            .expect("len == 1 guarantees first element")),
+        _ => {
+            let batch_schema = batches[0].schema();
+            concat_batches(&batch_schema, &batches)
+                .map_err(|e| anyhow::anyhow!("Failed to concatenate result batches: {}", e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn engine_with_numbers() -> DataFusionEngine {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+        ctx.register_batch("numbers", batch).unwrap();
+        DataFusionEngine::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn execute_with_limit_truncates_to_fetch() {
+        let engine = engine_with_numbers();
+        let batch = engine
+            .execute_with_limit("SELECT n FROM numbers ORDER BY n", 3)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn execute_with_limit_returns_all_rows_when_under_limit() {
+        let engine = engine_with_numbers();
+        let batch = engine
+            .execute_with_limit("SELECT n FROM numbers", 100)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn execute_with_limit_empty_result_keeps_schema() {
+        let engine = engine_with_numbers();
+        let batch = engine
+            .execute_with_limit("SELECT n FROM numbers WHERE n > 100", 10)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().fields().len(), 1);
+        assert_eq!(batch.schema().field(0).name(), "n");
     }
 }

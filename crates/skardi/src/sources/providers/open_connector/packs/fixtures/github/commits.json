@@ -1,0 +1,26 @@
+{
+  "commits": [
+    {
+      "sha": "aaa1110000000000000000000000000000000000",
+      "commit": {
+        "message": "feat: add dark mode",
+        "author": { "name": "Octo Cat", "email": "octo@example.com", "date": "2026-01-05T09:00:00Z" },
+        "committer": { "name": "Octo Cat", "email": "octo@example.com", "date": "2026-01-05T09:05:00Z" }
+      },
+      "author": { "login": "octocat" },
+      "committer": { "login": "octocat" },
+      "html_url": "https://github.com/acme/widgets/commit/aaa111"
+    },
+    {
+      "sha": "bbb2220000000000000000000000000000000000",
+      "commit": {
+        "message": "chore: import history",
+        "author": { "name": "Legacy Importer", "email": "legacy@example.com", "date": "2020-01-01T00:00:00Z" },
+        "committer": { "name": "Legacy Importer", "email": "legacy@example.com", "date": "2020-01-01T00:00:00Z" }
+      },
+      "author": null,
+      "committer": null,
+      "html_url": "https://github.com/acme/widgets/commit/bbb222"
+    }
+  ]
+}
