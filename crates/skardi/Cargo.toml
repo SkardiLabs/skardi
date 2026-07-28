@@ -30,7 +30,7 @@ rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
 documents = ["dep:liteparse", "dep:glob"]
 # rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
-rss = []
+rss = ["dep:encoding_rs"]
 
 [dependencies]
 # engine
@@ -91,6 +91,8 @@ liteparse = { version = "2.4.0", default-features = false, optional = true }
 blake3 = "1"
 # include_globs matching for the documents connector.
 glob = { version = "0.3", optional = true }
+# Label lookup + transcoding for the rss sanitation ladder's re-encode rung.
+encoding_rs = { version = "0.8", optional = true }
 secrecy = "0.10"
 pgvector = { version = "0.4", features = ["sqlx"] }
 sqlx = { workspace = true }

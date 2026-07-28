@@ -3,6 +3,8 @@
 //! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
 pub mod config;
 pub mod error;
+#[cfg(feature = "rss")]
+pub mod sanitize;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;

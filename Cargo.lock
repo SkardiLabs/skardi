@@ -9334,6 +9334,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-table-providers",
  "derivative",
+ "encoding_rs",
  "futures",
  "gguf-rs-lib",
  "glob",
