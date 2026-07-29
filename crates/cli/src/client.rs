@@ -8,7 +8,7 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
 use std::error::Error as StdError;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Characters percent-encoded by [`encode_component`]: everything except
 /// ASCII alphanumerics and the RFC 3986 "unreserved" marks (`-`, `.`, `_`,
@@ -259,9 +259,29 @@ fn is_cleartext_remote(base_url: &str) -> bool {
         host_port.split(':').next().unwrap_or("")
     };
 
-    !(host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback()))
+    !is_local_host(host)
+}
+
+/// True for hosts whose traffic never leaves the machine: `localhost`,
+/// IPv4 loopback (`127.0.0.0/8`), IPv6 loopback (`::1`) including its
+/// IPv4-mapped form (`::ffff:127.x.x.x`), and the unspecified addresses
+/// (`0.0.0.0` / `::`), which the usual platforms route to localhost when
+/// used as a connect target.
+fn is_local_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return v4.is_loopback() || v4.is_unspecified();
+    }
+    if let Ok(v6) = host.parse::<Ipv6Addr>() {
+        return v6.is_loopback()
+            || v6.is_unspecified()
+            || v6
+                .to_ipv4_mapped()
+                .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified());
+    }
+    false
 }
 
 #[cfg(test)]
@@ -475,6 +495,9 @@ mod tests {
         assert!(!is_cleartext_remote("http://localhost:8080"));
         assert!(!is_cleartext_remote("http://LOCALHOST"));
         assert!(!is_cleartext_remote("http://[::1]:8080"));
+        assert!(!is_cleartext_remote("http://[::ffff:127.0.0.1]:8080"));
+        assert!(!is_cleartext_remote("http://0.0.0.0:8080"));
+        assert!(!is_cleartext_remote("http://[::]:8080"));
         assert!(!is_cleartext_remote("https://example.com"));
         // Plain http to a real host is not.
         assert!(is_cleartext_remote("http://10.0.0.5:8080"));

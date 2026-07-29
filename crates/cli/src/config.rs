@@ -105,9 +105,12 @@ fn resolve_from(
 }
 
 /// Treat an empty (or whitespace-only) string as unset for precedence
-/// purposes.
+/// purposes, and trim the value that is kept — a padded
+/// `SKARDI_SERVER_URL=" http://x "` must not survive into request URLs.
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.filter(|s| !s.trim().is_empty())
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Load and parse `path` as a config manifest, returning its `spec` block.
@@ -213,6 +216,21 @@ mod tests {
         );
         assert_eq!(resolved.server, DEFAULT_SERVER_URL);
         assert_eq!(resolved.token, None);
+    }
+
+    #[test]
+    fn resolve_from_trims_padded_values() {
+        // A padded value is kept but normalized — surrounding whitespace
+        // must not leak into request URLs or the Authorization header.
+        let resolved = resolve_from(
+            None,
+            None,
+            Some(" http://env-server:9000 ".to_string()),
+            Some("\tenv-token\n".to_string()),
+            None,
+        );
+        assert_eq!(resolved.server, "http://env-server:9000");
+        assert_eq!(resolved.token, Some("env-token".to_string()));
     }
 
     #[test]
