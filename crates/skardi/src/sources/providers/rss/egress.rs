@@ -65,14 +65,6 @@
 //! handled means adding a check inside `check_v4`/`check_v6` themselves,
 //! not changing anything about how or when they're called.
 
-// This module's only consumer today is `fetch.rs`, and `fetch.rs` in turn
-// has no production caller yet — Task 11 (the engine) is the first one,
-// and hasn't landed. Until then, everything here outside of this module's
-// own tests is unreferenced from a build that excludes test code, and
-// `cargo check`/`cargo build` would otherwise flag the whole file. Remove
-// this once Task 11 wires `FeedFetcher` into the engine.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;

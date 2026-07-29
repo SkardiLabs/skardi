@@ -64,14 +64,6 @@
 //! `304` to [`FetchError::Status`] instead of silently handing the engine an
 //! outcome it cannot honor.
 
-// `FeedFetcher` has no production caller yet — Task 11 (the engine) is the
-// first one, and hasn't landed. Until then, everything here outside of this
-// module's own tests is unreferenced from a build that excludes test code
-// (and, transitively, so is `egress.rs`, whose only consumer is this
-// module), and `cargo check`/`cargo build` would otherwise flag both files.
-// Remove this once Task 11 wires `FeedFetcher` into the engine.
-#![allow(dead_code)]
-
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;

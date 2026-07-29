@@ -65,14 +65,6 @@
 //! there is no request coalescing here, matching `open_connector`'s cache.
 //! That is a documented future extension, not this module's job.
 
-// `FeedCache`/`MemoryFeedCache` have no production caller yet — Task 11 (the
-// engine) is the first one. Until then, everything here outside of this
-// module's own tests is unreferenced from a build that excludes test code,
-// and `cargo check`/`cargo build` would otherwise flag it. Mirrors
-// `fetch.rs`'s identical situation and identical fix; remove once Task 11
-// wires `FeedCache` into the engine.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
