@@ -28,10 +28,20 @@ use super::sanitize::find_sub;
 /// threads); 500 nested did not. `items.content` is attacker-authored by
 /// definition, so any subscribed feed can trigger this — there is no `Err` to
 /// return and no unwind a `catch_unwind` could intercept, only a process
-/// abort. 100 is a wide margin under that 500-600 danger zone — nothing in
-/// this crate's fixtures comes close — so this only ever engages on
-/// pathological input; above it, conversion degrades to tag-stripped text
-/// (`strip_tags_to_text`) instead of walking the tree at all.
+/// abort. Above this ceiling, conversion degrades to tag-stripped text
+/// (`strip_tags_to_text`) instead of walking the tree at all; nothing in this
+/// crate's fixtures comes close, so it only engages on pathological input.
+///
+/// The margin is narrower than the two numbers suggest, because the real tree
+/// can be deeper than the open-tag count (implied start tags — see
+/// [`max_open_tag_depth`]). Sweeping 2,057 repeated-unit shapes over a 42-tag
+/// pool, the deepest real tree reachable while the scan still reported ≤ 100
+/// was 203, always from `<table><td>`. Against the 500-600 overflow zone that
+/// is roughly 2.5x, not a wide margin. 203 is an empirical bound over those
+/// shapes, not a proof — and the whole argument presupposes the scan really is
+/// an upper bound on open-tag depth, which it only became once the stale
+/// `foreign` undercount was fixed (see the `foreign` counter in
+/// [`max_open_tag_depth`]).
 const MAX_HTML_DEPTH: usize = 100;
 
 /// Convert an HTML fragment to Markdown.
@@ -149,11 +159,11 @@ fn is_foreign_root(tag: &str) -> bool {
 /// are counted even though the tokenizer treats them as raw text: both make the
 /// real tree shallower than this estimate. The one direction html5ever goes
 /// *deeper* than the open-tag count is implied *start* tags — `<table><td>`
-/// builds `table > tbody > tr > td`, four levels from two tags — which
-/// inflates the real depth by a bounded factor per tag (measured at 2x for that
-/// case), on top of the fixed `document > html > body` wrapper worth 3. The gap
-/// between the 100 ceiling and the 500-600 depth where the walker actually
-/// overflows absorbs both.
+/// builds `table > tbody > tr > td`, four levels from two tags, roughly
+/// doubling it — on top of the fixed `document > html > body` wrapper worth 3.
+/// A sweep of 2,057 repeated-unit shapes put the deepest reachable real tree at
+/// 203 while this scan still reported ≤ 100, `<table><td>` being the worst; see
+/// [`MAX_HTML_DEPTH`] for what that leaves against the overflow zone.
 fn max_open_tag_depth(html: &str) -> usize {
     let bytes = html.as_bytes();
     let mut i = 0;
@@ -308,13 +318,34 @@ fn strip_tags_to_text(html: &str) -> String {
     out
 }
 
-/// Whitespace that ends a tag name or an attribute name in the tokenizer:
-/// `'\t' | '\n' | '\x0C' | ' '`, as spelled in every one of the tag states
-/// (html5ever-0.38.0/src/tokenizer/mod.rs). `\r` is not among them — it is an
-/// ordinary name character there, and appears only in
-/// `states::BeforeAttributeValue`'s skip set.
+/// Whitespace that ends a tag name or an attribute name in the tokenizer.
+///
+/// The tag states spell the set as `'\t' | '\n' | '\x0C' | ' '`
+/// (html5ever-0.38.0/src/tokenizer/mod.rs: `states::TagName` at `:923`,
+/// `BeforeAttributeName` `:1143`, `AttributeName` `:1166`, `AfterAttributeName`
+/// `:1189`). `\r` is included here anyway because no tag state ever sees one:
+/// all four read through `get_char!` (`:698`) → `get_char` (`:294-303`) →
+/// `get_preprocessed_char` (`:259-290`), whose `//§ preprocessing-the-input-stream`
+/// body rewrites every `\r` to `\n` at `:267-270` and sets `ignore_lf` to swallow
+/// a following `\n`. So a `\r` arrives as `\n` and ends a name exactly like one.
+/// `states::AttributeValue(Unquoted)` (`:1258`) reaches the same result by
+/// listing `'\r'` in its `small_char_set`, which routes it through
+/// `get_preprocessed_char` (`:318`) onto the `FromSet('\n')` arm.
+///
+/// The one state that does see a raw `\r` is `states::BeforeAttributeValue`
+/// (`:1215-1217`), which is why that set spells `'\r'` out: it reads through
+/// `peek!`, and `peek` does not normalize — see the note on `discard_char`
+/// (`:606-611`), "peek() deals in un-processed characters (no newline
+/// normalization), while get_char() does". [`find_tag_end`] handles that state
+/// separately.
+///
+/// Omitting `\r` was safe in direction (longer names pop less often, which
+/// over-counts) but cost real content: `"<p\r\nclass=\"lede\">x</p>".repeat(101)`
+/// scanned as depth 101 against a real DOM depth of 4 and degraded to
+/// tag-stripped text, while the same document with LF endings scanned as 1 and
+/// converted. CRLF inside start tags is ordinary in HTTP-delivered feeds.
 fn is_tag_space(c: u8) -> bool {
-    matches!(c, b'\t' | b'\n' | b'\x0C' | b' ')
+    matches!(c, b'\t' | b'\n' | b'\r' | b'\x0C' | b' ')
 }
 
 /// End of a tag name starting at `start` (one-past-the-last name byte).
@@ -377,12 +408,14 @@ fn find_tag_end(bytes: &[u8], from: usize) -> Option<(usize, bool)> {
             // In `states::BeforeAttributeName` it *is* the name's first
             // character, so it does not open a value there.
             (S::Name | S::AfterName, b'=') => {
-                // `states::BeforeAttributeValue`: skip whitespace (`\r`
-                // included, the one state where it counts), then a `"`/`'`
-                // opens a value running to the matching quote — a character
-                // reference inside cannot contain one, so a plain search for it
-                // is exact. Anything else is an unquoted value.
-                while bytes.get(j).is_some_and(|&c| is_tag_space(c) || c == b'\r') {
+                // `states::BeforeAttributeValue` (`:1215-1217`): skip
+                // whitespace, then a `"`/`'` opens a value running to the
+                // matching quote — a character reference inside cannot contain
+                // one, so a plain search for it is exact. Anything else is an
+                // unquoted value. This is the one tag state whose set spells
+                // `'\r'` out, because it peeks rather than normalizing; the
+                // byte is in [`is_tag_space`] either way.
+                while bytes.get(j).is_some_and(|&c| is_tag_space(c)) {
                     j += 1;
                 }
                 match bytes.get(j) {
@@ -744,6 +777,31 @@ mod tests {
             md.contains("*innermost*") || md.contains("_innermost_"),
             "1000 balanced paragraphs are depth 1, not 1000: {md}"
         );
+    }
+
+    #[test]
+    fn crlf_inside_a_start_tag_does_not_inflate_the_scanned_depth() {
+        // `\r` never reaches a tag state: `get_preprocessed_char` normalizes it
+        // to `\n` first (see `is_tag_space`), so it ends a tag or attribute name
+        // like any other space and these paragraphs are depth 1, not 101.
+        // Treating it as a name character instead scored this document at 101
+        // and silently dropped the Markdown structure of ordinary
+        // HTTP-delivered feed content.
+        let html = format!(
+            "{}<em>innermost</em>",
+            "<p\r\nclass=\"lede\">x</p>".repeat(101)
+        );
+        let md = html_to_markdown(&html);
+        assert!(
+            md.contains("*innermost*") || md.contains("_innermost_"),
+            "CRLF in a start tag degraded a depth-1 document: {md}"
+        );
+        // The LF spelling is the control: both must take the same path.
+        let lf = html_to_markdown(&format!(
+            "{}<em>innermost</em>",
+            "<p\nclass=\"lede\">x</p>".repeat(101)
+        ));
+        assert_eq!(md, lf, "CRLF and LF spellings converted differently");
     }
 
     #[test]
