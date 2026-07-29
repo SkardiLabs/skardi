@@ -547,7 +547,7 @@ bindings:
         )
         .await
         .expect("gateway registration succeeds");
-        register_open_connector_udtfs(&ctx, gateways);
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         ctx
     }
 

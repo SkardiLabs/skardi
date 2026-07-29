@@ -601,7 +601,7 @@ bindings:
         unsafe {
             std::env::remove_var(token_env);
         }
-        register_open_connector_udtfs(&ctx, gateways);
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
     }
 
