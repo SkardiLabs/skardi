@@ -899,22 +899,31 @@ mod tests {
     }
 
     /// M1: `<source>` alone — with no media beyond the single enclosure —
-    /// must populate `extensions_json` with a `source` key and *no* `media`
-    /// key, distinguishing this from the media-key test above.
+    /// was meant to populate `extensions_json` with a `source` key and *no*
+    /// `media` key, distinguishing this from the media-key test above. But
+    /// `entry.source` (the field this crate's `extensions_json` reads) is
+    /// never actually assigned by feed-rs 2.4.0, for *any* dialect: there is
+    /// no `.source =` anywhere under `feed-rs-2.4.0/src/parser/**` (checked
+    /// `rss2`, `atom`, `rss1`, and `json`), and the RSS2 item handler
+    /// (`feed-rs-2.4.0/src/parser/rss2/mod.rs`'s `handle_item` match) has no
+    /// arm for `(NS::RSS, "source")` at all — the element this fixture used
+    /// is silently ignored, not mapped to the model's `source: Option<String>`
+    /// (whose doc describes *Atom's* copied-source-feed-metadata concept, a
+    /// different thing from RSS2's `<source url>` attribution element, and
+    /// which no parser path sets either). So no XML/JSON fixture can drive
+    /// this key through `parse_feed_document` today. This instead calls
+    /// `extensions_json` directly against a hand-built `Entry`, pinning the
+    /// mapping this crate's own code performs so the property is still
+    /// covered if a future feed-rs starts populating the field.
     #[test]
     fn extensions_json_source_key_present_without_a_media_key() {
-        let doc = br#"<rss version="2.0"><channel>
-<title>C</title><link>https://e.com</link><description>D</description>
-<item><guid>1</guid><title>T</title>
-<enclosure url="https://e.com/a.mp3" type="audio/mpeg" length="1"/>
-<source url="https://origin.example/feed.xml">Origin</source>
-</item></channel></rss>"#;
-        let parsed = parse_feed_document(doc, None).unwrap();
-        let ext = parsed.items[0]
-            .extensions_json
-            .as_deref()
+        let entry = Entry {
+            source: Some("Origin".to_string()),
+            ..Entry::default()
+        };
+        let ext = extensions_json(&entry, false)
             .expect("source populates extensions even with no leftover media");
-        let value: serde_json::Value = serde_json::from_str(ext).expect("valid JSON");
+        let value: serde_json::Value = serde_json::from_str(&ext).expect("valid JSON");
         let obj = value.as_object().expect("extensions_json is a JSON object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>(),
@@ -925,22 +934,27 @@ mod tests {
     }
 
     /// M1: `language`, named in the original test, was never actually
-    /// exercised by it. `entry.language` is only ever populated from an Atom
-    /// entry's `xml:lang` (verified: `feed-rs-2.4.0/src/parser/atom/mod.rs`
-    /// is the only caller of `handle_language_attr` for an *entry*, as
-    /// opposed to a feed), so this needs an Atom fixture.
+    /// exercised by it. `entry.language` is populated only from the
+    /// `xml:lang` attribute on an Atom entry's `<content>` *child* element
+    /// (verified: `feed-rs-2.4.0/src/parser/atom/mod.rs`'s
+    /// `(NS::Atom, "content")` match arm is the only place that assigns
+    /// `entry.language`, via `util::handle_language_attr(&child)` where
+    /// `child` is that `<content>` element) — not from `xml:lang` on the
+    /// `<entry>` element itself, which the original fixture put it on and
+    /// which no code path reads for this field.
     #[test]
     fn extensions_json_language_key_from_atom_entry_xml_lang() {
         let doc = br#"<feed xmlns="http://www.w3.org/2005/Atom">
 <title>Chan</title><updated>2026-07-20T10:00:00Z</updated>
-<entry xml:lang="fr">
+<entry>
   <id>urn:uuid:1</id><title>Post</title>
+  <content type="text" xml:lang="fr">body</content>
 </entry></feed>"#;
         let parsed = parse_feed_document(doc, Some("application/atom+xml")).unwrap();
         let ext = parsed.items[0]
             .extensions_json
             .as_deref()
-            .expect("xml:lang populates extensions_json's language key");
+            .expect("xml:lang on <content> populates extensions_json's language key");
         let value: serde_json::Value = serde_json::from_str(ext).expect("valid JSON");
         let obj = value.as_object().expect("extensions_json is a JSON object");
         assert_eq!(obj.keys().collect::<Vec<_>>(), vec!["language"]);
@@ -1011,22 +1025,5 @@ mod tests {
             vec!["rust", "news"],
             "deduped, original order preserved"
         );
-    }
-}
-
-#[cfg(test)]
-mod debug_lang {
-    use super::*;
-    #[test]
-    fn debug_lang_print() {
-        let doc = br#"<feed xmlns="http://www.w3.org/2005/Atom">
-<title>Chan</title><updated>2026-07-20T10:00:00Z</updated>
-<entry xml:lang="fr">
-  <id>urn:uuid:1</id><title>Post</title>
-</entry></feed>"#;
-        let parsed = parse_feed_document(doc, Some("application/atom+xml")).unwrap();
-        eprintln!("items = {:?}", parsed.items);
-        let raw = feed_rs::parser::parse(&doc[..]).unwrap();
-        eprintln!("raw entries = {:?}", raw.entries);
     }
 }
