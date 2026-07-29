@@ -89,6 +89,27 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
         }
     }
 
+    // The guard above inspects the *raw* bytes, before the rungs run — cheap,
+    // and enough on its own for a document that was already well-formed
+    // enough to carry a literal `<!DOCTYPE … [` in its input bytes. But a
+    // rung can *produce* one that was not there before: a lowercase
+    // `<!doctype` evades the raw-bytes guard's case-sensitive-in-spirit scan
+    // just as well as a control character splitting `<!DOCTY\x01PE` (which
+    // rung 2 then removes) or a UTF-16 document (which rung 1 then
+    // transcodes) do. Re-running the guard on the sanitized bytes closes all
+    // three: whatever the rungs reveal or produce, this still sees it before
+    // the parse.
+    if family == DocFamily::Xml
+        && let Err(reason) = refuse_internal_dtd(&current)
+    {
+        tracing::debug!(stage = "refused-internal-dtd", %reason, "rss parse refused (post-sanitation)");
+        return Err(ParseFailure {
+            stage: "refused-internal-dtd",
+            reason,
+            dialect_declared,
+        });
+    }
+
     match try_parse(&current) {
         Ok(feed) => {
             tracing::debug!(?repairs, dialect = ?feed.feed_type, "rss document parsed");
@@ -267,8 +288,16 @@ fn extract_entry(entry: &Entry) -> Option<ItemRow> {
 }
 
 /// HTML-typed bodies become Markdown; anything else is stored byte-exact.
+///
+/// MIME subtypes are case-insensitive (RFC 2045 §5.1). `mediatype::Name` (what
+/// `.subty()` returns before a call site's `.as_str()` throws it away) already
+/// implements a case-insensitive `PartialEq<&str>` — verified in
+/// `mediatype-0.21.0/src/name.rs`, whose impl compares via
+/// `eq_ignore_ascii_case` — so `eq_ignore_ascii_case` here restores the same
+/// comparison instead of `==`, which let e.g. `type="TEXT/HTML"` store raw
+/// HTML in `items.content`/`items.summary` rather than converting it.
 fn render_text(body: &str, subtype: &str) -> String {
-    if subtype == "html" || subtype == "xhtml" {
+    if subtype.eq_ignore_ascii_case("html") || subtype.eq_ignore_ascii_case("xhtml") {
         html_to_markdown(body)
     } else {
         body.to_string()
@@ -514,6 +543,60 @@ mod tests {
         );
     }
 
+    /// Evasion 1: the guard's `<!DOCTYPE` match used to be case-sensitive, so
+    /// a lowercase `<!doctype` (still a real internal-DTD subset to feed-rs)
+    /// slipped past it.
+    #[test]
+    fn lowercase_doctype_with_internal_subset_is_refused() {
+        let doc = br#"<!doctype r [<!ENTITY a "b">]><r>x</r>"#;
+        let err = parse_with_ladder(doc).unwrap_err();
+        assert_eq!(err.stage, "refused-internal-dtd");
+        assert!(
+            err.reason.contains("internal DTD subset refused"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// Evasion 2: the guard used to run only on raw bytes, before rung 2
+    /// strips illegal control characters. `<!DOCTY\x01PE … [` does not match
+    /// `<!DOCTYPE` and passes that first check; rung 2 then removes the
+    /// control byte, producing a real `<!DOCTYPE … [` — which the
+    /// post-sanitation guard now catches.
+    #[test]
+    fn control_char_split_doctype_with_internal_subset_is_refused_after_sanitation() {
+        let mut doc = b"<!DOCTY".to_vec();
+        doc.push(0x01);
+        doc.extend_from_slice(br#"PE r [<!ENTITY lol "x">]><r>y</r>"#);
+        let err = parse_with_ladder(&doc).unwrap_err();
+        assert_eq!(err.stage, "refused-internal-dtd");
+        assert!(
+            err.reason.contains("internal DTD subset refused"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// Evasion 3: a UTF-16LE document's `<!DOCTYPE` is invisible to the
+    /// raw-bytes scanner (every ASCII byte is interleaved with a `0x00`);
+    /// rung 1 transcodes it to UTF-8, and the post-sanitation guard catches
+    /// the doctype rung 1 reveals.
+    #[test]
+    fn utf16_doctype_with_internal_subset_is_refused_after_reencoding() {
+        let text = r#"<!DOCTYPE r [<!ENTITY lol "x">]><r>y</r>"#;
+        let mut doc = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for unit in text.encode_utf16() {
+            doc.extend_from_slice(&unit.to_le_bytes());
+        }
+        let err = parse_with_ladder(&doc).unwrap_err();
+        assert_eq!(err.stage, "refused-internal-dtd");
+        assert!(
+            err.reason.contains("internal DTD subset refused"),
+            "{}",
+            err.reason
+        );
+    }
+
     #[test]
     fn hopeless_document_exhausts_ladder_with_strict_parse_stage() {
         let err = parse_with_ladder(b"<rss version=\"2.0\"><channel><title>truncat").unwrap_err();
@@ -562,6 +645,17 @@ mod tests {
             br#"</title><link>https://e.com</link><description>d</description></channel></rss>"#,
         );
         let ok = parse_with_ladder(&doc).unwrap();
+        assert_eq!(ok.repairs, vec![Repair::ReencodedToUtf8]);
+        assert_eq!(ok.feed.title.as_ref().unwrap().content, "café");
+    }
+
+    #[test]
+    fn lying_non_utf8_decl_over_utf8_bytes_is_repaired_and_noted() {
+        // decl claims iso-8859-1 but the title bytes are already UTF-8 (café,
+        // not Latin-1) — I3: this used to be a silent byte-level no-op that
+        // mojibaked for any consumer trusting the decl.
+        let doc = "<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><rss version=\"2.0\"><channel><title>café</title><link>https://e.com</link><description>d</description></channel></rss>".as_bytes();
+        let ok = parse_with_ladder(doc).unwrap();
         assert_eq!(ok.repairs, vec![Repair::ReencodedToUtf8]);
         assert_eq!(ok.feed.title.as_ref().unwrap().content, "café");
     }
@@ -673,6 +767,32 @@ mod tests {
         assert_eq!(it.enclosure_type.as_deref(), Some("audio/mpeg"));
     }
 
+    /// I1: MIME subtypes are case-insensitive (RFC 2045 §5.1); a `type=
+    /// "TEXT/HTML"` on `<content>` must still convert to Markdown, not store
+    /// raw HTML. Scoped to `<content>` deliberately — feed-rs's Atom
+    /// `<summary>`/`<title>`/`<rights>` handler (`atom::handle_text`, in
+    /// `feed-rs-2.4.0/src/parser/atom/mod.rs`) matches its `type` attribute
+    /// against literal lowercase strings and *errors the whole entry* on
+    /// anything else, so a mis-cased `<summary>` never even reaches our
+    /// case-sensitive comparison to trigger this bug in the first place; only
+    /// `<content>`'s handler has an "unrecognized type" fallback that lets a
+    /// mis-cased MIME type through as-is.
+    #[test]
+    fn atom_content_type_uppercase_html_still_converts_to_markdown() {
+        let doc = br#"<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Chan</title><updated>2026-07-20T10:00:00Z</updated>
+<entry>
+  <id>urn:uuid:1</id><title>Post</title>
+  <content type="TEXT/HTML">&lt;h1&gt;Body&lt;/h1&gt;</content>
+</entry></feed>"#;
+        let parsed = parse_feed_document(doc, Some("application/atom+xml")).unwrap();
+        assert_eq!(
+            parsed.items[0].content.as_deref(),
+            Some("# Body"),
+            "uppercase MIME subtype must still be treated as HTML"
+        );
+    }
+
     #[test]
     fn jsonfeed_maps_fields() {
         // feed-rs turns JSON Feed attachments into `entry.links`, not `media`.
@@ -733,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn extensions_json_carries_media_and_language_or_none() {
+    fn extensions_json_is_none_for_a_bare_item() {
         let bare = br#"<rss version="2.0"><channel><title>C</title><link>https://e.com</link><description>D</description>
 <item><guid>1</guid><title>T</title></item></channel></rss>"#;
         let parsed = parse_feed_document(bare, None).unwrap();
@@ -741,24 +861,104 @@ mod tests {
             parsed.items[0].extensions_json, None,
             "a bare item carries no extensions"
         );
+    }
 
-        // A second enclosure lands in extensions rather than being dropped.
-        let rich = br#"<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
+    /// M1: the previous version of this test only asserted `.expect(...)`
+    /// on the whole object, so a `<source>` alone (which never touches
+    /// `remaining_media`) satisfied it just as well as real leftover media
+    /// would — the brief's most intricate rule went untested. This asserts
+    /// on the parsed JSON's actual keys instead, so `media` and `source`
+    /// can't stand in for each other.
+    #[test]
+    fn extensions_json_media_key_is_only_leftover_media_beyond_the_enclosure() {
+        let doc = br#"<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
 <title>C</title><link>https://e.com</link><description>D</description>
 <item><guid>1</guid><title>T</title>
 <enclosure url="https://e.com/a.mp3" type="audio/mpeg" length="1"/>
 <media:content url="https://e.com/b.jpg" type="image/jpeg" fileSize="2"/>
-<source url="https://origin.example/feed.xml">Origin</source>
 </item></channel></rss>"#;
-        let parsed = parse_feed_document(rich, None).unwrap();
+        let parsed = parse_feed_document(doc, None).unwrap();
         let ext = parsed.items[0]
             .extensions_json
             .as_deref()
-            .expect("media beyond the first enclosure, or source, populates extensions");
-        // Deterministic key order (BTreeMap) and valid JSON.
+            .expect("a second media:content beyond the enclosure populates extensions");
         let value: serde_json::Value = serde_json::from_str(ext).expect("valid JSON");
-        assert!(value.is_object(), "{ext}");
+        let obj = value.as_object().expect("extensions_json is a JSON object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["media"],
+            "only the leftover media, not source/rights/language: {ext}"
+        );
+        let media = obj["media"].as_array().expect("media is an array");
+        assert_eq!(media.len(), 1, "the enclosure's own content is excluded");
+        assert_eq!(
+            media[0]["content"][0]["url"], "https://e.com/b.jpg",
+            "the *other* media:content survives, not the enclosure's: {ext}"
+        );
         assert_eq!(ext, serde_json::to_string(&value).unwrap(), "keys sorted");
+    }
+
+    /// M1: `<source>` alone — with no media beyond the single enclosure —
+    /// was meant to populate `extensions_json` with a `source` key and *no*
+    /// `media` key, distinguishing this from the media-key test above. But
+    /// `entry.source` (the field this crate's `extensions_json` reads) is
+    /// never actually assigned by feed-rs 2.4.0, for *any* dialect: there is
+    /// no `.source =` anywhere under `feed-rs-2.4.0/src/parser/**` (checked
+    /// `rss2`, `atom`, `rss1`, and `json`), and the RSS2 item handler
+    /// (`feed-rs-2.4.0/src/parser/rss2/mod.rs`'s `handle_item` match) has no
+    /// arm for `(NS::RSS, "source")` at all — the element this fixture used
+    /// is silently ignored, not mapped to the model's `source: Option<String>`
+    /// (whose doc describes *Atom's* copied-source-feed-metadata concept, a
+    /// different thing from RSS2's `<source url>` attribution element, and
+    /// which no parser path sets either). So no XML/JSON fixture can drive
+    /// this key through `parse_feed_document` today. This instead calls
+    /// `extensions_json` directly against a hand-built `Entry`, pinning the
+    /// mapping this crate's own code performs so the property is still
+    /// covered if a future feed-rs starts populating the field.
+    #[test]
+    fn extensions_json_source_key_present_without_a_media_key() {
+        let entry = Entry {
+            source: Some("Origin".to_string()),
+            ..Entry::default()
+        };
+        let ext = extensions_json(&entry, false)
+            .expect("source populates extensions even with no leftover media");
+        let value: serde_json::Value = serde_json::from_str(&ext).expect("valid JSON");
+        let obj = value.as_object().expect("extensions_json is a JSON object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["source"],
+            "source only, no media key when nothing is left over: {ext}"
+        );
+        assert_eq!(obj["source"], "Origin");
+    }
+
+    /// M1: `language`, named in the original test, was never actually
+    /// exercised by it. `entry.language` is populated only from the
+    /// `xml:lang` attribute on an Atom entry's `<content>` *child* element
+    /// (verified: `feed-rs-2.4.0/src/parser/atom/mod.rs`'s
+    /// `(NS::Atom, "content")` match arm is the only place that assigns
+    /// `entry.language`, via `util::handle_language_attr(&child)` where
+    /// `child` is that `<content>` element) — not from `xml:lang` on the
+    /// `<entry>` element itself, which the original fixture put it on and
+    /// which no code path reads for this field.
+    #[test]
+    fn extensions_json_language_key_from_atom_entry_xml_lang() {
+        let doc = br#"<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Chan</title><updated>2026-07-20T10:00:00Z</updated>
+<entry>
+  <id>urn:uuid:1</id><title>Post</title>
+  <content type="text" xml:lang="fr">body</content>
+</entry></feed>"#;
+        let parsed = parse_feed_document(doc, Some("application/atom+xml")).unwrap();
+        let ext = parsed.items[0]
+            .extensions_json
+            .as_deref()
+            .expect("xml:lang on <content> populates extensions_json's language key");
+        let value: serde_json::Value = serde_json::from_str(ext).expect("valid JSON");
+        let obj = value.as_object().expect("extensions_json is a JSON object");
+        assert_eq!(obj.keys().collect::<Vec<_>>(), vec!["language"]);
+        assert_eq!(obj["language"], "fr");
     }
 
     /// Identity must be reproducible across scans, so a random id is never

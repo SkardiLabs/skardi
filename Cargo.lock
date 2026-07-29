@@ -9482,7 +9482,7 @@ dependencies = [
  "ort",
  "percent-encoding",
  "pgvector",
- "quick-xml 0.37.5",
+ "quick-xml 0.41.0",
  "redis",
  "redis-test",
  "regex",

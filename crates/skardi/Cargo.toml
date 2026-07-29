@@ -108,12 +108,17 @@ mongodb = "3.1"
 mysql_async = "0.36"
 percent-encoding = "2.3"
 # rss source connector (optional, behind the `rss` feature): parses OPML
-# subscription lists — the only hand-rolled XML in the provider (a later
-# task adds `feed-rs`, whose own XML backend is also quick-xml, for feed
-# bodies themselves). Pinned to 0.37, the major Cargo.lock already resolves
-# via `reqsign`, rather than introducing a third quick-xml version; recheck
-# this pin against feed-rs's actual requirement when that task lands.
-quick-xml = { version = "0.37", optional = true }
+# subscription lists — the only hand-rolled XML in the provider besides
+# `feed-rs` (used for feed bodies themselves), whose own XML backend is also
+# quick-xml. `Cargo.lock` carries three quick-xml versions regardless of what
+# this line pins: `reqsign` requires exactly 0.37, `opendal` requires exactly
+# 0.38, and `feed-rs` 2.4 requires 0.41 (with its `encoding` feature) — three
+# mutually-incompatible minor versions from three deps this crate does not
+# control. This pin only decides which of those three our own direct usage
+# rides on; it cannot reduce the count to fewer than three either way.
+# Pinned to 0.41, `feed-rs`'s version, so this code exercises the same
+# quick-xml our own feed bodies already depend on.
+quick-xml = { version = "0.41", optional = true }
 redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster"] }
 # documents source connector (optional, behind the `documents` feature).
 # Pulls in native PDFium (downloaded by pdfium-sys build.rs).
