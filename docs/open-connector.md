@@ -286,7 +286,12 @@ fails with a targeted error instead of silently changing a table's
 schema; upgrading the gateway means re-capturing the contract and
 re-pinning. (Additive upstream fields in *row data* are still simply
 ignored by conversion — the fingerprint gates the declared schema, not
-the rows.) Bindings may pin `source_pack_version` so a Skardi upgrade
+the rows.) The gate's coverage is exactly the upstream **declaration**:
+mapped columns that a provider's schema leaves to `additionalProperties`
+passthrough sit outside the fingerprint, and drift there surfaces at scan
+time under the conversion rules instead (a shape change fails loudly; a
+removed nullable field reads as NULL). Each pack pins its uncovered-column
+set in a test, so that gap is a reviewed fact rather than an implicit one. Bindings may pin `source_pack_version` so a Skardi upgrade
 cannot silently change a bound table's schema either.
 
 ## Observability

@@ -116,6 +116,82 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_coverage_gap_is_pinned() {
+        // The gate protects only what upstream DECLARES; these mapped
+        // columns ride additionalProperties passthrough, so their drift is
+        // invisible to the fingerprint and surfaces at scan time per
+        // conversion rules (a shape change fails loudly; a removed nullable
+        // field reads as NULL). Pinning the set makes any change — upstream
+        // declaring more, or a mapping change — a conscious decision.
+        use crate::sources::providers::open_connector::testutil::fingerprint_uncovered_columns;
+        for (short, contract, expected) in [
+            (
+                "repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+                &[
+                    "language",
+                    "stargazers_count",
+                    "forks_count",
+                    "open_issues_count",
+                    "archived",
+                    "created_at",
+                    "updated_at",
+                    "pushed_at",
+                ] as &[&str],
+            ),
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+                &["created_at", "updated_at", "closed_at"],
+            ),
+            (
+                "issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+                &["author_login"],
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+                &[
+                    "head_ref",
+                    "base_ref",
+                    "created_at",
+                    "updated_at",
+                    "closed_at",
+                    "merged_at",
+                ],
+            ),
+            (
+                "reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+                &["author_login"],
+            ),
+            (
+                "commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+                &["message", "author_name", "authored_at", "committed_at"],
+            ),
+            (
+                "workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+                &["created_at", "updated_at"],
+            ),
+            (
+                "releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+                &[],
+            ),
+        ] {
+            let t = table(short);
+            assert_eq!(
+                fingerprint_uncovered_columns(contract, t.row_path, t.fields),
+                expected,
+                "fingerprint coverage changed for {short}"
+            );
+        }
+    }
+
+    #[test]
     fn pinned_fingerprints_match_the_reconciled_contracts() {
         // Pin <-> captured-contract lock, through the SAME function
         // registration uses. On mismatch this prints the actual hashes —

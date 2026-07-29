@@ -356,6 +356,31 @@ impl tracing::Subscriber for CaptureSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+/// Mapped columns whose dotted path is NOT declared in a captured
+/// contract's row-item schema — the subset the fingerprint gate cannot
+/// protect, because upstream leaves those fields to `additionalProperties`
+/// passthrough. Packs pin this set explicitly so the coverage gap is a
+/// conscious, reviewed fact rather than an implicit one.
+pub(crate) fn fingerprint_uncovered_columns(
+    contract: &str,
+    row_path: &str,
+    fields: &[crate::sources::providers::open_connector::json_to_arrow::FieldMapping],
+) -> Vec<&'static str> {
+    fn descend<'a>(mut node: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        for segment in path.split('.') {
+            node = &node["properties"][segment];
+        }
+        node
+    }
+    let contract: serde_json::Value = serde_json::from_str(contract).expect("contract parses");
+    let items = &descend(&contract, row_path.strip_prefix("$.").expect("row path"))["items"];
+    fields
+        .iter()
+        .filter(|field| descend(items, field.path).is_null())
+        .map(|field| field.name)
+        .collect()
+}
+
 /// Set an environment variable for the guard's lifetime and restore the
 /// previous state — prior value or absence — on drop, including on panic,
 /// so a failing test cannot leak its variable into tests that run later.

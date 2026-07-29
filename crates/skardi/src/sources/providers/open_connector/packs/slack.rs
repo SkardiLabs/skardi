@@ -143,6 +143,50 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_coverage_gap_is_pinned() {
+        // conversations and users are fully covered — the normalizing
+        // executors declare every emitted field. files rows are raw Slack
+        // passthrough plus aliases, so most mapped columns ride
+        // additionalProperties and sit outside the fingerprint gate; their
+        // drift surfaces at scan time per conversion rules. Pinned so any
+        // change is a conscious decision.
+        use crate::sources::providers::open_connector::testutil::fingerprint_uncovered_columns;
+        for (short, contract, expected) in [
+            (
+                "conversations",
+                include_str!("fixtures/slack/contracts/list_conversations.json"),
+                &[] as &[&str],
+            ),
+            (
+                "users",
+                include_str!("fixtures/slack/contracts/list_users.json"),
+                &[],
+            ),
+            (
+                "files",
+                include_str!("fixtures/slack/contracts/list_files.json"),
+                &[
+                    "id",
+                    "filetype",
+                    "size",
+                    "user_id",
+                    "channels",
+                    "is_public",
+                    "created",
+                    "permalink",
+                ],
+            ),
+        ] {
+            let t = table(short);
+            assert_eq!(
+                fingerprint_uncovered_columns(contract, t.row_path, t.fields),
+                expected,
+                "fingerprint coverage changed for {short}"
+            );
+        }
+    }
+
+    #[test]
     fn pinned_fingerprints_match_the_reconciled_contracts() {
         // Each pin is the BLAKE3 hash of the canonicalized output schema
         // captured from a live gateway (v1.3.1) into
