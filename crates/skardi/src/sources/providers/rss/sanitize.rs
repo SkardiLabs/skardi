@@ -168,18 +168,37 @@ pub fn rung_reencode_utf8(input: &[u8]) -> (Vec<u8>, bool) {
     let (body, had_bom) = strip_utf8_bom(input);
 
     // Already valid UTF-8. A missing declaration, or one that already says
-    // UTF-8, needs no repair beyond a leading BOM — that is what keeps the
-    // rung a byte-level no-op on well-formed input. A declaration naming some
-    // *other* encoding, though, is lying about bytes that are, in fact,
-    // already UTF-8 — a common real-world shape (content re-encoded to UTF-8
-    // without updating the declaration) that would otherwise mojibake for any
-    // consumer that trusts the decl. Point the token at UTF-8 too, same as the
-    // transcoding path below already does.
+    // UTF-8, needs no repair beyond a leading BOM — that is what keeps the rung
+    // a byte-level no-op on well-formed input.
+    //
+    // A declaration naming some *other* encoding only matters once the body
+    // actually carries a byte outside ASCII. Below 0x80 every label reachable
+    // here decodes byte-for-byte the way UTF-8 does — `Encoding::
+    // is_ascii_compatible` (encoding_rs-0.8.35/src/lib.rs) is false only for
+    // UTF-16LE/BE, ISO-2022-JP and `replacement` — so
+    // `<?xml version="1.0" encoding="ISO-8859-1"?>` over pure-ASCII content is
+    // a correctly-declared document that needs nothing, and rewriting it would
+    // break the no-op contract on an extremely common real-feed shape. The
+    // label cannot tell that case apart on its own: `for_label` maps
+    // `us-ascii`, `ascii`, `iso-8859-1` and `latin1` all to windows-1252
+    // (asserted in encoding_rs' own `src/test_labels_names.rs`), so none of
+    // them compare equal to `UTF_8`.
+    //
+    // With a non-ASCII byte present the declaration *is* lying — the bytes just
+    // passed UTF-8 validation — which is a common real-world shape (content
+    // re-encoded to UTF-8 without updating the declaration) that mojibakes
+    // `café` into `cafÃ©` for any consumer trusting the decl. Point the token at
+    // UTF-8 too, same as the transcoding path below already does. A label that
+    // is not ASCII-compatible gets the same treatment whatever the bytes are:
+    // ASCII under an `encoding="utf-16"` declaration is not a document any
+    // consumer can read as declared.
     if let Ok(text) = std::str::from_utf8(body) {
-        let names_other_encoding = xml_decl_encoding_label(body)
+        let declaration_misleads = xml_decl_encoding_label(body)
             .and_then(|label| encoding_rs::Encoding::for_label(&label))
-            .is_some_and(|enc| enc != encoding_rs::UTF_8);
-        if names_other_encoding {
+            .is_some_and(|enc| {
+                enc != encoding_rs::UTF_8 && (!body.is_ascii() || !enc.is_ascii_compatible())
+            });
+        if declaration_misleads {
             return (rewrite_decl_encoding(text), true);
         }
         return (body.to_vec(), had_bom);
@@ -354,8 +373,9 @@ fn valid_reference_len(rest: &[u8]) -> Option<usize> {
     // `&#[0-9]{1,7};` or `&#x[0-9A-Fa-f]{1,6};` (XML allows only a lowercase `x`).
     // The digit caps bound how far this scans looking for the terminating
     // `;`, but they are a byte-count cap, not a leading-zero-aware one: a
-    // well-formed reference with leading zeros past the cap (e.g. the 11
-    // digits of `&#00000169;`) is treated as unterminated within the window
+    // well-formed reference whose leading zeros push its digits past the cap
+    // (e.g. `&#000000169;`, 9 digits against the 7-digit window) is treated as
+    // unterminated within the window
     // and its `&` gets escaped to `&amp;`, corrupting an otherwise-valid
     // reference. Accepted tradeoff: a fixed, cheap-to-check cap over a
     // leading-zero-stripping scan.
@@ -401,6 +421,15 @@ mod tests {
             // names them): `apos;`/`quot;` were the two `valid_reference_len`
             // arms no test exercised before this.
             r#"<x a='&apos;&quot;'>&apos; &quot;</x>"#,
+            // A legacy-but-truthful declaration over ASCII-only content: every
+            // one of these labels resolves to windows-1252, which agrees with
+            // UTF-8 below 0x80, so the document is correctly declared and the
+            // bytes need nothing. The battery used to declare UTF-8 or nothing
+            // at all in every fixture, which is how rung 1 came to rewrite
+            // these — the single most common real-feed prolog there is.
+            r#"<?xml version="1.0" encoding="us-ascii"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
+            r#"<?xml version="1.0" encoding="ISO-8859-1"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
+            r#"<?xml version="1.0" encoding="windows-1252"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
         ];
         for doc in wellformed {
             let b = doc.as_bytes();
@@ -460,6 +489,31 @@ mod tests {
         assert!(
             !s.contains("iso-8859-1"),
             "decl encoding token rewritten: {s}"
+        );
+    }
+
+    #[test]
+    fn legacy_decl_over_ascii_only_content_is_a_noop() {
+        // The trigger is "declared non-UTF-8 *and* a non-ASCII byte is present":
+        // the same declaration is a lie over `café` (the test above) and the
+        // truth over ASCII, and only the bytes can tell the two apart.
+        let ascii = r#"<?xml version="1.0" encoding="ISO-8859-1"?><x>plain ascii</x>"#.as_bytes();
+        let (out, changed) = rung_reencode_utf8(ascii);
+        assert!(!changed, "ASCII under a legacy label needs no repair");
+        assert_eq!(out, ascii);
+    }
+
+    #[test]
+    fn ascii_under_a_non_ascii_compatible_decl_is_still_repaired() {
+        // ASCII bytes are not readable as the declared UTF-16 by any consumer
+        // that trusts the declaration, so this one is not well-formed input and
+        // the ASCII carve-out above must not reach it.
+        let doc = r#"<?xml version="1.0" encoding="utf-16"?><x>plain ascii</x>"#.as_bytes();
+        let (out, changed) = rung_reencode_utf8(doc);
+        assert!(changed);
+        assert_eq!(
+            out,
+            r#"<?xml version="1.0" encoding="UTF-8"?><x>plain ascii</x>"#.as_bytes()
         );
     }
 

@@ -116,12 +116,19 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
             })?;
             let decode = || -> Result<String, RssError> {
                 // `decode_and_unescape_value` is deprecated in quick-xml 0.41 in
-                // favor of this; passing `Implicit1_0` reproduces its exact old
-                // behavior (verified: quick-xml-0.41.0/src/events/attributes.rs
-                // defines `decode_and_unescape_value` as calling
-                // `decoded_and_normalized_value_with(XmlVersion::Implicit1_0,
-                // decoder, 1, resolve_predefined_entity)`, the same arguments
-                // `decoded_and_normalized_value` passes through here).
+                // favor of this, and `Implicit1_0` is what its own deprecated
+                // body passes. Relative to the 0.37 this bump replaced, though,
+                // the behavior is *not* identical: 0.37's
+                // `decode_and_unescape_value` was decode + `unescape_with`, i.e.
+                // entity resolution only, while 0.41 routes through
+                // `normalize_xml10_attribute_value`, which also performs XML
+                // attribute-value normalization — `is_xml10_normalization_char`
+                // (quick-xml-0.41.0/src/escape.rs) fires on `\t`, `\r`, `\n` and
+                // `&`, so a literal tab or newline inside an OPML attribute
+                // value now collapses to a space (`a\tb` → `a b`, pinned in this
+                // module's tests). That is the spec-correct reading of an
+                // attribute value, and it only ever touches whitespace inside a
+                // feed's display name or URL, so it is kept deliberately.
                 attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
                     .map(|v| v.into_owned())
                     .map_err(|e| {
@@ -254,6 +261,28 @@ mod tests {
         );
         assert_eq!(subs[1].name, "TWiR"); // title attr fallback
         assert_eq!(subs[2].name, "https://example.com/no-name.xml"); // name defaults to URL
+    }
+
+    #[test]
+    fn literal_tabs_and_newlines_in_attribute_values_collapse_to_spaces() {
+        // XML attribute-value normalization, which quick-xml applies from 0.41
+        // on (see the `decode` comment above); 0.37 passed both through as-is.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subs.opml");
+        std::fs::write(
+            &path,
+            "<opml version=\"2.0\"><body>\
+             <outline text=\"a\tb\nc\" xmlUrl=\"https://e.com/f\tx\"/>\
+             </body></opml>",
+        )
+        .unwrap();
+        let config = RssConfig {
+            opml: Some(path),
+            ..inline_config(vec![])
+        };
+        let subs = resolve_subscriptions("news", &config).unwrap();
+        assert_eq!(subs[0].name, "a b c");
+        assert_eq!(subs[0].url, "https://e.com/f x");
     }
 
     #[test]
