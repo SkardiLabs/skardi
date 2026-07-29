@@ -216,14 +216,25 @@ pub trait FeedCache: Send + Sync {
     /// `Error` is the honest answer there even though the feed itself is
     /// healthy. It is the one status whose contract is "no window is cached to
     /// fall back on", which is exactly the situation; it is also the status
-    /// whose [`FeedStatus::window_status_str`] is `None`, so it agrees with
-    /// the zero rows a scan will actually serve. `Revalidated` would claim a
-    /// current window exists — leaving `feeds` reporting a healthy feed with a
-    /// non-zero `item_count` while `items` returns nothing, and no column
-    /// anywhere explaining why. Recovery does not depend on this choice: with
-    /// no window there are no validators to send, so the next attempt after
-    /// the timer expires is an unconditional `GET` that rebuilds the window
-    /// whatever status was recorded here.
+    /// whose [`FeedStatus::window_status_str`] is `None`, so *from the next scan
+    /// on* it agrees with the zero rows that scan will serve. `Revalidated`
+    /// would instead claim a current window exists indefinitely — leaving
+    /// `feeds` reporting a healthy feed with a non-zero `item_count` while
+    /// `items` returns nothing, and no column anywhere explaining why.
+    ///
+    /// The serve that *records* this state is the one exception: the engine
+    /// already read a window out of its pre-permit snapshot and stamps those
+    /// rows `revalidated` from a literal, so for that one racing scan
+    /// `items.window_status = 'revalidated'` sits beside
+    /// `feeds.last_status = 'error'`. That is the same no-coalescing
+    /// consequence the engine's `304` branch documents — the rows it serves are
+    /// a real window the `304` really did vouch for — and it lasts exactly one
+    /// scan.
+    ///
+    /// Recovery does not depend on this choice: with no window there are no
+    /// validators to send, so the next attempt after the timer expires is an
+    /// unconditional `GET` that rebuilds the window whatever status was
+    /// recorded here.
     fn record_not_modified(
         &self,
         feed: &str,
@@ -256,11 +267,14 @@ pub trait FeedCache: Send + Sync {
 }
 
 /// `feeds.last_error` for a `304` whose window was evicted while the request
-/// was in flight — see [`FeedCache::record_not_modified`]. Carries no response
-/// content of any kind: the condition is entirely local to this cache, and the
-/// string is a fixed literal.
-pub const WINDOW_EVICTED_ON_REVALIDATION: &str = "revalidated (304) but the cached window had been evicted under the cache byte \
-     budget; the next attempt refetches it unconditionally";
+/// was in flight — see [`FeedCache::record_not_modified`]. Names no particular
+/// bound, since any of the three can produce the state: `max_bytes` and
+/// `max_entries` through [`Inner::evict`], and the `max_observations` backstop
+/// through [`Inner::evict_observations`]. Carries no response content of any
+/// kind: the condition is entirely local to this cache, and the string is a
+/// fixed literal.
+pub const WINDOW_EVICTED_ON_REVALIDATION: &str = "revalidated (304) but the cached window had already been evicted from the feed \
+     cache; the next attempt refetches it unconditionally";
 
 /// The negative-cache TTL for a feed that just failed: `clamp(ttl / 4, 30s,
 /// 300s)`. Shorter than the success TTL so a dead feed is retried sooner

@@ -52,47 +52,59 @@
 //!
 //! ## What may reach `feeds.last_error`
 //!
-//! This module is the only writer of that column, and [`MAX_ERROR_CHARS`]
-//! bounds its length — but truncation is not redaction, so the guarantee that
-//! no response *body content* lands there comes from which strings are passed
-//! in. Audited against the pinned `feed-rs` 2.4.0 and the `quick-xml` 0.41.0
-//! it resolves to (`Cargo.lock`):
+//! This module is the only writer of that column. [`MAX_ERROR_CHARS`] bounds
+//! its length, but truncation is not redaction, so the property that matters is
+//! separate:
 //!
-//! - `quick-xml`'s `IllFormedError` `Display` (`src/errors.rs:148`)
-//!   interpolates element and attribute *names* only — `MissingEndTag`,
-//!   `UnmatchedEndTag`, `MismatchedEndTag`, `MissingDeclVersion` — never
-//!   character data.
-//! - `quick-xml`'s `EscapeError` is the one variant family that *would* quote
-//!   content: `UnrecognizedEntity(Range, String)` renders as ``unrecognized
-//!   entity `{token}` `` with the token lifted straight out of character data
-//!   (`src/escape.rs:66-68`). It is not reachable through this parse chain, and
-//!   the reason is worth stating precisely because two plausible explanations
-//!   are wrong. It is *not* that `sanitize.rs`'s rung 3 escapes the `&` first
-//!   (it does, but disabling the rung does not produce a leak), and it is not
-//!   that such documents fail elsewhere first. Measured against feed-rs 2.4.0:
-//!   an undefined entity reference in character data produces **no error at
-//!   all** — `feed_rs::parser::parse` on
-//!   `<title>&SENTINEL-XYZ;</title>` returns `Ok` with the title read back
-//!   verbatim as `"&SENTINEL-XYZ;"`, both with and without the ladder, so
-//!   `parse_feed_document` never sees the variant to propagate. The XML errors
-//!   it *does* surface for a malformed document are the structural ones above
-//!   (a truncated feed reports "tag not closed: `>` not found before end of
-//!   input"). `parse_failure_last_error_never_echoes_character_data` carries a
-//!   sentinel in character data through three shapes, including the undefined
-//!   entity, so a future `feed-rs` that starts reporting escape errors is
-//!   caught rather than trusted.
-//! - `feed-rs`'s `ParseErrorKind` (`src/parser/mod.rs:94`) interpolates a MIME
-//!   string and a `&'static str` element name;
-//!   `ParseFeedError::JsonUnsupportedVersion` (`src/parser/mod.rs:37`)
-//!   interpolates a JSON Feed's declared `version`.
-//! - [`FetchError`]'s own strings are statuses, byte/second counts, and URLs
-//!   (the configured feed URL, or a redirect `Location`) — never a body.
+//! > No `feeds.last_error` value contains text taken from the feed body, with
+//! > one deliberate exception: a JSON Feed's declared `version` string, when
+//! > that version is unsupported.
 //!
-//! Element names, MIME types, and version strings are deliberately kept: they
-//! are what makes a malformed feed diagnosable, they are structure rather than
-//! content, and the character cap bounds the worst case. If a future
-//! `feed-rs`/`quick-xml` starts echoing character data, that test fails and a
-//! redaction filter belongs here.
+//! **The tests enforce that, not this comment.**
+//! `parse_failure_last_error_never_echoes_character_data` embeds a sentinel in
+//! body content across several document shapes — each chosen because it reaches
+//! a different error path, with a counter that fails if a shape stops erroring
+//! — and asserts the sentinel never appears in the recorded error.
+//! `json_unsupported_version_is_the_one_body_text_kept_in_last_error` pins the
+//! exception from the other side, so it cannot quietly widen. Three successive
+//! attempts at explaining this property in prose were each wrong in a different
+//! way; the tests were right every time. If a dependency upgrade changes any of
+//! this, they fail, and whoever sees that should re-derive the situation rather
+//! than trust the paragraph below.
+//!
+//! What was *measured*, against `feed-rs` 2.4.0 and the `quick-xml` 0.41.0 it
+//! resolves to (`Cargo.lock`) — evidence for the property today, not a taxonomy
+//! of everything a malformed document can produce:
+//!
+//! - Two error families were observed reaching this column, and both carry
+//!   structural text only. A truncated document reports
+//!   `SyntaxError::UnclosedTag` — "tag not closed: `>` not found before end of
+//!   input" (`quick-xml-0.41.0/src/errors.rs:71`), prefixed "syntax error: " by
+//!   `Error`'s `Display` (`src/errors.rs:287`). An out-of-range character
+//!   reference such as `&#x110000;` reports `EscapeError::InvalidCharRef`,
+//!   which renders the parsed *number* alone — "`1114112` is not a valid
+//!   codepoint" (`src/escape.rs:30`) — and nothing adjacent to it.
+//! - `EscapeError::UnrecognizedEntity` is the variant that would interpolate a
+//!   token lifted from the document (`src/escape.rs:66-68`). Its only producer
+//!   is `quick_xml::escape::unescape`, and feed-rs's only call to that is on
+//!   attribute values, where the error is discarded:
+//!   `unescape(&decoded_value).unwrap_or_else(|_| decoded_value.clone())`
+//!   (`feed-rs-2.4.0/src/xml/mod.rs:597-598`). Element text does not go through
+//!   `unescape` at all — feed-rs resolves references itself and writes an
+//!   unresolvable entity back into the text verbatim
+//!   (`feed-rs-2.4.0/src/xml/mod.rs:333-345`), which is why an undefined entity
+//!   in a title yields no error at all.
+//! - The exception is `ParseFeedError::JsonUnsupportedVersion(String)`, whose
+//!   `Display` is "unsupported version: {version}"
+//!   (`feed-rs-2.4.0/src/parser/mod.rs:66`), reached from
+//!   `src/parser/json/mod.rs:29`. That string is a member value out of the
+//!   document. It is kept because an unsupported version is undiagnosable
+//!   without it, and it is bounded by [`MAX_ERROR_CHARS`] like everything else
+//!   here.
+//! - [`FetchError`]'s own strings — this crate's, so not a dependency
+//!   question — are statuses, byte and second counts, and URLs: the configured
+//!   feed URL, or a redirect `Location`. A `Location` is attacker-influenced
+//!   but is not body content, and the cap bounds it.
 //!
 //! ## No in-flight coalescing
 //!
@@ -580,8 +592,11 @@ impl RssEngine {
 /// emits. Threading this out of the state machine rather than logging inside
 /// each branch is what keeps it one record per serve however the serve ended.
 struct ServeLog {
-    /// `cache-hit` | `revalidated` | `fetched` | `stale-error` | `error` |
-    /// `gate-closed`.
+    /// The full domain of the `outcome` log field: `cache-hit` |
+    /// `revalidated` | `fetched` | `stale-error` | `error` | `gate-closed`.
+    /// [`RssEngine::serve_feed`] emits one more value without building a
+    /// `ServeLog` for it — `unknown-feed`, for a name that is not a
+    /// subscription, which returns before the state machine runs.
     outcome: &'static str,
     http_status: Option<u16>,
     /// Decoded response body size; `0` when no body was read.
@@ -1035,24 +1050,37 @@ mod tests {
     /// error never echoing character data — pinned here end to end for both
     /// shapes that could carry it.
     ///
-    /// Each body carries the sentinel in *character data* — the one place a
-    /// parser could quote content from — in a different shape. Whether a given
-    /// body fails to parse is feed-rs's business and may change between
-    /// versions; the invariant is that if any reason lands in `last_error`, the
-    /// sentinel is not in it and the stored string respects the cap.
+    /// Each body carries the sentinel in body content, in a shape chosen to
+    /// reach a different error path. Whether a given body fails to parse is
+    /// feed-rs's business and may change between versions; the invariant is that
+    /// if a reason lands in `last_error`, the sentinel is not in it and the
+    /// stored string respects the cap.
     #[tokio::test]
     async fn parse_failure_last_error_never_echoes_character_data() {
         const SENTINEL: &str = "SHOULD-NOT-LEAK";
         let bodies = [
             // Truncated mid-element, sentinel as ordinary character data.
+            // Reaches `SyntaxError::UnclosedTag`.
             "<rss version=\"2.0\"><channel><title>SHOULD-NOT-LEAK secret prose",
             // Truncated, sentinel shaped as an undefined entity reference —
             // the input `EscapeError::UnrecognizedEntity` would quote verbatim.
+            // Reaches `UnclosedTag` too: the structural failure comes first.
             "<rss version=\"2.0\"><channel><title>&SHOULD-NOT-LEAK; truncat",
+            // Sentinel adjacent to an out-of-range character reference in
+            // character data. This is the shape that reaches
+            // `EscapeError::InvalidCharRef`, the only escape error observed
+            // reaching this column — the position matters, since the same
+            // reference inside `<title>` is swallowed per-element and yields no
+            // error at all.
+            concat!(
+                r#"<rss version="2.0"><channel>SHOULD-NOT-LEAK &#x110000;"#,
+                r#"<title>t</title><link>https://e.example/</link>"#,
+                r#"<description>d</description></channel></rss>"#,
+            ),
             // Well-formed, so nothing fails today: feed-rs 2.4.0 reads an
             // undefined entity back as literal text and reports no error at
             // all. Kept as a live guard — the day a future feed-rs starts
-            // reporting escape errors, this body is the one that produces one.
+            // reporting escape errors for element text, this body produces one.
             concat!(
                 r#"<rss version="2.0"><channel><title>&SHOULD-NOT-LEAK;</title>"#,
                 r#"<link>https://e.example/</link><description>d</description>"#,
@@ -1079,14 +1107,68 @@ mod tests {
                 );
             }
         }
-        // Guards the loop against going quietly vacuous: the two truncated
+        // Guards the loop against going quietly vacuous: three of the four
         // bodies must still reach the failure path for the assertions above to
-        // mean anything.
+        // mean anything. If this count moves, a shape changed error family and
+        // the new reason needs re-checking by hand.
         assert_eq!(
-            errors_seen, 2,
-            "expected the two truncated bodies to record an error and the well-formed \
-             one not to; if that changed, re-check what the new reason contains"
+            errors_seen, 3,
+            "expected the two truncated bodies and the bad character reference to record \
+             an error, and the well-formed one not to"
         );
+    }
+
+    /// The one documented exception to "no body text in `last_error`": feed-rs
+    /// interpolates a JSON Feed's declared `version` when it does not recognise
+    /// it, and that string is a member value out of the document.
+    ///
+    /// Pinned from the exception's side deliberately. The audit claims exactly
+    /// one carve-out, and a test that only asserted the absence of leaks would
+    /// pass just as happily if this one silently widened — or if someone
+    /// "fixed" it without updating the audit.
+    #[tokio::test]
+    async fn json_unsupported_version_is_the_one_body_text_kept_in_last_error() {
+        let body = r#"{"version":"SHOULD-NOT-LEAK-1.9","title":"t","items":[]}"#;
+        let server = MockFeedServer::start(move |_| {
+            MockResponse::new(200, body.as_bytes().to_vec())
+                .with_header("content-type", "application/json")
+        })
+        .await;
+        let engine = test_engine(&server, &[("a", "/f.json")], 900);
+
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        let error = str_opt_col(&engine.feeds_row("a"), "last_error")[0]
+            .clone()
+            .expect("an unsupported version is a parse failure");
+        assert!(
+            error.contains("unsupported version: SHOULD-NOT-LEAK-1.9"),
+            "the declared version is kept, because the error is undiagnosable \
+             without it: {error}"
+        );
+        assert!(error.chars().count() <= MAX_ERROR_CHARS);
+    }
+
+    /// The exception is bounded by the same cap as everything else, so an
+    /// absurdly long declared version cannot turn one field into an unbounded
+    /// write.
+    #[tokio::test]
+    async fn a_huge_json_version_is_still_capped() {
+        let body = format!(
+            r#"{{"version":"{}","title":"t","items":[]}}"#,
+            "v".repeat(20_000)
+        );
+        let server = MockFeedServer::start(move |_| {
+            MockResponse::new(200, body.clone().into_bytes())
+                .with_header("content-type", "application/json")
+        })
+        .await;
+        let engine = test_engine(&server, &[("a", "/f.json")], 900);
+
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        let error = str_opt_col(&engine.feeds_row("a"), "last_error")[0]
+            .clone()
+            .expect("last_error recorded");
+        assert_eq!(error.chars().count(), MAX_ERROR_CHARS);
     }
 
     #[tokio::test]
