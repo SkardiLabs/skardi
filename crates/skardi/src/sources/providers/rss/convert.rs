@@ -162,10 +162,25 @@ fn max_open_tag_depth(html: &str) -> usize {
     // ceiling, so hostile nesting never allocates proportional to its depth.
     let mut open: Vec<&str> = Vec::with_capacity(16);
     let mut max_depth: usize = 0;
-    // How many `svg`/`math` elements are open, i.e. whether the tree builder
-    // would be in foreign content here. Only ever an over-estimate: a breakout
-    // tag (`<br>`, `<table>`, …) returns the real parser to HTML content
-    // without any close tag for this to see.
+    // How many `svg`/`math` start tags are open and unclosed. This is *not* a
+    // reliable answer to "is the tree builder in foreign content here", and is
+    // only ever read where believing it too readily costs an over-count:
+    //
+    // * Trusted to suspend the [`VOID_ELEMENTS`] skip below. Wrong in the
+    //   direction of counting a void element as nesting, which over-counts.
+    // * *Not* trusted to decide that a self-closing tag closes itself. That
+    //   would under-count, and under-counting is the vulnerability.
+    //
+    // The reason it cannot be trusted is that html5ever leaves foreign content
+    // with no close tag for this scan to see, two ways: the breakout arm at
+    // `tree_builder/rules.rs:1618-1624` (`<b>`, `<br>`, `<div>`, `<table>`, …)
+    // calls `unexpected_start_tag_in_foreign_content` (`mod.rs:1829-1837`),
+    // which pops back to HTML content and re-steps the token there; and the
+    // HTML integration points (`svg foreignObject|desc|title`, mathml
+    // `mi|mo|mn|ms|mtext` — `tag_sets.rs:89-107`) parse their contents as HTML.
+    // A mismatched close tag under `<svg>` leaves it stale too. Tracking those
+    // exactly would mean replicating both sets, a far larger correctness
+    // surface for no safety gain, so this scan does not try.
     let mut foreign: usize = 0;
 
     while i < bytes.len() {
@@ -211,7 +226,19 @@ fn max_open_tag_depth(html: &str) -> usize {
             // A self-closing tag closes itself in foreign content only. In HTML
             // content the flag is acknowledged and then ignored, so `<div/>`
             // opens a `div` there.
-            if self_closing && (foreign > 0 || is_foreign_root(tag)) {
+            //
+            // Honored only for `<svg>`/`<math>` themselves, never for anything
+            // merely *under* one: `foreign` goes stale without a close tag (see
+            // its declaration above), and skipping the push on a stale count
+            // under-counts without bound — `"<svg>" + "<div/>".repeat(1000)`
+            // scanned as depth 1 against a real DOM depth of 1003, and reached
+            // htmd's walker, which aborted the process. The price is a
+            // deliberate over-count on a genuine `<svg>` holding more than
+            // `MAX_HTML_DEPTH` self-closing children (`<svg>` + `<path/>`x1000
+            // scans 101 against a real depth of 5, so it degrades to text) —
+            // the same safe side of the trade [`VOID_ELEMENTS`] takes for
+            // `<col>`.
+            if self_closing && is_foreign_root(tag) {
                 continue;
             }
             if is_foreign_root(tag) {
@@ -679,6 +706,26 @@ mod tests {
         // under `<svg>`, which is not on the tree builder's breakout list.
         assert_degraded_to_text(&deep("<svg>", "<wbr>"), "svg/wbr");
         assert_degraded_to_text(&deep("<math>", "<input>"), "math/input");
+    }
+
+    #[test]
+    fn a_self_closing_tag_under_foreign_content_still_counts_as_nesting() {
+        // html5ever leaves foreign content without any close tag for the scan
+        // to see, so "am I in foreign content" cannot be tracked lexically. A
+        // self-closing tag is therefore only self-closing when it is `<svg>`
+        // or `<math>` itself.
+        //
+        // `<i/>` breaks out of foreign content (`rules.rs:1618-1624`) and then
+        // opens an `i` in HTML content, where the self-closing flag is
+        // discarded; `<div/>` inside a `foreignObject` integration point is
+        // parsed as HTML for the same reason. Both nest ~1000 deep, so a scan
+        // that honored the flag here would hand these to htmd's walker and
+        // abort this test process instead of failing an assertion.
+        assert_degraded_to_text(&deep("<svg>", "<i/>"), "svg/self-closing i");
+        assert_degraded_to_text(
+            &deep("<svg><foreignObject>", "<div/>"),
+            "svg/foreignObject/self-closing div",
+        );
     }
 
     #[test]
