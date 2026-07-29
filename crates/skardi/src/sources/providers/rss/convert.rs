@@ -84,78 +84,144 @@ fn tidy(md: &str) -> String {
     out
 }
 
-/// HTML void elements (WHATWG HTML spec §13.1.2): always leaves, self-closing
-/// syntax or not, so they never increase nesting depth for
+/// Elements `html5ever` inserts and immediately pops in body content, so they
+/// never hold children and never increase nesting depth for
 /// [`max_open_tag_depth`].
+///
+/// Taken from the arms of `tree_builder/rules.rs` (html5ever-0.38.0) that call
+/// `insert_and_pop_element_for` in the "in body" insertion mode — `<area> |
+/// <br> | <embed> | <img> | <keygen> | <wbr>`, `<input>`, `<param> | <source> |
+/// <track>`, `<hr>` — plus `<base> | <basefont> | <bgsound> | <link> | <meta>`,
+/// which "in body" routes to the "in head" mode that pops them the same way.
+/// Anything not listed here is counted as nesting, which can only over-count —
+/// `<col>` is left off on purpose, since it is popped only in the table modes
+/// and merely *ignored* in body content (the `<caption> | <col> | … | <tr>` arm
+/// there reports it and returns), and paying an unnecessary degrade for a table
+/// with more than `MAX_HTML_DEPTH` columns is the cheap side of the trade.
+///
+/// The list only holds inside HTML content. In foreign content — anywhere under
+/// `<svg>` or `<math>` — a tag not on the tree builder's breakout list is an
+/// ordinary foreign element that nests, so [`max_open_tag_depth`] suspends the
+/// list there; `"<svg>".to_owned() + &"<wbr>".repeat(400)` measures at DOM depth
+/// 404 while a scan honoring the list scored 2.
 const VOID_ELEMENTS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr",
+    "area", "base", "basefont", "bgsound", "br", "embed", "hr", "img", "input", "keygen", "link",
+    "meta", "param", "source", "track", "wbr",
 ];
 
 fn is_void_element(tag: &str) -> bool {
     VOID_ELEMENTS.iter().any(|v| tag.eq_ignore_ascii_case(v))
 }
 
-/// Upper bound on HTML open-tag nesting depth, found in one non-recursive pass.
+/// The two elements that switch the tree builder into foreign content, where
+/// [`VOID_ELEMENTS`] stops applying and a self-closing tag really does close.
+fn is_foreign_root(tag: &str) -> bool {
+    tag.eq_ignore_ascii_case("svg") || tag.eq_ignore_ascii_case("math")
+}
+
+/// Upper bound on the element nesting depth `html5ever` will build from `html`,
+/// found in one non-recursive pass and capped at `MAX_HTML_DEPTH + 1` (all the
+/// caller needs in order to compare against the ceiling).
 ///
 /// This is a lexical scan, not a parse — it never builds a tree, so it is safe
 /// to run ahead of `htmd`'s recursive DOM walker no matter how deeply nested
-/// the input is (see [`MAX_HTML_DEPTH`]). It skips comments, doctypes, and
-/// processing instructions, and does not count void elements (`<br>`, `<img>`,
-/// …) as increasing depth, since they never hold children — real feed content
-/// commonly chains several of these (e.g. `<br>` for line breaks), and
-/// counting them would trip the ceiling on ordinary, unnested content. Any
-/// other construct this scan does not specifically recognize is counted as an
-/// opening tag: over-counting only costs an unnecessary (but still safe)
-/// fallback to tag-stripped text, while under-counting would defeat the
-/// ceiling — so this errs toward the side that stays safe.
+/// the input is (see [`MAX_HTML_DEPTH`]). Its one obligation is never to
+/// *under*-count: under-counting is what lets a payload through to the walker
+/// and aborts the process, while over-counting only costs an unnecessary (but
+/// still safe) fallback to tag-stripped text. So every construct it does not
+/// specifically recognize is counted as an opening tag, and nothing an attacker
+/// writes may talk the count downward:
+///
+/// * A close tag pops only when it matches the name on top of the open-element
+///   stack. html5ever's `process_end_tag_in_body`
+///   (html5ever-0.38.0/src/tree_builder/mod.rs) walks its open elements looking
+///   for the name and gives up without popping once it meets a "special" tag
+///   (`div` among them, `tag_sets.rs`), so `<div></b>` leaves the `div` open.
+///   Decrementing on *every* close tag, as this scan used to, scored
+///   `"<div></b>".repeat(1000)` as depth 1 against a real DOM depth of 1003.
+/// * Comments and bogus comments end where the tokenizer ends them, not where
+///   symmetry suggests — see [`skip_comment_or_declaration`].
+/// * A quote only opens an attribute value directly after an `=`; see
+///   [`find_tag_end`].
+///
+/// A matching close tag can still close *more* than this pops (implied end
+/// tags, the adoption agency), and tags inside a `script`/`style`/`title` body
+/// are counted even though the tokenizer treats them as raw text: both make the
+/// real tree shallower than this estimate. The one direction html5ever goes
+/// *deeper* than the open-tag count is implied *start* tags — `<table><td>`
+/// builds `table > tbody > tr > td`, four levels from two tags — which
+/// inflates the real depth by a bounded factor per tag (measured at 2x for that
+/// case), on top of the fixed `document > html > body` wrapper worth 3. The gap
+/// between the 100 ceiling and the 500-600 depth where the walker actually
+/// overflows absorbs both.
 fn max_open_tag_depth(html: &str) -> usize {
     let bytes = html.as_bytes();
     let mut i = 0;
-    let mut depth: usize = 0;
+    // Names of the currently open elements, innermost last. Bounded by
+    // `MAX_HTML_DEPTH + 1` entries: the scan returns the moment it passes the
+    // ceiling, so hostile nesting never allocates proportional to its depth.
+    let mut open: Vec<&str> = Vec::with_capacity(16);
     let mut max_depth: usize = 0;
+    // How many `svg`/`math` elements are open, i.e. whether the tree builder
+    // would be in foreign content here. Only ever an over-estimate: a breakout
+    // tag (`<br>`, `<table>`, …) returns the real parser to HTML content
+    // without any close tag for this to see.
+    let mut foreign: usize = 0;
 
     while i < bytes.len() {
         if bytes[i] != b'<' {
             i += 1;
             continue;
         }
-        if let Some(end) = skip_delimited_region(bytes, i, b"<!--", b"-->") {
+        if let Some(end) = skip_comment_or_declaration(bytes, i) {
             i = end;
-            continue;
-        }
-        if let Some(end) = skip_delimited_region(bytes, i, b"<?", b"?>") {
-            i = end;
-            continue;
-        }
-        if bytes[i..].starts_with(b"<!") {
-            i = find_byte(bytes, i, b'>').map_or(bytes.len(), |p| p + 1);
             continue;
         }
 
         let closing = bytes.get(i + 1) == Some(&b'/');
         let name_start = if closing { i + 2 } else { i + 1 };
         if !bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
-            // Not tag-shaped: a stray `<` in text. Move past just it.
+            // `<` not followed by an ASCII letter. For `<x`, `states::TagOpen`
+            // emits the `<` as text and reconsumes in `Data`, which is exactly
+            // this. For `</x`, `states::EndTagOpen` starts a bogus comment
+            // running to the next `>`; scanning that comment's body as markup
+            // instead can only over-count, so it is left alone.
             i += 1;
             continue;
         }
 
         let name_end = tag_name_end(bytes, name_start);
         let tag = &html[name_start..name_end];
-        let Some(gt) = find_tag_end(bytes, name_end) else {
-            break; // unterminated tag: nothing further to scan
+        let Some((gt, self_closing)) = find_tag_end(bytes, name_end) else {
+            break; // EOF inside a tag: html5ever emits no token for it either
         };
         i = gt + 1;
 
-        if is_void_element(tag) {
+        if foreign == 0 && is_void_element(tag) {
             continue;
         }
         if closing {
-            depth = depth.saturating_sub(1);
+            if open.last().is_some_and(|top| top.eq_ignore_ascii_case(tag)) {
+                let top = open.pop();
+                if top.is_some_and(is_foreign_root) {
+                    foreign -= 1;
+                }
+            }
         } else {
-            depth += 1;
-            max_depth = max_depth.max(depth);
+            // A self-closing tag closes itself in foreign content only. In HTML
+            // content the flag is acknowledged and then ignored, so `<div/>`
+            // opens a `div` there.
+            if self_closing && (foreign > 0 || is_foreign_root(tag)) {
+                continue;
+            }
+            if is_foreign_root(tag) {
+                foreign += 1;
+            }
+            open.push(tag);
+            max_depth = max_depth.max(open.len());
+            if max_depth > MAX_HTML_DEPTH {
+                return max_depth;
+            }
         }
     }
 
@@ -186,16 +252,8 @@ fn strip_tags_to_text(html: &str) -> String {
             i = next_lt;
             continue;
         }
-        if let Some(end) = skip_delimited_region(bytes, i, b"<!--", b"-->") {
+        if let Some(end) = skip_comment_or_declaration(bytes, i) {
             i = end;
-            continue;
-        }
-        if let Some(end) = skip_delimited_region(bytes, i, b"<?", b"?>") {
-            i = end;
-            continue;
-        }
-        if bytes[i..].starts_with(b"<!") {
-            i = find_byte(bytes, i, b'>').map_or(bytes.len(), |p| p + 1);
             continue;
         }
 
@@ -209,7 +267,7 @@ fn strip_tags_to_text(html: &str) -> String {
 
         let name_end = tag_name_end(bytes, name_start);
         let tag = &html[name_start..name_end];
-        let Some(gt) = find_tag_end(bytes, name_end) else {
+        let Some((gt, _)) = find_tag_end(bytes, name_end) else {
             break;
         };
 
@@ -223,47 +281,170 @@ fn strip_tags_to_text(html: &str) -> String {
     out
 }
 
+/// Whitespace that ends a tag name or an attribute name in the tokenizer:
+/// `'\t' | '\n' | '\x0C' | ' '`, as spelled in every one of the tag states
+/// (html5ever-0.38.0/src/tokenizer/mod.rs). `\r` is not among them — it is an
+/// ordinary name character there, and appears only in
+/// `states::BeforeAttributeValue`'s skip set.
+fn is_tag_space(c: u8) -> bool {
+    matches!(c, b'\t' | b'\n' | b'\x0C' | b' ')
+}
+
 /// End of a tag name starting at `start` (one-past-the-last name byte).
+///
+/// `states::TagName` consumes everything except whitespace, `/` and `>` into
+/// the name, so `_`, `:` and `.` are name characters — stopping at them, as
+/// this used to, made `<div_>` and `</div>` compare equal and let
+/// `"<div_></div>".repeat(n)` pop a stack html5ever never pops.
 fn tag_name_end(bytes: &[u8], start: usize) -> usize {
     let mut end = start;
-    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-') {
+    while end < bytes.len() && !is_tag_space(bytes[end]) && !matches!(bytes[end], b'/' | b'>') {
         end += 1;
     }
     end
 }
 
-/// First unquoted `>` at or after `from`, skipping over `"…"`/`'…'` attribute
-/// values so a quoted `>` does not end the tag early.
-fn find_tag_end(bytes: &[u8], from: usize) -> Option<usize> {
+/// Index of the `>` that ends the tag whose name ended at `from`, plus whether
+/// the tag carries the self-closing flag — or `None` at EOF inside the tag,
+/// where html5ever emits no token at all.
+///
+/// The flag is set only by a `/` consumed in `states::SelfClosingStartTag`'s
+/// predecessors, never by one inside an unquoted attribute value, where `/` is
+/// an ordinary value character: `<svg a=x/>` is *not* self-closing, and taking
+/// it for one would make `"<svg>" + "<path a=x/>".repeat(n)` undercount.
+///
+/// Quoting starts only in `states::BeforeAttributeValue`, i.e. directly after an
+/// attribute name's `=` (html5ever-0.38.0/src/tokenizer/mod.rs). Everywhere else
+/// a `"` or `'` is an ordinary attribute-name character:
+/// `states::BeforeAttributeName` and `states::AttributeName` push it onto the
+/// name and only flag a parse error, and `>` still ends the tag there. Treating
+/// every quote as opening a value, as this used to, let a single `<b '>` swallow
+/// the rest of the document — `"<b '>"` followed by 1000 `<div>`s scanned as
+/// depth 0 against a real DOM depth of 1004.
+fn find_tag_end(bytes: &[u8], from: usize) -> Option<(usize, bool)> {
+    /// Which of the tokenizer's tag states the scan stands in.
+    /// `states::SelfClosingStartTag` and `states::AfterAttributeValueQuoted`
+    /// both reconsume in `BeforeAttributeName` for everything except `>`, so
+    /// they need no state of their own.
+    #[derive(Clone, Copy)]
+    enum S {
+        BeforeName,
+        Name,
+        AfterName,
+        UnquotedValue,
+    }
+
     let mut j = from;
-    let mut quote: Option<u8> = None;
+    let mut state = S::BeforeName;
+    let mut self_closing = false;
     while j < bytes.len() {
         let c = bytes[j];
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None => match c {
-                b'"' | b'\'' => quote = Some(c),
-                b'>' => return Some(j),
-                _ => {}
-            },
+        if c == b'>' {
+            // Every one of these states emits the tag on `>`.
+            return Some((j, self_closing));
         }
+        self_closing = c == b'/' && !matches!(state, S::UnquotedValue);
         j += 1;
+        state = match (state, c) {
+            // `=` separates a name from its value only once a name has begun.
+            // In `states::BeforeAttributeName` it *is* the name's first
+            // character, so it does not open a value there.
+            (S::Name | S::AfterName, b'=') => {
+                // `states::BeforeAttributeValue`: skip whitespace (`\r`
+                // included, the one state where it counts), then a `"`/`'`
+                // opens a value running to the matching quote — a character
+                // reference inside cannot contain one, so a plain search for it
+                // is exact. Anything else is an unquoted value.
+                while bytes.get(j).is_some_and(|&c| is_tag_space(c) || c == b'\r') {
+                    j += 1;
+                }
+                match bytes.get(j) {
+                    Some(&q @ (b'"' | b'\'')) => {
+                        // Unterminated: EOF inside a tag emits no token.
+                        j = find_byte(bytes, j + 1, q)? + 1;
+                        S::BeforeName
+                    }
+                    _ => S::UnquotedValue,
+                }
+            }
+            // An unquoted value ends at whitespace or `>`; `/` is part of it.
+            (S::UnquotedValue, c) if is_tag_space(c) => S::BeforeName,
+            (S::UnquotedValue, b'&') => {
+                // `states::AttributeValue(Unquoted)` hands `&` to
+                // `consume_char_ref`, so a `>` that belongs to a reference does
+                // not end the tag. Only a `;`-terminated run is skipped, and
+                // the run's character set excludes `>`, so this can never skip
+                // *past* a tag end — which is what would let the scan resume
+                // inside a tag and pop an element html5ever left open.
+                let run = bytes[j..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'#')
+                    .count();
+                if bytes.get(j + run) == Some(&b';') {
+                    j += run + 1;
+                }
+                S::UnquotedValue
+            }
+            (S::UnquotedValue, _) => S::UnquotedValue,
+            // Whitespace and `/` keep these two waiting for a name.
+            (S::BeforeName | S::AfterName, c) if is_tag_space(c) || c == b'/' => state,
+            (S::Name, c) if is_tag_space(c) => S::AfterName,
+            (S::Name, b'/') => S::BeforeName,
+            _ => S::Name,
+        };
     }
     None
 }
 
-/// If `bytes[at..]` opens `open`, the index just past the matching `close` —
-/// or the end of input for an unterminated region (nothing further to scan).
-fn skip_delimited_region(bytes: &[u8], at: usize, open: &[u8], close: &[u8]) -> Option<usize> {
-    if !bytes[at..].starts_with(open) {
-        return None;
+/// If a comment, markup declaration or bogus comment starts at `at`, the index
+/// just past where html5ever's tokenizer ends it.
+///
+/// The termination rules are the tokenizer's, not the symmetric ones intuition
+/// suggests; each of these divergences was a way to make the depth scan skip
+/// the rest of the document (html5ever-0.38.0/src/tokenizer/mod.rs):
+///
+/// * `<!-->` and `<!--->` are complete comments containing no `-->` at all:
+///   `states::CommentStart` and `states::CommentStartDash` both emit the comment
+///   on `>`.
+/// * `--!>` ends a comment as well as `-->` does: `states::CommentEnd` routes
+///   `!` to `states::CommentEndBang`, which emits on `>`.
+/// * `<?…>` is a bogus comment ending at the first `>`, never at `?>` — HTML has
+///   no processing instructions, so `states::TagOpen`'s `'?'` arm reconsumes in
+///   `states::BogusComment`, which emits on `>`.
+/// * `<!` anything else is a doctype or (including `<![CDATA[` in HTML content)
+///   a bogus comment, and both also end at the first `>` — even one inside a
+///   doctype's quoted identifier, which `states::DoctypeIdentifierDoubleQuoted`
+///   treats as an abrupt end rather than as quoted content.
+fn skip_comment_or_declaration(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes[at..].starts_with(b"<!--") {
+        return Some(comment_end(bytes, at + 4));
     }
-    let rest = &bytes[at + open.len()..];
-    Some(match find_sub(rest, close) {
-        Some(p) => at + open.len() + p + close.len(),
-        None => bytes.len(),
-    })
+    if bytes[at..].starts_with(b"<!") || bytes[at..].starts_with(b"<?") {
+        return Some(find_byte(bytes, at, b'>').map_or(bytes.len(), |p| p + 1));
+    }
+    None
+}
+
+/// Index just past the end of the comment whose `<!--` ends at `body`.
+fn comment_end(bytes: &[u8], body: usize) -> usize {
+    // comment-start / comment-start-dash: a `>` closes the comment immediately.
+    if bytes.get(body) == Some(&b'>') {
+        return body + 1;
+    }
+    if bytes.get(body) == Some(&b'-') && bytes.get(body + 1) == Some(&b'>') {
+        return body + 2;
+    }
+    // Otherwise the first `-->` or `--!>` ends it, whichever comes first. A
+    // longer dash run ends the same way, since its last two dashes supply the
+    // `--`. Unterminated: EOF in any comment state emits the comment, so the
+    // rest of the input is comment body.
+    let close = find_sub(&bytes[body..], b"-->").map(|p| body + p + 3);
+    let close_bang = find_sub(&bytes[body..], b"--!>").map(|p| body + p + 4);
+    match (close, close_bang) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(e), None) | (None, Some(e)) => e,
+        (None, None) => bytes.len(),
+    }
 }
 
 /// First occurrence of byte `b` at or after `from` (used only where there are
@@ -281,7 +462,7 @@ fn skip_element_body(bytes: &[u8], from: usize, tag: &str) -> usize {
         if bytes[i] == b'<' && bytes.get(i + 1) == Some(&b'/') {
             let name_end = tag_name_end(bytes, i + 2);
             if bytes[i + 2..name_end].eq_ignore_ascii_case(tag.as_bytes()) {
-                return find_tag_end(bytes, name_end).map_or(bytes.len(), |gt| gt + 1);
+                return find_tag_end(bytes, name_end).map_or(bytes.len(), |(gt, _)| gt + 1);
             }
         }
         i += 1;
@@ -434,6 +615,87 @@ mod tests {
         assert!(
             !md.contains("*innermost*") && !md.contains("_innermost_"),
             "output looks markdown-converted, not tag-stripped: {md}"
+        );
+    }
+
+    /// `unit` nested `depth` times, ending in a marker the assertions can find.
+    fn deep(prefix: &str, unit: &str) -> String {
+        format!("{prefix}{}<em>innermost</em>", unit.repeat(1000))
+    }
+
+    /// Pin that `html` took the tag-stripped fallback, not `htmd`.
+    ///
+    /// Every caller's fixture nests ~1000 deep, past the 500-600 where htmd's
+    /// walker overflows a 2 MiB stack, so a scan that stopped seeing the
+    /// nesting would abort this test process rather than fail an assertion.
+    fn assert_degraded_to_text(html: &str, case: &str) {
+        let md = html_to_markdown(html);
+        assert!(md.contains("innermost"), "{case}: text lost: {md}");
+        assert!(
+            !md.contains("*innermost*") && !md.contains("_innermost_"),
+            "{case}: output is markdown-converted, not tag-stripped: {md}"
+        );
+    }
+
+    #[test]
+    fn mismatched_close_tags_do_not_reduce_the_scanned_depth() {
+        // html5ever discards an end tag matching nothing on its open-element
+        // stack, so these divs really do nest 1000 deep.
+        assert_degraded_to_text(&deep("", "<div></b>"), "</b>");
+        assert_degraded_to_text(&deep("", "<div></p>"), "</p>");
+    }
+
+    #[test]
+    fn abrupt_closing_empty_comment_does_not_hide_the_nesting() {
+        // `<!-->` / `<!--->` are complete comments; a scan demanding a literal
+        // `-->` treats everything after them as comment body.
+        assert_degraded_to_text(&deep("<!-->", "<div>"), "<!-->");
+        assert_degraded_to_text(&deep("<!--->", "<div>"), "<!--->");
+    }
+
+    #[test]
+    fn bang_comment_end_terminates_the_comment() {
+        assert_degraded_to_text(&deep("<!--x--!>", "<div>"), "--!>");
+    }
+
+    #[test]
+    fn question_mark_opens_a_bogus_comment_ending_at_the_first_gt() {
+        // HTML has no processing instructions, so `?>` is not a terminator.
+        assert_degraded_to_text(&deep("<?>", "<div>"), "<?>");
+        assert_degraded_to_text(&deep("<?php ", "<div>"), "<?php");
+    }
+
+    #[test]
+    fn a_quote_outside_an_attribute_value_does_not_swallow_the_document() {
+        // In `<b '>` the quote is an attribute-*name* character and the `>`
+        // ends the tag; treating it as opening a value hid every div after it.
+        assert_degraded_to_text(&deep("<b '>", "<div>"), "<b '>");
+        assert_degraded_to_text(&deep("<b ='>", "<div>"), "<b ='>");
+    }
+
+    #[test]
+    fn void_elements_nest_inside_foreign_content() {
+        // `<wbr>` is void in HTML content but an ordinary nesting SVG element
+        // under `<svg>`, which is not on the tree builder's breakout list.
+        assert_degraded_to_text(&deep("<svg>", "<wbr>"), "svg/wbr");
+        assert_degraded_to_text(&deep("<math>", "<input>"), "math/input");
+    }
+
+    #[test]
+    fn tag_names_are_compared_whole_not_truncated() {
+        // `div_` is a distinct name (`_` is a tag-name character), so `</div>`
+        // closes nothing here.
+        assert_degraded_to_text(&deep("", "<div_></div>"), "div_");
+    }
+
+    #[test]
+    fn balanced_content_far_past_the_ceiling_still_converts() {
+        // The other side of the contract: matching close tags must still pop,
+        // or ordinary long feed content would degrade to text.
+        let md = html_to_markdown(&format!("{}<em>innermost</em>", "<p>x</p>".repeat(1000)));
+        assert!(
+            md.contains("*innermost*") || md.contains("_innermost_"),
+            "1000 balanced paragraphs are depth 1, not 1000: {md}"
         );
     }
 
