@@ -275,11 +275,11 @@ otherwise report `RowPathNotFound` on an in-band error page.
 
 ## Compatibility and schema drift
 
-Each pack table pins the full relational contract and, once captured from
-a live gateway, an expected action-contract fingerprint (a canonicalized
-BLAKE3 hash of the discovered output schema; the slack pack is pinned
-against v1.3.1 with the captured schemas committed next to the pack, the
-github pack's pins are a pending follow-up). At registration a pinned
+Each pack table pins the full relational contract and an expected
+action-contract fingerprint captured from a live gateway (a canonicalized
+BLAKE3 hash of the discovered output schema; both the github and slack
+packs are pinned, with the captured schemas committed next to each pack
+under `fixtures/<provider>/contracts/`). At registration a pinned
 table's fingerprint is compared against the discovered contract and any
 difference — breaking or additive, since a hash cannot tell them apart —
 fails with a targeted error instead of silently changing a table's

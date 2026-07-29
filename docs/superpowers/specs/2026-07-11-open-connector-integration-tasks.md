@@ -169,8 +169,9 @@ event carrying the scan identity and error.
       (stable table with pushdown, both UDTFs, federated CSV join) — every README
       command and output executed against the real server before being written down;
       a final section documents the real-gateway path, whose protocol and action
-      contracts have since been reconciled live (fingerprint pins remain the open
-      follow-up).
+      contracts have since been reconciled live, and fingerprint pins have since
+      landed for all eight tables (captured contracts under
+      `fixtures/github/contracts/`).
 - [x] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users,
       and files, per the design's Slack caveat — message/thread tables stay gated on upstream
       complete message-cursor handling and are explicitly documented as absent. The wire
@@ -206,7 +207,7 @@ event carrying the scan identity and error.
       every mock registration serves the captured contracts (so the pass side of the
       gate is exercised by the whole suite), and a drift e2e proves a differing
       discovered schema fails registration as `ActionContractMismatch` naming the
-      table and action. GitHub's pins remain the open follow-up. Live-verified: all
+      table and action. The GitHub pack pins the same way. Live-verified: all
       three tables' generated inputs pass the gateway's strict
       action schemas (requests reach the credential wall, not `invalid_input`).
 
