@@ -222,7 +222,21 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         }
         PaginationStrategy::SinglePage => {}
     }
+    // NOT rejected on purpose: a filter input equal to a FIXED input is
+    // the override mechanism itself (a pushed predicate replacing the
+    // complete-collection pin — the github state=all pattern, pinned
+    // end-to-end by the pack tests). Two filters sharing an input are
+    // rejected below even though the scan-time claimed-inputs guard makes
+    // them safe (the loser stays local): which predicate pushes would
+    // depend on query order, and that ambiguity is an authoring mistake.
+    let mut filter_inputs = std::collections::HashSet::new();
     for filter in table.filters {
+        if !filter_inputs.insert(filter.input_field) {
+            return Err(format!(
+                "{id}: two filter mappings target input '{}'; declare one mapping per input",
+                filter.input_field
+            ));
+        }
         if pagination_params.contains(&filter.input_field) {
             return Err(format!(
                 "{id}: filter input '{}' collides with a pagination input, which is applied last and would overwrite the pushed predicate",
@@ -712,6 +726,18 @@ tables:
     filters:
       - { column: id, op: eq, input: owner, fidelity: exact }"#,
                 "collides with a declared resource",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: score, path: score, type: uint64, nullable: true }
+    filters:
+      - { column: id, op: eq, input: q, fidelity: inexact }
+      - { column: score, op: eq, input: q, fidelity: inexact }"#,
+                "two filter mappings target input 'q'",
             ),
             (
                 r#"    action: demo.list
