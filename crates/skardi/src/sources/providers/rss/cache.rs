@@ -4,8 +4,12 @@
 //! Each feed key holds two things that age independently:
 //!
 //! - an [`FeedObservation`] — the feed's health (status, last error, dialect,
-//!   item count, ...) — which, once set, is only ever replaced, never
-//!   dropped; and
+//!   item count, ...) — which persists across every call that doesn't remove
+//!   its whole entry: [`FeedCache::record_success`] replaces it wholesale,
+//!   [`FeedCache::record_failure`] and [`FeedCache::record_not_modified`]
+//!   mutate select fields of it in place, and only [`MemoryFeedCache`]'s
+//!   last-resort `max_observations` backstop (see below) ever discards one
+//!   outright; and
 //! - an optional [`CachedWindow`] — the parsed `items` batch plus the
 //!   conditional-GET validators that produced it — which the byte/entry
 //!   budget can evict independently of the observation.
@@ -36,6 +40,13 @@
 //! a `feeds` scan — specified to be a pure state read that never fetches —
 //! never loses a feed's health just because its window happened to be
 //! evicted.
+//!
+//! A separate, much larger `max_observations` bound exists purely as a
+//! last-resort backstop: `feed` is a fully generic `&str`, nothing in this
+//! module restricts it to a known subscription list, so the map of
+//! observations alone (unlike the windowed subset above) has no bound
+//! without one. See [`MemoryFeedCache`]'s doc for why removing a whole entry
+//! there does not conflict with the guarantee just described.
 //!
 //! ## A single window larger than the whole byte budget
 //!
@@ -73,9 +84,19 @@ use arrow::record_batch::RecordBatch;
 ///
 /// Callers must go through [`FeedStatus::as_str`] rather than writing the
 /// literal — `"never"`, `"fresh"`, `"revalidated"`, `"stale-error"`,
-/// `"error"` — themselves. That method is the only place in non-test code
-/// allowed to spell those strings, so a typo like `stale_error` fails to
-/// compile instead of silently breaking this public SQL surface.
+/// `"error"` — themselves. Within this module, `as_str` is the only place
+/// that spells those strings for `feeds.last_status`, so a typo like
+/// `stale_error` fails to compile here instead of silently breaking that
+/// column's contract.
+///
+/// Two spots in `schema.rs` are not yet routed through this and so are not
+/// covered by that guarantee: `build_items_batch` hardcodes `"fresh"` as the
+/// `window_status` value for a freshly built window, and
+/// `with_window_status`'s relabeling parameter is a bare `status: &str`, not
+/// a [`FeedStatus`]. Both predate this task and `schema.rs` is out of scope
+/// for it; Task 11, which is where the engine actually computes a status and
+/// calls into `schema.rs` with it, is where those two get pointed through
+/// [`FeedStatus::window_status_str`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FeedStatus {
     /// No fetch attempt has ever completed for this feed.
@@ -213,6 +234,17 @@ pub fn failure_fuse(ttl: Duration) -> Duration {
     (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300))
 }
 
+/// How many times `max_entries` the last-resort whole-entry bound
+/// (`max_observations`) is set to. `max_entries` bounds feeds holding a
+/// window, sized by the operator for a realistic number of concurrently
+/// fetched feeds; feeds that are failing or being revalidated hold no window
+/// at all and so don't count against it, yet still occupy a map slot. 8x
+/// gives that traffic comfortable headroom over the windowed bound before
+/// the backstop below ever engages, while still capping unbounded growth in
+/// the number of distinct feed keys ever seen (`feed` is a plain `&str` —
+/// nothing here restricts it to a known subscription list).
+const MAX_OBSERVATIONS_MULTIPLIER: usize = 8;
+
 /// A cached window plus the byte count it was charged against the budget
 /// with, so eviction can subtract exactly what was added.
 struct WindowEntry {
@@ -236,6 +268,12 @@ struct Inner {
     /// rather than the whole map.
     window_order: VecDeque<String>,
     window_bytes: usize,
+    /// Every feed key currently in `map`, most-recently-used first, where
+    /// "used" means touched by any of the four [`FeedCache`] methods —
+    /// unlike `window_order` above, this includes feeds with no window.
+    /// Backs the `max_observations` last-resort bound; see
+    /// [`MemoryFeedCache`]'s doc.
+    entry_order: VecDeque<String>,
 }
 
 impl Inner {
@@ -257,6 +295,16 @@ impl Inner {
         self.window_order.push_front(feed.to_string());
     }
 
+    /// Move `feed` to the front of the whole-entry LRU list. Called on every
+    /// access or update, whether or not `feed` currently holds a window, so
+    /// an observation-only entry that keeps getting queried or refreshed is
+    /// exactly as protected from the `max_observations` backstop as a
+    /// windowed one.
+    fn touch_entry(&mut self, feed: &str) {
+        self.entry_order.retain(|k| k != feed);
+        self.entry_order.push_front(feed.to_string());
+    }
+
     /// Evict least-recently-used windows (dropping only the window, never
     /// the observation) until both the byte and entry budgets hold.
     fn evict(&mut self, max_bytes: usize, max_entries: usize) {
@@ -271,24 +319,59 @@ impl Inner {
             }
         }
     }
+
+    /// Last-resort backstop: evict least-recently-used *whole* entries,
+    /// observation included, until the map holds at most `max_observations`
+    /// distinct feed keys. See [`MemoryFeedCache`]'s doc for why this
+    /// coexists with (rather than contradicts) `evict`'s observation-
+    /// preserving eviction above.
+    fn evict_observations(&mut self, max_observations: usize) {
+        while self.map.len() > max_observations {
+            let Some(oldest) = self.entry_order.pop_back() else {
+                break;
+            };
+            if let Some(entry) = self.map.remove(&oldest)
+                && let Some(w) = entry.window
+            {
+                self.window_bytes = self.window_bytes.saturating_sub(w.bytes);
+            }
+            self.window_order.retain(|k| k != &oldest);
+        }
+    }
 }
 
-/// In-memory [`FeedCache`], bounded by window bytes and window count,
-/// behind a `Mutex` (hand-rolled LRU, following `open_connector/cache.rs`'s
-/// precedent rather than adding the `lru` crate).
+/// In-memory [`FeedCache`], bounded by window bytes, window count, and
+/// (as a last resort) total observation count, behind a `Mutex`
+/// (hand-rolled LRU, following `open_connector/cache.rs`'s precedent rather
+/// than adding the `lru` crate).
 ///
-/// `max_entries` bounds how many feeds may hold a cached window at once, not
-/// the total number of feeds the map has ever seen: an observation is never
-/// evicted, only replaced, and the set of feed keys is bounded already by
-/// the (locally configured, not attacker-supplied) subscription list, so a
-/// second cap on raw map size would add nothing. `max_entries` earns its
-/// keep as a hard cap on window count independent of `max_bytes`, covering
-/// the case where many small windows would otherwise slip under the byte
-/// budget while still being too numerous.
+/// `max_entries` bounds how many feeds may hold a cached window at once —
+/// it does not bound the map itself, since a feed that is only failing or
+/// being revalidated holds no window and so never counts against it. That
+/// gap is what `max_observations` (`max_entries *`
+/// [`MAX_OBSERVATIONS_MULTIPLIER`]) closes: it caps the map's total size —
+/// windowed and observation-only entries together — and, once exceeded,
+/// evicts the least-recently-used *whole* entry, observation included, via
+/// [`Inner::evict_observations`].
+///
+/// This does not contradict the "eviction keeps the observation" guarantee
+/// the module doc describes for `max_bytes`/`max_entries`: that guarantee
+/// exists so a `feeds` scan can still report health for a feed whose
+/// *window* was evicted under memory pressure while the feed is still being
+/// actively scanned. A whole entry only reaches `max_observations` once the
+/// map holds far more distinct keys than the configured subscription list
+/// could produce for `max_entries`-many concurrently windowed feeds — i.e.
+/// keys that are no longer being scanned at all — and for a key this cache
+/// has never seen, [`FeedCache::snapshot`] already answers
+/// [`FeedStatus::Never`], which is the honest answer for a subscription this
+/// cache has no record of. The two bounds protect different things: one
+/// keeps a live feed's health visible after its window is reclaimed, the
+/// other keeps the map itself from growing without limit.
 pub struct MemoryFeedCache {
     inner: Mutex<Inner>,
     max_bytes: usize,
     max_entries: usize,
+    max_observations: usize,
 }
 
 impl MemoryFeedCache {
@@ -298,9 +381,11 @@ impl MemoryFeedCache {
                 map: HashMap::new(),
                 window_order: VecDeque::new(),
                 window_bytes: 0,
+                entry_order: VecDeque::new(),
             }),
             max_bytes,
             max_entries,
+            max_observations: max_entries.saturating_mul(MAX_OBSERVATIONS_MULTIPLIER),
         }
     }
 
@@ -329,6 +414,9 @@ impl FeedCache for MemoryFeedCache {
         if has_window {
             inner.touch_window(feed);
         }
+        // A read is still an access for the whole-entry LRU, whether or not
+        // this feed currently holds a window — see `Inner::touch_entry`.
+        inner.touch_entry(feed);
         FeedSnapshot {
             observation,
             window,
@@ -372,6 +460,9 @@ impl FeedCache for MemoryFeedCache {
             inner.window_order.push_front(feed.to_string());
             inner.evict(self.max_bytes, self.max_entries);
         }
+
+        inner.touch_entry(feed);
+        inner.evict_observations(self.max_observations);
     }
 
     fn record_not_modified(
@@ -405,6 +496,10 @@ impl FeedCache for MemoryFeedCache {
         entry.observation.last_fetch_ms = Some(last_fetch_ms);
         entry.observation.last_error = None;
         entry.armed_until = armed_until;
+        // `entry` already existed (that's what `has_window` established), so
+        // the map didn't grow — no need to re-run `evict_observations`, but
+        // this is still an access for whole-entry recency purposes.
+        inner.touch_entry(feed);
     }
 
     fn record_failure(
@@ -433,6 +528,9 @@ impl FeedCache for MemoryFeedCache {
         entry.observation.last_error = Some(error);
         entry.observation.last_fetch_ms = Some(last_fetch_ms);
         entry.armed_until = armed_until;
+
+        inner.touch_entry(feed);
+        inner.evict_observations(self.max_observations);
     }
 }
 
@@ -626,6 +724,14 @@ mod tests {
 
     #[test]
     fn record_not_modified_without_window_is_unreachable_but_asserted() {
+        // What this test actually cares about is the release-mode contract:
+        // a call the engine should never make must still return as a no-op
+        // rather than panicking or fabricating state. The `debug_assert!`
+        // branch below is standard `debug_assert!` mechanics (skipped in
+        // release, so checked here only under `cfg(debug_assertions)`) and
+        // is asserted mainly so a future reader can see both branches are
+        // exercised, not because firing it is this cache's real behavioral
+        // contract.
         let cache = MemoryFeedCache::new(1 << 20, 64);
         // No prior `record_success`, so there is no window — this is exactly
         // the "unconditional 304" case the module doc says the engine should
@@ -717,6 +823,48 @@ mod tests {
                 .snapshot("c", t0 + Duration::from_secs(1))
                 .window
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn max_observations_backstop_evicts_lru_whole_entry() {
+        // `max_entries` of 1 sets `max_observations` to `1 * 8 = 8` (see
+        // `MAX_OBSERVATIONS_MULTIPLIER`). Every feed here is recorded via
+        // `record_failure` with no window at all, so this drives the
+        // whole-entry backstop in isolation from the windowed bound above.
+        let cache = MemoryFeedCache::new(1 << 20, 1);
+        let t0 = Instant::now();
+        let armed = t0 + Duration::from_secs(30);
+        for i in 0..8 {
+            cache.record_failure(
+                &format!("feed-{i}"),
+                Some(500),
+                "http status 500".into(),
+                1,
+                armed,
+            );
+        }
+        // 8 distinct keys now fill the map exactly to `max_observations`;
+        // touch "feed-0" so it is not the least-recently-used entry once a
+        // 9th key arrives.
+        let touched = cache.snapshot("feed-0", t0 + Duration::from_secs(1));
+        assert!(matches!(touched.observation.last_status, FeedStatus::Error));
+
+        // A 9th distinct feed key pushes the map to 9 entries, over the
+        // 8-entry `max_observations` bound; "feed-1" — never touched again
+        // after its own insertion, and now the least-recently-used key —
+        // must be the one dropped, whole entry and all.
+        cache.record_failure("feed-8", Some(500), "http status 500".into(), 1, armed);
+
+        let evicted = cache.snapshot("feed-1", t0 + Duration::from_secs(1));
+        assert!(
+            matches!(evicted.observation.last_status, FeedStatus::Never),
+            "the least-recently-used whole entry, observation included, must be gone"
+        );
+        let survivor = cache.snapshot("feed-0", t0 + Duration::from_secs(1));
+        assert!(
+            matches!(survivor.observation.last_status, FeedStatus::Error),
+            "the recently touched entry survives with its observation intact"
         );
     }
 }
