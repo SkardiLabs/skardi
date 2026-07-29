@@ -938,7 +938,10 @@ Plus: `not_modified_rearms_and_flips_to_revalidated`, `lru_touch_order_respected
 
 **Files:**
 - Create: `crates/skardi/src/sources/providers/rss/engine.rs`
-- Modify: `crates/skardi/src/sources/providers/rss/{egress.rs, fetch.rs}` — delete the module-scoped `#![allow(dead_code)]` from each. This task is the **first production consumer** of both (Tasks 3-4 only exercised them from tests, which is why the suppressions exist); after wiring, `cargo check -p skardi --features rss` must be warning-free with no suppression left behind. If some item is still genuinely unused, name it in the report rather than keeping a blanket `allow`.
+- Modify: `crates/skardi/src/sources/providers/rss/{egress.rs, fetch.rs, cache.rs}` — delete the module-scoped `#![allow(dead_code)]` from each. This task is the **first production consumer** of all three (Tasks 3, 4, and 10 only exercised them from tests, which is why the suppressions exist); after wiring, `cargo check -p skardi --features rss` must be warning-free with no suppression left behind. If some item is still genuinely unused, name it in the report rather than keeping a blanket `allow`.
+- Modify: `crates/skardi/src/sources/providers/rss/schema.rs` — route its two remaining stringly-typed `window_status` sites through `FeedStatus` (Task 10's enum), which owns the domain: `build_items_batch` hardcodes `"fresh"`, and `with_window_status` takes a bare `status: &str`. Task 10's review flagged both as the residual of a deferred finding — a `stale_error` typo at this task's call site would otherwise compile and silently break the SQL contract. Prefer `FeedStatus` (or `&FeedStatus`) as the parameter type over a `&str` a caller can misspell.
+
+**Inherited requirement — feed-key discipline.** `MemoryFeedCache` keys entries by `&str` and bounds observation-only entries only by a last-resort backstop. Task 10's review accepted that on the stated assumption that keys always come from the fixed, config-derived subscription list. This task is where that assumption becomes real: every `feed` string handed to the cache must originate from `RssEngine`'s own `Vec<ResolvedSubscription>`, never from a predicate value, a projection, or anything else a query could influence. State in the report how the code guarantees it.
 
 **Interfaces:**
 - Consumes: everything from Tasks 2–10.
