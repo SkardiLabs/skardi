@@ -40,6 +40,7 @@ dirs = "5.0"
 datafusion = { workspace = true }
 datafusion-federation = { workspace = true }
 datafusion-tracing = "52.0.0"
+futures = { workspace = true }
 lance = { workspace = true }
 object_store = { workspace = true }
 serde = { workspace = true }

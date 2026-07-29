@@ -91,6 +91,28 @@ impl S3Storage {
         image_store: Option<&str>,
         source: &DataSource,
     ) -> Result<()> {
+        // Reject an `image_store` that equals or is an ancestor of the source
+        // `path`. `list_docs` excludes everything under `image_store` as a
+        // self-ingestion guard, so such overlap silently drops every source
+        // document and the scan returns an empty-but-successful result. Applies
+        // to any backend (local or s3://); `image_store` nested *inside* the
+        // source is still allowed — that's the guard's intended use.
+        if let Some(img) = image_store {
+            if loc_is_under_or_equal(path, img) {
+                return Err(ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!(
+                        "documents: `image_store` ('{img}') equals or is an ancestor of the \
+                         source `path` ('{path}'). Every source document lives under `image_store` \
+                         and would be excluded from the scan (self-ingestion guard), yielding an \
+                         empty result. Point `image_store` at a location nested inside or disjoint \
+                         from `path`.",
+                    ),
+                }
+                .into());
+            }
+        }
+
         let path_is_s3 = path.starts_with("s3://");
         let image_is_s3 = image_store.is_some_and(|s| s.starts_with("s3://"));
 
@@ -134,7 +156,9 @@ impl S3Storage {
     ///
     /// - **Read connectivity** — a *prefix-aware* `list` of the source `path`
     ///   (the object `head` used for CSV/Parquet returns `NotFound` for a
-    ///   prefix). An empty-but-reachable prefix is OK; auth/network errors fail.
+    ///   prefix). Only the stream's first item is polled — a full top-level
+    ///   inventory of a large prefix is never drained at startup — so an
+    ///   empty-but-reachable prefix is OK while auth/network errors still surface.
     /// - **Write preflight** — put+delete a probe object under `image_store` so a
     ///   missing `s3:PutObject` fails loudly here rather than silently dropping
     ///   crops mid-scan.
@@ -144,6 +168,7 @@ impl S3Storage {
         image_store: Option<&str>,
         source_name: &str,
     ) -> Result<()> {
+        use futures::StreamExt;
         use object_store::PutPayload;
         use object_store::path::Path as ObjectPath;
 
@@ -152,8 +177,11 @@ impl S3Storage {
             let (store, region) = build_bucket_store(&bucket, source_name)?;
             let prefix = s3_key_prefix(path);
             let op = (!prefix.is_empty()).then(|| ObjectPath::from(prefix.as_str()));
-            store.list_with_delimiter(op.as_ref()).await.map_err(|e| {
-                ConfigError::S3ObjectStoreRegistrationFailed {
+            // Poll only the first stream item: this proves auth/network/prefix
+            // reachability without draining a full inventory of a large prefix.
+            // `None` (empty but reachable) is a pass; a first-item error fails.
+            if let Some(res) = store.list(op.as_ref()).next().await {
+                res.map_err(|e| ConfigError::S3ObjectStoreRegistrationFailed {
                     name: source_name.to_string(),
                     error: format!(
                         "documents: S3 read connectivity check failed for '{}' (region '{}'): {}\n\
@@ -161,8 +189,8 @@ impl S3Storage {
                          credentials/region are configured via the environment.",
                         path, region, e
                     ),
-                }
-            })?;
+                })?;
+            }
         }
 
         if let Some(img) = image_store.filter(|s| s.starts_with("s3://")) {
@@ -214,6 +242,17 @@ fn write_probe_key(base: &str) -> String {
     } else {
         format!("{}/.skardi-write-probe", base.trim_end_matches('/'))
     }
+}
+
+/// Whether `inner` is the same location as, or nested under, `outer`
+/// (path-segment aware, trailing slashes ignored). Used at registration to
+/// detect a documents `image_store` that would swallow the source `path`.
+/// Cross-backend pairs (local vs `s3://`) never match, mirroring `list_docs`'s
+/// `loc_is_under`.
+fn loc_is_under_or_equal(inner: &str, outer: &str) -> bool {
+    let inner = inner.trim_end_matches('/');
+    let outer = outer.trim_end_matches('/');
+    inner == outer || inner.starts_with(&format!("{outer}/"))
 }
 
 /// The key/prefix portion of an `s3://bucket/key` URI (no leading `/`).
@@ -767,6 +806,63 @@ path: "s3://corpus-bucket/in/"
             )
             .unwrap_err();
         assert!(err.to_string().contains("same bucket"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn documents_rejects_image_store_equal_or_ancestor_of_path() {
+        let s3 = S3Storage::new();
+        let src = documents_source(
+            r#"
+name: "docs"
+type: "documents"
+path: "/data/corpus"
+"#,
+        );
+
+        // Local: image_store == path → rejected (all docs excluded → empty scan).
+        let err = s3
+            .validate_documents_configuration("/data/corpus", Some("/data/corpus"), &src)
+            .unwrap_err();
+        assert!(err.to_string().contains("ancestor"), "unexpected: {err}");
+        // Local: image_store is an ancestor of path → rejected.
+        let err = s3
+            .validate_documents_configuration("/data/corpus", Some("/data"), &src)
+            .unwrap_err();
+        assert!(err.to_string().contains("ancestor"), "unexpected: {err}");
+        // Local: image_store nested inside path → allowed (self-ingestion guard).
+        assert!(
+            s3.validate_documents_configuration("/data/corpus", Some("/data/corpus/crops"), &src)
+                .is_ok()
+        );
+        // A sibling that shares a name prefix but not a path segment is disjoint.
+        assert!(
+            s3.validate_documents_configuration("/data/corpus", Some("/data/corpus-2"), &src)
+                .is_ok()
+        );
+
+        // S3: image_store == path → rejected.
+        let err = s3
+            .validate_documents_configuration(
+                "s3://bucket/corpus/",
+                Some("s3://bucket/corpus/"),
+                &src,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("ancestor"), "unexpected: {err}");
+        // S3: image_store is the bucket root (ancestor of every key) → rejected.
+        let err = s3
+            .validate_documents_configuration("s3://bucket/corpus/", Some("s3://bucket"), &src)
+            .unwrap_err();
+        assert!(err.to_string().contains("ancestor"), "unexpected: {err}");
+        // S3: image_store nested inside path → allowed.
+        assert!(
+            s3.validate_documents_configuration(
+                "s3://bucket/corpus/",
+                Some("s3://bucket/corpus/crops/"),
+                &src
+            )
+            .is_ok()
+        );
     }
 
     #[test]
