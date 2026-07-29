@@ -48,6 +48,20 @@
 //! without one. See [`MemoryFeedCache`]'s doc for why removing a whole entry
 //! there does not conflict with the guarantee just described.
 //!
+//! ## A `304` can outlive the window it would have confirmed
+//!
+//! Eviction is driven by *other* feeds' `record_success` calls, so it can land
+//! between the moment a caller reads a feed's validators out of
+//! [`FeedCache::snapshot`] and the moment the resulting `304` comes back. The
+//! conditional request was well-formed and the answer is truthful — the
+//! caller's copy *is* still current upstream — but the copy itself is gone, so
+//! there is nothing left to serve. This is a reachable state under memory
+//! pressure, not a caller bug: [`FeedCache::record_not_modified`] handles it
+//! by re-arming the timer like any other attempt and recording
+//! [`FeedStatus::Error`] with [`WINDOW_EVICTED_ON_REVALIDATION`] as the
+//! reason, so the zero rows that follow have an explanation an operator can
+//! read. See that method's doc for why `Error` rather than `Revalidated`.
+//!
 //! ## A single window larger than the whole byte budget
 //!
 //! [`MemoryFeedCache::record_success`] measures the incoming window with
@@ -191,6 +205,25 @@ pub trait FeedCache: Send + Sync {
     /// it is left untouched, but the observation's fetch metadata and status
     /// move to [`FeedStatus::Revalidated`], and the next-attempt time re-arms
     /// to `armed_until`.
+    ///
+    /// If the window was evicted while this attempt was in flight — see the
+    /// module doc — the fetch metadata and the re-arm still apply (an attempt
+    /// happened, and skipping the re-arm would leave the feed expired and
+    /// refetching on every scan), but the status becomes
+    /// [`FeedStatus::Error`] with [`WINDOW_EVICTED_ON_REVALIDATION`] as
+    /// `last_error` rather than [`FeedStatus::Revalidated`].
+    ///
+    /// `Error` is the honest answer there even though the feed itself is
+    /// healthy. It is the one status whose contract is "no window is cached to
+    /// fall back on", which is exactly the situation; it is also the status
+    /// whose [`FeedStatus::window_status_str`] is `None`, so it agrees with
+    /// the zero rows a scan will actually serve. `Revalidated` would claim a
+    /// current window exists — leaving `feeds` reporting a healthy feed with a
+    /// non-zero `item_count` while `items` returns nothing, and no column
+    /// anywhere explaining why. Recovery does not depend on this choice: with
+    /// no window there are no validators to send, so the next attempt after
+    /// the timer expires is an unconditional `GET` that rebuilds the window
+    /// whatever status was recorded here.
     fn record_not_modified(
         &self,
         feed: &str,
@@ -221,6 +254,13 @@ pub trait FeedCache: Send + Sync {
         armed_until: Instant,
     );
 }
+
+/// `feeds.last_error` for a `304` whose window was evicted while the request
+/// was in flight — see [`FeedCache::record_not_modified`]. Carries no response
+/// content of any kind: the condition is entirely local to this cache, and the
+/// string is a fixed literal.
+pub const WINDOW_EVICTED_ON_REVALIDATION: &str = "revalidated (304) but the cached window had been evicted under the cache byte \
+     budget; the next attempt refetches it unconditionally";
 
 /// The negative-cache TTL for a feed that just failed: `clamp(ttl / 4, 30s,
 /// 300s)`. Shorter than the success TTL so a dead feed is retried sooner
@@ -487,33 +527,46 @@ impl FeedCache for MemoryFeedCache {
         armed_until: Instant,
     ) {
         let mut inner = self.lock();
-        let has_window = inner.map.get(feed).is_some_and(|e| e.window.is_some());
-        debug_assert!(
-            has_window,
-            "record_not_modified called for feed {feed:?} with no cached window: the \
-             engine only sends conditional-GET validators when a window (and the \
-             validators that came with it) are cached, so an unconditional 304 should be \
-             unreachable in practice"
-        );
-        if !has_window {
-            // No-op status-wise: without a window there is nothing this
-            // 304 could be confirming is still current, so leave whatever
-            // state (or absence of one) already exists untouched.
-            return;
-        }
-        let entry = inner
-            .map
-            .get_mut(feed)
-            .expect("has_window was true, so the entry exists");
-        entry.observation.last_status = FeedStatus::Revalidated;
+        let entry = inner.map.entry(feed.to_string()).or_insert_with(|| Entry {
+            observation: FeedObservation::default(),
+            window: None,
+            armed_until,
+        });
+
+        // An attempt happened and it is the caller's `armed_until` that
+        // decides when the next one may, so the fetch metadata and the re-arm
+        // are unconditional. In particular they must not be skipped when the
+        // window turns out to be gone: the module doc's TTL contract is that
+        // all three recording methods push the next-attempt time to exactly
+        // `armed_until`, and a `304` that quietly declined to would leave the
+        // feed expired and refetching on every scan.
         entry.observation.http_status = Some(http_status);
         entry.observation.last_fetch_ms = Some(last_fetch_ms);
-        entry.observation.last_error = None;
         entry.armed_until = armed_until;
-        // `entry` already existed (that's what `has_window` established), so
-        // the map didn't grow — no need to re-run `evict_observations`, but
-        // this is still an access for whole-entry recency purposes.
+
+        if entry.window.is_some() {
+            entry.observation.last_status = FeedStatus::Revalidated;
+            entry.observation.last_error = None;
+        } else {
+            // Reachable without any caller mistake — another feed's
+            // `record_success` can evict this one's window between the
+            // snapshot that produced the validators and the `304` answering
+            // them — so this is reported, not asserted. See the trait
+            // method's doc for why `Error` is the honest status.
+            entry.observation.last_status = FeedStatus::Error;
+            entry.observation.last_error = Some(WINDOW_EVICTED_ON_REVALIDATION.to_string());
+            tracing::warn!(
+                feed,
+                http_status,
+                "rss feed revalidated but its cached window had already been evicted"
+            );
+        }
+
         inner.touch_entry(feed);
+        // Normally a no-op — the entry existed already, since a conditional
+        // request needs validators this cache handed out — but `entry()` above
+        // can insert, so the bound is re-checked rather than assumed.
+        inner.evict_observations(self.max_observations);
     }
 
     fn record_failure(
@@ -744,37 +797,69 @@ mod tests {
         assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
     }
 
+    /// A `304` whose window was evicted while the request was in flight. This
+    /// state is reachable without any caller mistake — the eviction below is
+    /// driven entirely by another feed's `record_success` against the byte
+    /// budget, exactly as it would be in production — so the contract is that
+    /// it re-arms and reports, in *both* build profiles. It previously fired a
+    /// `debug_assert!` (a panic inside a partition's poll for every debug
+    /// build, integration suites included) and returned early without arming,
+    /// which left the feed expired and refetching on every scan.
     #[test]
-    fn record_not_modified_without_window_is_unreachable_but_asserted() {
-        // What this test actually cares about is the release-mode contract:
-        // a call the engine should never make must still return as a no-op
-        // rather than panicking or fabricating state. The `debug_assert!`
-        // branch below is standard `debug_assert!` mechanics (skipped in
-        // release, so checked here only under `cfg(debug_assertions)`) and
-        // is asserted mainly so a future reader can see both branches are
-        // exercised, not because firing it is this cache's real behavioral
-        // contract.
-        let cache = MemoryFeedCache::new(1 << 20, 64);
-        // No prior `record_success`, so there is no window — this is exactly
-        // the "unconditional 304" case the module doc says the engine should
-        // never produce; the cache still must not panic in a release build,
-        // so assert the debug-only signal rather than a panic.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cache.record_not_modified("ghost", 304, 1, Instant::now());
-        }));
-        if cfg!(debug_assertions) {
-            assert!(
-                result.is_err(),
-                "expected the debug assertion to fire for an unconditional 304"
-            );
-        } else {
-            assert!(result.is_ok());
-        }
-        let snap = cache.snapshot("ghost", Instant::now());
-        assert!(
-            matches!(snap.observation.last_status, FeedStatus::Never),
-            "a no-op call must not fabricate a Revalidated status"
+    fn record_not_modified_after_window_eviction_rearms_and_records_it() {
+        let one = window_with_rows(1);
+        let bytes = one.batch.get_array_memory_size();
+        // Room for exactly one window, so "b" arriving evicts "a"'s.
+        let cache = MemoryFeedCache::new(bytes + 8, 64);
+        let t0 = Instant::now();
+        // "a" is armed to `t0`, i.e. already expired — which is the only state
+        // that makes a caller send validators in the first place, and what
+        // makes the re-arm below the *only* thing that can put the feed back
+        // within its TTL.
+        cache.record_success("a", window_with_rows(1), obs_fresh(1), t0);
+        // "a" holds a window and its validators; a scan would send them now.
+        assert!(cache.snapshot("a", t0).window.is_some());
+        assert!(!cache.snapshot("a", t0 + Duration::from_secs(1)).within_ttl);
+
+        // Natural byte pressure from another feed drops "a"'s window while
+        // that conditional request is in flight.
+        cache.record_success(
+            "b",
+            window_with_rows(1),
+            obs_fresh(1),
+            t0 + Duration::from_secs(900),
         );
+        assert!(
+            cache.snapshot("a", t0).window.is_none(),
+            "b's window evicted a's under the byte budget"
+        );
+
+        // No panic in either profile: run it directly rather than through
+        // `catch_unwind`, so a reintroduced assertion fails this test.
+        cache.record_not_modified("a", 304, 42, t0 + Duration::from_secs(600));
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(
+            snap.within_ttl,
+            "the 304 re-armed the timer even though the window was gone — \
+             otherwise the feed refetches on every scan"
+        );
+        assert!(
+            matches!(snap.observation.last_status, FeedStatus::Error),
+            "no window means zero rows, and Error is the status that says so: {:?}",
+            snap.observation.last_status
+        );
+        assert_eq!(
+            snap.observation.last_error.as_deref(),
+            Some(WINDOW_EVICTED_ON_REVALIDATION),
+            "the zero rows an operator will see have a stated reason"
+        );
+        assert_eq!(snap.observation.http_status, Some(304));
+        assert_eq!(snap.observation.last_fetch_ms, Some(42));
+        assert!(snap.window.is_none());
+        // The earlier success's identity survives, as eviction always leaves
+        // the observation in place.
+        assert_eq!(snap.observation.item_count, Some(1));
     }
 
     #[test]
