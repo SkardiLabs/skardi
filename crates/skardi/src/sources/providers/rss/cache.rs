@@ -410,11 +410,11 @@ impl Inner {
 /// `max_entries` bounds how many feeds may hold a cached window at once —
 /// it does not bound the map itself, since a feed that is only failing or
 /// being revalidated holds no window and so never counts against it. That
-/// gap is what `max_observations` (`max(max_entries *`
-/// [`MAX_OBSERVATIONS_MULTIPLIER`]`, `[`MIN_OBSERVATIONS`]`)`) closes: it
+/// gap is what `max_observations` (`max(max_entries *
+/// MAX_OBSERVATIONS_MULTIPLIER, MIN_OBSERVATIONS)`) closes: it
 /// caps the map's total size — windowed and observation-only entries
 /// together — and, once exceeded, evicts the least-recently-used *whole*
-/// entry, observation included, via [`Inner::evict_observations`]. The floor
+/// entry, observation included, via `Inner::evict_observations`. The floor
 /// matters at `max_entries == 0` (window caching disabled entirely, a
 /// coherent configuration on its own): without it, `max_observations` would
 /// also be `0`, and the backstop would discard every observation the moment

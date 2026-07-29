@@ -8,7 +8,7 @@
 //! validate path — every check `validate()` already performs for the
 //! inline `feeds:` form has to be re-run against whatever the file
 //! contains: non-emptiness, name defaulting, effective-name uniqueness, and
-//! http/https scheme validation were all invisible before now. [`finalize`]
+//! http/https scheme validation were all invisible before now. `finalize`
 //! applies all four uniformly to both input forms so there is exactly one
 //! place either one's invariants are enforced.
 //!
