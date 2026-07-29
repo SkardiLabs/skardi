@@ -168,6 +168,12 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
             ));
         }
     }
+    // The request-input namespace is shared by resources, fixed inputs,
+    // filter inputs, and pagination parameters; exec.rs applies pagination
+    // LAST, so a collision would silently overwrite an Exact pushed
+    // predicate DataFusion never reapplies. Filter-vs-fixed-input overlap
+    // is the one DELIBERATE collision (a pushed predicate overrides the
+    // complete-collection pin) and stays legal.
     let pagination_params: Vec<&str> = match table.pagination {
         PaginationStrategy::PageNumber {
             page_param,
@@ -183,6 +189,53 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
             .collect(),
         PaginationStrategy::SinglePage => Vec::new(),
     };
+    match table.pagination {
+        PaginationStrategy::PageNumber {
+            page_param,
+            per_page_param,
+            per_page,
+            ..
+        } => {
+            if page_param == per_page_param {
+                return Err(format!(
+                    "{id}: pagination declares '{page_param}' as both the page and page-size input"
+                ));
+            }
+            if per_page == 0 {
+                return Err(format!("{id}: pagination page size must be positive"));
+            }
+        }
+        PaginationStrategy::Cursor {
+            cursor_param,
+            page_size_param,
+            page_size,
+            ..
+        } => {
+            if page_size_param == Some(cursor_param) {
+                return Err(format!(
+                    "{id}: pagination declares '{cursor_param}' as both the cursor and page-size input"
+                ));
+            }
+            if page_size_param.is_some() && page_size == 0 {
+                return Err(format!("{id}: pagination page size must be positive"));
+            }
+        }
+        PaginationStrategy::SinglePage => {}
+    }
+    for filter in table.filters {
+        if pagination_params.contains(&filter.input_field) {
+            return Err(format!(
+                "{id}: filter input '{}' collides with a pagination input, which is applied last and would overwrite the pushed predicate",
+                filter.input_field
+            ));
+        }
+        if table.declares_resource(filter.input_field) {
+            return Err(format!(
+                "{id}: filter input '{}' collides with a declared resource",
+                filter.input_field
+            ));
+        }
+    }
     for (key, _) in table.fixed_inputs {
         if table.declares_resource(key) {
             return Err(format!(
@@ -638,6 +691,51 @@ tables:
     columns:
       - { name: id, path: id, type: uint64, nullable: false }"#,
                 "collides with a pagination input",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+    filters:
+      - { column: id, op: eq, input: perPage, fidelity: exact }"#,
+                "collides with a pagination input",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { required: [owner] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+    filters:
+      - { column: id, op: eq, input: owner, fidelity: exact }"#,
+                "collides with a declared resource",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: page, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "both the page and page-size input",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 0 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "page size must be positive",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: cursor, cursor_input: cursor, next_cursor_path: "$.next", page_size_input: cursor, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "both the cursor and page-size input",
             ),
             (
                 r#"    action: demo.list
