@@ -17,6 +17,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use super::RSS_SURFACE_VERSION;
+use super::cache::FeedStatus;
 use super::parse::ItemRow;
 
 /// Position of `items.window_status`. The engine builds a window's batch once
@@ -134,8 +135,9 @@ pub fn feeds_schema() -> SchemaRef {
 ///
 /// `feed`/`feed_url` are constant for the batch (a partition is one feed), and
 /// `position` is the row's index in the window — the feed's own ordering, which
-/// is the only ordering a feed guarantees. `window_status` is filled `"fresh"`;
-/// serving a cached window re-labels it via [`with_window_status`].
+/// is the only ordering a feed guarantees. `window_status` is filled from
+/// [`FeedStatus::Fresh`] (a batch is only ever built from a document that just
+/// parsed); serving a cached window re-labels it via [`with_window_status`].
 pub fn build_items_batch(feed: &str, feed_url: &str, items: &[ItemRow]) -> RecordBatch {
     let rows = items.len();
     let mut guid = StringBuilder::new();
@@ -194,7 +196,7 @@ pub fn build_items_batch(feed: &str, feed_url: &str, items: &[ItemRow]) -> Recor
         Arc::new(enclosure_type.finish()),
         Arc::new(enclosure_length.finish()),
         Arc::new(UInt32Array::from_iter_values(0..rows as u32)),
-        Arc::new(StringArray::from(vec!["fresh"; rows])),
+        Arc::new(StringArray::from(vec![fresh_label(); rows])),
         Arc::new(extensions_json.finish()),
     ];
 
@@ -202,16 +204,41 @@ pub fn build_items_batch(feed: &str, feed_url: &str, items: &[ItemRow]) -> Recor
         .expect("built columns match the items schema declared above")
 }
 
-/// Re-label a window's freshness without rebuilding it.
+/// The `window_status` label [`build_items_batch`] stamps.
 ///
-/// Every other column and the schema are shared by `Arc`, so this costs one
-/// `status`-wide string array — cheap enough to run on every serve of a cached
-/// window.
-pub fn with_window_status(batch: &RecordBatch, status: &str) -> RecordBatch {
+/// [`FeedStatus::Fresh`] is one of the three statuses
+/// [`FeedStatus::window_status_str`] answers `Some` for, so the `expect` is
+/// discharged by that function's own match arms rather than by an assumption
+/// about a caller.
+fn fresh_label() -> &'static str {
+    FeedStatus::Fresh
+        .window_status_str()
+        .expect("FeedStatus::Fresh has a window_status label")
+}
+
+/// Re-label a window's freshness without rebuilding it, or `None` when
+/// `status` is one of the two that serve no window at all.
+///
+/// Takes a [`FeedStatus`] rather than a `&str` so a misspelled label
+/// (`stale_error` for `stale-error`) cannot compile: [`FeedStatus`] owns this
+/// domain and is the only place the strings are spelled. `None` covers
+/// [`FeedStatus::Never`] and [`FeedStatus::Error`], which have no label
+/// because a feed in either state has nothing to serve — that makes
+/// "relabelled with a status that isn't a window status" unrepresentable in
+/// the return value instead of something this function has to invent a label
+/// for.
+///
+/// Every other column and the schema are shared by `Arc`, so a `Some` costs
+/// one `status`-wide string array — cheap enough to run on every serve of a
+/// cached window.
+pub fn with_window_status(batch: &RecordBatch, status: FeedStatus) -> Option<RecordBatch> {
+    let label = status.window_status_str()?;
     let mut columns = batch.columns().to_vec();
-    columns[WINDOW_STATUS_IDX] = Arc::new(StringArray::from(vec![status; batch.num_rows()]));
-    RecordBatch::try_new(batch.schema(), columns)
-        .expect("only window_status changed, and it stayed Utf8 with the same length")
+    columns[WINDOW_STATUS_IDX] = Arc::new(StringArray::from(vec![label; batch.num_rows()]));
+    Some(
+        RecordBatch::try_new(batch.schema(), columns)
+            .expect("only window_status changed, and it stayed Utf8 with the same length"),
+    )
 }
 
 /// Encode feed health observations as a `feeds` batch.
@@ -540,7 +567,8 @@ mod tests {
     #[test]
     fn with_window_status_swaps_only_column_15() {
         let batch = build_items_batch(FEED, FEED_URL, &two_items());
-        let relabelled = with_window_status(&batch, "stale-error");
+        let relabelled = with_window_status(&batch, FeedStatus::StaleError)
+            .expect("stale-error is a window status");
 
         for idx in 0..batch.num_columns() {
             if idx == WINDOW_STATUS_IDX {
@@ -650,8 +678,19 @@ mod tests {
         assert_eq!(batch.schema(), items_schema());
         // A feed can legitimately serve an empty window; re-labelling one must
         // not be the path that panics.
-        let relabelled = with_window_status(&batch, "revalidated");
+        let relabelled = with_window_status(&batch, FeedStatus::Revalidated)
+            .expect("revalidated is a window status");
         assert_eq!(relabelled.num_rows(), 0);
         assert_eq!(relabelled.num_columns(), 17);
+    }
+
+    /// The two statuses that serve zero rows have no `window_status` label, so
+    /// relabelling with one answers `None` rather than writing a string
+    /// outside the column's domain.
+    #[test]
+    fn with_window_status_refuses_the_zero_row_statuses() {
+        let batch = build_items_batch(FEED, FEED_URL, &two_items());
+        assert!(with_window_status(&batch, FeedStatus::Never).is_none());
+        assert!(with_window_status(&batch, FeedStatus::Error).is_none());
     }
 }

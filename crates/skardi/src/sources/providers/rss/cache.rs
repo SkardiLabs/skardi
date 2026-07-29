@@ -89,14 +89,11 @@ use arrow::record_batch::RecordBatch;
 /// `stale_error` fails to compile here instead of silently breaking that
 /// column's contract.
 ///
-/// Two spots in `schema.rs` are not yet routed through this and so are not
-/// covered by that guarantee: `build_items_batch` hardcodes `"fresh"` as the
-/// `window_status` value for a freshly built window, and
-/// `with_window_status`'s relabeling parameter is a bare `status: &str`, not
-/// a [`FeedStatus`]. Both predate this task and `schema.rs` is out of scope
-/// for it; Task 11, which is where the engine actually computes a status and
-/// calls into `schema.rs` with it, is where those two get pointed through
-/// [`FeedStatus::window_status_str`] instead.
+/// The same holds for `items.window_status`: `schema.rs`'s two sites both go
+/// through [`FeedStatus::window_status_str`] — `build_items_batch` stamps a
+/// freshly built window from [`FeedStatus::Fresh`], and `with_window_status`
+/// takes a [`FeedStatus`] rather than a `&str` — so neither column's domain
+/// can be broken by a typo at a call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FeedStatus {
     /// No fetch attempt has ever completed for this feed.
@@ -215,11 +212,19 @@ pub trait FeedCache: Send + Sync {
     /// stale) or [`FeedStatus::Error`] if not, `last_error` is recorded, and
     /// the next-attempt time re-arms to `armed_until` regardless — this is
     /// the negative-caching half of the TTL contract.
+    ///
+    /// `dialect_declared` carries a sniff that succeeded even though the
+    /// attempt as a whole did not: the declared dialect is read off the raw
+    /// bytes before parsing, so a document that fails to parse still has one
+    /// to report. `Some` overwrites the recorded value, `None` leaves
+    /// whatever was already known in place — a transport failure has no
+    /// document to sniff and must not erase an earlier success's answer.
     fn record_failure(
         &self,
         feed: &str,
         http_status: Option<u16>,
         error: String,
+        dialect_declared: Option<String>,
         last_fetch_ms: i64,
         armed_until: Instant,
     );
@@ -524,6 +529,7 @@ impl FeedCache for MemoryFeedCache {
         feed: &str,
         http_status: Option<u16>,
         error: String,
+        dialect_declared: Option<String>,
         last_fetch_ms: i64,
         armed_until: Instant,
     ) {
@@ -544,6 +550,11 @@ impl FeedCache for MemoryFeedCache {
         entry.observation.http_status = http_status;
         entry.observation.last_error = Some(error);
         entry.observation.last_fetch_ms = Some(last_fetch_ms);
+        // Only overwrite when the caller actually has a sniff to report — see
+        // the trait method's doc.
+        if dialect_declared.is_some() {
+            entry.observation.dialect_declared = dialect_declared;
+        }
         entry.armed_until = armed_until;
 
         inner.touch_entry(feed);
@@ -618,6 +629,7 @@ mod tests {
             "a",
             Some(503),
             "http status 503".into(),
+            None,
             1,
             t0 + Duration::from_secs(30),
         );
@@ -648,6 +660,7 @@ mod tests {
             "a",
             Some(500),
             "http status 500".into(),
+            None,
             1,
             t0 + Duration::from_secs(30),
         );
@@ -857,6 +870,7 @@ mod tests {
                 &format!("feed-{i}"),
                 Some(500),
                 "http status 500".into(),
+                None,
                 1,
                 armed,
             );
@@ -871,7 +885,14 @@ mod tests {
         // 8-entry `max_observations` bound; "feed-1" — never touched again
         // after its own insertion, and now the least-recently-used key —
         // must be the one dropped, whole entry and all.
-        cache.record_failure("feed-8", Some(500), "http status 500".into(), 1, armed);
+        cache.record_failure(
+            "feed-8",
+            Some(500),
+            "http status 500".into(),
+            None,
+            1,
+            armed,
+        );
 
         let evicted = cache.snapshot("feed-1", t0 + Duration::from_secs(1));
         assert!(

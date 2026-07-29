@@ -1,9 +1,6 @@
 //! RSS/Atom subscriptions as a read-only data source (`type: rss`).
 //!
 //! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
-// Task 11 (the engine) is the first production caller of `FeedCache` — until
-// then everything here outside its own tests is unreferenced from a build
-// that excludes test code, matching `fetch.rs`'s `#![allow(dead_code)]`.
 #[cfg(feature = "rss")]
 pub mod cache;
 pub mod config;
@@ -26,6 +23,12 @@ pub mod opml;
 // own dependencies (reqwest, tokio) are already unconditional crate deps.
 #[cfg(feature = "rss")]
 mod egress;
+// The freshness state machine that composes every module above: it decides
+// per feed whether a scan serves a cached window, revalidates it, refetches
+// it, or degrades to stale rows, and it is the sole production consumer of
+// `egress`, `fetch`, and `cache`.
+#[cfg(feature = "rss")]
+pub mod engine;
 // The bounded HTTP fetcher (conditional GET, retries, egress enforcement)
 // built on top of `egress`. Not `pub` for the same reason `egress` isn't:
 // it is an implementation detail of the engine a later task builds on top,

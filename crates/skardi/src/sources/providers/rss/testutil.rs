@@ -14,9 +14,72 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arrow::array::{Array, RecordBatch, StringArray};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+/// A well-formed RSS 2.0 document carrying every `channel`-level field the
+/// dialect requires plus exactly one item, so a batch built from it has one
+/// row and `conformance_notes` comes out empty. The baseline body for the
+/// engine's tests; a test that needs a *defect* spells the defect out inline
+/// rather than editing this.
+pub(crate) const RSS2_MINIMAL: &str = concat!(
+    r#"<rss version="2.0"><channel>"#,
+    r#"<title>Minimal Feed</title>"#,
+    r#"<link>https://feed.example/</link>"#,
+    r#"<description>A minimal feed.</description>"#,
+    r#"<item><guid>https://feed.example/1</guid><title>First post</title>"#,
+    r#"<link>https://feed.example/1</link></item>"#,
+    r#"</channel></rss>"#,
+);
+
+/// The `Utf8` column named `name`, or a panic naming the column — every
+/// caller is a test asserting against a fixed schema, so a missing or
+/// retyped column is a bug in the test's expectations either way.
+fn utf8_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+    let index = batch
+        .schema()
+        .index_of(name)
+        .unwrap_or_else(|e| panic!("batch has no column {name:?}: {e}"));
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap_or_else(|| panic!("column {name:?} is not Utf8"))
+}
+
+/// Read a `Utf8` column as owned strings, panicking on a NULL — for the
+/// columns the schema declares non-nullable (`window_status`,
+/// `last_status`, `feed`, …).
+pub(crate) fn str_col(batch: &RecordBatch, name: &str) -> Vec<String> {
+    let column = utf8_column(batch, name);
+    (0..column.len())
+        .map(|row| {
+            assert!(
+                column.is_valid(row),
+                "column {name:?} row {row} is NULL but the schema declares it non-nullable"
+            );
+            column.value(row).to_string()
+        })
+        .collect()
+}
+
+/// Read a nullable `Utf8` column, preserving NULLs — for `last_error`,
+/// `dialect_declared`, `conformance_notes`, and friends, where the
+/// difference between NULL and `""` is the assertion.
+pub(crate) fn str_opt_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+    let column = utf8_column(batch, name);
+    (0..column.len())
+        .map(|row| {
+            if column.is_valid(row) {
+                Some(column.value(row).to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 /// One request observed by the mock server.
 #[derive(Debug, Clone)]
