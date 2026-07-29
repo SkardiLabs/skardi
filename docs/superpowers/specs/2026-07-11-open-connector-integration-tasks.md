@@ -147,8 +147,9 @@ event carrying the scan identity and error.
       schema-mismatch page whose targeted (column, page, row, expected, found-kind)
       error the contract test asserts, per the admission gate); the action IDs,
       input keys, row paths, and HTTP protocol are reconciled against a live gateway,
-      while fingerprint pins stay `None` like the mock pack until taken from a live
-      gateway's discovered contracts (follow-up).
+      and fingerprint pins are now taken from live-captured contracts
+      (`fixtures/github/contracts/`, landed alongside 5.2's pinning recipe: sync
+      test, contract-serving mocks, drift-refusal e2e).
       Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
       visibility incl. the pure-issues note, rate limits, freshness), README row updated.
       Verification: 27 pack tests (counted by
@@ -168,9 +169,78 @@ event carrying the scan identity and error.
       (stable table with pushdown, both UDTFs, federated CSV join) — every README
       command and output executed against the real server before being written down;
       a final section documents the real-gateway path, whose protocol and action
-      contracts have since been reconciled live (fingerprint pins remain the open
-      follow-up).
-- [ ] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users, and files first; complete message/thread tables only after Open Connector provides complete message cursor handling (per the design's Slack caveat)
+      contracts have since been reconciled live, and fingerprint pins have since
+      landed for all eight tables (captured contracts under
+      `fixtures/github/contracts/`).
+- [x] 5.2 Slack pack (OAuth bot token, cursor pagination): conversations (channels), users,
+      and files, per the design's Slack caveat — message/thread tables stay gated on upstream
+      complete message-cursor handling and are explicitly documented as absent. The wire
+      contract is Open Connector's normalized one, reconciled against a live gateway
+      (v1.3.1) and the OC provider source: camelCase rows (`channelId`, `realName`, …),
+      row arrays under `conversations`/`users`, top-level `nextCursor` (null at end), and
+      Slack's in-band `ok:false` consumed by the executor (so the tables declare no
+      `error_path`; the engine mechanism is modeled by the mock pack). Cursor pagination
+      (`cursor` / `$.nextCursor`, `limit` 200) terminates ONLY on the end-of-collection
+      spellings (null, empty-string, or absent cursor); a present non-string cursor
+      fails as `PaginationCursorInvalid` (kind-only, never the value) instead of
+      silently truncating, structural path failures propagate as themselves, and a
+      non-advancing gateway fails as `PaginationLoop`; `files` uses Slack's classic
+      `page`/`count` pagination
+      terminated by the envelope's authoritative `paging.pages` (a `total_pages_path`
+      extension to `PageNumber` — short non-final pages, legal under permission filtering,
+      never truncate; missing/non-numeric totals fail loudly).
+      `types: ["public_channel","private_channel"]` pinned on conversations as the schema's
+      array (the `state=all` move, via the new `FixedValue::StrList`); `includeLocale`
+      pinned on users so the declared `locale` column is populated; `files.user_id =` →
+      `userId` pushed Inexact per the string-push rule; **no time filter is pushed** — the
+      OC `list_files` contract declares no `ts_from` input and its strict schema would 400
+      one, so `created` predicates run in DataFusion (the engine's per-mapping
+      `ValueFormat` stays for future packs; non-timestamp mappings declare
+      `ValueFormat::Verbatim`, which also refuses to push a timestamp literal in a
+      guessed spelling). Engine support:
+      `FieldType::TimestampSecondsUtc` (Slack's epoch-second `files.created` — the millis
+      reader would silently produce 1970 dates); `files` optionally scopes to one channel
+      via the `channelId` optional resource. **Fingerprints are pinned** (a pack
+      first): each `expected_fingerprint` is the BLAKE3 hash of the canonicalized
+      output schema captured from the live gateway into
+      `packs/fixtures/slack/contracts/`; a sync test locks pin ↔ captured contract,
+      every mock registration serves the captured contracts (so the pass side of the
+      gate is exercised by the whole suite), and a drift e2e proves a differing
+      discovered schema fails registration as `ActionContractMismatch` naming the
+      table and action. The GitHub pack pins the same way. Live-verified: all
+      three tables' generated inputs pass the gateway's strict
+      action schemas (requests reach the credential wall, not `invalid_input`).
+
+      **Pack format**: all built-in packs (mock, github, slack) are now
+      declarative **embedded YAML assets** (`packs/*.yaml`, `include_str!`-compiled,
+      parsed once at first registry access via `packs/loader.rs` and leaked into the
+      engine's `&'static` shapes) — the design doc's illustrative pack format, and
+      the groundwork for its deferred second tier (user-authored packs from a
+      directory). The contract boundary is unchanged: packs stay inside the binary,
+      versioned, fingerprint-gated, never user-editable. Parsing is strict
+      (`deny_unknown_fields` end to end), table order is deterministic (BTreeMap),
+      the loader cross-validates each document (duplicate columns, filters
+      referencing undeclared columns, resource/fixed-input/pagination key
+      collisions) before converting it, and a malformed asset surfaces as a
+      targeted `SourcePackAssetInvalid` registration/UDTF-setup diagnostic —
+      never a panic — with a parse-all test keeping shipped assets valid.
+
+      **Verification**: 240 open_connector tests (counted by `cargo test -p skardi --lib
+      sources::providers::open_connector`): per-table fixture contract tests against the
+      normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
+      deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty
+      pages, and a schema-mismatch page whose targeted (column, page, row, expected,
+      found-kind) error the contract test asserts, per the admission gate — distinct
+      from the legitimate omitted-`memberCount` NULL path); e2e via mock gateway
+      speaking the real envelope — multi-page cursor scan (no
+      cursor on page 1, token afterwards, `limit` hint + `types` array pin on every
+      request), both termination spellings, pagination-loop detection bounded at the first
+      repeated cursor, LIMIT early stop, empty workspace, `userId` pushed and re-applied
+      against an ignoring provider, the negative-space guard that no time key ever reaches
+      the wire, gateway-failure surfacing of Slack's `ok:false`, multi-table binding with
+      zero required resources, UDTF parity for `slack.users`, and a two-page
+      users cursor scan pinning that table's own wire declarations (`$.users`
+      row path, `cursor`/`limit` inputs) independently of conversations'.
 - [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
 
@@ -182,12 +252,12 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 4 (UDTFs + security/observability + docs).
-  Milestones 1–3 are merged; registration builds a queryable catalog after
-  gateway health, action discovery, source-pack validation, and fingerprint
-  checks, and now also publishes per-gateway planning state for the two
-  UDTFs (shared with the server `OptimizerRegistry` / CLI the way the
-  KNN/FTS `DatasetRegistry` is).
+- **Current PR**: milestone 5.2 (Slack pack — conversations, users, files).
+  Milestones 1–4 and 5.1 (GitHub pack) are merged; this PR adds the second
+  real source pack against Open Connector's normalized Slack contract
+  (reconciled live), plus the engine extensions it required
+  (`total_pages_path` on PageNumber, per-mapping `ValueFormat`,
+  `FieldType::TimestampSecondsUtc`, `FixedValue::StrList`).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

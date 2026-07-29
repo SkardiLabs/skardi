@@ -204,6 +204,46 @@ pub enum OpenConnectorError {
     )]
     NonIdempotentAmbiguousFailure { operation: String, reason: String },
 
+    /// The provider reported an in-band error inside an otherwise
+    /// successful response envelope — Slack's HTTP-200 `ok: false` +
+    /// `error` pattern. The code is a short provider-authored identifier
+    /// (`missing_scope`, `not_authed`), bounded before display.
+    #[error(
+        "Open Connector action '{action_id}' page {page}: the provider reported \
+         error '{code}'"
+    )]
+    ProviderReportedError {
+        action_id: String,
+        page: usize,
+        code: String,
+    },
+
+    /// A declared total-pages location resolved to a non-numeric value, so
+    /// the scan cannot know when the collection ends.
+    #[error(
+        "Open Connector pagination total at '{path}' on page {page} is {found}, \
+         expected a non-negative integer"
+    )]
+    PaginationTotalInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
+    /// A continuation cursor was present at the declared path but was not a
+    /// string. Treating it as end-of-collection would silently truncate the
+    /// scan, so it fails instead. Carries the JSON *kind* only, never the
+    /// value.
+    #[error(
+        "Open Connector pagination cursor at '{path}' on page {page} is {found}, \
+         not a string; refusing to treat it as end-of-collection"
+    )]
+    PaginationCursorInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// Pagination failed to advance: the gateway returned an already-seen
     /// cursor, which would loop the scan forever.
     #[error(
@@ -353,6 +393,12 @@ pub enum OpenConnectorError {
         expected: String,
         found: String,
     },
+
+    /// An embedded source-pack asset failed to parse or validate. A build
+    /// defect (assets ship inside the binary), surfaced as a registration /
+    /// UDTF-setup diagnostic instead of a panic.
+    #[error("embedded source pack asset '{asset}' is invalid: {reason}")]
+    SourcePackAssetInvalid { asset: String, reason: String },
 
     /// A response body grew past the configured decoding bound.
     #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]

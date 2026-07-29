@@ -1,6 +1,8 @@
 //! Built-in source packs: stable relational contracts for SaaS providers.
 //!
-//! A source pack is Skardi-maintained Rust code (never user YAML). Each
+//! A source pack is a Skardi-maintained declarative asset — embedded YAML
+//! compiled into the binary and parsed once at first registry access (see
+//! `packs::loader`), never user-editable configuration. Each
 //! table definition pins the full relational contract — action, row path,
 //! fixed schema, pagination strategy, allowlisted filters, required
 //! resources — so users bind packs to concrete resources without being able
@@ -28,6 +30,10 @@ pub enum FixedValue {
     Float(f64),
     /// JSON boolean.
     Bool(bool),
+    /// JSON array of strings — e.g. Slack's `types:
+    /// ["public_channel", "private_channel"]`, whose action schema takes an
+    /// array, not a comma-joined string.
+    StrList(&'static [&'static str]),
 }
 
 impl FixedValue {
@@ -38,6 +44,9 @@ impl FixedValue {
             Self::Int(value) => serde_json::Value::from(*value),
             Self::Float(value) => serde_json::Value::from(*value),
             Self::Bool(value) => serde_json::Value::from(*value),
+            Self::StrList(items) => {
+                serde_json::Value::from(items.iter().map(|s| *s).collect::<Vec<_>>())
+            }
         }
     }
 }
@@ -72,6 +81,11 @@ pub struct SourcePackTable {
     pub fixed_inputs: &'static [(&'static str, FixedValue)],
     /// Allowlisted filter translations.
     pub filters: &'static [FilterMapping],
+    /// Row-path of an in-band provider error code in an otherwise
+    /// successful envelope (Slack's HTTP-200 `ok: false` + `error`
+    /// pattern). When declared and present in a page, the scan fails with
+    /// the provider's own code instead of a misleading row-path error.
+    pub error_path: Option<&'static str>,
     /// Expected action-contract fingerprint. When set, registration compares
     /// it with the discovered action's fingerprint and fails on mismatch.
     pub expected_fingerprint: Option<&'static str>,
@@ -105,17 +119,22 @@ pub struct SourcePackRegistry {
 
 impl SourcePackRegistry {
     /// The built-in packs shipped with this Skardi build.
-    pub fn builtins() -> Self {
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::SourcePackAssetInvalid`] when an embedded pack
+    /// asset fails to parse or validate — a build defect surfaced as a
+    /// registration diagnostic (the parse-all test pins shipped assets as
+    /// valid).
+    pub fn builtins() -> Result<Self, OpenConnectorError> {
         let mut packs = HashMap::new();
-        packs.insert(
-            super::packs::mock::MOCK_PACK.name,
-            &super::packs::mock::MOCK_PACK,
-        );
-        packs.insert(
-            super::packs::github::GITHUB_PACK.name,
-            &super::packs::github::GITHUB_PACK,
-        );
-        Self { packs }
+        for pack in [
+            super::packs::mock::pack()?,
+            super::packs::github::pack()?,
+            super::packs::slack::pack()?,
+        ] {
+            packs.insert(pack.name, pack);
+        }
+        Ok(Self { packs })
     }
 
     /// Look up a pack by provider name.
@@ -194,7 +213,7 @@ mod tests {
 
     #[test]
     fn builtin_mock_pack_is_registered() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
         assert_eq!(pack.name, "mock");
         assert_eq!(pack.version, 1);
@@ -210,11 +229,15 @@ mod tests {
         assert_eq!(FixedValue::Int(-3).to_json(), serde_json::json!(-3));
         assert_eq!(FixedValue::Float(2.5).to_json(), serde_json::json!(2.5));
         assert_eq!(FixedValue::Bool(true).to_json(), serde_json::json!(true));
+        assert_eq!(
+            FixedValue::StrList(&["public_channel", "private_channel"]).to_json(),
+            serde_json::json!(["public_channel", "private_channel"])
+        );
     }
 
     #[test]
     fn unknown_pack_is_a_targeted_error() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let err = registry.require("jira").unwrap_err();
         assert!(matches!(
             err,
@@ -224,29 +247,32 @@ mod tests {
 
     #[test]
     fn builtin_github_pack_is_registered() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("github").unwrap();
         assert_eq!(pack.name, "github");
         assert_eq!(pack.version, 1);
+        // Sorted by table name: the loader stores tables in a BTreeMap so
+        // registry (and catalog) order is deterministic regardless of how
+        // the YAML asset is laid out.
         let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
         assert_eq!(
             ids,
             vec![
-                "github.repositories",
-                "github.issues",
-                "github.issue_comments",
-                "github.pull_requests",
-                "github.reviews",
                 "github.commits",
-                "github.workflow_runs",
+                "github.issue_comments",
+                "github.issues",
+                "github.pull_requests",
                 "github.releases",
+                "github.repositories",
+                "github.reviews",
+                "github.workflow_runs",
             ]
         );
     }
 
     #[test]
     fn unknown_table_is_a_targeted_error() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
         let err = registry.table(pack, "users").unwrap_err();
         assert!(matches!(
@@ -258,7 +284,7 @@ mod tests {
 
     #[test]
     fn full_table_ids_resolve_exactly() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("github").unwrap();
         let by_short = registry.table(pack, "issues").unwrap();
         let by_full = registry.table(pack, "github.issues").unwrap();
@@ -279,7 +305,7 @@ mod tests {
             tables: Box::leak(tables.into_boxed_slice()),
         }));
 
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let err = registry.table(pack, "comments").unwrap_err();
         assert!(matches!(
             err,
@@ -297,8 +323,8 @@ mod tests {
         // every built-in pack keeps `<pack>.<table>` IDs with unique last
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
-        let registry = SourcePackRegistry::builtins();
-        for name in ["mock", "github"] {
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        for name in ["mock", "github", "slack"] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for table in pack.tables {
@@ -328,13 +354,14 @@ mod tests {
             optional_resources: &[],
             fixed_inputs: &[],
             filters: &[],
+            error_path: None,
             expected_fingerprint: None,
         }
     }
 
     #[test]
     fn version_pin_enforcement() {
-        let registry = SourcePackRegistry::builtins();
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
         SourcePackRegistry::check_version_pin(pack, None).unwrap();
         SourcePackRegistry::check_version_pin(pack, Some(1)).unwrap();

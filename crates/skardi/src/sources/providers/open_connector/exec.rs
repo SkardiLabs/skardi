@@ -47,6 +47,9 @@ pub struct ScanTarget {
     pub action_id: Arc<str>,
     /// Pagination contract.
     pub pagination: PaginationStrategy,
+    /// In-band provider-error location (see `SourcePackTable::error_path`);
+    /// `None` for raw scans and packs whose providers error at HTTP level.
+    pub error_path: Option<&'static str>,
     /// Fixed action inputs sent with every request (see
     /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
     /// input is caller-supplied.
@@ -63,6 +66,7 @@ impl ScanTarget {
             table_id: Arc::from(table.id),
             action_id: Arc::from(table.action_id),
             pagination: table.pagination,
+            error_path: table.error_path,
             fixed_inputs: table.fixed_inputs,
             source_pack_version,
         }
@@ -274,6 +278,9 @@ struct ScanState {
     scan_timeout: Duration,
     deadline: Instant,
     pagination: Pagination,
+    /// Pre-parsed in-band provider-error path, checked before each page's
+    /// row extraction.
+    error_path: Option<RowPath>,
     rows_emitted: u64,
     /// Cached batches to replay (non-empty only on a cache hit).
     replay: VecDeque<RecordBatch>,
@@ -358,6 +365,7 @@ impl ScanState {
             scan_timeout: exec.scan_timeout,
             deadline: Instant::now() + exec.scan_timeout,
             pagination: Pagination::new(exec.target.pagination)?,
+            error_path: exec.target.error_path.map(RowPath::parse).transpose()?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
@@ -474,6 +482,30 @@ impl ScanState {
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
         }
+        // Some gateways forward a provider's in-band application errors
+        // unchanged (Slack-style HTTP 200, `ok: false` + `error`). Packs
+        // targeting such a gateway declare `error_path` so the provider's
+        // own code surfaces instead of the misleading row-path error the
+        // missing row array would raise. (Open Connector's own executors
+        // consume Slack's `ok:false` and return a failure envelope, so its
+        // slack pack declares none — the mock pack models this mechanism.)
+        if let Some(error_path) = &self.error_path
+            && let Ok(code) = error_path.extract(&envelope, page)
+            && !code.is_null()
+        {
+            let code = match code.as_str() {
+                Some(text) => text.chars().take(128).collect(),
+                None => format!(
+                    "<{}>",
+                    crate::sources::providers::open_connector::row_path::json_kind(code)
+                ),
+            };
+            return Err(OpenConnectorError::ProviderReportedError {
+                action_id: self.target.action_id.to_string(),
+                page,
+                code,
+            });
+        }
         let rows = self.row_path.rows(&envelope, page)?;
         let batch = self.converter.convert(rows, page)?;
         // Conversion is synchronous, so it cannot be preempted by Tokio; do
@@ -529,10 +561,18 @@ impl ScanState {
             self.store_cache();
         }
 
-        let more = self.pagination.advance(&envelope, rows.len())?;
-        if !more {
-            self.done = true;
-            self.store_cache();
+        // Pagination advances only while the scan is still going. After a
+        // LIMIT-satisfied page there is no next request to prepare — and
+        // advance() also parses and validates continuation state, so a
+        // repeated cursor or a missing/malformed page total on that final
+        // page would fail a scan whose result is already complete for its
+        // key.
+        if !self.done {
+            let more = self.pagination.advance(&envelope, rows.len())?;
+            if !more {
+                self.done = true;
+                self.store_cache();
+            }
         }
 
         // A terminal empty page is completion, not output.
@@ -557,7 +597,7 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
+    use crate::sources::providers::open_connector::packs::mock;
     use crate::sources::providers::open_connector::testutil::{
         CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
     };
@@ -571,7 +611,7 @@ mod tests {
         limit: Option<usize>,
         source_pack_version: u32,
     ) -> OpenConnectorExec {
-        let table = &MOCK_PACK.tables[0];
+        let table = &mock::pack().expect("embedded asset parses").tables[0];
         OpenConnectorExec::new(
             client,
             cache,

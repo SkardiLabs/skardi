@@ -15,7 +15,7 @@
 //!   inside GitHub's enum domain (open/closed/all), and an Exact claim
 //!   would lean on the provider rejecting out-of-domain literals rather
 //!   than silently returning its default listing. `issues.updated_at >=`
-//!   maps to `since` as [`Fidelity::Inexact`]: GitHub documents issue `since` as
+//!   maps to `since` as [`Fidelity::Inexact`](crate::sources::providers::open_connector::filters::Fidelity::Inexact): GitHub documents issue `since` as
 //!   "updated at *or after*" (a superset of the predicate under any
 //!   timestamp-granularity fuzz), so DataFusion reapplies the predicate
 //!   locally. The commits endpoint's `since` is documented as commits
@@ -31,742 +31,283 @@
 //!   `sha`, `tag_name`, …) are non-null. GitHub nulls out whole objects
 //!   (`commit.author: null`, `issue.user: null`); nullable columns under
 //!   them become SQL NULL per the converter's null-parent rule.
-//! - **No fingerprint pins yet** (`expected_fingerprint: None`), same as
-//!   the mock pack: a pin must be taken from a live gateway's discovered
-//!   contract. The action IDs, input keys, row paths, and endpoint
-//!   contract of every table here HAVE been reconciled against a live
-//!   Open Connector gateway (v1.3.1) and its provider source; the
-//!   fingerprints themselves are still unpinned. The bundled fixtures
-//!   (see tests) are the build-time conversion contract; pins land next.
-//!   Operational consequence until then: incompatible upstream drift (a
-//!   removed required field, a mapped field changing type) is caught only
-//!   at scan time as a terminal `ConversionFailed` — for every query on
-//!   the table, since conversion builds all declared columns before
-//!   projection — and bindings deliberately cannot patch schemas, so the
-//!   fix is a pack version bump.
+//! - **Fingerprints are pinned** from a live gateway: each table's
+//!   `fingerprint` in `github.yaml` is the BLAKE3 hash of the canonicalized
+//!   output schema captured into `fixtures/github/contracts/`, and a test
+//!   keeps pin and captured contract locked together. Registration
+//!   compares the pin against the discovered contract and fails with
+//!   `ActionContractMismatch` on drift — including additive schema
+//!   changes, which is the designed tradeoff (re-capture and re-pin on
+//!   upstream upgrades). The action IDs, input keys, row paths, and
+//!   endpoint contract are likewise reconciled against the live gateway
+//!   and its provider source; the bundled fixtures (see tests) remain the
+//!   build-time conversion contract.
 
-use datafusion::logical_expr::Operator;
+use std::sync::OnceLock;
 
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping};
-use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
-use crate::sources::providers::open_connector::pagination::PaginationStrategy;
-use crate::sources::providers::open_connector::source_pack::{
-    FixedValue, SourcePack, SourcePackTable,
-};
+use crate::sources::providers::open_connector::error::OpenConnectorError;
+use crate::sources::providers::open_connector::source_pack::SourcePack;
 
-/// GitHub's maximum page size; also the short-page termination threshold.
-///
-/// The input keys follow Open Connector's action contracts, which are
-/// camelCase and strict (`additionalProperties` rejected): the live gateway
-/// returns HTTP 400 for `per_page` and accepts `perPage`, matching the
-/// `perPage`/`page` inputs in the actions' published contracts.
-const GITHUB_PAGINATION: PaginationStrategy = PaginationStrategy::PageNumber {
-    page_param: "page",
-    per_page_param: "perPage",
-    per_page: 100,
-};
+use super::loader;
 
-/// Repositories visible to the connected account.
-static REPOSITORIES: SourcePackTable = SourcePackTable {
-    id: "github.repositories",
-    action_id: "github.list_my_repositories",
-    row_path: "$.repositories",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "full_name",
-            path: "full_name",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "private",
-            path: "private",
-            field_type: FieldType::Boolean,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "description",
-            path: "description",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "default_branch",
-            path: "default_branch",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "language",
-            path: "language",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "stargazers_count",
-            path: "stargazers_count",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "forks_count",
-            path: "forks_count",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "open_issues_count",
-            path: "open_issues_count",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "archived",
-            path: "archived",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "pushed_at",
-            path: "pushed_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &[],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    expected_fingerprint: None,
-};
+static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
 
-/// Issues of one repository — pure issues: the Open Connector action
-/// filters out the pull requests GitHub's raw issues endpoint mixes in.
-static ISSUES: SourcePackTable = SourcePackTable {
-    id: "github.issues",
-    action_id: "github.list_repository_issues",
-    row_path: "$.issues",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "number",
-            path: "number",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "title",
-            path: "title",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "state",
-            path: "state",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "assignees",
-            path: "assignees",
-            field_type: FieldType::Utf8ListFromObjectKey("login"),
-            nullable: true,
-        },
-        FieldMapping {
-            name: "labels",
-            path: "labels",
-            field_type: FieldType::Utf8ListFromObjectKey("name"),
-            nullable: true,
-        },
-        FieldMapping {
-            name: "comments",
-            path: "comments",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "closed_at",
-            path: "closed_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    // GitHub lists only open issues by default; pin `state=all` so the
-    // table reads as the complete collection (a pushed `state` predicate
-    // overrides the pin).
-    fixed_inputs: &[("state", FixedValue::Str("all"))],
-    filters: &[
-        // `state` takes the SQL literal verbatim, but is Inexact on
-        // purpose: the push is faithful only inside GitHub's enum domain
-        // (open/closed/all), and an Exact claim would lean on the provider
-        // 422-ing out-of-domain values — a provider that silently ignored
-        // `state = 'merged'` and returned its default listing would hand
-        // back open rows as the "exact" answer to an empty query. The
-        // `state` column is in every row, so the local re-check is free.
-        FilterMapping {
-            column: "state",
-            operator: Operator::Eq,
-            input_field: "state",
-            fidelity: Fidelity::Inexact,
-        },
-        // GitHub documents issue `since` as "updated at or after this
-        // time" — a superset of `updated_at >= X` under any granularity
-        // fuzz — so the push narrows the fetch and DataFusion reapplies
-        // the predicate (Inexact).
-        FilterMapping {
-            column: "updated_at",
-            operator: Operator::GtEq,
-            input_field: "since",
-            fidelity: Fidelity::Inexact,
-        },
-    ],
-    expected_fingerprint: None,
-};
-
-/// Comments of one issue (or pull request — GitHub shares issue comments).
-static ISSUE_COMMENTS: SourcePackTable = SourcePackTable {
-    id: "github.issue_comments",
-    action_id: "github.list_issue_comments",
-    row_path: "$.comments",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo", "issueNumber"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    expected_fingerprint: None,
-};
-
-/// Pull requests of one repository.
-static PULL_REQUESTS: SourcePackTable = SourcePackTable {
-    id: "github.pull_requests",
-    action_id: "github.list_pull_requests",
-    row_path: "$.pull_requests",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "number",
-            path: "number",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "title",
-            path: "title",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "state",
-            path: "state",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "draft",
-            path: "draft",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "head_ref",
-            path: "head.ref",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "base_ref",
-            path: "base.ref",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "closed_at",
-            path: "closed_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "merged_at",
-            path: "merged_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    // Same open-by-default listing as issues; pin the complete collection.
-    fixed_inputs: &[("state", FixedValue::Str("all"))],
-    // Inexact for the same reason as issues.state: faithful only inside
-    // the provider's enum domain, and the local re-check is free.
-    filters: &[FilterMapping {
-        column: "state",
-        operator: Operator::Eq,
-        input_field: "state",
-        fidelity: Fidelity::Inexact,
-    }],
-    expected_fingerprint: None,
-};
-
-/// Reviews of one pull request.
-static REVIEWS: SourcePackTable = SourcePackTable {
-    id: "github.reviews",
-    action_id: "github.list_pull_request_reviews",
-    row_path: "$.reviews",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "state",
-            path: "state",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "user.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "commit_id",
-            path: "commit_id",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "submitted_at",
-            path: "submitted_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo", "pullNumber"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    expected_fingerprint: None,
-};
-
-/// Commits of one repository. `author` (the GitHub account) is routinely
-/// JSON null when no account is linked to the commit email — the nullable
-/// `author_login` becomes SQL NULL, while the git-level name and dates
-/// under `commit.*` stay available.
-static COMMITS: SourcePackTable = SourcePackTable {
-    id: "github.commits",
-    action_id: "github.list_commits",
-    row_path: "$.commits",
-    fields: &[
-        FieldMapping {
-            name: "sha",
-            path: "sha",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "message",
-            path: "commit.message",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "author.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_name",
-            path: "commit.author.name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "authored_at",
-            path: "commit.author.date",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "committed_at",
-            path: "commit.committer.date",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    // NOTE: GitHub's commits `since`/`until` are documented as commits
-    // *after*/*before* the date. Strictly-after cannot represent
-    // `committed_at >= X` even as Inexact — a boundary commit the provider
-    // drops is unrecoverable — so no time filter is mapped (the mock pack's
-    // `>=` rule, applied here).
-    filters: &[],
-    expected_fingerprint: None,
-};
-
-/// Workflow runs (GitHub Actions) of one repository. `conclusion` is JSON
-/// null while a run is in progress.
-static WORKFLOW_RUNS: SourcePackTable = SourcePackTable {
-    id: "github.workflow_runs",
-    action_id: "github.list_workflow_runs",
-    row_path: "$.workflow_runs",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "workflow_id",
-            path: "workflow_id",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "run_number",
-            path: "run_number",
-            field_type: FieldType::UInt64,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "event",
-            path: "event",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "status",
-            path: "status",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "conclusion",
-            path: "conclusion",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "head_branch",
-            path: "head_branch",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "head_sha",
-            path: "head_sha",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "updated_at",
-            path: "updated_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    // GitHub's `status` query parameter matches status OR conclusion values
-    // interchangeably — not a faithful translation of either column.
-    // Follow-up candidates (fetch-reduction only; local filtering already
-    // gives correct results): `event` and `head_branch` → the `branch`
-    // query parameter — both as Inexact per the string-enum push rule in
-    // the module docs.
-    filters: &[],
-    expected_fingerprint: None,
-};
-
-/// Releases of one repository. `published_at` is JSON null for drafts.
-static RELEASES: SourcePackTable = SourcePackTable {
-    id: "github.releases",
-    action_id: "github.list_releases",
-    row_path: "$.releases",
-    fields: &[
-        FieldMapping {
-            name: "id",
-            path: "id",
-            field_type: FieldType::UInt64,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "tag_name",
-            path: "tag_name",
-            field_type: FieldType::Utf8,
-            nullable: false,
-        },
-        FieldMapping {
-            name: "name",
-            path: "name",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "draft",
-            path: "draft",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "prerelease",
-            path: "prerelease",
-            field_type: FieldType::Boolean,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "body",
-            path: "body",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "author_login",
-            path: "author.login",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "created_at",
-            path: "created_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "published_at",
-            path: "published_at",
-            field_type: FieldType::TimestampMillisUtc,
-            nullable: true,
-        },
-        FieldMapping {
-            name: "html_url",
-            path: "html_url",
-            field_type: FieldType::Utf8,
-            nullable: true,
-        },
-    ],
-    pagination: GITHUB_PAGINATION,
-    required_resources: &["owner", "repo"],
-    optional_resources: &[],
-    fixed_inputs: &[],
-    filters: &[],
-    expected_fingerprint: None,
-};
-
-/// The GitHub source pack (version 1).
-pub static GITHUB_PACK: SourcePack = SourcePack {
-    name: "github",
-    version: 1,
-    tables: &[
-        REPOSITORIES,
-        ISSUES,
-        ISSUE_COMMENTS,
-        PULL_REQUESTS,
-        REVIEWS,
-        COMMITS,
-        WORKFLOW_RUNS,
-        RELEASES,
-    ],
-};
+/// The GitHub pack, parsed once from the embedded YAML asset.
+pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
+    loader::builtin("github.yaml", include_str!("github.yaml"), &PACK)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::error::OpenConnectorError;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use crate::sources::providers::open_connector::row_path::RowPath;
+    use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use arrow::array::{
         Array, BooleanArray, ListArray, StringArray, TimestampMillisecondArray, UInt64Array,
     };
     use arrow::record_batch::RecordBatch;
+
+    /// Discovery responses serve the CAPTURED live contracts, so every e2e
+    /// registration exercises the fingerprint gate's pass side.
+    fn github_discovery(path: &str) -> MockResponse {
+        let contracts: &[(&str, &str)] = &[
+            (
+                "github.list_my_repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+            ),
+            (
+                "github.list_repository_issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+            ),
+            (
+                "github.list_issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+            ),
+            (
+                "github.list_pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+            ),
+            (
+                "github.list_pull_request_reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+            ),
+            (
+                "github.list_commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+            ),
+            (
+                "github.list_workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+            ),
+            (
+                "github.list_releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+            ),
+        ];
+        let output_schema = contracts
+            .iter()
+            .find(|(action, _)| path.ends_with(action))
+            .map(|(_, schema)| *schema)
+            .unwrap_or(r#"{"type": "object"}"#);
+        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+    }
+
+    #[test]
+    fn fingerprint_coverage_gap_is_pinned() {
+        // The gate protects only what upstream DECLARES; these mapped
+        // columns ride additionalProperties passthrough, so their drift is
+        // invisible to the fingerprint and surfaces at scan time per
+        // conversion rules (a shape change fails loudly; a removed nullable
+        // field reads as NULL). Pinning the set makes any change — upstream
+        // declaring more, or a mapping change — a conscious decision.
+        use crate::sources::providers::open_connector::testutil::fingerprint_uncovered_columns;
+        for (short, contract, expected) in [
+            (
+                "repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+                &[
+                    "language",
+                    "stargazers_count",
+                    "forks_count",
+                    "open_issues_count",
+                    "archived",
+                    "created_at",
+                    "updated_at",
+                    "pushed_at",
+                ] as &[&str],
+            ),
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+                &["created_at", "updated_at", "closed_at"],
+            ),
+            (
+                "issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+                &["author_login"],
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+                &[
+                    "head_ref",
+                    "base_ref",
+                    "created_at",
+                    "updated_at",
+                    "closed_at",
+                    "merged_at",
+                ],
+            ),
+            (
+                "reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+                &["author_login"],
+            ),
+            (
+                "commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+                &["message", "author_name", "authored_at", "committed_at"],
+            ),
+            (
+                "workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+                &["created_at", "updated_at"],
+            ),
+            (
+                "releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+                &[],
+            ),
+        ] {
+            let t = table(short);
+            assert_eq!(
+                fingerprint_uncovered_columns(contract, t.row_path, t.fields),
+                expected,
+                "fingerprint coverage changed for {short}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_fingerprints_match_the_reconciled_contracts() {
+        // Pin <-> captured-contract lock, through the SAME function
+        // registration uses. On mismatch this prints the actual hashes —
+        // which is also how the pins are (re)taken after an upstream
+        // upgrade.
+        use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
+        let contracts = [
+            (
+                "repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+            ),
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+            ),
+            (
+                "issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+            ),
+            (
+                "reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+            ),
+            (
+                "commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+            ),
+            (
+                "workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+            ),
+            (
+                "releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (short, contract) in contracts {
+            let schema: Value = serde_json::from_str(contract).expect("contract fixture parses");
+            let actual = fingerprint_schema(Some(&schema));
+            let t = table(short);
+            if t.expected_fingerprint != Some(actual.as_str()) {
+                mismatches.push(format!(
+                    "{}: pinned {:?}, contract fixture hashes to {actual}",
+                    t.id, t.expected_fingerprint
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn drifted_contract_fails_registration_not_the_scan() {
+        // The pin's refusal side: a gateway whose discovered output schema
+        // differs from the captured contract must be refused at
+        // REGISTRATION, table and action named. (Every other e2e proves
+        // the pass side via github_discovery's captured contracts.)
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = testutil::EnvVarGuard::set("SKARDI_TEST_OC_GITHUB_DRIFT", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_GITHUB_DRIFT
+bindings:
+  - name: gh
+    source_pack: github
+    resource: { owner: acme, repo: widgets }
+    tables: [issues]
+"#,
+        )
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("a drifted contract must fail registration");
+        let message = err.to_string();
+        assert!(
+            message.contains("github.issues")
+                && message.contains("github.list_repository_issues")
+                && message.contains("fingerprint mismatch"),
+            "table, action, and cause are named: {message}"
+        );
+    }
+
+    /// Look up a table by short name; the assets are test-pinned to parse.
+    fn table(
+        short: &str,
+    ) -> &'static crate::sources::providers::open_connector::source_pack::SourcePackTable {
+        pack()
+            .expect("embedded asset is test-pinned to parse")
+            .tables
+            .iter()
+            .find(|t| t.id.rsplit('.').next() == Some(short))
+            .unwrap_or_else(|| panic!("table {short}"))
+    }
 
     // ── Contract tests: bundled redacted fixtures are the build-time
     // conversion contract (null-bearing, nested, empty, extra upstream
@@ -840,7 +381,7 @@ mod tests {
 
     #[test]
     fn issues_fixture_converts_with_nulls_and_lists() {
-        let batch = convert_fixture(&ISSUES, include_str!("fixtures/github/issues.json"));
+        let batch = convert_fixture(table("issues"), include_str!("fixtures/github/issues.json"));
         assert_eq!(batch.num_rows(), 3);
 
         assert_eq!(u64s(&batch, "id").value(0), 101);
@@ -883,11 +424,11 @@ mod tests {
         let page: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/github/issues_type_mismatch.json"))
                 .expect("fixture parses");
-        let rows = RowPath::parse(ISSUES.row_path)
+        let rows = RowPath::parse(table("issues").row_path)
             .expect("row path")
             .rows(&page, 1)
             .expect("row array");
-        let err = RowConverter::new(ISSUES.fields)
+        let err = RowConverter::new(table("issues").fields)
             .expect("converter")
             .convert(rows, 1)
             .expect_err("a string where UInt64 is declared must fail conversion");
@@ -917,7 +458,7 @@ mod tests {
     #[test]
     fn repositories_fixture_converts_with_nullable_metadata() {
         let batch = convert_fixture(
-            &REPOSITORIES,
+            table("repositories"),
             include_str!("fixtures/github/repositories.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -934,7 +475,7 @@ mod tests {
     #[test]
     fn issue_comments_fixture_converts_with_null_author() {
         let batch = convert_fixture(
-            &ISSUE_COMMENTS,
+            table("issue_comments"),
             include_str!("fixtures/github/issue_comments.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -946,7 +487,7 @@ mod tests {
     #[test]
     fn pull_requests_fixture_converts_with_nested_refs_and_merge_state() {
         let batch = convert_fixture(
-            &PULL_REQUESTS,
+            table("pull_requests"),
             include_str!("fixtures/github/pull_requests.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -959,7 +500,10 @@ mod tests {
 
     #[test]
     fn reviews_fixture_converts_with_null_bearing_row() {
-        let batch = convert_fixture(&REVIEWS, include_str!("fixtures/github/reviews.json"));
+        let batch = convert_fixture(
+            table("reviews"),
+            include_str!("fixtures/github/reviews.json"),
+        );
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(strings(&batch, "state").value(0), "APPROVED");
         assert!(strings(&batch, "author_login").is_null(1));
@@ -972,7 +516,10 @@ mod tests {
         // The classic GitHub shape: `author` (the account) is JSON null for
         // unlinked commit emails, while git-level identity under `commit.*`
         // stays available.
-        let batch = convert_fixture(&COMMITS, include_str!("fixtures/github/commits.json"));
+        let batch = convert_fixture(
+            table("commits"),
+            include_str!("fixtures/github/commits.json"),
+        );
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(strings(&batch, "author_login").value(0), "octocat");
         assert!(strings(&batch, "author_login").is_null(1));
@@ -984,7 +531,7 @@ mod tests {
     #[test]
     fn workflow_runs_fixture_converts_with_in_progress_run() {
         let batch = convert_fixture(
-            &WORKFLOW_RUNS,
+            table("workflow_runs"),
             include_str!("fixtures/github/workflow_runs.json"),
         );
         assert_eq!(batch.num_rows(), 2);
@@ -1000,7 +547,10 @@ mod tests {
 
     #[test]
     fn releases_fixture_converts_with_unpublished_draft() {
-        let batch = convert_fixture(&RELEASES, include_str!("fixtures/github/releases.json"));
+        let batch = convert_fixture(
+            table("releases"),
+            include_str!("fixtures/github/releases.json"),
+        );
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(strings(&batch, "tag_name").value(0), "v1.2.0");
         assert!(bools(&batch, "draft").value(1));
@@ -1011,7 +561,7 @@ mod tests {
 
     #[test]
     fn every_table_converts_an_empty_page_and_keeps_its_schema() {
-        for table in GITHUB_PACK.tables {
+        for table in pack().expect("embedded asset parses").tables {
             let converter = RowConverter::new(table.fields).expect("converter");
             let batch = converter.convert(&[], 1).expect("empty page");
             assert_eq!(batch.num_rows(), 0, "{}", table.id);
@@ -1029,6 +579,7 @@ mod tests {
     // the PR marker, LIMIT, and UDTF parity. ─────────────────────────────
 
     use crate::sources::hierarchy::HierarchyLevel;
+    use crate::sources::providers::open_connector::testutil;
     use crate::sources::providers::open_connector::testutil::{
         MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
@@ -1060,7 +611,7 @@ mod tests {
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path == "/v1/actions/github.list_repository_issues" {
-            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            return github_discovery(&req.path);
         }
         if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
             let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1126,7 +677,7 @@ bindings:
         unsafe {
             std::env::remove_var(token_env);
         }
-        register_open_connector_udtfs(&ctx, gateways);
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
     }
 
@@ -1242,12 +793,7 @@ bindings:
                     return MockResponse::ok("{}");
                 }
                 if req.method == "GET" && req.path == "/v1/actions/github.list_pull_requests" {
-                    return MockResponse::ok(&discovery_ok(
-                        "{}",
-                        r#"{"type": "object"}"#,
-                        true,
-                        None,
-                    ));
+                    return github_discovery(&req.path);
                 }
                 if req.method == "POST" && req.path == "/v1/actions/github.list_pull_requests" {
                     let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1379,12 +925,7 @@ bindings:
                     return MockResponse::ok("{}");
                 }
                 if req.method == "GET" && req.path == format!("/v1/actions/{action_id}") {
-                    return MockResponse::ok(&discovery_ok(
-                        "{}",
-                        r#"{"type": "object"}"#,
-                        true,
-                        None,
-                    ));
+                    return github_discovery(&req.path);
                 }
                 if req.method == "POST" && req.path == format!("/v1/actions/{action_id}") {
                     return MockResponse::ok(&envelope_ok(
@@ -1465,7 +1006,11 @@ bindings:
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
         assert!(
-            bodies.iter().all(|body| !body.contains("since")),
+            bodies.iter().all(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"]
+                    .get("since")
+                    .is_none()
+            }),
             "committed_at must never reach the strictly-after `since`: {bodies:?}"
         );
     }
@@ -1499,7 +1044,11 @@ bindings:
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
         assert!(
-            bodies.iter().all(|body| !body.contains("status")),
+            bodies.iter().all(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"]
+                    .get("status")
+                    .is_none()
+            }),
             "the status predicate must never reach the provider: {bodies:?}"
         );
     }
@@ -1581,7 +1130,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path == "/v1/actions/github.list_workflow_runs" {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return github_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_workflow_runs" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1725,7 +1274,10 @@ bindings:
         // marker column could never be non-NULL — the table must not
         // declare one, and PRs are reached through their own table.
         assert!(
-            ISSUES.fields.iter().all(|f| f.name != "pull_request"),
+            table("issues")
+                .fields
+                .iter()
+                .all(|f| f.name != "pull_request"),
             "issues is pure issues under the OC contract; a marker column \
              would be permanently NULL"
         );
@@ -1785,7 +1337,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return github_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_my_repositories" {
                 let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1926,7 +1478,7 @@ bindings:
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+                return github_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_issue_comments" {
                 return MockResponse::ok(&envelope_ok(
@@ -2020,7 +1572,7 @@ bindings:
         // Bind-time validation (row paths, field paths, pagination) plus the
         // admission-gate basics: page-number pagination that terminates, and
         // owner/repo-style resources spelled out.
-        for table in GITHUB_PACK.tables {
+        for table in pack().expect("embedded asset parses").tables {
             RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
             table

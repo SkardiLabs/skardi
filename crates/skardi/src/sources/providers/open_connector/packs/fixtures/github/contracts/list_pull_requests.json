@@ -1,0 +1,76 @@
+{
+  "type": "object",
+  "properties": {
+    "pull_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "number": {
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "html_url": {
+            "type": "string"
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "user": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "login": {
+                "type": "string"
+              },
+              "avatar_url": {
+                "type": "string"
+              },
+              "html_url": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "head": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+            "description": "A GitHub API object."
+          },
+          "base": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+            "description": "A GitHub API object."
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

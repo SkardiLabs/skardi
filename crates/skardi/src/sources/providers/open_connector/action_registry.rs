@@ -170,7 +170,7 @@ impl ActionRegistry {
 /// The schema is canonicalized first (object keys sorted recursively, so two
 /// semantically identical schemas with different key orders fingerprint
 /// equally), then hashed with BLAKE3 and hex-encoded.
-fn fingerprint_schema(output_schema: Option<&Value>) -> String {
+pub(crate) fn fingerprint_schema(output_schema: Option<&Value>) -> String {
     let canonical = match output_schema {
         Some(schema) => canonical_json(schema),
         None => "null".to_string(),
