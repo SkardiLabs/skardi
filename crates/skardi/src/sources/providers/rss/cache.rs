@@ -235,15 +235,26 @@ pub fn failure_fuse(ttl: Duration) -> Duration {
 }
 
 /// How many times `max_entries` the last-resort whole-entry bound
-/// (`max_observations`) is set to. `max_entries` bounds feeds holding a
-/// window, sized by the operator for a realistic number of concurrently
-/// fetched feeds; feeds that are failing or being revalidated hold no window
-/// at all and so don't count against it, yet still occupy a map slot. 8x
-/// gives that traffic comfortable headroom over the windowed bound before
-/// the backstop below ever engages, while still capping unbounded growth in
-/// the number of distinct feed keys ever seen (`feed` is a plain `&str` —
-/// nothing here restricts it to a known subscription list).
+/// (`max_observations`) is set to, before the [`MIN_OBSERVATIONS`] floor is
+/// applied. `max_entries` bounds feeds holding a window, sized by the
+/// operator for a realistic number of concurrently fetched feeds; feeds that
+/// are failing or being revalidated hold no window at all and so don't count
+/// against it, yet still occupy a map slot. 8x gives that traffic
+/// comfortable headroom over the windowed bound before the backstop below
+/// ever engages, while still capping unbounded growth in the number of
+/// distinct feed keys ever seen (`feed` is a plain `&str` — nothing here
+/// restricts it to a known subscription list).
 const MAX_OBSERVATIONS_MULTIPLIER: usize = 8;
+
+/// Floor under `max_observations`, so a caller-supplied `max_entries` of `0`
+/// (window caching fully disabled — a coherent configuration: `feeds`
+/// health is still worth tracking with no window cache at all) cannot turn
+/// the backstop into "discard the observation the instant it's inserted."
+/// 8 mirrors `1 * MAX_OBSERVATIONS_MULTIPLIER` — the headroom the smallest
+/// *window-caching* configuration (`max_entries == 1`) already gets — so
+/// disabling window caching entirely doesn't collapse observation tracking
+/// below what the smallest windowed configuration would have.
+const MIN_OBSERVATIONS: usize = 8;
 
 /// A cached window plus the byte count it was charged against the budget
 /// with, so eviction can subtract exactly what was added.
@@ -348,11 +359,15 @@ impl Inner {
 /// `max_entries` bounds how many feeds may hold a cached window at once —
 /// it does not bound the map itself, since a feed that is only failing or
 /// being revalidated holds no window and so never counts against it. That
-/// gap is what `max_observations` (`max_entries *`
-/// [`MAX_OBSERVATIONS_MULTIPLIER`]) closes: it caps the map's total size —
-/// windowed and observation-only entries together — and, once exceeded,
-/// evicts the least-recently-used *whole* entry, observation included, via
-/// [`Inner::evict_observations`].
+/// gap is what `max_observations` (`max(max_entries *`
+/// [`MAX_OBSERVATIONS_MULTIPLIER`]`, `[`MIN_OBSERVATIONS`]`)`) closes: it
+/// caps the map's total size — windowed and observation-only entries
+/// together — and, once exceeded, evicts the least-recently-used *whole*
+/// entry, observation included, via [`Inner::evict_observations`]. The floor
+/// matters at `max_entries == 0` (window caching disabled entirely, a
+/// coherent configuration on its own): without it, `max_observations` would
+/// also be `0`, and the backstop would discard every observation the moment
+/// it was inserted instead of leaving observation tracking intact.
 ///
 /// This does not contradict the "eviction keeps the observation" guarantee
 /// the module doc describes for `max_bytes`/`max_entries`: that guarantee
@@ -385,7 +400,9 @@ impl MemoryFeedCache {
             }),
             max_bytes,
             max_entries,
-            max_observations: max_entries.saturating_mul(MAX_OBSERVATIONS_MULTIPLIER),
+            max_observations: max_entries
+                .saturating_mul(MAX_OBSERVATIONS_MULTIPLIER)
+                .max(MIN_OBSERVATIONS),
         }
     }
 
@@ -866,5 +883,37 @@ mod tests {
             matches!(survivor.observation.last_status, FeedStatus::Error),
             "the recently touched entry survives with its observation intact"
         );
+    }
+
+    #[test]
+    fn max_entries_zero_disables_window_cache_but_keeps_observations() {
+        // `max_entries = 0` is a coherent way to disable window caching
+        // entirely while still wanting `feeds` health tracked. Without the
+        // `MIN_OBSERVATIONS` floor, `max_observations` would also be 0 and
+        // the backstop would discard each observation the instant it was
+        // inserted; this pins the floor keeping it alive instead.
+        let cache = MemoryFeedCache::new(1 << 20, 0);
+        let t0 = Instant::now();
+        let armed = t0 + Duration::from_secs(900);
+
+        cache.record_success("a", window_with_rows(2), obs_fresh(2), armed);
+        let snap_a = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(
+            snap_a.window.is_none(),
+            "max_entries = 0 must disable window caching, not just shrink it"
+        );
+        assert!(matches!(snap_a.observation.last_status, FeedStatus::Fresh));
+
+        // Insert a second, different feed — with no floor, `max_observations`
+        // would be 0 and this insert's `evict_observations` call would have
+        // already discarded "a"'s observation before this snapshot ever runs.
+        cache.record_success("b", window_with_rows(1), obs_fresh(1), armed);
+        let snap_a_after = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(
+            matches!(snap_a_after.observation.last_status, FeedStatus::Fresh),
+            "the floor must keep a's observation alive across a later, unrelated insert"
+        );
+        let snap_b = cache.snapshot("b", t0 + Duration::from_secs(1));
+        assert!(matches!(snap_b.observation.last_status, FeedStatus::Fresh));
     }
 }
