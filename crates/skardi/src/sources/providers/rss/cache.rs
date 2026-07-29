@@ -269,8 +269,8 @@ pub trait FeedCache: Send + Sync {
 /// `feeds.last_error` for a `304` whose window was evicted while the request
 /// was in flight — see [`FeedCache::record_not_modified`]. Names no particular
 /// bound, since any of the three can produce the state: `max_bytes` and
-/// `max_entries` through [`Inner::evict`], and the `max_observations` backstop
-/// through [`Inner::evict_observations`]. Carries no response content of any
+/// `max_entries` through `Inner::evict`, and the `max_observations` backstop
+/// through `Inner::evict_observations`. Carries no response content of any
 /// kind: the condition is entirely local to this cache, and the string is a
 /// fixed literal.
 pub const WINDOW_EVICTED_ON_REVALIDATION: &str = "revalidated (304) but the cached window had already been evicted from the feed \

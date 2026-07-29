@@ -42,7 +42,7 @@
 //! `MemoryFeedCache` keys entries by `&str` and bounds observation-only
 //! entries with a last-resort backstop, on the assumption that keys come from
 //! the fixed, config-derived subscription list. This module is where that
-//! assumption is enforced: [`RssEngine::subscription`] is the only way any
+//! assumption is enforced: `RssEngine::subscription` is the only way any
 //! path here obtains a feed key, it resolves the caller's `&str` against
 //! `self.subscriptions` (answering `None` for anything else), and every key
 //! passed to the cache is the resolved `ResolvedSubscription::name` — a
@@ -52,7 +52,7 @@
 //!
 //! ## What may reach `feeds.last_error`
 //!
-//! This module is the only writer of that column. [`MAX_ERROR_CHARS`] bounds
+//! This module is the only writer of that column. `MAX_ERROR_CHARS` bounds
 //! its length, but truncation is not redaction, so the property that matters is
 //! separate:
 //!
@@ -66,9 +66,10 @@
 //! a different error path, with a counter that fails if a shape stops erroring
 //! — and asserts the sentinel never appears in the recorded error.
 //! `json_unsupported_version_is_the_one_body_text_kept_in_last_error` pins the
-//! exception from the other side, so it cannot quietly widen. Three successive
-//! attempts at explaining this property in prose were each wrong in a different
-//! way; the tests were right every time. If a dependency upgrade changes any of
+//! exception from the other side, so it cannot quietly widen. Every prose
+//! explanation of this property so far has needed correction — each time for a
+//! different reason, and twice inside text written to fix the previous one —
+//! while the tests were right every time. If a dependency upgrade changes any of
 //! this, they fail, and whoever sees that should re-derive the situation rather
 //! than trust the paragraph below.
 //!
@@ -84,24 +85,34 @@
 //!   reference such as `&#x110000;` reports `EscapeError::InvalidCharRef`,
 //!   which renders the parsed *number* alone — "`1114112` is not a valid
 //!   codepoint" (`src/escape.rs:30`) — and nothing adjacent to it.
-//! - `EscapeError::UnrecognizedEntity` is the variant that would interpolate a
-//!   token lifted from the document (`src/escape.rs:66-68`). Its only producer
-//!   is `quick_xml::escape::unescape`, and feed-rs's only call to that is on
-//!   attribute values, where the error is discarded:
-//!   `unescape(&decoded_value).unwrap_or_else(|_| decoded_value.clone())`
-//!   (`feed-rs-2.4.0/src/xml/mod.rs:597-598`). Element text does not go through
-//!   `unescape` at all — feed-rs resolves references itself and writes an
-//!   unresolvable entity back into the text verbatim
-//!   (`feed-rs-2.4.0/src/xml/mod.rs:333-345`), which is why an undefined entity
-//!   in a title yields no error at all.
-//! - The exception is `ParseFeedError::JsonUnsupportedVersion(String)`, whose
-//!   `Display` is "unsupported version: {version}"
-//!   (`feed-rs-2.4.0/src/parser/mod.rs:66`), reached from
-//!   `src/parser/json/mod.rs:29`. That string is a member value out of the
-//!   document. It is kept because an unsupported version is undiagnosable
-//!   without it, and it is bounded by [`MAX_ERROR_CHARS`] like everything else
-//!   here.
-//! - [`FetchError`]'s own strings — this crate's, so not a dependency
+//! - `EscapeError::UnrecognizedEntity` is a variant that would interpolate a
+//!   token lifted from the document (`src/escape.rs:66-68`). It was not observed
+//!   reaching this column, and the check behind that is a grep over the one
+//!   crate we pin rather than a claim about quick-xml's internals. Grepping
+//!   `feed-rs-2.4.0/src` for every quick-xml unescaping and entity-resolution
+//!   routine — `unescape`, `normalize_attr`, `decode_and_normalize`,
+//!   `resolve_predefined_entity`, `resolve_char_ref` — returns three hits
+//!   outside feed-rs's own tests, all in `src/xml/mod.rs`, and each is one of:
+//!   `resolve_char_ref()?` at `:333`, which is the `InvalidCharRef` path above;
+//!   `resolve_predefined_entity` at `:337`, which returns an `Option` and so
+//!   raises nothing; and `unescape` at `:597`, whose error is discarded by
+//!   `unwrap_or_else(|_| decoded_value.clone())`. Element text goes through the
+//!   first two, not `unescape`: feed-rs resolves references itself and writes an
+//!   unresolvable entity back into the text verbatim (`:333-345`), which is why
+//!   an undefined entity in a title was measured to produce no error at all.
+//!   quick-xml raises this variant from other routines too (`escape.rs:295`,
+//!   `:807`, `de/mod.rs:2470`); the grep above is the statement that nothing
+//!   here calls them.
+//! - The exception named above is
+//!   `ParseFeedError::JsonUnsupportedVersion(String)`, whose `Display` is
+//!   "unsupported version: {version}" (`feed-rs-2.4.0/src/parser/mod.rs:66`),
+//!   reached from `src/parser/json/mod.rs:29`. That string is a member value out
+//!   of the document. It is the one body-derived string this sweep surfaced —
+//!   which is a statement about the shapes swept, not a proof that no other
+//!   exists — and it is kept because an unsupported version is undiagnosable
+//!   without it. `MAX_ERROR_CHARS` bounds it like everything else here, pinned
+//!   by `a_huge_json_version_is_still_capped`.
+//! - `FetchError`'s own strings — this crate's, so not a dependency
 //!   question — are statuses, byte and second counts, and URLs: the configured
 //!   feed URL, or a redirect `Location`. A `Location` is attacker-influenced
 //!   but is not body content, and the cap bounds it.
