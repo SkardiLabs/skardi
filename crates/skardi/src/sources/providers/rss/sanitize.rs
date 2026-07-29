@@ -457,7 +457,10 @@ mod tests {
         assert!(changed);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("café"), "{s}");
-        assert!(!s.contains("iso-8859-1"), "decl encoding token rewritten: {s}");
+        assert!(
+            !s.contains("iso-8859-1"),
+            "decl encoding token rewritten: {s}"
+        );
     }
 
     #[test]

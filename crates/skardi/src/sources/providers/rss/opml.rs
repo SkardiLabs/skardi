@@ -115,7 +115,14 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
                 ))
             })?;
             let decode = || -> Result<String, RssError> {
-                attr.decode_and_unescape_value(decoder)
+                // `decode_and_unescape_value` is deprecated in quick-xml 0.41 in
+                // favor of this; passing `Implicit1_0` reproduces its exact old
+                // behavior (verified: quick-xml-0.41.0/src/events/attributes.rs
+                // defines `decode_and_unescape_value` as calling
+                // `decoded_and_normalized_value_with(XmlVersion::Implicit1_0,
+                // decoder, 1, resolve_predefined_entity)`, the same arguments
+                // `decoded_and_normalized_value` passes through here).
+                attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
                     .map(|v| v.into_owned())
                     .map_err(|e| {
                         invalid(format!(
