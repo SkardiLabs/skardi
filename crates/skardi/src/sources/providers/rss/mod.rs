@@ -1,6 +1,11 @@
 //! RSS/Atom subscriptions as a read-only data source (`type: rss`).
 //!
 //! See `docs/superpowers/specs/2026-07-22-rss-feed-support-design.md`.
+// Task 11 (the engine) is the first production caller of `FeedCache` — until
+// then everything here outside its own tests is unreferenced from a build
+// that excludes test code, matching `fetch.rs`'s `#![allow(dead_code)]`.
+#[cfg(feature = "rss")]
+pub mod cache;
 pub mod config;
 #[cfg(feature = "rss")]
 pub mod conformance;
