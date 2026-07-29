@@ -101,11 +101,21 @@ fn convert_table(
         .into_iter()
         .map(convert_filter)
         .collect::<Vec<_>>();
-    let fixed_inputs = doc
-        .fixed_inputs
-        .into_iter()
-        .map(|(key, value)| (leak_str(key), value.into_fixed()))
-        .collect::<Vec<_>>();
+    let mut fixed_inputs = Vec::with_capacity(doc.fixed_inputs.len());
+    for (key, value) in doc.fixed_inputs {
+        // YAML happily parses `.nan` / `.inf` / `-.inf`, but JSON has no
+        // spelling for them — FixedValue::to_json would silently send null
+        // at query time, bypassing the startup diagnostic this loader
+        // promises. Finite-only, enforced here.
+        if let FixedValueDoc::Float(v) = &value
+            && !v.is_finite()
+        {
+            return Err(format!(
+                "{id}: fixed input '{key}' is {v}, which has no JSON spelling;                  pin a finite number"
+            ));
+        }
+        fixed_inputs.push((leak_str(key), value.into_fixed()));
+    }
     let table = SourcePackTable {
         id,
         action_id: leak_str(doc.action),
@@ -738,6 +748,36 @@ tables:
       - { column: id, op: eq, input: q, fidelity: inexact }
       - { column: score, op: eq, input: q, fidelity: inexact }"#,
                 "two filter mappings target input 'q'",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      threshold: .nan
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "no JSON spelling",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      threshold: .inf
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "no JSON spelling",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      threshold: -.inf
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "no JSON spelling",
             ),
             (
                 r#"    action: demo.list
