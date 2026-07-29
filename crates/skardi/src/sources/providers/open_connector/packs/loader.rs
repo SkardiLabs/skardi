@@ -4,9 +4,14 @@
 //! into the binary with `include_str!` — the design doc's illustrative
 //! pack format, chosen over Rust statics so a pack is reviewable and
 //! generatable as plain data and so the format is ready for the designed
-//! second tier (user-authored packs from a directory). Nothing about the
-//! contract boundary changes: packs are still shipped inside the Skardi
-//! binary, versioned, fingerprint-gated, and never user-editable
+//! second tier (user-authored packs from a directory). To be explicit
+//! about what this is NOT: there is no dynamic loading here — adding a
+//! built-in pack still means a YAML asset plus a small Rust accessor
+//! module, a `mod` declaration, a registry entry, and a rebuild.
+//! Directory-loaded user packs remain the design's deliberately deferred
+//! tier; this refactor stabilizes the format they will use. Nothing about
+//! the contract boundary changes: packs are still shipped inside the
+//! Skardi binary, versioned, fingerprint-gated, and never user-editable
 //! configuration.
 //!
 //! Each asset is parsed exactly once (first registry access) and leaked
