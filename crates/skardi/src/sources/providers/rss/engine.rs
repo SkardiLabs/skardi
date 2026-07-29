@@ -62,18 +62,36 @@
 //!   interpolates element and attribute *names* only — `MissingEndTag`,
 //!   `UnmatchedEndTag`, `MismatchedEndTag`, `MissingDeclVersion` — never
 //!   character data.
+//! - `quick-xml`'s `EscapeError` is the one variant family that *would* quote
+//!   content: `UnrecognizedEntity(Range, String)` renders as ``unrecognized
+//!   entity `{token}` `` with the token lifted straight out of character data
+//!   (`src/escape.rs:66-68`). It is not reachable through this parse chain, and
+//!   the reason is worth stating precisely because two plausible explanations
+//!   are wrong. It is *not* that `sanitize.rs`'s rung 3 escapes the `&` first
+//!   (it does, but disabling the rung does not produce a leak), and it is not
+//!   that such documents fail elsewhere first. Measured against feed-rs 2.4.0:
+//!   an undefined entity reference in character data produces **no error at
+//!   all** — `feed_rs::parser::parse` on
+//!   `<title>&SENTINEL-XYZ;</title>` returns `Ok` with the title read back
+//!   verbatim as `"&SENTINEL-XYZ;"`, both with and without the ladder, so
+//!   `parse_feed_document` never sees the variant to propagate. The XML errors
+//!   it *does* surface for a malformed document are the structural ones above
+//!   (a truncated feed reports "tag not closed: `>` not found before end of
+//!   input"). `parse_failure_last_error_never_echoes_character_data` carries a
+//!   sentinel in character data through three shapes, including the undefined
+//!   entity, so a future `feed-rs` that starts reporting escape errors is
+//!   caught rather than trusted.
 //! - `feed-rs`'s `ParseErrorKind` (`src/parser/mod.rs:94`) interpolates a MIME
 //!   string and a `&'static str` element name;
-//!   `ParseFeedError::JsonUnsupportedVersion` interpolates a JSON Feed's
-//!   declared `version`.
+//!   `ParseFeedError::JsonUnsupportedVersion` (`src/parser/mod.rs:37`)
+//!   interpolates a JSON Feed's declared `version`.
 //! - [`FetchError`]'s own strings are statuses, byte/second counts, and URLs
 //!   (the configured feed URL, or a redirect `Location`) — never a body.
 //!
 //! Element names, MIME types, and version strings are deliberately kept: they
 //! are what makes a malformed feed diagnosable, they are structure rather than
 //! content, and the character cap bounds the worst case. If a future
-//! `feed-rs`/`quick-xml` starts echoing character data,
-//! `parse_failure_last_error_never_echoes_character_data` below fails and a
+//! `feed-rs`/`quick-xml` starts echoing character data, that test fails and a
 //! redaction filter belongs here.
 //!
 //! ## No in-flight coalescing
@@ -183,6 +201,16 @@ impl RssEngine {
             .enumerate()
             .map(|(index, sub)| (sub.name.clone(), index))
             .collect();
+        let configured_ttl = Duration::from_secs(config.ttl_seconds);
+        let ttl = configured_ttl.min(MAX_TTL);
+        if ttl != configured_ttl {
+            tracing::warn!(
+                source = %source_name,
+                configured_ttl_seconds = config.ttl_seconds,
+                effective_ttl_seconds = ttl.as_secs(),
+                "rss ttl_seconds clamped to the engine's ceiling"
+            );
+        }
         Self {
             source_name,
             subscriptions,
@@ -193,7 +221,7 @@ impl RssEngine {
             // keeps a directly constructed config from producing a
             // semaphore that parks every fetch forever.
             semaphore: Arc::new(Semaphore::new(config.max_concurrent.max(1))),
-            ttl: Duration::from_secs(config.ttl_seconds).min(MAX_TTL),
+            ttl,
             scan_timeout: Duration::from_secs(config.scan_timeout_seconds),
         }
     }
@@ -222,7 +250,20 @@ impl RssEngine {
         // Resolving first is what keeps every cache key config-derived: from
         // here on the feed is `sub.name`, owned by `self.subscriptions`, and
         // the caller's `feed` argument is never used again.
-        let sub = self.subscription(feed)?;
+        let Some(sub) = self.subscription(feed) else {
+            // Still one record per serve: a name that is not a subscription is
+            // a projection or a stale plan referring to a feed this source no
+            // longer has, which is worth seeing rather than silently zero
+            // rows. `feed` is echoed because the whole point is which name was
+            // asked for; it reaches no cache and no request.
+            tracing::debug!(
+                source = %self.source_name,
+                feed,
+                outcome = "unknown-feed",
+                "rss feed served"
+            );
+            return None;
+        };
         let started = Instant::now();
         let (batch, log) = self.serve_subscription(sub, launch_gate).await;
         // One record per serve. Feed URLs are safe to log; response bodies
@@ -309,8 +350,16 @@ impl RssEngine {
                     now_ms(),
                     arm(Instant::now(), self.ttl),
                 );
-                // The `304` confirms exactly the window whose validators
-                // this attempt sent, which is the one in `snapshot`.
+                // The `304` confirms exactly the window whose validators this
+                // attempt sent, which is the one in `snapshot` — read before
+                // the permit, so with no in-flight coalescing a concurrent
+                // scan may have replaced the cached window in between. This
+                // serve then emits the older rows while `feeds.item_count`,
+                // read from the observation, describes the newer ones. That is
+                // the one observable consequence of allowing double fetches:
+                // serving the window this `304` actually vouches for is more
+                // defensible than stamping `revalidated` on rows no server
+                // confirmed, and both windows are legitimate reads of the feed.
                 let batch = snapshot
                     .window
                     .as_ref()
@@ -364,11 +413,7 @@ impl RssEngine {
                     Err(failure) => self.degrade(
                         sub,
                         Some(http_status),
-                        format!(
-                            "parse failed at {}: {}",
-                            failure.stage,
-                            truncate(&failure.reason, MAX_ERROR_CHARS)
-                        ),
+                        parse_error_message(failure.stage, &failure.reason),
                         failure.dialect_declared,
                         bytes,
                     ),
@@ -559,6 +604,19 @@ impl ServeLog {
     }
 }
 
+/// The `feeds.last_error` text for a failed parse: the stage that gave up plus
+/// the parser's own reason.
+///
+/// The cap applies to the *composed* string, not just to `reason`. Bounding the
+/// reason alone would let the `"parse failed at …: "` prefix push the stored
+/// value past [`MAX_ERROR_CHARS`], which is a cap on what lands in the column.
+fn parse_error_message(stage: &str, reason: &str) -> String {
+    truncate(
+        &format!("parse failed at {stage}: {reason}"),
+        MAX_ERROR_CHARS,
+    )
+}
+
 /// Bound a stored error string to `max_chars` *characters*, cutting on a char
 /// boundary so a multi-byte sequence is never split. A length bound only:
 /// nothing here removes content, so what may appear in `feeds.last_error` is
@@ -601,6 +659,7 @@ mod tests {
     use arrow::array::{Array, UInt64Array};
 
     use super::*;
+    use crate::sources::providers::rss::cache::FeedSnapshot;
     use crate::sources::providers::rss::config::{FeedSubscription, inline_config};
     use crate::sources::providers::rss::testutil::{
         MockFeedServer, MockResponse, RSS2_MINIMAL, str_col, str_opt_col,
@@ -622,6 +681,77 @@ mod tests {
         feeds: &[(String, String)],
         ttl_seconds: u64,
         max_concurrent: usize,
+    ) -> RssEngine {
+        let cache = Arc::new(MemoryFeedCache::new(CACHE_MAX_BYTES, feeds.len() + 8));
+        engine_with_cache(feeds, ttl_seconds, max_concurrent, cache)
+    }
+
+    /// A `FeedCache` that answers "expired" for every feed while delegating
+    /// every write, and every other part of the read, to a real
+    /// [`MemoryFeedCache`].
+    ///
+    /// Needed because a failure arms to `failure_fuse(ttl)`, at least 30
+    /// seconds even at `ttl_seconds: 0`, so no configuration can get a test to
+    /// a *third* attempt after a failed one. Overriding only the verdict keeps
+    /// every state transition under test real — the window, the validators,
+    /// and the statuses all come from the wrapped cache — without a sleep.
+    struct AlwaysExpired(MemoryFeedCache);
+
+    impl FeedCache for AlwaysExpired {
+        fn snapshot(&self, feed: &str, now: Instant) -> FeedSnapshot {
+            FeedSnapshot {
+                within_ttl: false,
+                ..self.0.snapshot(feed, now)
+            }
+        }
+
+        fn record_success(
+            &self,
+            feed: &str,
+            window: CachedWindow,
+            observation: FeedObservation,
+            armed_until: Instant,
+        ) {
+            self.0
+                .record_success(feed, window, observation, armed_until);
+        }
+
+        fn record_not_modified(
+            &self,
+            feed: &str,
+            http_status: u16,
+            last_fetch_ms: i64,
+            armed_until: Instant,
+        ) {
+            self.0
+                .record_not_modified(feed, http_status, last_fetch_ms, armed_until);
+        }
+
+        fn record_failure(
+            &self,
+            feed: &str,
+            http_status: Option<u16>,
+            error: String,
+            dialect_declared: Option<String>,
+            last_fetch_ms: i64,
+            armed_until: Instant,
+        ) {
+            self.0.record_failure(
+                feed,
+                http_status,
+                error,
+                dialect_declared,
+                last_fetch_ms,
+                armed_until,
+            );
+        }
+    }
+
+    fn engine_with_cache(
+        feeds: &[(String, String)],
+        ttl_seconds: u64,
+        max_concurrent: usize,
+        cache: Arc<dyn FeedCache>,
     ) -> RssEngine {
         let subscriptions: Vec<ResolvedSubscription> = feeds
             .iter()
@@ -649,10 +779,6 @@ mod tests {
             config.user_agent.clone(),
         )
         .expect("build the test fetcher");
-        let cache = Arc::new(MemoryFeedCache::new(
-            CACHE_MAX_BYTES,
-            subscriptions.len() + 8,
-        ));
         RssEngine::with_parts(
             "rss_test".to_string(),
             subscriptions,
@@ -745,11 +871,107 @@ mod tests {
         );
 
         // Negative cache: an immediate third serve does not re-poke the dead
-        // feed, and reading its health issues no request either.
+        // feed, and reading its health issues no request either. That third
+        // serve goes through the cache-hit path, which must stamp the *stored*
+        // status rather than the `fresh` the window was built with.
         let n = server.requests().len();
-        assert!(engine.serve_feed("a", || true).await.is_some());
+        let cached = engine
+            .serve_feed("a", || true)
+            .await
+            .expect("stale rows again, from the cache");
+        assert_eq!(
+            str_col(&cached, "window_status"),
+            vec!["stale-error"],
+            "the cache-hit path stamps the stored status, not the batch's build-time label"
+        );
         engine.feeds_row("a");
         assert_eq!(server.requests().len(), n);
+    }
+
+    /// A `304` after a failure clears the error and restores `revalidated`
+    /// while keeping the validators that earned the `304`. Needs three
+    /// attempts against one feed, which `failure_fuse`'s 30s floor rules out
+    /// by configuration — hence [`AlwaysExpired`].
+    #[tokio::test]
+    async fn stale_error_then_304_returns_to_revalidated_and_clears_the_error() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let server = MockFeedServer::start(move |req| {
+            match h.fetch_add(1, Ordering::SeqCst) {
+                // The window and its etag.
+                0 => MockResponse::xml(RSS2_MINIMAL).with_header("etag", "\"v1\""),
+                // Every attempt of the second serve (MAX_ATTEMPTS is 3).
+                1..=3 => MockResponse::status(500),
+                _ if req.header("if-none-match").is_some() => MockResponse::status(304),
+                // A 304 here would be unconditional; fail loudly instead.
+                _ => MockResponse::status(400),
+            }
+        })
+        .await;
+        let urls = vec![("a".to_string(), format!("{}/f.xml", server.url()))];
+        let cache = Arc::new(AlwaysExpired(MemoryFeedCache::new(CACHE_MAX_BYTES, 8)));
+        let engine = engine_with_cache(&urls, 900, 4, cache);
+
+        engine.serve_feed("a", || true).await.expect("first serve");
+        let stale = engine.serve_feed("a", || true).await.expect("stale rows");
+        assert_eq!(str_col(&stale, "window_status"), vec!["stale-error"]);
+        assert!(str_opt_col(&engine.feeds_row("a"), "last_error")[0].is_some());
+
+        let revalidated = engine.serve_feed("a", || true).await.expect("304 serve");
+        assert_eq!(str_col(&revalidated, "window_status"), vec!["revalidated"]);
+        assert_eq!(revalidated.num_rows(), 1);
+
+        let row = engine.feeds_row("a");
+        assert_eq!(str_col(&row, "last_status"), vec!["revalidated"]);
+        assert_eq!(
+            str_opt_col(&row, "last_error"),
+            vec![None],
+            "a successful revalidation clears the previous failure's error"
+        );
+        assert_eq!(
+            str_opt_col(&row, "etag"),
+            vec![Some("\"v1\"".to_string())],
+            "the validators that earned the 304 survive it"
+        );
+    }
+
+    /// The politeness permit is released when a serve is cancelled mid-fetch,
+    /// not just when it completes — otherwise one cancelled scan would park
+    /// every later fetch of that source forever.
+    #[tokio::test]
+    async fn a_cancelled_serve_releases_the_politeness_permit() {
+        let server = MockFeedServer::start(|_| {
+            MockResponse::xml(RSS2_MINIMAL).with_delay(Duration::from_millis(300))
+        })
+        .await;
+        let urls = vec![
+            ("a".to_string(), format!("{}/a.xml", server.url())),
+            ("b".to_string(), format!("{}/b.xml", server.url())),
+        ];
+        // One permit, so `b` can only proceed if `a` gave its permit back.
+        let engine = engine_over(&urls, 900, 1);
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(30), engine.serve_feed("a", || true)).await;
+        assert!(
+            cancelled.is_err(),
+            "the serve must still have been in flight when the timeout dropped it"
+        );
+        // A leaked permit makes this hang rather than fail, so bound it.
+        let served = tokio::time::timeout(Duration::from_secs(10), engine.serve_feed("b", || true))
+            .await
+            .expect("b acquired the permit a released on cancellation");
+        assert!(served.is_some());
+        assert_eq!(
+            str_col(&engine.feeds_row("b"), "last_status"),
+            vec!["fresh"]
+        );
+        // The cancelled serve wrote no health state: it was dropped before it
+        // could record anything.
+        assert_eq!(
+            str_col(&engine.feeds_row("a"), "last_status"),
+            vec!["never"]
+        );
     }
 
     #[tokio::test]
@@ -809,28 +1031,61 @@ mod tests {
     }
 
     /// `last_error` must carry no response-body content. The 512-char cap
-    /// bounds length but does not redact, so the guarantee rests on the
-    /// parse error never echoing character data — pinned here end to end.
+    /// bounds length but does not redact, so the guarantee rests on the parse
+    /// error never echoing character data — pinned here end to end for both
+    /// shapes that could carry it.
+    ///
+    /// Each body carries the sentinel in *character data* — the one place a
+    /// parser could quote content from — in a different shape. Whether a given
+    /// body fails to parse is feed-rs's business and may change between
+    /// versions; the invariant is that if any reason lands in `last_error`, the
+    /// sentinel is not in it and the stored string respects the cap.
     #[tokio::test]
     async fn parse_failure_last_error_never_echoes_character_data() {
-        let server = MockFeedServer::start(|_| {
-            MockResponse::xml("<rss version=\"2.0\"><channel><title>SHOULD-NOT-LEAK secret prose")
-        })
-        .await;
-        let engine = test_engine(&server, &[("a", "/f.xml")], 900);
+        const SENTINEL: &str = "SHOULD-NOT-LEAK";
+        let bodies = [
+            // Truncated mid-element, sentinel as ordinary character data.
+            "<rss version=\"2.0\"><channel><title>SHOULD-NOT-LEAK secret prose",
+            // Truncated, sentinel shaped as an undefined entity reference —
+            // the input `EscapeError::UnrecognizedEntity` would quote verbatim.
+            "<rss version=\"2.0\"><channel><title>&SHOULD-NOT-LEAK; truncat",
+            // Well-formed, so nothing fails today: feed-rs 2.4.0 reads an
+            // undefined entity back as literal text and reports no error at
+            // all. Kept as a live guard — the day a future feed-rs starts
+            // reporting escape errors, this body is the one that produces one.
+            concat!(
+                r#"<rss version="2.0"><channel><title>&SHOULD-NOT-LEAK;</title>"#,
+                r#"<link>https://e.example/</link><description>d</description>"#,
+                r#"</channel></rss>"#,
+            ),
+        ];
 
-        assert!(engine.serve_feed("a", || true).await.is_none());
-        let error = str_opt_col(&engine.feeds_row("a"), "last_error")[0]
-            .clone()
-            .expect("last_error recorded");
-        assert!(
-            !error.contains("SHOULD-NOT-LEAK"),
-            "response body content reached last_error: {error}"
-        );
-        assert!(
-            error.len() <= MAX_ERROR_CHARS + 64,
-            "bounded: {}",
-            error.len()
+        let mut errors_seen = 0;
+        for body in bodies {
+            let server = MockFeedServer::start(move |_| MockResponse::xml(body)).await;
+            let engine = test_engine(&server, &[("a", "/f.xml")], 900);
+
+            engine.serve_feed("a", || true).await;
+            if let Some(error) = str_opt_col(&engine.feeds_row("a"), "last_error")[0].clone() {
+                errors_seen += 1;
+                assert!(
+                    !error.contains(SENTINEL),
+                    "response body content reached last_error for {body:?}: {error}"
+                );
+                assert!(
+                    error.chars().count() <= MAX_ERROR_CHARS,
+                    "stored error exceeds the stated cap: {}",
+                    error.chars().count()
+                );
+            }
+        }
+        // Guards the loop against going quietly vacuous: the two truncated
+        // bodies must still reach the failure path for the assertions above to
+        // mean anything.
+        assert_eq!(
+            errors_seen, 2,
+            "expected the two truncated bodies to record an error and the well-formed \
+             one not to; if that changed, re-check what the new reason contains"
         );
     }
 
@@ -1030,6 +1285,20 @@ mod tests {
         assert!(engine.serve_feed("' OR 1=1 --", || true).await.is_none());
         assert_eq!(engine.feeds_row("' OR 1=1 --").num_rows(), 0);
         assert_eq!(server.requests().len(), 0);
+    }
+
+    /// The stored value, prefix included, respects the cap — a reason bounded
+    /// on its own would leave the column at `512 + prefix`.
+    #[test]
+    fn parse_error_message_caps_the_composed_string_not_just_the_reason() {
+        let message = parse_error_message("strict-parse", &"x".repeat(4_000));
+        assert_eq!(message.chars().count(), MAX_ERROR_CHARS);
+        assert!(message.starts_with("parse failed at strict-parse: "));
+        // A short reason is untouched.
+        assert_eq!(
+            parse_error_message("refused-internal-dtd", "internal DTD subset refused"),
+            "parse failed at refused-internal-dtd: internal DTD subset refused"
+        );
     }
 
     #[test]
