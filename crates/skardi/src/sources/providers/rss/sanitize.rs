@@ -171,32 +171,45 @@ pub fn rung_reencode_utf8(input: &[u8]) -> (Vec<u8>, bool) {
     // UTF-8, needs no repair beyond a leading BOM — that is what keeps the rung
     // a byte-level no-op on well-formed input.
     //
-    // A declaration naming some *other* encoding only matters once the body
-    // actually carries a byte outside ASCII. Below 0x80 every label reachable
-    // here decodes byte-for-byte the way UTF-8 does — `Encoding::
-    // is_ascii_compatible` (encoding_rs-0.8.35/src/lib.rs) is false only for
-    // UTF-16LE/BE, ISO-2022-JP and `replacement` — so
-    // `<?xml version="1.0" encoding="ISO-8859-1"?>` over pure-ASCII content is
-    // a correctly-declared document that needs nothing, and rewriting it would
-    // break the no-op contract on an extremely common real-feed shape. The
-    // label cannot tell that case apart on its own: `for_label` maps
-    // `us-ascii`, `ascii`, `iso-8859-1` and `latin1` all to windows-1252
-    // (asserted in encoding_rs' own `src/test_labels_names.rs`), so none of
-    // them compare equal to `UTF_8`.
+    // A declaration naming some *other* encoding matters only when reading the
+    // body under that label would yield different text than reading it as
+    // UTF-8. That is tested directly: decode under the declared label and
+    // compare against the bytes as-is. Identical means every consumer gets the
+    // same characters either way, so the declaration is harmless and this rung
+    // must stay a byte-level no-op; differing means `feed-rs` would read
+    // something other than what the bytes say, so the token gets pointed at
+    // UTF-8 (the same thing the transcoding path below does).
     //
-    // With a non-ASCII byte present the declaration *is* lying — the bytes just
-    // passed UTF-8 validation — which is a common real-world shape (content
-    // re-encoded to UTF-8 without updating the declaration) that mojibakes
-    // `café` into `cafÃ©` for any consumer trusting the decl. Point the token at
-    // UTF-8 too, same as the transcoding path below already does. A label that
-    // is not ASCII-compatible gets the same treatment whatever the bytes are:
-    // ASCII under an `encoding="utf-16"` declaration is not a document any
-    // consumer can read as declared.
+    // The direct comparison replaces a `!body.is_ascii() ||
+    // !enc.is_ascii_compatible()` proxy that was wrong in both directions
+    // across two review rounds. `Encoding::is_ascii_compatible`
+    // (encoding_rs-0.8.35/src/lib.rs:2928-2930) is `!(self == REPLACEMENT ||
+    // self == UTF_16BE || self == UTF_16LE || self == ISO_2022_JP)` — a
+    // hardcoded name list, not a test of whether ASCII survives decoding. It
+    // therefore over-triggered on ISO-2022-JP, which is on that list only
+    // because of its `ESC`/`SO`/`SI` sequences: pure-ASCII bytes decode
+    // byte-identically under it, so
+    // `<?xml encoding="ISO-2022-JP"?><x>plain ascii</x>` is truthfully declared
+    // yet was being rewritten and recorded a false `reencoded-to-utf8` note.
+    //
+    // One decode covers every case the proxy needed special-casing for, with no
+    // encoding named in the code: ASCII under a legacy label is identical (a
+    // no-op — and a very common real-feed shape, which is what the contract
+    // protects); a UTF-8 `café` under an `iso-8859-1` declaration differs
+    // (`cafÃ©`, so repair); UTF-16 and `replacement`-mapped labels over ASCII
+    // differ (repair); ISO-2022-JP carrying real escape sequences differs
+    // (repair). Costed at the 5 MiB `max_response_bytes` cap on an ASCII body
+    // under an `iso-8859-1` declaration: 283 µs against the old scan's 166 µs,
+    // and only on bodies that actually carry a non-UTF-8 declaration.
+    //
+    // `decode_without_bom_handling` because both BOM forms were already
+    // consumed above; the `UTF_8` short-circuit only avoids a decode whose
+    // result would be `text` by construction.
     if let Ok(text) = std::str::from_utf8(body) {
         let declaration_misleads = xml_decl_encoding_label(body)
             .and_then(|label| encoding_rs::Encoding::for_label(&label))
             .is_some_and(|enc| {
-                enc != encoding_rs::UTF_8 && (!body.is_ascii() || !enc.is_ascii_compatible())
+                enc != encoding_rs::UTF_8 && enc.decode_without_bom_handling(body).0 != text
             });
         if declaration_misleads {
             return (rewrite_decl_encoding(text), true);
@@ -430,6 +443,13 @@ mod tests {
             r#"<?xml version="1.0" encoding="us-ascii"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
             r#"<?xml version="1.0" encoding="ISO-8859-1"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
             r#"<?xml version="1.0" encoding="windows-1252"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
+            // ISO-2022-JP over pure ASCII. `is_ascii_compatible` is false for
+            // this encoding (encoding_rs-0.8.35/src/lib.rs:2928-2930 excludes it
+            // by name, for its ESC/SO/SI sequences), but ASCII decodes
+            // byte-identically under it, so this document is truthfully declared
+            // and must not be rewritten. The old `!enc.is_ascii_compatible()`
+            // proxy rewrote it and recorded a false `reencoded-to-utf8` note.
+            r#"<?xml version="1.0" encoding="ISO-2022-JP"?><rss version="2.0"><channel><title>t</title></channel></rss>"#,
         ];
         for doc in wellformed {
             let b = doc.as_bytes();
@@ -494,9 +514,9 @@ mod tests {
 
     #[test]
     fn legacy_decl_over_ascii_only_content_is_a_noop() {
-        // The trigger is "declared non-UTF-8 *and* a non-ASCII byte is present":
+        // The trigger is "decoding under the declared label changes the text":
         // the same declaration is a lie over `café` (the test above) and the
-        // truth over ASCII, and only the bytes can tell the two apart.
+        // truth over ASCII, and only decoding can tell the two apart.
         let ascii = r#"<?xml version="1.0" encoding="ISO-8859-1"?><x>plain ascii</x>"#.as_bytes();
         let (out, changed) = rung_reencode_utf8(ascii);
         assert!(!changed, "ASCII under a legacy label needs no repair");
@@ -504,16 +524,49 @@ mod tests {
     }
 
     #[test]
-    fn ascii_under_a_non_ascii_compatible_decl_is_still_repaired() {
-        // ASCII bytes are not readable as the declared UTF-16 by any consumer
-        // that trusts the declaration, so this one is not well-formed input and
-        // the ASCII carve-out above must not reach it.
+    fn ascii_under_a_utf16_decl_is_still_repaired() {
+        // Decoding these ASCII bytes as the declared UTF-16 pairs them up into
+        // unrelated CJK, so the text changes and the declaration has to go. This
+        // is the case the ASCII no-op above must not swallow.
         let doc = r#"<?xml version="1.0" encoding="utf-16"?><x>plain ascii</x>"#.as_bytes();
         let (out, changed) = rung_reencode_utf8(doc);
         assert!(changed);
         assert_eq!(
             out,
             r#"<?xml version="1.0" encoding="UTF-8"?><x>plain ascii</x>"#.as_bytes()
+        );
+    }
+
+    #[test]
+    fn iso_2022_jp_carrying_real_escape_sequences_is_still_repaired() {
+        // The companion to the ISO-2022-JP entry in the no-op battery: that label
+        // is a no-op only because *ASCII* survives it. Once the body carries the
+        // escape sequences the encoding exists for, decoding changes the text
+        // (`\x1b$B$3$s$K$A$O\x1b(B` decodes to `こんにちは`), so the rung engages
+        // — decided by the bytes rather than by the encoding's name.
+        let mut doc = br#"<?xml version="1.0" encoding="ISO-2022-JP"?><x>"#.to_vec();
+        doc.extend_from_slice(b"\x1b$B$3$s$K$A$O\x1b(B");
+        doc.extend_from_slice(b"</x>");
+        let (out, changed) = rung_reencode_utf8(&doc);
+        assert!(changed, "escape-sequence body decodes to different text");
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !s.contains("ISO-2022-JP") && s.contains("UTF-8"),
+            "decl encoding token rewritten: {s}"
+        );
+        // Pinning what this branch actually does, which the predicate swap did
+        // not change: the bytes already passed UTF-8 validation, so it relabels
+        // the declaration and leaves the body alone rather than transcoding.
+        // The escape sequences survive as literal text under the new UTF-8
+        // label. Both the old `!enc.is_ascii_compatible()` proxy and the direct
+        // decode test select this same path for this input.
+        assert!(
+            s.contains('\x1b'),
+            "body relabeled, not transcoded, so ESC survives: {s:?}"
+        );
+        assert!(
+            !s.contains("こんにちは"),
+            "body is not transcoded here: {s:?}"
         );
     }
 
