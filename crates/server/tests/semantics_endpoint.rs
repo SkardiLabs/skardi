@@ -68,6 +68,7 @@ fn products_data_source(description: Option<&str>) -> DataSource {
         hierarchy_level: Default::default(),
         description: description.map(str::to_string),
         open_connector: None,
+        rss: None,
     }
 }
 

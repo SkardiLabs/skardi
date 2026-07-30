@@ -19,6 +19,7 @@ pub enum DataSourceType {
     Clickhouse,
     Documents,
     Dynamodb,
+    Rss,
     // Explicit rename: the `lowercase` rule would produce `openconnector`,
     // but the public YAML spelling (and the design spec) is `open_connector`.
     #[serde(rename = "open_connector")]
@@ -42,6 +43,7 @@ impl DataSourceType {
             Self::Clickhouse => "clickhouse",
             Self::Documents => "documents",
             Self::Dynamodb => "dynamodb",
+            Self::Rss => "rss",
             Self::OpenConnector => "open_connector",
         }
     }
@@ -76,6 +78,13 @@ mod tests {
         let t: DataSourceType = serde_yaml::from_str("dynamodb").unwrap();
         assert_eq!(t, DataSourceType::Dynamodb);
         assert_eq!(t.as_str(), "dynamodb");
+    }
+
+    #[test]
+    fn rss_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("rss").unwrap();
+        assert_eq!(t, DataSourceType::Rss);
+        assert_eq!(t.as_str(), "rss");
     }
 
     #[test]

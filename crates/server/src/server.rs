@@ -408,6 +408,7 @@ spec:
             hierarchy_level: Default::default(),
             description: None,
             open_connector: None,
+            rss: None,
         }];
 
         let pipeline = create_test_pipeline().await;

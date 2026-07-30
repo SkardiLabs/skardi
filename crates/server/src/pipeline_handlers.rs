@@ -379,7 +379,10 @@ pub async fn get_data_sources(
             | DataSourceType::Influxdb
             | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
-            | DataSourceType::Dynamodb => None,
+            | DataSourceType::Dynamodb
+            // RSS has no path: its feed URLs live in the typed `rss:` block,
+            // not in `path`.
+            | DataSourceType::Rss => None,
         };
 
         let url = match data_source.source_type {
@@ -903,6 +906,7 @@ spec:
             hierarchy_level: Default::default(),
             description: None,
             open_connector: None,
+            rss: None,
         };
 
         // Create pipeline that queries the registered data source
@@ -1531,6 +1535,7 @@ spec:
                 enable_cache: false,
                 description: None,
                 open_connector: None,
+                rss: None,
             });
         }
 

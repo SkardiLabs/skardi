@@ -25,6 +25,10 @@ chunking = ["skardi/chunking"]
 rag = ["embedding", "chunking"]
 # documents source connector (mirrors skardi/documents).
 documents = ["skardi/documents"]
+# rss source connector (mirrors skardi/rss). The typed `rss:` config block on
+# `data_sources[]` parses without it; this flag is what makes a `type: rss`
+# source register instead of failing with a build-capability error.
+rss = ["skardi/rss"]
 
 [dependencies]
 better-auth = { workspace = true }

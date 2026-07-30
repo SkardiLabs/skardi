@@ -296,6 +296,7 @@ mod tests {
             hierarchy_level: Default::default(),
             description: None,
             open_connector: None,
+            rss: None,
         }];
 
         registry
@@ -334,6 +335,7 @@ mod tests {
             hierarchy_level: Default::default(),
             description: None,
             open_connector: None,
+            rss: None,
         }];
 
         // Should not register Lance functions for CSV-only data sources
