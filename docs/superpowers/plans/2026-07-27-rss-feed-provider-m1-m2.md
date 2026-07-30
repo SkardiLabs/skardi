@@ -1093,6 +1093,19 @@ async fn limit_satisfied_stops_launching_fetches() {
     for i in 0..3 { let _ = collect_stream(exec.execute(i, ctx.clone())).await; }
     assert_eq!(server.requests().len(), 1);
 }
+```
+
+**This sequential test is NOT sufficient on its own — Task 12 proved it by mutation.** Replacing the gate with a pre-check-only version (passing `|| true` into `serve_feed`) leaves this test still passing, because draining partitions one at a time means the cheap pre-check alone already sees `emitted >= n` before partition 1 starts. The post-acquire re-check — the whole reason Task 11 placed the gate after the permit — is unverified by it.
+
+So a second test is required, and it is the one that carries the property: launch several partitions **concurrently** with `max_concurrent` small enough that later partitions queue on the semaphore, let the first one emit, and assert the queued partitions did not fetch after their permit arrived. Verify it by the same mutation: pre-check-only must fail *this* test.
+
+```rust
+#[tokio::test]
+async fn a_queued_partition_is_stopped_by_the_gate_after_the_permit() {
+    // Same shape, but poll the partitions concurrently so partitions 1 and 2 are
+    // already past their pre-check and waiting on the permit when partition 0 emits.
+    // Pre-check-only implementations pass the sequential test above and fail this one.
+}
 
 #[tokio::test]
 async fn empty_projection_preserves_row_count() {
