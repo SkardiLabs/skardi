@@ -247,6 +247,17 @@ struct LocalDataSource {
     /// type is `open_connector`, rejected for every other type.
     #[serde(default)]
     open_connector: Option<OpenConnectorConfig>,
+    /// Typed RSS/Atom subscription configuration. Required when the source
+    /// type is `rss`, rejected for every other type: a list of feed
+    /// subscriptions does not fit the flat `options` map.
+    ///
+    /// Unconditional rather than `#[cfg(feature = "rss")]`: `RssConfig`
+    /// compiles without the feature
+    /// (`skardi/src/sources/providers/rss/config.rs:1-10`), so a featureless
+    /// build parses the block and then fails at registration with a message
+    /// naming the feature, instead of a serde error about an unknown field.
+    #[serde(default)]
+    rss: Option<skardi::sources::providers::rss::RssConfig>,
 }
 
 impl LocalDataSource {
@@ -801,6 +812,15 @@ async fn register_source(
         );
     }
 
+    // Same rule for the typed `rss` block.
+    if source_type != "rss" && source.rss.is_some() {
+        anyhow::bail!(
+            "Data source '{}': `rss:` block is only valid for type: rss, got '{}'",
+            source.name,
+            source.source_type
+        );
+    }
+
     match source_type.as_str() {
         "csv" => {
             let path_str = source
@@ -1060,6 +1080,40 @@ async fn register_source(
             register_iceberg_table(session_ctx, &source.name, path_str, source.options.as_ref())
                 .await
                 .with_context(|| format!("Failed to register Iceberg '{}'", source.name))?;
+        }
+        "rss" => {
+            #[cfg(feature = "rss")]
+            {
+                // Hierarchy defaults to Table; fail here with a clear message
+                // rather than the provider's wrapped CatalogHierarchyRequired.
+                if source.hierarchy_level != HierarchyLevel::Catalog {
+                    anyhow::bail!(
+                        "RSS source '{}': hierarchy_level must be 'catalog' \
+                         (one source exposes <name>.main.feeds and <name>.main.items)",
+                        source.name
+                    );
+                }
+                // Config-block presence, read-only enforcement, and hierarchy
+                // are all re-checked inside the provider — the single
+                // validation point shared with the server. Notably, the
+                // read-only invariant has no CLI-side equivalent of the
+                // server's WRITABLE_SOURCE_TYPES gate, so the provider is the
+                // only thing that rejects `access_mode: read_write` here.
+                skardi::sources::providers::rss::register_rss_tables(
+                    session_ctx,
+                    &source.name,
+                    source.rss.as_ref(),
+                    source.is_read_write(),
+                    source.hierarchy_level,
+                )
+                .await
+                .with_context(|| format!("Failed to register RSS source '{}'", source.name))?;
+            }
+            #[cfg(not(feature = "rss"))]
+            anyhow::bail!(
+                "RSS source '{}': this build lacks the `rss` feature (rebuild with --features rss)",
+                source.name
+            );
         }
         _ => {
             anyhow::bail!(
@@ -2891,6 +2945,7 @@ spec:
                 access_mode: None,
                 description: None,
                 open_connector: None,
+                rss: None,
             }
         }
 
@@ -2944,6 +2999,7 @@ spec:
                 access_mode: None,
                 description: None,
                 open_connector: None,
+                rss: None,
             }
         }
 
@@ -3010,6 +3066,7 @@ bindings:
                 description: None,
                 open_connector: config_yaml
                     .map(|yaml| serde_yaml::from_str(yaml).expect("parse config")),
+                rss: None,
             }
         }
 
@@ -3110,6 +3167,182 @@ bindings:
             );
             assert!(
                 msg.contains("SKARDI_CLI_TEST_OC_TOKEN_UNSET"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    // Guards for the `rss` arm of `register_source`. Registration performs no
+    // network I/O — it resolves the subscription list and builds two table
+    // providers — so no live feed is needed. The hosts below are `.invalid`
+    // (RFC 2606 §2 reserves it as never-resolvable) so any accidental fetch
+    // would fail loudly rather than reach a real feed.
+    mod register_rss_source {
+        use super::*;
+
+        const VALID_RSS_YAML: &str = r#"
+feeds:
+  - url: https://feeds.example.invalid/f.xml
+"#;
+
+        fn rss_source(config_yaml: Option<&str>) -> LocalDataSource {
+            LocalDataSource {
+                name: "news".to_string(),
+                source_type: "rss".to_string(),
+                path: None,
+                connection_string: None,
+                options: None,
+                hierarchy_level: HierarchyLevel::Catalog,
+                access_mode: None,
+                description: None,
+                open_connector: None,
+                rss: config_yaml.map(|yaml| serde_yaml::from_str(yaml).expect("parse rss config")),
+            }
+        }
+
+        #[test]
+        fn local_data_source_parses_rss_block() {
+            // The typed field parses off a real ctx `data_sources[]` entry, in
+            // a build with or without the `rss` feature.
+            let yaml = r#"
+name: news
+type: rss
+hierarchy_level: catalog
+rss:
+  feeds:
+    - url: https://feeds.example.invalid/f.xml
+      name: example
+  ttl_seconds: 300
+"#;
+            let source: LocalDataSource = serde_yaml::from_str(yaml).expect("parse ctx entry");
+            assert_eq!(source.source_type, "rss");
+            assert_eq!(source.hierarchy_level, HierarchyLevel::Catalog);
+            let config = source.rss.expect("rss block present");
+            assert_eq!(config.ttl_seconds, 300);
+            assert_eq!(config.feeds.as_ref().unwrap().len(), 1);
+            assert_eq!(
+                config.feeds.as_ref().unwrap()[0].name.as_deref(),
+                Some("example")
+            );
+        }
+
+        #[tokio::test]
+        async fn stray_rss_block_on_sqlite_bails() {
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let mut source = rss_source(Some(VALID_RSS_YAML));
+            source.source_type = "sqlite".to_string();
+            source.path = Some("unused.db".to_string());
+
+            let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("only valid for type: rss"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        /// Without the `rss` feature the arm must still exist and name the
+        /// feature — a `type: rss` source must not fall through to the
+        /// "Unsupported data source type" catch-all.
+        #[cfg(not(feature = "rss"))]
+        #[tokio::test]
+        async fn rss_source_without_feature_names_the_feature() {
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let source = rss_source(Some(VALID_RSS_YAML));
+            let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("`rss` feature"), "unexpected error: {msg}");
+        }
+
+        #[cfg(feature = "rss")]
+        #[tokio::test]
+        async fn rss_source_registers_and_feeds_queryable() {
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let source = rss_source(Some(VALID_RSS_YAML));
+            register_source(&mut session_ctx, &source, &registry, &oc_gateways)
+                .await
+                .expect("rss source should register");
+
+            // A `feeds` scan is a synchronous state read that issues no
+            // request (`skardi/src/sources/providers/rss/exec.rs:322-327`), so
+            // this stays offline.
+            let batches = session_ctx
+                .sql("SELECT name, url, last_status FROM news.main.feeds")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 1, "one subscription → one feeds row");
+
+            let batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+            let col = |i: usize| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap()
+                    .value(0)
+                    .to_string()
+            };
+            // `name` defaults to the URL when the subscription omits it.
+            assert_eq!(col(0), "https://feeds.example.invalid/f.xml");
+            assert_eq!(col(1), "https://feeds.example.invalid/f.xml");
+            assert_eq!(col(2), "never");
+        }
+
+        #[cfg(feature = "rss")]
+        #[tokio::test]
+        async fn rss_source_with_table_hierarchy_bails() {
+            // hierarchy_level defaults to Table; the CLI must reject it with a
+            // clear message rather than the provider's wrapped error.
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let mut source = rss_source(Some(VALID_RSS_YAML));
+            source.hierarchy_level = HierarchyLevel::Table;
+
+            let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("hierarchy_level must be 'catalog'"),
+                "unexpected error: {msg}"
+            );
+        }
+
+        #[cfg(feature = "rss")]
+        #[tokio::test]
+        async fn rss_source_with_read_write_access_mode_bails() {
+            // The CLI has no WRITABLE_SOURCE_TYPES equivalent, so the
+            // provider is the only thing standing between `access_mode:
+            // read_write` and a registered RSS source. Pin that it holds.
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let mut source = rss_source(Some(VALID_RSS_YAML));
+            source.access_mode = Some("read_write".to_string());
+
+            let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("read-only"), "unexpected error: {msg}");
+        }
+
+        #[cfg(feature = "rss")]
+        #[tokio::test]
+        async fn rss_source_without_typed_config_bails() {
+            let (mut session_ctx, registry, oc_gateways) = new_session_context();
+            let source = rss_source(None);
+            let err = register_source(&mut session_ctx, &source, &registry, &oc_gateways)
+                .await
+                .unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("missing required `rss:` configuration block"),
                 "unexpected error: {msg}"
             );
         }

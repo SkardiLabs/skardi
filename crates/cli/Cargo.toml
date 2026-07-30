@@ -25,6 +25,13 @@ embedding = ["onnx", "candle", "gguf", "remote-embed"]
 chunking = ["skardi/chunking"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
+# rss source connector (mirrors skardi/rss). Must be this crate's OWN flag and
+# not merely `skardi/rss`: the `"rss"` arm of `register_source` is gated on
+# `feature = "rss"` here, so enabling only the underlying crate's feature would
+# compile the provider and still leave `type: rss` unregisterable. Not part of
+# `default` — the fetch/parse chain pulls in feed-rs, quick-xml, htmd, and
+# encoding_rs.
+rss = ["skardi/rss"]
 
 [dependencies]
 anyhow = { workspace = true }
