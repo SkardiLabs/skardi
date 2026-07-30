@@ -367,7 +367,7 @@ The normative dialect → unified-schema mapping. It ships in `docs/rss.md` and 
 
 | `items` column | RSS 2.0 | RSS 1.0 (RDF) | Atom 1.0 | JSON Feed 1.x |
 |---|---|---|---|---|
-| `guid` | `<guid>` → fallback `<link>` | `rdf:about` → fallback `<link>` | `<id>` | `id` |
+| `guid` | `<guid>` → fallback `<link>` | `<link>` — see note | `<id>` | `id` |
 | `title` | `<title>` | `<title>` | `<title>` (text/html/xhtml normalized) | `title` |
 | `link` | `<link>` | `<link>` | `<link rel="alternate">` (first, else first link) | `url` |
 | `author` | `<author>` / `dc:creator` | `dc:creator` | `<author><name>` | `authors[0].name` |
@@ -377,6 +377,8 @@ The normative dialect → unified-schema mapping. It ships in `docs/rss.md` and 
 | `summary` | `<description>` | `<description>` | `<summary>` | `summary` |
 | `categories` | `<category>*` | `dc:subject*` | `<category term>*` | `tags[]` |
 | `enclosure_*` | `<enclosure url/type/length>` | — | `<link rel="enclosure">` | `attachments[0]` |
+
+**RSS 1.0 identity note (measured, not designed).** An earlier revision of this table claimed RSS 1.0 items key on `rdf:about` with `<link>` as a fallback. `feed-rs` 2.4 never reads `rdf:about`, so the guid is the item's `<link>`; the corpus fixture gives the two attributes different values so a regression is visible rather than coincidentally masked. Related: an Atom 0.3 document reaches feed-rs's Atom parser by root-element name, but its namespace maps to `NS::Unknown`, so it parses as an *empty* feed — zero items, no error, two missing-required-field entries in `conformance_notes`. Both facts are pinned by the fixture corpus; neither is a choice this design made.
 
 All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a dialect lacks are simply null — nullability in the schema *is* the dialect-coverage annotation. Anything outside this table lands in `extensions_json`. `feed`, `feed_url`, `position`, and `window_status` are provider-synthesized, not wire fields, so they do not appear in the mapping. For `content` and `summary` the table names the wire field the value comes from; HTML-typed values are then converted to Markdown at extraction (see Markdown converter), plain-text values pass through unchanged.
 

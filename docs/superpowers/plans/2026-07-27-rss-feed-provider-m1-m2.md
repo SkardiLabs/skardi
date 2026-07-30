@@ -793,7 +793,7 @@ fn rss2_maps_per_field_mapping_table() {
 
 (The exact Markdown strings `"# Body\n\ntext"` / `"Sum **bold**"` are pinned against the Task 6 converter — adjust to its actual output once, then they are frozen.)
 
-Plus same-shape tests: `atom10_maps_fields` (id, `<link rel="alternate">` vs bare link, published+updated, `<content type="html">` converted / `<summary type="text">` passthrough, `<category term=>`), `jsonfeed_maps_fields` (`content_text` passthrough verbatim incl. newlines, `content_html` converted, tags, attachments→enclosure, date_modified→updated), `rss1_rdf_maps_fields` (rdf:about identity, dc:creator, dc:date), `plain_text_content_is_never_converted` (JSON `content_text: "a < b & c"` → stored exactly `"a < b & c"`), `extensions_json_carries_media_and_language_or_none` (bare minimal item → `extensions_json: None`).
+Plus same-shape tests: `atom10_maps_fields` (id, `<link rel="alternate">` vs bare link, published+updated, `<content type="html">` converted / `<summary type="text">` passthrough, `<category term=>`), `jsonfeed_maps_fields` (`content_text` passthrough verbatim incl. newlines, `content_html` converted, tags, attachments→enclosure, date_modified→updated), `rss1_rdf_maps_fields` (guid from `<link>` — feed-rs 2.4 does not read `rdf:about`; dc:creator, dc:date), `plain_text_content_is_never_converted` (JSON `content_text: "a < b & c"` → stored exactly `"a < b & c"`), `extensions_json_carries_media_and_language_or_none` (bare minimal item → `extensions_json: None`).
 
 - [ ] **Step 2: Verify failure.** `cargo test -p skardi --features rss rss::parse`
 
@@ -1421,9 +1421,9 @@ Corpus (each file authored in this task; content requirements in parentheses):
 |---|---|
 | `rss2_wellformed.xml` | parses; dialect `rss-2.0`; declared `rss-2.0`; notes `[]`; full field assertions (guid, RFC-822 date, content:encoded → golden md, categories, enclosure, dc:creator) |
 | `rss2_missing_channel_description.xml` | parses; notes contain `missing-required-field: channel/description`; rows still served |
-| `rss1_rdf.xml` | dialect `rss-1.0`; rdf:about → guid; dc:date ISO-8601 → timestamp; dc:creator → author |
+| `rss1_rdf.xml` | dialect `rss-1.0`; **guid comes from `<link>`, not `rdf:about`** — feed-rs 2.4 never reads `rdf:about` (measured in Task 17; give the fixture different values for the two so the test can tell them apart); dc:date ISO-8601 → timestamp; dc:creator → author |
 | `atom10.xml` | dialect `atom`; declared `atom-1.0`; id/alternate-link/published+updated; html content → golden md; text summary passthrough |
-| `atom03.xml` | declared `atom-0.3`; parses (dialect `atom`) **or** degrades with recorded reason — pin whichever feed-rs 2.x does, never a panic |
+| `atom03.xml` | declared `atom-0.3`; reaches the Atom parser by root-element name but its namespace maps to `NS::Unknown`, so feed-rs 2.4 parses it as an **empty** feed that degrades visibly via two missing-required-field notes (measured in Task 17). Zero items, no error — surface this in `docs/rss.md`'s tolerance floor. |
 | `jsonfeed_11.json` | dialect `json-feed-1.x`; declared `json-feed-1.1`; content_text passthrough byte-exact; content_html → golden md; tags; attachment → enclosure |
 | `lying_content_type` (uses `atom10.xml` + content_type param `application/rss+xml`) | notes contain `content-type-mismatch: served application/rss+xml, parsed atom` |
 | `encoding_latin1_mislabeled.xml` | rescued; notes contain `sanitation: reencoded-to-utf8`; title's `é` correct in stored value |
@@ -1620,7 +1620,7 @@ Tests:
   10. Pipeline examples — the Task 19 anti-join INSERT + chunk INSERT verbatim; the closing health-report SELECT; the absence-check anti-join.
   11. Troubleshooting — absence diagnosis: legitimately-empty (`fresh` + `item_count 0`) vs dead (`error`/`never`) vs not-scanned (bare-`LIMIT` pruning; `ORDER BY … LIMIT` is Top-K and prunes nothing); `last_error` reading guide by stage.
 - [ ] **Step 2: `docs/sample_data/rss_context.yaml`** — the spec's Persistent Context Binding example, registration-ready.
-- [ ] **Step 3: `docs/rss/semantics.yaml`** — `kind: semantics` overlay: table descriptions for `news.main.feeds` (health surface; the absence-check pattern inline) and `news.main.items` (live window; the bare-`LIMIT` caveat; `window_status` freshness semantics), and per-column descriptions carrying the Field Mapping provenance (one line per column, e.g. `guid: "Stable item identity. RSS 2.0 <guid> (falls back to <link>), RDF rdf:about, Atom <id>, JSON Feed id."`). Loading path: standard `<ctx_dir>/semantics/` mechanism; say so in a header comment.
+- [ ] **Step 3: `docs/rss/semantics.yaml`** — `kind: semantics` overlay: table descriptions for `news.main.feeds` (health surface; the absence-check pattern inline) and `news.main.items` (live window; the bare-`LIMIT` caveat; `window_status` freshness semantics), and per-column descriptions carrying the Field Mapping provenance (one line per column, e.g. `guid: "Stable item identity. RSS 2.0 <guid> (falls back to <link>), RSS 1.0 <link>, Atom <id>, JSON Feed id."`). Loading path: standard `<ctx_dir>/semantics/` mechanism; say so in a header comment.
 - [ ] **Step 4: README** — add the row to the supported-sources table (columns per that table's existing shape: type `rss`, read-only, catalog, feature `rss`) + one architecture-section sentence.
 - [ ] **Step 5: Verify** — smoke-run the sample context (zero network, works offline since `feeds` never fetches):
 
