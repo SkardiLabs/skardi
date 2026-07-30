@@ -27,8 +27,13 @@
 //! performs after being handed the permit is ordered against the `fetch_add`
 //! that the emitting partition already completed. What the gate does *not*
 //! promise is a row-exact stop: two partitions that pass the gate together
-//! both serve, and DataFusion's limit operator truncates the surplus. The gate
-//! exists to stop *requests*, not to count rows.
+//! both serve, and the surplus is truncated above this plan. `push_down_limit`
+//! copies the fetch into the `TableScan` but rebuilds the `Limit` node over it
+//! rather than removing it (datafusion-optimizer 52.5.0,
+//! `src/push_down_limit.rs:93-110` and the `make_limit` both arms return
+//! through, `:222-238`), so the pushed limit is a hint to the scan and the
+//! operator above still enforces the row count. The gate exists to stop
+//! *requests*, not to count rows.
 //!
 //! ## The scan deadline
 //!
@@ -39,12 +44,26 @@
 //! failure mode this provider's design rejects, and it is why `serve_feed`
 //! returns no `Err` in the first place.
 //!
-//! Two consequences worth naming. The fetcher's own per-request timeout is
-//! normally the shorter of the two, so this is a backstop for the aggregate
-//! rather than the common path. And `timeout_at` polls the wrapped future
-//! before it polls the delay (tokio 1.52.3, `src/time/timeout.rs:216-221`), so
-//! an already-elapsed deadline still gives the serve one poll — the deadline
-//! bounds how long a partition *waits*, not whether it starts.
+//! Three consequences worth naming.
+//!
+//! The fetcher's own per-request timeout is normally the shorter of the two —
+//! 10 seconds against a 60-second scan deadline at the shipped defaults — so
+//! this is a backstop for the aggregate rather than the common path. It bites
+//! when enough feeds queue behind the politeness bound that a later one runs
+//! out of scan budget before its own request timeout fires.
+//!
+//! `timeout_at` polls the wrapped future before it polls the delay (tokio
+//! 1.52.3, `src/time/timeout.rs:216-221`), so an already-elapsed deadline still
+//! gives the serve one poll — the deadline bounds how long a partition *waits*,
+//! not whether it starts.
+//!
+//! And a serve dropped at the deadline writes no health state, by construction:
+//! the future is cancelled before the engine records anything. That is right for
+//! `feeds.last_status` — nothing was observed, so claiming an error would be a
+//! lie — but it means a feed that *reliably* outruns the scan deadline reads
+//! `never` with a NULL `last_error` indefinitely, and the only signal is this
+//! module's `warn!`. Whoever chases "why is this feed always empty" should look
+//! for that log line rather than at the `feeds` row.
 //!
 //! ## Projection, including the empty one
 //!
@@ -242,6 +261,34 @@ impl ExecutionPlan for RssScanExec {
         }
     }
 
+    /// Rebuild this plan around a *fresh* `ScanShared`: a zeroed counter and a
+    /// deadline recomputed from now.
+    ///
+    /// The default implementation is `with_new_children(children())`
+    /// (datafusion-physical-plan 52.5.0, `src/execution_plan.rs:232-236`), and
+    /// for a leaf plan that hands back the very same `Arc` — carrying a counter
+    /// that already satisfies the LIMIT and a deadline that has already been
+    /// spent. A re-executed scan would then serve zero rows without issuing a
+    /// request. `RecursiveQueryExec` reaches exactly that: it calls
+    /// `reset_plan_states` on its recursive term and then `execute(0, …)` once
+    /// per iteration (`src/recursive_query.rs:359-362`, and the `reset_state`
+    /// walk itself at `:396-402`), so a
+    /// `WITH RECURSIVE` whose recursive term scans a feed would silently shrink
+    /// after its first iteration. The hook exists for precisely this and its doc
+    /// says stateful implementations must override it
+    /// (`src/execution_plan.rs:211-222`); its one requirement on an override is
+    /// that the cached plan properties stay valid, which they do — the schema,
+    /// the partitioning, and the feed list are rebuilt from the same inputs.
+    fn reset_state(self: Arc<Self>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(
+            Arc::clone(&self.engine),
+            self.kind,
+            self.feeds.clone(),
+            self.projection.clone(),
+            self.limit,
+        )?))
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -420,6 +467,19 @@ mod tests {
     }
 
     /// Captured events with `message`, in emission order.
+    ///
+    /// Every test in this binary that reaches one of this module's `warn!`
+    /// callsites must hold a [`capture_events`] guard, whether or not it asserts
+    /// on the events. `tracing` caches a callsite's `Interest` globally on first
+    /// use, and with a single registered dispatcher it computes that interest
+    /// from whatever default is installed on the *registering* thread
+    /// (tracing-core 0.1.36, `src/callsite.rs:490-506` and the `JustOne`
+    /// rebuilder at `:544-560`). A guardless test that emits the callsite first
+    /// therefore caches `Interest::never` for the whole binary and silently
+    /// empties the assertions here — measured, not hypothesised: it is how
+    /// `the_scan_deadline_degrades_one_partition_to_zero_rows` started failing
+    /// only when run alongside
+    /// `a_deadlined_partition_releases_the_permit_for_the_next_scan`.
     fn events_with_message(
         events: &Arc<Mutex<Vec<CapturedEvent>>>,
         message: &str,
@@ -679,8 +739,177 @@ mod tests {
             &feed_urls(&server, &[("a", "/a.xml")]),
             |config| config.scan_timeout_seconds = u64::MAX,
         ));
+        let (_guard, events) = capture_events();
         let exec = items_exec(engine, &["a"], None, None);
+
         assert_eq!(total_rows(&collect_stream(exec.execute(0, ctx())).await), 1);
+        // The clamp is silent otherwise: an operator who configured a longer
+        // budget than they get has to be able to see that from the log.
+        let clamped = events_with_message(
+            &events,
+            "rss scan_timeout_seconds clamped to the exec layer's ceiling",
+        );
+        assert_eq!(clamped.len(), 1, "one warning per plan built");
+        assert_eq!(clamped[0].level, tracing::Level::WARN);
+        assert_eq!(
+            clamped[0].field("configured_scan_timeout_seconds"),
+            Some(u64::MAX.to_string().as_str())
+        );
+        assert_eq!(
+            clamped[0].field("effective_scan_timeout_seconds"),
+            Some(MAX_SCAN_TIMEOUT.as_secs().to_string().as_str())
+        );
+    }
+
+    /// A LIMIT of zero closes the gate before anything is served, so no
+    /// partition fetches at all.
+    #[tokio::test]
+    async fn a_zero_limit_closes_the_gate_for_every_partition() {
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        let engine = Arc::new(test_engine(
+            &feed_urls(&server, &[("a", "/a.xml"), ("b", "/b.xml")]),
+            |_| {},
+        ));
+        let exec = items_exec(Arc::clone(&engine), &["a", "b"], None, Some(0));
+
+        for partition in 0..2 {
+            assert!(
+                collect_stream(exec.execute(partition, ctx()))
+                    .await
+                    .is_empty(),
+                "partition {partition} serves nothing under LIMIT 0"
+            );
+        }
+        assert!(server.requests().is_empty(), "and fetches nothing");
+        for feed in ["a", "b"] {
+            assert_eq!(
+                str_col(&engine.feeds_row(feed), "last_status"),
+                vec!["never"]
+            );
+        }
+    }
+
+    /// `count(*) FROM feeds` is the same empty projection down the other branch
+    /// of `execute`, and it must not lose the health row either.
+    #[tokio::test]
+    async fn empty_projection_over_feeds_preserves_row_count() {
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        let engine = Arc::new(test_engine(&feed_urls(&server, &[("a", "/a.xml")]), |_| {}));
+        let exec = RssScanExec::new(
+            engine,
+            RssTableKind::Feeds,
+            vec!["a".to_string()],
+            Some(vec![]),
+            None,
+        )
+        .expect("build the feeds exec");
+
+        let batches = collect_stream(exec.execute(0, ctx())).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_columns(), 0);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].schema(), exec.schema());
+        assert!(server.requests().is_empty());
+    }
+
+    /// A partition dropped at the scan deadline gives its politeness permit
+    /// back, so the *next* scan of the same source can still fetch.
+    ///
+    /// Two plans over one engine with one permit: the first is deadlined mid-fetch
+    /// and the second, built afterwards, gets its own deadline — which is why
+    /// this needs two plans rather than two partitions of one. A leaked permit
+    /// parks the second scan forever (a semaphore acquire has no timeout of its
+    /// own), so the wait is bounded and fails instead of hanging.
+    #[tokio::test]
+    async fn a_deadlined_partition_releases_the_permit_for_the_next_scan() {
+        let server = MockFeedServer::start(|req| match req.path.as_str() {
+            "/slow.xml" => MockResponse::xml(RSS2_MINIMAL).with_delay(Duration::from_secs(3)),
+            _ => MockResponse::xml(RSS2_MINIMAL),
+        })
+        .await;
+        let engine = Arc::new(test_engine(
+            &feed_urls(&server, &[("slow", "/slow.xml"), ("fast", "/fast.xml")]),
+            |config| {
+                config.scan_timeout_seconds = 1;
+                config.max_concurrent = 1;
+            },
+        ));
+
+        // The guard is mandatory, not decorative — see `events_with_message`.
+        let (_guard, events) = capture_events();
+        let deadlined = items_exec(Arc::clone(&engine), &["slow"], None, None);
+        assert!(
+            collect_stream(deadlined.execute(0, ctx())).await.is_empty(),
+            "the slow feed outruns the scan deadline"
+        );
+        let warns = events_with_message(&events, "rss scan deadline reached");
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].field("feed"), Some("slow"));
+
+        // A second scan, so a second deadline measured from now.
+        let next = items_exec(Arc::clone(&engine), &["fast"], None, None);
+        let batches = tokio::time::timeout(
+            Duration::from_secs(20),
+            collect_stream(next.execute(0, ctx())),
+        )
+        .await
+        .expect("a leaked permit would park this scan forever");
+        assert_eq!(total_rows(&batches), 1);
+        assert_eq!(
+            str_col(&engine.feeds_row("fast"), "last_status"),
+            vec!["fresh"]
+        );
+    }
+
+    /// `ScanShared` must not survive re-execution: DataFusion re-executes a plan
+    /// object through `reset_state` (`RecursiveQueryExec` does it once per
+    /// iteration), and a carried-over counter would make every iteration after
+    /// the first serve zero rows without a request.
+    ///
+    /// Asserts the behaviour — rows served, a request made — rather than the
+    /// identity of the rebuilt state, so it still holds if the rebuild changes
+    /// shape.
+    #[tokio::test]
+    async fn reset_state_rebuilds_a_scan_whose_limit_was_already_satisfied() {
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        // ttl 0, so the second execution is a live fetch rather than a cache hit
+        // — the point is that a request is issued at all.
+        let engine = Arc::new(test_engine(
+            &feed_urls(&server, &[("a", "/a.xml")]),
+            |config| {
+                config.ttl_seconds = 0;
+            },
+        ));
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(items_exec(Arc::clone(&engine), &["a"], None, Some(1)));
+
+        assert_eq!(
+            total_rows(&collect_stream(exec.execute(0, ctx())).await),
+            1,
+            "the first execution fills the LIMIT"
+        );
+        assert_eq!(server.requests().len(), 1);
+        assert!(
+            collect_stream(Arc::clone(&exec).execute(0, ctx()))
+                .await
+                .is_empty(),
+            "re-executing the same plan object sees its own satisfied LIMIT"
+        );
+        assert_eq!(server.requests().len(), 1, "and issues no request");
+
+        let reset = Arc::clone(&exec)
+            .reset_state()
+            .expect("reset_state rebuilds the plan");
+        assert_eq!(
+            total_rows(&collect_stream(reset.execute(0, ctx())).await),
+            1,
+            "the reset plan serves again: its counter and deadline are fresh"
+        );
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "and it actually fetched rather than replaying anything"
+        );
     }
 
     #[test]
