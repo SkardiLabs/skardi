@@ -61,9 +61,17 @@ repo-scoped tables without tripping the gateway's strict input schemas.
 
 All tables use page-number pagination at GitHub's 100-row maximum, sent as
 the gateway's camelCase `page`/`perPage` inputs (Open Connector's action
-schemas are strict — snake_case keys are rejected); a short or empty page
-terminates the scan (GitHub's documented end-of-collection signal), so
-every scan is complete and bounded by `max_pages` / `max_rows`.
+schemas are strict — snake_case keys are rejected). A short or empty page
+terminates the scan (GitHub's documented end-of-collection signal) — with
+one deliberate exception: the `issues` action filters pull requests out
+*after* paginating, so a short or even empty issues page can sit in the
+middle of the collection. The table therefore paginates on the gateway's
+raw page length (`$.pageInfo.fetched`, added in
+[open-connector#228](https://github.com/oomol-lab/open-connector/pull/228))
+and continues while the raw page was full. This requires a gateway that
+includes that fix; older gateways fail `issues` registration at the
+fingerprint gate rather than silently truncating. Every scan is complete
+and bounded by `max_pages` / `max_rows`.
 
 | Table | Action | Resources | Filter pushdown |
 |---|---|---|---|

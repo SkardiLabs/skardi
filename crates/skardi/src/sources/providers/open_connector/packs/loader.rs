@@ -400,6 +400,8 @@ enum PaginationDoc {
         page_size: u32,
         #[serde(default)]
         total_pages_path: Option<String>,
+        #[serde(default)]
+        raw_page_size_path: Option<String>,
     },
     Cursor {
         cursor_input: String,
@@ -418,11 +420,13 @@ impl PaginationDoc {
                 page_size_input,
                 page_size,
                 total_pages_path,
+                raw_page_size_path,
             } => PaginationStrategy::PageNumber {
                 page_param: leak_str(page_input),
                 per_page_param: leak_str(page_size_input),
                 per_page: page_size,
                 total_pages_path: total_pages_path.map(leak_str),
+                raw_page_size_path: raw_page_size_path.map(leak_str),
             },
             Self::Cursor {
                 cursor_input,

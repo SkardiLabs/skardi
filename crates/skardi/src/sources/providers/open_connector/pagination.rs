@@ -23,8 +23,16 @@ pub enum PaginationStrategy {
     /// `page >= total pages` — a short or even empty non-final page keeps
     /// going, because providers that filter rows *after* paginating
     /// (permission checks, deletions) can legally return short middle pages.
-    /// Without a declared path, the short/empty-page heuristic ends the scan
-    /// — the only signal providers like GitHub give.
+    /// When `raw_page_size_path` is declared, the scan trusts the provider's
+    /// reported RAW page length (the count before any post-pagination
+    /// filtering) and continues while it equals the requested page size —
+    /// the signal Open Connector's `github.list_repository_issues`
+    /// publishes as `$.pageInfo.fetched` (oomol-lab/open-connector#228),
+    /// whose filtered row array says nothing about whether more pages
+    /// exist.
+    ///
+    /// Without either path, the short/empty-page heuristic ends the scan —
+    /// sound only when the returned rows ARE the raw page.
     PageNumber {
         /// Action input field for the page number.
         page_param: &'static str,
@@ -33,9 +41,13 @@ pub enum PaginationStrategy {
         /// Page size to request (also the limit-pushdown ceiling).
         per_page: u32,
         /// Row-path-style location of the provider's total page count in the
-        /// response envelope (e.g. Slack's `$.paging.pages`). `None` falls
-        /// back to short/empty-page termination.
+        /// response envelope (e.g. Slack's `$.paging.pages`). Mutually
+        /// exclusive with `raw_page_size_path`; with neither, the heuristic
+        /// applies.
         total_pages_path: Option<&'static str>,
+        /// Row-path-style location of the raw (pre-filter) page length in
+        /// the response envelope (e.g. `$.pageInfo.fetched`).
+        raw_page_size_path: Option<&'static str>,
     },
     /// Cursor pagination: the request carries the previous page's cursor
     /// (absent on the first page); the response carries the next cursor at a
@@ -73,6 +85,8 @@ pub struct Pagination {
     cursor_path: Option<RowPath>,
     /// Pre-parsed total-pages path (PageNumber only), same discipline.
     total_pages_path: Option<RowPath>,
+    /// Pre-parsed raw-page-size path (PageNumber only).
+    raw_page_size_path: Option<RowPath>,
 }
 
 impl PaginationStrategy {
@@ -86,10 +100,27 @@ impl PaginationStrategy {
                 RowPath::parse(next_cursor_path)?;
             }
             PaginationStrategy::PageNumber {
-                total_pages_path: Some(path),
+                total_pages_path,
+                raw_page_size_path,
                 ..
             } => {
-                RowPath::parse(path)?;
+                if let Some(path) = total_pages_path {
+                    RowPath::parse(path)?;
+                }
+                if let Some(path) = raw_page_size_path {
+                    RowPath::parse(path)?;
+                }
+                // Two authoritative signals cannot coexist: a page where
+                // they disagree would have no defensible winner.
+                if total_pages_path.is_some() && raw_page_size_path.is_some() {
+                    return Err(OpenConnectorError::InvalidRowPath {
+                        path: "<pagination>".to_string(),
+                        reason: "total_pages_path and raw_page_size_path are mutually \
+                                 exclusive; declare the one signal the provider makes \
+                                 authoritative"
+                            .to_string(),
+                    });
+                }
             }
             _ => {}
         }
@@ -121,6 +152,13 @@ impl Pagination {
             } => Some(RowPath::parse(path)?),
             _ => None,
         };
+        let raw_page_size_path = match &strategy {
+            PaginationStrategy::PageNumber {
+                raw_page_size_path: Some(path),
+                ..
+            } => Some(RowPath::parse(path)?),
+            _ => None,
+        };
         Ok(Self {
             strategy,
             page: 1,
@@ -128,6 +166,7 @@ impl Pagination {
             seen_tokens: HashSet::new(),
             cursor_path,
             total_pages_path,
+            raw_page_size_path,
         })
     }
 
@@ -200,9 +239,26 @@ impl Pagination {
                         })?;
                         (self.page as u64) < total
                     }
-                    // Heuristic: short or empty page → last page (all the
-                    // signal providers like GitHub give).
-                    None => rows_in_page >= *per_page as usize,
+                    // Raw page length: the provider filters rows AFTER
+                    // paginating but reports how many it fetched — continue
+                    // while the raw page was full, no matter how short (or
+                    // empty) the filtered row array is.
+                    None => match &self.raw_page_size_path {
+                        Some(path) => {
+                            let fetched = path.extract(envelope, self.page)?;
+                            let fetched = fetched.as_u64().ok_or_else(|| {
+                                OpenConnectorError::PaginationRawPageSizeInvalid {
+                                    path: path.as_str().to_string(),
+                                    page: self.page,
+                                    found: json_kind(fetched),
+                                }
+                            })?;
+                            fetched >= u64::from(*per_page)
+                        }
+                        // Heuristic: short or empty page → last page (all
+                        // the signal the provider gives).
+                        None => rows_in_page >= *per_page as usize,
+                    },
                 };
                 if more {
                     self.page += 1;
@@ -266,6 +322,7 @@ mod tests {
             per_page_param: "per_page",
             per_page,
             total_pages_path: None,
+            raw_page_size_path: None,
         })
         .unwrap()
     }
@@ -329,6 +386,79 @@ mod tests {
     fn page_number_stops_on_empty_page() {
         let mut pagination = page_number(10);
         assert!(!pagination.advance(&json!({}), 0).unwrap());
+    }
+
+    fn page_number_with_raw(per_page: u32) -> Pagination {
+        Pagination::new(PaginationStrategy::PageNumber {
+            page_param: "page",
+            per_page_param: "perPage",
+            per_page,
+            total_pages_path: None,
+            raw_page_size_path: Some("$.pageInfo.fetched"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn raw_page_size_drives_termination_regardless_of_filtered_rows() {
+        // Full raw page + short (even empty) filtered rows → continue: the
+        // provider filtered rows AFTER paginating, so the filtered count
+        // says nothing. Short raw page → done, even if rows LOOK full.
+        let mut pagination = page_number_with_raw(100);
+        assert!(
+            pagination
+                .advance(&json!({"pageInfo": {"fetched": 100}}), 37)
+                .unwrap(),
+            "full raw page with a short filtered page continues"
+        );
+        assert!(
+            pagination
+                .advance(&json!({"pageInfo": {"fetched": 100}}), 0)
+                .unwrap(),
+            "an all-filtered (empty) page continues while the raw page was full"
+        );
+        assert!(
+            !pagination
+                .advance(&json!({"pageInfo": {"fetched": 99}}), 99)
+                .unwrap(),
+            "a short raw page terminates"
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_raw_page_size_fails_the_scan() {
+        // The declared signal going missing or changing type is drift, not
+        // end-of-collection — reading it as termination would truncate.
+        let mut pagination = page_number_with_raw(100);
+        assert!(matches!(
+            pagination.advance(&json!({"issues": []}), 0),
+            Err(OpenConnectorError::RowPathNotFound { .. })
+        ));
+
+        let mut pagination = page_number_with_raw(100);
+        assert!(matches!(
+            pagination.advance(&json!({"pageInfo": {"fetched": "100"}}), 0),
+            Err(OpenConnectorError::PaginationRawPageSizeInvalid { page: 1, ref found, .. })
+                if found == "a string"
+        ));
+    }
+
+    #[test]
+    fn total_and_raw_page_size_are_mutually_exclusive() {
+        let err = PaginationStrategy::PageNumber {
+            page_param: "page",
+            per_page_param: "perPage",
+            per_page: 100,
+            total_pages_path: Some("$.paging.pages"),
+            raw_page_size_path: Some("$.pageInfo.fetched"),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::InvalidRowPath { ref reason, .. }
+                if reason.contains("mutually")
+        ));
     }
 
     #[test]
@@ -442,6 +572,7 @@ mod tests {
             per_page_param: "count",
             per_page,
             total_pages_path: Some("$.paging.pages"),
+            raw_page_size_path: None,
         })
         .unwrap()
     }
@@ -507,6 +638,7 @@ mod tests {
             per_page_param: "count",
             per_page: 2,
             total_pages_path: Some("not-a-path"),
+            raw_page_size_path: None,
         };
         assert!(matches!(
             strategy.validate(),

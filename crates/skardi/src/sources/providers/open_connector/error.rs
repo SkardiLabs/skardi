@@ -230,6 +230,19 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// The declared raw-page-size signal was present but not a non-negative
+    /// integer. Treating it as anything else would either truncate the scan
+    /// or loop it; carries the JSON *kind* only, never the value.
+    #[error(
+        "Open Connector pagination raw page size at '{path}' on page {page} is {found}, \
+         expected a non-negative integer"
+    )]
+    PaginationRawPageSizeInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// A continuation cursor was present at the declared path but was not a
     /// string. Treating it as end-of-collection would silently truncate the
     /// scan, so it fails instead. Carries the JSON *kind* only, never the

@@ -7,8 +7,15 @@
 //! - **Page-number pagination everywhere** (`page`/`perPage`, 100 per page
 //!   — GitHub's maximum; the camelCase keys are Open Connector's strict
 //!   action-input contract, not GitHub's raw REST parameters). A short or
-//!   empty page terminates the scan, which is GitHub's documented
-//!   end-of-collection signal.
+//!   empty page terminates the scan — except for `issues`, whose OC action
+//!   filters pull requests out AFTER paginating, so a filtered page's
+//!   length is not a termination signal: the table declares
+//!   `raw_page_size_path: $.pageInfo.fetched` (upstream #228) and the scan
+//!   continues while the RAW page was full, even when the filtered rows
+//!   come back short or empty. Requires a gateway with
+//!   oomol-lab/open-connector#228 (older gateways fail the fingerprint
+//!   gate at registration, and their responses would fail the scan loudly
+//!   with a missing `$.pageInfo.fetched` — never a silent truncation).
 //! - **Filters are allowlisted only where faithful — and every string-enum
 //!   push is Inexact.** `issues.state` / `pull_requests.state` narrow the
 //!   fetch but DataFusion re-applies them: the translation is faithful only
@@ -113,6 +120,49 @@ mod tests {
             .map(|(_, schema)| *schema)
             .unwrap_or(r#"{"type": "object"}"#);
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+    }
+
+    #[tokio::test]
+    async fn filtered_issue_pages_do_not_truncate_the_scan() {
+        // The OC action filters pull requests out AFTER paginating, so a
+        // filtered page can be short — or entirely empty — while more pages
+        // exist. The raw signal (pageInfo.fetched, upstream #228) must
+        // drive continuation: page 1 returns 2 issues of a full raw page,
+        // page 2 is ALL pull requests (0 issues, raw full), page 3 is the
+        // genuine final page. Short-page termination would stop after page
+        // 1 and lose everything after it.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return github_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let page = body["input"]["page"].as_u64().unwrap_or(1);
+                let response = match page {
+                    1 => json!({"issues": [issue(1, "open", "2026-01-01T00:00:00Z"),
+                                             issue(2, "open", "2026-01-01T00:00:00Z")],
+                                 "pageInfo": {"fetched": 100}}),
+                    2 => json!({"issues": [], "pageInfo": {"fetched": 100}}),
+                    3 => json!({"issues": [issue(3, "open", "2026-01-02T00:00:00Z")],
+                                 "pageInfo": {"fetched": 1}}),
+                    other => panic!("unexpected page {other}"),
+                };
+                return MockResponse::ok(&envelope_ok(&response.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gw, ctx) = setup_with_gateway(gateway, "SKARDI_TEST_OC_GITHUB_RAW_PAGE").await;
+
+        let batches = collect(&ctx, "SELECT number FROM saas.gh.issues ORDER BY number").await;
+        assert_eq!(
+            rows_of(&batches),
+            3,
+            "all three pages were scanned: the short and the all-PR page did not terminate"
+        );
     }
 
     #[test]
@@ -623,16 +673,24 @@ bindings:
                 .and_then(Value::as_str)
                 .unwrap_or("open")
                 .to_string();
-            let slice: Vec<_> = rows
+            let matching: Vec<_> = rows
                 .iter()
                 .filter(|row| {
                     state == "all" || row.get("state").and_then(Value::as_str) == Some(&state)
                 })
+                .collect();
+            let slice: Vec<_> = matching
+                .iter()
                 .skip((page - 1) * per_page)
                 .take(per_page)
-                .cloned()
+                .map(|row| (*row).clone())
                 .collect();
-            return MockResponse::ok(&envelope_ok(&json!({"issues": slice}).to_string()));
+            // The raw page length before any post-pagination filtering; the
+            // stub does none, so it equals the slice length.
+            let fetched = slice.len();
+            return MockResponse::ok(&envelope_ok(
+                &json!({"issues": slice, "pageInfo": {"fetched": fetched}}).to_string(),
+            ));
         }
         MockResponse::new(404, "{}")
     }
@@ -658,6 +716,14 @@ bindings:
             let served = std::sync::Arc::clone(&served);
             MockGateway::start(move |req| issues_handler(req, &served)).await
         };
+        setup_with_gateway(gateway, token_env).await
+    }
+
+    /// Register the issues binding against an arbitrary gateway stub.
+    async fn setup_with_gateway(
+        gateway: MockGateway,
+        token_env: &str,
+    ) -> (MockGateway, SessionContext) {
         unsafe {
             std::env::set_var(token_env, "test-token");
         }
@@ -1356,7 +1422,9 @@ bindings:
                 return MockResponse::ok(&envelope_ok(r#"{"repositories": []}"#));
             }
             if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
-                return MockResponse::ok(&envelope_ok(r#"{"issues": []}"#));
+                return MockResponse::ok(&envelope_ok(
+                    r#"{"issues": [], "pageInfo": {"fetched": 0}}"#,
+                ));
             }
             MockResponse::new(404, "{}")
         })
