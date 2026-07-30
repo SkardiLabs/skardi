@@ -1,13 +1,14 @@
 # Catalog Semantics
 
 A **semantics overlay** attaches natural-language descriptions to the
-tables and columns already registered through a context file. Both
-binaries consume it:
+tables and columns already registered through a context file. It is
+loaded entirely server-side:
 
 - `skardi-server` loads it at startup and emits the descriptions on
   `GET /data_source` so an agent can read them when picking a tool.
-- `skardi query --schema` renders the descriptions inline next to each
-  table and column, for human inspection.
+- `skardi schema` — the thin CLI's client for that same endpoint —
+  prints the merged view for human inspection, against whatever
+  server the CLI is pointed at.
 
 This page documents the YAML shape, how the loader finds it, the
 override / fallback rules, and where the descriptions surface.
@@ -105,19 +106,26 @@ existing [`docs/basic/ctx.yaml`](basic/ctx.yaml).
 ## Loading
 
 ```bash
-# server
+# Load semantics as part of starting the server
 skardi-server \
   --ctx ctx.yaml \
   --pipeline pipelines/ \
   --semantics semantics/ \    # optional; auto-discovered next to ctx if omitted
   --port 8080
 
-# CLI
-skardi query --ctx ctx.yaml --schema --all
-skardi query --ctx ctx.yaml --schema --all --semantics ./custom/semantics.yaml
+# or point --semantics at a single file instead of a directory
+skardi-server --ctx ctx.yaml --semantics ./custom/semantics.yaml
 ```
 
-Both binaries follow the same resolution order:
+The CLI never loads a semantics file itself — it has no local catalog
+to merge one into. Once the server above is running, ask it for the
+merged view over HTTP:
+
+```bash
+skardi schema
+```
+
+`skardi-server` resolves the path with this order:
 
 1. **Explicit `--semantics <path>`** — used directly. Accepts either a
    single yaml file or a directory.
@@ -197,25 +205,6 @@ few want their own.
 
 ## Where it shows up
 
-### `skardi query --schema`
-
-The CLI renders the merged view inline next to each table and column.
-A `--` separator carries the description; lines without an overlay or
-fallback render bare, so existing scripts that parse the output keep
-working.
-
-```bash
-$ skardi query --ctx ./ctx.yaml --schema --all
-table: products  -- Product catalog with pricing/inventory. One row per SKU.
-  id: Int64  -- Stable internal SKU; primary key.
-  brand: Utf8
-  price: Float64  -- Retail price in USD.
-```
-
-No flag is needed to opt in: if a `kind: semantics` overlay is
-discovered (or `data_sources[].description` is set), the descriptions
-appear automatically.
-
 ### `GET /data_source` (server)
 
 The catalog endpoint returns the merged view:
@@ -253,6 +242,21 @@ curl http://localhost:8080/data_source
 `description` is omitted from the JSON when no overlay or fallback is
 present, so the wire shape stays clean for sources that opt out.
 
+### `skardi schema`
+
+The CLI has no local catalog of its own — `skardi schema` is a thin
+client that calls `GET /data_source` on the server it's pointed at and
+pretty-prints the same JSON response shown just above. The merged
+descriptions show up automatically whenever the server has a
+`kind: semantics` overlay (or `data_sources[].description`) loaded —
+no flag is needed to opt in:
+
+```bash
+skardi schema
+```
+
+The output is always pretty-printed JSON — `skardi schema` takes no flags.
+
 ---
 
 ## Limitations
@@ -261,9 +265,9 @@ present, so the wire shape stays clean for sources that opt out.
   source name *is* the table name in the JSON response). Catalog-mode
   sources expose many inner tables, but the HTTP endpoint doesn't
   enumerate them yet — so qualified `catalog.schema.table` overlays
-  defined for inner tables won't surface on the endpoint until the
-  endpoint is extended. The CLI (`skardi query --schema --all`) does
-  enumerate inner tables and renders qualified overlays correctly today.
+  defined for inner tables won't surface on the endpoint (or on
+  `skardi schema`, which only renders that endpoint's response) until
+  the endpoint is extended.
 - There is no agent-callable `describe` verb yet. Agents reach the
   semantics through the HTTP endpoint above; a pipeline form is a
   separate task on the roadmap.

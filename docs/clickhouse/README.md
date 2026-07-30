@@ -366,12 +366,12 @@ the following `options` keys:
 | `user_env` | for auth | **Name of an environment variable** holding the username. The out-of-the-box `default` user needs no credentials, so this is optional. |
 | `pass_env` | for auth | **Name of an environment variable** holding the password. |
 
-Option validation is strict and runs at registration (server and CLI alike):
-an unrecognised key — e.g. a misspelled `pass_env`, which would otherwise
-silently connect as the `default` user — is a hard error, as is an option
-that belongs to the other hierarchy mode (`table`/`database` in catalog mode,
-`allowed_schemas` in table mode) or an `allowed_schemas` with no non-empty
-entry.
+Option validation is strict and runs at registration, when the server loads
+its `--ctx` file: an unrecognised key — e.g. a misspelled `pass_env`, which
+would otherwise silently connect as the `default` user — is a hard error, as
+is an option that belongs to the other hierarchy mode (`table`/`database` in
+catalog mode, `allowed_schemas` in table mode) or an `allowed_schemas` with no
+non-empty entry.
 
 The native TCP protocol (port 9000) is not supported — registration rejects
 non-`http(s)` schemes. Credentials embedded in the URL
@@ -384,8 +384,8 @@ out of the YAML, the logs, and the API.
 ## Access Mode
 
 This source is **read-only**. Declaring `access_mode: read_write` on a
-ClickHouse source is rejected at the provider boundary — the server config
-path and the CLI enforce the same contract — and ClickHouse sources are
-rejected as job destinations. Ingest into ClickHouse should go through ClickHouse's own
+ClickHouse source is rejected at the provider boundary when the server loads
+its `--ctx` file — and ClickHouse sources are rejected as job destinations
+too. Ingest into ClickHouse should go through ClickHouse's own
 INSERT pipelines (Kafka engine, `clickhouse-client`, HTTP inserts) — Skardi is
 the query side.

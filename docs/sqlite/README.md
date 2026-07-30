@@ -63,24 +63,32 @@ curl -X POST http://localhost:8080/query_user_by_id/execute \
   -d '{"user_id": 1}' | jq .
 ```
 
-## Using the CLI (Direct Path Query)
+## Ad Hoc Queries via the CLI
 
-SQLite tables can be queried directly by path — no context file needed. Use the pattern `path/to/file.db.table_name`:
+Older, local-engine builds of the CLI could scan a SQLite file directly from a
+bare path embedded in the SQL (`'path/to/file.db.table_name'`), with no context
+file needed. That local query engine is gone — `skardi` is now a thin HTTP
+client with no engine or catalog of its own, so every table has to be
+registered as a data source on the server first, same as the pipelines
+elsewhere in this guide (see `ctx_sqlite_demo.yaml`, which registers `users`
+and `orders` from `docs/sqlite/demo.db`).
+
+Once a server is running with that context loaded, query the registered
+tables by name — no pipeline required:
 
 ```bash
+# Start the server with the demo context (see "Running the Example" below)
+cargo run -p skardi-server -- --ctx docs/sqlite/ctx_sqlite_demo.yaml
+
 # Query a table directly
-skardi query --sql "SELECT * FROM './docs/sqlite/demo.db.users'"
+skardi query -e "SELECT * FROM users"
 
-# Join two tables from the same database
-skardi query --sql "
+# Join two tables registered from the same database
+skardi query -e "
   SELECT u.name, o.product, o.amount
-  FROM './docs/sqlite/demo.db.users' u
-  JOIN './docs/sqlite/demo.db.orders' o ON u.id = o.user_id
-"
-
-# Works with .sqlite and .sqlite3 extensions too
-skardi query --sql "SELECT * FROM './data/app.sqlite.customers'"
-skardi query --sql "SELECT * FROM './data/app.sqlite3.customers'"
+  FROM users u
+  JOIN orders o ON u.id = o.user_id
+" --table
 ```
 
 ## Running the Example
