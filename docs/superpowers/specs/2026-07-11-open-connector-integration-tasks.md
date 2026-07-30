@@ -149,7 +149,16 @@ event carrying the scan identity and error.
       input keys, row paths, and HTTP protocol are reconciled against a live gateway,
       and fingerprint pins are now taken from live-captured contracts
       (`fixtures/github/contracts/`, landed alongside 5.2's pinning recipe: sync
-      test, contract-serving mocks, drift-refusal e2e).
+      test, contract-serving mocks, drift-refusal e2e). The `issues` table
+      paginates on the gateway's raw page length (`raw_page_size_path:
+      $.pageInfo.fetched`, a `PageNumber` extension mirroring `total_pages_path`;
+      upstream fix oomol-lab/open-connector#228): the OC action filters pull
+      requests out after paginating, so filtered page length is not a termination
+      signal — short-page termination would silently truncate on any PR-bearing
+      page, and even empty-page termination fails on 100 consecutive PRs. Engine
+      unit tests pin continue-on-full-raw/terminate-on-short-raw/missing-and-
+      invalid-signal failures plus total/raw mutual exclusion; a pack e2e drives
+      a 3-page scan whose middle page is all pull requests.
       Docs: `docs/open-connector-github.md` (per-table filter/limit behavior, authz/
       visibility incl. the pure-issues note, rate limits, freshness), README row updated.
       Verification: 27 pack tests (counted by
@@ -225,7 +234,7 @@ event carrying the scan identity and error.
       targeted `SourcePackAssetInvalid` registration/UDTF-setup diagnostic —
       never a panic — with a parse-all test keeping shipped assets valid.
 
-      **Verification**: 240 open_connector tests (counted by `cargo test -p skardi --lib
+      **Verification**: 246 open_connector tests (counted by `cargo test -p skardi --lib
       sources::providers::open_connector`): per-table fixture contract tests against the
       normalized shapes (explicit nulls vs omitted `memberCount`, flattened profiles,
       deleted users, Slack's empty-string convention, epoch-seconds `files.created`, empty
