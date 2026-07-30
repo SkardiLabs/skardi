@@ -78,6 +78,14 @@ pub mod table;
 #[cfg(all(test, feature = "rss"))]
 mod integration_tests;
 
+// One layer above `integration_tests`: the downstream composition the design
+// leaves to user-space SQL — a federated join, and the two-`INSERT` archive
+// that gives feed entries a history the live window does not. In-crate for the
+// same reason, and additionally gated behind `chunking` because the archive's
+// second statement is a `chunk()` call.
+#[cfg(all(test, feature = "rss", feature = "chunking"))]
+mod composition_tests;
+
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
 #[cfg(feature = "rss")]
