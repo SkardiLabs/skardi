@@ -70,6 +70,14 @@ pub mod schema;
 #[cfg(feature = "rss")]
 pub mod table;
 
+// The acceptance-criteria crosswalk: full SQL against a registered catalog
+// whose feeds live on `testutil::MockFeedServer`. In-crate rather than in
+// `crates/skardi/tests/` because it drives `register_rss_tables_with_policy`
+// below, which is `#[cfg(test)] pub(crate)` and unreachable from an external
+// test crate — see that function's doc, and this module's own.
+#[cfg(all(test, feature = "rss"))]
+mod integration_tests;
+
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
 #[cfg(feature = "rss")]
