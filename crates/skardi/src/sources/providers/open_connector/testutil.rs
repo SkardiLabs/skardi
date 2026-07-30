@@ -64,6 +64,39 @@ impl MockResponse {
     }
 }
 
+/// Wrap executor output (or any `data` payload) in the gateway's uniform
+/// success envelope, exactly as `POST /v1/actions/{id}` returns it.
+pub(crate) fn envelope_ok(data: &str) -> String {
+    format!(r#"{{"success":true,"message":"OK","data":{data},"meta":{{}}}}"#)
+}
+
+/// A failed gateway envelope with an `errorCode`, as the gateway returns
+/// alongside a 4xx/5xx status.
+pub(crate) fn envelope_err(error_code: &str, message: &str) -> String {
+    format!(
+        r#"{{"success":false,"message":"{message}","data":null,"errorCode":"{error_code}","meta":{{}}}}"#
+    )
+}
+
+/// A discovery envelope (`GET /v1/actions/{{id}}`) whose `data` carries the
+/// given schemas and execution block. `read_only` renders the
+/// forward-compatible `execution.readOnly` field when present — today's
+/// gateway omits it.
+pub(crate) fn discovery_ok(
+    input_schema: &str,
+    output_schema: &str,
+    locally_executable: bool,
+    read_only: Option<bool>,
+) -> String {
+    let read_only = match read_only {
+        Some(value) => format!(r#","readOnly":{value}"#),
+        None => String::new(),
+    };
+    envelope_ok(&format!(
+        r#"{{"inputSchema":{input_schema},"outputSchema":{output_schema},"execution":{{"locallyExecutable":{locally_executable}{read_only}}}}}"#
+    ))
+}
+
 type Handler = Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync>;
 
 /// A running mock gateway. Dropping it aborts the accept loop.
@@ -321,6 +354,64 @@ impl tracing::Subscriber for CaptureSubscriber {
     fn enter(&self, _span: &tracing::span::Id) {}
 
     fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Mapped columns whose dotted path is NOT declared in a captured
+/// contract's row-item schema — the subset the fingerprint gate cannot
+/// protect, because upstream leaves those fields to `additionalProperties`
+/// passthrough. Packs pin this set explicitly so the coverage gap is a
+/// conscious, reviewed fact rather than an implicit one.
+pub(crate) fn fingerprint_uncovered_columns(
+    contract: &str,
+    row_path: &str,
+    fields: &[crate::sources::providers::open_connector::json_to_arrow::FieldMapping],
+) -> Vec<&'static str> {
+    fn descend<'a>(mut node: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        for segment in path.split('.') {
+            node = &node["properties"][segment];
+        }
+        node
+    }
+    let contract: serde_json::Value = serde_json::from_str(contract).expect("contract parses");
+    let items = &descend(&contract, row_path.strip_prefix("$.").expect("row path"))["items"];
+    fields
+        .iter()
+        .filter(|field| descend(items, field.path).is_null())
+        .map(|field| field.name)
+        .collect()
+}
+
+/// Set an environment variable for the guard's lifetime and restore the
+/// previous state — prior value or absence — on drop, including on panic,
+/// so a failing test cannot leak its variable into tests that run later.
+///
+/// `set_var`/`remove_var` are unsafe because mutating the process
+/// environment is not thread-safe; what keeps the tests sound is what
+/// always has — per-test-unique variable names — and the guard adds
+/// restore-on-drop on top, not thread safety.
+pub(crate) struct EnvVarGuard {
+    name: String,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    pub(crate) fn set(name: &str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, value) };
+        Self {
+            name: name.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(&self.name, value) },
+            None => unsafe { std::env::remove_var(&self.name) },
+        }
+    }
 }
 
 /// Capture every tracing event emitted on the current thread while the

@@ -7,10 +7,13 @@
 //! and limit pushdown, DataFusion registration) on top.
 //!
 //! **Status: typed config, HTTP client, action registry, source packs, the
-//! scan engine, and the two UDTFs have landed.** A configured gateway
-//! registers as a real catalog (`<gateway>.<binding>.<table>`) and is
-//! queryable today — with the synthetic `mock` source pack. Real provider
-//! packs (GitHub, Slack, Notion) land next.
+//! scan engine, the two UDTFs, and the first real provider packs (GitHub,
+//! Slack) have landed.** A configured gateway registers as a real catalog
+//! (`<gateway>.<binding>.<table>`) and is queryable today with the `github`
+//! pack (repositories, issues, pull requests, reviews, commits, workflow
+//! runs, releases), the `slack` pack (conversations, users, files), and
+//! the synthetic `mock` pack. Further provider packs (Jira, Notion) land
+//! one PR each.
 //!
 //! - [`OpenConnectorConfig`] / [`OpenConnectorBinding`] — the typed
 //!   `open_connector:` block of a `type: open_connector` data source, shared
@@ -52,7 +55,7 @@ pub use action_registry::{ActionMetadata, ActionRegistry};
 pub use client::OpenConnectorClient;
 pub use config::{OpenConnectorBinding, OpenConnectorConfig};
 pub use error::OpenConnectorError;
-pub use source_pack::{SourcePack, SourcePackRegistry, SourcePackTable};
+pub use source_pack::{FixedValue, SourcePack, SourcePackRegistry, SourcePackTable};
 pub use table::OpenConnectorTableProvider;
 pub use table_functions::{GatewayHandle, OpenConnectorGateways, register_open_connector_udtfs};
 
@@ -170,11 +173,12 @@ pub async fn register_open_connector_tables(
 
     // Resolve bindings to pack table definitions first, so discovery covers
     // the allowlist *and* every action a bound table needs.
-    let pack_registry = SourcePackRegistry::builtins();
+    let pack_registry = SourcePackRegistry::builtins()?;
     let mut action_ids = config.raw_action_allowlist.clone();
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;
         SourcePackRegistry::check_version_pin(pack, binding.source_pack_version)?;
+        let mut tables = Vec::with_capacity(binding.tables.len());
         for table_name in &binding.tables {
             let table = pack_registry.table(pack, table_name)?;
             action_ids.push(table.action_id.to_string());
@@ -186,6 +190,21 @@ pub async fn register_open_connector_tables(
                     }
                     .into());
                 }
+            }
+            tables.push(table);
+        }
+        // Every supplied resource key must be declared by at least one bound
+        // table: each table's requests carry only the keys it declares (see
+        // `OpenConnectorTableProvider::new`), so a key no table consumes is
+        // dead configuration — most likely a typo — and fails loudly here
+        // instead of being silently dropped from every request.
+        for key in binding.resource.keys() {
+            if !tables.iter().any(|table| table.declares_resource(key)) {
+                return Err(OpenConnectorError::UnknownResourceKey {
+                    binding: binding.name.clone(),
+                    key: key.clone(),
+                }
+                .into());
             }
         }
     }
@@ -232,14 +251,7 @@ pub async fn register_open_connector_tables(
                 binding.connection_alias.clone(),
                 table,
                 pack.version,
-                Value::Object(
-                    binding
-                        .resource
-                        .clone()
-                        .into_iter()
-                        .map(|(k, v)| (k, Value::from(v)))
-                        .collect(),
-                ),
+                Value::Object(binding.resource.clone().into_iter().collect()),
                 config.max_pages,
                 config.max_rows,
                 scan_timeout,
@@ -291,7 +303,7 @@ pub async fn register_open_connector_tables(
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
 
     const TOKEN_ENV_HEALTH_FAIL: &str = "SKARDI_TEST_OC_REGISTER_TOKEN_HEALTH_FAIL";
@@ -600,18 +612,75 @@ bindings:
     }
 
     #[tokio::test]
+    async fn in_band_error_key_fails_the_scan_as_a_provider_error() {
+        // The mock pack declares `error_path: $.error` — the engine's
+        // in-band error mechanism for providers whose gateway executors
+        // pass application errors through inside 2xx action output. The
+        // scan must fail naming the provider's own code and the action,
+        // never the misleading row-path error the missing row array would
+        // raise.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&envelope_ok(r#"{"error": "missing_scope"}"#));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_INBAND_ERROR";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(token_env, 0)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let err = ctx
+            .sql("SELECT id FROM saas.ws.items")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("the in-band error must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing_scope") && message.contains("mock.list_items"),
+            "the provider's own code and the action are named: {message}"
+        );
+        assert!(
+            !message.contains("row path"),
+            "never the misleading row-path error: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn scan_deadline_bounds_retry_waits() {
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
             }
             if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
-                return MockResponse::ok(
-                    r#"{"input_schema": {}, "output_schema": {"type": "object"},
-                       "locally_executable": true, "connection_aliases": []}"#,
-                );
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
             }
-            if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
                 // The client would wait two seconds before retrying this 429,
                 // but the one-second scan deadline must cut that wait short.
                 return MockResponse::new(429, "{}").with_header("retry-after", "2");
@@ -782,6 +851,67 @@ bindings:
     }
 
     #[tokio::test]
+    async fn full_scan_after_limited_scan_never_replays_the_truncated_entry() {
+        // LIMIT's membership in the cache key is the load-bearing invariant
+        // that makes caching LIMIT-satisfied scans safe (design doc, caching
+        // section). If limit ever falls out of the key, the full scan below
+        // replays 2 truncated rows instead of fetching 5 — and this fails.
+        let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_CATALOG_LIMIT_FULL, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(TOKEN_ENV_CATALOG_LIMIT_FULL, 60)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("catalog registration succeeds");
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_CATALOG_LIMIT_FULL);
+        }
+
+        // Warm the cache with a LIMIT-satisfied (truncated) scan.
+        let df = ctx
+            .sql("SELECT id FROM saas.ws.items LIMIT 2")
+            .await
+            .expect("plan");
+        let rows: usize = df
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2);
+        let live_pages = execute_requests(&gateway).len();
+
+        // The fuller query computes a different key: live fetch, all rows.
+        let df = ctx.sql("SELECT id FROM saas.ws.items").await.expect("plan");
+        let rows: usize = df
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(
+            rows, 5,
+            "the truncated entry must never serve a fuller query"
+        );
+        assert!(
+            execute_requests(&gateway).len() > live_pages,
+            "the full scan fetched live"
+        );
+    }
+
+    #[tokio::test]
     async fn cached_empty_scan_replays_without_new_requests() {
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 0)).await;
 
@@ -887,6 +1017,9 @@ bindings:
     const TOKEN_ENV_CATALOG_EMPTY_CACHE: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_EMPTY_CACHE";
 
     #[cfg(test)]
+    const TOKEN_ENV_CATALOG_LIMIT_FULL: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_LIMIT_FULL";
+
+    #[cfg(test)]
     const TOKEN_ENV_CATALOG_TIMEOUT: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_TIMEOUT";
 
     #[cfg(test)]
@@ -929,12 +1062,9 @@ bindings:
             return MockResponse::ok("{}");
         }
         if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
-            return MockResponse::ok(
-                r#"{"input_schema": {}, "output_schema": {"type": "object"},
-               "locally_executable": true, "connection_aliases": []}"#,
-            );
+            return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
         }
-        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             let input = body.get("input").cloned().unwrap_or_default();
             let page = input
@@ -955,9 +1085,9 @@ bindings:
                 .skip(start)
                 .take(2)
                 .collect();
-            return MockResponse::ok(
-                &serde_json::json!({ "output": { "items": slice } }).to_string(),
-            );
+            return MockResponse::ok(&envelope_ok(
+                &serde_json::json!({ "items": slice }).to_string(),
+            ));
         }
         MockResponse::new(404, "{}")
     }

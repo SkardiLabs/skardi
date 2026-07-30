@@ -1,0 +1,42 @@
+kind: context
+
+metadata:
+  name: ctx_github_demo
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: "saas"
+      type: "open_connector"
+      # The demo stub gateway (docs/open-connector/stub_gateway.py). For a
+      # real Open Connector deployment, point this at its base URL — see the
+      # README's "Running against a real Open Connector gateway" section.
+      connection_string: "http://127.0.0.1:3000"
+      hierarchy_level: catalog
+      description: "GitHub via an Open Connector gateway (demo stub)"
+
+      open_connector:
+        # Name of the environment variable holding the gateway runtime
+        # token; the value itself never appears in YAML.
+        runtime_token_env: OPEN_CONNECTOR_TOKEN
+
+        # Raw actions open_connector_scan may invoke (default-deny).
+        raw_action_allowlist:
+          - github.list_repository_issues
+
+        bindings:
+          - name: github_demo # schema name in SQL: saas.github_demo.<table>
+            source_pack: github
+            source_pack_version: 1
+            resource:
+              owner: acme
+              repo: widgets
+            tables:
+              - issues
+              - pull_requests
+
+    # CSV data source for the federated-join demo.
+    - name: "team_owners"
+      type: "csv"
+      path: "docs/open-connector/sample_data/team_owners.csv"
+      description: "Maps GitHub logins to owning teams"

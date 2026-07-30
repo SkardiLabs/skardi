@@ -1,0 +1,39 @@
+{
+  "repositories": [
+    {
+      "id": 9001,
+      "name": "widgets",
+      "full_name": "acme/widgets",
+      "private": false,
+      "description": "Widget factory",
+      "default_branch": "main",
+      "language": "Rust",
+      "stargazers_count": 42,
+      "forks_count": 7,
+      "open_issues_count": 3,
+      "archived": false,
+      "created_at": "2025-06-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "pushed_at": "2026-01-02T00:00:00Z",
+      "html_url": "https://github.com/acme/widgets",
+      "topics": ["rust", "widgets"]
+    },
+    {
+      "id": 9002,
+      "name": "empty-repo",
+      "full_name": "acme/empty-repo",
+      "private": true,
+      "description": null,
+      "default_branch": "main",
+      "language": null,
+      "stargazers_count": 0,
+      "forks_count": 0,
+      "open_issues_count": 0,
+      "archived": true,
+      "created_at": "2025-07-01T00:00:00Z",
+      "updated_at": "2025-07-01T00:00:00Z",
+      "pushed_at": null,
+      "html_url": "https://github.com/acme/empty-repo"
+    }
+  ]
+}

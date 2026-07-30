@@ -33,9 +33,10 @@ use std::any::Any;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
+use super::expr_to_sqlite_sql;
 use super::knn_exec::SqliteKnnExec;
-use super::{expr_to_sqlite_sql, extract_string};
 use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
+use crate::sources::providers::udtf_args::string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered SQLite table.
@@ -73,8 +74,8 @@ impl TableFunctionImpl for SqliteKnnTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let vector_col = extract_string(&exprs[1], "vector_col")?;
+        let table_name = string_arg(&exprs[0], "sqlite_knn", "table")?;
+        let vector_col = string_arg(&exprs[1], "sqlite_knn", "vector_col")?;
         let k = extract_k(&exprs[3], "sqlite_knn")?;
 
         // Try to extract a literal vector.

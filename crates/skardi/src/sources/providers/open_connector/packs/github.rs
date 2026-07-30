@@ -1,0 +1,1602 @@
+//! GitHub source pack: stable relational contracts over the Open Connector
+//! `github.*` read actions (API-key auth, page-number pagination).
+//!
+//! Design decisions, per the integration design spec and the source-pack
+//! admission gate:
+//!
+//! - **Page-number pagination everywhere** (`page`/`perPage`, 100 per page
+//!   — GitHub's maximum; the camelCase keys are Open Connector's strict
+//!   action-input contract, not GitHub's raw REST parameters). A short or
+//!   empty page terminates the scan, which is GitHub's documented
+//!   end-of-collection signal.
+//! - **Filters are allowlisted only where faithful — and every string-enum
+//!   push is Inexact.** `issues.state` / `pull_requests.state` narrow the
+//!   fetch but DataFusion re-applies them: the translation is faithful only
+//!   inside GitHub's enum domain (open/closed/all), and an Exact claim
+//!   would lean on the provider rejecting out-of-domain literals rather
+//!   than silently returning its default listing. `issues.updated_at >=`
+//!   maps to `since` as [`Fidelity::Inexact`](crate::sources::providers::open_connector::filters::Fidelity::Inexact): GitHub documents issue `since` as
+//!   "updated at *or after*" (a superset of the predicate under any
+//!   timestamp-granularity fuzz), so DataFusion reapplies the predicate
+//!   locally. The commits endpoint's `since` is documented as commits
+//!   *after* the date — strictly-after cannot guarantee a superset of a
+//!   `>=` predicate (the boundary row would be unrecoverable), so it is
+//!   deliberately **not** mapped, exactly like the mock pack's `>=` note.
+//! - **`issues` is pure issues.** GitHub's raw issues endpoint mixes pull
+//!   requests in, but the Open Connector action filters them out before
+//!   returning (`"Pull requests are filtered out from the response"`), so
+//!   the table declares no `pull_request` marker column — it could never
+//!   be non-NULL. Pull requests live in their own table.
+//! - **Nullability is conservative**: only identity fields (`id`, `number`,
+//!   `sha`, `tag_name`, …) are non-null. GitHub nulls out whole objects
+//!   (`commit.author: null`, `issue.user: null`); nullable columns under
+//!   them become SQL NULL per the converter's null-parent rule.
+//! - **Fingerprints are pinned** from a live gateway: each table's
+//!   `fingerprint` in `github.yaml` is the BLAKE3 hash of the canonicalized
+//!   output schema captured into `fixtures/github/contracts/`, and a test
+//!   keeps pin and captured contract locked together. Registration
+//!   compares the pin against the discovered contract and fails with
+//!   `ActionContractMismatch` on drift — including additive schema
+//!   changes, which is the designed tradeoff (re-capture and re-pin on
+//!   upstream upgrades). The action IDs, input keys, row paths, and
+//!   endpoint contract are likewise reconciled against the live gateway
+//!   and its provider source; the bundled fixtures (see tests) remain the
+//!   build-time conversion contract.
+
+use std::sync::OnceLock;
+
+use crate::sources::providers::open_connector::error::OpenConnectorError;
+use crate::sources::providers::open_connector::source_pack::SourcePack;
+
+use super::loader;
+
+static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
+
+/// The GitHub pack, parsed once from the embedded YAML asset.
+pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
+    loader::builtin("github.yaml", include_str!("github.yaml"), &PACK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::providers::open_connector::error::OpenConnectorError;
+    use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+    use crate::sources::providers::open_connector::row_path::RowPath;
+    use crate::sources::providers::open_connector::source_pack::SourcePackTable;
+    use arrow::array::{
+        Array, BooleanArray, ListArray, StringArray, TimestampMillisecondArray, UInt64Array,
+    };
+    use arrow::record_batch::RecordBatch;
+
+    /// Discovery responses serve the CAPTURED live contracts, so every e2e
+    /// registration exercises the fingerprint gate's pass side.
+    fn github_discovery(path: &str) -> MockResponse {
+        let contracts: &[(&str, &str)] = &[
+            (
+                "github.list_my_repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+            ),
+            (
+                "github.list_repository_issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+            ),
+            (
+                "github.list_issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+            ),
+            (
+                "github.list_pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+            ),
+            (
+                "github.list_pull_request_reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+            ),
+            (
+                "github.list_commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+            ),
+            (
+                "github.list_workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+            ),
+            (
+                "github.list_releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+            ),
+        ];
+        let output_schema = contracts
+            .iter()
+            .find(|(action, _)| path.ends_with(action))
+            .map(|(_, schema)| *schema)
+            .unwrap_or(r#"{"type": "object"}"#);
+        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+    }
+
+    #[test]
+    fn fingerprint_coverage_gap_is_pinned() {
+        // The gate protects only what upstream DECLARES; these mapped
+        // columns ride additionalProperties passthrough, so their drift is
+        // invisible to the fingerprint and surfaces at scan time per
+        // conversion rules (a shape change fails loudly; a removed nullable
+        // field reads as NULL). Pinning the set makes any change — upstream
+        // declaring more, or a mapping change — a conscious decision.
+        use crate::sources::providers::open_connector::testutil::fingerprint_uncovered_columns;
+        for (short, contract, expected) in [
+            (
+                "repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+                &[
+                    "language",
+                    "stargazers_count",
+                    "forks_count",
+                    "open_issues_count",
+                    "archived",
+                    "created_at",
+                    "updated_at",
+                    "pushed_at",
+                ] as &[&str],
+            ),
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+                &["created_at", "updated_at", "closed_at"],
+            ),
+            (
+                "issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+                &["author_login"],
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+                &[
+                    "head_ref",
+                    "base_ref",
+                    "created_at",
+                    "updated_at",
+                    "closed_at",
+                    "merged_at",
+                ],
+            ),
+            (
+                "reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+                &["author_login"],
+            ),
+            (
+                "commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+                &["message", "author_name", "authored_at", "committed_at"],
+            ),
+            (
+                "workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+                &["created_at", "updated_at"],
+            ),
+            (
+                "releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+                &[],
+            ),
+        ] {
+            let t = table(short);
+            assert_eq!(
+                fingerprint_uncovered_columns(contract, t.row_path, t.fields),
+                expected,
+                "fingerprint coverage changed for {short}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_fingerprints_match_the_reconciled_contracts() {
+        // Pin <-> captured-contract lock, through the SAME function
+        // registration uses. On mismatch this prints the actual hashes —
+        // which is also how the pins are (re)taken after an upstream
+        // upgrade.
+        use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
+        let contracts = [
+            (
+                "repositories",
+                include_str!("fixtures/github/contracts/list_my_repositories.json"),
+            ),
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/list_repository_issues.json"),
+            ),
+            (
+                "issue_comments",
+                include_str!("fixtures/github/contracts/list_issue_comments.json"),
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/list_pull_requests.json"),
+            ),
+            (
+                "reviews",
+                include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
+            ),
+            (
+                "commits",
+                include_str!("fixtures/github/contracts/list_commits.json"),
+            ),
+            (
+                "workflow_runs",
+                include_str!("fixtures/github/contracts/list_workflow_runs.json"),
+            ),
+            (
+                "releases",
+                include_str!("fixtures/github/contracts/list_releases.json"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (short, contract) in contracts {
+            let schema: Value = serde_json::from_str(contract).expect("contract fixture parses");
+            let actual = fingerprint_schema(Some(&schema));
+            let t = table(short);
+            if t.expected_fingerprint != Some(actual.as_str()) {
+                mismatches.push(format!(
+                    "{}: pinned {:?}, contract fixture hashes to {actual}",
+                    t.id, t.expected_fingerprint
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn drifted_contract_fails_registration_not_the_scan() {
+        // The pin's refusal side: a gateway whose discovered output schema
+        // differs from the captured contract must be refused at
+        // REGISTRATION, table and action named. (Every other e2e proves
+        // the pass side via github_discovery's captured contracts.)
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = testutil::EnvVarGuard::set("SKARDI_TEST_OC_GITHUB_DRIFT", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_GITHUB_DRIFT
+bindings:
+  - name: gh
+    source_pack: github
+    resource: { owner: acme, repo: widgets }
+    tables: [issues]
+"#,
+        )
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("a drifted contract must fail registration");
+        let message = err.to_string();
+        assert!(
+            message.contains("github.issues")
+                && message.contains("github.list_repository_issues")
+                && message.contains("fingerprint mismatch"),
+            "table, action, and cause are named: {message}"
+        );
+    }
+
+    /// Look up a table by short name; the assets are test-pinned to parse.
+    fn table(
+        short: &str,
+    ) -> &'static crate::sources::providers::open_connector::source_pack::SourcePackTable {
+        pack()
+            .expect("embedded asset is test-pinned to parse")
+            .tables
+            .iter()
+            .find(|t| t.id.rsplit('.').next() == Some(short))
+            .unwrap_or_else(|| panic!("table {short}"))
+    }
+
+    // ── Contract tests: bundled redacted fixtures are the build-time
+    // conversion contract (null-bearing, nested, empty, extra upstream
+    // fields, and a schema mismatch per the source-pack admission gate). ─
+
+    /// Convert one bundled fixture page through a table's declared contract.
+    fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
+        let page: serde_json::Value = serde_json::from_str(fixture).expect("fixture parses");
+        let rows = RowPath::parse(table.row_path)
+            .expect("row path")
+            .rows(&page, 1)
+            .expect("row array");
+        RowConverter::new(table.fields)
+            .expect("converter")
+            .convert(rows, 1)
+            .expect("fixture converts")
+    }
+
+    fn strings<'a>(batch: &'a RecordBatch, column: &str) -> &'a StringArray {
+        batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("column {column}"))
+            .as_any()
+            .downcast_ref()
+            .expect("Utf8 column")
+    }
+
+    fn u64s<'a>(batch: &'a RecordBatch, column: &str) -> &'a UInt64Array {
+        batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("column {column}"))
+            .as_any()
+            .downcast_ref()
+            .expect("UInt64 column")
+    }
+
+    fn bools<'a>(batch: &'a RecordBatch, column: &str) -> &'a BooleanArray {
+        batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("column {column}"))
+            .as_any()
+            .downcast_ref()
+            .expect("Boolean column")
+    }
+
+    fn timestamps<'a>(batch: &'a RecordBatch, column: &str) -> &'a TimestampMillisecondArray {
+        batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("column {column}"))
+            .as_any()
+            .downcast_ref()
+            .expect("Timestamp column")
+    }
+
+    fn string_list(batch: &RecordBatch, column: &str, row: usize) -> Vec<String> {
+        let lists: &ListArray = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("column {column}"))
+            .as_any()
+            .downcast_ref()
+            .expect("List column");
+        let values = lists.value(row);
+        let values = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 items");
+        (0..values.len())
+            .map(|i| values.value(i).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn issues_fixture_converts_with_nulls_and_lists() {
+        let batch = convert_fixture(table("issues"), include_str!("fixtures/github/issues.json"));
+        assert_eq!(batch.num_rows(), 3);
+
+        assert_eq!(u64s(&batch, "id").value(0), 101);
+        assert_eq!(u64s(&batch, "number").value(2), 3);
+        assert_eq!(
+            strings(&batch, "title").value(0),
+            "Scan panics on empty page"
+        );
+        assert_eq!(strings(&batch, "state").value(1), "closed");
+
+        // JSON null body and null `user` parent become SQL NULL.
+        assert!(strings(&batch, "body").is_null(1));
+        assert_eq!(strings(&batch, "author_login").value(0), "octocat");
+        assert!(strings(&batch, "author_login").is_null(1));
+
+        // Object lists pluck the declared key; empty arrays stay empty lists.
+        assert_eq!(
+            string_list(&batch, "assignees", 0),
+            vec!["octocat", "hubot"]
+        );
+        assert!(string_list(&batch, "assignees", 1).is_empty());
+        assert_eq!(string_list(&batch, "labels", 0), vec!["bug", "p1"]);
+
+        // Timestamps parse; closed_at is NULL while open.
+        assert_eq!(
+            timestamps(&batch, "created_at").value(0),
+            1_767_225_600_000,
+            "2026-01-01T00:00:00Z"
+        );
+        assert!(timestamps(&batch, "closed_at").is_null(0));
+        assert!(!timestamps(&batch, "closed_at").is_null(1));
+    }
+
+    #[test]
+    fn issues_mismatch_fixture_fails_with_the_targeted_error() {
+        // Admission-gate schema-mismatch fixture: upstream turning a declared
+        // integer into a string is incompatible drift and must fail the scan
+        // with the full (column, page, row, expected, found-kind) identity —
+        // never a quiet null, and never the offending value itself.
+        let page: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/github/issues_type_mismatch.json"))
+                .expect("fixture parses");
+        let rows = RowPath::parse(table("issues").row_path)
+            .expect("row path")
+            .rows(&page, 1)
+            .expect("row array");
+        let err = RowConverter::new(table("issues").fields)
+            .expect("converter")
+            .convert(rows, 1)
+            .expect_err("a string where UInt64 is declared must fail conversion");
+        match err {
+            OpenConnectorError::ConversionFailed {
+                column,
+                path,
+                page,
+                row,
+                expected,
+                found,
+            } => {
+                assert_eq!(column, "number");
+                assert_eq!(path, "$.number");
+                assert_eq!(page, 1);
+                assert_eq!(
+                    row, 1,
+                    "the valid first row converts; the error names the bad row"
+                );
+                assert_eq!(expected, "non-negative integer");
+                assert_eq!(found, "string");
+            }
+            other => panic!("expected ConversionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn repositories_fixture_converts_with_nullable_metadata() {
+        let batch = convert_fixture(
+            table("repositories"),
+            include_str!("fixtures/github/repositories.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "full_name").value(0), "acme/widgets");
+        assert!(bools(&batch, "private").value(1));
+        assert!(bools(&batch, "archived").value(1));
+        assert_eq!(strings(&batch, "language").value(0), "Rust");
+        assert!(strings(&batch, "language").is_null(1));
+        assert!(strings(&batch, "description").is_null(1));
+        assert!(timestamps(&batch, "pushed_at").is_null(1));
+        assert_eq!(u64s(&batch, "stargazers_count").value(0), 42);
+    }
+
+    #[test]
+    fn issue_comments_fixture_converts_with_null_author() {
+        let batch = convert_fixture(
+            table("issue_comments"),
+            include_str!("fixtures/github/issue_comments.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "body").value(0), "Reproduced on main.");
+        assert!(strings(&batch, "body").is_null(1));
+        assert!(strings(&batch, "author_login").is_null(1));
+    }
+
+    #[test]
+    fn pull_requests_fixture_converts_with_nested_refs_and_merge_state() {
+        let batch = convert_fixture(
+            table("pull_requests"),
+            include_str!("fixtures/github/pull_requests.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "head_ref").value(0), "feature/dark-mode");
+        assert_eq!(strings(&batch, "base_ref").value(0), "main");
+        assert!(bools(&batch, "draft").value(0));
+        assert!(timestamps(&batch, "merged_at").is_null(0), "open PR");
+        assert!(!timestamps(&batch, "merged_at").is_null(1), "merged PR");
+    }
+
+    #[test]
+    fn reviews_fixture_converts_with_null_bearing_row() {
+        let batch = convert_fixture(
+            table("reviews"),
+            include_str!("fixtures/github/reviews.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "state").value(0), "APPROVED");
+        assert!(strings(&batch, "author_login").is_null(1));
+        assert!(strings(&batch, "commit_id").is_null(1));
+        assert!(timestamps(&batch, "submitted_at").is_null(1));
+    }
+
+    #[test]
+    fn commits_fixture_converts_with_null_github_account() {
+        // The classic GitHub shape: `author` (the account) is JSON null for
+        // unlinked commit emails, while git-level identity under `commit.*`
+        // stays available.
+        let batch = convert_fixture(
+            table("commits"),
+            include_str!("fixtures/github/commits.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "author_login").value(0), "octocat");
+        assert!(strings(&batch, "author_login").is_null(1));
+        assert_eq!(strings(&batch, "author_name").value(1), "Legacy Importer");
+        assert_eq!(strings(&batch, "message").value(0), "feat: add dark mode");
+        assert!(!timestamps(&batch, "committed_at").is_null(0));
+    }
+
+    #[test]
+    fn workflow_runs_fixture_converts_with_in_progress_run() {
+        let batch = convert_fixture(
+            table("workflow_runs"),
+            include_str!("fixtures/github/workflow_runs.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "conclusion").value(0), "success");
+        assert!(
+            strings(&batch, "conclusion").is_null(1),
+            "conclusion is NULL while a run is in progress"
+        );
+        assert!(strings(&batch, "name").is_null(1));
+        assert_eq!(strings(&batch, "status").value(1), "in_progress");
+        assert_eq!(u64s(&batch, "run_number").value(0), 128);
+    }
+
+    #[test]
+    fn releases_fixture_converts_with_unpublished_draft() {
+        let batch = convert_fixture(
+            table("releases"),
+            include_str!("fixtures/github/releases.json"),
+        );
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(strings(&batch, "tag_name").value(0), "v1.2.0");
+        assert!(bools(&batch, "draft").value(1));
+        assert!(timestamps(&batch, "published_at").is_null(1), "draft");
+        assert!(strings(&batch, "name").is_null(1));
+        assert!(strings(&batch, "author_login").is_null(1));
+    }
+
+    #[test]
+    fn every_table_converts_an_empty_page_and_keeps_its_schema() {
+        for table in pack().expect("embedded asset parses").tables {
+            let converter = RowConverter::new(table.fields).expect("converter");
+            let batch = converter.convert(&[], 1).expect("empty page");
+            assert_eq!(batch.num_rows(), 0, "{}", table.id);
+            assert_eq!(
+                batch.schema().fields().len(),
+                table.fields.len(),
+                "{} keeps its stable schema on empty results",
+                table.id
+            );
+        }
+    }
+
+    // ── Integration tests: the issues table end to end through a mock
+    // gateway — pagination, the state=all pin, Exact and Inexact pushdown,
+    // the PR marker, LIMIT, and UDTF parity. ─────────────────────────────
+
+    use crate::sources::hierarchy::HierarchyLevel;
+    use crate::sources::providers::open_connector::testutil;
+    use crate::sources::providers::open_connector::testutil::{
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
+    };
+    use crate::sources::providers::open_connector::{
+        OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
+        register_open_connector_udtfs,
+    };
+    use datafusion::prelude::SessionContext;
+    use serde_json::{Value, json};
+
+    /// One minimal issue row: only the non-null contract fields plus
+    /// whatever the test cares about (missing nullable keys become NULL).
+    fn issue(n: u64, state: &str, updated_at: &str) -> Value {
+        json!({
+            "id": n,
+            "number": n,
+            "title": format!("issue-{n}"),
+            "state": state,
+            "updated_at": updated_at
+        })
+    }
+
+    /// Mock gateway serving `github.list_repository_issues` over `rows`:
+    /// honors `state` exactly, pages at `perPage`, and deliberately
+    /// IGNORES `since` — returning a superset is exactly what an Inexact
+    /// mapping permits, and DataFusion must trim it.
+    fn issues_handler(req: &RecordedRequest, rows: &[Value]) -> MockResponse {
+        if req.method == "GET" && req.path == "/v1/health" {
+            return MockResponse::ok("{}");
+        }
+        if req.method == "GET" && req.path == "/v1/actions/github.list_repository_issues" {
+            return github_discovery(&req.path);
+        }
+        if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+            let input = body.get("input").cloned().unwrap_or_default();
+            let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let per_page = input.get("perPage").and_then(Value::as_u64).unwrap_or(30) as usize;
+            let state = input
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("open")
+                .to_string();
+            let slice: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    state == "all" || row.get("state").and_then(Value::as_str) == Some(&state)
+                })
+                .skip((page - 1) * per_page)
+                .take(per_page)
+                .cloned()
+                .collect();
+            return MockResponse::ok(&envelope_ok(&json!({"issues": slice}).to_string()));
+        }
+        MockResponse::new(404, "{}")
+    }
+
+    fn issues_config(token_env: &str) -> OpenConnectorConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [issues]
+"#
+        ))
+        .expect("parse config")
+    }
+
+    /// Register the gateway (catalog + UDTFs) against `rows`.
+    async fn setup(rows: Vec<Value>, token_env: &str) -> (MockGateway, SessionContext) {
+        let served = std::sync::Arc::new(rows);
+        let gateway = {
+            let served = std::sync::Arc::clone(&served);
+            MockGateway::start(move |req| issues_handler(req, &served)).await
+        };
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let gateways = OpenConnectorGateways::default();
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&issues_config(token_env)),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
+        (gateway, ctx)
+    }
+
+    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect")
+    }
+
+    fn rows_of(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn execute_bodies(gateway: &MockGateway) -> Vec<String> {
+        gateway
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| r.body)
+            .collect()
+    }
+
+    /// 150 issues: odd numbers open, even numbers closed.
+    fn many_issues() -> Vec<Value> {
+        (1..=150)
+            .map(|n| {
+                issue(
+                    n,
+                    if n % 2 == 1 { "open" } else { "closed" },
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_scan_paginates_the_complete_collection() {
+        let (gateway, ctx) = setup(many_issues(), "SKARDI_TEST_OC_GITHUB_SCAN").await;
+
+        let batches = collect(&ctx, "SELECT count(*) AS n FROM saas.gh.issues").await;
+        let count = u64s_i64(&batches[0], "n");
+        assert_eq!(
+            count, 150,
+            "closed issues included, not GitHub's open-only default"
+        );
+
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(bodies.len(), 2, "150 rows at perPage=100 → 2 pages");
+        assert!(bodies[0].contains(r#""page":1"#) && bodies[0].contains(r#""perPage":100"#));
+        assert!(bodies[1].contains(r#""page":2"#));
+        assert!(
+            bodies.iter().all(|body| body.contains(r#""state":"all""#)),
+            "the state=all pin makes the table the complete collection"
+        );
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""owner":"acme""#)
+                    && body.contains(r#""repo":"widgets""#)),
+            "resource inputs ride on every request"
+        );
+    }
+
+    /// Extract the single Int64 count value (count(*) output).
+    fn u64s_i64(batch: &RecordBatch, column: &str) -> i64 {
+        batch
+            .column_by_name(column)
+            .expect("count column")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("Int64")
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn state_predicate_overrides_the_fixed_input_exactly() {
+        let (gateway, ctx) = setup(many_issues(), "SKARDI_TEST_OC_GITHUB_STATE").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.issues WHERE state = 'open'").await;
+        assert_eq!(rows_of(&batches), 75, "odd-numbered issues are open");
+        assert!(
+            execute_bodies(&gateway).iter().all(
+                |body| body.contains(r#""state":"open""#) && !body.contains(r#""state":"all""#)
+            ),
+            "the pushed state predicate replaces the state=all pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_requests_state_pin_and_override_run_end_to_end() {
+        // pull_requests is the second (and only other) table declaring the
+        // state=all pin plus a pushed state filter; its pin/override path
+        // must run through the real scan engine, not ride on the issues
+        // coverage alone.
+        let rows: Vec<Value> = (1..=4)
+            .map(|number| {
+                json!({
+                    "id": number * 10,
+                    "number": number,
+                    "title": format!("pr-{number}"),
+                    "state": if number % 2 == 1 { "open" } else { "closed" }
+                })
+            })
+            .collect();
+        let served = std::sync::Arc::new(rows);
+        let gateway = {
+            let served = std::sync::Arc::clone(&served);
+            MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path == "/v1/actions/github.list_pull_requests" {
+                    return github_discovery(&req.path);
+                }
+                if req.method == "POST" && req.path == "/v1/actions/github.list_pull_requests" {
+                    let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    let input = body.get("input").cloned().unwrap_or_default();
+                    let state = input
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("open")
+                        .to_string();
+                    let slice: Vec<_> = served
+                        .iter()
+                        .filter(|row| {
+                            state == "all"
+                                || row.get("state").and_then(Value::as_str) == Some(&state)
+                        })
+                        .cloned()
+                        .collect();
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({"pull_requests": slice}).to_string(),
+                    ));
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await
+        };
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_PR_STATE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [pull_requests]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        // Without a predicate, the state=all pin reads the complete
+        // collection (GitHub's endpoint defaults to open PRs only).
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.pull_requests").await;
+        assert_eq!(rows_of(&batches), 4, "the pin exposes closed PRs too");
+        assert!(
+            execute_bodies(&gateway)
+                .iter()
+                .all(|body| body.contains(r#""state":"all""#)),
+            "the fixed input rides every request"
+        );
+
+        // A pushed state predicate replaces the pin in the action input.
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.pull_requests WHERE state = 'open'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 2, "PRs 1 and 3 are open");
+        let bodies = execute_bodies(&gateway);
+        let last = bodies.last().expect("an execute call");
+        assert!(
+            last.contains(r#""state":"open""#) && !last.contains(r#""state":"all""#),
+            "the pushed state predicate replaces the state=all pin: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_pushdown_is_inexact_and_reapplied_locally() {
+        // The gateway ignores `since` entirely — the harshest legal Inexact
+        // provider (a full superset). DataFusion must trim it back to the
+        // predicate, so the boundary row stays and older rows never leak.
+        let rows = vec![
+            issue(1, "open", "2026-01-01T00:00:00Z"),
+            issue(2, "open", "2026-01-02T00:00:00Z"),
+            issue(3, "open", "2026-01-03T00:00:00Z"),
+        ];
+        let (gateway, ctx) = setup(rows, "SKARDI_TEST_OC_GITHUB_SINCE").await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.issues \
+             WHERE updated_at >= TIMESTAMP '2026-01-02T00:00:00Z' ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows_of(&batches),
+            2,
+            "rows 2 and 3: the superset row 1 is re-filtered, the boundary row 2 kept"
+        );
+        assert!(
+            execute_bodies(&gateway)
+                .iter()
+                .all(|body| body.contains(r#""since":"2026-01-02T00:00:00Z""#)),
+            "the predicate still narrows the fetch as GitHub's since"
+        );
+    }
+
+    /// Register one non-issues table against a stub gateway that serves the
+    /// given rows for `action_id` under `row_key`, recording every request.
+    async fn setup_table(
+        table: &'static str,
+        action_id: &'static str,
+        row_key: &'static str,
+        rows: Vec<Value>,
+        token_env: &'static str,
+    ) -> (MockGateway, SessionContext) {
+        let served = std::sync::Arc::new(rows);
+        let gateway = {
+            let served = std::sync::Arc::clone(&served);
+            MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path == format!("/v1/actions/{action_id}") {
+                    return github_discovery(&req.path);
+                }
+                if req.method == "POST" && req.path == format!("/v1/actions/{action_id}") {
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({row_key: served.as_slice()}).to_string(),
+                    ));
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await
+        };
+
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [{table}]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        (gateway, ctx)
+    }
+
+    #[tokio::test]
+    async fn commits_time_predicate_is_never_pushed_as_since() {
+        // The pack deliberately does NOT map committed_at to the commits
+        // endpoint's `since`: GitHub documents it as commits strictly
+        // *after* the date, so pushing a `>=` predicate could drop the
+        // boundary commit unrecoverably. This guards the decision — if a
+        // future mapping is added by accident, the body assertion fails.
+        let commit =
+            |sha: &str, date: &str| json!({"sha": sha, "commit": {"committer": {"date": date}}});
+        let rows = vec![
+            commit("aaa", "2026-01-01T00:00:00Z"),
+            commit("bbb", "2026-01-02T00:00:00Z"),
+            commit("ccc", "2026-01-03T00:00:00Z"),
+        ];
+        let (gateway, ctx) = setup_table(
+            "commits",
+            "github.list_commits",
+            "commits",
+            rows,
+            "SKARDI_TEST_OC_GITHUB_COMMITS_SINCE",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT sha FROM saas.gh.commits \
+             WHERE committed_at >= TIMESTAMP '2026-01-02T00:00:00Z'",
+        )
+        .await;
+        assert_eq!(
+            rows_of(&batches),
+            2,
+            "DataFusion filters locally: boundary commit bbb stays"
+        );
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies.iter().all(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"]
+                    .get("since")
+                    .is_none()
+            }),
+            "committed_at must never reach the strictly-after `since`: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_runs_status_predicate_is_never_pushed() {
+        // `status` is deliberately unmapped: GitHub's status parameter also
+        // matches conclusion values, so an Exact claim would be unfaithful.
+        // Guard the decision the same way as commits/since.
+        let run = |id: u64, status: &str| json!({"id": id, "status": status});
+        let rows = vec![
+            run(1, "completed"),
+            run(2, "in_progress"),
+            run(3, "completed"),
+        ];
+        let (gateway, ctx) = setup_table(
+            "workflow_runs",
+            "github.list_workflow_runs",
+            "workflow_runs",
+            rows,
+            "SKARDI_TEST_OC_GITHUB_RUNS_STATUS",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.workflow_runs WHERE status = 'completed'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 2, "DataFusion filters locally");
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies.iter().all(|body| {
+                serde_json::from_str::<Value>(body).expect("request body is JSON")["input"]
+                    .get("status")
+                    .is_none()
+            }),
+            "the status predicate must never reach the provider: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_missing_a_required_resource_fails_before_discovery() {
+        // owner/repo are the pack's declared resource contract; a binding
+        // without `repo` must fail registration with the targeted error —
+        // and before any action-discovery request leaves the process. This
+        // is also the registration-time MissingResourceInput path's only
+        // direct pin (the UDTF path asserts it separately).
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_MISSING_RESOURCE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme }}
+    tables: [issues]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        let result = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let err = result
+            .unwrap_err()
+            .downcast::<crate::sources::providers::open_connector::OpenConnectorError>()
+            .unwrap();
+        assert!(matches!(
+            err,
+            crate::sources::providers::open_connector::OpenConnectorError::MissingResourceInput {
+                ref binding,
+                ref key,
+            } if binding == "gh" && key == "repo"
+        ));
+        assert!(
+            gateway
+                .requests()
+                .iter()
+                .all(|request| request.path == "/v1/health"),
+            "resource enforcement precedes every discovery call"
+        );
+    }
+
+    /// Register `workflow_runs` against a stub serving `total` runs through
+    /// GitHub's wrapped envelope (`{total_count, workflow_runs}`), sliced by
+    /// page/perPage.
+    async fn setup_workflow_runs(
+        total: usize,
+        token_env: &'static str,
+    ) -> (MockGateway, SessionContext) {
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/github.list_workflow_runs" {
+                return github_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_workflow_runs" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let input = body.get("input").cloned().unwrap_or_default();
+                let page = input.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
+                let per_page = input.get("perPage").and_then(Value::as_u64).unwrap_or(30) as usize;
+                let slice: Vec<Value> = (1..=total)
+                    .map(|id| json!({"id": id, "status": "completed"}))
+                    .skip((page - 1) * per_page)
+                    .take(per_page)
+                    .collect();
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"total_count": total, "workflow_runs": slice}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [workflow_runs]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        (gateway, ctx)
+    }
+
+    #[tokio::test]
+    async fn wrapped_envelope_with_total_count_paginates_and_terminates() {
+        // workflow_runs is the pack's one structurally different response
+        // shape: the row array sits beside a sibling `total_count`
+        // (GitHub's actual envelope). Pagination and short-page termination
+        // must run end to end against that shape — the sibling key is
+        // ignored by the row path and must never confuse the scan.
+        let (gateway, ctx) = setup_workflow_runs(150, "SKARDI_TEST_OC_GITHUB_RUNS_ENVELOPE").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.workflow_runs").await;
+        assert_eq!(rows_of(&batches), 150, "the sibling total_count is inert");
+
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "150 runs at perPage=100: a full page, then a short page that terminates"
+        );
+        assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
+        assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn exact_page_boundary_terminates_on_the_empty_page() {
+        // 100 rows == per_page: GitHub cannot signal completion on the full
+        // page, so the engine must spend one more request and terminate on
+        // the EMPTY page — the realistic large-repo path, previously covered
+        // only by the pagination unit tests, never through a pack scan.
+        let (gateway, ctx) = setup_workflow_runs(100, "SKARDI_TEST_OC_GITHUB_RUNS_BOUNDARY").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.workflow_runs").await;
+        assert_eq!(rows_of(&batches), 100, "every boundary row is emitted");
+
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "a full page cannot terminate: the empty page 2 is fetched and ends the scan"
+        );
+        assert!(bodies[0].contains(r#""page":1"#), "{}", bodies[0]);
+        assert!(bodies[1].contains(r#""page":2"#), "{}", bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn out_of_domain_state_yields_empty_not_the_provider_default() {
+        // The motivating case for classifying `state` as Inexact: a provider
+        // that silently ignores an out-of-domain enum ('merged') and returns
+        // its default listing. Under Exact those rows would leak back as the
+        // "exact" answer; Inexact re-applies the predicate locally, so the
+        // query is correctly empty. setup_table's stub is exactly such a
+        // provider — it serves its rows regardless of the state input.
+        let rows = vec![
+            json!({"id": 1, "number": 1, "title": "a", "state": "open"}),
+            json!({"id": 2, "number": 2, "title": "b", "state": "open"}),
+        ];
+        let (gateway, ctx) = setup_table(
+            "pull_requests",
+            "github.list_pull_requests",
+            "pull_requests",
+            rows,
+            "SKARDI_TEST_OC_GITHUB_PR_OOD_STATE",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.pull_requests WHERE state = 'merged'",
+        )
+        .await;
+        assert_eq!(
+            rows_of(&batches),
+            0,
+            "the provider's default listing must not leak into an empty query"
+        );
+        // The predicate still narrows the fetch on providers that honor it.
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""state":"merged""#)),
+            "the push still happens: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn issues_declares_no_pull_request_marker() {
+        // Negative-space guard: the Open Connector action already filters
+        // pull requests out of `list_repository_issues`, so a `pull_request`
+        // marker column could never be non-NULL — the table must not
+        // declare one, and PRs are reached through their own table.
+        assert!(
+            table("issues")
+                .fields
+                .iter()
+                .all(|f| f.name != "pull_request"),
+            "issues is pure issues under the OC contract; a marker column \
+             would be permanently NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_stops_github_pagination_after_the_first_page() {
+        let (gateway, ctx) = setup(many_issues(), "SKARDI_TEST_OC_GITHUB_LIMIT").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.issues LIMIT 5").await;
+        assert_eq!(rows_of(&batches), 5);
+        assert_eq!(
+            execute_bodies(&gateway).len(),
+            1,
+            "LIMIT 5 must stop after the first page"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_udtf_matches_the_yaml_bound_issues_table() {
+        let (_gateway, ctx) = setup(many_issues(), "SKARDI_TEST_OC_GITHUB_UDTF").await;
+
+        let from_table = collect(
+            &ctx,
+            "SELECT id, title, state FROM saas.gh.issues ORDER BY id",
+        )
+        .await;
+        let from_udtf = collect(
+            &ctx,
+            r#"SELECT id, title, state
+               FROM open_connector_query('saas', 'github.issues',
+                                         '{"owner":"acme","repo":"widgets"}')
+               ORDER BY id"#,
+        )
+        .await;
+        assert_eq!(from_table[0].schema(), from_udtf[0].schema());
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&from_table)
+                .unwrap()
+                .to_string(),
+            arrow::util::pretty::pretty_format_batches(&from_udtf)
+                .unwrap()
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_binding_sends_each_table_only_its_declared_resources() {
+        // Live-gateway-confirmed failure mode: a binding's resource map must
+        // NOT be forwarded wholesale. `github.list_my_repositories` declares
+        // no resource inputs and its strict schema rejects `owner`/`repo`
+        // (`additionalProperties: false`) — yet repositories must be able to
+        // share one binding with the repo-scoped tables. Each table's
+        // requests carry exactly the keys it declares.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return github_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_my_repositories" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let input = body.get("input").cloned().unwrap_or_default();
+                // Mirror the live gateway's strictness so a regression fails
+                // this test the way it fails production: HTTP 400.
+                if input.get("owner").is_some() || input.get("repo").is_some() {
+                    return MockResponse::new(
+                        400,
+                        &crate::sources::providers::open_connector::testutil::envelope_err(
+                            "invalid_input",
+                            "Action input does not match the action schema.",
+                        ),
+                    );
+                }
+                return MockResponse::ok(&envelope_ok(r#"{"repositories": []}"#));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
+                return MockResponse::ok(&envelope_ok(r#"{"issues": []}"#));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_SHARED_BINDING";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets }}
+    tables: [repositories, issues]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("owner/repo are consumed by issues, so the binding is valid");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let batches = collect(&ctx, "SELECT name FROM saas.gh.repositories").await;
+        assert_eq!(rows_of(&batches), 0, "strict stub accepted the request");
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.issues").await;
+        assert_eq!(rows_of(&batches), 0);
+
+        let input_for = |action: &str| -> Value {
+            let body = gateway
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "POST" && r.path.contains(action))
+                .unwrap_or_else(|| panic!("{action} was executed"))
+                .body;
+            serde_json::from_str::<Value>(&body).expect("JSON body")["input"].clone()
+        };
+        let repos_input = input_for("github.list_my_repositories");
+        assert!(
+            repos_input.get("owner").is_none() && repos_input.get("repo").is_none(),
+            "repositories declares no resources, so none are sent: {repos_input}"
+        );
+        let issues_input = input_for("github.list_repository_issues");
+        assert_eq!(issues_input.get("owner"), Some(&Value::from("acme")));
+        assert_eq!(issues_input.get("repo"), Some(&Value::from("widgets")));
+    }
+
+    #[tokio::test]
+    async fn unconsumed_resource_key_fails_registration() {
+        // A key no bound table declares is dead configuration (requests
+        // never carry it) — almost certainly a typo, so registration fails
+        // loudly instead of silently dropping it.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_UNKNOWN_KEY";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets, ownr: typo }}
+    tables: [issues]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect_err("unconsumed key must fail registration");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("resource key 'ownr'") && message.contains("'gh'"),
+            "error names the binding and the dead key: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_yaml_resource_values_reach_the_gateway_as_numbers() {
+        // A YAML binding's numeric resource must arrive as a JSON number —
+        // the same value an equivalent UDTF resource JSON sends — never a
+        // string. Both numeric-resource consumers are covered: issue_comments
+        // (issueNumber) and reviews (pullNumber).
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return github_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_issue_comments" {
+                return MockResponse::ok(&envelope_ok(
+                    &serde_json::json!({"comments": []}).to_string(),
+                ));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/github.list_pull_request_reviews" {
+                return MockResponse::ok(&envelope_ok(
+                    &serde_json::json!({"reviews": []}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_GITHUB_NUMERIC_RESOURCE";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: gh
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets, issueNumber: 42 }}
+    tables: [issue_comments]
+  - name: ghr
+    source_pack: github
+    resource: {{ owner: acme, repo: widgets, pullNumber: 7 }}
+    tables: [reviews]
+"#
+        ))
+        .expect("parse config");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("gateway registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gh.issue_comments").await;
+        assert_eq!(rows_of(&batches), 0, "stub serves an empty collection");
+        let batches = collect(&ctx, "SELECT id FROM saas.ghr.reviews").await;
+        assert_eq!(rows_of(&batches), 0, "stub serves an empty collection");
+
+        let bodies_for = |action: &str| -> Vec<String> {
+            gateway
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.path.contains(action))
+                .map(|r| r.body)
+                .collect()
+        };
+        for (action, number_json, stringified) in [
+            (
+                "github.list_issue_comments",
+                r#""issueNumber":42"#,
+                r#""issueNumber":"42""#,
+            ),
+            (
+                "github.list_pull_request_reviews",
+                r#""pullNumber":7"#,
+                r#""pullNumber":"7""#,
+            ),
+        ] {
+            let bodies = bodies_for(action);
+            assert!(!bodies.is_empty(), "{action} was executed");
+            assert!(
+                bodies.iter().all(|body| body.contains(number_json)),
+                "{action}: numeric resource must stay a JSON number: {bodies:?}"
+            );
+            assert!(
+                bodies.iter().all(|body| !body.contains(stringified)),
+                "{action}: never stringified: {bodies:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_table_binds_and_declares_a_complete_contract() {
+        // Bind-time validation (row paths, field paths, pagination) plus the
+        // admission-gate basics: page-number pagination that terminates, and
+        // owner/repo-style resources spelled out.
+        for table in pack().expect("embedded asset parses").tables {
+            RowPath::parse(table.row_path).unwrap_or_else(|e| panic!("{}: {e}", table.id));
+            RowConverter::new(table.fields).unwrap_or_else(|e| panic!("{}: {e}", table.id));
+            table
+                .pagination
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: {e}", table.id));
+            assert!(
+                matches!(
+                    table.pagination,
+                    PaginationStrategy::PageNumber { per_page: 100, .. }
+                ),
+                "{} uses GitHub's page-number pagination at the 100 maximum",
+                table.id
+            );
+            assert!(
+                table.id.starts_with("github."),
+                "{} carries the pack namespace",
+                table.id
+            );
+            assert!(
+                table.action_id.starts_with("github."),
+                "{} executes a github action",
+                table.id
+            );
+        }
+    }
+}

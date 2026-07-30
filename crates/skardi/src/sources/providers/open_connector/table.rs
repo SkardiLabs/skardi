@@ -79,6 +79,23 @@ impl OpenConnectorTableProvider {
         // Same bind-time guarantee as the row path: a malformed pack-authored
         // pagination path fails here at registration, not mid-scan.
         table.pagination.validate()?;
+        if let Some(error_path) = table.error_path {
+            RowPath::parse(error_path)?;
+        }
+        // Withhold resource keys this table's action does not declare: Open
+        // Connector's action schemas are strict (`additionalProperties:
+        // false`), so a shared binding's extra keys — another table's
+        // `issueNumber`, or `owner`/`repo` reaching the resource-less
+        // repositories listing — would 400 every request. Registration has
+        // already rejected keys no bound table consumes.
+        let resource = match resource {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .filter(|(key, _)| table.declares_resource(key))
+                    .collect(),
+            ),
+            other => other,
+        };
         Ok(Self {
             client,
             cache,
@@ -158,7 +175,9 @@ impl TableProvider for OpenConnectorTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::filters::FilterMapping;
+    use crate::sources::providers::open_connector::filters::{
+        Fidelity, FilterMapping, ValueFormat,
+    };
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use datafusion::logical_expr::Operator;
@@ -184,11 +203,16 @@ mod tests {
             }],
             pagination,
             required_resources: &[],
+            optional_resources: &[],
+            fixed_inputs: &[],
             filters: &[FilterMapping {
                 column: "id",
                 operator: Operator::Gt,
                 input_field: "min_id",
+                fidelity: Fidelity::Exact,
+                value_format: ValueFormat::Rfc3339,
             }],
+            error_path: None,
             expected_fingerprint: None,
         }))
     }

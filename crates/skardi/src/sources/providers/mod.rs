@@ -14,6 +14,7 @@ pub mod redis;
 pub mod seekdb;
 pub mod sqlite;
 pub mod sqlx;
+pub(crate) mod udtf_args;
 
 use ::lance::dataset::Dataset;
 use datafusion::datasource::TableProvider;

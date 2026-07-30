@@ -1,0 +1,31 @@
+kind: pack
+pack: mock
+version: 1
+
+tables:
+  items:
+    action: mock.list_items
+    row_path: "$.items"
+    # Small page size so tests exercise multi-page scans with few rows.
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: per_page
+      page_size: 2
+    resources:
+      required: [workspace]
+    # The synthetic pack models the in-band error mechanism; the real
+    # packs so far don't need it (Open Connector's executors consume
+    # provider in-band errors themselves).
+    error_path: "$.error"
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: false }
+      - { name: value, path: value, type: float64, nullable: true }
+      - { name: tags, path: tags, type: utf8_list, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
+    filters:
+      # Only `>` is mapped: the gateway's min_value is strictly greater-
+      # than, so mapping `>=` here would be classified Exact and silently
+      # drop the boundary row. `>=` stays in DataFusion.
+      - { column: value, op: gt, input: min_value, fidelity: exact }

@@ -52,9 +52,10 @@ use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnect
 use std::any::Any;
 use std::sync::Arc;
 
+use super::expr_to_seekdb_sql;
 use super::knn_exec::{DistanceMetric, SeekDbKnnExec};
-use super::{expr_to_seekdb_sql, extract_string_arg};
 use crate::sources::providers::knn_utils::{extract_k, extract_literal_vector};
+use crate::sources::providers::udtf_args::string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Entry stored in the registry for each registered SeekDB table.
@@ -92,10 +93,10 @@ impl TableFunctionImpl for SeekDbKnnTableFunction {
             );
         }
 
-        let table_name = extract_string_arg(&exprs[0], "seekdb_knn", "table")?;
-        let vector_col = extract_string_arg(&exprs[1], "seekdb_knn", "vector_col")?;
+        let table_name = string_arg(&exprs[0], "seekdb_knn", "table")?;
+        let vector_col = string_arg(&exprs[1], "seekdb_knn", "vector_col")?;
 
-        let metric_str = extract_string_arg(&exprs[3], "seekdb_knn", "metric")?;
+        let metric_str = string_arg(&exprs[3], "seekdb_knn", "metric")?;
         let metric = if metric_str.is_empty() {
             // NULL placeholder during schema inference — default to L2.
             DistanceMetric::default()

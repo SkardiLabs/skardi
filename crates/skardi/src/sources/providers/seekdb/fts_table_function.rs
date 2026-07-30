@@ -36,8 +36,9 @@ use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnect
 use std::any::Any;
 use std::sync::Arc;
 
+use super::expr_to_seekdb_sql;
 use super::fts_exec::SeekDbFtsExec;
-use super::{expr_to_seekdb_sql, extract_string_arg};
+use crate::sources::providers::udtf_args::string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit.
@@ -66,9 +67,9 @@ impl TableFunctionImpl for SeekDbFtsTableFunction {
             );
         }
 
-        let table_name = extract_string_arg(&exprs[0], "seekdb_fts", "table")?;
-        let text_col = extract_string_arg(&exprs[1], "seekdb_fts", "text_col")?;
-        let query = extract_string_arg(&exprs[2], "seekdb_fts", "query")?;
+        let table_name = string_arg(&exprs[0], "seekdb_fts", "table")?;
+        let text_col = string_arg(&exprs[1], "seekdb_fts", "text_col")?;
+        let query = string_arg(&exprs[2], "seekdb_fts", "query")?;
         let limit = match extract_int(&exprs[3], "limit")? {
             None => 1,
             Some(v) if v > MAX_FTS_LIMIT => {

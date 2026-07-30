@@ -31,7 +31,6 @@ pub struct ActionMetadata {
     input_schema: Option<Value>,
     output_schema: Option<Value>,
     read_only: Option<bool>,
-    connection_aliases: Vec<String>,
     fingerprint: String,
 }
 
@@ -45,7 +44,6 @@ impl ActionMetadata {
             input_schema: discovered.input_schema,
             output_schema: discovered.output_schema,
             read_only: discovered.read_only,
-            connection_aliases: discovered.connection_aliases,
             fingerprint,
         }
     }
@@ -70,11 +68,6 @@ impl ActionMetadata {
     /// raw-action UDTF) must refuse to execute the action in that case.
     pub fn read_only(&self) -> Option<bool> {
         self.read_only
-    }
-
-    /// Connection aliases available for this action.
-    pub fn connection_aliases(&self) -> &[String] {
-        &self.connection_aliases
     }
 
     /// Stable hash of the output schema, used for compatibility checks.
@@ -177,7 +170,7 @@ impl ActionRegistry {
 /// The schema is canonicalized first (object keys sorted recursively, so two
 /// semantically identical schemas with different key orders fingerprint
 /// equally), then hashed with BLAKE3 and hex-encoded.
-fn fingerprint_schema(output_schema: Option<&Value>) -> String {
+pub(crate) fn fingerprint_schema(output_schema: Option<&Value>) -> String {
     let canonical = match output_schema {
         Some(schema) => canonical_json(schema),
         None => "null".to_string(),
@@ -189,15 +182,15 @@ fn fingerprint_schema(output_schema: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use crate::sources::providers::open_connector::client::OpenConnectorClient;
-    use crate::sources::providers::open_connector::testutil::{MockGateway, MockResponse};
+    use crate::sources::providers::open_connector::testutil::{
+        MockGateway, MockResponse, discovery_ok, envelope_ok,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn action_response(output_schema: &str) -> String {
-        format!(
-            r#"{{"input_schema": {{}}, "output_schema": {output_schema}, "locally_executable": true, "connection_aliases": ["work"]}}"#
-        )
+        discovery_ok("{}", output_schema, true, None)
     }
 
     fn client(gateway: &MockGateway) -> OpenConnectorClient {
@@ -249,12 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_rejects_non_executable_action() {
-        let gateway = MockGateway::start(|_| {
-            MockResponse::ok(
-                r#"{"input_schema": {}, "output_schema": {}, "locally_executable": false}"#,
-            )
-        })
-        .await;
+        let gateway =
+            MockGateway::start(|_| MockResponse::ok(&discovery_ok("{}", "{}", false, None))).await;
 
         let err = ActionRegistry::load(&client(&gateway), &["github.x".to_string()])
             .await
@@ -272,7 +261,7 @@ mod tests {
         // read as "executable". The error is a distinct variant so operators
         // can tell a metadata gap from an explicit refusal.
         let gateway = MockGateway::start(|_| {
-            MockResponse::ok(r#"{"input_schema": {}, "output_schema": {}}"#)
+            MockResponse::ok(&envelope_ok(r#"{"inputSchema": {}, "outputSchema": {}}"#))
         })
         .await;
 
@@ -309,7 +298,6 @@ mod tests {
             meta.output_schema(),
             Some(&serde_json::json!({"type": "array"}))
         );
-        assert_eq!(meta.connection_aliases(), &["work".to_string()]);
         assert_eq!(meta.fingerprint().len(), 64, "BLAKE3 hash as hex");
         assert_eq!(
             meta.read_only(),
@@ -320,13 +308,11 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_carries_explicit_read_only_classification() {
-        let gateway = MockGateway::start(|_| {
-            MockResponse::ok(
-                r#"{"input_schema": {}, "output_schema": {}, "locally_executable": true,
-                    "read_only": true, "connection_aliases": []}"#,
-            )
-        })
-        .await;
+        // Forward-compat: today's gateway publishes no classification, but
+        // one that does must flow through to the raw-scan gate.
+        let gateway =
+            MockGateway::start(|_| MockResponse::ok(&discovery_ok("{}", "{}", true, Some(true))))
+                .await;
         let registry = ActionRegistry::load(&client(&gateway), &["github.x".to_string()])
             .await
             .expect("load");

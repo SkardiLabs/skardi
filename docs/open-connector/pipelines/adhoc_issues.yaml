@@ -1,0 +1,12 @@
+kind: pipeline
+
+metadata:
+  name: "adhoc_issues"
+  version: "1.0"
+  description: "The same stable definition through the open_connector_query UDTF — no persistent binding needed"
+
+spec:
+  query: |
+    SELECT number, title, state, author_login
+    FROM open_connector_query('saas', 'github.issues', '{"owner":"acme","repo":"widgets"}')
+    ORDER BY number

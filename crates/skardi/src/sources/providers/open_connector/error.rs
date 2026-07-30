@@ -204,6 +204,46 @@ pub enum OpenConnectorError {
     )]
     NonIdempotentAmbiguousFailure { operation: String, reason: String },
 
+    /// The provider reported an in-band error inside an otherwise
+    /// successful response envelope — Slack's HTTP-200 `ok: false` +
+    /// `error` pattern. The code is a short provider-authored identifier
+    /// (`missing_scope`, `not_authed`), bounded before display.
+    #[error(
+        "Open Connector action '{action_id}' page {page}: the provider reported \
+         error '{code}'"
+    )]
+    ProviderReportedError {
+        action_id: String,
+        page: usize,
+        code: String,
+    },
+
+    /// A declared total-pages location resolved to a non-numeric value, so
+    /// the scan cannot know when the collection ends.
+    #[error(
+        "Open Connector pagination total at '{path}' on page {page} is {found}, \
+         expected a non-negative integer"
+    )]
+    PaginationTotalInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
+    /// A continuation cursor was present at the declared path but was not a
+    /// string. Treating it as end-of-collection would silently truncate the
+    /// scan, so it fails instead. Carries the JSON *kind* only, never the
+    /// value.
+    #[error(
+        "Open Connector pagination cursor at '{path}' on page {page} is {found}, \
+         not a string; refusing to treat it as end-of-collection"
+    )]
+    PaginationCursorInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// Pagination failed to advance: the gateway returned an already-seen
     /// cursor, which would loop the scan forever.
     #[error(
@@ -223,6 +263,18 @@ pub enum OpenConnectorError {
     #[error("Open Connector source pack '{pack}' has no table '{table}'")]
     SourcePackTableNotFound { pack: String, table: String },
 
+    /// A short table name matched more than one table in the pack;
+    /// first-match would silently bind the wrong relational contract.
+    #[error(
+        "Open Connector source pack '{pack}' has multiple tables matching '{table}' \
+         ({candidates}); use the full table ID"
+    )]
+    SourcePackTableAmbiguous {
+        pack: String,
+        table: String,
+        candidates: String,
+    },
+
     /// A binding pinned a source-pack version that is not the built-in one.
     #[error(
         "Open Connector source pack '{pack}' pinned to version {pinned}, \
@@ -240,6 +292,22 @@ pub enum OpenConnectorError {
          for the bound source-pack table"
     )]
     MissingResourceInput { binding: String, key: String },
+
+    /// A binding set a resource value to null, which would satisfy the
+    /// required-key presence check while sending `null` to the gateway.
+    #[error("Open Connector binding '{binding}' sets resource input '{key}' to null")]
+    NullResourceValue { binding: String, key: String },
+
+    /// A binding supplied a resource key that none of its bound tables
+    /// declare. Requests carry only declared keys (the gateway's strict
+    /// action schemas reject the rest), so an unconsumed key is dead
+    /// configuration — most likely a typo — and fails registration.
+    #[error(
+        "Open Connector binding '{binding}' supplies resource key '{key}' that none of its \
+         bound tables declare; each table's requests carry only the resource inputs its \
+         action contract lists"
+    )]
+    UnknownResourceKey { binding: String, key: String },
 
     /// The discovered action contract does not match the source pack's
     /// expected fingerprint — the upstream action changed incompatibly.
@@ -325,6 +393,12 @@ pub enum OpenConnectorError {
         expected: String,
         found: String,
     },
+
+    /// An embedded source-pack asset failed to parse or validate. A build
+    /// defect (assets ship inside the binary), surfaced as a registration /
+    /// UDTF-setup diagnostic instead of a panic.
+    #[error("embedded source pack asset '{asset}' is invalid: {reason}")]
+    SourcePackAssetInvalid { asset: String, reason: String },
 
     /// A response body grew past the configured decoding bound.
     #[error("Open Connector {operation} response exceeded the {limit_bytes}-byte bound")]

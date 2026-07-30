@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use super::fts_exec::PgFtsExec;
 use super::utils::expr_to_pg_sql;
+use crate::sources::providers::udtf_args::string_arg;
 use crate::sources::providers::{DatasetEntry, DatasetRegistry};
 
 /// Maximum allowed FTS result limit.
@@ -66,13 +67,13 @@ impl TableFunctionImpl for PgFtsTableFunction {
             );
         }
 
-        let table_name = extract_string(&exprs[0], "table")?;
-        let text_col = extract_string(&exprs[1], "text_col")?;
-        let query = extract_string(&exprs[2], "query")?;
+        let table_name = string_arg(&exprs[0], "pg_fts", "table")?;
+        let text_col = string_arg(&exprs[1], "pg_fts", "text_col")?;
+        let query = string_arg(&exprs[2], "pg_fts", "query")?;
         let limit = extract_int(&exprs[3], "limit")?;
 
         let language = if exprs.len() == 5 {
-            let lang = extract_string(&exprs[4], "language")?;
+            let lang = string_arg(&exprs[4], "pg_fts", "language")?;
             if lang.is_empty() {
                 "english".to_string()
             } else {
@@ -240,16 +241,6 @@ impl TableProvider for PgFtsProvider {
 }
 
 // ─── Argument extraction helpers ─────────────────────────────────────────────
-
-fn extract_string(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        // Accept NULL as placeholder during pipeline validation/schema inference.
-        Expr::Literal(ScalarValue::Null, _) => Ok(String::new()),
-        _ => plan_err!("pg_fts: '{}' must be a string literal", name),
-    }
-}
 
 fn extract_int(expr: &Expr, name: &str) -> DFResult<usize> {
     match expr {

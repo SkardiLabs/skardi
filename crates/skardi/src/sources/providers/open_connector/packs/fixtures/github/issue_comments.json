@@ -1,0 +1,20 @@
+{
+  "comments": [
+    {
+      "id": 501,
+      "body": "Reproduced on main.",
+      "user": { "login": "octocat" },
+      "created_at": "2026-01-02T00:00:00Z",
+      "updated_at": "2026-01-02T00:05:00Z",
+      "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-501"
+    },
+    {
+      "id": 502,
+      "body": null,
+      "user": null,
+      "created_at": "2026-01-02T01:00:00Z",
+      "updated_at": "2026-01-02T01:00:00Z",
+      "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-502"
+    }
+  ]
+}

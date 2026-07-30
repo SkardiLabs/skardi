@@ -1,0 +1,36 @@
+{
+  "pull_requests": [
+    {
+      "id": 701,
+      "number": 3,
+      "title": "Add dark mode",
+      "state": "open",
+      "body": "Implements the dark palette.",
+      "user": { "login": "hubot" },
+      "draft": true,
+      "head": { "ref": "feature/dark-mode", "sha": "aaa111" },
+      "base": { "ref": "main", "sha": "bbb222" },
+      "created_at": "2026-01-05T00:00:00Z",
+      "updated_at": "2026-01-06T00:00:00Z",
+      "closed_at": null,
+      "merged_at": null,
+      "html_url": "https://github.com/acme/widgets/pull/3"
+    },
+    {
+      "id": 702,
+      "number": 4,
+      "title": "Fix flaky test",
+      "state": "closed",
+      "body": null,
+      "user": { "login": "octocat" },
+      "draft": false,
+      "head": { "ref": "fix/flaky", "sha": "ccc333" },
+      "base": { "ref": "main", "sha": "ddd444" },
+      "created_at": "2026-01-07T00:00:00Z",
+      "updated_at": "2026-01-08T00:00:00Z",
+      "closed_at": "2026-01-08T00:00:00Z",
+      "merged_at": "2026-01-08T00:00:00Z",
+      "html_url": "https://github.com/acme/widgets/pull/4"
+    }
+  ]
+}

@@ -33,7 +33,7 @@ use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
 use super::pagination::{Pagination, PaginationStrategy};
 use super::row_path::RowPath;
-use super::source_pack::SourcePackTable;
+use super::source_pack::{FixedValue, SourcePackTable};
 
 /// The scanned collection's identity and pagination contract — the shape
 /// shared by YAML-bound source-pack tables and `open_connector_scan` raw
@@ -47,6 +47,13 @@ pub struct ScanTarget {
     pub action_id: Arc<str>,
     /// Pagination contract.
     pub pagination: PaginationStrategy,
+    /// In-band provider-error location (see `SourcePackTable::error_path`);
+    /// `None` for raw scans and packs whose providers error at HTTP level.
+    pub error_path: Option<&'static str>,
+    /// Fixed action inputs sent with every request (see
+    /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
+    /// input is caller-supplied.
+    pub fixed_inputs: &'static [(&'static str, FixedValue)],
     /// Source-pack version, part of the cache key (0 for raw scans, which
     /// have no pack and bypass the cache).
     pub source_pack_version: u32,
@@ -59,6 +66,8 @@ impl ScanTarget {
             table_id: Arc::from(table.id),
             action_id: Arc::from(table.action_id),
             pagination: table.pagination,
+            error_path: table.error_path,
+            fixed_inputs: table.fixed_inputs,
             source_pack_version,
         }
     }
@@ -269,6 +278,9 @@ struct ScanState {
     scan_timeout: Duration,
     deadline: Instant,
     pagination: Pagination,
+    /// Pre-parsed in-band provider-error path, checked before each page's
+    /// row extraction.
+    error_path: Option<RowPath>,
     rows_emitted: u64,
     /// Cached batches to replay (non-empty only on a cache hit).
     replay: VecDeque<RecordBatch>,
@@ -303,6 +315,13 @@ impl ScanState {
                 .map(|f| f.name().clone())
                 .collect(),
         };
+        // Key parts follow the design's cache-key list, with two deliberate
+        // wrinkles: `limit` IS in the key (that membership is what makes
+        // caching a LIMIT-satisfied scan safe — see the store sites below),
+        // and `fixed_inputs` is absent because pack-pinned inputs are
+        // functionally determined by (action_id, source_pack_version), both
+        // already keyed. If fixed inputs ever become binding-configurable or
+        // vary within a pack version, they must join the key.
         let cache_key = scan_cache_key(&ScanKeyParts {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),
@@ -346,6 +365,7 @@ impl ScanState {
             scan_timeout: exec.scan_timeout,
             deadline: Instant::now() + exec.scan_timeout,
             pagination: Pagination::new(exec.target.pagination)?,
+            error_path: exec.target.error_path.map(RowPath::parse).transpose()?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
@@ -424,11 +444,16 @@ impl ScanState {
             });
         }
 
-        // Assemble the action input: fixed resource inputs, Exact filters,
-        // then page parameters.
+        // Assemble the action input: resource inputs, the pack's fixed
+        // inputs, pushed-down filters (which may override a fixed input —
+        // `state=all` yields to a pushed `state='open'`), then page
+        // parameters.
         let mut input = self.resource.as_object().cloned().expect(
             "resource is a JSON object by construction (registration always builds Value::Object)",
         );
+        for (field, value) in self.target.fixed_inputs {
+            input.insert((*field).to_string(), value.to_json());
+        }
         for (field, value) in &self.filter_inputs {
             input.insert(field.clone(), value.clone());
         }
@@ -456,6 +481,30 @@ impl ScanState {
         self.pages_fetched += 1;
         if Instant::now() >= self.deadline {
             return Err(self.timeout_error());
+        }
+        // Some gateways forward a provider's in-band application errors
+        // unchanged (Slack-style HTTP 200, `ok: false` + `error`). Packs
+        // targeting such a gateway declare `error_path` so the provider's
+        // own code surfaces instead of the misleading row-path error the
+        // missing row array would raise. (Open Connector's own executors
+        // consume Slack's `ok:false` and return a failure envelope, so its
+        // slack pack declares none — the mock pack models this mechanism.)
+        if let Some(error_path) = &self.error_path
+            && let Ok(code) = error_path.extract(&envelope, page)
+            && !code.is_null()
+        {
+            let code = match code.as_str() {
+                Some(text) => text.chars().take(128).collect(),
+                None => format!(
+                    "<{}>",
+                    crate::sources::providers::open_connector::row_path::json_kind(code)
+                ),
+            };
+            return Err(OpenConnectorError::ProviderReportedError {
+                action_id: self.target.action_id.to_string(),
+                page,
+                code,
+            });
         }
         let rows = self.row_path.rows(&envelope, page)?;
         let batch = self.converter.convert(rows, page)?;
@@ -512,10 +561,18 @@ impl ScanState {
             self.store_cache();
         }
 
-        let more = self.pagination.advance(&envelope, rows.len())?;
-        if !more {
-            self.done = true;
-            self.store_cache();
+        // Pagination advances only while the scan is still going. After a
+        // LIMIT-satisfied page there is no next request to prepare — and
+        // advance() also parses and validates continuation state, so a
+        // repeated cursor or a missing/malformed page total on that final
+        // page would fail a scan whose result is already complete for its
+        // key.
+        if !self.done {
+            let more = self.pagination.advance(&envelope, rows.len())?;
+            if !more {
+                self.done = true;
+                self.store_cache();
+            }
         }
 
         // A terminal empty page is completion, not output.
@@ -540,9 +597,9 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::packs::mock::MOCK_PACK;
+    use crate::sources::providers::open_connector::packs::mock;
     use crate::sources::providers::open_connector::testutil::{
-        CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events,
+        CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
     };
     use futures::StreamExt;
     use serde_json::json;
@@ -554,7 +611,7 @@ mod tests {
         limit: Option<usize>,
         source_pack_version: u32,
     ) -> OpenConnectorExec {
-        let table = &MOCK_PACK.tables[0];
+        let table = &mock::pack().expect("embedded asset parses").tables[0];
         OpenConnectorExec::new(
             client,
             cache,
@@ -586,7 +643,7 @@ mod tests {
     /// Execute-only mock gateway for `mock.list_items` (per_page = 2), the
     /// only call `ScanState` makes (discovery/health happen at registration).
     fn items_handler(req: &RecordedRequest, total: usize) -> MockResponse {
-        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             let page = body
                 .get("input")
@@ -598,7 +655,7 @@ mod tests {
                 .skip((page - 1) * 2)
                 .take(2)
                 .collect();
-            return MockResponse::ok(&json!({"output": {"items": items}}).to_string());
+            return MockResponse::ok(&envelope_ok(&json!({"items": items}).to_string()));
         }
         MockResponse::new(404, "{}")
     }

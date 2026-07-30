@@ -13,13 +13,20 @@ Provider credentials never enter Skardi. Skardi is configured with only two
 things: the gateway URL and the name of an environment variable holding the
 gateway **runtime token**.
 
-> **Status:** the shared foundation is complete and queryable end to end
-> with the synthetic `mock` source pack (used by the test suite and local
-> stub gateways). Real provider packs (GitHub, Slack, Notion, …) ship one
-> pack per release per the
+> **Status:** the shared foundation is complete, and the first real
+> provider packs have landed alongside the synthetic `mock` pack used by
+> the test suite: [GitHub](open-connector-github.md) (repositories, issues,
+> pull requests, reviews, commits, workflow runs, releases) and
+> [Slack](open-connector-slack.md) (conversations, users, files — message
+> tables are gated on upstream cursor support). Further
+> provider packs (Jira, Notion, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.
+>
+> A runnable local walkthrough (bundled stub gateway, server, all three SQL
+> interfaces, federated join) lives in the
+> [GitHub pack demo](open-connector/README.md).
 
 ## Configuration
 
@@ -83,6 +90,12 @@ Notes:
 - Unknown keys anywhere in the block are rejected at load time — a
   misspelled `source_pack_versions` fails loudly instead of silently
   disabling the pin it was meant to set.
+- One binding can serve tables with different resource needs: each table's
+  requests carry only the resource keys its contract declares (Open
+  Connector's strict action schemas reject undeclared inputs), so binding
+  `repositories` alongside `issues` under one `owner`/`repo` resource map
+  just works. A resource key that *no* bound table declares fails
+  registration as a probable typo.
 - The gateway URL must be plain `http(s)://` with no embedded credentials,
   query string, or fragment; the runtime token travels only as a Bearer
   header.
@@ -161,10 +174,15 @@ Raw scans are deliberately narrow:
 
 - **Default-deny.** The action must be in the gateway's
   `raw_action_allowlist`, *and* its discovered metadata must classify it as
-  a non-mutating read (`read_only: true`). A missing or ambiguous
+  a non-mutating read (`execution.readOnly`). A missing or ambiguous
   classification is refused with an error naming the gap — the allowlist
   alone never grants execution. Both checks fire at planning time, before
-  any HTTP request.
+  any HTTP request. **Current-gateway caveat:** Open Connector does not yet
+  publish a read/write classification in its action metadata (verified
+  against v1.3.1), so raw scans against today's real gateway are refused by
+  this gate; built-in pack tables — read-only by Skardi's own review — are
+  unaffected. The parse site is forward-compatible for when the upstream
+  grows the field.
 - **Deterministic row type or planning error.** The Arrow schema is derived
   from the discovered action output schema at the row path: declared
   primitives (`string`, `integer`, `number`, `boolean`, including
@@ -237,19 +255,44 @@ calls (health, discovery) retry `429`/transient `5xx` with capped
 exponential backoff honoring `Retry-After`; non-idempotent execute calls
 retry only a pre-execution `429` and never re-send a request that may have
 already run. Cursor pagination that stops advancing fails as a detected
-loop instead of spinning forever. Conversion errors report the action, row
+loop instead of spinning forever; a continuation cursor of the wrong JSON
+type fails the scan as itself (only an absent, `null`, or empty-string
+cursor means end-of-collection — anything else would silently truncate).
+Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
 *kind*, never the value.
+
+Provider errors reported *in-band* (Slack-style HTTP 200 with `ok: false`
++ `error`) are handled at one of two layers. Open Connector's own
+executors consume them and return the gateway's failure envelope
+(non-2xx), which Skardi surfaces with the provider's message — this is
+the path the built-in slack pack relies on. For a gateway that instead
+forwards such envelopes unchanged, a pack table must declare an
+`error_path`; the scan checks it before row extraction and fails with the
+provider's own code (bounded, value-free), never the misleading
+missing-row-array error. A pack whose gateway does neither would
+otherwise report `RowPathNotFound` on an in-band error page.
 
 ## Compatibility and schema drift
 
 Each pack table pins the full relational contract and an expected
-action-contract fingerprint (a canonicalized hash of the discovered output
-schema). An Open Connector upgrade that changes an action incompatibly
-fails registration with a targeted error instead of silently changing a
-table's schema; additive upstream fields are ignored. Bindings may pin
-`source_pack_version` so a Skardi upgrade cannot silently change a bound
-table's schema either.
+action-contract fingerprint captured from a live gateway (a canonicalized
+BLAKE3 hash of the discovered output schema; both the github and slack
+packs are pinned, with the captured schemas committed next to each pack
+under `fixtures/<provider>/contracts/`). At registration a pinned
+table's fingerprint is compared against the discovered contract and any
+difference — breaking or additive, since a hash cannot tell them apart —
+fails with a targeted error instead of silently changing a table's
+schema; upgrading the gateway means re-capturing the contract and
+re-pinning. (Additive upstream fields in *row data* are still simply
+ignored by conversion — the fingerprint gates the declared schema, not
+the rows.) The gate's coverage is exactly the upstream **declaration**:
+mapped columns that a provider's schema leaves to `additionalProperties`
+passthrough sit outside the fingerprint, and drift there surfaces at scan
+time under the conversion rules instead (a shape change fails loudly; a
+removed nullable field reads as NULL). Each pack pins its uncovered-column
+set in a test, so that gap is a reviewed fact rather than an implicit one. Bindings may pin `source_pack_version` so a Skardi upgrade
+cannot silently change a bound table's schema either.
 
 ## Observability
 

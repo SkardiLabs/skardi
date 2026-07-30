@@ -35,8 +35,18 @@ pub enum FieldType {
     Utf8,
     /// RFC 3339 string or epoch-millis number ↔ Arrow Timestamp(Millisecond, UTC).
     TimestampMillisUtc,
+    /// JSON integer epoch **seconds** ↔ Arrow Timestamp(Millisecond, UTC).
+    /// For Slack-style APIs whose `created` / `updated` fields are whole
+    /// seconds — reading those through [`FieldType::TimestampMillisUtc`]
+    /// would silently misparse them as millis (dates in January 1970).
+    /// Strictly integers: fractional or string values fail with their kind.
+    TimestampSecondsUtc,
     /// JSON array of strings ↔ Arrow List\<Utf8\>.
     Utf8List,
+    /// JSON array of objects, each contributing the string under the given
+    /// key ↔ Arrow List\<Utf8\> — the design's `$.labels[*].name` /
+    /// `$.assignees[*].login` flattening for GitHub-style shapes.
+    Utf8ListFromObjectKey(&'static str),
     /// Any JSON value serialized to a JSON string ↔ Arrow Utf8. For
     /// intentionally opaque fields (arbitrary maps, unstable unions). A
     /// present JSON null is SQL NULL (per the shared null rules), not the
@@ -53,10 +63,12 @@ impl FieldType {
             Self::UInt64 => DataType::UInt64,
             Self::Float64 => DataType::Float64,
             Self::Utf8 | Self::Json => DataType::Utf8,
-            Self::TimestampMillisUtc => {
+            Self::TimestampMillisUtc | Self::TimestampSecondsUtc => {
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
             }
-            Self::Utf8List => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            Self::Utf8List | Self::Utf8ListFromObjectKey(_) => {
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+            }
         }
     }
 
@@ -68,7 +80,9 @@ impl FieldType {
             Self::Float64 => "number",
             Self::Utf8 => "string",
             Self::TimestampMillisUtc => "RFC 3339 timestamp or epoch millis",
+            Self::TimestampSecondsUtc => "epoch-seconds timestamp",
             Self::Utf8List => "array of strings",
+            Self::Utf8ListFromObjectKey(_) => "array of objects each carrying a string key",
             Self::Json => "any JSON value",
         }
     }
@@ -146,6 +160,22 @@ impl RowConverter {
         let mut fields = Vec::with_capacity(columns.len());
         let mut arrow_fields = Vec::with_capacity(columns.len());
         for spec in columns {
+            // Column paths are row-relative (`user.login`); the `$.` marker
+            // belongs to whole-document row paths only. Reject it rather
+            // than strip: `$.{path}` would otherwise parse into a literal
+            // `"$"` first segment and silently read the wrong key —
+            // all-NULL columns instead of a loud error.
+            if spec.path.starts_with("$.") {
+                return Err(OpenConnectorError::InvalidRowPath {
+                    path: spec.path.clone(),
+                    reason: format!(
+                        "column paths are row-relative object keys \
+                         (write '{}', not '{}')",
+                        &spec.path[2..],
+                        spec.path
+                    ),
+                });
+            }
             let path = RowPath::parse(&format!("$.{}", spec.path))?;
             arrow_fields.push(Field::new(
                 &spec.name,
@@ -196,15 +226,24 @@ impl RowConverter {
         for (row_index, row) in rows.iter().enumerate() {
             match field.path.extract(row, page) {
                 Ok(value) => cells.push(Some(value)),
-                // Only a genuinely-absent key may become null for a nullable
-                // column. A present-but-wrong-shape value mid-path (e.g.
-                // `user` changed from object to string) is an upstream
-                // *breaking* change and must fail, per this module's contract.
+                // Absence may become null for a nullable column: either the
+                // key is genuinely missing, or a parent on the path is JSON
+                // null — providers null out whole objects routinely (GitHub's
+                // `commit.author: null`, `issue.user: null`), and a null
+                // parent means every leaf under it is absent. A
+                // present-but-wrong-shape parent (e.g. `user` changed from
+                // object to string) is an upstream *breaking* change and
+                // must fail, per this module's contract.
                 Err(OpenConnectorError::RowPathNotFound { .. }) if spec.nullable => {
                     cells.push(None)
                 }
                 Err(OpenConnectorError::RowPathNotFound { .. }) => {
                     return Err(self.failure(field, page, row_index, "missing key"));
+                }
+                Err(OpenConnectorError::RowPathNotObject { ref found, .. })
+                    if found == "null" && spec.nullable =>
+                {
+                    cells.push(None)
                 }
                 Err(OpenConnectorError::RowPathNotObject { ref found, .. }) => {
                     return Err(self.failure(field, page, row_index, found));
@@ -265,15 +304,36 @@ impl RowConverter {
                 )?)
                 .with_timezone("UTC"),
             )),
-            FieldType::Utf8List => self.convert_string_list(field, &cells, page),
+            FieldType::TimestampSecondsUtc => Ok(Arc::new(
+                TimestampMillisecondArray::from(collect_cells_described(
+                    &cells,
+                    spec,
+                    |v| {
+                        let seconds = v.as_i64().ok_or_else(|| json_kind(v).to_string())?;
+                        seconds.checked_mul(1000).ok_or_else(|| {
+                            "an epoch second out of range for millisecond timestamps".to_string()
+                        })
+                    },
+                    fail,
+                )?)
+                .with_timezone("UTC"),
+            )),
+            FieldType::Utf8List => self.convert_string_list(field, &cells, page, None),
+            FieldType::Utf8ListFromObjectKey(key) => {
+                self.convert_string_list(field, &cells, page, Some(key))
+            }
         }
     }
 
+    /// Convert a list column. With `pluck: None` elements must be strings;
+    /// with `pluck: Some(key)` elements must be objects carrying a string
+    /// under `key` (the flattened value).
     fn convert_string_list(
         &self,
         field: &CompiledField,
         cells: &[Option<&Value>],
         page: usize,
+        pluck: Option<&'static str>,
     ) -> Result<ArrayRef, OpenConnectorError> {
         let mut builder = ListBuilder::new(StringBuilder::new());
         for (row_index, cell) in cells.iter().enumerate() {
@@ -292,10 +352,62 @@ impl RowConverter {
                 .as_array()
                 .ok_or_else(|| self.failure(field, page, row_index, json_kind(value)))?;
             for item in items {
-                let text = item.as_str().ok_or_else(|| {
-                    self.failure(field, page, row_index, "non-string array element")
-                })?;
-                builder.values().append_value(text);
+                // A JSON null wherever an item's text would come from is an
+                // Arrow null item — the list's item field is declared
+                // nullable, and a provider null is data, not shape drift. A
+                // *missing* pluck key stays a failure: unlike columns, items
+                // carry no pack-declared nullability that authorizes reading
+                // absence as null, so a dropped upstream key fails loudly
+                // instead of silently yielding all-null lists.
+                let text = match pluck {
+                    None => match item {
+                        Value::Null => None,
+                        Value::String(text) => Some(text.as_str()),
+                        other => {
+                            return Err(self.failure(
+                                field,
+                                page,
+                                row_index,
+                                &format!("{} array element", json_kind(other)),
+                            ));
+                        }
+                    },
+                    Some(key) => match item {
+                        Value::Null => None,
+                        Value::Object(object) => match object.get(key) {
+                            Some(Value::Null) => None,
+                            Some(Value::String(text)) => Some(text.as_str()),
+                            Some(other) => {
+                                return Err(self.failure(
+                                    field,
+                                    page,
+                                    row_index,
+                                    &format!("array element whose '{key}' is {}", json_kind(other)),
+                                ));
+                            }
+                            None => {
+                                return Err(self.failure(
+                                    field,
+                                    page,
+                                    row_index,
+                                    &format!("array element without key '{key}'"),
+                                ));
+                            }
+                        },
+                        other => {
+                            return Err(self.failure(
+                                field,
+                                page,
+                                row_index,
+                                &format!("{} array element", json_kind(other)),
+                            ));
+                        }
+                    },
+                };
+                match text {
+                    Some(text) => builder.values().append_value(text),
+                    None => builder.values().append_null(),
+                }
             }
             builder.append(true);
         }
@@ -321,7 +433,8 @@ impl RowConverter {
 }
 
 /// Project `cells` through `convert`, mapping JSON null to Arrow null for
-/// nullable fields and failing otherwise.
+/// nullable fields and failing otherwise — for the common case where a type
+/// mismatch is the only failure mode, described by the value's JSON kind.
 fn collect_cells<T, F, E>(
     cells: &[Option<&Value>],
     spec: &ColumnSpec,
@@ -330,6 +443,27 @@ fn collect_cells<T, F, E>(
 ) -> Result<Vec<Option<T>>, OpenConnectorError>
 where
     F: Fn(&Value) -> Option<T>,
+    E: Fn(usize, &str) -> OpenConnectorError,
+{
+    collect_cells_described(
+        cells,
+        spec,
+        |value| convert(value).ok_or_else(|| json_kind(value).to_string()),
+        fail,
+    )
+}
+
+/// [`collect_cells`] with converter-described failures, for conversions
+/// with more than one failure mode — an out-of-range epoch second must not
+/// masquerade as "found: number" when the value *is* a number.
+fn collect_cells_described<T, F, E>(
+    cells: &[Option<&Value>],
+    spec: &ColumnSpec,
+    convert: F,
+    fail: E,
+) -> Result<Vec<Option<T>>, OpenConnectorError>
+where
+    F: Fn(&Value) -> Result<T, String>,
     E: Fn(usize, &str) -> OpenConnectorError,
 {
     let mut out = Vec::with_capacity(cells.len());
@@ -344,8 +478,8 @@ where
                 }
             }
             Some(value) => match convert(value) {
-                Some(converted) => out.push(Some(converted)),
-                None => return Err(fail(index, json_kind(value))),
+                Ok(converted) => out.push(Some(converted)),
+                Err(found) => return Err(fail(index, &found)),
             },
         }
     }
@@ -502,6 +636,166 @@ mod tests {
     }
 
     #[test]
+    fn null_parent_object_nulls_for_nullable_column() {
+        // Providers null out whole objects (GitHub `commit.author: null`,
+        // `issue.user: null`): a JSON-null parent means every leaf under it
+        // is absent — NULL for a nullable column, not a structural failure.
+        let mut value = row(1, "a");
+        value["user"] = Value::Null;
+        let batch = converter().convert(&[value], 1).unwrap();
+        let authors = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(authors.is_null(0));
+    }
+
+    #[test]
+    fn null_parent_object_fails_for_required_column() {
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "author_login",
+            path: "user.login",
+            field_type: FieldType::Utf8,
+            nullable: false,
+        }])
+        .unwrap();
+        let err = converter
+            .convert(&[serde_json::json!({"user": null})], 1)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::ConversionFailed { ref column, ref found, .. }
+                if column == "author_login" && found == "null"
+        ));
+    }
+
+    #[test]
+    fn object_list_plucks_the_declared_string_key() {
+        // The design's `$.labels[*].name` flattening: an array of objects
+        // becomes List<Utf8> of one declared key.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "labels",
+            path: "labels",
+            field_type: FieldType::Utf8ListFromObjectKey("name"),
+            nullable: true,
+        }])
+        .unwrap();
+        let batch = converter
+            .convert(
+                &[
+                    serde_json::json!({"labels": [{"name": "bug", "color": "red"}, {"name": "p1"}]}),
+                    serde_json::json!({"labels": []}),
+                    serde_json::json!({"labels": null}),
+                    serde_json::json!({}),
+                ],
+                1,
+            )
+            .unwrap();
+        let lists = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+        let first = lists.value(0);
+        let first = first.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(first.value(0), "bug");
+        assert_eq!(first.value(1), "p1");
+        assert_eq!(lists.value(1).len(), 0, "empty array stays an empty list");
+        assert!(lists.is_null(2), "JSON null becomes NULL");
+        assert!(lists.is_null(3), "absent key becomes NULL");
+    }
+
+    #[test]
+    fn object_list_shape_mismatches_fail_with_the_specific_kind() {
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "labels",
+            path: "labels",
+            field_type: FieldType::Utf8ListFromObjectKey("name"),
+            nullable: true,
+        }])
+        .unwrap();
+        for (bad, found) in [
+            // A dropped upstream key is shape drift and must fail loudly —
+            // it must never silently become an all-null list.
+            (
+                serde_json::json!({"labels": [{"color": "red"}]}),
+                "array element without key 'name'",
+            ),
+            (
+                serde_json::json!({"labels": [{"name": 42}]}),
+                "array element whose 'name' is number",
+            ),
+            (
+                serde_json::json!({"labels": ["bug"]}),
+                "string array element",
+            ),
+        ] {
+            let err = converter.convert(&[bad], 1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, .. } if f == found
+                ),
+                "expected found={found}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_null_list_elements_become_null_items() {
+        // The item field is declared nullable (List<Utf8> with nullable
+        // items), so an explicit provider null — a null element, or a pluck
+        // key holding null — must convert to an Arrow null item, not fail.
+        let converter = RowConverter::new(&[
+            FieldMapping {
+                name: "tags",
+                path: "tags",
+                field_type: FieldType::Utf8List,
+                nullable: true,
+            },
+            FieldMapping {
+                name: "labels",
+                path: "labels",
+                field_type: FieldType::Utf8ListFromObjectKey("name"),
+                nullable: true,
+            },
+        ])
+        .unwrap();
+        let batch = converter
+            .convert(
+                &[serde_json::json!({
+                    "tags": ["a", null, "b"],
+                    "labels": [{"name": null}, {"name": "bug"}, null]
+                })],
+                1,
+            )
+            .unwrap();
+
+        let tags = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap()
+            .value(0);
+        let tags = tags.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(tags.value(0), "a");
+        assert!(tags.is_null(1), "null element is a null item");
+        assert_eq!(tags.value(2), "b");
+
+        let labels = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap()
+            .value(0);
+        let labels = labels.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(labels.is_null(0), "pluck key holding null is a null item");
+        assert_eq!(labels.value(1), "bug");
+        assert!(labels.is_null(2), "null element is a null item");
+    }
+
+    #[test]
     fn missing_parent_object_still_nulls_for_nullable_column() {
         // A genuinely-absent parent (no `user` key at all) is absence, not a
         // shape change — nullable user.login becomes null.
@@ -570,6 +864,64 @@ mod tests {
             .downcast_ref::<TimestampMillisecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1767225600000);
+    }
+
+    #[test]
+    fn epoch_seconds_convert_to_millis_and_reject_other_shapes() {
+        // Slack-style `created`/`updated` are whole epoch seconds; the
+        // seconds variant scales to millis, and anything that is not an
+        // integer fails with its kind — a fractional or string timestamp
+        // must never be misread.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "created",
+            path: "created",
+            field_type: FieldType::TimestampSecondsUtc,
+            nullable: true,
+        }])
+        .unwrap();
+
+        let batch = converter
+            .convert(
+                &[
+                    serde_json::json!({"created": 1735689600}), // 2025-01-01T00:00:00Z
+                    serde_json::json!({"created": null}),
+                    serde_json::json!({}),
+                ],
+                1,
+            )
+            .unwrap();
+        let created = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(created.value(0), 1_735_689_600_000);
+        assert!(created.is_null(1), "JSON null stays NULL");
+        assert!(created.is_null(2), "absent key stays NULL");
+
+        for (bad, found) in [
+            (serde_json::json!({"created": 1735689600.5}), "number"),
+            (
+                serde_json::json!({"created": "2025-01-01T00:00:00Z"}),
+                "string",
+            ),
+            // Overflow is its own diagnosis — "found: number" would
+            // contradict the expected type, which is also a number.
+            (
+                serde_json::json!({"created": i64::MAX}),
+                "an epoch second out of range for millisecond timestamps",
+            ),
+        ] {
+            let err = converter.convert(&[bad], 1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
+                        if f == found && expected == "epoch-seconds timestamp"
+                ),
+                "got {err}"
+            );
+        }
     }
 
     #[test]
@@ -656,6 +1008,27 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(ids.value(0), 7);
+    }
+
+    #[test]
+    fn dollar_prefixed_column_paths_are_rejected_not_silently_misread() {
+        // `$.user.login` would survive the `$.{path}` concatenation as a
+        // literal `"$"` first segment and read the wrong key — nullable
+        // columns would silently go all-NULL. Reject it with the corrected
+        // spelling instead.
+        let err = RowConverter::new(&[FieldMapping {
+            name: "author",
+            path: "$.user.login",
+            field_type: FieldType::Utf8,
+            nullable: true,
+        }])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenConnectorError::InvalidRowPath { ref path, ref reason }
+                if path == "$.user.login"
+                    && reason.contains("write 'user.login', not '$.user.login'")
+        ));
     }
 
     #[test]

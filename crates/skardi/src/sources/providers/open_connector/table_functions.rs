@@ -37,7 +37,7 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{ScalarValue, plan_err};
+use datafusion::common::{plan_datafusion_err, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
@@ -57,6 +57,7 @@ use super::raw_schema::derive_raw_columns;
 use super::row_path::RowPath;
 use super::source_pack::SourcePackRegistry;
 use super::table::OpenConnectorTableProvider;
+use crate::sources::providers::udtf_args::strict_string_arg;
 
 /// Planning-time state of one registered gateway, captured by
 /// `register_open_connector_tables` and shared with both UDTFs.
@@ -106,15 +107,28 @@ impl GatewayHandle {
 pub type OpenConnectorGateways = Arc<RwLock<HashMap<String, Arc<GatewayHandle>>>>;
 
 /// Register `open_connector_query` and `open_connector_scan` on a session.
-pub fn register_open_connector_udtfs(ctx: &SessionContext, gateways: OpenConnectorGateways) {
+///
+/// # Errors
+/// [`OpenConnectorError::SourcePackAssetInvalid`] when an embedded pack
+/// asset fails to parse or validate — surfaced here, at setup, instead of
+/// on first use.
+pub fn register_open_connector_udtfs(
+    ctx: &SessionContext,
+    gateways: OpenConnectorGateways,
+) -> Result<(), OpenConnectorError> {
+    let packs = SourcePackRegistry::builtins()?;
     ctx.register_udtf(
         "open_connector_query",
-        Arc::new(OpenConnectorQueryFunction::new(Arc::clone(&gateways))),
+        Arc::new(OpenConnectorQueryFunction::new(
+            Arc::clone(&gateways),
+            packs,
+        )),
     );
     ctx.register_udtf(
         "open_connector_scan",
         Arc::new(OpenConnectorScanFunction::new(gateways)),
     );
+    Ok(())
 }
 
 /// `open_connector_query('gateway', 'pack.table', '{resource json}'[, 'alias'])`.
@@ -125,12 +139,10 @@ pub struct OpenConnectorQueryFunction {
 }
 
 impl OpenConnectorQueryFunction {
-    /// Build the function over the shared gateway map.
-    pub fn new(gateways: OpenConnectorGateways) -> Self {
-        Self {
-            gateways,
-            packs: SourcePackRegistry::builtins(),
-        }
+    /// Build the function over the shared gateway map and a validated
+    /// pack registry (see [`SourcePackRegistry::builtins`]).
+    pub fn new(gateways: OpenConnectorGateways, packs: SourcePackRegistry) -> Self {
+        Self { gateways, packs }
     }
 }
 
@@ -143,12 +155,12 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                 exprs.len()
             );
         }
-        let gateway = literal_string("open_connector_query", &exprs[0], "gateway")?;
-        let table_id = literal_string("open_connector_query", &exprs[1], "table_id")?;
-        let resource_json = literal_string("open_connector_query", &exprs[2], "resource_json")?;
+        let gateway = strict_string_arg(&exprs[0], "open_connector_query", "gateway")?;
+        let table_id = strict_string_arg(&exprs[1], "open_connector_query", "table_id")?;
+        let resource_json = strict_string_arg(&exprs[2], "open_connector_query", "resource_json")?;
         let alias = exprs
             .get(3)
-            .map(|expr| literal_string("open_connector_query", expr, "connection_alias"))
+            .map(|expr| strict_string_arg(expr, "open_connector_query", "connection_alias"))
             .transpose()?;
 
         let handle = lookup_gateway(&self.gateways, &gateway)?;
@@ -165,23 +177,32 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
         let pack = self.packs.require(pack_name).map_err(plan_error)?;
         let table = self.packs.table(pack, table_name).map_err(plan_error)?;
 
-        let resource: Value = serde_json::from_str(&resource_json).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "open_connector_query: resource_json is not valid JSON: {e}"
-            ))
-        })?;
-        if !resource.is_object() {
-            return plan_err!(
-                "open_connector_query: resource_json must be a JSON object of resource \
-                 inputs, e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
-            );
-        }
+        let resource = parse_json_object(
+            "open_connector_query",
+            "resource_json",
+            &resource_json,
+            "resource inputs",
+        )?;
         for key in table.required_resources {
             if resource.get(*key).is_none() {
                 return Err(plan_error(OpenConnectorError::MissingResourceInput {
                     binding: format!("open_connector_query('{gateway}', '{table_id}')"),
                     key: (*key).to_string(),
                 }));
+            }
+        }
+        // One table, so undeclared keys are rejected outright (the YAML
+        // path allows a shared binding's keys to be consumed by *another*
+        // bound table; here there is no other table to consume them, and
+        // the gateway's strict action schema would 400 the whole scan).
+        if let Value::Object(map) = &resource {
+            for key in map.keys() {
+                if !table.declares_resource(key) {
+                    return Err(plan_error(OpenConnectorError::UnknownResourceKey {
+                        binding: format!("open_connector_query('{gateway}', '{table_id}')"),
+                        key: key.clone(),
+                    }));
+                }
             }
         }
 
@@ -242,13 +263,13 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 exprs.len()
             );
         }
-        let gateway = literal_string("open_connector_scan", &exprs[0], "gateway")?;
-        let action_id = literal_string("open_connector_scan", &exprs[1], "action_id")?;
-        let input_json = literal_string("open_connector_scan", &exprs[2], "input_json")?;
-        let row_path = literal_string("open_connector_scan", &exprs[3], "row_path")?;
+        let gateway = strict_string_arg(&exprs[0], "open_connector_scan", "gateway")?;
+        let action_id = strict_string_arg(&exprs[1], "open_connector_scan", "action_id")?;
+        let input_json = strict_string_arg(&exprs[2], "open_connector_scan", "input_json")?;
+        let row_path = strict_string_arg(&exprs[3], "open_connector_scan", "row_path")?;
         let alias = exprs
             .get(4)
-            .map(|expr| literal_string("open_connector_scan", expr, "connection_alias"))
+            .map(|expr| strict_string_arg(expr, "open_connector_scan", "connection_alias"))
             .transpose()?;
 
         let handle = lookup_gateway(&self.gateways, &gateway)?;
@@ -279,17 +300,12 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             }
         }
 
-        let input: Value = serde_json::from_str(&input_json).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "open_connector_scan: input_json is not valid JSON: {e}"
-            ))
-        })?;
-        if !input.is_object() {
-            return plan_err!(
-                "open_connector_scan: input_json must be a JSON object of action inputs, \
-                 e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
-            );
-        }
+        let input = parse_json_object(
+            "open_connector_scan",
+            "input_json",
+            &input_json,
+            "action inputs",
+        )?;
 
         let row_path = RowPath::parse(&row_path).map_err(plan_error)?;
         // Deterministic row type or planning error — derived purely from the
@@ -306,6 +322,8 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 table_id: Arc::from(format!("raw:{action_id}")),
                 action_id: Arc::from(action_id),
                 pagination: PaginationStrategy::SinglePage,
+                error_path: None,
+                fixed_inputs: &[],
                 source_pack_version: 0,
             },
             converter,
@@ -423,13 +441,20 @@ fn plan_error(e: OpenConnectorError) -> DataFusionError {
     DataFusionError::Plan(e.to_string())
 }
 
-/// Extract one string-literal argument.
-fn literal_string(function: &str, expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Ok(s.clone()),
-        _ => plan_err!("{function}: {name} must be a string literal"),
+/// Parse a UDTF argument that must carry a JSON object, shared by both
+/// functions so the two diagnostics stay in lockstep. `noun` names what the
+/// object holds in the caller's vocabulary ("resource inputs" / "action
+/// inputs"), so sharing the implementation doesn't flatten the context.
+fn parse_json_object(fn_name: &str, arg: &str, raw: &str, noun: &str) -> DFResult<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| plan_datafusion_err!("{fn_name}: {arg} is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        return plan_err!(
+            "{fn_name}: {arg} must be a JSON object of {noun}, \
+             e.g. '{{\"owner\":\"SkardiLabs\",\"repo\":\"skardi\"}}'"
+        );
     }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -438,7 +463,7 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::register_open_connector_tables;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest,
+        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
     };
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::prelude::CsvReadOptions;
@@ -448,14 +473,7 @@ mod tests {
     /// read-only classification and an output schema matching the items the
     /// mock gateway serves.
     fn discovery_response(read_only: Option<bool>, output_schema: &str) -> String {
-        let read_only = match read_only {
-            Some(flag) => format!(r#""read_only": {flag},"#),
-            None => String::new(),
-        };
-        format!(
-            r#"{{"input_schema": {{}}, "output_schema": {output_schema},
-                "locally_executable": true, {read_only} "connection_aliases": ["work"]}}"#
-        )
+        discovery_ok("{}", output_schema, true, read_only)
     }
 
     /// Output schema describing the mock item rows.
@@ -507,7 +525,7 @@ mod tests {
         if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
             return MockResponse::ok(&discovery_response(read_only, output_schema));
         }
-        if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
+        if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             let input = body.get("input").cloned().unwrap_or_default();
             let page = input
@@ -526,9 +544,9 @@ mod tests {
                 .skip((page - 1) * 2)
                 .take(2)
                 .collect();
-            return MockResponse::ok(
-                &serde_json::json!({ "output": { "items": slice } }).to_string(),
-            );
+            return MockResponse::ok(&envelope_ok(
+                &serde_json::json!({ "items": slice }).to_string(),
+            ));
         }
         MockResponse::new(404, "{}")
     }
@@ -585,7 +603,7 @@ raw_action_allowlist:
         unsafe {
             std::env::remove_var(token_env);
         }
-        register_open_connector_udtfs(&ctx, gateways);
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         ctx
     }
 
@@ -668,7 +686,7 @@ raw_action_allowlist:
         assert!(
             executes
                 .iter()
-                .all(|r| r.header("x-openconnector-connection-alias").as_deref() == Some("work")),
+                .all(|r| r.header("x-oo-connector-alias").as_deref() == Some("work")),
             "explicit connection alias sent on every execute"
         );
     }
@@ -718,8 +736,8 @@ raw_action_allowlist:
         .await;
         expect_plan_error(
             &ctx,
-            "SELECT * FROM open_connector_query('saas', 'github.issues', '{}')",
-            "unknown source pack 'github'",
+            "SELECT * FROM open_connector_query('saas', 'jira.issues', '{}')",
+            "unknown source pack 'jira'",
         )
         .await;
         expect_plan_error(
@@ -746,6 +764,22 @@ raw_action_allowlist:
             "resource_json is not valid JSON",
         )
         .await;
+        // Undeclared resource keys are rejected at planning: the gateway's
+        // strict action schemas (additionalProperties: false) would 400
+        // every request that carried them.
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_query('saas', 'mock.items',
+                                                  '{"workspace":"demo","workspce":"typo"}')"#,
+            "resource key 'workspce'",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', 'mock.items', '[1, 2]')",
+            "resource_json must be a JSON object of resource inputs",
+        )
+        .await;
         expect_plan_error(
             &ctx,
             "SELECT * FROM open_connector_query('saas', 'mock.items')",
@@ -755,7 +789,27 @@ raw_action_allowlist:
         expect_plan_error(
             &ctx,
             "SELECT * FROM open_connector_query(1, 'mock.items', '{}')",
-            "gateway must be a string literal",
+            "'gateway' must be a string literal",
+        )
+        .await;
+        // NULL is rejected outright for schema-determining arguments — a
+        // placeholder cannot produce a plan (strict_string_arg semantics).
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query(NULL, 'mock.items', '{}')",
+            "'gateway' must be a string literal, not NULL",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', NULL, '{}')",
+            "'table_id' must be a string literal, not NULL",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', 'mock.items', NULL)",
+            "'resource_json' must be a string literal, not NULL",
         )
         .await;
 
@@ -873,14 +927,14 @@ raw_action_allowlist:
             if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
                 return MockResponse::ok(&discovery_response(Some(true), ITEMS_OUTPUT_SCHEMA));
             }
-            if req.method == "POST" && req.path == "/v1/actions/mock.list_items/execute" {
-                return MockResponse::ok(
-                    &serde_json::json!({"output": {"items": [
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&envelope_ok(
+                    &serde_json::json!({"items": [
                         {"id": 1, "name": "tagged", "tags": ["t1"]},
                         {"id": 2, "name": "untagged", "tags": null}
-                    ]}})
+                    ]})
                     .to_string(),
-                );
+                ));
             }
             MockResponse::new(404, "{}")
         })
@@ -996,6 +1050,13 @@ raw_action_allowlist:
             r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
                                                  '{"workspace":"demo"}', 'items')"#,
             "must start with '$.'",
+        )
+        .await;
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
+                                                 '[1, 2]', '$.items')"#,
+            "input_json must be a JSON object of action inputs",
         )
         .await;
         assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");

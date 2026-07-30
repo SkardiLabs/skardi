@@ -1,0 +1,37 @@
+{
+  "users": [
+    {
+      "userId": "U0001",
+      "username": "ada",
+      "realName": "Ada Lovelace",
+      "displayName": "ada",
+      "isBot": false,
+      "isDeleted": false,
+      "isAdmin": true,
+      "isOwner": true,
+      "locale": "en-GB"
+    },
+    {
+      "userId": "U0002",
+      "username": "deploybot",
+      "realName": "Deploy Bot",
+      "displayName": "",
+      "isBot": true,
+      "isDeleted": false,
+      "isAdmin": false,
+      "isOwner": false
+    },
+    {
+      "userId": "U0003",
+      "username": "former.employee",
+      "realName": null,
+      "displayName": "former",
+      "isBot": false,
+      "isDeleted": true,
+      "isAdmin": null,
+      "isOwner": null,
+      "locale": "en-US"
+    }
+  ],
+  "nextCursor": null
+}

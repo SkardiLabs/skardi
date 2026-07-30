@@ -548,7 +548,7 @@ Cache entries are keyed by:
 - upstream projection;
 - stable Arrow schema fingerprint.
 
-Only scans that run to natural pagination exhaustion are stored. A scan that stops early — because a `LIMIT` was satisfied, the scan was cancelled, or a safety bound was reached — is never cached, so a cache entry always represents the complete result for its key and truncated data can never be served as a complete result.
+Only completed scans are stored. Because the SQL `LIMIT` is part of the cache key, a scan that stops because its `LIMIT` was satisfied is complete *for its key* and is cached: an identical `LIMIT` query replays it, while any fuller query computes a different key and fetches live. Scans that stop early for any other reason — cancellation or a safety bound — are never cached. Either way a cache entry always represents the complete result for its key, and truncated data can never be served as a complete result. `LIMIT`'s membership in the cache key is the load-bearing invariant here; removing it would silently reintroduce truncated-served-as-complete. *(Refined during milestone 3 from the original "never cache a LIMIT-stopped scan" rule — the key-scoped form preserves the rule's intent while letting repeated `LIMIT` queries hit the cache.)*
 
 Milestone one cache invalidation is TTL-based. The cache is bounded by bytes and entries and uses least-recently-used eviction. Cache state is observable in traces and metrics.
 
