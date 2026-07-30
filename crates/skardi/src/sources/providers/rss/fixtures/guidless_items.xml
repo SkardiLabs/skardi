@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Identity fallbacks: the first two items have no <guid> and fall back to
+     their <link>; the third has neither, so it cannot be keyed and is skipped
+     and counted. -->
+<rss version="2.0">
+  <channel>
+    <title>Guidless Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>Items without a guid.</description>
+    <item>
+      <title>Link only</title>
+      <link>https://corpus.example/guidless/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Link only, again</title>
+      <link>https://corpus.example/guidless/2</link>
+    </item>
+    <item>
+      <title>Neither guid nor link</title>
+      <description>No identity at all.</description>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,34 @@
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "Corpus JSON Feed",
+  "home_page_url": "https://corpus.example/",
+  "feed_url": "https://corpus.example/feed.json",
+  "description": "A JSON Feed 1.1 document.",
+  "items": [
+    {
+      "id": "corpus-json-1",
+      "url": "https://corpus.example/json/1",
+      "title": "JSON post",
+      "content_html": "<h3>JSON body</h3><p>With a <code>code span</code> and a <a href=\"https://corpus.example/json/1#more\">link</a>.</p>",
+      "summary": "Summary supplied explicitly.",
+      "date_published": "2026-07-20T10:00:00Z",
+      "date_modified": "2026-07-21T11:00:00Z",
+      "authors": [{ "name": "Katherine Johnson" }],
+      "tags": ["rust", "json"],
+      "attachments": [
+        {
+          "url": "https://corpus.example/audio/json-1.mp3",
+          "mime_type": "audio/mpeg",
+          "size_in_bytes": 4096
+        }
+      ]
+    },
+    {
+      "id": "corpus-json-2",
+      "url": "https://corpus.example/json/2",
+      "title": "Plain-text JSON post",
+      "content_text": "Stored verbatim: 3 < 4 & *not italic*  <b>not bold</b>",
+      "date_published": "2026-07-22T09:15:00Z"
+    }
+  ]
+}

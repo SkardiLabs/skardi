@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/"
+     xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Corpus Weekly</title>
+    <link>https://corpus.example/</link>
+    <description>A well-formed RSS 2.0 channel.</description>
+    <language>en-us</language>
+    <lastBuildDate>Tue, 21 Jul 2026 12:00:00 GMT</lastBuildDate>
+    <item>
+      <guid isPermaLink="false">tag:corpus.example,2026:post-1</guid>
+      <title>First post</title>
+      <link>https://corpus.example/posts/1</link>
+      <dc:creator>Ada Lovelace</dc:creator>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+      <description>Plain summary for the first post.</description>
+      <content:encoded><![CDATA[<h1>First post</h1>
+<p>Body with <strong>bold</strong>, <em>emphasis</em> and a <a href="https://corpus.example/posts/1#more">link</a>.</p>
+<ul><li>alpha</li><li>beta</li></ul>]]></content:encoded>
+      <category>rust</category>
+      <category>news</category>
+      <enclosure url="https://corpus.example/audio/1.mp3" type="audio/mpeg" length="12345"/>
+    </item>
+    <item>
+      <guid isPermaLink="true">https://corpus.example/posts/2</guid>
+      <title>Second post</title>
+      <link>https://corpus.example/posts/2</link>
+      <pubDate>Tue, 21 Jul 2026 08:30:00 -0400</pubDate>
+      <description>Plain summary for the second post.</description>
+    </item>
+  </channel>
+</rss>

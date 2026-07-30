@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ampersand lexis, one shape per line below:
+       - the channel title carries a naked `&` (what rung 3 escapes),
+       - the item description carries `&nbsp;`, an entity XML never defined,
+       - the CDATA block carries `&&`, `&#169;` and `&amp;`, none of which
+         rung 3 may touch, since CDATA is a pass-through region. -->
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Fish & Chips</title>
+    <link>https://corpus.example/</link>
+    <description>Half &amp; half.</description>
+    <item>
+      <guid>tag:corpus.example,2026:amp-1</guid>
+      <title>Salt & Vinegar</title>
+      <link>https://corpus.example/amp/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+      <description>A naked &nbsp; entity in the summary.</description>
+      <content:encoded><![CDATA[<p>Tom &amp; Jerry, math: 3 && 4, copyright &#169; 2026, and a hard&nbsp;space.</p>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

@@ -6,8 +6,15 @@ pub mod cache;
 pub mod config;
 #[cfg(feature = "rss")]
 pub mod conformance;
+// The compatibility corpus: committed feed documents in `fixtures/` plus the
+// manifest-driven contract test over them. Test-only and additionally gated
+// behind `rss`, like `testutil` below, since everything it drives
+// (`parse_feed_document`, the sanitation rungs, the HTML→Markdown conversion)
+// is.
 #[cfg(feature = "rss")]
 pub mod convert;
+#[cfg(all(test, feature = "rss"))]
+mod corpus;
 pub mod error;
 // Reads OPML files and pulls in `quick-xml`; gated so the config/error types
 // above stay parseable — and `ResolvedSubscription` below stays nameable —
