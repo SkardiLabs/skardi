@@ -56,6 +56,12 @@ pub mod parse;
 pub mod sanitize;
 #[cfg(feature = "rss")]
 pub mod schema;
+// The two `TableProvider`s (`feeds` and `items`): they classify filters for
+// pushdown, prune the subscription list to the feeds a scan must visit, and
+// construct the `exec` plan above. `pub` so the catalog registration a later
+// task adds can name them.
+#[cfg(feature = "rss")]
+pub mod table;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;
