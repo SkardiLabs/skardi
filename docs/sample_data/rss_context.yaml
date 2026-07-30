@@ -1,0 +1,43 @@
+# Example context for the RSS/Atom data source (`type: rss`).
+# Reference: docs/rss.md
+#
+# Try it — registration performs no network I/O and `feeds` is a pure state
+# read, so this works offline and fetches nothing:
+#
+#   cargo run -p skardi-cli --features rss -- \
+#     query --ctx docs/sample_data/rss_context.yaml \
+#     --sql "SELECT name, last_status FROM news.main.feeds"
+#
+# Every row comes back `never`: no `items` scan has run, so no feed has been
+# attempted. The hosts below are under the reserved `.invalid` TLD and are
+# deliberately unresolvable — swap in real feed URLs before scanning `items`.
+
+kind: context
+
+metadata:
+  name: news-context
+  version: 1.0.0
+
+spec:
+  data_sources:
+    - name: news
+      type: rss
+      hierarchy_level: catalog
+      access_mode: read_only
+      description: "Subscribed RSS/Atom feeds: health in main.feeds, the live window in main.items"
+      rss:
+        feeds:
+          - url: https://blog.example.invalid/feed.xml
+            name: example-blog          # optional; defaults to the URL
+          - url: https://weekly.example.invalid/rss.xml
+            name: example-weekly
+          - url: https://notes.example.invalid/atom.xml
+        # or: opml: subscriptions.opml  # mutually exclusive with feeds:
+        ttl_seconds: 900                # 0 = always live
+        max_concurrent: 6               # fetch parallelism and per-host politeness bound (per process)
+        request_timeout_seconds: 10     # per-request timeout
+        scan_timeout_seconds: 60        # deadline for one full scan across all feeds
+        max_response_bytes: 5242880     # cap on one decoded response body (5 MiB)
+        # user_agent defaults to "skardi-rss/<crate version> (+https://github.com/SkardiLabs/skardi)";
+        # override it only to add your own contact URL. Feed hosts ban anonymous clients.
+        user_agent: "skardi-rss (+https://example.invalid/contact)"
