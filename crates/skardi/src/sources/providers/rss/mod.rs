@@ -23,6 +23,12 @@ pub mod opml;
 // own dependencies (reqwest, tokio) are already unconditional crate deps.
 #[cfg(feature = "rss")]
 mod egress;
+// The partition-per-feed execution plan: the engine's only consumer, and the
+// layer that enforces the scan deadline and the LIMIT launch gate. `pub` so
+// the table provider a later task adds — in this module tree but a different
+// file — can construct it.
+#[cfg(feature = "rss")]
+pub mod exec;
 // The freshness state machine that composes every module above: it decides
 // per feed whether a scan serves a cached window, revalidates it, refetches
 // it, or degrades to stale rows, and it is the sole production consumer of

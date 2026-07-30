@@ -15,9 +15,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{Array, RecordBatch, StringArray};
+use datafusion::error::Result as DFResult;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+use super::ResolvedSubscription;
+use super::cache::MemoryFeedCache;
+use super::config::{FeedSubscription, RssConfig, inline_config};
+use super::egress::EgressPolicy;
+use super::engine::{CACHE_MAX_BYTES, RssEngine};
+use super::fetch::FeedFetcher;
 
 /// A well-formed RSS 2.0 document carrying every `channel`-level field the
 /// dialect requires plus exactly one item, so a batch built from it has one
@@ -79,6 +89,92 @@ pub(crate) fn str_opt_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>
             }
         })
         .collect()
+}
+
+/// `(name, url)` pairs pointing at `server`, from `(name, path)` pairs — the
+/// subscription list shape [`test_engine`] takes.
+pub(crate) fn feed_urls(server: &MockFeedServer, feeds: &[(&str, &str)]) -> Vec<(String, String)> {
+    feeds
+        .iter()
+        .map(|(name, path)| ((*name).to_string(), format!("{}{path}", server.url())))
+        .collect()
+}
+
+/// An [`RssEngine`] over `feeds` (`(name, url)` pairs, e.g. from
+/// [`feed_urls`]), with `tune` applied to the spec-default config before the
+/// engine is assembled — the seam for `ttl_seconds`, `max_concurrent`, and
+/// `scan_timeout_seconds`.
+///
+/// The fetcher is pointed at the loopback-allowing egress policy so the
+/// subscriptions can name [`MockFeedServer`]. `request_timeout_seconds` is
+/// pulled down from the spec default (30) to 5 so a test that means to hit a
+/// *different* bound does not first have to wait out a request timeout.
+///
+/// `engine.rs`'s own tests have a near-identical private helper. It cannot be
+/// shared in either direction: it lives inside that module's `#[cfg(test)] mod
+/// tests`, which nothing outside the module can name. This copy is the one the
+/// exec layer's tests build on.
+pub(crate) fn test_engine(
+    feeds: &[(String, String)],
+    tune: impl FnOnce(&mut RssConfig),
+) -> RssEngine {
+    let subscriptions: Vec<ResolvedSubscription> = feeds
+        .iter()
+        .map(|(name, url)| ResolvedSubscription {
+            name: name.clone(),
+            url: url.clone(),
+        })
+        .collect();
+    let mut config = inline_config(
+        subscriptions
+            .iter()
+            .map(|sub| FeedSubscription {
+                url: sub.url.clone(),
+                name: Some(sub.name.clone()),
+            })
+            .collect(),
+    );
+    config.request_timeout_seconds = 5;
+    tune(&mut config);
+    let fetcher = FeedFetcher::new(
+        Arc::new(EgressPolicy::allowing_loopback_for_tests()),
+        Duration::from_secs(config.request_timeout_seconds),
+        config.max_response_bytes,
+        config.user_agent.clone(),
+    )
+    .expect("build the test fetcher");
+    let cache = Arc::new(MemoryFeedCache::new(
+        CACHE_MAX_BYTES,
+        subscriptions.len() + 8,
+    ));
+    RssEngine::with_parts(
+        "rss_test".to_string(),
+        subscriptions,
+        &config,
+        fetcher,
+        cache,
+    )
+}
+
+/// Drain one partition's stream to its batches.
+///
+/// Panics on an `Err` item rather than returning it: no `rss` partition may
+/// ever surface an error — a dead or slow feed degrades to zero rows — so an
+/// error here is a failed assertion, and the panic message says which.
+pub(crate) async fn collect_stream(
+    stream: DFResult<SendableRecordBatchStream>,
+) -> Vec<RecordBatch> {
+    let mut stream = stream.expect("execute returned a stream");
+    let mut batches = Vec::new();
+    while let Some(item) = stream.next().await {
+        batches.push(item.expect("an rss partition must never yield an error"));
+    }
+    batches
+}
+
+/// Total rows across a partition's batches.
+pub(crate) fn total_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
 }
 
 /// One request observed by the mock server.
