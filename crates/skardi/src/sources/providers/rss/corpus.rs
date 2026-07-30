@@ -679,6 +679,33 @@ fn control_chars_fixture_keeps_the_text_the_control_byte_split() {
 }
 
 #[test]
+fn encoding_latin1_fixture_recovers_the_accented_characters() {
+    // The manifest row asserts only the `sanitation: reencoded-to-utf8` note,
+    // which says a rung changed bytes — not that it changed them *correctly*. A
+    // rung that rescued the document into mojibake (sniffing some other
+    // single-byte encoding, or replacing each undecodable byte with U+FFFD)
+    // would satisfy the note and the row count both. These are the recovered
+    // characters, so the note cannot stand in for the repair.
+    //
+    // Every accented character in the fixture is the single byte 0xE9 —
+    // Latin-1's `é`, and not valid UTF-8 (verified against the committed bytes:
+    // `<title>Caf\xe9 Corpus</title>`, `<title>Caf\xe9 au lait</title>`,
+    // `<description>R\xe9sum\xe9 en latin-1.</description>`).
+    let doc = parse_case("encoding_latin1_mislabeled");
+    assert_eq!(
+        doc.items[0].title.as_deref(),
+        Some("Café au lait"),
+        "the 0xE9 byte must arrive as U+00E9, not as mojibake or U+FFFD"
+    );
+    assert_eq!(doc.meta.title.as_deref(), Some("Café Corpus"));
+    assert_eq!(
+        doc.items[0].summary.as_deref(),
+        Some("Résumé en latin-1."),
+        "two 0xE9 bytes in one field, both recovered"
+    );
+}
+
+#[test]
 fn naked_ampersand_fixture_keeps_cdata_intact_and_resolves_nbsp() {
     // The golden pins all of this byte-exactly; these assertions name the three
     // properties it encodes, because a no-break space is invisible in a diff.
