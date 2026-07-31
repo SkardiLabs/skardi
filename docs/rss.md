@@ -64,6 +64,18 @@ retyping a column, tightening nullability, repurposing an enum domain
 (`last_status`, `window_status`), or changing `(feed, guid)` identity or window
 semantics is a breaking change and bumps the integer.
 
+### What gets logged
+
+**Response bodies are never logged.** One `debug` line is emitted per feed per
+serve, carrying the source and subscription names, the **subscribed feed URL**,
+the outcome, the HTTP status, and byte/row/note *counts* — the body is described,
+never quoted. A degraded feed additionally emits a `warn` with its `last_error`.
+
+The feed URL in those `debug` lines is the thing to know before turning `debug` on
+in an environment where logs go somewhere less trusted than the config does: a
+subscription URL can carry a private token in its query string, and at `debug` it
+is in the log. At `info` and above, no feed URL is emitted.
+
 ---
 
 ## Configuration
@@ -87,7 +99,7 @@ spec:
           - url: https://this-week-in-rust.org/rss.xml
         # or: opml: subscriptions.opml # mutually exclusive with feeds:
         ttl_seconds: 900               # 0 = always live
-        max_concurrent: 6              # fetch parallelism and per-host politeness bound (per process)
+        max_concurrent: 6              # in-flight fetches for THIS source; not per-host, not per-process
         request_timeout_seconds: 10
         scan_timeout_seconds: 60
         max_response_bytes: 5242880
@@ -104,7 +116,7 @@ A ready-to-run version of this file lives at
 | `feeds` | — | Inline subscription list. Each entry has a `url` (must be `http`/`https`) and an optional `name`. Mutually exclusive with `opml`; exactly one of the two must be set. |
 | `opml` | — | Path to an OPML subscription list. Read once, at registration. Mutually exclusive with `feeds`. |
 | `ttl_seconds` | `900` | Per-feed cache TTL. `0` means always-live: every `items` scan revalidates every feed it visits. The only bound where zero is legal. |
-| `max_concurrent` | `6` | Feeds fetched concurrently — both the fetch parallelism and the per-host politeness bound. **Per process** (see [Politeness](#politeness-and-bounds)). |
+| `max_concurrent` | `6` | Feeds of **this source** fetched concurrently. Not a per-host bound and not a per-process one — see [Politeness](#politeness-and-bounds) for what it actually bounds. |
 | `request_timeout_seconds` | `10` | Timeout for one feed HTTP request. |
 | `scan_timeout_seconds` | `60` | Deadline for one whole scan across every subscribed feed. |
 | `max_response_bytes` | `5242880` (5 MiB) | Cap on one **decoded** response body, so a compressed payload cannot inflate past it. |
@@ -114,6 +126,15 @@ Bounds other than `ttl_seconds` must be at least `1`; `user_agent` must be
 non-blank. Unknown keys are rejected at both levels — a misspelled
 `ttl_secondsss` fails loudly with the offending field named, rather than being
 dropped and silently changing the config's meaning.
+
+Two of the bounds also have **upper** ceilings, applied silently-but-loudly: the
+value is clamped and a `warn` line records both the configured and the effective
+number. Neither is a config error, so nothing fails to load.
+
+| Field | Ceiling | Why |
+|---|---|---|
+| `ttl_seconds` | one year | The TTL becomes a `Duration` added to an `Instant` on every arm, and a large enough add can panic (`std`'s own `Instant` docs give a macOS example). Longer than any meaningful feed TTL. |
+| `scan_timeout_seconds` | one hour | The deadline becomes an `Instant` the same way. A scan that has run for an hour has a different problem than its deadline. |
 
 Subscription **names** must be unique across the resolved list, comparing the
 *effective* name (an explicit `name`, else the URL). Two subscriptions may
@@ -232,6 +253,31 @@ This is also why reading `feeds` right after a failure is instant: the failure
 was recorded, so there is nothing to re-attempt, and `feeds` cannot reach the
 fetcher in the first place.
 
+### The cache is bounded, and windows can be evicted
+
+The window cache is bounded by a **64 MiB budget on cached window bytes**, shared
+across every feed of one source, plus an entry-count bound of one per subscription
+with a little headroom. When a new window pushes either bound over, the
+least-recently-used **window** is dropped. It is not configurable.
+
+Eviction drops the window and its validators, and deliberately **keeps the feed's
+health observation** — `feeds` is specified to be a pure state read, so a feed
+must not lose its health just because its window was reclaimed. Two consequences
+follow from that split:
+
+- `feeds.etag` and `feeds.last_modified` read NULL for an evicted feed while
+  `last_status` and `item_count` still describe the window that is gone. The next
+  fetch for that feed is therefore an unconditional `200`, not a `304`.
+- **A feed whose window was evicted refetches on its next `items` scan, even
+  inside its TTL.** "Within TTL" and "has rows to serve" are independent, and
+  serving zero rows while `feeds` reported the feed healthy would be a silent
+  capture gap, so the provider treats a lost window as a cache miss instead. The
+  cost is one request; the alternative was an empty feed until the TTL expired.
+
+A single window larger than the whole 64 MiB budget can never fit, so it is not
+stored at all — not even transiently — while the observation still records the
+successful parse. That feed then refetches on every scan.
+
 ### The cache is process-lifetime state
 
 The window cache — validators included — lives in memory for the life of the
@@ -261,11 +307,27 @@ trait.
 Every scan is bounded by the per-request timeout, the whole-scan deadline, the
 decoded-response cap, and `max_concurrent`.
 
-**`max_concurrent` is per process.** It caps both fetch parallelism and the
-per-host request pressure — but each replica counts its own permits
-independently, so **N replicas can present one feed host with up to N× this
-bound**, and a crash/restart loop the same. Size it against the number of
-processes you actually run, not against the number you configured.
+**`max_concurrent` bounds one data source's in-flight fetches — nothing wider.**
+The semaphore lives on the engine, and one engine is built per registered `rss`
+source, so the bound is **per source**, and the three things it is *not* all
+matter for politeness:
+
+- **It is not per host.** There is no per-host accounting anywhere in the
+  provider. With the default of `6`, six subscriptions that happen to live on the
+  same host are six concurrent requests to that host. If a host's feeds need
+  gentler treatment, the lever is a lower `max_concurrent` on the source holding
+  them — which is also the reason to split a hostile host's feeds into their own
+  `rss` source.
+- **It is not per process.** Two `rss` sources in one context are two engines with
+  two semaphores, so a process running both permits up to the sum. Size against
+  the number of `rss` sources you register, not just the number you configured on
+  one of them.
+- **It is not global across replicas.** Each process counts its own permits, so
+  **N replicas can present one host with up to N×** the per-source bound, and a
+  crash/restart loop the same.
+
+Multiply all three together for the worst case a single feed host can see:
+`max_concurrent` × sources-sharing-that-host × replicas.
 
 A self-identifying `User-Agent` is sent on every request, by default naming the
 Skardi version and the project URL. Feed servers routinely ban anonymous
@@ -299,15 +361,33 @@ The normative dialect → unified-schema mapping.
 | `link` | `<link>` | `<link>` | `<link rel="alternate">` (first, else first link) | `url` |
 | `author` | `<author>` / `dc:creator` | `dc:creator` | `<author><name>` | `authors[0].name` |
 | `published` | `<pubDate>` (RFC 822) | `dc:date` (ISO 8601) | `<published>` (RFC 3339) | `date_published` |
-| `updated` | — (extensions) | — | `<updated>` (RFC 3339) | `date_modified` |
+| `updated` | = `published` — see note | — (NULL) | `<updated>` (RFC 3339) | `date_modified` |
 | `content` | `content:encoded` | `content:encoded` | `<content>` | `content_html` / `content_text` |
 | `summary` | `<description>` | `<description>` | `<summary>` | `summary` |
 | `categories` | `<category>*` | `dc:subject*` | `<category term>*` | `tags[]` |
 | `enclosure_*` | `<enclosure url/type/length>` | — | `<link rel="enclosure">` | `attachments[0]` |
 
 All date formats normalize to `Timestamp(ms, UTC)` at parse time. Fields a
-dialect lacks are simply null — nullability in the schema *is* the
-dialect-coverage annotation.
+dialect lacks are *usually* null — nullability in the schema is the
+dialect-coverage annotation — but `updated` is the exception, and the two RSS
+dialects differ:
+
+> **`items.updated` is not NULL on RSS 2.0.** Neither RSS dialect has an update
+> element, but `feed-rs` copies `<pubDate>` into `updated` for RSS 2.0 when the
+> latter is absent (`feed-rs-2.4.0/src/parser/rss2/mod.rs:279-281`), so an RSS 2.0
+> item reads `updated = published`. Nothing does that on the RSS 1.0 path, so RSS
+> 1.0 really is NULL. Both are pinned by corpus fixtures because they are
+> dependency decisions, not ours.
+>
+> User-visible consequence: **`WHERE updated IS NULL` never matches an RSS 2.0
+> feed**, and `WHERE updated > published` never matches one either. To find items
+> a feed has actually revised, restrict to the dialects that carry a real update
+> time — `WHERE updated > published AND dialect IN ('atom', 'json-feed-1.x')` —
+> rather than relying on `updated` alone.
+
+Also note `categories` is **NULL**, not `[]`, when an entry carries no tags: an
+absent list reads the same as every other absent field on the row. `IS NULL` is
+the test; `cardinality(categories) = 0` does not match.
 
 `feed`, `feed_url`, `position`, and `window_status` are **provider-synthesized**,
 not wire fields, so they do not appear above. For `content` and `summary` the
@@ -356,6 +436,16 @@ unknown:<root element name>
 Note `atom-0.3` vs `atom-1.0` here against a single `atom` in `dialect` — the
 distinction that matters is in `dialect_declared`.
 
+`unknown:<root element name>` is **the XML fallback only**, not a universal one.
+The sniff reads a JSON document's `jsonfeed.org/version/` marker and recognizes
+exactly `1` and `1.1`; anything else — a JSON Feed declaring version `2`, or a
+JSON document with no version marker at all — leaves `dialect_declared` **NULL**.
+So `dialect_declared IS NULL` on a document that parsed as `json-feed-1.x` means
+"a version this build does not know", which is a different thing from the XML
+side's `unknown:` prefix. The `unknown:` form is also capped at the same 512
+characters `last_error` is, since the root element name is feed-supplied text of
+unbounded length.
+
 ### `conformance_notes`
 
 A JSON array of strings, or `[]` when the document is clean — "parsed with
@@ -376,10 +466,13 @@ document rescued by ampersand escaping alone does not also claim to have been
 re-encoded. Each rung is a byte-level no-op on well-formed input, which is a
 contract test rather than an aspiration.
 
-The content-type check only fires for media types that name a family
-(`application/rss+xml`, `application/atom+xml`, `application/feed+json`, and
-their siblings). Generic types — `text/xml`, `application/xml`,
-`application/octet-stream` — carry no opinion and produce no note. The declared
+The content-type check only fires for media types that name a family:
+`application/rss+xml` / `text/rss+xml` → `rss`, `application/atom+xml` /
+`text/atom+xml` → `atom`, and `application/feed+json` → `json`. Note that
+`application/json` and `text/json` **also** count as naming the JSON family, so
+an XML feed served as `application/json` does produce a note. Types that name no
+family carry no opinion and produce none: `text/xml`, `application/xml`,
+`application/octet-stream`, anything unrecognized, and an absent header. The declared
 and parsed dialects cannot disagree *in band*: `feed-rs` dispatches its XML
 parsers on root element plus version attribute, so a document either parses as
 what it declares or fails outright; the mismatch check is therefore against the
@@ -407,7 +500,9 @@ ones.
 
 A `<!DOCTYPE … [ … ]>` internal subset means the parse is refused before it
 starts: `last_status = 'error'`, and `last_error` reads
-`parse failed at refused-internal-dtd: internal DTD subset refused`. The guard
+`parse failed at refused-internal-dtd: internal DTD subset refused
+(entity-expansion guard)` — the parenthetical included, which is worth knowing if
+you are matching on the string. The guard
 runs twice — once on the raw bytes and once again on the sanitized bytes, since
 a rung can *reveal* a doctype the first pass could not see (a lowercase
 `<!doctype`, a control character splitting the keyword, a UTF-16 document).
@@ -532,14 +627,37 @@ extraction:
 - The conversion is **deterministic** — identical fragment in, byte-identical
   Markdown out. The fixture corpus pins converted output byte-for-byte, so a
   converter upgrade that changes output is a reviewed, visible change.
-- The output contains **no raw HTML**. Elements with a Markdown equivalent
+- **No HTML *tag* survives as markup.** Elements with a Markdown equivalent
   convert (headings, lists, links, emphasis, code, tables, images);
   `<script>`/`<style>` and comments are dropped wholesale; remaining markup is
-  reduced to its text content.
+  reduced to its text content. `<template>` content is dropped rather than
+  reduced to text — the converter walks a parsed tree, and its contents are not
+  in it.
 - It **never fails a feed**: pathological HTML degrades to text content, not to
   an error.
-- Plain-text values pass through untouched.
-- **No raw HTML is stored**, and **the source HTML is not retained.**
+- Plain-text values pass through untouched — **byte-exact, including anything
+  tag-shaped in them.** See the caveat below.
+- **The source HTML is not retained.**
+
+> **The claim is "no HTML tag survives as markup", not "no raw HTML is
+> stored".** The stronger claim would be false in two shapes, and both are
+> pinned by tests rather than being surprises:
+>
+> 1. **An attribute value's `<` survives unescaped**, because there is no
+>    Markdown place to escape it into. `<a href="#" title="<script>">t</a>`
+>    converts to `[t](# "<script>")`.
+> 2. **A plain-text-typed value is not converted at all**, so
+>    `<content type="text">&lt;script&gt;alert(1)&lt;/script&gt;</content>`
+>    stores the literal `<script>alert(1)</script>`. The XML entity references
+>    are transport encoding and are removed at extraction; what the feed *meant*
+>    was that text, and declaring `type="text"` is the feed asserting it is not
+>    markup. Skardi stores what it was told, which is the same passthrough
+>    described under [Field mapping](#field-mapping) — it is not a conversion
+>    bug, and the corpus carries a fixture for exactly this hostile shape.
+>
+> Neither changes what a consumer must do, because that was never "trust the
+> stored value": the two [rendering rules](#rendering-it) below are what make
+> the value safe to display, and they cover both shapes.
 
 The last point is a deliberate trade with a real cost: because the wire HTML is
 gone, a future better converter **cannot re-render history**. What remains
@@ -784,15 +902,30 @@ WHERE i.feed IS NULL
 ORDER BY f.name;
 ```
 
-The check never fetches, so it is cheap by construction rather than by timing.
-**Absence alone is not a verdict** — three different situations produce it, and
+> **This check fetches.** `feeds` is a pure state read, but the `items` side of
+> the anti-join carries no `feed` predicate, so it is a full scan: every
+> subscription past its TTL is fetched. A cold absence check over 50
+> subscriptions issues 50 requests. Run it *alongside* a read whose scan has
+> already warmed the cache and it costs nothing extra; run it on its own and it
+> is the most expensive query in this document.
+>
+> One consequence of the two tables being scanned in the same query: there is no
+> ordering guarantee between them, so the `feeds` side can be read before the
+> `items` side's fetch has recorded its result. A feed the same query just
+> fetched can therefore report `never` with a NULL `last_error` — the fetch
+> happened, the health write landed after the read. It self-corrects on the next
+> query; if a `never` row surprises you, read `feeds` again on its own (that read
+> really is free).
+
+**Absence alone is not a verdict** — several different situations produce it, and
 `last_status` is what separates them:
 
 | `last_status` | `item_count` | Diagnosis |
 |---|---|---|
 | `fresh` / `revalidated` | `0` | **Legitimately empty.** The feed was fetched and parsed successfully and simply has no entries right now. Nothing is wrong. (If the feed *does* have entries in a browser, check `dialect_declared` — see [Atom 0.3](#an-atom-03-document-parses-as-an-empty-feed).) |
 | `error` | `NULL` | **Dead.** The fetch or parse failed and no window was ever cached, so there is nothing to serve. `last_error` says why. |
-| `never` | `NULL` | **Never attempted.** Either no `items` scan has run since registration, or every scan so far pruned this feed away. |
+| `error` | non-`NULL` | **Dead, but it held a window once.** The `item_count` describes a window that is gone. Reached one way today: a `304` came back for a window the cache had already evicted — `last_error` says so, and the next scan refetches unconditionally. |
+| `never` | `NULL` | **Never attempted, or dropped at the deadline.** Either no `items` scan has run since registration, every scan so far pruned this feed away, or — the one that is easy to miss — every scan so far ran out of `scan_timeout_seconds` before this feed's turn. A serve dropped at the scan deadline writes **no** health state at all, exactly like a partition the plan never launched, so the feed keeps reading `never` with a NULL `last_error` indefinitely. `last_error` being NULL is what distinguishes all three of these from a real failure; nothing distinguishes them from *each other* in this table. If a `never` row persists across scans you believe should have reached it, raise `scan_timeout_seconds` and look at the `debug` log, where each serve records one line. |
 
 `stale-error` does not normally appear in this check at all: a feed in that
 state *has* a cached window and is serving it, so the anti-join does not find
@@ -838,11 +971,36 @@ unaffected: one dead feed among fifty never fails the scan.
 
 ### Reading `last_error`
 
-`last_error` is bounded at 512 characters and **contains no text taken from the
-feed body**, with one deliberate exception: a JSON Feed's declared `version`
-string when that version is unsupported (an unsupported version is
-undiagnosable without it). This is enforced by tests that embed a sentinel in
-body content across several document shapes and assert it never surfaces.
+`last_error` is bounded at 512 characters (the provider's `MAX_ERROR_CHARS`; the
+numeral here and in the semantics overlay are that constant's value, which is
+defined in `error.rs`).
+
+**What it may contain.** A `last_error` may quote a feed-supplied token that sat
+in a **structural position** — an element or attribute *name*, an attribute value
+the parser had to interpret (a `type`/MIME string), a declared version string, or
+the JSON member *value* that failed a type check. Those fragments are kept
+deliberately: they are what makes a malformed feed diagnosable, and an
+unsupported version or an unknown content type cannot be acted on without them.
+
+It does **not** quote a value the provider reads as content — the character data
+of an element, a `title`, a `description`, an entry body. That holds even when
+the document fails to parse for an unrelated reason: the error names the
+mismatched tag, not the `<summary>` next to it.
+
+**The cap is the only bound on a quoted fragment's length**, and that matters
+because a feed author who wants arbitrary text of their choosing in this column
+can get it, by putting that text in a structural position rather than a prose
+one. Measured: a ~1 KB string in a JSON Feed's `tags`, `authors`, `attachments`,
+or `size_in_bytes` is quoted verbatim up to the cap. Since the [closing health
+report](#the-closing-health-report) `SELECT`s this column straight into a reading
+agent's context, treat its contents as **feed-authored text**, on the same footing
+as `content` and `summary` — see [Feeding it to an LLM](#feeding-it-to-an-llm).
+
+The boundary above is measured at the pinned dependency versions and enforced by
+`parse_failure_last_error_quotes_structure_not_prose`, which runs a table of
+document shapes and asserts, shape by shape, which ones' text reaches the column
+and which do not. It is not a closed list of what a malformed document can
+produce; if a dependency upgrade moves the boundary, that test fails.
 
 By the shape of the message:
 
@@ -857,7 +1015,7 @@ By the shape of the message:
 | `too many redirects (limit 5)` | Fetch | The redirect chain was longer than the hop budget. |
 | `invalid feed url: …` | Fetch | The URL — or a redirect `Location` — is not a usable `http(s)` URL. |
 | `transport error: …` | Fetch | A connection or I/O failure, after retries were exhausted. |
-| `revalidated (304) but the cached window had already been evicted …` | Cache | A `304` came back for a window the bounded cache had already evicted. Self-correcting on the next scan — the next attempt refetches unconditionally. |
+| `revalidated (304) but the cached window had already been evicted …` | Cache | A `304` came back for a window the [bounded cache](#the-cache-is-bounded-and-windows-can-be-evicted) had already evicted. Self-correcting on the next scan — the next attempt refetches unconditionally. This is the one shape that pairs `last_status = 'error'` with a non-NULL `item_count`. |
 
 ### A feed serves rows but they are missing fields
 
@@ -883,8 +1041,11 @@ is a full `200` for every feed it visits — see
 
 ### A feed host is rate-limiting us
 
-`max_concurrent` is per process. If you run N replicas, that host sees up to N×
-the bound you configured — see [Politeness](#politeness-and-bounds).
+`max_concurrent` bounds one source's in-flight fetches, not one host's. Six
+subscriptions on the same host are six concurrent requests to it by default, and
+that multiplies again by the number of `rss` sources sharing the host and by the
+number of replicas — see [Politeness](#politeness-and-bounds) for the full
+worst case and the levers.
 
 ---
 

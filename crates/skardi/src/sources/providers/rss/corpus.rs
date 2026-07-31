@@ -235,6 +235,16 @@ const CORPUS: &[Case] = &[
             .golden(0, "hostile_markup_item0.md"),
     ),
     case(
+        "plaintext_typed_markup",
+        "plaintext_typed_markup.xml",
+        Some("application/atom+xml"),
+        // No golden: the point is that nothing converts this value, so the
+        // contract is the exact stored string, asserted by
+        // `plaintext_typed_content_is_stored_byte_exact` below rather than by a
+        // Markdown file that would imply a conversion happened.
+        Expect::parses("atom", "atom-1.0", 1).notes(&[]),
+    ),
+    case(
         "markdown_structures",
         "markdown_structures.xml",
         Some("application/rss+xml"),
@@ -289,6 +299,7 @@ fn fixture_bytes(name: &str) -> &'static [u8] {
         "naked_ampersand.xml" => include_bytes!("fixtures/naked_ampersand.xml"),
         "billion_laughs.xml" => include_bytes!("fixtures/billion_laughs.xml"),
         "hostile_markup.xml" => include_bytes!("fixtures/hostile_markup.xml"),
+        "plaintext_typed_markup.xml" => include_bytes!("fixtures/plaintext_typed_markup.xml"),
         "markdown_structures.xml" => include_bytes!("fixtures/markdown_structures.xml"),
         "truncated.xml" => include_bytes!("fixtures/truncated.xml"),
         "empty_feed.xml" => include_bytes!("fixtures/empty_feed.xml"),
@@ -754,6 +765,38 @@ fn hostile_markup_content_carries_no_tag_and_no_script_or_style_text() {
     // The `javascript:` URL is stored as link data (consumers filter schemes),
     // which is what keeps this from being a silent content loss.
     assert!(content.contains("javascript:void"), "{content:?}");
+}
+
+/// The counterpart to the test above, and the reason `docs/rss.md` claims "no
+/// HTML *tag* survives as markup" rather than "no raw HTML is stored".
+///
+/// An Atom value typed `type="text"` is not markup by the feed's own assertion,
+/// so it is not converted — it is stored byte-exact, and a feed that spells out
+/// HTML in escaped text gets that HTML back verbatim. The escaping is XML
+/// transport encoding and is removed at extraction, so `&lt;script&gt;` becomes
+/// a literal `<script>`.
+///
+/// Pinned as exact equality, both fields, deliberately: this is the shape the
+/// documentation's stronger claim denied, and a `contains` assertion would let a
+/// converter that started mangling text-typed values pass. Nothing here says the
+/// behaviour is *safe* to render — the two renderer rules in `docs/rss.md` are
+/// what make it safe, and they were always what the guarantee rested on.
+#[test]
+fn plaintext_typed_content_is_stored_byte_exact_tags_included() {
+    let row = item("plaintext_typed_markup", 0);
+
+    let content = row.content.clone().expect("content present");
+    assert_eq!(
+        content, "<script>alert(1)</script>",
+        "a text-typed value is stored verbatim, tag-shaped text included"
+    );
+
+    let summary = row.summary.clone().expect("summary present");
+    assert_eq!(
+        summary, "<b>not bold</b> & not escaped further",
+        "the same holds for `summary`, and the `&amp;` decodes to a bare `&` \
+         rather than being re-escaped"
+    );
 }
 
 #[test]

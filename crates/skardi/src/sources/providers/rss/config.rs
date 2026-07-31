@@ -20,7 +20,7 @@
 //!     - url: https://this-week-in-rust.org/rss.xml
 //!   # or: opml: subscriptions.opml # mutually exclusive with feeds:
 //!   ttl_seconds: 900               # 0 = always live
-//!   max_concurrent: 6              # fetch parallelism / per-host politeness bound (per process)
+//!   max_concurrent: 6              # in-flight fetches for THIS source; not per-host, not per-process
 //!   request_timeout_seconds: 10    # per-request timeout
 //!   scan_timeout_seconds: 60       # deadline for one full scan across all feeds
 //!   max_response_bytes: 5242880    # decoded-body cap per feed fetch
@@ -35,7 +35,8 @@ use super::error::RssError;
 
 /// Default per-feed cache TTL, in seconds (15 minutes).
 const DEFAULT_TTL_SECONDS: u64 = 900;
-/// Default fetch parallelism / per-host politeness bound, per process.
+/// Default in-flight fetch bound for one `rss` source. See
+/// [`RssConfig::max_concurrent`] for what it does and does not bound.
 const DEFAULT_MAX_CONCURRENT: usize = 6;
 /// Default timeout for a single feed HTTP request.
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 10;
@@ -122,7 +123,10 @@ pub struct RssConfig {
     pub ttl_seconds: u64,
 
     /// Maximum number of feeds fetched concurrently: both the fetch
-    /// parallelism and the per-host politeness bound, per process.
+    /// parallelism for THIS source's feeds. It is neither a per-host nor a
+    /// per-process bound: the semaphore lives on one `RssEngine` and one engine
+    /// is built per registered source (`mod.rs`), so two `rss` sources in one
+    /// process permit the sum, and nothing anywhere accounts per host.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 

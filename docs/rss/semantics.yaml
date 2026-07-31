@@ -27,17 +27,24 @@ spec:
       description: >-
         Fetch health, one row per configured subscription, always — the table
         stays total over the subscription list even for feeds that have never
-        been fetched. Reading it issues ZERO HTTP requests at any moment,
+        been fetched. Reading THIS TABLE issues ZERO HTTP requests at any moment,
         including right after a failure, so it is cheap by construction. This
         is the authoritative signal for a feed that served no rows: absence has
         no in-band carrier in `items`, so run the anti-join
         `SELECT f.name, f.last_status, f.last_error FROM news.main.feeds f LEFT
         JOIN news.main.items i ON i.feed = f.name WHERE i.feed IS NULL`
-        alongside any read where completeness matters. Absence alone is not a
-        verdict: `last_status = 'fresh'` with `item_count = 0` is a
-        legitimately empty feed, `'error'` is a dead one, and `'never'` means no
-        scan has visited it yet. The subscription list is configuration and is
-        not SQL-mutable.
+        alongside any read where completeness matters. NOTE that the anti-join
+        DOES fetch: its `items` side has no `feed` predicate, so it is a full
+        scan and every subscription past its TTL is fetched — cheap after a scan
+        has warmed the cache, expensive cold. It can also report 'never' for a
+        feed that same query just fetched, since the two tables are scanned with
+        no ordering guarantee between them; re-read `feeds` on its own to
+        confirm. Absence alone is not a verdict: `last_status = 'fresh'` with
+        `item_count = 0` is a legitimately empty feed, `'error'` is a dead one,
+        and `'never'` means no scan has visited it yet — or that every scan so
+        far hit the scan deadline before reaching it, which writes no health
+        state at all. The subscription list is configuration and is not
+        SQL-mutable.
       columns:
         - name: name
           description: >-
@@ -75,16 +82,30 @@ spec:
             connecting.
         - name: last_error
           description: >-
-            Why the last attempt failed, bounded at 512 characters and carrying
-            no text from the feed body. The prefix names the stage: 'egress
+            Why the last attempt failed, bounded at 512 characters (the
+            provider's MAX_ERROR_CHARS). TREAT AS FEED-AUTHORED TEXT: it may
+            quote a feed-supplied token that sat in a structural position — an
+            element or attribute name, a type/MIME string, a declared version
+            string, or the JSON member value that failed a type check — and the
+            512-char cap is the only bound on how long such a fragment is. It
+            does not quote what the provider reads as content (character data, a
+            title, a description, an entry body), even when the document fails
+            for an unrelated reason. The prefix names the stage: 'egress
             blocked: …', 'parse failed at refused-internal-dtd: …', 'parse
             failed at strict-parse: …', 'http status <n>', 'request timed out
-            after <n>s', 'response exceeded <n> bytes'.
+            after <n>s', 'response exceeded <n> bytes', 'too many redirects
+            (limit 5)', 'invalid feed url: …', 'transport error: …', or
+            'revalidated (304) but the cached window had already been
+            evicted …'.
         - name: etag
           description: >-
             Stored ETag validator, sent as If-None-Match on the next refresh.
             Process-lifetime state: a restart clears it, so the first scan after
-            a restart is a full 200 rather than a 304.
+            a restart is a full 200 rather than a 304. Also NULL once the feed's
+            cached window has been evicted under the cache's 64 MiB window
+            budget — the validators live on the window, while `last_status` and
+            `item_count` survive on the health record, so this column reading
+            NULL beside a 'fresh' status means the next fetch is unconditional.
         - name: last_modified
           description: >-
             Stored Last-Modified validator, sent as If-Modified-Since on the
@@ -101,7 +122,11 @@ spec:
             'rss-2.0' / 'atom-0.3' / 'atom-1.0' / 'json-feed-1' /
             'json-feed-1.1', or 'unknown:<root element>'. Keeps the version
             detail the parsed dialect collapses. A value of 'atom-0.3' with
-            `item_count = 0` is the known empty-parse case, not a fault.
+            `item_count = 0` is the known empty-parse case, not a fault. The
+            'unknown:' form is the XML fallback ONLY, and is capped at 512
+            characters because the root element name is feed-supplied: a JSON
+            document whose version marker is neither 1 nor 1.1 — version 2, say —
+            leaves this column NULL rather than reporting 'unknown:…'.
         - name: conformance_notes
           description: >-
             JSON array of observations about the document; '[]' means clean and
@@ -115,7 +140,10 @@ spec:
           description: >-
             Entries in the currently cached window. NULL when no window was ever
             built. A failed refresh leaves it describing the window still being
-            served, not the failed attempt.
+            served, not the failed attempt — and after a 304 whose window had
+            already been evicted it describes a window that is gone, which is the
+            one shape where a non-NULL `item_count` sits beside `last_status =
+            'error'`.
 
     - name: news.main.items
       description: >-
@@ -130,20 +158,29 @@ spec:
         satisfied, and the feeds it never launched are neither fetched nor
         health-refreshed. Use `ORDER BY … LIMIT` (a Top-K consumes every
         partition) or no `LIMIT`. (2) A feed that served zero rows leaves no
-        trace here at all — check `news.main.feeds` for it. Only `feed` and
-        `feed_url` equality, and `IN` lists of four or more values, prune which
-        feeds are fetched; everything else filters after the fetch.
+        trace here at all — check `news.main.feeds` for it. Three predicate
+        shapes over `feed` or `feed_url` prune which feeds are fetched, and
+        nothing else does: equality against a literal (either operand order), a
+        non-negated `IN` list of literals AT ANY LENGTH, and a disjunction of
+        either of those over ONE of the two columns (`feed = 'a' OR feed = 'c'`
+        prunes to exactly those two). A disjunction mixing the two columns
+        (`feed = 'a' OR feed_url = '…'`) or containing any non-prunable branch
+        fetches everything. Everything else filters after the fetch — correct
+        rows, wasted requests.
       columns:
         - name: feed
           description: >-
             The subscription's configured name (`feeds.name`). Synthesized by
-            the provider, not a wire field. Equality and 4+-value `IN`
-            predicates on this column prune the scan to those feeds before any
-            HTTP request.
+            the provider, not a wire field. Equality, `IN` lists of any length,
+            and `OR` chains of either over this column alone prune the scan to
+            those feeds before any HTTP request. Names matching no subscription
+            contribute nothing rather than erroring.
         - name: feed_url
           description: >-
-            The subscribed feed URL. Provider-synthesized. Also prunable; two
-            subscriptions may share a URL, and pruning on it visits both.
+            The subscribed feed URL. Provider-synthesized. Prunable by the same
+            three shapes as `feed`, but a disjunction may not MIX the two
+            columns. Two subscriptions may share a URL, and pruning on it visits
+            both.
         - name: guid
           description: >-
             Stable item identity, unique within a feed. RSS 2.0 <guid> (falling
@@ -174,17 +211,26 @@ spec:
         - name: updated
           description: >-
             Last-modified time, normalized to Timestamp(ms, UTC). Atom <updated>
-            (RFC 3339), JSON Feed `date_modified`. RSS 2.0 and 1.0 have no
-            equivalent, so it is NULL there.
+            (RFC 3339), JSON Feed `date_modified`. Neither RSS dialect has an
+            update element, but THE TWO DIFFER: feed-rs copies <pubDate> into
+            `updated` for RSS 2.0, so an RSS 2.0 item reads `updated =
+            published` and NEVER NULL, while RSS 1.0 really is NULL. So `WHERE
+            updated IS NULL` never matches an RSS 2.0 feed and `updated >
+            published` never matches one either — to find revised items,
+            restrict to `dialect IN ('atom', 'json-feed-1.x')`.
         - name: content
           description: >-
             Full entry body as MARKDOWN, converted once at extraction. RSS
             2.0/1.0 content:encoded, Atom <content>, JSON Feed `content_html` /
             `content_text`. HTML-typed values are converted deterministically
-            and contain no raw HTML (script/style dropped, unknown markup
-            reduced to its text); plain-text values pass through unchanged. The
-            source HTML is not retained. Prompt-ready as-is, and chunkable with
-            chunk('markdown', …).
+            and no HTML TAG survives as markup (script/style dropped, unknown
+            markup reduced to its text). That is narrower than "no raw HTML": an
+            attribute value's `<` survives unescaped, and a plain-text-typed
+            value (Atom type="text", JSON Feed `content_text`) passes through
+            BYTE-EXACT, so a feed declaring text can store a literal
+            `<script>…</script>`. UNTRUSTED FEED-AUTHORED TEXT either way —
+            disable raw HTML in any renderer and filter link schemes. The source
+            HTML is not retained. Chunkable with chunk('markdown', …).
         - name: summary
           description: >-
             Short entry body as Markdown, same conversion as `content`. RSS
@@ -193,7 +239,9 @@ spec:
         - name: categories
           description: >-
             Tags as a List<Utf8>. RSS 2.0 <category>*, RSS 1.0 dc:subject*, Atom
-            <category term>*, JSON Feed `tags[]`.
+            <category term>*, JSON Feed `tags[]`. An entry with no tags is NULL,
+            not an empty list — test it with `IS NULL`, not
+            `cardinality(categories) = 0`.
         - name: enclosure_url
           description: >-
             URL of the entry's primary attachment (podcast audio, video). RSS
