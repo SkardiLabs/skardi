@@ -306,10 +306,39 @@ fn build_config(opts: &ParseOptions) -> LiteParseConfig {
     cfg
 }
 
+/// Running tally of `image_store` write attempts across a scan.
+///
+/// An individual failed write is not fatal — the affected row simply carries no
+/// `page_image_ref` / crop ref. But that degradation is invisible in the result
+/// set, so the counts are aggregated here and inspected once at the end of the
+/// scan (see [`parse_source_blocking`]) rather than only appearing as one
+/// `warn!` per object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WriteTally {
+    attempted: usize,
+    failed: usize,
+}
+
+impl WriteTally {
+    fn record(&mut self, ok: bool) {
+        self.attempted += 1;
+        if !ok {
+            self.failed += 1;
+        }
+    }
+
+    /// Every attempted write failed — indistinguishable, from the rows alone,
+    /// from `image_store` never having been configured.
+    fn all_failed(&self) -> bool {
+        self.attempted > 0 && self.failed == self.attempted
+    }
+}
+
 /// Parse a single file (given its raw bytes) into its pages. Errors propagate to
 /// the caller, which isolates them per-file. `write_store` is the resolved
 /// `image_store` backend (present when `image_store` is configured); crops/page
-/// renders are written through it for both local and S3 targets.
+/// renders are written through it for both local and S3 targets, and each
+/// attempt is recorded in `writes`.
 ///
 /// Inputs are fed to liteparse as `PdfInput::Bytes`, so routing to LibreOffice
 /// for non-PDF inputs is by content sniff (see the design doc), not extension.
@@ -318,6 +347,7 @@ async fn parse_file(
     rel_path: &str,
     opts: &ParseOptions,
     write_store: Option<&BlobStore>,
+    writes: &mut WriteTally,
 ) -> Result<Vec<ParsedPage>> {
     let mut cfg = build_config(opts);
 
@@ -362,7 +392,9 @@ async fn parse_file(
                 for shot in shots {
                     let uri = page_image_uri(opts.image_store.as_deref(), rel_path, shot.page_num);
                     if let Some(store) = write_store {
-                        if let Err(e) = write_crop(store, &uri, &shot.image_bytes).await {
+                        let res = write_crop(store, &uri, &shot.image_bytes).await;
+                        writes.record(res.is_ok());
+                        if let Err(e) = res {
                             tracing::warn!(
                                 "documents: failed to write page image {}: {:#}",
                                 uri,
@@ -411,7 +443,9 @@ async fn parse_file(
                 let uri =
                     image_ref_uri(opts.image_store.as_deref(), rel_path, &img.id, &img.format);
                 if let Some(store) = write_store {
-                    if let Err(e) = write_crop(store, &uri, &img.bytes).await {
+                    let res = write_crop(store, &uri, &img.bytes).await;
+                    writes.record(res.is_ok());
+                    if let Err(e) = res {
                         tracing::warn!("documents: failed to write image crop {}: {:#}", uri, e);
                         continue;
                     }
@@ -582,6 +616,7 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
 
     let mut rows = Vec::new();
     let mut ok_files = 0usize;
+    let mut writes = WriteTally::default();
     for (loc, rel_path) in entries {
         let bytes = match runtime.block_on(read_store.get(&loc)) {
             Ok(b) => b,
@@ -590,7 +625,13 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
                 continue;
             }
         };
-        match runtime.block_on(parse_file(&bytes, &rel_path, opts, write_store.as_ref())) {
+        match runtime.block_on(parse_file(
+            &bytes,
+            &rel_path,
+            opts,
+            write_store.as_ref(),
+            &mut writes,
+        )) {
             Ok(mut page_rows) => {
                 ok_files += 1;
                 rows.append(&mut page_rows);
@@ -609,6 +650,30 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
         anyhow::bail!(
             "documents: all {total} matched object(s) failed to fetch/parse — treating as a \
              hard error rather than an empty result (check credentials/permissions)"
+        );
+    }
+
+    // Same reasoning applied to the write side. Individual crop/page-image write
+    // failures only `warn!` and drop the ref, which is invisible in the result
+    // set: rows come back with `page_image_ref = NULL` exactly as if
+    // `render_page_images` were off. The registration preflight covers `s3://`
+    // targets at startup, but not credentials that expire mid-scan, and not a
+    // local `image_store` at all — so a wholesale write failure is escalated
+    // here rather than silently degrading every row.
+    if writes.all_failed() {
+        anyhow::bail!(
+            "documents: all {} image_store write(s) failed — refusing to return rows whose \
+             page_image_ref/image_refs would silently be empty (check write permissions on \
+             image_store: s3:PutObject for s3://, filesystem permissions for a local path)",
+            writes.attempted
+        );
+    }
+    if writes.failed > 0 {
+        tracing::warn!(
+            "documents: {}/{} image_store write(s) failed; the affected rows carry no \
+             page_image_ref/image_refs (individual failures logged above)",
+            writes.failed,
+            writes.attempted
         );
     }
 
@@ -859,6 +924,81 @@ mod tests {
             image_ref_uri(Some("/tmp/out/"), "a.pdf", "img0", "png"),
             "/tmp/out/a.pdf_img0.png"
         );
+    }
+
+    #[test]
+    fn write_tally_only_escalates_on_wholesale_failure() {
+        // Nothing attempted (no image_store, or nothing to write) is not a failure.
+        let empty = WriteTally::default();
+        assert!(!empty.all_failed());
+
+        // Partial failure degrades those rows but must not fail the scan.
+        let mut partial = WriteTally::default();
+        partial.record(true);
+        partial.record(false);
+        assert_eq!((partial.attempted, partial.failed), (2, 1));
+        assert!(
+            !partial.all_failed(),
+            "a partial write failure must not fail the whole scan"
+        );
+
+        // Every write failing is indistinguishable from an unconfigured
+        // image_store in the rows, so it escalates.
+        let mut total = WriteTally::default();
+        total.record(false);
+        total.record(false);
+        assert!(total.all_failed());
+    }
+
+    #[tokio::test]
+    async fn wholesale_image_store_write_failure_is_an_error() {
+        // A read-only local `image_store` gets no preflight at all (that only
+        // covers `s3://`), so this guard is the only thing standing between a
+        // permission problem and every row silently losing its image refs.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/documents/two_pages.pdf",
+            src.path().join("a.pdf"),
+        )
+        .unwrap();
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().join("readonly");
+        std::fs::create_dir(&store_path).unwrap();
+        // Drop write permission so every `write_crop` fails.
+        let mut perms = std::fs::metadata(&store_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o500);
+        }
+        std::fs::set_permissions(&store_path, perms).unwrap();
+
+        let opts = ParseOptions {
+            recursive: false,
+            include_globs: vec!["*.pdf".into()],
+            image_store: Some(store_path.to_string_lossy().into_owned()),
+            render_page_images: true,
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let err = parse_source(src.path().to_str().unwrap(), &opts)
+            .expect_err("every image_store write failing must be a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("image_store write(s) failed"),
+            "unexpected error: {msg}"
+        );
+
+        // Restore permissions so the tempdir can be cleaned up.
+        let mut perms = std::fs::metadata(&store_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+        }
+        std::fs::set_permissions(&store_path, perms).unwrap();
     }
 
     #[test]
