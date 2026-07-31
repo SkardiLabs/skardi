@@ -105,3 +105,7 @@ tokio-test = "0.4"
 tempfile = { workspace = true }
 redis-test = "0.13.0"
 gguf-rs-lib = "0.2"
+# Seeding / cleaning object-store fixtures in the opt-in `documents_s3_live`
+# integration test (it drives S3 directly, not through the connector).
+object_store = { workspace = true }
+futures = { workspace = true }

@@ -861,6 +861,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn s3_image_refs_round_trip_back_into_a_loc() {
+        // The refs this module *writes* into `page_image_ref` / `image_refs` are
+        // the same strings `llm_extract`'s image fetch later resolves. If the two
+        // ever disagree, multimodal escalation silently breaks on S3 — so pin the
+        // round-trip here rather than only asserting the string shape.
+        let store = "s3://my-bucket/extracted";
+
+        let page_uri = page_image_uri(Some(store), "nested/sub/report.pdf", 2);
+        assert_eq!(
+            page_uri,
+            "s3://my-bucket/extracted/nested_sub_report.pdf_page_2.png"
+        );
+        assert_eq!(
+            Loc::parse(&page_uri).unwrap(),
+            Loc::S3 {
+                bucket: "my-bucket".into(),
+                key: "extracted/nested_sub_report.pdf_page_2.png".into(),
+            },
+            "page_image_ref must parse back to the object it was written to"
+        );
+
+        let crop_uri = image_ref_uri(Some(store), "nested/sub/report.pdf", "img0", "png");
+        assert_eq!(
+            Loc::parse(&crop_uri).unwrap(),
+            Loc::S3 {
+                bucket: "my-bucket".into(),
+                key: "extracted/nested_sub_report.pdf_img0.png".into(),
+            },
+            "image_refs entries must parse back to the object they were written to"
+        );
+
+        // A trailing slash on the configured store must not produce a `//` key,
+        // which S3 treats as a distinct (empty-named) path segment.
+        let slashed = page_image_uri(Some("s3://my-bucket/extracted/"), "a.pdf", 1);
+        assert_eq!(
+            Loc::parse(&slashed).unwrap(),
+            Loc::S3 {
+                bucket: "my-bucket".into(),
+                key: "extracted/a.pdf_page_1.png".into(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn list_docs_filters_by_glob_and_respects_recursive() {
         let dir = tempfile::tempdir().unwrap();
