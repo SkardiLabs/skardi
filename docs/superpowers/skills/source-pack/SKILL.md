@@ -91,7 +91,9 @@ before deciding anything. Summary of the rules that have survived review:
 ## Phase 3 — Implement
 
 Follow [references/implementation.md](references/implementation.md)
-§Implementation for the full checklist: pack file, registry entry, the
+§Implementation for the full checklist: the pack's YAML asset (packs are
+declarative embedded YAML validated by `packs/loader.rs` — authoring is
+data, not Rust) plus its accessor module and registry entry, the
 six fixture categories (including schema-mismatch), fingerprint pinning
 (capture → pin → sync test → contract-serving mocks → drift-refusal
 e2e), per-declaration end-to-end tests through `MockGateway`, and the
@@ -104,9 +106,9 @@ added `Fidelity` and list plucking; 5.2 added `total_pages_path`,
 (optional fields, `None` defaults) and test them at both the engine and
 the pack level. Before relying on any engine invariant this skill
 names, verify it exists on your base branch — see the implementation
-reference's **Engine baseline** section; a base predating milestone 5.2
-lacks the cursor/total safety guardrails entirely, and adding them is
-then prerequisite work.
+reference's **Engine baseline** section; `main` carries the full
+baseline today, but an older base may lack part of it, and adding the
+missing invariant (with regression tests) is then prerequisite work.
 
 ## Phase 4 — Self-review before any PR
 

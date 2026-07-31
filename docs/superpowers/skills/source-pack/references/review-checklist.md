@@ -15,11 +15,16 @@ The worst failure class: wrong results with a green status.
       end-of-collection spellings. Anything else that stops a scan —
       wrong-typed continuation state, structural traversal failure —
       fails loudly (`PaginationCursorInvalid`, `PaginationTotalInvalid`,
-      propagated row-path errors), never reads as "done". These
-      guardrails are the 5.2 engine baseline — VERIFY they exist on your
-      branch (implementation.md §Engine baseline); on a pre-5.2 base,
-      adding them (with regression tests) is prerequisite work, not a
-      checkbox to assume.
+      `PaginationRawPageSizeInvalid`, propagated row-path errors), never
+      reads as "done". VERIFY these guardrails exist on your branch
+      (implementation.md §Engine baseline); on an older base, adding them
+      (with regression tests) is prerequisite work, not a checkbox to
+      assume.
+- [ ] Post-pagination filtering checked: if the executor filters the
+      fetched page, the table declares `raw_page_size_path` (or an
+      authoritative total) — a filtered count is never a termination
+      signal, and a missing signal means upstream contribution or
+      deferral, not a heuristic.
 - [ ] Short/empty non-final pages cannot truncate: if the envelope has
       an authoritative total, the strategy declares `total_pages_path`;
       if not, the heuristic's limits are documented.
@@ -42,7 +47,9 @@ The worst failure class: wrong results with a green status.
       domain; every string-enum push is `Inexact`.
 - [ ] Fingerprints pinned from the live capture; sync test locks pin ↔
       contract fixture; drift-refusal e2e exists; mocks serve the
-      captured contracts so the gate's pass side actually runs.
+      captured contracts so the gate's pass side actually runs; the
+      fingerprint coverage gap (uncovered mapped columns) is pinned per
+      table.
 - [ ] Deliberate gaps (unmapped filters, deferred tables, `error_path:
       None`) each have a module-doc rationale AND a guard test.
 

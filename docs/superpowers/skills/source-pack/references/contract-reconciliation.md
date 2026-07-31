@@ -95,6 +95,17 @@ executors. This is the only reliable answer to:
   filter pushdown fidelity.
 - **Emitted output construction** — where the row array, totals, and
   cursors really live.
+- **Pagination soundness** — specifically whether the executor filters
+  rows AFTER paginating (`.filter(...)` on the fetched page). If it does,
+  the filtered page length carries no termination information and NO
+  pack-side termination rule is sound (a short page may be mid-collection;
+  an all-filtered page is empty but non-final). Check whether the
+  response carries a raw-length or total signal (`pageInfo.fetched`,
+  `paging.pages`) and declare it; if the gateway destroys the signal
+  entirely, the fix belongs UPSTREAM — contribute it (precedent:
+  oomol-lab/open-connector#228 added `pageInfo.fetched` to
+  `list_repository_issues`) or defer the table per the admission gate.
+  Never ship a table whose termination is known-unsound.
 
 ## 5. Validate generated inputs without provider credentials
 

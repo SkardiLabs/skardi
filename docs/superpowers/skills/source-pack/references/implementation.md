@@ -2,29 +2,25 @@
 
 ## Engine baseline — verify before relying
 
-This guide references engine capabilities that landed with milestone 5.2
-(PR #172); a base branch that predates it lacks ALL of them. Before
-designing anything, verify your baseline:
+Everything this guide references now ships on `main`: embedded-YAML packs
+with the validating loader, fingerprint pinning, `total_pages_path` and
+`raw_page_size_path` on `PageNumber`, `PaginationCursorInvalid` /
+`PaginationRawPageSizeInvalid`, per-mapping `ValueFormat` (incl.
+`Verbatim`), `FieldType::TimestampSecondsUtc`, `FixedValue::StrList`,
+`SourcePackTable::error_path`, and `testutil::EnvVarGuard` +
+`fingerprint_uncovered_columns`. Still verify rather than assume — every
+safety invariant this guide names is a claim about code, and your base
+branch may predate one of them:
 
 ```bash
-git grep -l "PaginationCursorInvalid\|total_pages_path\|ValueFormat\|TimestampSecondsUtc\|EnvVarGuard" \
+git grep -l "raw_page_size_path\|PaginationCursorInvalid\|fingerprint_uncovered_columns" \
   crates/skardi/src/sources/providers/open_connector/
 ```
 
-Zero hits means the base still has the pre-5.2 engine, where — most
-dangerously — a non-string cursor and every row-path failure read as
-"scan complete": a drifted gateway truncates results silently. In that
-case, bringing the engine up to this baseline (with its regression
-tests) is a PREREQUISITE step of your milestone, not an assumption to
-inherit. More generally: every safety invariant this guide names is a
-claim about code — verify it exists (and its failure-mode test passes)
-on YOUR branch before leaning on it. Documentation snapshots go stale;
-`git grep` does not.
-
-The 5.2 baseline features referenced below: `total_pages_path` on
-`PageNumber`, `PaginationCursorInvalid`, per-mapping `ValueFormat`,
-`FieldType::TimestampSecondsUtc`, `FixedValue::StrList`,
-`SourcePackTable::error_path`, `testutil::EnvVarGuard`.
+Zero hits for any of these means your base predates part of the baseline;
+bringing the engine up to it (with its regression tests) is a
+PREREQUISITE step of your milestone, not an assumption to inherit.
+Documentation snapshots go stale; `git grep` does not.
 
 ## Design
 
@@ -56,6 +52,13 @@ Match the strategy to what the executor actually emits (phase 1):
   fails as `PaginationCursorInvalid`; a repeated cursor fails as
   `PaginationLoop`. Use the page size the provider recommends as its
   ceiling.
+- `raw_page_size_path` (mutually exclusive with `total_pages_path`): for
+  gateways that filter rows AFTER paginating and report the raw page
+  length (e.g. `$.pageInfo.fetched` on `github.list_repository_issues`,
+  upstream oomol-lab/open-connector#228). The scan continues while the
+  RAW page was full, no matter how short or empty the filtered rows are —
+  the filtered count carries no termination information for such actions,
+  and the heuristic would silently truncate.
 - The request page size doubles as the limit-pushdown ceiling — use the
   provider's maximum.
 
@@ -120,10 +123,23 @@ the gateway-failure path.
 
 Work module by module; the reference packs are the style guide.
 
-1. **`packs/<provider>.rs`** — table statics, a
-   `pub(crate) static <PROVIDER>_PACK: SourcePack`, registry entry in
-   `source_pack.rs` builtins (short-name uniqueness test will catch
-   collisions). Module doc records every design decision with rationale.
+1. **`packs/<provider>.yaml` + `packs/<provider>.rs`** — packs are
+   embedded YAML assets. Author the declaration in the YAML (`kind: pack`,
+   `pack:`, `version:`, `tables:` keyed by bare short names — the id is
+   derived as `<pack>.<table>`; per-table `action`, `row_path`,
+   `fingerprint`, `pagination`, `resources`, `fixed_inputs`, `columns`,
+   `filters`, `error_path`; design rationale as YAML comments). The `.rs`
+   module is a small accessor (`OnceLock` + `loader::builtin` +
+   `include_str!`) plus the module doc and the test suite; add the
+   registry entry in `source_pack.rs` builtins and a `mod` line in
+   `packs/mod.rs`. The loader validates structure FOR you at parse time —
+   unknown keys, duplicate columns, filters on undeclared columns,
+   duplicate mappings or shared filter inputs, resource/fixed-input/
+   pagination key collisions, zero page sizes, non-finite floats, and
+   path validity all fail as `SourcePackAssetInvalid` diagnostics — so
+   your authoring attention goes to the SEMANTIC choices the loader
+   cannot check: which action, which columns, which fidelity, which
+   termination signal.
 2. **Fixtures** (`packs/fixtures/<provider>/*.json`) — redacted,
    provider-shaped pages covering ALL SIX admission-gate categories:
    null-bearing, null-parent, empty-list/empty-page, nested,
@@ -146,7 +162,13 @@ Work module by module; the reference packs are the style guide.
      `<provider>_discovery(path)` helper), so every e2e registration
      exercises the gate's pass side;
    - one drift-refusal e2e: a stub serving a different schema must fail
-     registration with `ActionContractMismatch` naming table and action.
+     registration with `ActionContractMismatch` naming table and action;
+   - a coverage-gap pin: `testutil::fingerprint_uncovered_columns` walks
+     every mapped path through the captured row-item schema, and the pack
+     test asserts the exact uncovered set per table (columns riding
+     `additionalProperties` passthrough sit outside the fingerprint gate;
+     their drift surfaces at scan time). An empty set is the goal;
+     pinning a non-empty one makes the gap a reviewed fact.
 4. **End-to-end tests** via `MockGateway` (`testutil.rs` — use
    `envelope_ok` / `envelope_err` / `discovery_ok`; the mocks speak the
    real protocol: uniform envelope, `POST /v1/actions/:id`, camelCase).
