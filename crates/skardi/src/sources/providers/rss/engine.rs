@@ -216,8 +216,10 @@ pub struct RssEngine {
     by_name: HashMap<String, usize>,
     fetcher: FeedFetcher,
     cache: Arc<dyn FeedCache>,
-    /// Politeness bound: at most `max_concurrent` feeds in flight per
-    /// process, and the queue a closed launch gate cancels a feed out of.
+    /// Politeness bound: at most `max_concurrent` of this source's feeds in
+    /// flight, and the queue a closed launch gate cancels a feed out of. One
+    /// engine is built per registered source, so this bounds a source — not a
+    /// process, and not a host.
     semaphore: Arc<Semaphore>,
     ttl: Duration,
     scan_timeout: Duration,
@@ -377,7 +379,8 @@ impl RssEngine {
             );
         }
 
-        // Politeness: at most `max_concurrent` feeds in flight per process.
+        // Politeness: at most `max_concurrent` of *this source's* feeds in
+        // flight. Not per host and not per process — see the field's doc.
         // The permit is released when this guard drops, whether this future
         // completes or is cancelled mid-fetch — `SemaphorePermit`'s `Drop`
         // calls `Semaphore::add_permits` (tokio 1.52.3,
@@ -629,7 +632,7 @@ impl RssEngine {
             site_url: observation.site_url,
             description: observation.description,
             last_fetch_ms: observation.last_fetch_ms,
-            last_status: observation.last_status.as_str(),
+            last_status: observation.last_status,
             http_status: observation.http_status,
             last_error: observation.last_error,
             etag,
@@ -764,6 +767,7 @@ mod tests {
     use arrow::array::{Array, UInt64Array};
 
     use super::*;
+    use crate::sources::providers::open_connector::testutil::{CapturedEvent, capture_events};
     use crate::sources::providers::rss::config::{FeedSubscription, inline_config};
     use crate::sources::providers::rss::testutil::{
         MockFeedServer, MockResponse, RSS2_MINIMAL, str_col, str_opt_col,
@@ -892,6 +896,23 @@ mod tests {
         )
     }
 
+    /// Captured events with `message`, in emission order.
+    ///
+    /// Mirrors `exec.rs`'s helper of the same name; the two cannot be shared
+    /// because each lives inside its own module's `#[cfg(test)] mod tests`.
+    fn events_with_message(
+        events: &Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+        message: &str,
+    ) -> Vec<CapturedEvent> {
+        events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|event| event.message == message)
+            .cloned()
+            .collect()
+    }
+
     fn u64_col(batch: &RecordBatch, name: &str) -> Vec<Option<u64>> {
         let index = batch.schema().index_of(name).expect("column exists");
         let column = batch
@@ -946,6 +967,12 @@ mod tests {
 
     #[tokio::test]
     async fn failed_refetch_serves_stale_rows_and_records_error() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = Arc::clone(&hits);
         let server = MockFeedServer::start(move |_| {
@@ -998,6 +1025,12 @@ mod tests {
     /// by configuration — hence [`AlwaysExpired`].
     #[tokio::test]
     async fn stale_error_then_304_returns_to_revalidated_and_clears_the_error() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = Arc::clone(&hits);
         let server = MockFeedServer::start(move |req| {
@@ -1080,6 +1113,12 @@ mod tests {
 
     #[tokio::test]
     async fn never_fetched_failure_yields_zero_rows_and_error_status() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let server = MockFeedServer::start(|_| MockResponse::status(500)).await;
         let engine = test_engine(&server, &[("a", "/f.xml")], 900);
 
@@ -1109,6 +1148,12 @@ mod tests {
 
     #[tokio::test]
     async fn parse_failure_records_stage_and_declared_dialect() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         // Declares rss-2.0 and then stops mid-element: the sniff succeeds,
         // the parse cannot.
         let server = MockFeedServer::start(|_| {
@@ -1150,6 +1195,12 @@ mod tests {
     /// all four of which are `Kept` rows below.
     #[tokio::test]
     async fn parse_failure_last_error_quotes_structure_not_prose() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         const SENTINEL: &str = "SHOULD-NOT-LEAK";
 
         /// Where a shape's sentinel is expected to end up.
@@ -1362,6 +1413,12 @@ mod tests {
     /// here and see [`MAX_ERROR_CHARS`] of it stored.
     #[tokio::test]
     async fn a_json_type_mismatch_quotes_arbitrary_text_up_to_the_cap() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let filler = "arbitrary feed-chosen text ".repeat(40);
         let body = format!(
             concat!(
@@ -1405,6 +1462,12 @@ mod tests {
     /// someone "fixed" it without updating the module doc.
     #[tokio::test]
     async fn json_unsupported_version_is_body_text_kept_in_last_error() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let body = r#"{"version":"SHOULD-NOT-LEAK-1.9","title":"t","items":[]}"#;
         let server = MockFeedServer::start(move |_| {
             MockResponse::new(200, body.as_bytes().to_vec())
@@ -1430,6 +1493,12 @@ mod tests {
     /// write.
     #[tokio::test]
     async fn a_huge_json_version_is_still_capped() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let body = format!(
             r#"{{"version":"{}","title":"t","items":[]}}"#,
             "v".repeat(20_000)
@@ -1448,8 +1517,72 @@ mod tests {
         assert_eq!(error.chars().count(), MAX_ERROR_CHARS);
     }
 
+    /// AC4's "a tracing warning is emitted — nothing silent" clause, pinned.
+    ///
+    /// Every degraded feed emits exactly one `warn` naming the source, the
+    /// subscription, its URL, and the error — the log-side half of a degradation
+    /// that `feeds.last_error` carries in band. Nothing asserted this before, so
+    /// deleting the `warn!` would have been invisible.
+    ///
+    /// Note the [`capture_events`] contract this test depends on, and why every
+    /// other test above that reaches `degrade` now holds a guard too: `tracing`
+    /// caches a callsite's `Interest` globally on first use, so a guardless test
+    /// that reached this `warn!` first could cache `Interest::never` for the
+    /// whole binary and empty the assertions below without failing anything.
+    #[tokio::test]
+    async fn a_degraded_feed_emits_a_warning_naming_the_feed_and_reason() {
+        let (_guard, events) = capture_events();
+        let server = MockFeedServer::start(|_| MockResponse::status(503)).await;
+        let engine = test_engine(&server, &[("a", "/f.xml")], 900);
+
+        assert!(engine.serve_feed("a", || true).await.is_none());
+
+        let warnings = events_with_message(&events, "rss feed degraded");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one warning per degraded serve, not zero and not one per attempt"
+        );
+        let warning = &warnings[0];
+        assert_eq!(warning.level, tracing::Level::WARN);
+        assert_eq!(warning.fields.get("feed").map(String::as_str), Some("a"));
+        assert_eq!(
+            warning.fields.get("source").map(String::as_str),
+            Some("rss_test")
+        );
+        let error = warning
+            .fields
+            .get("error")
+            .expect("the warning carries the reason, not just the feed name");
+        assert!(
+            error.contains("503"),
+            "and the reason is the one recorded in last_error: {error}"
+        );
+        assert_eq!(
+            warning.fields.get("error").cloned(),
+            str_opt_col(&engine.feeds_row("a"), "last_error")[0].clone(),
+            "the log and the column carry the same string, so neither can drift"
+        );
+
+        // A healthy serve emits none, so the warning means something.
+        let ok = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        let healthy = test_engine(&ok, &[("b", "/f.xml")], 900);
+        healthy.serve_feed("b", || true).await.expect("b served");
+        assert_eq!(
+            events_with_message(&events, "rss feed degraded").len(),
+            1,
+            "a successful serve adds no degradation warning"
+        );
+    }
+
     #[tokio::test]
     async fn egress_blocked_feed_degrades_like_unreachable() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
         let engine = engine_over(
             &[("a".to_string(), "http://10.1.2.3/f".to_string())],
@@ -1638,6 +1771,12 @@ mod tests {
     /// and a dead feed is still not re-poked on every scan.
     #[tokio::test]
     async fn within_ttl_error_state_still_short_circuits_the_network() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
         let server = MockFeedServer::start(|_| MockResponse::status(500)).await;
         let engine = test_engine(&server, &[("a", "/f.xml")], 900);
 

@@ -110,7 +110,11 @@ pub struct FeedsRow {
     pub site_url: Option<String>,
     pub description: Option<String>,
     pub last_fetch_ms: Option<i64>,
-    pub last_status: &'static str,
+    /// Typed rather than `&'static str` for the same reason
+    /// [`with_window_status`] takes a [`FeedStatus`]: [`FeedStatus`] owns this
+    /// column's domain and is the only place its strings are spelled, so a typo
+    /// cannot reach the column from here.
+    pub last_status: FeedStatus,
     pub http_status: Option<u16>,
     pub last_error: Option<String>,
     pub etag: Option<String>,
@@ -266,7 +270,7 @@ pub fn build_feeds_batch(rows: &[FeedsRow]) -> RecordBatch {
         site_url.append_option(row.site_url.as_deref());
         description.append_option(row.description.as_deref());
         last_fetch.append_option(row.last_fetch_ms);
-        last_status.append_value(row.last_status);
+        last_status.append_value(row.last_status.as_str());
         http_status.append_option(row.http_status);
         last_error.append_option(row.last_error.as_deref());
         etag.append_option(row.etag.as_deref());
@@ -313,6 +317,79 @@ mod tests {
 
     const FEED: &str = "news";
     const FEED_URL: &str = "https://example.com/feed.xml";
+
+    /// The bundled semantics overlay describes exactly these two schemas'
+    /// columns — no more, no fewer — and parses as a real `SemanticsFile`.
+    ///
+    /// Nothing else tests `docs/rss/semantics.yaml` at all, and it is the file an
+    /// agent reads when planning a query, so a drift between it and the surface
+    /// is a drift in what agents are told. Both directions matter: a column the
+    /// overlay omits is a column with no provenance, and a column the overlay
+    /// invents is a lookup that silently never matches. Two live examples this
+    /// would have caught — a stale pruning rule the overlay kept after the
+    /// implementation widened it, and a NULL-ability claim contradicted by a
+    /// corpus fixture — were both found by review instead.
+    #[test]
+    fn the_bundled_semantics_overlay_matches_the_two_schemas() {
+        use crate::semantics::{SEMANTICS_KIND, SemanticsFile};
+
+        // `CARGO_MANIFEST_DIR` is `crates/skardi`; the overlay ships at the
+        // repo root under `docs/`.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/rss/semantics.yaml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read the bundled overlay at {}: {e}", path.display()));
+        let file: SemanticsFile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("the bundled overlay must parse as a SemanticsFile: {e}"));
+
+        assert_eq!(
+            file.kind.as_deref(),
+            Some(SEMANTICS_KIND),
+            "the overlay must declare `kind: semantics` or the loader skips it"
+        );
+
+        for (table, schema) in [("feeds", feeds_schema()), ("items", items_schema())] {
+            // The overlay's `name:` keys are fully-qualified and assume a source
+            // called `news`, which the file's own header documents.
+            let qualified = format!("news.main.{table}");
+            let source = file
+                .spec
+                .sources
+                .iter()
+                .find(|s| s.name == qualified)
+                .unwrap_or_else(|| panic!("the overlay must carry an entry for {qualified}"));
+            assert!(
+                source.description.is_some(),
+                "{qualified} needs a table-level description"
+            );
+
+            let described: Vec<&str> = source.columns.iter().map(|c| c.name.as_str()).collect();
+            let declared: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+            for name in &declared {
+                assert!(
+                    described.contains(name),
+                    "{qualified}.{name} is in the schema but has no description in the overlay"
+                );
+            }
+            for name in &described {
+                assert!(
+                    declared.contains(name),
+                    "the overlay describes {qualified}.{name}, which is not a column of that \
+                     table — an agent reading it would plan a query against nothing"
+                );
+            }
+            // Catches a duplicated column entry, which the two containment
+            // checks above would each pass.
+            assert_eq!(
+                described.len(),
+                declared.len(),
+                "{qualified}: the overlay lists {} columns for a {}-column table",
+                described.len(),
+                declared.len()
+            );
+        }
+    }
 
     /// The expected types are restated here rather than shared with the
     /// implementation on purpose: a helper used by both would let a wrong type
@@ -404,7 +481,7 @@ mod tests {
             site_url: None,
             description: None,
             last_fetch_ms: None,
-            last_status: "never",
+            last_status: FeedStatus::Never,
             http_status: None,
             last_error: None,
             etag: None,
@@ -603,7 +680,7 @@ mod tests {
             site_url: Some("https://blog.example.com/".into()),
             description: Some("posts".into()),
             last_fetch_ms: Some(1_700_000_000_000),
-            last_status: "revalidated",
+            last_status: FeedStatus::Revalidated,
             http_status: Some(304),
             last_error: None,
             etag: Some("\"abc\"".into()),
