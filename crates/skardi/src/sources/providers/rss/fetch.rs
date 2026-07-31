@@ -882,19 +882,39 @@ mod tests {
         );
     }
 
+    /// Every status the module doc names as retryable, exercised as a status.
+    ///
+    /// The list is spelled out here rather than read from `RETRYABLE_STATUSES`,
+    /// so a status quietly dropped from that array fails this test instead of
+    /// being agreed with — the same discipline `retry_after_is_capped_at_max_retry_wait`
+    /// applies to `MAX_RETRY_WAIT`. Before this was parameterised only `429`,
+    /// `500` and `503` were ever exercised, and dropping `502` and `504` from the
+    /// array left the suite green; `502`/`504` are what a CDN in front of a dead
+    /// feed host actually returns. The five literals here and the five the module
+    /// doc's Retries section names (`fetch.rs:42-43`) are the same claim, so they
+    /// have to move together.
     #[tokio::test]
     async fn retries_exhaust_to_status_error() {
-        let server = MockFeedServer::start(|_req| MockResponse::status(503)).await;
-        let f = test_fetcher();
-        let err = f
-            .fetch(&format!("{}/f", server.url()), None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, FetchError::Status { status: 503 }),
-            "got {err}"
-        );
-        assert_eq!(server.requests().len() as u32, MAX_ATTEMPTS);
+        for status in [429, 500, 502, 503, 504] {
+            let server = MockFeedServer::start(move |_req| MockResponse::status(status)).await;
+            let f = test_fetcher();
+            let err = f
+                .fetch(&format!("{}/f", server.url()), None)
+                .await
+                .unwrap_err();
+            match err {
+                FetchError::Status { status: got } => assert_eq!(
+                    got, status,
+                    "the terminal error carries the status that kept failing"
+                ),
+                other => panic!("expected a Status error for {status}, got {other:?}"),
+            }
+            assert_eq!(
+                server.requests().len() as u32,
+                MAX_ATTEMPTS,
+                "{status} must be retried to the attempt budget, not treated as terminal"
+            );
+        }
     }
 
     #[tokio::test]

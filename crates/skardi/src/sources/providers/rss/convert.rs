@@ -678,6 +678,57 @@ mod tests {
         );
     }
 
+    /// The ceiling's exact boundary, from both sides.
+    ///
+    /// Every other test on this path is an order of magnitude away from it: the
+    /// degradation cases nest ~1000 and every positive conversion is depth 1, so
+    /// `MAX_HTML_DEPTH` could be moved anywhere in roughly `[20, 400]` without
+    /// failing anything (measured: 20 and 400 both left the suite green). Both
+    /// directions are real. Tightened to 20, ordinary nested feed content —
+    /// nested lists, blockquotes, tables — would silently lose its Markdown
+    /// structure; loosened to 400, the ceiling walks toward the 500-600 zone
+    /// where htmd's recursive walker overflows a 2 MiB stack and aborts the
+    /// process, which is the whole reason it exists (see [`MAX_HTML_DEPTH`]).
+    ///
+    /// 100 and 101 are written as literals rather than derived from the constant,
+    /// so this cannot agree with a changed one. The real DOM at the passing end is
+    /// the open-tag count plus html5ever's fixed `document > html > body` wrapper
+    /// — ~103, nowhere near the overflow zone — so the converting side is safe to
+    /// actually run through htmd.
+    #[test]
+    fn the_depth_ceiling_converts_at_100_and_degrades_at_101() {
+        // `depth` is the whole document's open-tag depth: the `<em>` marker is
+        // itself an open tag, so it accounts for one of the levels and the divs
+        // supply the rest.
+        let nested = |depth: usize| {
+            format!(
+                "{}<em>innermost</em>{}",
+                "<div>".repeat(depth - 1),
+                "</div>".repeat(depth - 1)
+            )
+        };
+        // Fixture guard, so a drifting fixture cannot quietly stop straddling the
+        // boundary. `max_open_tag_depth` short-circuits at `MAX_HTML_DEPTH + 1`,
+        // so a ceiling moved below 100 makes these read low and fails here first
+        // rather than in the assertions below.
+        assert_eq!(max_open_tag_depth(&nested(100)), 100);
+        assert_eq!(max_open_tag_depth(&nested(101)), 101);
+
+        let at = html_to_markdown(&nested(100));
+        assert!(
+            at.contains("*innermost*") || at.contains("_innermost_"),
+            "depth 100 is the last depth htmd still converts, and this one degraded \
+             to tag-stripped text: {at}"
+        );
+
+        let past = html_to_markdown(&nested(101));
+        assert!(past.contains("innermost"), "text lost at depth 101: {past}");
+        assert!(
+            !past.contains("*innermost*") && !past.contains("_innermost_"),
+            "depth 101 is past the ceiling and must degrade to tag-stripped text: {past}"
+        );
+    }
+
     /// `unit` nested `depth` times, ending in a marker the assertions can find.
     fn deep(prefix: &str, unit: &str) -> String {
         format!("{prefix}{}<em>innermost</em>", unit.repeat(1000))
