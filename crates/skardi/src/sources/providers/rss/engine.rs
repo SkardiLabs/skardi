@@ -14,6 +14,18 @@
 //! among fifty leave the other forty-nine queryable: a scan cannot fail
 //! because of one subscription.
 //!
+//! ## A within-TTL entry is only a cache hit if it can still serve
+//!
+//! The TTL lives on the feed's observation and the rows live on its window, and
+//! the cache can drop the second while keeping the first — window eviction is
+//! specified to preserve the observation (`cache.rs:36-42`). So "within TTL"
+//! and "has rows" are independent, and a feed can be both fresh and empty. That
+//! combination is not served: `window_lost` classifies it as a miss so the
+//! scan refetches, because the alternative is zero rows beside a `feeds` row
+//! reporting `fresh` with a non-zero `item_count` and no error — the exact
+//! state `cache.rs:216-223` argues is unacceptable. Pinned by
+//! `within_ttl_serve_refetches_after_its_window_was_evicted`.
+//!
 //! ## `feeds` is a pure state read
 //!
 //! [`RssEngine::feeds_row`] is synchronous and never touches the fetcher, so
@@ -132,7 +144,8 @@ use tokio::sync::Semaphore;
 
 use super::ResolvedSubscription;
 use super::cache::{
-    CachedWindow, FeedCache, FeedObservation, FeedStatus, MemoryFeedCache, failure_fuse,
+    CachedWindow, FeedCache, FeedObservation, FeedSnapshot, FeedStatus, MemoryFeedCache,
+    failure_fuse,
 };
 use super::config::RssConfig;
 use super::egress::EgressPolicy;
@@ -315,7 +328,7 @@ impl RssEngine {
     ) -> (Option<RecordBatch>, ServeLog) {
         let snapshot = self.cache.snapshot(&sub.name, Instant::now());
 
-        if snapshot.within_ttl {
+        if snapshot.within_ttl && !window_lost(&snapshot) {
             // Zero network, zero permit, and the gate is not consulted:
             // serving what is already cached has no side effect to gate.
             // `Never`/`Error` have no window label, so those serve zero rows.
@@ -360,6 +373,14 @@ impl RssEngine {
             return (None, ServeLog::bare("gate-closed"));
         }
 
+        // The validators live on the window, so a feed that reached here
+        // through [`window_lost`] has none to send and this is an
+        // unconditional `GET`. That is the right request to make: there is no
+        // cached copy left for a `304` to confirm, so a conditional one could
+        // only answer "still current" about rows this process no longer holds
+        // — the state `record_not_modified` has to record as an error
+        // (`cache.rs:561-577`). A full body is what actually refills the
+        // window.
         let validators = snapshot.window.as_ref().map(|window| Validators {
             etag: window.etag.clone(),
             last_modified: window.last_modified.clone(),
@@ -630,6 +651,46 @@ impl ServeLog {
     }
 }
 
+/// Whether `snapshot`'s observation claims a servable window that is no longer
+/// there — the one shape in which a within-TTL entry must *not* short-circuit
+/// the network.
+///
+/// [`FeedStatus::window_status_str`] is the discriminator, and it is exactly the
+/// right one: it answers `Some` for `Fresh`/`Revalidated`/`StaleError` and
+/// `None` for `Never`/`Error` (`cache.rs:136-143`). So `Some` with no window
+/// means the two halves of the entry disagree — the health record says rows are
+/// serveable, and there are none.
+///
+/// That state is reachable with no caller mistake. `MemoryFeedCache` evicts a
+/// window without its observation (`cache.rs:372-383`, deliberately — see
+/// `cache.rs:36-42`), driven by *other* feeds' `record_success` calls against
+/// the byte or entry budget, and nothing about that eviction touches the
+/// evicted feed's TTL. `record_success` also declines to store a window that
+/// alone exceeds `max_bytes` while still recording the observation
+/// (`cache.rs:521-530`), which lands in the same place.
+///
+/// Short-circuiting there would serve zero rows silently while `feeds` reported
+/// the feed `fresh` with a non-zero `item_count` and a NULL `last_error`, for
+/// the rest of the TTL — precisely the combination
+/// [`FeedCache::record_not_modified`]'s doc rejects on the `304` path
+/// (`cache.rs:216-223`): "`feeds` reporting a healthy feed with a non-zero
+/// `item_count` while `items` returns nothing, and no column anywhere
+/// explaining why". Treating it as a miss costs one unconditional request and
+/// gets the data back on this scan, rather than leaving a capture gap until the
+/// TTL expires.
+///
+/// `Error` is deliberately *not* in this set: no window and no claim to one is a
+/// coherent state, and it is the negative cache — refetching it here would undo
+/// [`failure_fuse`].
+fn window_lost(snapshot: &FeedSnapshot) -> bool {
+    snapshot.window.is_none()
+        && snapshot
+            .observation
+            .last_status
+            .window_status_str()
+            .is_some()
+}
+
 /// The `feeds.last_error` text for a failed parse: the stage that gave up plus
 /// the parser's own reason.
 ///
@@ -685,7 +746,6 @@ mod tests {
     use arrow::array::{Array, UInt64Array};
 
     use super::*;
-    use crate::sources::providers::rss::cache::FeedSnapshot;
     use crate::sources::providers::rss::config::{FeedSubscription, inline_config};
     use crate::sources::providers::rss::testutil::{
         MockFeedServer, MockResponse, RSS2_MINIMAL, str_col, str_opt_col,
@@ -1287,6 +1347,106 @@ mod tests {
         assert_eq!(
             u64_col(&after, "item_count"),
             u64_col(&before, "item_count")
+        );
+    }
+
+    /// A within-TTL feed whose window was evicted refetches rather than
+    /// silently serving nothing.
+    ///
+    /// The seam two task-scoped tests each missed: `cache.rs`'s
+    /// `eviction_drops_window_and_validators_but_keeps_observation` asserts the
+    /// cache's half and never runs the engine, while this module's TTL tests run
+    /// the engine and never evict. Reverting [`window_lost`] makes the third
+    /// serve below return `None` with no request, while `feeds` still reports
+    /// `fresh` / `item_count = 1` / NULL `last_error` — a silent capture gap for
+    /// the rest of the TTL.
+    #[tokio::test]
+    async fn within_ttl_serve_refetches_after_its_window_was_evicted() {
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        let urls = vec![
+            ("a".to_string(), format!("{}/a.xml", server.url())),
+            ("b".to_string(), format!("{}/b.xml", server.url())),
+        ];
+
+        // Size the byte budget for exactly one window, measured off a real one
+        // rather than guessed: a throwaway engine with the shipped budget
+        // serves `a` once and reports what its window costs. Both feeds serve
+        // the same document under equal-length names and paths, so `b`'s window
+        // costs the same and the two cannot both fit.
+        let probe = engine_over(&urls, 900, 4);
+        let window_bytes = probe
+            .serve_feed("a", || true)
+            .await
+            .expect("probe serve")
+            .get_array_memory_size();
+
+        let cache = Arc::new(MemoryFeedCache::new(window_bytes + 8, 64));
+        let engine = engine_with_cache(&urls, 900, 4, cache);
+
+        let first = engine.serve_feed("a", || true).await.expect("a served");
+        assert_eq!(first.num_rows(), 1);
+
+        // `b`'s window evicts `a`'s under the byte budget while `a` is still
+        // deep inside its 900s TTL. `a`'s observation survives by design.
+        engine.serve_feed("b", || true).await.expect("b served");
+        let health = engine.feeds_row("a");
+        assert_eq!(
+            str_col(&health, "last_status"),
+            vec!["fresh"],
+            "eviction keeps the observation, so health still reads fresh"
+        );
+        assert_eq!(u64_col(&health, "item_count"), vec![Some(1)]);
+        assert_eq!(str_opt_col(&health, "last_error"), vec![None]);
+        assert_eq!(
+            str_opt_col(&health, "etag"),
+            vec![None],
+            "the validators went with the window, so the refetch below has none"
+        );
+
+        let before = server.requests().len();
+        let again = engine
+            .serve_feed("a", || true)
+            .await
+            .expect("an evicted window inside its TTL refetches instead of serving nothing");
+        assert_eq!(again.num_rows(), 1, "the rows are actually back");
+        assert_eq!(str_col(&again, "window_status"), vec!["fresh"]);
+
+        let refetches = &server.requests()[before..];
+        assert_eq!(
+            refetches.len(),
+            1,
+            "exactly one request, not zero and not a retry storm"
+        );
+        assert_eq!(refetches[0].path, "/a.xml");
+        assert_eq!(
+            refetches[0].header("if-none-match"),
+            None,
+            "no window means no validators: an unconditional GET, which is the \
+             only request that can refill the window"
+        );
+        assert_eq!(refetches[0].header("if-modified-since"), None);
+    }
+
+    /// The negative cache is *not* collateral of the fix above: `error` within
+    /// its failure fuse has no window and claims none, so it stays a cache hit
+    /// and a dead feed is still not re-poked on every scan.
+    #[tokio::test]
+    async fn within_ttl_error_state_still_short_circuits_the_network() {
+        let server = MockFeedServer::start(|_| MockResponse::status(500)).await;
+        let engine = test_engine(&server, &[("a", "/f.xml")], 900);
+
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        assert_eq!(
+            str_col(&engine.feeds_row("a"), "last_status"),
+            vec!["error"]
+        );
+        let after_failure = server.requests().len();
+
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        assert_eq!(
+            server.requests().len(),
+            after_failure,
+            "a window-less `error` inside its fuse must not refetch"
         );
     }
 
