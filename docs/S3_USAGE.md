@@ -16,8 +16,9 @@ export AWS_ACCESS_KEY_ID="your_access_key_id"
 export AWS_SECRET_ACCESS_KEY="your_secret_access_key"
 export AWS_SESSION_TOKEN="your_session_token"  # Optional for temporary credentials
 
-# Method 2: Use AWS CLI profile (recommended for local development)
-export AWS_PROFILE="your_profile_name"
+# Method 2: Convert an AWS CLI profile into env vars (AWS_PROFILE alone does
+# NOT work — the S3 client never reads ~/.aws/; see Authentication Methods)
+eval "$(aws configure export-credentials --profile your_profile_name --format env)"
 ```
 
 ### 2. Configure S3 Data Sources
@@ -79,36 +80,50 @@ The server automatically:
 
 ## Authentication Methods
 
-### 1. Environment Variables (Development/CI)
+> **⚠️ Environment variables are the only working method today.** The S3 client
+> is built from environment variables alone and never reads `~/.aws/`, and the
+> credential check requires `AWS_ACCESS_KEY_ID` (or `AWS_PROFILE`) to be present.
+> Profiles, SSO, and IAM roles therefore need the conversion step shown below.
+
+### 1. Environment Variables (Development/CI) — works
 ```bash
+export AWS_REGION="us-east-1"   # or AWS_DEFAULT_REGION; required, no default
 export AWS_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
 export AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+export AWS_SESSION_TOKEN="..."  # only for temporary credentials
 ```
 
-### 2. AWS CLI Profiles (Local Development)
+### 2. AWS CLI Profiles / SSO — export them first
+Setting `AWS_PROFILE` alone passes the credential check but contributes **no
+credentials to request signing**, so requests then fail with an S3 auth error.
+Convert the profile into environment variables instead:
+
 ```bash
-# Configure profile
-aws configure --profile myprofile
-
-# Use profile
-export AWS_PROFILE="myprofile"
+eval "$(aws configure export-credentials --profile myprofile --format env)"
+export AWS_REGION="us-east-1"
 ```
 
-### 3. IAM Roles (Production - AWS Infrastructure)
-No explicit credentials needed. Perfect for:
-- EC2 instances with IAM instance profiles
-- ECS tasks with IAM task roles
-- Lambda functions with IAM execution roles
-- EKS pods with IAM roles for service accounts
+The same applies to SSO / Identity Center profiles (`aws configure sso`) — log
+in, then export.
 
-### 4. AWS SSO/Identity Center
+### 3. IAM Roles (EC2 / ECS / Lambda / EKS) — not supported yet
+The underlying `object_store` client can source credentials from instance
+metadata, ECS task endpoints, and EKS web-identity tokens, but skardi's
+credential check rejects those setups before they are reached: it requires
+`AWS_ACCESS_KEY_ID` or `AWS_PROFILE`, neither of which is set under an instance
+profile or IRSA. Assume the role explicitly and export the result:
+
 ```bash
-# Configure SSO
-aws configure sso
-
-# Use SSO profile
-export AWS_PROFILE="sso-profile-name"
+CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name skardi)
+export AWS_ACCESS_KEY_ID=$(jq -r .Credentials.AccessKeyId <<<"$CREDS")
+export AWS_SECRET_ACCESS_KEY=$(jq -r .Credentials.SecretAccessKey <<<"$CREDS")
+export AWS_SESSION_TOKEN=$(jq -r .Credentials.SessionToken <<<"$CREDS")
+export AWS_REGION="us-east-1"
 ```
+
+Note that assumed-role credentials expire (1h by default), and the server reads
+the environment at registration *and* on each scan — so a long-running server
+needs re-exported credentials, or a restart, before they lapse.
 
 ## Required IAM Permissions
 

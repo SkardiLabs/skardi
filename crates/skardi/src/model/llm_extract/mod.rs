@@ -505,6 +505,17 @@ fn fetch_image(image_ref: &str) -> anyhow::Result<provider::ImageInput> {
     fetch_image_with_policy(image_ref, image_fetch_allowed())
 }
 
+/// Test-only entry point into the real [`fetch_image_with_policy`], so the
+/// opt-in integration tests exercise the shipped resolution path rather than a
+/// reimplementation of it. Not part of the public API.
+#[doc(hidden)]
+pub fn fetch_image_for_test(
+    image_ref: &str,
+    allow_fetch: bool,
+) -> anyhow::Result<provider::ImageInput> {
+    fetch_image_with_policy(image_ref, allow_fetch)
+}
+
 /// Whether http(s)/file `image_ref` fetching is opted in via
 /// `LLM_EXTRACT_IMAGE_FETCH` (`1`/`true`/`yes`). Default-deny.
 fn image_fetch_allowed() -> bool {
@@ -517,6 +528,35 @@ fn image_fetch_allowed() -> bool {
     )
 }
 
+/// How an `image_ref` should be resolved. Kept separate from
+/// [`fetch_image_with_policy`] so the routing decision is unit-testable without
+/// performing any I/O — the `s3://`-misrouted-as-a-file bug this guards against
+/// was only observable at runtime before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefKind {
+    /// Inline `data:` URI — no I/O.
+    Data,
+    /// `http://` / `https://`.
+    Http,
+    /// `s3://bucket/key`.
+    S3,
+    /// `file://` URL or a bare filesystem path.
+    File,
+}
+
+/// Classify an `image_ref` by scheme. Pure; performs no I/O.
+fn classify_ref(image_ref: &str) -> RefKind {
+    if image_ref.starts_with("data:") {
+        RefKind::Data
+    } else if image_ref.starts_with("http://") || image_ref.starts_with("https://") {
+        RefKind::Http
+    } else if image_ref.starts_with("s3://") {
+        RefKind::S3
+    } else {
+        RefKind::File
+    }
+}
+
 /// Fetch an image referenced by `image_ref` and return it as base64 + mime.
 ///
 /// **Security — `image_ref` is data-derived (a column value), so fetching it is
@@ -524,6 +564,12 @@ fn image_fetch_allowed() -> bool {
 /// - `data:<mime>;base64,<payload>` — always allowed (no I/O; payload is inline).
 /// - `http://` / `https://` — only when `allow_fetch` is `true`
 ///   (`LLM_EXTRACT_IMAGE_FETCH=1`); otherwise refused. Can reach internal hosts.
+/// - `s3://bucket/key` — only when `allow_fetch` is `true`; otherwise refused.
+///   Gated identically to http(s) because the bucket/key are data-derived: with
+///   the process's ambient AWS credentials this is a read primitive over every
+///   object those credentials can reach, not just the configured `image_store`.
+///   Requires the `documents` feature (which owns the S3 client); without it the
+///   ref is refused with a build hint rather than being read off the filesystem.
 /// - any other scheme / bare path — treated as a local file, only when
 ///   `allow_fetch` is `true`; otherwise refused. Can read arbitrary files.
 fn fetch_image_with_policy(
@@ -532,8 +578,11 @@ fn fetch_image_with_policy(
 ) -> anyhow::Result<provider::ImageInput> {
     use anyhow::Context;
 
-    if let Some(rest) = image_ref.strip_prefix("data:") {
+    let kind = classify_ref(image_ref);
+
+    if kind == RefKind::Data {
         // data:<mime>;base64,<payload>
+        let rest = image_ref.strip_prefix("data:").unwrap_or(image_ref);
         let (meta, payload) = rest
             .split_once(',')
             .ok_or_else(|| anyhow::anyhow!("malformed data URI"))?;
@@ -554,14 +603,14 @@ fn fetch_image_with_policy(
         return Err(anyhow::anyhow!(
             "refusing to fetch image_ref '{image_ref}': only data: URIs are allowed by \
              default (SSRF / path-traversal guard). Set LLM_EXTRACT_IMAGE_FETCH=1 to \
-             enable http(s)/file fetching"
+             enable http(s)/s3/file fetching"
         ));
     }
 
     use base64::Engine;
     let engine = base64::engine::general_purpose::STANDARD;
 
-    if image_ref.starts_with("http://") || image_ref.starts_with("https://") {
+    if kind == RefKind::Http {
         let handle = tokio::runtime::Handle::current();
         let (bytes, mime) = tokio::task::block_in_place(|| {
             handle.block_on(async {
@@ -583,6 +632,40 @@ fn fetch_image_with_policy(
             base64: engine.encode(&bytes),
             mime,
         });
+    }
+
+    // Object store. `page_image_ref` / `image_refs` are `s3://…` whenever the
+    // documents connector runs with an `s3://` `image_store`, so without this
+    // branch such a ref would fall through to `std::fs::read("s3://…")` and fail
+    // with a misleading "No such file or directory".
+    if kind == RefKind::S3 {
+        #[cfg(feature = "documents")]
+        {
+            use crate::sources::providers::documents::blob::BlobStore;
+
+            let handle = tokio::runtime::Handle::current();
+            let bytes = tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    // Build the store inside this runtime: the underlying reqwest
+                    // client must not outlive / cross runtimes (see blob.rs).
+                    let (store, loc) = BlobStore::resolve(image_ref)?;
+                    store.get(&loc).await
+                })
+            })
+            .with_context(|| format!("reading s3 image_ref '{image_ref}'"))?;
+            return Ok(provider::ImageInput {
+                base64: engine.encode(&bytes),
+                mime: mime_from_path(image_ref),
+            });
+        }
+        #[cfg(not(feature = "documents"))]
+        {
+            return Err(anyhow::anyhow!(
+                "cannot fetch image_ref '{image_ref}': s3:// refs require the `documents` \
+                 Cargo feature (which provides the S3 client). Rebuild with \
+                 --features documents, or use a local image_store."
+            ));
+        }
     }
 
     // Local file path.
@@ -1498,6 +1581,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err3.contains("refusing to fetch"), "got: {err3}");
+
+        // s3:// is gated by the same opt-in: the bucket/key are data-derived, so
+        // with ambient AWS credentials an un-gated fetch would be a read
+        // primitive over every object those credentials can reach.
+        let err4 = fetch_image_with_policy("s3://some-bucket/secret/key.png", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err4.contains("refusing to fetch"), "got: {err4}");
+        assert!(err4.contains("LLM_EXTRACT_IMAGE_FETCH"), "got: {err4}");
+    }
+
+    #[test]
+    fn classify_ref_routes_s3_away_from_the_filesystem() {
+        // The regression this guards: an `s3://` ref used to fall through to the
+        // local-file branch and fail with a misleading
+        // "reading image file 's3://…': No such file or directory".
+        assert_eq!(
+            classify_ref("s3://bucket/extracted/report.pdf_page_1.png"),
+            RefKind::S3
+        );
+        assert_eq!(classify_ref("s3://bucket"), RefKind::S3);
+
+        // Neighbouring schemes keep their existing routing.
+        assert_eq!(classify_ref("data:image/png;base64,aGk="), RefKind::Data);
+        assert_eq!(classify_ref("http://example.com/a.png"), RefKind::Http);
+        assert_eq!(classify_ref("https://example.com/a.png"), RefKind::Http);
+        assert_eq!(classify_ref("file:///tmp/a.png"), RefKind::File);
+        assert_eq!(classify_ref("/tmp/a.png"), RefKind::File);
+        assert_eq!(classify_ref("relative/a.png"), RefKind::File);
+
+        // Not S3: a lookalike prefix must not be routed to the object store.
+        assert_eq!(classify_ref("s3:/bucket/key.png"), RefKind::File);
+        assert_eq!(classify_ref("s3x://bucket/key.png"), RefKind::File);
+        assert_eq!(classify_ref("/data/s3://weird.png"), RefKind::File);
+    }
+
+    #[test]
+    fn mime_inferred_from_s3_key_extension() {
+        // The documents connector always writes `.png` crops/page renders, and
+        // the S3 branch infers the MIME from the key alone (no HEAD request).
+        assert_eq!(
+            mime_from_path("s3://bucket/extracted/a.pdf_page_1.png"),
+            "image/png"
+        );
+        assert_eq!(mime_from_path("s3://bucket/scan.jpg"), "image/jpeg");
     }
 
     #[test]
