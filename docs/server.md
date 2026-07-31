@@ -139,17 +139,69 @@ Request fields:
   queries from one agent session) — plus any free-form keys of the caller's
   choosing. The whole object must serialize to ≤ 4096 bytes. Recorded for
   observability; never executed. Any violation → `400
-  parameter_validation_error`.
+  parameter_validation_error`. Omitting the field is valid; sending
+  `"ai_context": null` is *not* — an explicit null is a present-but-malformed
+  value and is rejected like any other non-object.
 
-**Query logging.** By default the raw SQL is **never written to logs or
-traces** — because callers may inline literal secrets/PII, only a value-free
-marker (`ai_context`, `max_rows`, statement kind, timing) is emitted. To keep a
-full audit trail, start the server with `--query-log <path>`: every executed
-statement is appended to that local file as one JSON line (raw `sql`,
-`ai_context`, `max_rows`, timestamp). That file contains sensitive query text, so
-**securing, rotating, and retaining it is the operator's responsibility**. The
-sink is a dedicated local file, never the OTLP/tracing pipeline, so enabling it
-does not push query text to external collectors.
+#### Query confidentiality
+
+Callers may inline literal secrets or PII into `sql`, so by default **no query
+text or literal value reaches the log/trace/OTLP stream.** Two things enforce
+that:
+
+- The handler's INFO audit marker is value-free: it carries `ai_context`,
+  `max_rows`, statement kind and timing, never the statement.
+- The tracing filter pins every plan-printing target (`datafusion*`,
+  `sqlparser`, and the server's own `skardi_query_plan` instrumentation spans)
+  to INFO, and drops any `RUST_LOG` directive that would lower them.
+  Suppressing the handler's `sql` field alone is not enough — DataFusion's
+  analyzer/optimizer reprint the same literals inside the plans they log at
+  DEBUG (`Projection: Utf8("…")`), and those records fan out to every
+  configured collector.
+
+  An operator debugging a planning problem on non-sensitive data can lift the
+  floor with `SKARDI_ALLOW_PLAN_VALUE_LOGGING=1`. It is a separate, explicit
+  opt-in because it re-enables value export.
+
+#### Query audit ledger
+
+`--query-audit-db <path>` turns on a durable, queryable record of what ran.
+Off by default; when off, raw SQL is never persisted anywhere.
+
+Each accepted statement is committed to a SQLite `query_audit` table **before**
+execution and updated with its outcome afterwards:
+
+| column | notes |
+| --- | --- |
+| `id` | stable record id |
+| `created_at` / `finished_at` | RFC 3339 |
+| `sql` | raw statement text |
+| `ai_context` | the caller's object, verbatim JSON |
+| `session_id` | denormalised from `ai_context` for indexed session lookup |
+| `max_rows`, `statement_kind` | request shape |
+| `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
+| `row_count`, `error` | outcome detail |
+
+Indexed on `(session_id, created_at)`, `created_at` and `status`, so an agent
+session can be reconstructed with plain SQL.
+
+Failure semantics are explicit:
+
+- **Startup.** Opening or migrating the ledger is fatal — a server configured
+  to audit never runs silently unaudited.
+- **Before execution.** If the pre-execution write fails, the request is
+  rejected with `503 query_audit_error` and the statement is **not executed**.
+- **After execution.** A failed outcome update is logged only; the query
+  already ran. The row stays `started` and the next startup reconciles it to
+  `unknown`, as it does for statements killed mid-flight.
+
+Retention is opt-in: `--query-audit-retention-days <n>` deletes records older
+than `n` days at startup and hourly thereafter. Without it, records are kept
+forever and pruning is the operator's call.
+
+The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
+including the WAL sidecars). It is a local database, never the OTLP/tracing
+pipeline, so enabling it does not push query text to external collectors.
 
 ---
 

@@ -1,7 +1,9 @@
 # Replace `/query`'s flat `purpose` with a structured `ai_context` object
 
 **Date:** 2026-07-28
-**Status:** Proposed
+**Status:** Proposed — partly superseded by
+[2026-07-31](2026-07-31-query-audit-store-design.md), which replaces the file
+sink with a durable SQLite ledger and closes the `ai_context: null` gap.
 **Branch:** `feat/query-parameterization-design`
 
 ## Goal
@@ -92,9 +94,9 @@ never logged in the general stream and goes only to the opt-in file sink.
 - **INFO audit marker** (`query_handlers.rs`): replace the `purpose` field with the
   full serialized `ai_context` (an empty/omitted context logs as `{}` or is
   omitted). Still no `sql` field on this line.
-- **`--query-log` file** (`query_log.rs`): the recorded line replaces the
-  `purpose` column with the `ai_context` object, alongside the raw `sql`,
-  `max_rows`, and timestamp.
+- **Operator sink**: the record replaces the `purpose` column with the
+  `ai_context` object, alongside the raw `sql`, `max_rows`, and timestamp.
+  (The sink itself became the SQLite ledger in the 2026-07-31 spec.)
 
 ## Components
 
@@ -141,6 +143,8 @@ never logged in the general stream and goes only to the opt-in file sink.
 
 - Query parameterization / a `params` channel (still out, as in the 2026-07-24
   spec).
-- Persisting `ai_context` to a database/store (the local file sink only).
-- Aggregating or querying by `session_id` server-side (callers/operators do that
-  over the query-log file for now).
+- ~~Persisting `ai_context` to a database/store (the local file sink only).~~
+  Superseded: the 2026-07-31 spec persists it to a SQLite ledger, indexed by
+  `session_id`.
+- Aggregating or querying by `session_id` server-side (operators query the
+  ledger directly).

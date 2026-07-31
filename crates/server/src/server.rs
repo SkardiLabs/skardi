@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router,
     routing::{get, post},
@@ -31,13 +31,14 @@ use crate::config::register_remote_embed_udf;
 use crate::gui::serve_dashboard;
 use crate::handlers::health_check;
 use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
+use crate::logging::QUERY_PLAN_TARGET;
 use crate::metrics::PipelineMetrics;
 use crate::pipeline_handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
     pipeline_health_check,
 };
+use crate::query_audit::QueryAuditStore;
 use crate::query_handlers::execute_query;
-use crate::query_log::QueryLog;
 #[cfg(test)]
 use crate::semantics::SemanticsRegistry;
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
@@ -61,10 +62,10 @@ pub struct AppState {
     /// [`crate::config::adhoc_policy_from_sources`] for why a snapshot is
     /// safe (no runtime writer mutates access modes).
     pub adhoc_policy: Arc<AdhocSqlPolicy>,
-    /// Optional sink that appends raw `/query` SQL to a local file. `Some` only
-    /// when the operator passed `--query-log`. `None` means raw SQL is never
-    /// written anywhere. See [`crate::query_log`].
-    pub query_log: Option<Arc<QueryLog>>,
+    /// Durable audit ledger for `/query`. `Some` only when the operator passed
+    /// `--query-audit-db`. `None` means raw SQL is never persisted anywhere.
+    /// See [`crate::query_audit`].
+    pub query_audit: Option<Arc<QueryAuditStore>>,
 }
 
 impl AppState {
@@ -72,34 +73,21 @@ impl AppState {
     /// config's data sources. Centralizing construction here keeps the derived
     /// policy from drifting across the many call sites that build an
     /// `AppState` (handlers, tests, integration harnesses).
+    /// `query_audit` is opened by [`setup_app_state`] rather than here: opening
+    /// it is async and *fallible by design* (an operator who configured an
+    /// audit trail must never get a server that silently runs without one), so
+    /// it cannot be derived inside this infallible constructor.
     pub fn new(
         config: ServerConfig,
         engine: Arc<DataFusionEngine>,
         session_ctx: Arc<SessionContext>,
         auth_layer: AuthLayer,
         jobs: Option<Arc<JobExecutor>>,
+        query_audit: Option<Arc<QueryAuditStore>>,
     ) -> Self {
         let adhoc_policy = Arc::new(crate::config::adhoc_policy_from_sources(
             &config.data_sources,
         ));
-        // Open the raw-SQL sink if the operator asked for one. A failure to
-        // open the file must not take the server down — warn and run without
-        // the audit file (raw SQL simply won't be recorded).
-        let query_log =
-            config
-                .args
-                .query_log
-                .as_ref()
-                .and_then(|path| match QueryLog::open(path) {
-                    Ok(log) => Some(Arc::new(log)),
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to open --query-log file {}: {e}; raw SQL will not be recorded",
-                            path.display()
-                        );
-                        None
-                    }
-                });
         Self {
             config: Arc::new(RwLock::new(config)),
             engine,
@@ -108,7 +96,7 @@ impl AppState {
             auth_layer,
             jobs,
             adhoc_policy,
-            query_log,
+            query_audit,
         }
     }
 }
@@ -153,30 +141,13 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     let additional_optimizers =
         optimizer_registry.get_physical_optimizer_rules(&config.data_sources);
 
-    // Build physical optimizer rules: skardi rules first, tracing rule last
-    // (tracing must be last so it sees the fully optimized plan)
-    let mut physical_optimizer_rules = state.physical_optimizers().to_vec();
     if !additional_optimizers.is_empty() {
         tracing::info!(
             "Adding {} physical optimizer(s) to SessionState",
             additional_optimizers.len()
         );
-        physical_optimizer_rules.extend(additional_optimizers);
     }
-    physical_optimizer_rules.push(datafusion_tracing::instrument_with_debug_spans!(
-        options: datafusion_tracing::InstrumentationOptions::default()
-    ));
-
-    // Rebuild SessionState with all physical optimizer rules
-    let state = datafusion::execution::SessionStateBuilder::new_from_existing(state)
-        .with_physical_optimizer_rules(physical_optimizer_rules)
-        .build();
-
-    // Instrument analyzer and logical/physical optimizer rule phases with tracing spans
-    let state = datafusion_tracing::instrument_rules_with_debug_spans!(
-        options: datafusion_tracing::RuleInstrumentationOptions::full(),
-        state: state
-    );
+    let state = instrument_session_state(state, additional_optimizers);
 
     let mut session_ctx = SessionContext::new_with_state(state);
 
@@ -273,12 +244,114 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         None
     };
 
+    // Open the `/query` audit ledger if the operator asked for one. Every
+    // failure here is fatal: a configured audit trail that silently doesn't
+    // record would be worse than none at all.
+    let query_audit = match config.args.query_audit_db.as_ref() {
+        Some(path) => {
+            tracing::info!("Opening /query audit ledger at {}", path.display());
+            let store = Arc::new(QueryAuditStore::open(path).await.with_context(|| {
+                format!("Failed to open --query-audit-db at {}", path.display())
+            })?);
+            let orphaned = store
+                .reconcile_orphaned("server restarted before the query completed")
+                .await?;
+            if orphaned > 0 {
+                tracing::warn!(
+                    "Reconciled {} /query audit record(s) left in flight by a previous run",
+                    orphaned
+                );
+            }
+            if let Some(days) = config.args.query_audit_retention_days {
+                spawn_query_audit_retention(Arc::clone(&store), days).await?;
+            }
+            Some(store)
+        }
+        None => None,
+    };
+
     // Create shared application state with RwLock for runtime updates
-    let app_state = AppState::new(config, engine, session_ctx_arc, auth_layer, jobs_bundle);
+    let app_state = AppState::new(
+        config,
+        engine,
+        session_ctx_arc,
+        auth_layer,
+        jobs_bundle,
+        query_audit,
+    );
 
     tracing::info!("Application state setup completed successfully");
 
     Ok(app_state)
+}
+
+/// Prune audit records older than `retention_days` now, then hourly for the
+/// life of the process.
+///
+/// The first prune is awaited so a broken retention setup surfaces at startup
+/// alongside every other audit failure; subsequent ones only warn, since a
+/// transient prune failure must not take a running server down.
+async fn spawn_query_audit_retention(
+    store: Arc<QueryAuditStore>,
+    retention_days: u32,
+) -> Result<()> {
+    let retention = chrono::Duration::days(retention_days as i64);
+    let pruned = store.prune_before(chrono::Utc::now() - retention).await?;
+    tracing::info!(
+        "Query-audit retention: {} day(s); pruned {} record(s) at startup",
+        retention_days,
+        pruned
+    );
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        ticker.tick().await; // fires immediately; the startup prune covered it
+        loop {
+            ticker.tick().await;
+            match store.prune_before(chrono::Utc::now() - retention).await {
+                Ok(n) if n > 0 => tracing::info!("Query-audit retention pruned {n} record(s)"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Query-audit retention prune failed: {e}"),
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Attach datafusion-tracing instrumentation (execution nodes + analyzer /
+/// optimizer rule phases) to `state`, appending `additional_optimizers` ahead
+/// of the tracing rule so tracing sees the fully optimized plan.
+///
+/// Both instrumentations are pinned to [`QUERY_PLAN_TARGET`] rather than the
+/// macros' default of `module_path!()`: the spans record plan node displays
+/// (`ProjectionExec: expr=[…]`), which reproduce the statement's literal
+/// values, and a dedicated target is what lets
+/// [`crate::logging::build_env_filter`] hold them at INFO. Exposed so
+/// `tests/query_plan_logging.rs` can assert against the real instrumentation
+/// instead of a lookalike.
+pub fn instrument_session_state(
+    state: datafusion::execution::SessionState,
+    additional_optimizers: Vec<
+        Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
+    >,
+) -> datafusion::execution::SessionState {
+    // skardi rules first, tracing rule last.
+    let mut physical_optimizer_rules = state.physical_optimizers().to_vec();
+    physical_optimizer_rules.extend(additional_optimizers);
+    physical_optimizer_rules.push(datafusion_tracing::instrument_with_debug_spans!(
+        target: QUERY_PLAN_TARGET,
+        options: datafusion_tracing::InstrumentationOptions::default()
+    ));
+
+    let state = datafusion::execution::SessionStateBuilder::new_from_existing(state)
+        .with_physical_optimizer_rules(physical_optimizer_rules)
+        .build();
+
+    datafusion_tracing::instrument_rules_with_debug_spans!(
+        target: QUERY_PLAN_TARGET,
+        options: datafusion_tracing::RuleInstrumentationOptions::full(),
+        state: state
+    )
 }
 
 /// Resolve where the SQLite run ledger should live. Explicit `--jobs-db`
@@ -450,7 +523,8 @@ spec:
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
-                query_log: None,
+                query_audit_db: None,
+                query_audit_retention_days: None,
             },
         };
 
@@ -474,7 +548,8 @@ spec:
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
-                query_log: None,
+                query_audit_db: None,
+                query_audit_retention_days: None,
             },
         }
     }

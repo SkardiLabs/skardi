@@ -90,10 +90,18 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
             ctx_file: None,
             semantics_path: None,
             port: 0,
-            query_log: None,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         },
     };
-    AppState::new(config, engine, Arc::clone(&ctx), AuthLayer::None, None)
+    AppState::new(
+        config,
+        engine,
+        Arc::clone(&ctx),
+        AuthLayer::None,
+        None,
+        None,
+    )
 }
 
 async fn body_to_json(resp: axum::response::Response) -> Value {

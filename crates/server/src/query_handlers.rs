@@ -9,13 +9,14 @@
 //!   carries a `truncated` flag.
 
 use axum::{Json, extract::State, http::StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use skardi::engine::Engine;
 use skardi::sources::sql_validator::{SqlValidationError, StatementKind, validate_single_sql};
 use std::time::Instant;
 
 use crate::auth::routes::require_session;
+use crate::query_audit::QueryAuditStatus;
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
@@ -52,11 +53,27 @@ pub struct QueryRequest {
     /// object carrying a non-empty `purpose` and `session_id` (see
     /// [`validate_ai_context`]); other keys are free-form. Recorded for
     /// observability; never executed.
+    ///
+    /// [`deserialize_present`] keeps *absent* distinguishable from an explicit
+    /// `"ai_context": null` — a plain `Option<Value>` collapses both to `None`
+    /// and would wave the null past validation.
+    #[serde(default, deserialize_with = "deserialize_present")]
     pub ai_context: Option<Value>,
 }
 
+/// Deserialize a present field into `Some`, including an explicit JSON `null`
+/// (which becomes `Some(Value::Null)`). Combined with `#[serde(default)]`, an
+/// omitted field is the only thing that yields `None`.
+fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
 /// Validate an optional `ai_context`. `Ok(())` when absent or well-formed;
-/// `Err(msg)` (a client-safe message) when present but malformed.
+/// `Err(msg)` (a client-safe message) when present but malformed. An explicit
+/// `null` counts as present and is rejected like any other non-object.
 ///
 /// Rules, first failure wins: must be a JSON object; serialized size within
 /// [`MAX_AI_CONTEXT_BYTES`]; a non-empty string `purpose` within
@@ -101,6 +118,26 @@ fn validate_context_string(
             "ai_context.{name} must be at most {max_chars} characters"
         )),
         Some(_) => Ok(()),
+    }
+}
+
+/// Stamp the terminal outcome onto an audit record.
+///
+/// Unlike the pre-execution write, a failure here cannot un-run the query, so
+/// it is logged rather than surfaced: the row simply stays `started` and the
+/// next startup reconciles it to `unknown`. No-op when auditing is off.
+async fn finish_audit(
+    app_state: &AppState,
+    audit_id: Option<&str>,
+    status: QueryAuditStatus,
+    row_count: Option<usize>,
+    error: Option<&str>,
+) {
+    let (Some(store), Some(id)) = (&app_state.query_audit, audit_id) else {
+        return;
+    };
+    if let Err(e) = store.record_outcome(id, status, row_count, error).await {
+        tracing::error!("Failed to record query-audit outcome for {id}: {e}");
     }
 }
 
@@ -204,12 +241,43 @@ pub async fn execute_query(
         "Executing ad-hoc query"
     );
 
-    // Raw SQL goes only to the opt-in operator query-log file, which the
-    // operator is responsible for securing. Recorded before execution so a
-    // crash mid-query still leaves a record.
-    if let Some(query_log) = &app_state.query_log {
-        query_log.record(&request.sql, request.ai_context.as_ref(), max_rows);
-    }
+    // Raw SQL goes only to the opt-in audit ledger, which the operator asked
+    // for and which is created owner-only. Committed *before* execution, so a
+    // crash mid-query still leaves a record — and a write failure means the
+    // statement does not run at all: an audited server must not execute
+    // anything it cannot account for.
+    let audit_id = match &app_state.query_audit {
+        Some(store) => {
+            let kind = format!("{statement_kind:?}");
+            match store
+                .record_started(&request.sql, request.ai_context.as_ref(), max_rows, &kind)
+                .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::error!("Query audit write failed; refusing to execute: {e}");
+
+                    let elapsed_ms = start_time.elapsed().as_millis() as f64;
+                    app_state.metrics.record_error(
+                        QUERY_METRICS_LABEL,
+                        elapsed_ms,
+                        "query_audit_error",
+                    );
+
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        create_error_response(
+                            "Query auditing is enabled but the audit record could not be \
+                             written; the query was not executed",
+                            "query_audit_error",
+                            None,
+                        ),
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
 
     // Queries get the row cap pushed into the plan (fetch cap + 1 so
     // truncation is detectable). Writes and other statements return small
@@ -239,8 +307,16 @@ pub async fn execute_query(
             // Log the engine error server-side; do not echo it to the client.
             // DataFusion errors can quote row/column values and internal
             // schema, so the response stays generic. The SQL text is not
-            // logged here — it lives only in the opt-in `--query-log` file.
+            // logged here — it lives only in the opt-in audit ledger.
             tracing::error!("Ad-hoc query execution failed: {}", e);
+            finish_audit(
+                &app_state,
+                audit_id.as_deref(),
+                QueryAuditStatus::Failed,
+                None,
+                Some(&e.to_string()),
+            )
+            .await;
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state.metrics.record_error(
@@ -267,9 +343,13 @@ pub async fn execute_query(
         record_batch
     };
 
-    let data = match record_batch_to_json(&record_batch) {
+    // `record_batch_to_json` yields a `Box<dyn Error>`, which is not `Send`.
+    // Flatten it to a message up front: holding the box across the audit await
+    // below would make the whole handler future non-`Send`.
+    let data = match record_batch_to_json(&record_batch).map_err(|e| e.to_string()) {
         Ok(json_data) => json_data,
         Err(e) => {
+            let reason = format!("result conversion failed: {e}");
             // Keep the schema/error detail in the server log only; the client
             // response must not echo internal schema back.
             tracing::error!(
@@ -278,6 +358,14 @@ pub async fn execute_query(
                 record_batch.schema(),
                 record_batch.num_rows()
             );
+            finish_audit(
+                &app_state,
+                audit_id.as_deref(),
+                QueryAuditStatus::Failed,
+                Some(record_batch.num_rows()),
+                Some(&reason),
+            )
+            .await;
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state.metrics.record_error(
@@ -299,6 +387,15 @@ pub async fn execute_query(
 
     let execution_time = start_time.elapsed().as_millis() as u64;
     let row_count = record_batch.num_rows();
+
+    finish_audit(
+        &app_state,
+        audit_id.as_deref(),
+        QueryAuditStatus::Succeeded,
+        Some(row_count),
+        None,
+    )
+    .await;
 
     app_state
         .metrics

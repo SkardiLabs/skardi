@@ -834,7 +834,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
-            query_log: None,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let config = ServerConfig {
@@ -854,6 +855,7 @@ spec:
             engine,
             session_ctx,
             crate::auth::layer::AuthLayer::None,
+            None,
             None,
         )
     }
@@ -919,7 +921,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
-            query_log: None,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let config = ServerConfig {
@@ -944,6 +947,7 @@ spec:
             engine,
             session_ctx_arc,
             crate::auth::layer::AuthLayer::None,
+            None,
             None,
         );
 

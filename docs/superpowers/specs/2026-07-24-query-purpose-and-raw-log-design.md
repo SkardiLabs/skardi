@@ -1,7 +1,10 @@
 # Add a `purpose` field to `/query`; make raw-SQL logging an operator config
 
 **Date:** 2026-07-24
-**Status:** Proposed
+**Status:** Proposed — the raw-SQL file sink is superseded by
+[2026-07-31](2026-07-31-query-audit-store-design.md) (durable SQLite ledger);
+the flat `purpose` field is superseded by
+[2026-07-28](2026-07-28-query-ai-context-design.md).
 **Branch:** `feat/query-parameterization-design`
 
 ## Goal
