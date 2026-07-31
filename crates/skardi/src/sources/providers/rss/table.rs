@@ -25,27 +25,57 @@
 //! `feed_url` with the subscription's own `name` and `url`
 //! (`engine.rs:472`, `build_items_batch(&sub.name, &sub.url, …)`), so
 //! restricting *which subscriptions a scan visits* is exactly equivalent to
-//! applying an equality or `IN` predicate on those two columns to the rows —
-//! which is what earns `Exact` rather than `Inexact`.
+//! applying a predicate that constrains those two columns to a fixed set of
+//! values to the rows — which is what earns `Exact` rather than `Inexact`.
 //!
 //! ## Why the allowlist is this narrow
 //!
-//! Only equality and non-negated `IN` over `items.feed` / `items.feed_url`
-//! prune; everything else stays `Unsupported`. That is not an oversight, it is
-//! the shape of the source. An RSS subscription is one fixed URL with no query
+//! Only three shapes over `items.feed` / `items.feed_url` prune — equality, a
+//! non-negated `IN`, and a disjunction of those over *one* of the two columns —
+//! and everything else stays `Unsupported`. That is not an oversight, it is the
+//! shape of the source. An RSS subscription is one fixed URL with no query
 //! parameters, so *no* predicate can narrow what the wire returns — there is no
 //! request for `WHERE title = …` to become part of. Choosing a subset of feeds
 //! to fetch is the only work a predicate can do here, so the allowlist is
-//! exactly the predicates that name a feed.
+//! exactly the predicates that name a fixed set of feeds.
 //!
 //! A conjunction needs no splitting here: the optimizer calls
 //! `split_conjunction` on the filter predicate before consulting the provider
 //! (datafusion-optimizer 52.5.0, `src/push_down_filter.rs:1135`), so `AND`
 //! arrives as separate `Expr`s. That function recurses only through
 //! `Operator::And` and through aliases (datafusion-expr 52.5.0,
-//! `src/utils.rs:968-984`), so `a OR b` arrives as a single `BinaryExpr` the
-//! classifier rejects — an `OR` is unsupported by construction rather than by a
-//! special case.
+//! `src/utils.rs:968-984`), so a disjunction arrives whole, as a single
+//! `BinaryExpr` — which the classifier walks itself.
+//!
+//! ## Disjunction, and where the walk stops
+//!
+//! A disjunction prunes to the *union* of its leaves, and is `Exact` only when
+//! every leaf is prunable over the same column. `feed = 'a' OR feed = 'b'`
+//! visits `{a, b}`; a single leaf the classifier does not understand rejects the
+//! whole predicate, because a row satisfying that leaf could come from any
+//! subscription. So `feed = 'a' OR title = 't'`, `feed = 'a' OR feed > 'b'`, a
+//! negated leaf, and an `AND` nested under the `OR` are all `Unsupported`.
+//!
+//! Mixing the two feed columns — `feed = 'a' OR feed_url = '…'` — is refused
+//! too, and that one is a choice rather than a necessity: both columns name a
+//! subscription, so the union across them would be sound. It is left out so the
+//! rule stays "one feed column per disjunction" and a `FeedFilter` stays one
+//! key against a set of values. `docs/rss.md` records it as the residual
+//! limitation, and
+//! `a_disjunction_mixing_feed_and_feed_url_does_not_prune` in
+//! `integration_tests.rs` is what would have to change to support it.
+//!
+//! This is also what makes a short `IN` list prune. DataFusion rewrites
+//! `col IN (…)` into a left-deep chain of `OR`ed equalities when the list holds
+//! one value, or at most `THRESHOLD_INLINE_INLIST` (3) values with a plain
+//! column on the left (datafusion-optimizer 52.5.0,
+//! `src/simplify_expressions/inlist_simplifier.rs:38-56`, the non-negated fold
+//! at `:82-90`, and the constant at
+//! `src/simplify_expressions/expr_simplifier.rs:111`), so below four values the
+//! `InList` arm below is unreachable from SQL and the disjunction arm is what
+//! prunes. `integration_tests.rs` pins both lengths, from the request counts:
+//! `a_short_in_list_is_rewritten_to_a_disjunction_and_still_prunes` at two
+//! values and `a_long_in_list_prunes_to_its_members` at four.
 //!
 //! ## Intersection, and the empty result
 //!
@@ -174,6 +204,35 @@ fn feed_filter(expr: &Expr) -> Option<FeedFilter<'_>> {
                 values.push(string_literal(item)?);
             }
             Some(FeedFilter { key, values })
+        }
+        // A disjunction prunes when *every* leaf does, over one column: the
+        // union of the leaves' value sets is then exactly the subscriptions the
+        // predicate can admit a row from, so pruning to that union applies the
+        // predicate rather than approximating it. One unprunable leaf makes the
+        // union unbounded — `feed = 'a' OR title = 't'` admits a row from every
+        // subscription — so it rejects the whole disjunction rather than
+        // pruning to the part it understood.
+        //
+        // Recursing through this same function is what makes nesting fall out:
+        // `Or` is left-deep as the parser and the `IN` rewrite both build it,
+        // and an `And` under an `Or` has no arm here, so it returns `None` and
+        // takes the disjunction with it.
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            let left = feed_filter(&binary.left)?;
+            let right = feed_filter(&binary.right)?;
+            // One column per disjunction. A union across `feed` and `feed_url`
+            // would also be sound — both name a subscription — and is refused
+            // to keep the rule statable and `FeedFilter` a single key; see the
+            // module doc.
+            if left.key != right.key {
+                return None;
+            }
+            let mut values = left.values;
+            values.extend(right.values);
+            Some(FeedFilter {
+                key: left.key,
+                values,
+            })
         }
         _ => None,
     }
@@ -515,6 +574,118 @@ mod tests {
         );
     }
 
+    /// The disjunction shapes *inside* the allowlist, each asserting both
+    /// obligations: the exact feeds it prunes to, and the `Exact` claim that
+    /// tells DataFusion to stop filtering it above the scan. A shape that
+    /// pruned correctly but classified `Unsupported` would only be slow; a
+    /// shape that classified `Exact` and pruned to the wrong set would return
+    /// wrong rows, so neither assertion stands alone.
+    #[tokio::test]
+    async fn disjunctions_of_feed_equalities_prune_to_the_union_and_claim_exact() {
+        let subs = subs(&[
+            ("a", "http://x/a"),
+            ("b", "http://x/b"),
+            ("c", "http://x/c"),
+        ]);
+        let provider = items_provider_with_feeds(&["a", "b", "c"]);
+        let cases: Vec<(&str, Expr, Vec<&str>)> = vec![
+            (
+                "two equalities",
+                col("feed").eq(lit("a")).or(col("feed").eq(lit("b"))),
+                vec!["a", "b"],
+            ),
+            (
+                "three equalities, left-deep as the simplifier builds them",
+                col("feed")
+                    .eq(lit("a"))
+                    .or(col("feed").eq(lit("b")))
+                    .or(col("feed").eq(lit("c"))),
+                vec!["a", "b", "c"],
+            ),
+            (
+                "three equalities, right-deep",
+                col("feed")
+                    .eq(lit("a"))
+                    .or(col("feed").eq(lit("b")).or(col("feed").eq(lit("c")))),
+                vec!["a", "b", "c"],
+            ),
+            (
+                "the union in predicate order, reported in subscription order",
+                col("feed").eq(lit("c")).or(col("feed").eq(lit("a"))),
+                vec!["a", "c"],
+            ),
+            (
+                "a reversed-operand leaf",
+                lit("a").eq(col("feed")).or(col("feed").eq(lit("c"))),
+                vec!["a", "c"],
+            ),
+            (
+                "a duplicated leaf, which names one feed once",
+                col("feed").eq(lit("a")).or(col("feed").eq(lit("a"))),
+                vec!["a"],
+            ),
+            (
+                "a leaf naming no subscription, which adds nothing",
+                col("feed").eq(lit("a")).or(col("feed").eq(lit("nope"))),
+                vec!["a"],
+            ),
+            (
+                "every leaf naming no subscription, which is unsatisfiable",
+                col("feed").eq(lit("nope")).or(col("feed").eq(lit("nor"))),
+                vec![],
+            ),
+            (
+                "leaves on feed_url, mapped back to subscription names",
+                col("feed_url")
+                    .eq(lit("http://x/a"))
+                    .or(col("feed_url").eq(lit("http://x/c"))),
+                vec!["a", "c"],
+            ),
+            (
+                "an IN list as a leaf, whose members join the union",
+                col("feed")
+                    .eq(lit("a"))
+                    .or(col("feed").in_list(vec![lit("b"), lit("c")], false)),
+                vec!["a", "b", "c"],
+            ),
+        ];
+        for (why, filter, expected) in cases {
+            assert_eq!(
+                prune_feeds(std::slice::from_ref(&filter), &subs),
+                expected,
+                "{why} must prune to the union of its leaves: {filter}"
+            );
+            assert_eq!(
+                provider
+                    .supports_filters_pushdown(&[&filter])
+                    .expect("classify"),
+                vec![Exact],
+                "{why} prunes, so it must be claimed Exact: {filter}"
+            );
+        }
+    }
+
+    /// A disjunction still intersects with the other predicates beside it: the
+    /// union is one predicate's contribution, not the whole feed list.
+    #[test]
+    fn a_disjunction_intersects_with_the_predicates_beside_it() {
+        let subs = subs(&[
+            ("a", "http://x/a"),
+            ("b", "http://x/b"),
+            ("c", "http://x/c"),
+        ]);
+        assert_eq!(
+            prune_feeds(
+                &[
+                    col("feed").eq(lit("a")).or(col("feed").eq(lit("b"))),
+                    col("feed").eq(lit("b")).or(col("feed").eq(lit("c"))),
+                ],
+                &subs
+            ),
+            vec!["b"]
+        );
+    }
+
     /// Every shape outside the allowlist must do the *same two* things: prune
     /// nothing, and be classified `Unsupported`. Failing to classify must never
     /// be read as "matches nothing".
@@ -547,8 +718,34 @@ mod tests {
             ("a column on both sides", col("feed").eq(col("feed_url"))),
             ("an IS NULL", col("feed").is_null()),
             (
-                "a disjunction of two prunable halves",
-                col("feed").eq(lit("a")).or(col("feed").eq(lit("b"))),
+                "a disjunction with a non-feed leaf",
+                col("feed").eq(lit("a")).or(col("title").eq(lit("t"))),
+            ),
+            (
+                "a disjunction with an inequality leaf",
+                col("feed").eq(lit("a")).or(col("feed").gt(lit("b"))),
+            ),
+            (
+                "a disjunction with a negated leaf",
+                col("feed").eq(lit("a")).or(col("feed").not_eq(lit("b"))),
+            ),
+            (
+                "a disjunction mixing the two feed columns",
+                col("feed")
+                    .eq(lit("a"))
+                    .or(col("feed_url").eq(lit("http://x/c"))),
+            ),
+            (
+                "a conjunction nested inside a disjunction",
+                col("feed")
+                    .eq(lit("a"))
+                    .or(col("feed").eq(lit("b")).and(col("title").eq(lit("t")))),
+            ),
+            (
+                "a disjunction whose non-feed leaf is itself a disjunction",
+                col("feed")
+                    .eq(lit("a"))
+                    .or(col("title").eq(lit("t")).or(col("feed").eq(lit("b")))),
             ),
         ];
         for (why, filter) in cases {

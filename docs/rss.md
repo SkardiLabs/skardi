@@ -722,36 +722,48 @@ DataFusion.
 |---|---|
 | `WHERE feed = 'b'` | exactly one |
 | `WHERE feed_url = '<url>'` | every subscription using that URL |
-| `WHERE feed IN ('a','b','c','d')` (4+ values) | exactly those four |
-| `WHERE feed IN ('a','c')` (**fewer than 4**) | **all of them** — see below |
-| `WHERE feed = 'a' OR feed = 'c'` | all of them — same reason |
+| `WHERE feed IN ('a','b','c','d')` (any length) | exactly those members |
+| `WHERE feed = 'a' OR feed = 'c'` | exactly those two |
+| `WHERE feed = 'a' OR feed_url = '<url>'` | **all of them** — see below |
 | `WHERE feed IN (…) AND feed = 'b'` | the intersection — one |
 | `JOIN … ON m.feed = i.feed` | all of them |
 | `LIMIT n` with no `ORDER BY` | as many as it takes to fill `n` — a nondeterministic subset |
 | `ORDER BY … LIMIT n` | all of them (Top-K consumes every partition) |
 
-### Current limitation: a short `IN` list does not prune
+### What prunes
 
-**`WHERE feed IN (…)` does not prune below four values.** DataFusion's
-`ShortenInListSimplifier` rewrites a short `IN` list into a chain of `OR`s
-before the predicate reaches the provider, and the provider's filter classifier
-does not recognize an `OR` chain, so every subscribed feed is fetched.
+Three shapes over `feed` or `feed_url` prune, and nothing else does:
 
-The rows are still correct — the rewritten predicate is applied above the scan
-by DataFusion. The cost is HTTP requests, not correctness.
+- **equality against a literal** — `feed = 'b'`, either operand order;
+- **a non-negated `IN` list** of literals, at any length;
+- **a disjunction of either of the above over one of the two columns** —
+  `feed = 'a' OR feed = 'c'` visits exactly `a` and `c`.
 
-The same applies to an `OR` chain written by hand: `WHERE feed = 'a' OR feed =
-'c'` is what the rewrite produces, and it prunes nothing either.
+The disjunction case is what makes a short `IN` list prune. DataFusion rewrites
+`feed IN ('a','c')` into `feed = 'a' OR feed = 'c'` before the predicate reaches
+the provider, for lists of three or fewer values, so a short `IN` and the
+hand-written `OR` are the same predicate by the time it is classified — and both
+prune. `EXPLAIN` shows this: the pruned predicate appears as the table scan's
+`full_filters` with no `FilterExec` above it.
 
-This is a **current limitation**, not intended behavior; a decision on closing
-it is pending. Until then:
+Duplicates and unknown names need no care. `feed = 'a' OR feed = 'a'` visits `a`
+once, and a name matching no subscription simply contributes nothing to the
+union — `feed = 'a' OR feed = 'typo'` visits only `a`, and a predicate naming no
+subscription at all fetches nothing.
 
-- an `IN` list of **four or more** distinct values prunes to exactly its
-  members, and
-- **equality on a single feed always prunes**.
+### Residual limitation: a disjunction may not mix the two feed columns
 
-So when the fetch cost matters and you want two or three feeds, issue one
-single-feed query per feed rather than one `IN` query.
+A disjunction prunes only when **every** branch names the **same** column, so
+`WHERE feed = 'a' OR feed_url = '<url>'` fetches every subscription. So does any
+disjunction with a branch that is not itself prunable — `feed = 'a' OR title =
+'x'`, `feed = 'a' OR feed > 'b'`, a negated branch, or an `AND` nested inside the
+`OR`.
+
+The rows are still correct in every one of these cases — the predicate is applied
+above the scan by DataFusion. The cost is HTTP requests, not correctness.
+
+When the fetch cost matters, express the feed set with one column: an `IN` list,
+or an `OR` chain over `feed` alone.
 
 ---
 

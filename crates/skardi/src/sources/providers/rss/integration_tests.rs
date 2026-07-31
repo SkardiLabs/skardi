@@ -1101,8 +1101,8 @@ async fn cancellation_stops_further_fetches() {
 
 /// Five subscriptions, so an `IN` list can name four of them — the shortest
 /// list that reaches the provider as an `Expr::InList` at all. See
-/// [`a_short_in_list_is_rewritten_and_prunes_nothing`] for why the length
-/// matters.
+/// [`a_short_in_list_is_rewritten_to_a_disjunction_and_still_prunes`] for why
+/// the length matters, and why both lengths now prune anyway.
 const FIVE_FEEDS: [(&str, &str); 5] = [
     ("a", "/a.xml"),
     ("b", "/b.xml"),
@@ -1129,44 +1129,95 @@ async fn a_long_in_list_prunes_to_its_members() {
 }
 
 /// An `IN` list of three or fewer values never reaches this provider as an
-/// `Expr::InList`, so it prunes nothing — the rows are right and the fetches are
-/// not.
+/// `Expr::InList` — and prunes anyway, because the classifier recognises the
+/// disjunction it was rewritten into.
 ///
 /// Measured, not inferred: `ShortenInListSimplifier` rewrites `col IN (…)` into
 /// a chain of `OR`s when the list holds a single value, or at most
 /// `THRESHOLD_INLINE_INLIST` (3) values with a plain column on the left
 /// (datafusion-optimizer 52.5.0,
-/// `src/simplify_expressions/inlist_simplifier.rs:38-56`, and the constant at
+/// `src/simplify_expressions/inlist_simplifier.rs:38-56`, the non-negated fold
+/// at `:82-90`, and the constant at
 /// `src/simplify_expressions/expr_simplifier.rs:111`). `split_conjunction`
-/// recurses only through `AND`, so the resulting `OR` arrives as one
-/// `BinaryExpr` that `table.rs`'s classifier reports `Unsupported` — correctly,
-/// since it prunes on no part of it. `EXPLAIN` for this query confirms both
-/// halves: the logical plan is
-/// `Filter: feed = Utf8("a") OR feed = Utf8("c")` over a
-/// `TableScan` with no `full_filters`, and the physical plan is a `FilterExec`
-/// over `RssScanExec: kind=items feeds=3`.
+/// recurses only through `AND`, so the resulting `OR` arrives at the provider as
+/// one `BinaryExpr` — which `table.rs`'s classifier now reads as a disjunction
+/// of feed equalities and prunes to the union of its leaves. `EXPLAIN` for this
+/// query is a bare `TableScan: items projection=[feed],
+/// full_filters=[items.feed = Utf8("a") OR items.feed = Utf8("c")]` over
+/// `RssScanExec: kind=items feeds=2`: no `Filter` survives above the scan, which
+/// is the `Exact` claim being honoured.
 ///
-/// This is a real gap between the design's acceptance criterion for `IN`
-/// pushdown and what the stack does — recorded here rather than worked around,
-/// because closing it means changing production code (see the task report).
-/// The assertion on the rows is the half that must never regress: pruning is an
-/// optimisation, and returning `a` and `c` is not.
+/// This is the SQL shape that made the classifier's `InList` arm unreachable
+/// below four values. Keeping the test at two values is the point: it fails if
+/// the disjunction path regresses, and the `EXPLAIN` above is how to tell which
+/// arm a given length lands on.
 #[tokio::test]
-async fn a_short_in_list_is_rewritten_and_prunes_nothing() {
+async fn a_short_in_list_is_rewritten_to_a_disjunction_and_still_prunes() {
     let news = TestNews::start(&[("a", "/a.xml"), ("b", "/b.xml"), ("c", "/c.xml")], |_| {}).await;
 
     let items = news
         .sql("SELECT feed FROM news.main.items WHERE feed IN ('a', 'c') ORDER BY feed")
         .await;
+    assert_eq!(col(&items, "feed"), vec!["a", "c"]);
+    assert_eq!(
+        sorted(news.paths()),
+        vec!["/a.xml", "/c.xml"],
+        "the rewritten short IN list prunes to its members, so `b` is never fetched"
+    );
+}
+
+/// The same disjunction written by hand, which no `IN` rewrite produces and
+/// which the `InList` arm could therefore never have covered.
+///
+/// The row assertion is the half that must never regress — pruning is an
+/// optimisation, returning exactly `a` and `c` is not — and the request count is
+/// the only thing that catches a silent loss of pruning, since an unpruned scan
+/// returns the same rows.
+#[tokio::test]
+async fn a_hand_written_disjunction_of_feed_equalities_prunes() {
+    let news = TestNews::start(&FIVE_FEEDS, |_| {}).await;
+
+    let items = news
+        .sql(
+            "SELECT feed FROM news.main.items \
+             WHERE feed = 'a' OR feed = 'c' ORDER BY feed",
+        )
+        .await;
+    assert_eq!(col(&items, "feed"), vec!["a", "c"]);
+    assert_eq!(
+        sorted(news.paths()),
+        vec!["/a.xml", "/c.xml"],
+        "a hand-written OR over one feed column prunes to the union of its leaves"
+    );
+}
+
+/// A disjunction mixing `feed` and `feed_url` is *not* prunable: the classifier
+/// takes one feed column per disjunction, so this shape stays `Unsupported` and
+/// DataFusion filters it above the scan.
+///
+/// The rows are the obligation, and they are right either way. The request count
+/// is what states the deliberate limitation — if mixed-column disjunctions are
+/// ever supported, this is the test that says so.
+#[tokio::test]
+async fn a_disjunction_mixing_feed_and_feed_url_does_not_prune() {
+    let news = TestNews::start(&[("a", "/a.xml"), ("b", "/b.xml"), ("c", "/c.xml")], |_| {}).await;
+    let c_url = format!("{}/c.xml", news.server.url());
+
+    let items = news
+        .sql(&format!(
+            "SELECT feed FROM news.main.items \
+             WHERE feed = 'a' OR feed_url = '{c_url}' ORDER BY feed"
+        ))
+        .await;
     assert_eq!(
         col(&items, "feed"),
         vec!["a", "c"],
-        "the rewritten predicate is still applied — above the scan, by DataFusion"
+        "the predicate is still applied — above the scan, by DataFusion"
     );
     assert_eq!(
         sorted(news.paths()),
         vec!["/a.xml", "/b.xml", "/c.xml"],
-        "a short IN list prunes nothing, so every subscription is fetched"
+        "a disjunction over two feed columns prunes nothing, so every subscription is fetched"
     );
 }
 
