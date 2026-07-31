@@ -7,12 +7,13 @@
 //! and limit pushdown, DataFusion registration) on top.
 //!
 //! **Status: typed config, HTTP client, action registry, source packs, the
-//! scan engine, the two UDTFs, and the first real provider pack (GitHub)
-//! have landed.** A configured gateway registers as a real catalog
+//! scan engine, the two UDTFs, and the first real provider packs (GitHub,
+//! Slack) have landed.** A configured gateway registers as a real catalog
 //! (`<gateway>.<binding>.<table>`) and is queryable today with the `github`
 //! pack (repositories, issues, pull requests, reviews, commits, workflow
-//! runs, releases) and the synthetic `mock` pack. Further provider packs
-//! (Jira, Notion, Slack) land one PR each.
+//! runs, releases), the `slack` pack (conversations, users, files), and
+//! the synthetic `mock` pack. Further provider packs (Jira, Notion) land
+//! one PR each.
 //!
 //! - [`OpenConnectorConfig`] / [`OpenConnectorBinding`] — the typed
 //!   `open_connector:` block of a `type: open_connector` data source, shared
@@ -172,7 +173,7 @@ pub async fn register_open_connector_tables(
 
     // Resolve bindings to pack table definitions first, so discovery covers
     // the allowlist *and* every action a bound table needs.
-    let pack_registry = SourcePackRegistry::builtins();
+    let pack_registry = SourcePackRegistry::builtins()?;
     let mut action_ids = config.raw_action_allowlist.clone();
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;
@@ -607,6 +608,66 @@ bindings:
             execute_requests(&gateway2).len(),
             1,
             "LIMIT 1 must stop after the first page"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_band_error_key_fails_the_scan_as_a_provider_error() {
+        // The mock pack declares `error_path: $.error` — the engine's
+        // in-band error mechanism for providers whose gateway executors
+        // pass application errors through inside 2xx action output. The
+        // scan must fail naming the provider's own code and the action,
+        // never the misleading row-path error the missing row array would
+        // raise.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
+                return MockResponse::ok(&envelope_ok(r#"{"error": "missing_scope"}"#));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let token_env = "SKARDI_TEST_OC_INBAND_ERROR";
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&mock_config(token_env, 0)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect("registration succeeds");
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+
+        let err = ctx
+            .sql("SELECT id FROM saas.ws.items")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("the in-band error must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing_scope") && message.contains("mock.list_items"),
+            "the provider's own code and the action are named: {message}"
+        );
+        assert!(
+            !message.contains("row path"),
+            "never the misleading row-path error: {message}"
         );
     }
 

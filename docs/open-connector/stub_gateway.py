@@ -146,7 +146,11 @@ def execute(action_id, params):
     page = int(params.get("page", 1))
     # Open Connector action inputs are camelCase (and strict about it).
     per_page = int(params.get("perPage", 30))
-    return {row_key: rows[(page - 1) * per_page : page * per_page]}
+    sliced = rows[(page - 1) * per_page : page * per_page]
+    # The raw page length before any post-pagination filtering (the stub
+    # does none), matching open-connector#228's pageInfo signal that the
+    # issues table paginates on.
+    return {row_key: sliced, "pageInfo": {"fetched": len(sliced)}}
 
 
 class Handler(BaseHTTPRequestHandler):

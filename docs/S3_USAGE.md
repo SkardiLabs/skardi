@@ -56,6 +56,18 @@ spec:
 skardi-server --pipeline pipeline.yaml --ctx s3_context.yaml
 ```
 
+### 4. Query the Data
+
+Once the server is running with the S3 context loaded, query the registered
+sources by name with the `skardi` CLI (see [docs/cli.md](cli.md)) — the CLI
+is a thin HTTP client, so no local S3 access or credentials are needed on the
+client side, only on the server:
+
+```bash
+skardi query -e "SELECT * FROM sales_data LIMIT 10"
+skardi query -e "SELECT * FROM customer_events LIMIT 10" --table
+```
+
 ## Connectivity Verification
 
 The server automatically:

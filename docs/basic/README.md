@@ -89,6 +89,29 @@ Server listening on 0.0.0.0:8080
 | `/data_source` | GET | List all data sources |
 | `/:name/execute` | POST | Execute a pipeline by name |
 
+### Using the `skardi` CLI
+
+Every endpoint above is also reachable through the `skardi` CLI (see
+[docs/cli.md](../cli.md)), a thin HTTP client that sends the same requests as
+the curl examples below:
+
+```bash
+skardi health                              # GET /health
+skardi health product-search-demo          # GET /health/:name
+skardi pipeline list                       # GET /pipelines
+skardi pipeline show product-search-demo   # GET /pipeline/:name
+skardi schema                              # GET /data_source
+
+# POST /:name/execute — mirrors the curl example below (-d for the JSON
+# body, -p for individual overrides/additions such as limit)
+skardi run product-search-demo \
+  -d '{"brand":null,"max_price":null,"min_price":null,"color":null,"category":null,"availability":null}' \
+  -p limit=5 --table
+```
+
+The rest of this guide uses curl so you can see the raw request/response
+shapes; swap in the CLI form whenever that's more convenient.
+
 ### 1. Service Health Check
 ```bash
 curl http://localhost:8080/health

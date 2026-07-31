@@ -1,6 +1,11 @@
 # Skardi CLI
 
-CLI for running SQL queries against local files, remote object stores, datalake formats, and databases. No server required.
+`skardi` is a thin HTTP client for `skardi-server`: every command builds one
+HTTP request, sends it to a running server, and renders the response. It
+holds no local query engine, no catalog, and no storage access of its own —
+all of that lives in the server. Start a server first (see
+[docs/server.md](server.md)), point the CLI at it, and every command below
+becomes available.
 
 ## Install
 
@@ -14,8 +19,8 @@ Then run `skardi` from anywhere.
 
 > `--locked` tells cargo to respect the checked-in `Cargo.lock` instead of
 > re-resolving transitive dependencies. Without it, cargo may pull a newer
-> version of a transitive crate whose MSRV is higher than yours. If that happens, add
-> `--locked` or upgrade your toolchain.
+> version of a transitive crate whose MSRV is higher than yours. If that
+> happens, add `--locked` or upgrade your toolchain.
 
 ## Run without installing
 
@@ -25,626 +30,183 @@ From the repo root:
 cargo run -p skardi-cli -- <command> [options]
 ```
 
-## Commands
+## Connecting
 
-### `query` — Run SQL or show schema
+Every command accepts two global flags, `--server <URL>` and `--token
+<TOKEN>`. Each is resolved independently from four sources, in this
+precedence order (highest wins):
 
-Execute a SQL query or show table schema(s). Data sources can come from:
+| Precedence | Server URL | API token |
+|---|---|---|
+| 1 | `--server <URL>` flag | `--token <TOKEN>` flag |
+| 2 | `SKARDI_SERVER_URL` env var | `SKARDI_API_TOKEN` env var |
+| 3 | `server:` in `~/.skardi/config.yaml` | `token:` in `~/.skardi/config.yaml` |
+| 4 | `http://127.0.0.1:8080` (default) | none |
 
-- **Local files** — CSV, Parquet, JSON/NDJSON (directly by path in SQL or via context file)
-- **Remote files** — S3, GCS, Azure Blob, HTTP/HTTPS, OSS, COS (directly by URL in SQL or via context file)
-- **Datalake formats** — Lance (directly by path in SQL or via context file), Iceberg (via context file)
-- **Databases** — PostgreSQL, MySQL, SQLite, MongoDB (via context file or direct path for SQLite)
+`~/.skardi/config.yaml` is a client manifest in the repo's manifest style:
 
-#### Query files directly (no context file needed)
-
-You can query local or remote files directly by referencing their paths in SQL — no context file or pre-registration required:
-
-```bash
-# Local files
-skardi query --sql "SELECT * FROM './data/products.csv' LIMIT 10"
-skardi query --sql "SELECT * FROM '/absolute/path/events.parquet'"
-skardi query --sql "SELECT * FROM './data/logs.json'"
-
-# Lance datasets
-skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
-
-# SQLite tables (pattern: path/to/file.db.table_name)
-skardi query --sql "SELECT * FROM './data/my_database.db.users'"
-skardi query --sql "SELECT * FROM './data/app.sqlite.customers'"
-
-# Remote files (S3, GCS, Azure)
-skardi query --sql "SELECT * FROM 's3://mybucket/data/events.parquet'"
-skardi query --sql "SELECT * FROM 'gs://mybucket/data.csv'"
-skardi query --sql "SELECT * FROM 'az://mycontainer/data.parquet'"
-skardi query --sql "SELECT * FROM 'https://example.com/data.csv'"
-
-# Join across sources
-skardi query --sql "
-  SELECT a.*, b.score
-  FROM './users.csv' a
-  JOIN 's3://mybucket/scores.parquet' b ON a.id = b.user_id
-"
+```yaml
+kind: client
+metadata:
+  name: default
+spec:
+  server: http://127.0.0.1:8080
+  token: <optional bearer token>
 ```
 
-Remote storage credentials are read from standard environment variables (e.g., `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` for S3; `GOOGLE_SERVICE_ACCOUNT` for GCS; `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCESS_KEY` for Azure).
+Both `spec.server` and `spec.token` are optional. A missing file is fine
+(defaults apply); a present-but-malformed file prints a `warning:` to
+stderr and falls back to defaults — never a silent ignore.
 
-**Supported remote schemes:** `s3://`, `gs://`, `gcs://`, `az://`, `azure://`, `abfs://`, `abfss://`, `http://`, `https://`, `oss://` (Alibaba), `cos://` (Tencent)
+When a token is resolved (from any source), every request carries
+`Authorization: Bearer <token>`.
 
-#### Query with a context file
+## Ad-hoc SQL — `query`
 
-For database sources or when you want named tables, use a context file:
+`skardi query` sends one SQL statement to `POST /query` on the server and
+prints the result.
 
 ```bash
 # Inline SQL
-skardi query --ctx <path-to-ctx.yaml> --sql "SELECT * FROM my_table LIMIT 10"
+skardi query -e "SELECT * FROM products LIMIT 10"
 
-# SQL from file
-skardi query --ctx <path-to-ctx.yaml> --file query.sql
+# SQL from a file (-f wins over -e when both are given)
 skardi query -f ./queries/report.sql
 
-# With default ctx — SKARDICONFIG accepts a directory (preferred) or a
-# single ctx file. When it's a directory, the CLI also looks inside it for
-# `aliases.yaml` and `pipelines/`.
-export SKARDICONFIG=/path/to/config-dir
-# or point at a single file
-export SKARDICONFIG=/path/to/ctx.yaml
-skardi query --sql "SELECT * FROM my_table"
-skardi query --file report.sql
+# Cap the number of returned rows (server default: 1000)
+skardi query -e "SELECT * FROM events" --max-rows 50
+
+# Render as an ASCII table instead of JSON
+skardi query -e "SELECT * FROM products LIMIT 10" --table
 ```
 
-**Context resolution** (when `--ctx` is omitted): `SKARDICONFIG` env, then `~/.skardi/config/`. Both `--ctx` and `SKARDICONFIG` accept either a file (used directly) or a directory (the CLI appends `ctx.yaml` by convention). If no context file is found, the query runs without pre-registered tables (you can still query files directly by path).
-
-#### Schema inspection
-
-Use `--schema` with either `--all` (all tables) or `-t TABLE` (one table):
+Default output is the response's `data` array, pretty-printed JSON, on
+stdout — nothing else — so it pipes cleanly into `jq`:
 
 ```bash
-skardi query --ctx ./demo/ctx.yaml --schema --all
-skardi query --ctx ./demo/ctx.yaml --schema -t products
+skardi query -e "SELECT id, price FROM products WHERE price > 100" \
+  | jq '.[] | .id'
 ```
 
-**Semantics overlay** — if a `kind: semantics` YAML is discovered (or
-`data_sources[].description` is set), `--schema` renders the
-descriptions inline next to each table and column with a `--`
-separator. No flag is needed to opt in.
+`products` (and any other table referenced) must already be registered as
+a data source on the server you're talking to — see the server's `--ctx`
+flag in [docs/server.md](server.md). The CLI does not register sources
+itself.
 
-```text
-table: products  -- Product catalog with pricing/inventory. One row per SKU.
-  id: Int64  -- Stable internal SKU; primary key.
-  brand: Utf8
-  price: Float64  -- Retail price in USD.
+When the server truncates the result set (more rows existed than
+`max_rows`), a notice is printed to **stderr** — stdout stays clean for
+piping:
+
+```
+note: results truncated; pass a higher --max-rows to see the rest
 ```
 
-The overlay is resolved in this order:
+## Pipelines
 
-1. `--semantics <FILE-OR-DIR>` (explicit override).
-2. Auto-discovered `<ctx_dir>/semantics/` directory.
-3. Auto-discovered `<ctx_dir>/semantics.yaml` (or `.yml`) file.
-4. None — descriptions fall back to `data_sources[].description` from
-   the ctx, or render bare if neither is set.
-
-Defining both `<ctx_dir>/semantics/` and `<ctx_dir>/semantics.yaml` is
-a hard error to prevent silent shadowing. See [semantics.md](semantics.md)
-for the file format and composition rules.
-
-#### Context file format
-
-```yaml
-data_sources:
-  # Local CSV
-  - name: products
-    type: csv
-    path: data/products.csv
-    options:
-      has_header: true
-      delimiter: ","
-      schema_infer_max_records: 1000
-
-  # Local Parquet
-  - name: events
-    type: parquet
-    path: data/events.parquet
-
-  # Remote Parquet (S3)
-  - name: remote_events
-    type: parquet
-    path: s3://mybucket/data/events.parquet
-
-  # JSON / NDJSON
-  - name: logs
-    type: json
-    path: data/logs.json
-
-  # Lance dataset
-  - name: embeddings
-    type: lance
-    path: data/embeddings.lance
-
-  # Iceberg table
-  - name: transactions
-    type: iceberg
-    path: s3://warehouse/path
-    options:
-      namespace: my_db
-      table: transactions
-      aws_region: us-east-1
-
-  # PostgreSQL
-  - name: users
-    type: postgres
-    connection_string: postgresql://localhost:5432/mydb
-    options:
-      table: users
-      schema: public
-      user_env: PG_USER
-      pass_env: PG_PASS
-
-  # MySQL
-  - name: orders
-    type: mysql
-    connection_string: mysql://localhost:3306/mydb
-    options:
-      table: orders
-      user_env: MYSQL_USER
-      pass_env: MYSQL_PASS
-
-  # SQLite
-  - name: users
-    type: sqlite
-    path: data/my_database.db
-    options:
-      table: users
-      busy_timeout_ms: "5000"   # Optional
-
-  # MongoDB
-  - name: profiles
-    type: mongo
-    connection_string: mongodb://localhost:27017
-    options:
-      database: mydb
-      collection: profiles
-      primary_key: _id
-```
-
-**Supported types:**
-
-| Type | Source | Path / Connection |
-|------|--------|-------------------|
-| `csv` | Local or remote CSV files | File path or remote URL |
-| `parquet` | Local or remote Parquet files | File path or remote URL |
-| `json` / `ndjson` | Local or remote JSON files | File path or remote URL |
-| `lance` | Lance vector datasets | Local path |
-| `iceberg` | Apache Iceberg tables | Warehouse path (local or S3) |
-| `postgres` | PostgreSQL tables | `postgresql://host:port/db` |
-| `mysql` | MySQL tables | `mysql://host:port/db` |
-| `sqlite` | SQLite tables | Local file path (e.g. `data/my.db`) |
-| `mongo` | MongoDB collections | `mongodb://host:port` |
-
-**Path resolution:** Relative paths in the context file are resolved relative to your **current working directory**.
-
-**Database credentials:** For security, database credentials are supplied via environment variables (specified in `options` as `user_env` / `pass_env`), not in the connection string.
-
-#### Vector search with `lance_knn`
-
-The `lance_knn` table function is built-in and lets you run K-nearest-neighbor searches against Lance datasets.
-
-The Lance dataset must be registered first — either via a context file or by querying it by path (which auto-registers it under the file stem as the table name). For example, querying `'./embeddings.lance'` registers it as `embeddings`.
-
-```sql
--- Syntax: lance_knn(table_name, vector_column, query_vector, k [, filter])
-```
-
-Arguments:
-1. `table_name` (string) — Name of the registered Lance table
-2. `vector_column` (string) — Column containing the vectors
-3. `query_vector` (array or subquery) — The query vector to search for
-4. `k` (integer) — Number of nearest neighbors to return
-5. `filter` (string, optional) — SQL filter predicate applied before KNN search
-
-The result includes all columns from the table (except the vector column) plus a `_distance` column.
-
-**Using with a context file:**
-
-```yaml
-# ctx.yaml
-data_sources:
-  - name: embeddings
-    type: lance
-    path: data/embeddings.lance
-```
+What used to be CLI aliases are now just pipeline names: a pipeline is a
+named, parameterized SQL template registered on the server (see
+[docs/pipelines.md](pipelines.md)), and `skardi run <name>` calls it
+directly — there is no separate alias layer to define or maintain.
 
 ```bash
-skardi query --ctx ./ctx.yaml --sql "
-  SELECT id, label, _distance
-  FROM lance_knn('embeddings', 'vector', [0.1, 0.2, 0.3], 5)
-"
+# List every pipeline the server knows about
+skardi pipeline list
+
+# Show one pipeline's definition (SQL, inferred params, etc.)
+skardi pipeline show daily_report
 ```
 
-**Using with direct path (no context file):**
-
-First reference the Lance dataset in a query so it gets auto-registered, then use `lance_knn` with the derived table name (file stem):
+`skardi run <name>` sends `POST /{name}/execute` with a JSON body built
+from `-p`/`--param` and/or `-d`/`--data`:
 
 ```bash
-# The path './embeddings.lance' auto-registers as table name 'embeddings'
-skardi query --sql "
-  SELECT * FROM lance_knn('embeddings', 'vector',
-    (SELECT vector FROM './embeddings.lance' WHERE id = 42), 10)
-"
+# Named parameters, one flag per key
+skardi run daily_report -p user_id=1 -p category=premium
+
+# Whole body inline as JSON
+skardi run daily_report -d '{"user_id": 1, "category": "premium"}'
+
+# Body from a file, with a -p override on top
+skardi run daily_report -d @params.json -p category=premium
+
+# Body piped in from stdin
+echo '{"user_id": 1}' | skardi run daily_report -d -
+
+# Render as a table
+skardi run daily_report -p user_id=1 --table
 ```
 
-**More examples:**
+`-d` and `-p` compose: the JSON object from `-d` (inline, `@file`, or `-`
+for stdin) is the base, then each `-p NAME=VALUE` sets or overrides that
+key. With neither flag, the body is `{}`.
 
-```sql
--- KNN with a literal vector
-SELECT * FROM lance_knn('embeddings', 'vector', [0.1, 0.2, 0.3, ...], 10)
+`-p` values are **JSON-first typed**: `-p user_id=1` sends the number `1`,
+not the string `"1"`; `-p active=true` sends a boolean; `-p tags=[1,2]`
+sends an array. A value only falls back to a plain string when it isn't
+valid JSON on its own (e.g. `-p name=hello`). This matters because the
+server substitutes typed literals into the pipeline's SQL.
 
--- KNN with a subquery vector
-SELECT * FROM lance_knn('embeddings', 'vector',
-    (SELECT vector FROM embeddings WHERE id = 42), 10)
+Calling a pipeline that doesn't exist on the server returns a friendly
+error instead of a raw 404:
 
--- KNN with a pre-filter
-SELECT * FROM lance_knn('embeddings', 'vector', [0.1, 0.2, ...], 10,
-    'category = ''electronics''')
+```
+error: pipeline 'no_such_pipeline' not found — try 'skardi pipeline list'
 ```
 
-#### Full-text search with `lance_fts`
-
-The `lance_fts` table function is built-in and lets you run full-text search (BM25) against Lance datasets with a full-text index.
-
-Like `lance_knn`, the Lance dataset must be registered first — either via a context file or by querying it by path (which auto-registers it under the file stem as the table name).
-
-```sql
--- Syntax: lance_fts(table_name, text_column, search_query, limit)
-```
-
-Arguments:
-1. `table_name` (string) — Name of the registered Lance table
-2. `text_column` (string) — Column containing the text to search
-3. `search_query` (string) — The search query (see query syntax below)
-4. `limit` (integer) — Maximum number of results to return
-
-The result includes all columns from the table plus a `_score` column with BM25 relevance scores.
-
-**Query syntax:**
-
-| Syntax | Example | Description |
-|--------|---------|-------------|
-| Term search | `'umbrella train'` | OR logic across terms, ranked by BM25 |
-| Phrase search | `'"train to boston"'` | Exact phrase match |
-| Fuzzy search | `'rammen~1'` | Typo-tolerant (edit distance 1–2) |
-| Boolean search | `'+umbrella -train'` | `+` = must include, `-` = must exclude |
-
-**Using with a context file:**
-
-```yaml
-# ctx.yaml
-data_sources:
-  - name: products
-    type: lance
-    path: data/products.lance
-```
+## Discovery and health
 
 ```bash
-skardi query --ctx ./ctx.yaml --sql "
-  SELECT id, description, _score
-  FROM lance_fts('products', 'description', 'wireless headphones', 10)
-"
+# Show the server's registered data sources and their schemas
+skardi schema
+
+# Overall server health
+skardi health
+
+# One pipeline's health (includes upstream data-source status)
+skardi health daily_report
 ```
 
-**Using with direct path (no context file):**
+## Jobs
+
+`skardi job` is a thin client over the server's `/jobs/*` endpoints for
+async batch execution (see [docs/jobs.md](jobs.md)). All five subcommands:
 
 ```bash
-# The path './products.lance' auto-registers as table name 'products'
-skardi query --sql "
-  SELECT * FROM lance_fts('products', 'description', 'wireless headphones', 10)
-"
+# Submit a new run; returns immediately with a run_id
+skardi job run nightly_sync -p day=2026-07-23 -p batch=500
+
+# Poll a run's current status
+skardi job status <run_id>
+
+# List recent runs, optionally filtered by job name
+skardi job list --job nightly_sync --limit 20
+
+# Request cancellation of an in-progress run
+skardi job cancel <run_id>
+
+# List every job the server knows about and its destination
+skardi job show
 ```
 
-**More examples:**
-
-```sql
--- Term search
-SELECT * FROM lance_fts('products', 'description', 'umbrella', 10)
-
--- Phrase search
-SELECT * FROM lance_fts('products', 'description', '"noise cancelling"', 10)
-
--- Fuzzy search
-SELECT * FROM lance_fts('products', 'description', 'headphnes~1', 10)
-
--- Boolean search
-SELECT * FROM lance_fts('products', 'description', '+wireless -bluetooth', 10)
-
--- With WHERE filter
-SELECT * FROM lance_fts('products', 'description', 'premium', 50)
-WHERE category = 'electronics' AND price < 20
-```
-
-### `run` — Execute a pipeline YAML by name
-
-A **pipeline** is a named SQL template stored in a YAML file:
-
-```yaml
-# demo/llm_wiki/cli/pipelines/list.yaml
-metadata:
-  name: "wiki-list"
-query: |
-  SELECT slug, title, page_type, updated_at
-  FROM wiki.main.wiki_pages
-  WHERE page_type LIKE {page_type_pattern}
-    AND slug      LIKE {slug_prefix}
-  ORDER BY updated_at DESC
-  LIMIT {limit}
-```
-
-`{name}` placeholders are substituted at call time. Each parameter must be
-bound via `--param NAME=VALUE`; values are rendered as SQL-safe literals
-before DataFusion sees the query (strings are single-quoted with `'` → `''`
-escaping, so quotes inside values can't break out).
-
-The examples below use `SKARDICONFIG` so `--ctx` doesn't have to be repeated
-on every line. `--ctx PATH` still works and takes precedence over the env
-var, per the resolution order at the top of this README.
-
-```bash
-export SKARDICONFIG=./demo/llm_wiki/cli
-
-skardi run wiki-list \
-  --param 'page_type_pattern=%' \
-  --param 'slug_prefix=concept/%' \
-  --param 'limit=10'
-```
-
-**Pipeline discovery** — the CLI scans a single directory for
-`*.yaml` / `*.yml` files, resolved in this order:
-
-1. `--pipeline-dir <DIR>` flag.
-2. `pipelines_dir:` key in the ctx YAML (relative paths resolve against the
-   ctx file's directory).
-3. `<config-dir>/pipelines/` by convention, where `<config-dir>` is the dir
-   `SKARDICONFIG` (or `--ctx`) points at (or the parent of the ctx file if
-   it's given as a file path). Only used when the directory exists.
-4. Otherwise, no pipelines are registered.
-
-Most projects just drop a `pipelines/` directory next to `ctx.yaml` and get
-discovery for free; set `pipelines_dir:` if you want them somewhere else.
-
-Minimal layout:
-
-```
-my-project/
-  ctx.yaml
-  aliases.yaml      # optional
-  pipelines/
-    search.yaml
-    ...
-```
-
-Then `export SKARDICONFIG=./my-project` makes every `skardi run` and alias
-invocation pick up the ctx, the aliases, and the pipelines automatically.
-
-**Parameter typing** — `--param NAME=VALUE` is parsed with `serde_json`,
-so the resulting `ScalarValue` matches what the server would bind if the
-same value appeared in a JSON request body. This keeps pipeline YAMLs
-portable between `skardi run` and an HTTP `/pipeline/execute` call:
-
-| CLI                        | Server JSON equivalent | Bound type |
-|----------------------------|------------------------|------------|
-| `--param foo=42`           | `{"foo": 42}`          | `Int64`    |
-| `--param foo=3.5`          | `{"foo": 3.5}`         | `Float64`  |
-| `--param foo=true`         | `{"foo": true}`        | `Boolean`  |
-| `--param foo=null`         | `{"foo": null}`        | `Utf8(NULL)` |
-| `--param foo=hello`        | `{"foo": "hello"}`     | `Utf8`     |
-| `--param 'foo:str=42'`     | `{"foo": "42"}`        | `Utf8`     |
-
-Force a specific type explicitly with `NAME:TYPE=VALUE` when the JSON
-form is ambiguous (e.g. a string that happens to look like a number):
-
-```bash
-# Force "42" to be a string even though it parses as an int
-skardi run my-pipeline --param 'query:str=42' --param 'limit:int=10'
-```
-
-Supported explicit types: `str` / `string`, `int` / `i64`, `float` / `f64`,
-`bool`. Because parsing is strict JSON, `TRUE` / `True` are **not**
-booleans (only lowercase `true` / `false` are), and numbers must have a
-leading digit (`0.5`, not `.5`) — both matching what the server accepts.
-
-### `alias` — Bind a short verb to a pipeline
-
-Aliases let you replace `skardi run wiki-search-hybrid --query="..." --text_query="..." ...`
-with a one-word verb like `skardi grep "..."`. They are a **CLI-only**
-concept: the server does not read alias files. Any unknown subcommand is
-looked up in the alias store, resolved to a pipeline + params, and
-dispatched to the same code path as `skardi run`.
-
-#### Add an alias
-
-```bash
-export SKARDICONFIG=./demo/llm_wiki/cli
-
-skardi alias add grep \
-  --pipeline wiki-search-hybrid \
-  --positional query \
-  --default 'text_query={query}' \
-  --default 'vector_weight=0.5' \
-  --default 'text_weight=0.5' \
-  --default 'limit=10' \
-  --description "Hybrid search over the wiki"
-```
-
-Flags:
-
-- `--pipeline <NAME>` (required) — `metadata.name` of the pipeline to call.
-- `--positional <NAMES>` — comma-separated pipeline-param names to bind to
-  positional CLI args in order (e.g. `--positional query,text_query`).
-- `--default <NAME=VALUE>` (repeatable) — default value for a param. May
-  contain `{other}` tokens that are substituted from an already-bound param
-  (one level), so a single positional can fan out to multiple params.
-- `--description <TEXT>` — optional short help string shown in `alias list`.
-- `--force` — overwrite an existing alias with the same name.
-
-The bare form is also useful — `skardi alias add grep --ctx ... --pipeline wiki-search-hybrid`
-saves an alias with no positional/default bindings. Callers then pass every
-pipeline param as a `--name=value` flag at call time; `skardi grep --help`
-will list them.
-
-When the pipeline YAML can be located via the ctx's `pipelines_dir:`, the
-CLI parses its `{name}` placeholders and:
-
-- rejects `--positional` / `--default` names that don't match a real
-  parameter (so `--default txt_query=...` fails fast with the known-params
-  list instead of silently creating a broken alias), and
-- prints which params are covered by this alias and which remain unbound
-  — those either need `--default`s now or flag overrides at call time.
-
-Example output:
-
-```
-$ skardi alias add grep --pipeline wiki-search-hybrid --positional query
-Pipeline 'wiki-search-hybrid' has 5 parameter(s): query, text_query, vector_weight, text_weight, limit
-  Unbound by this alias: text_query, vector_weight, text_weight, limit (pass at call time with --name=value, or re-run `alias add --force` with --default/--positional)
-Alias 'grep' → pipeline 'wiki-search-hybrid' saved to ./demo/llm_wiki/aliases.yaml
-```
-
-If the pipeline can't be located (e.g. the alias is being authored before
-the pipeline is), validation is skipped with a `note:` — the alias is still
-saved.
-
-Now `grep` is a first-class verb:
-
-```bash
-skardi grep "turing machine"
-# → skardi run wiki-search-hybrid \
-#     --param 'query=turing machine' \
-#     --param 'text_query=turing machine' \
-#     --param 'vector_weight=0.5' \
-#     --param 'text_weight=0.5' \
-#     --param 'limit=10'
-
-# Flag overrides beat positional/default bindings
-skardi grep "turing machine" --text_query='bletchley OR enigma' --limit=3
-```
-
-Positional args bind in order to `alias.positional`. Extra positional args
-error. `--name=value` / `--name value` flags always win over positional
-binds and defaults.
-
-#### Inspect an alias — `skardi <alias> --help` or `alias show`
-
-Both commands print the alias's bindings and the target pipeline's full
-parameter list, annotated with where each param gets its value. Use
-`--help` when invoking an alias to discover its interface; use `alias show`
-for the underlying YAML plus the same annotations.
-
-```bash
-$ skardi grep --help
-skardi grep — runs pipeline `wiki-search-hybrid`
-
-Hybrid search over the wiki
-
-Positional args:
-  <query>   binds pipeline param `query` (positional[0])
-
-Pipeline params (override at call time with --name=VALUE):
-  --query          bound positionally (positional[0])
-  --text_query     default: "{query}"
-  --vector_weight  default: "0.5"
-  --text_weight    default: "0.5"
-  --limit          default: "10"
-
-Control flags:
-  --ctx <PATH>       Context YAML (SKARDICONFIG env / ~/.skardi/config/ctx.yaml)
-  --aliases <PATH>   Override aliases file
-  --pipeline-dir <DIR>  Override pipeline discovery directory
-
-Example: skardi grep <query>
-```
-
-`skardi alias show grep` prints the same information with the alias YAML
-on top.
-
-#### List / remove
-
-```bash
-skardi alias list
-skardi alias remove grep
-```
-
-#### Alias file resolution
-
-The aliases YAML is resolved in this order:
-
-1. `--aliases <PATH>` flag.
-2. `SKARDI_ALIASES` env var.
-3. `<config-dir>/aliases.yaml` (only if it already exists). The config dir
-   is whatever `--ctx` or `SKARDICONFIG` points at — a directory is used
-   directly, a file uses its parent.
-4. `~/.skardi/config/aliases.yaml`.
-
-The file is a simple top-level map keyed by alias name:
-
-```yaml
-# demo/llm_wiki/cli/aliases.yaml
-grep:
-  pipeline: wiki-search-hybrid
-  positional: [query]
-  defaults:
-    text_query: "{query}"
-    vector_weight: "0.5"
-    limit: "10"
-  description: Hybrid search over the wiki
-ls:
-  pipeline: wiki-list
-  defaults:
-    page_type_pattern: "%"
-    slug_prefix: "%"
-    limit: "100"
-```
-
-Hand-editing the file is fine — `skardi alias add` is just a convenience
-that round-trips through serde.
-
-## Examples
-
-```bash
-# Simple query (no context file needed)
-skardi query --sql "SELECT 1"
-
-# Query a local file directly
-skardi query --sql "SELECT count(*) FROM './data/products.csv'"
-
-# Query a remote parquet file
-skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
-
-# Query a Lance dataset
-skardi query --sql "SELECT * FROM './embeddings.lance' LIMIT 5"
-
-# Query a SQLite table directly
-skardi query --sql "SELECT * FROM './data/app.db.users' LIMIT 10"
-
-# With context file (set once; --ctx PATH also works and takes precedence)
-export SKARDICONFIG=./demo/llm_wiki/cli
-
-# Query against the exported ctx
-skardi query --sql "SELECT * FROM wiki.main.wiki_pages LIMIT 5"
-
-# Show schema
-skardi query --schema --all
-skardi query --schema -t wiki_pages
-
-# SQL from file
-skardi query -f ./queries/report.sql
-
-# Run a pipeline YAML by name, passing named parameters
-skardi run wiki-list \
-  --param 'page_type_pattern=entity' --param 'slug_prefix=%' --param 'limit=20'
-
-# Invoke a user-defined alias (dispatches to `skardi run <pipeline>`)
-skardi grep "turing machine"
-
-# Manage aliases
-skardi alias list
-skardi alias show grep
-```
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success. |
+| `1` | Client or server error: bad flags/JSON, SQL validation error, pipeline not found, unauthorized, or any other 4xx/5xx from the server. |
+| `2` | Server unreachable: connection refused, DNS failure, or timeout. Check `--server`, `SKARDI_SERVER_URL`, or `~/.skardi/config.yaml`. |
+
+## Migrating from the old (local-engine) CLI
+
+The CLI no longer embeds a query engine — every command is now an HTTP
+call to `skardi-server`. There is no local/offline mode and no feature
+flags to build a bigger CLI binary; everything that used to be a CLI
+feature flag now lives server-side, if it lives anywhere.
+
+| Old | New |
+|---|---|
+| `skardi query --ctx <ctx.yaml> -e "SQL"` | Start `skardi-server` with that same `--ctx <ctx.yaml>` (registers the sources once, server-side), then `skardi query -e "SQL"` against it. |
+| `skardi query --schema [--all \| -t TABLE]` | `skardi schema` — the server always describes every registered source; there's no per-table flag, the CLI doesn't filter server output. |
+| `skardi run <pipeline.yaml> -p ...` (local YAML file) | Load the pipeline on the server (`--pipeline` at server startup), then `skardi run <pipeline-name> -p ...` calls it by name over HTTP. |
+| `skardi alias add <verb> --pipeline <name> ...` / bare-verb dispatch (`skardi <verb>`) | Gone — call the pipeline directly: `skardi run <pipeline-name> -p ...`. Named pipelines already are the short, parameterized verb; there's no separate alias file to maintain. |
+| CLI builds with `--features embedding` / `--features rag` (candle, gguf, onnx, remote-embed, chunking) | Gone from the CLI entirely. These UDFs live in `skardi-server` (`cargo build -p skardi-server --features rag`) since inference now happens where the engine runs. |

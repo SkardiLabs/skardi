@@ -190,7 +190,7 @@ server. The server URL defaults to `http://127.0.0.1:8080`; override with
 # Submit — returns the run_id
 skardi job run wiki-backfill-to-lake \
     --param slug_prefix='entity/%' \
-    --param limit:int=1000
+    --param limit=1000
 
 # Poll the run
 skardi job status <run_id>
@@ -209,14 +209,16 @@ skardi job cancel <run_id>
 skardi job show
 ```
 
-`--param` uses the exact same typing rules as `skardi run`:
+`--param` uses the exact same typing rules as `skardi run`: the value is
+parsed as JSON first (numbers, booleans, arrays, `null`, quoted strings)
+and falls back to a plain string otherwise.
 
 - `name=42` → int
 - `name=3.14` → float
 - `name=true` → bool
 - `name=null` → SQL NULL
 - `name=hello` → string (no quotes needed)
-- `name:str=42` → force string (useful for numeric-looking strings)
+- `name='"42"'` → force string (useful for numeric-looking strings)
 
 Jobs run **only inside the server** — there is no in-process fallback
 and no `--ctx` flag on the CLI-side job commands. If the server isn't
@@ -398,8 +400,8 @@ In another terminal:
 
 ```bash
 skardi job run wiki-backfill-to-lake \
-    --param slug_prefix:str='entity/%' \
-    --param limit:int=500
+    --param slug_prefix='entity/%' \
+    --param limit=500
 ```
 
 The CLI prints `submitted: <run_id> (pending)`. Follow it with

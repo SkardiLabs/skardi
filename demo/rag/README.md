@@ -1,6 +1,6 @@
 # Hybrid Search / RAG Demo
 
-This demo has two flavours: the **server / PostgreSQL** version and a **CLI / SQLite** version that runs entirely through `skardi-cli` against a local file (no server, no Docker).
+This demo has two flavours: the **server / PostgreSQL** version and a **local / SQLite** version. Both run the same way now: a `skardi-server` process registers the data source and hosts the pipeline endpoints, and `skardi` — a thin HTTP client — drives ingestion and search against it. The SQLite flavour just needs a local file and no Docker/Postgres.
 
 ---
 
@@ -80,8 +80,9 @@ EOF
 ### 3. Download the embedding model
 
 ```bash
-# Requires Python 3.12
-pip install huggingface_hub
+# Requires Python 3.12 — run through the repo venv (huggingface_hub is
+# installed there, not on the system interpreter)
+source .venv/bin/activate
 
 python -c "
 from huggingface_hub import hf_hub_download
@@ -300,27 +301,32 @@ pkill -f skardi-server
 ```
 ---
 
-## CLI version — `skardi-cli` + SQLite + `sqlite-vec` + FTS5
+## SQLite version — `skardi-server` + SQLite + `sqlite-vec` + FTS5
 
-The same hybrid search pipeline (vector + FTS + RRF) runs end-to-end through
-`skardi` — **no server, no Docker, no HTTP**. Vectors live in a
+The same hybrid search pipeline (vector + FTS + RRF) runs against a local
+SQLite file — no Docker, no Postgres. A `skardi-server` process registers
+the file as its one data source and hosts the pipeline endpoints; `skardi`,
+the thin HTTP client, drives ingestion and search against it exactly the
+way it does against the Postgres server above. Vectors live in a
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec) `vec0` virtual table,
 text lives in an FTS5 virtual table, and a regular `documents` table with an
 `AFTER INSERT` trigger fans new rows out to both. Each pipeline YAML under
-[cli/pipelines/](cli/pipelines/) is exposed through a short verb alias
-defined in [cli/aliases.yaml](cli/aliases.yaml): `skardi ingest <id> "..."`,
-`skardi grep "..."`, `skardi vec "..."`, `skardi fts "..."`.
+[cli/pipelines/](cli/pipelines/) is loaded on the server with `--pipeline`
+and called by its `metadata.name`: `skardi run ingest ...`, `skardi run
+ingest-chunked ...`, `skardi run search-hybrid ...`, `skardi run
+search-vector ...`, `skardi run search-fulltext ...`.
 
-### 1. Install the CLI with embedding support
+### 1. Install the CLI
 
 ```bash
-cargo install --locked --path crates/cli --features candle
+cargo install --locked --path crates/cli
 ```
 
-`--locked` makes cargo honor the checked-in `Cargo.lock` instead of
-re-resolving transitive deps, which can otherwise pull a newer crate whose
-MSRV is higher than your toolchain (e.g. `constant_time_eq@0.4.3 requires
-rustc 1.95.0`).
+The CLI has no cargo feature flags of its own anymore — it's a thin HTTP
+client, so one build works against any server. `--locked` makes cargo
+honor the checked-in `Cargo.lock` instead of re-resolving transitive deps,
+which can otherwise pull a newer crate whose MSRV is higher than your
+toolchain (e.g. `constant_time_eq@0.4.3 requires rustc 1.95.0`).
 
 ### 2. Get the `sqlite-vec` extension
 
@@ -331,14 +337,17 @@ Then point Skardi at it:
 ```bash
 export SQLITE_VEC_PATH=/absolute/path/to/vec0.dylib   # or .so / .dll
 
-#    If using the pip package:
-export SQLITE_VEC_PATH=$(python -c "import sqlite_vec; print(sqlite_vec.loadable_path())")
+#    If using the pip package (installed in the repo venv):
+export SQLITE_VEC_PATH=$(.venv/bin/python -c "import sqlite_vec; print(sqlite_vec.loadable_path())")
 ```
 
 ### 3. Download the embedding model
 
 ```bash
-pip install huggingface_hub
+# Requires Python 3.12 — run through the repo venv (huggingface_hub is
+# installed there, not on the system interpreter)
+source .venv/bin/activate
+
 python -c "
 from huggingface_hub import hf_hub_download
 import os
@@ -352,8 +361,7 @@ for f in ['model.safetensors', 'config.json', 'tokenizer.json']:
 ### 4. Create the database
 
 ```bash
-pip install sqlite-vec
-python demo/rag/setup.py
+.venv/bin/python demo/rag/setup.py
 ```
 
 The script loads the `sqlite-vec` extension via the `sqlite_vec` Python
@@ -365,14 +373,17 @@ atomically. See [setup.py](setup.py) for the schema.
 
 ### 5. Config layout
 
-Everything the CLI needs for the demo lives under [cli/](cli/):
+Everything the *server* needs for this demo lives under [cli/](cli/):
 
 ```
 demo/rag/cli/
   ctx.yaml        # registers rag.db as a SQLite catalog data source
-  aliases.yaml    # short verbs → pipeline bindings
-  pipelines/      # pipeline YAMLs (one per verb)
+  pipelines/      # pipeline YAMLs, one per verb (ingest, search, ...)
 ```
+
+(`cli/aliases.yaml` also still sits in that directory but is no longer
+read by anything — the CLI's alias system was removed, and each pipeline's
+`metadata.name` is now called directly.)
 
 [cli/ctx.yaml](cli/ctx.yaml) registers one SQLite source in `catalog` mode,
 which auto-discovers every table, loads `sqlite-vec` once on the shared
@@ -398,29 +409,35 @@ spec:
 ```
 
 The pipeline YAMLs in [cli/pipelines/](cli/pipelines/) use the same
-`metadata` + `query` shape as the server pipelines, with `{param}`
+`metadata` + `query` shape as the server/Postgres pipelines, with `{param}`
 placeholders — just targeting the SQLite stack (`sqlite_knn` / `sqlite_fts`
-/ `vec_to_binary(candle(...))`) instead of `pg_knn` / `pg_fts`. Verb →
-pipeline bindings live in [cli/aliases.yaml](cli/aliases.yaml).
+/ `vec_to_binary(candle(...))`) instead of `pg_knn` / `pg_fts`. Each
+pipeline's `metadata.name` — `ingest`, `ingest-chunked`, `search-fulltext`,
+`search-hybrid`, `search-vector` — is the name you pass to `skardi run`.
 
-**Export the config dir once** so the verbs below don't need `--ctx` on
-every line. `SKARDICONFIG` accepts either a config directory (which the CLI
-looks inside for `ctx.yaml`, `aliases.yaml`, and `pipelines/`) or an
-individual ctx file. `--ctx PATH` still works and takes precedence:
+### 6. Start the server
 
 ```bash
-export SKARDICONFIG=demo/rag/cli
+cargo run -p skardi-server --features rag -- \
+  --ctx demo/rag/cli/ctx.yaml \
+  --pipeline demo/rag/cli/pipelines/ \
+  --port 8080
 ```
 
-### 6. `ingest` — write one document
+`--features rag` is the umbrella that bundles `embedding` (which pulls in
+the `candle` backend every pipeline below uses) and `chunking` (needed by
+`ingest-chunked`'s inline `chunk('markdown', ...)`), so this one server
+build covers the whole demo.
+
+### 7. `ingest` — write one document
 
 ```bash
-skardi ingest 1 "Vector databases store high-dimensional vectors and enable fast similarity search at scale."
-skardi ingest 2 "Retrieval-Augmented Generation combines retrieval with a language model to ground responses in factual content."
-skardi ingest 3 "The Transformer architecture introduced multi-head self-attention to replace recurrent networks."
+skardi run ingest -p doc_id=1 -p content="Vector databases store high-dimensional vectors and enable fast similarity search at scale."
+skardi run ingest -p doc_id=2 -p content="Retrieval-Augmented Generation combines retrieval with a language model to ground responses in factual content."
+skardi run ingest -p doc_id=3 -p content="The Transformer architecture introduced multi-head self-attention to replace recurrent networks."
 ```
 
-The `ingest` alias invokes [cli/pipelines/ingest.yaml](cli/pipelines/ingest.yaml),
+`ingest` calls [cli/pipelines/ingest.yaml](cli/pipelines/ingest.yaml),
 which INSERTs the row and computes the embedding inline with
 `vec_to_binary(candle(...))`. The `AFTER INSERT` trigger atomically mirrors
 the row to `documents_fts` and `documents_vec`, so a single call makes the
@@ -435,15 +452,15 @@ document searchable by both `sqlite_fts` and `sqlite_knn`.
 > `vec_to_binary(candle(...))`. The SELECT-wrapper keeps the subquery's own
 > schema in scope so the projection lands the row at full width.
 
-### 6b. `ingest-doc` — write one *long* document, chunked inline
+### 8. `ingest-chunked` — write one *long* document, chunked inline
 
 `ingest` above expects content that's already chunk-sized. For a real
-document, `ingest-doc` chunks it inline with the markdown splitter,
+document, `ingest-chunked` chunks it inline with the markdown splitter,
 embeds each chunk with `candle()`, and writes one row per chunk — all in
 one statement, all going through the same `AFTER INSERT` trigger:
 
 ```bash
-skardi ingest-doc 100 "# Vector Search
+skardi run ingest-chunked -p doc_id=100 -p chunk_size=250 -p overlap=50 -p content="# Vector Search
 
 Vector databases index high-dimensional embeddings. They use approximate
 nearest-neighbour algorithms — HNSW, IVF, and product quantisation are
@@ -460,69 +477,69 @@ Chunk size and overlap matter. Too small and chunks lose context; too
 large and precision drops."
 ```
 
-Override the chunk shape on the same line:
+Override the chunk shape, or load the body from a file, the same way:
 
 ```bash
-skardi ingest-doc 101 "$(cat my-long-doc.md)" \
-  --chunk_size=400 --overlap=80
+skardi run ingest-chunked -p doc_id=101 -p chunk_size=400 -p overlap=80 \
+  -p content="$(cat my-long-doc.md)"
 ```
 
 Synthesised ids are `doc_id * 1000 + chunk_idx` (0-based), so the
 example above becomes ids `100000, 100001, 100002, …`. Pick `doc_id`s
 that don't collide with single-row `ingest` calls.
 
-Install the CLI with the RAG umbrella (bundles embedding UDFs + `chunk`):
+### 9. `search-hybrid` — hybrid search (RRF over FTS + vector)
 
 ```bash
-cargo install --locked --path crates/cli --features rag
+skardi run search-hybrid -p query="similarity search at scale" -p text_query="similarity search at scale" -p vector_weight=0.5 -p text_weight=0.5 -p limit=10
 ```
 
-### 7. `grep` — hybrid search (RRF over FTS + vector)
+`query` is embedded with `candle()` for `sqlite_knn`; `text_query` goes to
+`sqlite_fts` — pass them independently to tune each side:
 
 ```bash
-skardi grep "similarity search at scale"
-```
-
-One positional arg binds to both `{query}` (embedded with `candle()` for
-`sqlite_knn`) and `{text_query}` (via the `text_query: "{query}"` default in
-the alias). Override either independently:
-
-```bash
-skardi grep "similarity search" \
-  --text_query="vector similarity search" \
-  --vector_weight=0.3 --text_weight=0.7 --limit=5
+skardi run search-hybrid \
+  -p query="similarity search" \
+  -p text_query="vector similarity search" \
+  -p vector_weight=0.3 -p text_weight=0.7 -p limit=5
 ```
 
 > FTS5 reserves `?`, `"`, `+`, `-`, `~`, `^`, and parentheses as query
-> syntax. A bare `?` in the text query will fail with an `fts5: syntax
+> syntax. A bare `?` in `text_query` will fail with an `fts5: syntax
 > error` — phrase-quote or strip it out for natural-language queries.
 
 The structure mirrors the server's `search_hybrid.yaml` exactly —
 `sqlite_knn` and `sqlite_fts` replace `pg_knn` / `pg_fts`, RRF is the same
 SQL, and `candle()` is reused unchanged for the query embedding. Run
-`skardi grep --help` to see every param the alias exposes and where each
-value comes from.
+`skardi pipeline show search-hybrid` to see every param the pipeline
+exposes and where each value is substituted.
 
-### 8. `vec` / `fts` — single-signal search
+### 10. `search-vector` / `search-fulltext` — single-signal search
 
-If you want just one side of hybrid, the alias pair avoids the RRF wrapper:
+If you want just one side of hybrid, these two pipelines skip the RRF
+wrapper:
 
 ```bash
 # Vector-only KNN via sqlite_knn (+ JOIN back to documents for content)
-skardi vec "similarity search" --limit=5
+skardi run search-vector -p query="similarity search" -p limit=5
 
 # Full-text-only via sqlite_fts
-skardi fts "vector similarity search" --limit=5
+skardi run search-fulltext -p query="vector similarity search" -p limit=5
 ```
 
-### 9. Fall back to raw SQL
+### 11. Fall back to raw SQL
 
-`skardi run` and the aliases above are a thin layer over the pipeline YAMLs.
-The underlying queries are still plain SQL — if you want to experiment
-ad-hoc, `skardi query --sql "..."` works just as before (same exported
-`SKARDICONFIG`).
+`skardi run` is a thin layer over the pipeline YAMLs — the underlying
+queries are still plain SQL. Query the server directly (same one started
+in step 6) if you want to experiment ad-hoc:
+
+```bash
+skardi query -e "SELECT id, content FROM rag.main.documents LIMIT 10"
+```
 
 ### Cleanup
 
 ```bash
+pkill -f skardi-server
 rm demo/rag/rag.db
+```
