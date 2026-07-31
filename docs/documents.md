@@ -66,7 +66,7 @@ All keys are optional except `path`.
 | `recursive` | `true` | Descend into subdirectories. |
 | `include_globs` | all supported | Comma-separated `*.ext` globs; only matching files are parsed. |
 | `image_mode` | `off` | `embedded` extracts image bytes; `placeholder` keeps refs only; `off` strips images. |
-| `image_store` | — | Destination for extracted image crops — a local path or an `s3://bucket/prefix`. Both backends perform a real write (S3 objects get a `Content-Type` inferred from the extension), so refs are safe to use as-is (including as `llm_extract`'s `image_ref`). When both `path` and `image_store` are `s3://`, they must be in the **same bucket** (see [S3 / object store](#s3--object-store)). |
+| `image_store` | — | Destination for extracted image crops — a local path or an `s3://bucket/prefix`. Both backends perform a real write (S3 objects get a `Content-Type` inferred from the extension). Local refs are usable as `llm_extract`'s `image_ref` as-is; `s3://` refs are readable too but **only with `LLM_EXTRACT_IMAGE_FETCH=1`** — see [Image refs and `llm_extract`](#image-refs-and-llm_extract). When both `path` and `image_store` are `s3://`, they must be in the **same bucket** (see [S3 / object store](#s3--object-store)). |
 | `ocr` | `auto` | `auto` OCRs only complex pages (needs `ocr_server_url`); `on` always (requires `ocr_server_url`, else hard error); `off` never. See OCR. |
 | `render_page_images` | `false` | Render each page to a PNG into `image_store` and set `page_image_ref` (needed for multimodal `llm_extract`). |
 | `ocr_server_url` | — | HTTP OCR engine URL. The only way to do OCR in this build (no bundled Tesseract). Mandatory for `ocr: on`. |
@@ -145,6 +145,28 @@ on the row's `page_image_ref`. This is what the multimodal
 so **`render_page_images` must be enabled (with an `image_store`) for multimodal
 extraction to have an image to escalate to** — otherwise `page_image_ref` is
 `NULL` and only the text path is available.
+
+### Image refs and `llm_extract`
+
+`llm_extract` treats `image_ref` as **untrusted data** (it is a column value, so
+a crafted row could point it anywhere). Fetching is therefore default-deny:
+only inline `data:` URIs resolve unless you set `LLM_EXTRACT_IMAGE_FETCH=1`,
+which enables `http(s)://`, `s3://`, and local-file refs alike.
+
+That means a **local** `image_store` needs `LLM_EXTRACT_IMAGE_FETCH=1` for
+multimodal escalation, and so does an **`s3://`** one:
+
+```bash
+export LLM_EXTRACT_IMAGE_FETCH=1
+```
+
+`s3://` refs are read through the same object-store client and env-only
+credential contract as the connector itself, so the process needs
+`s3:GetObject` on the `image_store` prefix — which is *not* required for
+writing crops, so a least-privilege policy scoped to `PutObject` alone will
+fail here. `s3://` support also requires the `documents` Cargo feature (it owns
+the S3 client); an `s3://` ref in a build without it is refused with a build
+hint rather than being misread as a filesystem path.
 
 ## Error handling
 
