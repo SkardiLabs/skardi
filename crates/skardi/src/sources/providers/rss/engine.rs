@@ -855,6 +855,82 @@ mod tests {
         }
     }
 
+    /// A cache that remembers every `armed_until` the engine hands
+    /// `record_failure`, delegating every call to a real [`MemoryFeedCache`].
+    ///
+    /// The failure fuse has no other observable: `FeedSnapshot` exposes
+    /// `within_ttl`, not the instant behind it, and no configuration can make a
+    /// test wait one out. See
+    /// [`a_failure_arms_the_ttls_quarter_not_the_floor`].
+    struct RecordsFailureArm {
+        inner: MemoryFeedCache,
+        armed: std::sync::Mutex<Vec<Instant>>,
+    }
+
+    impl RecordsFailureArm {
+        fn new(inner: MemoryFeedCache) -> Self {
+            Self {
+                inner,
+                armed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn armed_instants(&self) -> Vec<Instant> {
+            self.armed.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    impl FeedCache for RecordsFailureArm {
+        fn snapshot(&self, feed: &str, now: Instant) -> FeedSnapshot {
+            self.inner.snapshot(feed, now)
+        }
+
+        fn record_success(
+            &self,
+            feed: &str,
+            window: CachedWindow,
+            observation: FeedObservation,
+            armed_until: Instant,
+        ) {
+            self.inner
+                .record_success(feed, window, observation, armed_until);
+        }
+
+        fn record_not_modified(
+            &self,
+            feed: &str,
+            http_status: u16,
+            last_fetch_ms: i64,
+            armed_until: Instant,
+        ) {
+            self.inner
+                .record_not_modified(feed, http_status, last_fetch_ms, armed_until);
+        }
+
+        fn record_failure(
+            &self,
+            feed: &str,
+            http_status: Option<u16>,
+            error: String,
+            dialect_declared: Option<String>,
+            last_fetch_ms: i64,
+            armed_until: Instant,
+        ) {
+            self.armed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(armed_until);
+            self.inner.record_failure(
+                feed,
+                http_status,
+                error,
+                dialect_declared,
+                last_fetch_ms,
+                armed_until,
+            );
+        }
+    }
+
     fn engine_with_cache(
         feeds: &[(String, String)],
         ttl_seconds: u64,
@@ -1491,6 +1567,13 @@ mod tests {
     /// The exception is bounded by the same cap as everything else, so an
     /// absurdly long declared version cannot turn one field into an unbounded
     /// write.
+    ///
+    /// The stored length is asserted as a literal `512` rather than against
+    /// [`MAX_ERROR_CHARS`], because 512 is what `docs/rss.md:974` and
+    /// `docs/rss/semantics.yaml:85` publish to consumers of the column — this
+    /// is the end-to-end half of `error.rs`'s
+    /// `max_error_chars_is_the_number_the_docs_publish`, and it is what pins
+    /// the *column* rather than the constant.
     #[tokio::test]
     async fn a_huge_json_version_is_still_capped() {
         // Guard, not an assertion target: this test reaches the `rss feed
@@ -1514,7 +1597,11 @@ mod tests {
         let error = str_opt_col(&engine.feeds_row("a"), "last_error")[0]
             .clone()
             .expect("last_error recorded");
-        assert_eq!(error.chars().count(), MAX_ERROR_CHARS);
+        assert_eq!(
+            error.chars().count(),
+            512,
+            "the documented cap on feeds.last_error, spelled out"
+        );
     }
 
     /// AC4's "a tracing warning is emitted — nothing silent" clause, pinned.
@@ -1896,6 +1983,113 @@ mod tests {
         assert_eq!(
             parse_error_message("refused-internal-dtd", "internal DTD subset refused"),
             "parse failed at refused-internal-dtd: internal DTD subset refused"
+        );
+    }
+
+    /// `ttl_seconds` is stored raw by `RssConfig` — validation puts no ceiling
+    /// on it at all — and [`RssEngine::with_parts`] is the first code that turns
+    /// it into the `Duration` [`arm`] adds to an `Instant`.
+    ///
+    /// The counterpart of `exec.rs`'s
+    /// `an_absurd_scan_timeout_is_clamped_rather_than_overflowing` for the
+    /// sibling constant, written to the same shape: the clamp *and* the warning
+    /// that makes it visible, at the same absurd input.
+    #[tokio::test]
+    async fn an_absurd_ttl_is_clamped_rather_than_overflowing() {
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        // Set before the engine is built: `with_parts` is where the clamp and
+        // its warning happen.
+        let (_guard, events) = capture_events();
+        let engine = test_engine(&server, &[("a", "/f.xml")], u64::MAX);
+
+        // Serving is what actually performs the add — an unclamped
+        // `Duration::from_secs(u64::MAX)` is the value `Instant`'s `+` operator
+        // documents as possibly panicking, and which `arm` catches.
+        let batch = engine.serve_feed("a", || true).await.expect("rows served");
+        assert_eq!(str_col(&batch, "window_status"), vec!["fresh"]);
+
+        // The clamp is silent otherwise: an operator who configured a longer TTL
+        // than they get has to be able to see that from the log.
+        let clamped =
+            events_with_message(&events, "rss ttl_seconds clamped to the engine's ceiling");
+        assert_eq!(clamped.len(), 1, "one warning per engine built");
+        assert_eq!(clamped[0].level, tracing::Level::WARN);
+        assert_eq!(
+            clamped[0].field("configured_ttl_seconds"),
+            Some(u64::MAX.to_string().as_str())
+        );
+        assert_eq!(
+            clamped[0].field("effective_ttl_seconds"),
+            Some(MAX_TTL.as_secs().to_string().as_str())
+        );
+    }
+
+    /// [`arm`]'s fallback, exercised directly.
+    ///
+    /// [`MAX_TTL`] and [`failure_fuse`]'s own clamp keep every duration that
+    /// reaches `arm` in production far inside the representable range, so this
+    /// is the only place the `checked_add` is reachable. Without it the `+`
+    /// operator would panic here instead of returning `now`, and a panic mid-scan
+    /// is what the fallback exists to avoid.
+    #[test]
+    fn arm_saturates_to_now_rather_than_panicking_on_an_unrepresentable_add() {
+        let now = Instant::now();
+        assert_eq!(
+            arm(now, Duration::MAX),
+            now,
+            "an add no platform Instant can represent leaves the feed due immediately"
+        );
+        // The ordinary case still moves the deadline forward, so the fallback is
+        // not simply swallowing every add.
+        assert!(arm(now, Duration::from_secs(30)) > now);
+    }
+
+    /// The engine arms a failed feed with `failure_fuse(self.ttl)`, not a
+    /// hardcoded floor.
+    ///
+    /// `cache.rs`'s `failure_fuse_is_clamped` pins the function
+    /// (`clamp(ttl / 4, 30s, 300s)`, `cache.rs:286-288`); nothing pinned which
+    /// duration the engine passes it. Every other engine test configures
+    /// `ttl_seconds` 0 or 900 and then observes only "the dead feed is not
+    /// re-poked on the next serve" — which a hardcoded 30s would satisfy just as
+    /// well, since no test can wait a fuse out.
+    ///
+    /// At `ttl_seconds: 900` the fuse is `900 / 4 = 225s`, strictly between the
+    /// 30s floor and the 300s ceiling, so the armed instant discriminates the
+    /// real expression from either clamp arm. 225 is spelled out rather than
+    /// computed from `failure_fuse`, so the assertion cannot agree with a
+    /// changed one.
+    #[tokio::test]
+    async fn a_failure_arms_the_ttls_quarter_not_the_floor() {
+        // Guard, not an assertion target: this test reaches the `rss feed
+        // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
+        // globally on first use — a guardless test reaching it first would cache
+        // `Interest::never` and silently empty
+        // `a_degraded_feed_emits_a_warning_naming_the_feed_and_reason`.
+        let (_interest_guard, _) = capture_events();
+        let server = MockFeedServer::start(|_| MockResponse::status(500)).await;
+        let urls = vec![("a".to_string(), format!("{}/f.xml", server.url()))];
+        let cache = Arc::new(RecordsFailureArm::new(MemoryFeedCache::new(
+            CACHE_MAX_BYTES,
+            8,
+        )));
+        let engine = engine_with_cache(&urls, 900, 4, Arc::clone(&cache) as Arc<dyn FeedCache>);
+
+        let before = Instant::now();
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        let after = Instant::now();
+
+        let armed = cache.armed_instants();
+        assert_eq!(armed.len(), 1, "one failed serve records one arm");
+        // `arm` ran somewhere in `before..=after`, so the duration it added is
+        // bracketed by these two and 225s has to fall inside the bracket.
+        let lower = armed[0].duration_since(after);
+        let upper = armed[0].duration_since(before);
+        let expected = Duration::from_secs(225);
+        assert!(
+            lower <= expected && expected <= upper,
+            "the engine armed a fuse in {lower:?}..={upper:?}; ttl_seconds 900 must arm \
+             failure_fuse(900s) = 225s — neither the 30s floor nor the 300s ceiling"
         );
     }
 }

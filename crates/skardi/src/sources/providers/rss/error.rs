@@ -102,6 +102,26 @@ pub enum RssError {
 mod tests {
     use super::*;
 
+    /// The published number, spelled literally.
+    ///
+    /// `docs/rss.md:974` ("bounded at 512 characters") and
+    /// `docs/rss/semantics.yaml:85` (the `last_error` column description) both
+    /// state 512 as this provider's diagnostic-length contract, and neither is
+    /// Rust: neither can reference the constant, so neither would notice it
+    /// changing. Every other assertion in this crate compares against
+    /// `MAX_ERROR_CHARS` itself and so agrees with any value it is given —
+    /// verified by mutation (512 → 200 and 512 → 999 both left the suite
+    /// green). Same discipline as `mod.rs`'s
+    /// `schema_metadata_carries_surface_version`, which spells `"1"` rather than
+    /// reading `RSS_SURFACE_VERSION`.
+    #[test]
+    fn max_error_chars_is_the_number_the_docs_publish() {
+        assert_eq!(
+            MAX_ERROR_CHARS, 512,
+            "docs/rss.md and docs/rss/semantics.yaml both publish 512; change them together"
+        );
+    }
+
     #[test]
     fn truncate_bounds_length_on_char_boundaries() {
         let long = "é".repeat(1_000);
