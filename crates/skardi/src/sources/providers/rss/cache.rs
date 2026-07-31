@@ -85,6 +85,8 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 
+use super::error::{MAX_ERROR_CHARS, truncate};
+
 /// A feed's freshness state, and the single source of the exact strings the
 /// `feeds.last_status` column serves.
 ///
@@ -568,7 +570,12 @@ impl FeedCache for MemoryFeedCache {
             // them — so this is reported, not asserted. See the trait
             // method's doc for why `Error` is the honest status.
             entry.observation.last_status = FeedStatus::Error;
-            entry.observation.last_error = Some(WINDOW_EVICTED_ON_REVALIDATION.to_string());
+            // Routed through the cap like every other write to this column
+            // rather than relying on the literal above staying short. It is 131
+            // characters today, so this is a no-op; the point is that the
+            // column has one bound and no writer sits outside it.
+            entry.observation.last_error =
+                Some(truncate(WINDOW_EVICTED_ON_REVALIDATION, MAX_ERROR_CHARS));
             tracing::warn!(
                 feed,
                 http_status,

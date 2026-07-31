@@ -17,6 +17,7 @@ use super::conformance::{
     content_type_family_note, parsed_dialect, required_field_notes, sniff_declared_dialect,
 };
 use super::convert::html_to_markdown;
+use super::error::{MAX_ERROR_CHARS, truncate};
 use super::sanitize::{
     DocFamily, Repair, detect_family, refuse_internal_dtd, rung_escape_naked_ampersands,
     rung_reencode_utf8, rung_strip_control_chars,
@@ -116,7 +117,18 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
             Ok(success(feed, dialect_declared, repairs))
         }
         Err(reason) => {
-            tracing::debug!(stage = "strict-parse", %reason, "rss parse exhausted the ladder");
+            // Logged capped, at the same bound the column gets. The reason is
+            // the dependency's own string, and the shapes `engine.rs`'s module
+            // doc measures include ones that quote a feed-supplied token
+            // verbatim and unabbreviated — so untruncated this line was bounded
+            // only by `max_response_bytes`. `engine.rs` caps its own copy
+            // separately (`parse_error_message` bounds the composed string,
+            // prefix included), so the two do not depend on each other.
+            tracing::debug!(
+                stage = "strict-parse",
+                reason = %truncate(&reason, MAX_ERROR_CHARS),
+                "rss parse exhausted the ladder"
+            );
             Err(ParseFailure {
                 stage: "strict-parse",
                 reason,

@@ -7,6 +7,7 @@
 
 use feed_rs::model::{Feed, FeedType};
 
+use super::error::{MAX_ERROR_CHARS, truncate};
 use super::sanitize::{DocFamily, find_sub};
 
 const ATOM_1_0_NS: &str = "http://www.w3.org/2005/Atom";
@@ -21,7 +22,15 @@ pub fn sniff_declared_dialect(bytes: &[u8], family: DocFamily) -> Option<String>
             let (name, attrs) = first_start_element(bytes)?;
             let local = name.rsplit(':').next().unwrap_or(&name);
             let version = attr_value(&attrs, "version");
-            let unknown = || format!("unknown:{name}");
+            // `name` is a raw root element name off the wire, so this is
+            // feed-controlled text of whatever length the document supplies —
+            // and it is retained in a `FeedObservation`, which
+            // `MemoryFeedCache` never byte-bounds (its budget meters
+            // `RecordBatch` bytes only, `cache.rs:505`). Capped at the same
+            // bound its sibling `feeds.last_error` gets: a 4 KB root element
+            // name was measured producing a 4,104-character column value, and
+            // nothing stopped a 5 MiB one from producing 5 MiB.
+            let unknown = || truncate(&format!("unknown:{name}"), MAX_ERROR_CHARS);
 
             let dialect = if local.eq_ignore_ascii_case("RDF") {
                 "rss-1.0".to_string()
@@ -264,6 +273,24 @@ mod tests {
             )
             .as_deref(),
             Some("json-feed-1.1")
+        );
+    }
+
+    /// `unknown:<root>` is feed-controlled text and is capped, because it is
+    /// retained in a `FeedObservation` that nothing else byte-bounds.
+    #[test]
+    fn an_absurd_root_element_name_is_capped_like_last_error() {
+        let doc = format!("<{}/>", "x".repeat(4_096));
+        let declared = sniff_declared_dialect(doc.as_bytes(), DocFamily::Xml)
+            .expect("an unrecognised root still sniffs to `unknown:…`");
+        assert_eq!(
+            declared.chars().count(),
+            MAX_ERROR_CHARS,
+            "a 4 KB root element name must be cut to the cap, not stored whole"
+        );
+        assert!(
+            declared.starts_with("unknown:xxx"),
+            "the prefix and enough of the name to diagnose it survive: {declared}"
         );
     }
 

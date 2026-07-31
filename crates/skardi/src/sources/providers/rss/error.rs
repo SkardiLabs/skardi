@@ -1,6 +1,43 @@
-//! Error taxonomy for the RSS provider.
+//! Error taxonomy for the RSS provider, plus the one length bound every
+//! feed-influenced diagnostic string in this provider is held to.
 
 use thiserror::Error;
+
+/// Length cap, in characters, on any feed-influenced diagnostic string this
+/// provider stores or logs.
+///
+/// Three call sites share it, and they share it because they are bounded by the
+/// same thing — how many characters of feed-chosen text a document can push into
+/// a diagnostic — rather than by coincidence:
+///
+/// - `feeds.last_error` (`engine.rs`, the column's only writer), including the
+///   fixed literal `cache.rs` writes for an evicted-window `304`;
+/// - `feeds.dialect_declared`'s `unknown:<root element>` form
+///   (`conformance.rs`), built from a raw root element name of whatever length
+///   the document supplies;
+/// - the `debug`-level parse-failure line (`parse.rs`), which logs the
+///   dependency's own reason and was otherwise bounded only by
+///   `max_response_bytes`.
+///
+/// A bound on *length* only. What content may reach `feeds.last_error` at all is
+/// a separate question, argued in `engine.rs`'s module doc.
+///
+/// `docs/rss.md` and `docs/rss/semantics.yaml` publish the number as a bare
+/// `512`; neither is Rust and neither can reference this constant, so both name
+/// it as `MAX_ERROR_CHARS`'s value and this is where it is defined.
+pub const MAX_ERROR_CHARS: usize = 512;
+
+/// Bound `text` to `max_chars` *characters*, cutting on a char boundary so a
+/// multi-byte sequence is never split.
+///
+/// A length bound only: nothing here removes content, so what may appear in a
+/// string this bounds is decided by which strings are passed in, not by this.
+pub fn truncate(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_index, _)) => text[..byte_index].to_string(),
+        None => text.to_string(),
+    }
+}
 
 /// Errors surfaced while validating or registering an RSS/Atom data source.
 ///
@@ -59,4 +96,20 @@ pub enum RssError {
     /// path.
     #[error("failed to build the rss fetcher's HTTP client: {reason}")]
     HttpClientBuild { reason: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_bounds_length_on_char_boundaries() {
+        let long = "é".repeat(1_000);
+        let cut = truncate(&long, MAX_ERROR_CHARS);
+        assert_eq!(cut.chars().count(), MAX_ERROR_CHARS);
+        // Characters, not bytes: a 512-char run of 2-byte scalars is 1024 bytes.
+        assert_eq!(cut.len(), MAX_ERROR_CHARS * 2);
+        assert_eq!(truncate("short", MAX_ERROR_CHARS), "short");
+        assert_eq!(truncate("", MAX_ERROR_CHARS), "");
+    }
 }

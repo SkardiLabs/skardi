@@ -64,40 +64,83 @@
 //!
 //! ## What may reach `feeds.last_error`
 //!
-//! This module is the only writer of that column. `MAX_ERROR_CHARS` bounds
-//! its length, but truncation is not redaction, so the property that matters is
-//! separate:
+//! This module is the only writer of that column, and the column is read
+//! straight into an agent's context by `sync`'s closing health report
+//! (`docs/rss.md`), so what a feed can put in it is a prompt-content question,
+//! not a tidiness one. [`MAX_ERROR_CHARS`] bounds its length; truncation is not
+//! redaction, so the content question is separate.
 //!
-//! > No `feeds.last_error` value contains text taken from the feed body, with
-//! > one deliberate exception: a JSON Feed's declared `version` string, when
-//! > that version is unsupported.
+//! The property, stated as measured rather than as a wish:
 //!
-//! **The tests enforce that, not this comment.**
-//! `parse_failure_last_error_never_echoes_character_data` embeds a sentinel in
-//! body content across several document shapes — each chosen because it reaches
-//! a different error path, with a counter that fails if a shape stops erroring
-//! — and asserts the sentinel never appears in the recorded error.
-//! `json_unsupported_version_is_the_one_body_text_kept_in_last_error` pins the
-//! exception from the other side, so it cannot quietly widen. Every prose
-//! explanation of this property so far has needed correction — each time for a
-//! different reason, and twice inside text written to fix the previous one —
-//! while the tests were right every time. If a dependency upgrade changes any of
-//! this, they fail, and whoever sees that should re-derive the situation rather
-//! than trust the paragraph below.
+//! > A `feeds.last_error` value may quote a **feed-supplied token that sat in a
+//! > structural position** — an element or attribute *name*, an attribute value
+//! > the parser had to interpret (a `type`/MIME string), a declared version
+//! > string, or the JSON member *value* that failed a type check. It never
+//! > quotes a value the provider actually reads as content: the character data
+//! > of an element, a `title`, a `description`, an entry body. The cap is the
+//! > only bound on how long a quoted token may be.
 //!
-//! What was *measured*, against `feed-rs` 2.4.0 and the `quick-xml` 0.41.0 it
-//! resolves to (`Cargo.lock`) — evidence for the property today, not a taxonomy
-//! of everything a malformed document can produce:
+//! That is deliberate rather than accidental: those fragments are what make a
+//! malformed feed diagnosable, and the plan's error-redaction decision keeps
+//! them. But note what the second sentence does *not* say. A feed author who
+//! wants arbitrary text of their choosing in this column can get it, by putting
+//! that text in a structural position — an attribute value, or a JSON member
+//! whose declared type it violates — and the cap is then the whole defence.
+//! Measured: a ~1 KB string in a JSON Feed's `tags`, `authors`, `attachments`,
+//! or `size_in_bytes` is quoted verbatim into the column up to
+//! [`MAX_ERROR_CHARS`]. What is *not* reachable is the other thing: prose
+//! sitting where prose belongs stays out even when the document fails to parse
+//! for an unrelated reason.
 //!
-//! - Two error families were observed reaching this column, and both carry
-//!   structural text only. A truncated document reports
-//!   `SyntaxError::UnclosedTag` — "tag not closed: `>` not found before end of
-//!   input" (`quick-xml-0.41.0/src/errors.rs:71`), prefixed "syntax error: " by
-//!   `Error`'s `Display` (`src/errors.rs:287`). An out-of-range character
-//!   reference such as `&#x110000;` reports `EscapeError::InvalidCharRef`,
-//!   which renders the parsed *number* alone — "`1114112` is not a valid
-//!   codepoint" (`src/escape.rs:30`) — and nothing adjacent to it.
-//! - `EscapeError::UnrecognizedEntity` is a variant that would interpolate a
+//! **The tests enforce this, not this comment.**
+//! `parse_failure_last_error_quotes_structure_not_prose` runs a table of
+//! document shapes, each declaring whether its sentinel is expected to reach the
+//! column, and asserts that shape by shape in both directions — so a leak into a
+//! prose slot fails, and so does a `Kept` fragment quietly disappearing or
+//! widening. `json_unsupported_version_is_body_text_kept_in_last_error` and
+//! `a_huge_json_version_is_still_capped` pin the version-string case and its
+//! bound. Every prose explanation of this property so far has needed
+//! correction — each time for a different reason, twice inside text written to
+//! fix the previous one, and once more when a reviewer found four reachable
+//! shapes the property had denied outright — while the tests were right every
+//! time. If a dependency upgrade changes any of this they fail, and whoever sees
+//! that should re-derive the situation rather than trust the paragraphs below.
+//!
+//! What was *measured*, at `feed-rs` 2.4.0 and the `quick-xml` 0.41.0 it
+//! resolves to (`Cargo.lock`). This is the evidence behind the property today,
+//! **not** a closed list of what a malformed document can produce — the shapes
+//! below are the ones swept, and a shape nobody swept is not a shape nobody can
+//! write:
+//!
+//! - **Element names.** A mismatched end tag reports quick-xml's ill-formed
+//!   family and names both tags: `expected </entry>, but </X> was found`, where
+//!   `X` is whatever the document wrote. Measured through a mismatch inside an
+//!   `xhtml` `<content>` body too, so the shape is not confined to the feed's
+//!   own elements.
+//! - **Attribute values the parser interprets.** An Atom
+//!   `<content type="X">` whose `X` is not a type feed-rs handles reports
+//!   `unsupported content type X`. `X` is a raw attribute value.
+//! - **JSON type-mismatch values.** `serde_json` renders the offending value in
+//!   `invalid type: …, expected …`, and for a string it renders that string
+//!   verbatim and unabbreviated — `invalid type: string "X", expected u64`.
+//!   Reached from every JSON Feed member whose declared type a string violates.
+//!   This is the widest of the channels and the reason the cap is load-bearing.
+//! - **Declared version strings.** `ParseFeedError::JsonUnsupportedVersion`'s
+//!   `Display` is `unsupported version: {version}`
+//!   (`feed-rs-2.4.0/src/parser/mod.rs:66`, reached from
+//!   `src/parser/json/mod.rs:29`) — a member value out of the document, kept
+//!   because an unsupported version is undiagnosable without it.
+//! - **Structural syntax errors carry no document text at all.** A truncated
+//!   document reports `SyntaxError::UnclosedTag` — "tag not closed: `>` not
+//!   found before end of input" (`quick-xml-0.41.0/src/errors.rs:71`), prefixed
+//!   "syntax error: " by `Error`'s `Display` (`src/errors.rs:287`). An
+//!   out-of-range character reference such as `&#x110000;` reports
+//!   `EscapeError::InvalidCharRef`, which renders the parsed *number* alone —
+//!   "`1114112` is not a valid codepoint" (`src/escape.rs:30`) — and nothing
+//!   adjacent to it. These are the shapes that make character data in a failing
+//!   document stay out of the column.
+//! - **Why character data stays out.**
+//!   `EscapeError::UnrecognizedEntity` is a variant that would interpolate a
 //!   token lifted from the document (`src/escape.rs:66-68`). It was not observed
 //!   reaching this column, and the check behind that is a grep over the one
 //!   crate we pin rather than a claim about quick-xml's internals. Grepping
@@ -115,15 +158,6 @@
 //!   quick-xml raises this variant from other routines too (`escape.rs:295`,
 //!   `:807`, `de/mod.rs:2470`); the grep above is the statement that nothing
 //!   here calls them.
-//! - The exception named above is
-//!   `ParseFeedError::JsonUnsupportedVersion(String)`, whose `Display` is
-//!   "unsupported version: {version}" (`feed-rs-2.4.0/src/parser/mod.rs:66`),
-//!   reached from `src/parser/json/mod.rs:29`. That string is a member value out
-//!   of the document. It is the one body-derived string this sweep surfaced —
-//!   which is a statement about the shapes swept, not a proof that no other
-//!   exists — and it is kept because an unsupported version is undiagnosable
-//!   without it. `MAX_ERROR_CHARS` bounds it like everything else here, pinned
-//!   by `a_huge_json_version_is_still_capped`.
 //! - `FetchError`'s own strings — this crate's, so not a dependency
 //!   question — are statuses, byte and second counts, and URLs: the configured
 //!   feed URL, or a redirect `Location`. A `Location` is attacker-influenced
@@ -149,7 +183,7 @@ use super::cache::{
 };
 use super::config::RssConfig;
 use super::egress::EgressPolicy;
-use super::error::RssError;
+use super::error::{MAX_ERROR_CHARS, RssError, truncate};
 use super::fetch::{FeedFetcher, FetchError, FetchOutcome, Validators};
 use super::parse::{ParsedDocument, parse_feed_document};
 use super::schema::{FeedsRow, build_feeds_batch, build_items_batch, with_window_status};
@@ -161,11 +195,6 @@ pub const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// so a source whose feeds all hold a window at once is not evicting on the
 /// steady state.
 const WINDOW_ENTRY_HEADROOM: usize = 8;
-
-/// Length cap on a stored `feeds.last_error`, in characters. A bound on length
-/// only — see the module doc for the separate argument about what content can
-/// reach the column at all.
-const MAX_ERROR_CHARS: usize = 512;
 
 /// Ceiling on the configured TTL. `RssConfig` puts no upper bound on
 /// `ttl_seconds`, and the TTL becomes the `Duration` added to an `Instant`
@@ -704,17 +733,6 @@ fn parse_error_message(stage: &str, reason: &str) -> String {
     )
 }
 
-/// Bound a stored error string to `max_chars` *characters*, cutting on a char
-/// boundary so a multi-byte sequence is never split. A length bound only:
-/// nothing here removes content, so what may appear in `feeds.last_error` is
-/// decided by which strings are passed in, not by this.
-fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((byte_index, _)) => text[..byte_index].to_string(),
-        None => text.to_string(),
-    }
-}
-
 /// Wall-clock milliseconds since the Unix epoch, for `feeds.last_fetch`.
 /// A clock before the epoch, or a value past `i64`, reads as `0` rather than
 /// wrapping into a nonsense timestamp.
@@ -1116,89 +1134,277 @@ mod tests {
         );
     }
 
-    /// `last_error` must carry no response-body content. The 512-char cap
-    /// bounds length but does not redact, so the guarantee rests on the parse
-    /// error never echoing character data — pinned here end to end for both
-    /// shapes that could carry it.
+    /// What may reach `feeds.last_error`, pinned in both directions.
     ///
-    /// Each body carries the sentinel in body content, in a shape chosen to
-    /// reach a different error path. Whether a given body fails to parse is
-    /// feed-rs's business and may change between versions; the invariant is that
-    /// if a reason lands in `last_error`, the sentinel is not in it and the
-    /// stored string respects the cap.
+    /// The module doc states the property; this table is what enforces it. Each
+    /// shape declares the [`Fate`] of a sentinel placed at one specific position
+    /// in the document, and the assertions below check that fate exactly — so a
+    /// sentinel in a *prose* position reaching the column fails, and so does a
+    /// `Kept` fragment quietly vanishing (which would mean the error stopped
+    /// being diagnosable) or a `NoError` shape starting to error (which means a
+    /// dependency changed and the row needs re-deriving by hand).
+    ///
+    /// The earlier version of this test placed its sentinel only in character
+    /// data and stated the property as "no body text at all". A reviewer then
+    /// found four reachable shapes that put feed-supplied text in the column,
+    /// all four of which are `Kept` rows below.
     #[tokio::test]
-    async fn parse_failure_last_error_never_echoes_character_data() {
+    async fn parse_failure_last_error_quotes_structure_not_prose() {
         const SENTINEL: &str = "SHOULD-NOT-LEAK";
-        let bodies = [
-            // Truncated mid-element, sentinel as ordinary character data.
-            // Reaches `SyntaxError::UnclosedTag`.
-            "<rss version=\"2.0\"><channel><title>SHOULD-NOT-LEAK secret prose",
-            // Truncated, sentinel shaped as an undefined entity reference —
-            // the input `EscapeError::UnrecognizedEntity` would quote verbatim.
-            // Reaches `UnclosedTag` too: the structural failure comes first.
-            "<rss version=\"2.0\"><channel><title>&SHOULD-NOT-LEAK; truncat",
-            // Sentinel adjacent to an out-of-range character reference in
-            // character data. This is the shape that reaches
-            // `EscapeError::InvalidCharRef`, the only escape error observed
-            // reaching this column — the position matters, since the same
-            // reference inside `<title>` is swallowed per-element and yields no
-            // error at all.
-            concat!(
-                r#"<rss version="2.0"><channel>SHOULD-NOT-LEAK &#x110000;"#,
-                r#"<title>t</title><link>https://e.example/</link>"#,
-                r#"<description>d</description></channel></rss>"#,
+
+        /// Where a shape's sentinel is expected to end up.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Fate {
+            /// The shape fails to parse and the sentinel must not be in the
+            /// recorded error: it sat somewhere the provider reads as content.
+            Absent,
+            /// The shape fails to parse and the sentinel *is* in the error, by
+            /// the plan's error-redaction decision: it sat in a structural
+            /// position, and the fragment is what makes the failure
+            /// diagnosable.
+            Kept,
+            /// The shape does not fail to parse at all today, so there is no
+            /// error to inspect. A live guard rather than a filler row.
+            NoError,
+        }
+
+        // (label, body, content-type is JSON, expected fate)
+        let shapes: &[(&str, &str, bool, Fate)] = &[
+            // ---- Absent: the sentinel sits where the provider reads content.
+            (
+                "character data, document truncated",
+                "<rss version=\"2.0\"><channel><title>SHOULD-NOT-LEAK secret prose",
+                false,
+                // Reaches `SyntaxError::UnclosedTag`, which names no document
+                // text at all.
+                Fate::Absent,
             ),
-            // Well-formed, so nothing fails today: feed-rs 2.4.0 reads an
-            // undefined entity back as literal text and reports no error at
-            // all. Kept as a live guard — the day a future feed-rs starts
-            // reporting escape errors for element text, this body produces one.
-            concat!(
-                r#"<rss version="2.0"><channel><title>&SHOULD-NOT-LEAK;</title>"#,
-                r#"<link>https://e.example/</link><description>d</description>"#,
-                r#"</channel></rss>"#,
+            (
+                "undefined entity in character data, document truncated",
+                // The input `EscapeError::UnrecognizedEntity` would quote
+                // verbatim. Reaches `UnclosedTag` instead: the structural
+                // failure comes first.
+                "<rss version=\"2.0\"><channel><title>&SHOULD-NOT-LEAK; truncat",
+                false,
+                Fate::Absent,
+            ),
+            (
+                "character data beside an out-of-range character reference",
+                // The one shape that reaches `EscapeError::InvalidCharRef`,
+                // which renders the parsed number alone. Position matters: the
+                // same reference inside `<title>` is swallowed per-element and
+                // yields no error.
+                concat!(
+                    r#"<rss version="2.0"><channel>SHOULD-NOT-LEAK &#x110000;"#,
+                    r#"<title>t</title><link>https://e.example/</link>"#,
+                    r#"<description>d</description></channel></rss>"#,
+                ),
+                false,
+                Fate::Absent,
+            ),
+            (
+                "entry prose, document failing structurally elsewhere",
+                // The shape that matters most: an article body in the slot an
+                // article body belongs in, in a document that *does* fail. The
+                // error names the mismatched tag, not the summary.
+                concat!(
+                    r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title>"#,
+                    r#"<id>i</id><entry><id>e</id>"#,
+                    r#"<summary>SHOULD-NOT-LEAK the whole article body</summary>"#,
+                    r#"</mismatched></feed>"#,
+                ),
+                false,
+                Fate::Absent,
+            ),
+            (
+                "feed title, JSON failing on a type elsewhere",
+                // Same idea on the JSON side: the sentinel is a correctly typed
+                // `title`, and the failure is a different member's type.
+                r#"{"version":"https://jsonfeed.org/version/1.1","title":"SHOULD-NOT-LEAK prose","items":"x"}"#,
+                true,
+                Fate::Absent,
+            ),
+            // ---- NoError: nothing fails, so nothing is asserted about content.
+            (
+                "undefined entity in a well-formed title",
+                // feed-rs 2.4.0 writes an unresolvable entity back into the text
+                // verbatim and reports nothing. Kept as a live guard: the day a
+                // future feed-rs starts reporting escape errors for element
+                // text, this row's fate flips and this test says so.
+                concat!(
+                    r#"<rss version="2.0"><channel><title>&SHOULD-NOT-LEAK;</title>"#,
+                    r#"<link>https://e.example/</link><description>d</description>"#,
+                    r#"</channel></rss>"#,
+                ),
+                false,
+                Fate::NoError,
+            ),
+            // ---- Kept: the sentinel sits in a structural position.
+            (
+                "Atom content type attribute",
+                // An attribute value the parser has to interpret; the error is
+                // `unsupported content type SHOULD-NOT-LEAK`.
+                concat!(
+                    r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title>"#,
+                    r#"<id>i</id><entry><id>e</id>"#,
+                    r#"<content type="SHOULD-NOT-LEAK">x</content></entry></feed>"#,
+                ),
+                false,
+                Fate::Kept,
+            ),
+            (
+                "mismatched end tag names the element",
+                // quick-xml's ill-formed family quotes both tag names.
+                concat!(
+                    r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title>"#,
+                    r#"<id>i</id><entry><id>e</id></SHOULD-NOT-LEAK></feed>"#,
+                ),
+                false,
+                Fate::Kept,
+            ),
+            (
+                "JSON string where a u64 was declared",
+                // serde_json renders the offending value verbatim in
+                // `invalid type: string "…", expected u64`.
+                concat!(
+                    r#"{"version":"https://jsonfeed.org/version/1.1","title":"t","#,
+                    r#""items":[{"id":"1","attachments":[{"url":"u","#,
+                    r#""size_in_bytes":"SHOULD-NOT-LEAK"}]}]}"#,
+                ),
+                true,
+                Fate::Kept,
+            ),
+            (
+                "JSON string where a sequence was declared",
+                r#"{"version":"https://jsonfeed.org/version/1.1","title":"t","items":"SHOULD-NOT-LEAK"}"#,
+                true,
+                Fate::Kept,
             ),
         ];
 
         let mut errors_seen = 0;
-        for body in bodies {
-            let server = MockFeedServer::start(move |_| MockResponse::xml(body)).await;
-            let engine = test_engine(&server, &[("a", "/f.xml")], 900);
+        for (label, body, is_json, fate) in shapes {
+            let body = (*body).to_string();
+            let is_json = *is_json;
+            let server = MockFeedServer::start(move |_| {
+                if is_json {
+                    MockResponse::new(200, body.clone().into_bytes())
+                        .with_header("content-type", "application/json")
+                } else {
+                    MockResponse::xml(&body)
+                }
+            })
+            .await;
+            let engine = test_engine(&server, &[("a", "/f")], 900);
 
             engine.serve_feed("a", || true).await;
-            if let Some(error) = str_opt_col(&engine.feeds_row("a"), "last_error")[0].clone() {
-                errors_seen += 1;
-                assert!(
-                    !error.contains(SENTINEL),
-                    "response body content reached last_error for {body:?}: {error}"
-                );
+            let recorded = str_opt_col(&engine.feeds_row("a"), "last_error")[0].clone();
+
+            match (fate, &recorded) {
+                (Fate::NoError, Some(error)) => panic!(
+                    "shape {label:?} was expected to parse cleanly but recorded an error — \
+                     a dependency changed and this row must be re-derived by hand: {error}"
+                ),
+                (Fate::NoError, None) => {}
+                (_, None) => panic!(
+                    "shape {label:?} was expected to fail to parse and did not; the assertion \
+                     it exists for never ran"
+                ),
+                (Fate::Absent, Some(error)) => {
+                    errors_seen += 1;
+                    assert!(
+                        !error.contains(SENTINEL),
+                        "feed content the provider reads as prose reached last_error for \
+                         {label:?}: {error}"
+                    );
+                }
+                (Fate::Kept, Some(error)) => {
+                    errors_seen += 1;
+                    assert!(
+                        error.contains(SENTINEL),
+                        "shape {label:?} is documented as quoting its structural fragment and \
+                         no longer does; the module doc's measured list is now wrong: {error}"
+                    );
+                }
+            }
+            // Whatever the fate, the cap holds — it is the only bound on a
+            // `Kept` fragment's length.
+            if let Some(error) = recorded {
                 assert!(
                     error.chars().count() <= MAX_ERROR_CHARS,
-                    "stored error exceeds the stated cap: {}",
+                    "stored error for {label:?} exceeds the cap: {}",
                     error.chars().count()
                 );
             }
         }
-        // Guards the loop against going quietly vacuous: three of the four
-        // bodies must still reach the failure path for the assertions above to
-        // mean anything. If this count moves, a shape changed error family and
-        // the new reason needs re-checking by hand.
+
+        // Guards the loop against going quietly vacuous. The per-shape match
+        // above already fails a row whose fate changed, so this is the
+        // belt-and-braces total: nine of the ten shapes must reach the failure
+        // path for the assertions to have run.
         assert_eq!(
-            errors_seen, 3,
-            "expected the two truncated bodies and the bad character reference to record \
-             an error, and the well-formed one not to"
+            errors_seen,
+            shapes
+                .iter()
+                .filter(|(_, _, _, f)| *f != Fate::NoError)
+                .count(),
+            "every shape but the well-formed one must record an error"
+        );
+        assert_eq!(errors_seen, 9);
+    }
+
+    /// A `Kept` fragment is bounded only by the cap, and the cap is therefore
+    /// the whole defence against a feed choosing what lands in this column.
+    ///
+    /// Measured with a JSON type mismatch because that is the widest of the
+    /// channels: `serde_json` renders the offending string verbatim and
+    /// unabbreviated, so a feed can put an arbitrary ~1 KB of its own choosing
+    /// here and see [`MAX_ERROR_CHARS`] of it stored.
+    #[tokio::test]
+    async fn a_json_type_mismatch_quotes_arbitrary_text_up_to_the_cap() {
+        let filler = "arbitrary feed-chosen text ".repeat(40);
+        let body = format!(
+            concat!(
+                r#"{{"version":"https://jsonfeed.org/version/1.1","title":"t","#,
+                r#""items":[{{"id":"1","tags":"{}"}}]}}"#,
+            ),
+            filler
+        );
+        assert!(
+            filler.len() > MAX_ERROR_CHARS,
+            "the filler must overrun the cap"
+        );
+        let server = MockFeedServer::start(move |_| {
+            MockResponse::new(200, body.clone().into_bytes())
+                .with_header("content-type", "application/json")
+        })
+        .await;
+        let engine = test_engine(&server, &[("a", "/f.json")], 900);
+
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        let error = str_opt_col(&engine.feeds_row("a"), "last_error")[0]
+            .clone()
+            .expect("a type mismatch is a parse failure");
+        assert!(
+            error.contains("arbitrary feed-chosen text"),
+            "the offending value is quoted verbatim: {error}"
+        );
+        assert_eq!(
+            error.chars().count(),
+            MAX_ERROR_CHARS,
+            "and the cap is what stops it"
         );
     }
 
-    /// The one documented exception to "no body text in `last_error`": feed-rs
-    /// interpolates a JSON Feed's declared `version` when it does not recognise
-    /// it, and that string is a member value out of the document.
+    /// A JSON Feed's declared `version`, kept when unrecognised: feed-rs
+    /// interpolates it, and it is a member value out of the document.
     ///
-    /// Pinned from the exception's side deliberately. The audit claims exactly
-    /// one carve-out, and a test that only asserted the absence of leaks would
-    /// pass just as happily if this one silently widened — or if someone
-    /// "fixed" it without updating the audit.
+    /// Pinned from the kept side deliberately. A test that only asserted the
+    /// absence of leaks would pass just as happily if this fragment silently
+    /// disappeared — leaving an unsupported version undiagnosable — or if
+    /// someone "fixed" it without updating the module doc.
     #[tokio::test]
-    async fn json_unsupported_version_is_the_one_body_text_kept_in_last_error() {
+    async fn json_unsupported_version_is_body_text_kept_in_last_error() {
         let body = r#"{"version":"SHOULD-NOT-LEAK-1.9","title":"t","items":[]}"#;
         let server = MockFeedServer::start(move |_| {
             MockResponse::new(200, body.as_bytes().to_vec())
@@ -1552,13 +1758,5 @@ mod tests {
             parse_error_message("refused-internal-dtd", "internal DTD subset refused"),
             "parse failed at refused-internal-dtd: internal DTD subset refused"
         );
-    }
-
-    #[test]
-    fn truncate_bounds_length_on_char_boundaries() {
-        let long = "é".repeat(1_000);
-        let cut = truncate(&long, MAX_ERROR_CHARS);
-        assert_eq!(cut.chars().count(), MAX_ERROR_CHARS);
-        assert_eq!(truncate("short", MAX_ERROR_CHARS), "short");
     }
 }
