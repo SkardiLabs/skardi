@@ -177,6 +177,52 @@ hint rather than being misread as a filesystem path.
   matched file fails to fetch/parse (e.g. credentials expired after listing),
   the scan errors instead of silently returning zero rows that would masquerade
   as an empty corpus.
+- **Image-write failures are counted, not hidden.** A crop / page-image write
+  that fails is logged and the affected row simply carries no
+  `page_image_ref` / crop ref — but the scan logs an aggregate
+  `N/M image_store write(s) failed` summary, and if *every* write fails the scan
+  errors rather than returning rows that look exactly as if `image_store` were
+  never configured. This is the only guard for a local `image_store` (the
+  registration preflight covers `s3://` targets only) and it catches S3
+  credentials that expire after the preflight.
+
+## Performance and cost
+
+**Every scan re-reads the whole corpus, and every query triggers a scan.**
+There is no caching layer: a `SELECT` against a `documents` table lists the
+source prefix, fetches each matching file, parses it, and — when `image_store`
+and `render_page_images` / `image_mode: embedded` are set — **re-writes the
+image outputs**, overwriting the previous scan's objects. Two identical queries
+do all of that twice.
+
+On a local path this costs CPU and disk I/O. On S3 it also costs money and
+latency, roughly per query:
+
+| Operation | Count per query |
+|---|---|
+| `ListObjectsV2` | 1 per prefix (paged, so more for >1000 keys) |
+| `GetObject` | one per matched file, plus egress if leaving the region |
+| `PutObject` | one per page render + one per extracted crop |
+
+A measured example: a 4-PDF, 9-page corpus took ~7s and ~21 S3 requests per
+query, rewriting 12 objects each time. Scaling that to a few thousand documents
+makes interactive querying impractical and the request bill non-trivial.
+
+Practical mitigations until caching exists:
+
+- Materialize once instead of querying repeatedly — run the scan through a
+  [job](jobs.md) that writes to a table (Parquet/Lance/Postgres), then query
+  that. This is the recommended shape for anything beyond a small corpus.
+- Narrow `include_globs` and point `path` at the tightest prefix that holds
+  the documents you need; both cut the per-query file count directly.
+- Leave `render_page_images` off unless multimodal escalation is actually
+  used — it is the largest contributor to per-query `PutObject` volume
+  (full-page PNGs are far bigger than crops).
+- Keep the bucket in the same region as the server to avoid egress charges on
+  every re-read.
+
+Files are also fetched and parsed **sequentially**, so wall-clock scales
+linearly with corpus size; there is no per-file concurrency yet.
 
 ## S3 / object store
 
