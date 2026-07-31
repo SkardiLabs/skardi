@@ -1,0 +1,111 @@
+# Notion source pack. Wire contract reconciled against a live Open
+# Connector gateway: raw-passthrough executors (rows are Notion API
+# objects verbatim), camelCase strict inputs (startCursor/pageSize),
+# Notion's native cursor envelope ($.next_cursor, null at end — has_more
+# is redundant with the null cursor and deliberately unused). Design
+# rationale lives in the module docs of packs/notion.rs.
+kind: pack
+pack: notion
+version: 1
+
+tables:
+  users:
+    action: notion.list_users
+    row_path: "$.results"
+    fingerprint: 2c7a234b30e3b016a4405586602c2bbe9e8fe873eb9b62c5257c98eb3f099421
+    pagination:
+      strategy: cursor
+      cursor_input: startCursor
+      next_cursor_path: "$.next_cursor"
+      page_size_input: pageSize
+      page_size: 100
+    columns:
+      # person.email is deliberately NOT mapped: it is capability-gated on
+      # the integration and privacy-sensitive; the raw `person` object is
+      # not exposed either, for the same reason.
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: avatar_url, path: avatar_url, type: utf8, nullable: true }
+
+  pages:
+    action: notion.search
+    row_path: "$.results"
+    fingerprint: a7d90d2d753b28954b1bf77c26abc2ff4b36caf905c8c1fc74a182acb2a6e9d1
+    pagination:
+      strategy: cursor
+      cursor_input: startCursor
+      next_cursor_path: "$.next_cursor"
+      page_size_input: pageSize
+      page_size: 100
+    # The empty query plus an object filter is Notion's spelling for "the
+    # complete listing the integration can see" — the state=all move.
+    fixed_inputs:
+      query: ""
+      filter:
+        property: object
+        value: page
+    columns:
+      # `properties` is the page's dynamic property map — opaque JSON by
+      # design; typed projection of dynamic schemas is the deferred
+      # query_data_source work.
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
+      - { name: last_edited_time, path: last_edited_time, type: timestamp_ms_utc, nullable: true }
+      - { name: archived, path: archived, type: boolean, nullable: true }
+      - { name: in_trash, path: in_trash, type: boolean, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }
+      - { name: public_url, path: public_url, type: utf8, nullable: true }
+      - { name: parent, path: parent, type: json, nullable: true }
+      - { name: properties, path: properties, type: json, nullable: true }
+
+  data_sources:
+    action: notion.search
+    row_path: "$.results"
+    fingerprint: a7d90d2d753b28954b1bf77c26abc2ff4b36caf905c8c1fc74a182acb2a6e9d1
+    pagination:
+      strategy: cursor
+      cursor_input: startCursor
+      next_cursor_path: "$.next_cursor"
+      page_size_input: pageSize
+      page_size: 100
+    fixed_inputs:
+      query: ""
+      filter:
+        property: object
+        value: data_source
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
+      - { name: last_edited_time, path: last_edited_time, type: timestamp_ms_utc, nullable: true }
+      - { name: title, path: title, type: utf8_list_from_object_key, key: plain_text, nullable: true }
+      - { name: archived, path: archived, type: boolean, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }
+      - { name: parent, path: parent, type: json, nullable: true }
+      - { name: properties, path: properties, type: json, nullable: true }
+
+  block_children:
+    action: notion.list_block_children
+    row_path: "$.results"
+    fingerprint: 69f20cdc842b890c280265048d143d36de1699396b8ca4f53f7a7f203b7bd51c
+    pagination:
+      strategy: cursor
+      cursor_input: startCursor
+      next_cursor_path: "$.next_cursor"
+      page_size_input: pageSize
+      page_size: 100
+    resources:
+      required: [blockId]
+    columns:
+      # The type-specific payload (paragraph/heading_1/...) lives under a
+      # key named BY `type`, which a fixed relational mapping cannot
+      # address; content extraction belongs to a rendered-markdown table
+      # (notion.retrieve_page_markdown) as a follow-up.
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
+      - { name: last_edited_time, path: last_edited_time, type: timestamp_ms_utc, nullable: true }
+      - { name: has_children, path: has_children, type: boolean, nullable: true }
+      - { name: archived, path: archived, type: boolean, nullable: true }
+      - { name: in_trash, path: in_trash, type: boolean, nullable: true }
+      - { name: parent, path: parent, type: json, nullable: true }

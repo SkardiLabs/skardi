@@ -34,6 +34,10 @@ pub enum FixedValue {
     /// ["public_channel", "private_channel"]`, whose action schema takes an
     /// array, not a comma-joined string.
     StrList(&'static [&'static str]),
+    /// An arbitrary JSON value (typically an object) — e.g. Notion's search
+    /// `filter: {"property": "object", "value": "page"}`, whose action
+    /// schema takes an object. Pre-parsed and leaked by the pack loader.
+    Json(&'static serde_json::Value),
 }
 
 impl FixedValue {
@@ -47,6 +51,7 @@ impl FixedValue {
             Self::StrList(items) => {
                 serde_json::Value::from(items.iter().map(|s| *s).collect::<Vec<_>>())
             }
+            Self::Json(value) => (*value).clone(),
         }
     }
 }
@@ -130,6 +135,7 @@ impl SourcePackRegistry {
         for pack in [
             super::packs::mock::pack()?,
             super::packs::github::pack()?,
+            super::packs::notion::pack()?,
             super::packs::slack::pack()?,
         ] {
             packs.insert(pack.name, pack);

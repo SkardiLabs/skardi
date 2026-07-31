@@ -1,0 +1,22 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "data_source", "id": "ds-0001",
+      "created_time": "2026-02-01T00:00:00.000Z",
+      "last_edited_time": "2026-02-02T00:00:00.000Z",
+      "title": [{ "plain_text": "Tasks" }, { "plain_text": " DB" }],
+      "archived": false,
+      "url": "https://www.notion.so/ds-0001",
+      "parent": { "type": "page_id", "page_id": "p-0001" },
+      "properties": { "Name": { "type": "title" }, "Status": { "type": "select" } }
+    },
+    {
+      "object": "data_source", "id": "ds-0002",
+      "created_time": null, "last_edited_time": null,
+      "title": [], "archived": null, "url": null,
+      "parent": null, "properties": null
+    }
+  ],
+  "next_cursor": null, "has_more": false
+}

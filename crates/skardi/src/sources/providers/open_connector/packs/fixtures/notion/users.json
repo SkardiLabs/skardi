@@ -1,0 +1,17 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "user", "id": "u-0001", "name": "Ada Lovelace",
+      "type": "person", "avatar_url": "https://img.example/ada.png",
+      "person": { "email": "redacted@example.test" }
+    },
+    {
+      "object": "user", "id": "u-0002", "name": null,
+      "type": "bot", "avatar_url": null,
+      "bot": { "owner": { "type": "workspace" } }
+    },
+    { "object": "user", "id": "u-0003", "type": "person" }
+  ],
+  "next_cursor": null, "has_more": false
+}

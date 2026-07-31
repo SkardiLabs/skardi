@@ -1,0 +1,25 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "page", "id": "p-0001",
+      "created_time": "2026-01-01T00:00:00.000Z",
+      "last_edited_time": "2026-01-02T10:30:00.000Z",
+      "archived": false, "in_trash": false,
+      "url": "https://www.notion.so/p-0001",
+      "public_url": null,
+      "parent": { "type": "workspace", "workspace": true },
+      "properties": { "title": { "id": "title", "type": "title", "title": [{ "plain_text": "Roadmap" }] } }
+    },
+    {
+      "object": "page", "id": "p-0002",
+      "created_time": "2026-01-03T00:00:00.000Z",
+      "last_edited_time": null,
+      "archived": true,
+      "url": "https://www.notion.so/p-0002",
+      "parent": null,
+      "properties": null
+    }
+  ],
+  "next_cursor": null, "has_more": false
+}

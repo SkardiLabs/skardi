@@ -107,11 +107,15 @@ fn convert_table(
         // spelling for them — FixedValue::to_json would silently send null
         // at query time, bypassing the startup diagnostic this loader
         // promises. Finite-only, enforced here.
-        if let FixedValueDoc::Float(v) = &value
-            && !v.is_finite()
-        {
+        let non_finite = match &value {
+            FixedValueDoc::Float(v) => (!v.is_finite()).then(|| v.to_string()),
+            FixedValueDoc::Json(v) => first_non_finite(v),
+            _ => None,
+        };
+        if let Some(shown) = non_finite {
             return Err(format!(
-                "{id}: fixed input '{key}' is {v}, which has no JSON spelling;                  pin a finite number"
+                "{id}: fixed input '{key}' contains {shown}, which has no JSON \
+                 spelling; pin finite numbers only"
             ));
         }
         fixed_inputs.push((leak_str(key), value.into_fixed()));
@@ -333,6 +337,21 @@ fn convert_filter(doc: FilterDoc) -> FilterMapping {
     }
 }
 
+/// First non-finite float inside a JSON value, if any. serde_json parses
+/// no non-finite literals itself, but serde_yaml's `.nan`/`.inf` arrive
+/// through the untagged `Json` variant as f64s that `Number::from_f64`
+/// silently turns into null on write — the same trap as bare floats.
+fn first_non_finite(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(n) => {
+            n.as_f64().filter(|f| !f.is_finite()).map(|f| f.to_string())
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(first_non_finite),
+        serde_json::Value::Object(map) => map.values().find_map(first_non_finite),
+        _ => None,
+    }
+}
+
 fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
@@ -490,6 +509,10 @@ enum FixedValueDoc {
     Float(f64),
     Str(String),
     StrList(Vec<String>),
+    /// Object-shaped inputs (e.g. Notion's search `filter`). Captured as a
+    /// JSON value so nesting is unrestricted; converted with the same
+    /// finite-floats guard as the scalar variants.
+    Json(serde_json::Value),
 }
 
 impl FixedValueDoc {
@@ -500,6 +523,7 @@ impl FixedValueDoc {
             Self::Float(v) => FixedValue::Float(v),
             Self::Str(v) => FixedValue::Str(leak_str(v)),
             Self::StrList(v) => FixedValue::StrList(leak_str_slice(v)),
+            Self::Json(v) => FixedValue::Json(Box::leak(Box::new(v))),
         }
     }
 }
@@ -560,6 +584,7 @@ mod tests {
             ("mock.yaml", include_str!("mock.yaml")),
             ("github.yaml", include_str!("github.yaml")),
             ("slack.yaml", include_str!("slack.yaml")),
+            ("notion.yaml", include_str!("notion.yaml")),
         ] {
             // parse_pack performs the full structural + cross-field
             // validation pass itself; parsing IS the gate.

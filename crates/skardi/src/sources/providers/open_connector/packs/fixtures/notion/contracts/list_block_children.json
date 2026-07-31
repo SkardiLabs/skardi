@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "properties": {
+    "object": {
+      "const": "list",
+      "type": "string",
+      "description": "The Notion object type."
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "object": {
+            "const": "block",
+            "type": "string",
+            "description": "The Notion object type."
+          },
+          "id": {
+            "type": "string",
+            "description": "The block ID."
+          },
+          "parent": {
+            "type": "object",
+            "additionalProperties": {
+              "description": "A Notion API field value."
+            },
+            "description": "The official Notion parent object."
+          },
+          "type": {
+            "type": "string",
+            "description": "The block type."
+          },
+          "has_children": {
+            "type": "boolean",
+            "description": "Whether this block has child blocks."
+          },
+          "in_trash": {
+            "type": "boolean",
+            "description": "Whether the block is in the trash."
+          }
+        },
+        "additionalProperties": true,
+        "description": "A Notion block object."
+      },
+      "description": "Returned Notion objects."
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Cursor for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "has_more": {
+      "type": "boolean",
+      "description": "Whether more results are available."
+    }
+  },
+  "additionalProperties": true,
+  "required": [
+    "object",
+    "results",
+    "has_more"
+  ],
+  "description": "Child blocks returned by Notion."
+}
