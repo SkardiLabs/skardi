@@ -1001,9 +1001,20 @@ async fn retry_after_is_honored_within_scan() {
 /// the two shapes that reach the scan differently.
 ///
 /// `LIMIT 1` alone: DataFusion copies the fetch into the `TableScan`, so the
-/// scan gets `limit: Some(1)`, and with one politeness permit the two later
-/// partitions are handed the permit only after the first has already emitted —
-/// the gate the engine re-reads after acquiring is what stops them.
+/// scan gets `limit: Some(1)`, and only one of the three feeds is requested.
+///
+/// What stops the other two here is *not* the launch gate — this test cannot
+/// tell the gate from ordinary stream cancellation, and an earlier version of
+/// this docstring claimed the post-permit gate re-read. Measured by mutation:
+/// with the exec pre-check and the closure gate both defeated (`exec.rs:357`
+/// and `:363`), this test still passes while four `exec.rs` tests fail. With one
+/// politeness permit the two later partitions are still queued on the semaphore
+/// when the limit fills, so DataFusion drops their un-polled streams — the
+/// mechanism [`cancellation_stops_further_fetches`] owns directly. The gate
+/// itself is pinned in `exec.rs`, where a closed gate *is* distinguishable from a
+/// dropped stream: `limit_satisfied_stops_launching_fetches` (`exec.rs:531`) for
+/// the pre-check, and `a_queued_partition_is_stopped_by_the_gate_after_the_permit`
+/// (`exec.rs:572`) for the re-read after the permit.
 ///
 /// `ORDER BY guid LIMIT 1`: a Top-K has to see every row before it knows which
 /// one wins, so the limit stops at the sort and never reaches the scan. Every
@@ -1025,7 +1036,7 @@ async fn limit_stops_launching_fetches() {
     assert_eq!(
         news.request_count(),
         1,
-        "one row of LIMIT is one fetch: the gated-off partitions must not launch"
+        "one row of LIMIT is one fetch: the partitions past it must not launch one"
     );
 
     let top_k = news

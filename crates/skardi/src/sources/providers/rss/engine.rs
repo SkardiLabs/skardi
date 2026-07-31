@@ -1203,10 +1203,21 @@ mod tests {
         assert_eq!(str_col(&row, "last_status"), vec!["error"]);
         assert_eq!(u64_col(&row, "item_count"), vec![None]);
 
-        // The failure armed the TTL, so reading health does not re-poke it.
+        // Negative cache: the failure armed a fuse, so an immediate second
+        // serve does not re-poke the dead feed. Asserted through `serve_feed`
+        // and not `feeds_row` — the latter is synchronous with no `await`, so it
+        // structurally cannot fetch whatever the fuse says, and asserting a
+        // stable request count across it proved nothing.
         let n = server.requests().len();
-        engine.feeds_row("a");
-        assert_eq!(server.requests().len(), n);
+        assert!(
+            engine.serve_feed("a", || true).await.is_none(),
+            "still no window to serve"
+        );
+        assert_eq!(
+            server.requests().len(),
+            n,
+            "the second serve went to the negative cache, not the network"
+        );
     }
 
     #[tokio::test]

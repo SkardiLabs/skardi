@@ -91,15 +91,23 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
     }
 
     // The guard above inspects the *raw* bytes, before the rungs run — cheap,
-    // and enough on its own for a document that was already well-formed
-    // enough to carry a literal `<!DOCTYPE … [` in its input bytes. But a
-    // rung can *produce* one that was not there before: a lowercase
-    // `<!doctype` evades the raw-bytes guard's case-sensitive-in-spirit scan
-    // just as well as a control character splitting `<!DOCTY\x01PE` (which
-    // rung 2 then removes) or a UTF-16 document (which rung 1 then
-    // transcodes) do. Re-running the guard on the sanitized bytes closes all
-    // three: whatever the rungs reveal or produce, this still sees it before
-    // the parse.
+    // and enough on its own for any document whose input bytes already carry a
+    // literal `<!DOCTYPE … [`, in either case: `refuse_internal_dtd` matches the
+    // keyword with `starts_with_ignore_ascii_case` (`sanitize.rs:118`, helper at
+    // `:147`), so a lowercase `<!doctype` is caught there and needs nothing
+    // further. What the raw-bytes pass cannot see is a subset a rung *reveals*:
+    // a control character splitting `<!DOCTY\x01PE` (which rung 2 then removes)
+    // or a UTF-16 document whose ASCII is interleaved with NUL bytes (which rung
+    // 1 then transcodes). Re-running the guard on the sanitized bytes closes
+    // both: whatever the rungs uncover, this still sees it before the parse.
+    //
+    // The earlier pass is therefore defence in depth rather than the only catch
+    // for any document that reaches feed-rs carrying a live subset — by
+    // construction, sanitized bytes that still hold one are caught here. It
+    // earns its place by refusing before three byte-level passes over a body up
+    // to `max_response_bytes`, and it is the only guard that can refuse a
+    // document whose prolog the rungs mangle past recognition (pinned by
+    // `a_mislabelled_utf16_documents_subset_is_refused_before_the_rungs_run`).
     if family == DocFamily::Xml
         && let Err(reason) = refuse_internal_dtd(&current)
     {
@@ -555,9 +563,16 @@ mod tests {
         );
     }
 
-    /// Evasion 1: the guard's `<!DOCTYPE` match used to be case-sensitive, so
-    /// a lowercase `<!doctype` (still a real internal-DTD subset to feed-rs)
-    /// slipped past it.
+    /// A lowercase `<!doctype`, which the guard's match used to miss because it
+    /// was case-sensitive.
+    ///
+    /// Unlike the two numbered evasions below, this input needs no sanitation to
+    /// become visible: the subset is literal in the raw bytes, and
+    /// `starts_with_ignore_ascii_case` (`sanitize.rs:118`, helper at `:147`)
+    /// recognizes the keyword in any case, so the refusal comes from the
+    /// *pre*-sanitation guard and the rungs never run. Grouped with them because
+    /// this spelling once slipped past that guard, not because it needs the
+    /// post-sanitation re-run.
     #[test]
     fn lowercase_doctype_with_internal_subset_is_refused() {
         let doc = br#"<!doctype r [<!ENTITY a "b">]><r>x</r>"#;
@@ -570,7 +585,56 @@ mod tests {
         );
     }
 
-    /// Evasion 2: the guard used to run only on raw bytes, before rung 2
+    /// The pre-sanitation guard is the only one that can refuse this document, so
+    /// deleting it fails a test rather than nothing.
+    ///
+    /// The two cases below are caught by the post-sanitation re-run, and every
+    /// other refusal in this module is caught by *both* passes — sanitized bytes
+    /// that still carry a live subset reach the second guard by construction,
+    /// which is why the first one could be deleted with the suite staying green
+    /// (measured).
+    ///
+    /// This document escapes that symmetry from the other side: it declares
+    /// `utf-16` while carrying a byte that is not valid UTF-8, so rung 1 takes
+    /// its transcoding path and decodes the whole body as UTF-16LE, pairing up
+    /// ASCII bytes into CJK. `<!DOCTYPE r [` is unrecognizable afterwards — the
+    /// second assertion below measures exactly that — so only the raw-bytes pass
+    /// can see it.
+    ///
+    /// Honest about what this is: the mangled bytes hold no DTD for feed-rs to
+    /// expand either, so this shape is not a live entity-expansion threat that
+    /// the early guard alone averts. What it pins is that the refusal happens
+    /// before the rungs, which is the guard's reason to exist (refusing early is
+    /// cheaper than three byte-level passes over a body up to
+    /// `max_response_bytes`) and was otherwise unobservable.
+    #[test]
+    fn a_mislabelled_utf16_documents_subset_is_refused_before_the_rungs_run() {
+        let mut doc =
+            br#"<?xml version="1.0" encoding="utf-16"?><!DOCTYPE r [<!ENTITY a "b">]><r>x"#
+                .to_vec();
+        doc.push(0xFF); // not valid UTF-8, so rung 1 transcodes rather than passing through
+        doc.extend_from_slice(b"</r>");
+
+        let err = parse_with_ladder(&doc).unwrap_err();
+        assert_eq!(err.stage, "refused-internal-dtd");
+        assert!(
+            err.reason.contains("internal DTD subset refused"),
+            "{}",
+            err.reason
+        );
+
+        // And the post-sanitation guard could not have produced that refusal:
+        // after rung 1 there is no `<!DOCTYPE` left to find.
+        let (sanitized, changed) = rung_reencode_utf8(&doc);
+        assert!(changed, "rung 1 must have rewritten the body");
+        assert!(
+            refuse_internal_dtd(&sanitized).is_ok(),
+            "the transcoded body still carries a recognizable subset, so this document \
+             no longer isolates the pre-sanitation guard"
+        );
+    }
+
+    /// Evasion 1: the guard used to run only on raw bytes, before rung 2
     /// strips illegal control characters. `<!DOCTY\x01PE … [` does not match
     /// `<!DOCTYPE` and passes that first check; rung 2 then removes the
     /// control byte, producing a real `<!DOCTYPE … [` — which the
@@ -589,7 +653,7 @@ mod tests {
         );
     }
 
-    /// Evasion 3: a UTF-16LE document's `<!DOCTYPE` is invisible to the
+    /// Evasion 2: a UTF-16LE document's `<!DOCTYPE` is invisible to the
     /// raw-bytes scanner (every ASCII byte is interleaved with a `0x00`);
     /// rung 1 transcodes it to UTF-8, and the post-sanitation guard catches
     /// the doctype rung 1 reveals.
