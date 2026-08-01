@@ -126,7 +126,8 @@ pub const RSS_SURFACE_VERSION: u32 = 1;
 /// machine, the partition-per-feed execution plan — consumes only a
 /// `Vec<ResolvedSubscription>` and never looks at `RssConfig`'s input shape
 /// again. It is a plain data struct with no parsing logic of its own, so
-/// unlike [`opml`] (which requires the `rss` feature for `quick-xml`) it
+/// unlike the `opml` module (which requires the `rss` feature for
+/// `quick-xml`, so a doc link to it would dangle in featureless builds) it
 /// stays nameable in featureless builds — the server and CLI can hold it
 /// in a typed field regardless of which features a given build enables.
 #[derive(Debug, Clone, PartialEq, Eq)]
