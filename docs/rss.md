@@ -3,7 +3,7 @@
 > **Build flag:**
 > ```bash
 > cargo build --release -p skardi-server --features rss
-> cargo run -p skardi-cli --features rss -- query --ctx ctx.yaml --sql "..."
+> skardi query -e "..."   # the CLI is a thin HTTP client; only the server needs the feature
 > ```
 >
 > The whole provider is gated behind the `rss` Cargo feature. Without it, a

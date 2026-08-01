@@ -90,13 +90,17 @@ Expected output:
 ## Starting the Server
 
 ```bash
-cargo run --bin skardi-server --features gguf -- \
+cargo run -p skardi-server --features gguf -- \
   --ctx docs/embeddings/gguf/ctx.yaml \
   --pipeline docs/embeddings/gguf/pipelines/ \
   --port 8080
 ```
 
 ## Running Queries
+
+The `semantic-search-gguf` pipeline loaded above is now reachable either
+directly over HTTP or through the `skardi` CLI (a thin HTTP client — see
+[docs/cli.md](../../cli.md)). Both forms send the same request.
 
 ### Semantic Search
 
@@ -107,6 +111,14 @@ curl -X POST http://localhost:8080/semantic-search-gguf/execute \
     "query": "how does similarity search work in vector databases?",
     "k": 10
   }' | jq .
+```
+
+Equivalent call via the CLI:
+
+```bash
+skardi run semantic-search-gguf \
+  -p query="how does similarity search work in vector databases?" \
+  -p k=10
 ```
 
 **Response**:

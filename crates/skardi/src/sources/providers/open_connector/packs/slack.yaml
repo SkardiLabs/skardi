@@ -1,0 +1,83 @@
+# Slack source pack. Wire contract is Open Connector's NORMALIZED shape
+# (camelCase rows, top-level nextCursor, executor-consumed ok:false),
+# reconciled against a live gateway (v1.3.1); fingerprints are pinned
+# from that capture. Design rationale lives in packs/slack.rs.
+kind: pack
+pack: slack
+version: 1
+
+tables:
+  conversations:
+    action: slack.list_conversations
+    row_path: "$.conversations"
+    fingerprint: 2d4e5cee7cf87f146ab7848849f97a559ba44ff09350295e0dc50b75abf0ef84
+    pagination:
+      strategy: cursor
+      page_size_input: limit
+      cursor_input: cursor
+      next_cursor_path: "$.nextCursor"
+      page_size: 200
+    fixed_inputs:
+      types: [public_channel, private_channel]
+    columns:
+      - { name: id, path: channelId, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: is_private, path: isPrivate, type: boolean, nullable: true }
+      - { name: is_archived, path: isArchived, type: boolean, nullable: true }
+      - { name: is_member, path: isMember, type: boolean, nullable: true }
+      - { name: member_count, path: memberCount, type: uint64, nullable: true }
+      - { name: topic, path: topic, type: utf8, nullable: true }
+      - { name: purpose, path: purpose, type: utf8, nullable: true }
+
+  users:
+    action: slack.list_users
+    row_path: "$.users"
+    fingerprint: 77f3f0f41d30b9095875b1c02d5f93f31b948f4a666fdfc820192348e5e1b18f
+    pagination:
+      strategy: cursor
+      page_size_input: limit
+      cursor_input: cursor
+      next_cursor_path: "$.nextCursor"
+      page_size: 200
+    fixed_inputs:
+      includeLocale: true
+    columns:
+      - { name: id, path: userId, type: utf8, nullable: false }
+      - { name: name, path: username, type: utf8, nullable: true }
+      - { name: real_name, path: realName, type: utf8, nullable: true }
+      - { name: display_name, path: displayName, type: utf8, nullable: true }
+      - { name: is_bot, path: isBot, type: boolean, nullable: true }
+      - { name: is_admin, path: isAdmin, type: boolean, nullable: true }
+      - { name: is_owner, path: isOwner, type: boolean, nullable: true }
+      - { name: deleted, path: isDeleted, type: boolean, nullable: true }
+      - { name: locale, path: locale, type: utf8, nullable: true }
+
+  files:
+    action: slack.list_files
+    row_path: "$.files"
+    fingerprint: 54f3b15b426612c2d0bd0291d2cabb1cbf18c5f5061bce13b53e93fa1bba4ac2
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: count
+      page_size: 100
+      total_pages_path: "$.paging.pages"
+    resources:
+      optional: [channelId]
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: title, path: title, type: utf8, nullable: true }
+      - { name: filetype, path: filetype, type: utf8, nullable: true }
+      - { name: mimetype, path: mimetype, type: utf8, nullable: true }
+      - { name: size, path: size, type: uint64, nullable: true }
+      - { name: user_id, path: user, type: utf8, nullable: true }
+      - { name: channels, path: channels, type: utf8_list, nullable: true }
+      - { name: is_public, path: is_public, type: boolean, nullable: true }
+      - { name: created, path: created, type: timestamp_s_utc, nullable: true }
+      - { name: permalink, path: permalink, type: utf8, nullable: true }
+    filters:
+      # No time filter is pushed: the list_files contract declares no
+      # ts_from-style input and its strict schema would 400 one.
+      - { column: user_id, op: eq, input: userId, fidelity: inexact }

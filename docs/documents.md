@@ -24,18 +24,17 @@
 > When both are set, `pdfium-sys` links the provided library instead of
 > downloading one.
 
-`documents` is a read-only skardi data source that turns a **local directory**
-of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, and images — into queryable
-rows. Each row is one parsed **(file, page)** carrying reconstructed markdown,
-tables, and references to extracted images. It is backed by the pure-Rust
-[`liteparse`](https://github.com/run-llama/liteparse) crate.
+`documents` is a read-only skardi data source that turns a **local directory
+or `s3://` prefix** of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, and
+images — into queryable rows. Each row is one parsed **(file, page)** carrying
+reconstructed markdown, tables, and references to extracted images. It is
+backed by the pure-Rust [`liteparse`](https://github.com/run-llama/liteparse)
+crate.
 
-> **`path` is local-filesystem only in v1.** File discovery walks `path` with
-> `std::fs::read_dir`; there is no object-store listing/read path yet, so an
-> `s3://…` (or `gs://`/`az://`) `path` will register successfully but scan
-> zero files. `image_store` (below) accepts `s3://…` today only in the sense
-> that it *records* the ref — see that row for what "later upload pass" means
-> in practice.
+> **S3 support.** `path` and `image_store` may **each independently** be a
+> local directory or an `s3://bucket/prefix` URI; see [S3 / object
+> store](#s3--object-store) for the credential contract and constraints.
+> Other object-store schemes (`gs://`, `az://`) are not wired yet.
 
 Once registered, `SELECT * FROM documents` behaves like any other table: it is
 joinable in SQL and can be fed to the `llm_extract` UDF over its `markdown`
@@ -47,14 +46,14 @@ shared Rust between the two, only SQL.
 ```yaml
 - name: documents
   type: documents
-  path: /data/pp/inbound         # local directory (the root); recurses by default
+  path: /data/pp/inbound         # local directory or s3://bucket/prefix (the root); recurses by default
   access_mode: read_only
   description: "Supplier source documents"
   options:
     recursive: "true"            # descend subdirectories (default: true)
     include_globs: "*.pdf,*.docx,*.xlsx,*.png,*.jpg"  # default: all supported types
     image_mode: "embedded"       # embedded | placeholder | off (default: off)
-    image_store: "/data/pp/extracted"  # where cropped images are written; s3://… records refs only, see below
+    image_store: "/data/pp/extracted"  # where cropped images are written; local path or s3://bucket/prefix
     ocr: "auto"                  # auto | on | off (default: auto)
     render_page_images: "true"   # render full-page images for page_image_ref
     ocr_server_url: "http://ocr:8080/ocr"  # HTTP OCR engine (see OCR below)
@@ -67,7 +66,7 @@ All keys are optional except `path`.
 | `recursive` | `true` | Descend into subdirectories. |
 | `include_globs` | all supported | Comma-separated `*.ext` globs; only matching files are parsed. |
 | `image_mode` | `off` | `embedded` extracts image bytes; `placeholder` keeps refs only; `off` strips images. |
-| `image_store` | — | Destination for extracted image crops. Local paths are written immediately and are safe to use as-is (including as `llm_extract`'s `image_ref`). Remote (`s3://…`) refs are recorded but **bytes are not uploaded** — no upload pass exists yet — so a remote `image_store` currently produces refs nothing can read. Use a local path until that lands. |
+| `image_store` | — | Destination for extracted image crops — a local path or an `s3://bucket/prefix`. Both backends perform a real write (S3 objects get a `Content-Type` inferred from the extension). Local refs are usable as `llm_extract`'s `image_ref` as-is; `s3://` refs are readable too but **only with `LLM_EXTRACT_IMAGE_FETCH=1`** — see [Image refs and `llm_extract`](#image-refs-and-llm_extract). When both `path` and `image_store` are `s3://`, they must be in the **same bucket** (see [S3 / object store](#s3--object-store)). |
 | `ocr` | `auto` | `auto` OCRs only complex pages (needs `ocr_server_url`); `on` always (requires `ocr_server_url`, else hard error); `off` never. See OCR. |
 | `render_page_images` | `false` | Render each page to a PNG into `image_store` and set `page_image_ref` (needed for multimodal `llm_extract`). |
 | `ocr_server_url` | — | HTTP OCR engine URL. The only way to do OCR in this build (no bundled Tesseract). Mandatory for `ocr: on`. |
@@ -139,19 +138,128 @@ the local Tesseract binary.
 ## Full-page images and multimodal (`render_page_images`)
 
 With `render_page_images: "true"`, every page is rendered to a PNG (via PDFium,
-no external OCR needed), written to `image_store` (a local path is written
-immediately and readable right away; a remote `s3://` URI is recorded but
-**not uploaded** — there is no upload pass yet, so `page_image_ref` would
-point at bytes that don't exist anywhere), and its URI is set on the row's
-`page_image_ref`. Use a local `image_store` until remote upload lands. This
-is what the multimodal
+no external OCR needed), written to `image_store` — local directory or
+`s3://` prefix, both are real writes readable right away — and its URI is set
+on the row's `page_image_ref`. This is what the multimodal
 `llm_extract` escalation consumes (`llm_extract(markdown, page_image_ref, …)`),
 so **`render_page_images` must be enabled (with an `image_store`) for multimodal
 extraction to have an image to escalate to** — otherwise `page_image_ref` is
 `NULL` and only the text path is available.
+
+### Image refs and `llm_extract`
+
+`llm_extract` treats `image_ref` as **untrusted data** (it is a column value, so
+a crafted row could point it anywhere). Fetching is therefore default-deny:
+only inline `data:` URIs resolve unless you set `LLM_EXTRACT_IMAGE_FETCH=1`,
+which enables `http(s)://`, `s3://`, and local-file refs alike.
+
+That means a **local** `image_store` needs `LLM_EXTRACT_IMAGE_FETCH=1` for
+multimodal escalation, and so does an **`s3://`** one:
+
+```bash
+export LLM_EXTRACT_IMAGE_FETCH=1
+```
+
+`s3://` refs are read through the same object-store client and env-only
+credential contract as the connector itself, so the process needs
+`s3:GetObject` on the `image_store` prefix — which is *not* required for
+writing crops, so a least-privilege policy scoped to `PutObject` alone will
+fail here. `s3://` support also requires the `documents` Cargo feature (it owns
+the S3 client); an `s3://` ref in a build without it is refused with a build
+hint rather than being misread as a filesystem path.
 
 ## Error handling
 
 - A single unparseable file is logged (`tracing::warn`) and skipped; the rest of
   the directory still produces rows.
 - An empty or fully-unmatched source returns zero rows, not an error.
+- **Wholesale failure is a hard error:** if the listing is non-empty but *every*
+  matched file fails to fetch/parse (e.g. credentials expired after listing),
+  the scan errors instead of silently returning zero rows that would masquerade
+  as an empty corpus.
+- **Image-write failures are counted, not hidden.** A crop / page-image write
+  that fails is logged and the affected row simply carries no
+  `page_image_ref` / crop ref — but the scan logs an aggregate
+  `N/M image_store write(s) failed` summary, and if *every* write fails the scan
+  errors rather than returning rows that look exactly as if `image_store` were
+  never configured. This is the only guard for a local `image_store` (the
+  registration preflight covers `s3://` targets only) and it catches S3
+  credentials that expire after the preflight.
+
+## Performance and cost
+
+**Every scan re-reads the whole corpus, and every query triggers a scan.**
+There is no caching layer: a `SELECT` against a `documents` table lists the
+source prefix, fetches each matching file, parses it, and — when `image_store`
+and `render_page_images` / `image_mode: embedded` are set — **re-writes the
+image outputs**, overwriting the previous scan's objects. Two identical queries
+do all of that twice.
+
+On a local path this costs CPU and disk I/O. On S3 it also costs money and
+latency, roughly per query:
+
+| Operation | Count per query |
+|---|---|
+| `ListObjectsV2` | 1 per prefix (paged, so more for >1000 keys) |
+| `GetObject` | one per matched file, plus egress if leaving the region |
+| `PutObject` | one per page render + one per extracted crop |
+
+A measured example: a 4-PDF, 9-page corpus took ~7s and ~21 S3 requests per
+query, rewriting 12 objects each time. Scaling that to a few thousand documents
+makes interactive querying impractical and the request bill non-trivial.
+
+Practical mitigations until caching exists:
+
+- Materialize once instead of querying repeatedly — run the scan through a
+  [job](jobs.md) that writes to a table (Parquet/Lance/Postgres), then query
+  that. This is the recommended shape for anything beyond a small corpus.
+- Narrow `include_globs` and point `path` at the tightest prefix that holds
+  the documents you need; both cut the per-query file count directly.
+- Leave `render_page_images` off unless multimodal escalation is actually
+  used — it is the largest contributor to per-query `PutObject` volume
+  (full-page PNGs are far bigger than crops).
+- Keep the bucket in the same region as the server to avoid egress charges on
+  every re-read.
+
+Files are also fetched and parsed **sequentially**, so wall-clock scales
+linearly with corpus size; there is no per-file concurrency yet.
+
+## S3 / object store
+
+`path` and `image_store` may each independently be local or `s3://bucket/prefix`.
+
+**Credentials and region come from the environment, never from config.**
+Putting `aws_access_key_id` / `aws_secret_access_key` / `aws_session_token` /
+`aws_region` in `options` fails registration. Set `AWS_REGION` (or
+`AWS_DEFAULT_REGION`) plus `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+(and `AWS_SESSION_TOKEN` for temporary credentials). Note the S3 client reads
+**environment variables only** — `~/.aws/` profiles are not consulted at
+request time, so if you normally use a profile, export it first:
+
+```bash
+eval "$(aws configure export-credentials --format env)"
+export AWS_REGION=us-east-1
+```
+
+Constraints and behavior:
+
+- **Same bucket when both sides are S3.** An `s3://` `path` with an `s3://`
+  `image_store` in a *different* bucket fails registration — one registered
+  store / region / credential set cannot serve two buckets. Cross-bucket
+  support is a tracked follow-up. Local + S3 combinations are unrestricted.
+- **Registration-time preflight.** Before the source registers, the server
+  checks read connectivity (a prefix-scoped list of `path`; an
+  empty-but-reachable prefix is fine) and, when `image_store` is `s3://`,
+  write access (put + delete of a `.skardi-write-probe` object under the
+  prefix). Missing permissions (`s3:ListBucket`/`s3:GetObject`/`s3:PutObject`),
+  a bad bucket, or missing env config all fail startup with an actionable
+  error instead of surfacing mid-scan.
+- **Prefix scoping.** `s3://bucket/corpus` lists exactly the `corpus/` prefix —
+  a sibling `corpus-2/` never matches.
+- **Self-ingestion guard.** Anything under the `image_store` location is
+  excluded from the scan, so crops written by a previous scan are never
+  re-ingested even when `image_store` nests inside `path` and matches
+  `include_globs`.
+- `doc_id` and `path` are computed from the prefix-relative key with `/`
+  separators, identical to the local backend — moving a corpus between a local
+  directory and S3 keeps ids stable.

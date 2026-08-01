@@ -43,7 +43,7 @@
 **The most agent-friendly backend for builders shipping their first AI agent.** The painful part of agent-building isn't the prompt — it's the data plumbing: a vector DB to stand up, an embedding pipeline to maintain, a chunker to debug, a tool-call wrapper to write for every query. Skardi auto-bootstraps the primitives every agent needs so you ship in hours, not weeks:
 
 - **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag) — Auto-RAG (Retrieval Augmented Generation).** Server-backed hybrid search (vector + full-text + RRF) via `skardi-server` over a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST. One command from a datastore to a working retrieval API your agent calls as a tool — no Python orchestration layer, no glue code.
-- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) — Auto agent knowledge base.** Point it at a directory of documents and you have a queryable, citable local KB one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi grep` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded knowledge base over your files.
+- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) — Auto agent knowledge base.** Point it at a directory of documents and you have a queryable, citable local KB one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi run` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded knowledge base over your files.
 - **Zero bootstrap** — `ctx.yaml`, pipelines, schema, server, all rendered for you by **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Install once and your agent has a working data tool the same hour.
 
 You build the agent. Skardi handles the data plane.
@@ -96,8 +96,8 @@ spec:
 ```
 
 ```bash
-$ skardi grep "turing machines" --limit=10                # shell tool, any Bash-tool agent
-$ curl -X POST :8080/wiki-search-hybrid/execute -d '{...}' # same pipeline, served as REST
+$ skardi run wiki-search-hybrid -p query="turing machines" -p limit=10  # shell tool, any Bash-tool agent
+$ curl -X POST :8080/wiki-search-hybrid/execute -d '{...}'              # same pipeline, served as REST
 ```
 
 That uniformity is also what makes the *durable* reason to put a plane in front possible: **governance**. Once every read and write goes through one engine, three primitives compose on top of it instead of fragmenting across N SDKs:
@@ -120,7 +120,7 @@ For the longer technical read — each primitive's shipped vs. in-progress statu
                   (YAML pipelines)
 ```
 
-- **`skardi` CLI** — run federated SQL or any pipeline directly from a shell. Drop it into Claude Code, Cursor, or any agent with a Bash tool and it's wired with no MCP config.
+- **`skardi` CLI** — a thin HTTP client: send ad-hoc SQL or call any pipeline against a running `skardi-server`, right from a shell. Drop it into Claude Code, Cursor, or any agent with a Bash tool and it's wired with no MCP config.
 - **`skardi-server`** — same engine over HTTP, with two surfaces: **online serving** (a YAML pipeline becomes a parameterized REST endpoint with an inferred request/response schema) and **offline jobs** (async batch writes into Lance or any read-write DB; if a job fails halfway you don't get a corrupted dataset, and every run is logged in a SQLite ledger you can list and inspect).
 - **Skardi-server is stateful but lightweight** — a single Rust process, plus a small SQLite file for the run ledger and (optional) auth. One server can serve many agents; deploy it next to your data, behind your usual auth.
 
@@ -181,14 +181,11 @@ sudo mv skardi /usr/local/bin/
 
 ### First-time agent loop (two minutes)
 
-**Step 1 — ad-hoc SQL, no server, no pre-registration.** The CLI prints results as a pretty-printed table to stdout — see [docs/cli.md](docs/cli.md).
+The CLI is a thin HTTP client — every command below talks to a running
+`skardi-server`, so step 1 is always starting one. See
+[docs/cli.md](docs/cli.md) for the full command reference.
 
-```bash
-skardi query --sql "SELECT * FROM './data/products.csv' LIMIT 10"
-skardi query --sql "SELECT * FROM 's3://mybucket/events.parquet' LIMIT 10"
-```
-
-**Step 2 — register named sources in a `ctx.yaml`.** Five example lines:
+**Step 1 — register named sources in a `ctx.yaml`, and start the server.** Five example lines:
 
 ```yaml
 # ctx.yaml — describes where your data lives. Each entry gets a name you use in SQL.
@@ -209,12 +206,23 @@ spec:
 ```
 
 ```bash
-skardi query --ctx ./ctx.yaml --sql "SELECT * FROM products LIMIT 10"
+cargo run --bin skardi-server -- --ctx ./ctx.yaml --port 8080
 ```
 
-**Step 3 — turn a parameterized SQL into an agent-callable verb.** Two YAMLs from [`demo/llm_wiki/cli/`](demo/llm_wiki/cli/) — the actual files, not pseudo-code:
+**Step 2 — ad-hoc SQL against the running server.** The CLI prints the
+response's `data` array as pretty-printed JSON to stdout by default (pass
+`--table` for an ASCII table) — see [docs/cli.md](docs/cli.md).
 
-> ⚠️ Unlike Steps 1–2 (zero-dependency), this hybrid-search verb also needs a local embedding model at `models/…` + the `sqlite-vec` extension (`SQLITE_VEC_PATH`) and a seeded DB — so it is **not runnable by copy-paste alone**. The [`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) sets all of this up for you; use it if you just want the verb working.
+```bash
+skardi query -e "SELECT * FROM products LIMIT 10"
+skardi query -e "SELECT * FROM products LIMIT 10" --table
+```
+
+**Step 3 — turn a parameterized SQL into an agent-callable pipeline.** One
+YAML from [`demo/llm_wiki/cli/`](demo/llm_wiki/cli/) — the actual file, not
+pseudo-code:
+
+> ⚠️ Unlike Steps 1–2 (zero-dependency), this hybrid-search pipeline also needs a local embedding model at `models/…` + the `sqlite-vec` extension (`SQLITE_VEC_PATH`) and a seeded DB — so it is **not runnable by copy-paste alone**. The [`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) sets all of this up for you; use it if you just want the pipeline working.
 
 ```yaml
 # pipelines/search_hybrid.yaml — declares the SQL once; Skardi infers the params
@@ -239,24 +247,22 @@ spec:
     ORDER BY rrf_score DESC LIMIT {limit}
 ```
 
-```yaml
-# aliases.yaml — gives the pipeline a short shell verb, with positional + default args
-kind: aliases
-spec:
-  grep:
-    pipeline: wiki-search-hybrid
-    positional: [query]
-    defaults: { text_query: "{query}", text_weight: "0.5", vector_weight: "0.5", limit: "10" }
-    description: Hybrid search over the wiki (RRF of sqlite_knn + sqlite_fts)
-```
-
-Now any agent with a shell can call it:
+Restart the server with `--pipeline pipelines/` so it loads this file (see
+[Skardi Server](#skardi-server--online-serving--offline-jobs) below), and
+any agent with a shell can call it by name — no separate alias file, no
+alias-management step:
 
 ```bash
-skardi grep "turing machine computation" --limit=10
+skardi run wiki-search-hybrid \
+  -p query="turing machine computation" \
+  -p text_query="turing machine computation" \
+  -p vector_weight=0.5 -p text_weight=0.5 -p limit=10
 ```
 
-The output your agent sees is the standard Arrow-pretty table on stdout (`+----+--------+ ...`). Over the server (next section), the same pipeline is mounted at `POST /wiki-search-hybrid/execute` — the request body is a JSON object whose keys match the `{...}` placeholders in the SQL (Skardi infers this schema and serves it on `GET /data_source` so the agent can read it). One full cycle:
+The same pipeline is mounted at `POST /wiki-search-hybrid/execute` — the
+request body is a JSON object whose keys match the `{...}` placeholders in
+the SQL (Skardi infers this schema and serves it on `GET /data_source` so
+the agent can read it). One full cycle:
 
 ```bash
 curl -X POST http://localhost:8080/wiki-search-hybrid/execute \
@@ -272,7 +278,7 @@ curl -X POST http://localhost:8080/wiki-search-hybrid/execute \
   "rows": 10, "execution_time_ms": 23 }
 ```
 
-Drop `skardi` into a Claude Code or Cursor session and the agent can already use any pipeline you've declared as a tool via its Bash integration. No MCP config, no separate server — that's the MVP design intent.
+Drop `skardi` into a Claude Code or Cursor session and the agent can already use any pipeline you've declared as a tool via its Bash integration, as long as a `skardi-server` is reachable — no MCP config needed.
 
 ### Skardi Server — online serving + offline jobs
 
@@ -330,8 +336,8 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
-| Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
-| Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories; `documents` feature) | [docs/documents.md](docs/documents.md) |
+| Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), Slack pack (conversations, users, files — [guide](docs/open-connector-slack.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
+| Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories or S3 prefixes; `documents` feature) | [docs/documents.md](docs/documents.md) |
 | RSS / Atom | Read | Yes | RSS 0.9x/1.0/2.0, Atom, JSON Feed subscriptions as `feeds` (health) + `items` (live window); content stored as Markdown, per-feed TTL cache with conditional GETs, per-feed fault isolation, default-deny SSRF egress guard (`rss` feature) | [docs/rss.md](docs/rss.md) |
 
 ---
@@ -442,8 +448,8 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 `3` Online serving (pipelines)
    - [x] Declarative YAML → parameterized REST endpoint with inferred request / response schema
    - [x] Built-in pipeline dashboard
-   - [x] CLI pipeline binding + aliases — `skardi run <pipeline> --param=…` and user-defined verb aliases ([#90](https://github.com/SkardiLabs/skardi/pull/90))
-   - [x] CLI federated SQL — `skardi query` against files, object stores, datalake formats, and databases with no server required
+   - [x] CLI pipeline binding — `skardi run <pipeline> -p name=value` calls any named, server-loaded pipeline directly ([#90](https://github.com/SkardiLabs/skardi/pull/90))
+   - [x] CLI as a thin HTTP client — `skardi query` / `skardi run` send ad-hoc SQL and pipeline calls to a running `skardi-server` over the network; federation across sources happens server-side (see [docs/cli.md](docs/cli.md))
 
 `4` Offline jobs
    - [x] Async batch execution with submit / poll / cancel ([#98](https://github.com/SkardiLabs/skardi/pull/98))
@@ -454,7 +460,7 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 `5` Agent-facing bindings
    - [x] REST — every pipeline served as a parameterized HTTP endpoint
    - [x] Shell — every pipeline runnable as a `skardi` command; works in Claude Code, Cursor, and any agent with a Bash tool
-   - [ ] Skills generator — `skardi skills generate --ctx <ctx.yaml> --out .claude/skills/` emits a skill Markdown per pipeline for Claude Code / Desktop auto-discovery
+   - [ ] Skills generator — `skardi skills generate --server <URL> --out .claude/skills/` emits a skill Markdown per pipeline for Claude Code / Desktop auto-discovery
    - [ ] MCP binding — same pipeline YAML projected to MCP tools for non-Claude hosts
 
 `6` Governance & lineage

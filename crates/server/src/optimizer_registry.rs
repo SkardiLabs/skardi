@@ -120,7 +120,7 @@ impl OptimizerRegistry {
         // Register Open Connector table functions
         if source_types.contains(&DataSourceType::OpenConnector) {
             tracing::info!("Registering Open Connector table functions");
-            register_open_connector_udtfs(ctx, self.open_connector_gateways());
+            register_open_connector_udtfs(ctx, self.open_connector_gateways())?;
             tracing::info!("✓ Registered open_connector_query and open_connector_scan");
         }
 

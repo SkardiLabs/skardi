@@ -28,7 +28,7 @@ chunking = ["dep:text-splitter"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
-documents = ["dep:liteparse", "dep:glob"]
+documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
 # rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
 # reqwest/gzip: the fetcher decodes gzip-compressed feed responses itself
 # (the response-size cap is measured on the decoded stream), which needs the
@@ -137,6 +137,9 @@ encoding_rs = { version = "0.8", optional = true }
 htmd = { version = "0.5.5", optional = true }
 # RSS 0.9x/1.0/2.0, Atom, and JSON Feed parsing into one model.
 feed-rs = { version = "2.4", optional = true }
+# object-store (S3/GCS/Azure) backend for the documents connector's source `path`
+# and `image_store`. Only the `aws` scheme is wired in v1 (see blob.rs).
+object_store = { workspace = true, optional = true }
 secrecy = "0.10"
 pgvector = { version = "0.4", features = ["sqlx"] }
 sqlx = { workspace = true }
@@ -150,3 +153,7 @@ tokio-test = "0.4"
 tempfile = { workspace = true }
 redis-test = "0.13.0"
 gguf-rs-lib = "0.2"
+# Seeding / cleaning object-store fixtures in the opt-in `documents_s3_live`
+# integration test (it drives S3 directly, not through the connector).
+object_store = { workspace = true }
+futures = { workspace = true }

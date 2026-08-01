@@ -1,0 +1,44 @@
+{
+  "files": [
+    {
+      "id": "F0001",
+      "fileId": "F0001",
+      "created": 1735689600,
+      "name": "roadmap.pdf",
+      "title": "2026 Roadmap",
+      "mimetype": "application/pdf",
+      "filetype": "pdf",
+      "user": "U0001",
+      "size": 204800,
+      "is_public": true,
+      "channels": ["C0001", "C0002"],
+      "permalink": "https://acme.slack.example/files/U0001/F0001/roadmap.pdf",
+      "urlPrivate": "https://files.slack.example/files-pri/T0001-F0001/roadmap.pdf"
+    },
+    {
+      "id": "F0002",
+      "fileId": "F0002",
+      "created": 1735776000,
+      "name": "notes.txt",
+      "mimetype": "text/plain",
+      "filetype": "text",
+      "user": "U0002",
+      "size": 512,
+      "is_public": false,
+      "channels": [],
+      "permalink": "https://acme.slack.example/files/U0002/F0002/notes.txt",
+      "urlPrivate": "https://files.slack.example/files-pri/T0001-F0002/notes.txt"
+    },
+    {
+      "id": "F0003",
+      "fileId": "F0003",
+      "created": 1704067200,
+      "name": "logo.png",
+      "title": "Logo",
+      "filetype": "png",
+      "user": "U0001",
+      "channels": ["C0001"]
+    }
+  ],
+  "paging": { "count": 100, "total": 3, "page": 1, "pages": 1 }
+}

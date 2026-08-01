@@ -2,11 +2,11 @@
 
 A durable, editable wiki for an LLM agent, built entirely on Skardi
 primitives: every agent verb (`write`, `open`, `grep`, `ls`, `log`) is one
-pipeline YAML plus a CLI alias, and the whole thing runs on `candle()`
-inline embeddings, `pg_knn` / `sqlite_knn`, `pg_fts` / `sqlite_fts`, and RRF
-hybrid search — all in the same SQL. The demo shows what **full data
-autonomy** looks like for an agent: it curates a compounding knowledge base
-itself, with no external orchestration code.
+pipeline YAML, invoked with `skardi run <pipeline-name>`, and the whole
+thing runs on `candle()` inline embeddings, `pg_knn` / `sqlite_knn`,
+`pg_fts` / `sqlite_fts`, and RRF hybrid search — all in the same SQL. The
+demo shows what **full data autonomy** looks like for an agent: it curates
+a compounding knowledge base itself, with no external orchestration code.
 
 Two flavours ship side by side:
 
@@ -15,10 +15,12 @@ Two flavours ship side by side:
   somewhere else (Claude Desktop, a web backend, a managed runtime) and
   talks to skardi across the wire.
 - **CLI / SQLite + `sqlite-vec` + FTS5** — the "drop into any agent" shape:
-  same pipeline YAMLs, but invoked as `skardi <verb>` shell commands with
-  no server, no Docker, no HTTP. This is the MVP story — any agent with a
-  Bash tool (Claude Code, Cursor, custom loops) gets the full wiki loop
-  locally in a few minutes.
+  same pipeline YAMLs, but invoked as `skardi run wiki-<verb>` commands
+  against a `skardi-server` running locally over SQLite — no Docker, no
+  Postgres. `skardi` itself is a thin HTTP client with no query engine of
+  its own (see [docs/cli.md](../../docs/cli.md)), so this flavour still
+  needs a `skardi-server` process, just one you start and forget on your
+  own machine in a few minutes.
 
 Both flavours use the **same pipeline YAML format**, because the whole point
 of the Skardi design is that one declaration is every agent-facing surface:
@@ -393,14 +395,16 @@ pkill -f skardi-server
 
 ---
 
-## CLI version — `skardi-cli` + SQLite + `sqlite-vec` + FTS5
+## CLI version — `skardi` + local `skardi-server` + SQLite + `sqlite-vec` + FTS5
 
-The same wiki primitives (`create`, `update`, `get`, `grep`, `ls`) run end-to-end
-through `skardi` — **no server, no Docker, no HTTP**. Each primitive is a
-pipeline YAML under [cli/pipelines/](cli/pipelines/) (same format as the server
-pipelines) and is invoked through a short verb alias defined in
-[cli/aliases.yaml](cli/aliases.yaml): `skardi grep "..."`, `skardi ls`,
-`skardi open <slug>`, `skardi write --slug=... --title=...`, etc.
+The same wiki primitives (`create`, `get`, `grep`, `ls`, `log`, plus an edit
+workflow built from `delete` + `create`) run through `skardi` talking to a
+`skardi-server` running locally over SQLite — **no Docker, no Postgres**.
+Each primitive is a pipeline YAML under [cli/pipelines/](cli/pipelines/)
+(same format as the server pipelines) and is invoked directly by its
+pipeline name: `skardi run wiki-search-hybrid -p query="..."`,
+`skardi run wiki-list`, `skardi run wiki-get -p slug=<slug>`,
+`skardi run wiki-create -p slug=... -p title=...`, etc.
 
 A regular `wiki_pages` table holds canonical state (slug, title, page_type,
 content, embedding); `AFTER INSERT` / `AFTER UPDATE` triggers fan rows out to
@@ -410,15 +414,19 @@ KNN, so a single `INSERT` (or `UPDATE`) keeps content and embedding in sync.
 Embeddings are computed inline by the `candle()` UDF (same model as the server
 version).
 
-### 1. Install the CLI with embedding support
+### 1. Install the CLI
 
 ```bash
-cargo install --locked --path crates/cli --features candle
+cargo install --locked --path crates/cli
 ```
 
 `--locked` makes cargo honor the checked-in `Cargo.lock` instead of
 re-resolving transitive deps, which can otherwise pull a newer crate whose
 MSRV is higher than your toolchain.
+
+The CLI itself builds featureless — it's a thin HTTP client with no query
+engine of its own. Embedding support (`candle`) is a `skardi-server`
+feature, enabled when you start the server in step 5 below.
 
 ### 2. Get the `sqlite-vec` extension
 
@@ -468,8 +476,8 @@ To explore the demo with non-empty data, [seed.py](seed.py) splits the
 markdown files in [`data/test_corpus/`](../../data/test_corpus/) (Alice in
 Wonderland, Jane Eyre, The Art of War) into ~110 paragraph-sized pages,
 computes a real `bge-small-en-v1.5` embedding for each one in Python, and
-INSERTs them through the same triggers — so `skardi grep` and `skardi ls`
-work end-to-end without writing a page yourself.
+INSERTs them through the same triggers — so `skardi run wiki-search-hybrid`
+and `skardi run wiki-list` work end-to-end without writing a page yourself.
 
 ```bash
 pip install transformers torch
@@ -477,24 +485,28 @@ python demo/llm_wiki/seed.py
 ```
 
 Embeddings use CLS pooling + L2 normalization, matching what the `candle()`
-UDF produces, so seeded pages and pages later written via `skardi write`
-share the same vector space. Pages are tagged by source (`page_type =
-alice | jane-eyre | art-of-war`) so `skardi ls --page_type_pattern=alice`
+UDF produces, so seeded pages and pages later written via
+`skardi run wiki-create` share the same vector space. Pages are tagged by
+source (`page_type = alice | jane-eyre | art-of-war`) so
+`skardi run wiki-list -p page_type_pattern=alice -p slug_prefix=% -p limit=100`
 shows only Alice excerpts.
 
 Re-running `seed.py` on an already-seeded DB will fail on the
 `UNIQUE(slug)` constraint — re-run `setup.py` first to drop and recreate.
 
-### 5. Config layout
+### 5. Start `skardi-server` for the CLI flavour
 
-Everything the CLI needs for the demo lives under [cli/](cli/):
+Everything the demo needs is under [cli/](cli/):
 
 ```
 demo/llm_wiki/cli/
   ctx.yaml        # registers wiki.db as a SQLite catalog data source
-  aliases.yaml    # short verbs → pipeline bindings
   pipelines/      # pipeline YAMLs (one per verb)
 ```
+
+(`cli/aliases.yaml` also still sits in that directory but is no longer
+read by anything — the CLI's alias system was removed, and each pipeline's
+`metadata.name` is now called directly.)
 
 [cli/ctx.yaml](cli/ctx.yaml) registers one SQLite source in `catalog` mode,
 which auto-discovers every table, loads `sqlite-vec` once on the shared
@@ -505,7 +517,7 @@ both SQL and `sqlite_knn` / `sqlite_fts` lookups:
 kind: context
 
 metadata:
-  name: example-context
+  name: cli-context
   version: 1.0.0
 
 spec:
@@ -523,56 +535,60 @@ The pipeline YAMLs in [cli/pipelines/](cli/pipelines/) use the same
 `metadata` + `query` shape as the server pipelines, with `{param}`
 placeholders for named parameters — just targeting the SQLite stack
 (`sqlite_knn` / `sqlite_fts` / `vec_to_binary(candle(...))`) instead of
-`pg_knn` / `pg_fts`. Verb → pipeline bindings live in
-[cli/aliases.yaml](cli/aliases.yaml).
+`pg_knn` / `pg_fts`.
 
-**Export the config dir once** so the verbs below don't need `--ctx` on
-every line. `SKARDICONFIG` accepts either a config directory (which the CLI
-looks inside for `ctx.yaml`, `aliases.yaml`, and `pipelines/`) or an
-individual ctx file. `--ctx PATH` still works and takes precedence:
+Start a `skardi-server` pointed at this ctx and pipeline directory. Use a
+different `--port` from the Postgres flavour above so both can run at once
+if you want to compare them; `SQLITE_VEC_PATH` must still be set in the
+shell that starts the server, since it's the server process that now opens
+`wiki.db` and loads the extension:
 
 ```bash
-export SKARDICONFIG=demo/llm_wiki/cli
+cargo run -p skardi-server --features candle -- \
+  --ctx demo/llm_wiki/cli/ctx.yaml \
+  --pipeline demo/llm_wiki/cli/pipelines/ \
+  --port 8081
 ```
 
-### 6. Set up aliases (bundled for this demo)
-
-The demo ships with [cli/aliases.yaml](cli/aliases.yaml) pre-populated so
-the verbs below just work. You can add more aliases yourself — each alias
-maps a short verb to a pipeline plus positional/default param bindings:
+Point the CLI at it once so the commands below don't need `--server` on
+every line:
 
 ```bash
-# Example: a `today` alias that lists only today's pages
-skardi alias add today \
-  --pipeline wiki-list \
-  --default 'page_type_pattern=%' \
-  --default 'slug_prefix=%' \
-  --default 'limit=20' \
-  --description "List the 20 most recently-touched pages"
-
-skardi alias list
-skardi alias show grep
-skardi alias remove today
+export SKARDI_SERVER_URL=http://127.0.0.1:8081
 ```
 
-Alias files resolve in this order: `--aliases <path>` → `SKARDI_ALIASES`
-env → `aliases.yaml` next to the active ctx file →
-`~/.skardi/config/aliases.yaml`.
+### 6. Discover the pipelines
 
-### 7. `write` — create a new page
+There's no alias layer to set up anymore — every pipeline is called
+directly by its `metadata.name`. List and inspect what the server loaded:
 
 ```bash
-skardi write \
-  --slug=entity/alan-turing \
-  --title="Alan Turing" \
-  --page_type=entity \
-  --content='# Alan Turing
+skardi pipeline list
+skardi pipeline show wiki-search-hybrid
+```
+
+If you want a shorter verb for one you type constantly, an ordinary shell
+alias works fine and needs nothing from skardi itself:
+
+```bash
+alias wiki-grep='skardi run wiki-search-hybrid -p'
+# wiki-grep query="white rabbit" -p text_query="white rabbit" -p vector_weight=0.5 -p text_weight=0.5 -p limit=5
+```
+
+### 7. `wiki-create` — create a new page
+
+```bash
+skardi run wiki-create \
+  -p slug=entity/alan-turing \
+  -p title="Alan Turing" \
+  -p page_type=entity \
+  -p content='# Alan Turing
 
 British mathematician and logician who formalized the concepts of algorithm and computation with the Turing machine.'
 ```
 
-The `write` alias invokes [cli/pipelines/create.yaml](cli/pipelines/create.yaml),
-which computes the embedding inline with `candle()`, packs it with
+`wiki-create` ([cli/pipelines/create.yaml](cli/pipelines/create.yaml))
+computes the embedding inline with `candle()`, packs it with
 `vec_to_binary()`, and INSERTs the row. The `AFTER INSERT` trigger then
 mirrors the row to `wiki_pages_fts` and `wiki_pages_vec` atomically.
 
@@ -584,54 +600,60 @@ mirrors the row to `wiki_pages_fts` and `wiki_pages_vec` atomically.
 > `vec_to_binary(candle(...))`. The SELECT-wrapper keeps the subquery's own
 > schema in scope so the projection lands the row at full width.
 
-### 7b. `bulk-write` — seed many pages from one long markdown doc
+### 7b. `wiki-bulk-create` — seed many pages from one long markdown doc
 
-`write` is for hand-curated pages. To seed a long document — a chapter,
-an RFC, a transcript — `bulk-write` chunks the body inline with
-[`chunk('markdown', …)`](../../docs/chunk.md), embeds each chunk with
-`candle()`, and inserts one page per chunk. Each call goes through the
-same `AFTER INSERT` trigger as `write`, so the resulting pages are
-immediately searchable via `skardi grep`.
+`wiki-create` is for hand-curated pages, one per call. To seed a long
+document — a chapter, an RFC, a transcript — `wiki-bulk-create` chunks the
+body inline with [`chunk('markdown', …)`](../../docs/chunk.md), embeds each
+chunk with `candle()`, and inserts one page per chunk. Each call goes
+through the same `AFTER INSERT` trigger as `wiki-create`, so the resulting
+pages are immediately searchable via `wiki-search-hybrid`.
 
 ```bash
-skardi bulk-write \
-  --slug_prefix=rfc/9110 \
-  --title="RFC 9110: HTTP Semantics" \
-  --page_type=rfc \
-  --content="$(cat rfc9110.md)"
+skardi run wiki-bulk-create \
+  -p slug_prefix=rfc/9110 \
+  -p title="RFC 9110: HTTP Semantics" \
+  -p page_type=rfc \
+  -p content="$(cat rfc9110.md)"
 ```
 
 Override the chunk shape on the same line:
 
 ```bash
-skardi bulk-write \
-  --slug_prefix=alice/ch1 \
-  --title="Alice in Wonderland — Chapter 1" \
-  --page_type=alice \
-  --content="$(cat data/test_corpus/alice_sample.md)" \
-  --chunk_size=400 --overlap=80
+skardi run wiki-bulk-create \
+  -p slug_prefix=alice/ch1 \
+  -p title="Alice in Wonderland — Chapter 1" \
+  -p page_type=alice \
+  -p content="$(cat data/test_corpus/alice_sample.md)" \
+  -p chunk_size=400 -p overlap=80
 ```
 
 Synthesised slugs follow `{slug_prefix}/p<NNN>` (`rfc/9110/p001`,
 `/p002`, …) and titles get a `#N` suffix so each chunk is a distinct
-page visible to `skardi ls` and `skardi grep`. Per-page edits stay on
-`rm` + `write` (or direct UPDATE against SQLite) — `bulk-write` is a
-one-shot seeder, not a re-runnable upsert. Re-running it on the same
-slug prefix will fail on the `UNIQUE(slug)` constraint.
+page visible to `wiki-list` and `wiki-search-hybrid`. Per-page edits stay on
+`wiki-delete` + `wiki-create` (or direct UPDATE against SQLite) —
+`wiki-bulk-create` is a one-shot seeder, not a re-runnable upsert.
+Re-running it on the same slug prefix will fail on the `UNIQUE(slug)`
+constraint.
 
 This is the same flow [seed.py](seed.py) implements in Python today,
 but in pure SQL: `chunk('markdown', body, ...)` replaces the manual
 paragraph splitter and `candle()` replaces the Python embedding step.
-Seeding a fresh corpus needs only `setup.py` + `bulk-write` calls —
+Seeding a fresh corpus needs only `setup.py` + `wiki-bulk-create` calls —
 no Python embedding loop.
 
-Install the CLI with the RAG umbrella (bundles embedding UDFs + `chunk`):
+`wiki-bulk-create` calls `chunk()` in addition to `candle()`, so start the
+server with the `rag` feature umbrella (bundles `embedding` + `chunking`)
+instead of just `candle` if you want to use it:
 
 ```bash
-cargo install --locked --path crates/cli --features rag
+cargo run -p skardi-server --features rag -- \
+  --ctx demo/llm_wiki/cli/ctx.yaml \
+  --pipeline demo/llm_wiki/cli/pipelines/ \
+  --port 8081
 ```
 
-### 8. Edit an existing page (`rm` + `write`)
+### 8. Edit an existing page (`wiki-delete` + `wiki-create`)
 
 DataFusion's UPDATE planner unparses each `SET` expression back to SQL for
 the underlying SQLite connection to execute, and it can't currently render a
@@ -641,13 +663,13 @@ as a SQL literal. The portable workaround is **delete + re-insert** — the
 repopulates them, and the new row picks up a fresh `updated_at`.
 
 ```bash
-skardi rm entity/alan-turing
+skardi run wiki-delete -p slug=entity/alan-turing
 
-skardi write \
-  --slug=entity/alan-turing \
-  --title="Alan Turing" \
-  --page_type=entity \
-  --content='# Alan Turing
+skardi run wiki-create \
+  -p slug=entity/alan-turing \
+  -p title="Alan Turing" \
+  -p page_type=entity \
+  -p content='# Alan Turing
 
 British mathematician, logician, and cryptanalyst who broke the Enigma cipher at Bletchley Park.'
 ```
@@ -655,80 +677,94 @@ British mathematician, logician, and cryptanalyst who broke the Enigma cipher at
 If you'd rather edit the row in place from a SQLite client (e.g. `sqlite3`),
 the original `AFTER UPDATE` trigger is still installed and will refresh both
 mirrors when an `UPDATE wiki_pages SET ...` runs against the underlying
-database directly — only the DataFusion path needs the delete-and-reinsert
+database directly — only the `skardi run` path needs the delete-and-reinsert
 dance.
 
-### 9. `open` — fetch one page by slug
+### 9. `wiki-get` — fetch one page by slug
 
 If you ran the optional seed step in 4b, every paragraph in the corpus is
 already a page. The opening of *Alice in Wonderland* is at
 `alice/chapter-i-down-the-rabbit-hole/p001`:
 
 ```bash
-skardi open alice/chapter-i-down-the-rabbit-hole/p001
+skardi run wiki-get -p slug=alice/chapter-i-down-the-rabbit-hole/p001
 ```
 
 Under the hood this runs [cli/pipelines/get.yaml](cli/pipelines/get.yaml):
 `SELECT slug, title, page_type, content, updated_at FROM wiki.main.wiki_pages WHERE slug = {slug}`.
 
-### 10. `grep` — hybrid search (RRF over FTS + vector)
+### 10. `wiki-search-hybrid` — hybrid search (RRF over FTS + vector)
 
-A single positional arg drives both halves of the RRF merge — semantic
-nearest-neighbour over `sqlite_knn` and BM25 over `sqlite_fts`:
+Both halves of the RRF merge come from the same call — semantic
+nearest-neighbour over `sqlite_knn` and BM25 over `sqlite_fts`. Unlike the
+old alias, `query` and `text_query` are independent params you set
+explicitly on every call:
 
 ```bash
 # Pure semantic intent — finds the rabbit-hole paragraphs in Alice ch.1
-skardi grep "white rabbit pocket watch" --limit=5
+skardi run wiki-search-hybrid \
+  -p query="white rabbit pocket watch" \
+  -p text_query="white rabbit pocket watch" \
+  -p vector_weight=0.5 -p text_weight=0.5 -p limit=5
 
 # Same query crosses corpora — top hits mix Alice and Jane Eyre
-skardi grep "young girl sent away to her room" --limit=5
+skardi run wiki-search-hybrid \
+  -p query="young girl sent away to her room" \
+  -p text_query="young girl sent away to her room" \
+  -p vector_weight=0.5 -p text_weight=0.5 -p limit=5
 ```
 
-The positional arg binds to both `{query}` (embedded with `candle()` for
-`sqlite_knn`) and `{text_query}` (via the `text_query: "{query}"` default in
-the alias). Override either independently — useful when you want a loose
+Set `query` and `text_query` to different strings when you want a loose
 semantic intent paired with strict keyword filters:
 
 ```bash
-skardi grep "Sun Tzu" \
-  --text_query="strategy OR victory OR planning" \
-  --vector_weight=0.3 --text_weight=0.7 --limit=5
+skardi run wiki-search-hybrid \
+  -p query="Sun Tzu" \
+  -p text_query="strategy OR victory OR planning" \
+  -p vector_weight=0.3 -p text_weight=0.7 -p limit=5
 ```
 
 See [cli/pipelines/search_hybrid.yaml](cli/pipelines/search_hybrid.yaml) for
-the full RRF merge. Run `skardi grep --help` to see every param the alias
-exposes and where each value comes from.
+the full RRF merge, or run `skardi pipeline show wiki-search-hybrid` to see
+every parameter it expects.
 
-### 11. `ls` — browse by type or slug prefix
+### 11. `wiki-list` — browse by type or slug prefix
 
 ```bash
-skardi ls
+skardi run wiki-list -p page_type_pattern=% -p slug_prefix=% -p limit=100
 
 # All Alice excerpts (page_type tags pages by source after seeding)
-skardi ls --page_type_pattern=alice
+skardi run wiki-list -p page_type_pattern=alice -p slug_prefix=% -p limit=100
 
 # Just one chapter
-skardi ls --slug_prefix='art-of-war/chapter-i-laying-plans/%'
+skardi run wiki-list -p page_type_pattern=% \
+  -p slug_prefix='art-of-war/chapter-i-laying-plans/%' -p limit=100
 ```
 
-### 12. `log` — append an activity entry
+### 12. `wiki-log-append` — append an activity entry
 
 ```bash
-skardi log \
-  --event_type=ingest \
-  --slug=entity/alan-turing \
-  --message="Created from Wikipedia article."
+skardi run wiki-log-append \
+  -p event_type=ingest \
+  -p slug=entity/alan-turing \
+  -p message="Created from Wikipedia article."
 ```
 
 ### Falling back to raw SQL
 
-`skardi run` and the aliases above are a thin layer over the pipeline YAMLs.
-The underlying queries are still plain SQL — if you want to experiment
-ad-hoc, `skardi query --sql "..."` works just as before (same exported
-`SKARDICONFIG`).
+`skardi run` is a thin layer over the pipeline YAMLs — the underlying
+queries are still plain SQL against the `wiki` source registered in
+[cli/ctx.yaml](cli/ctx.yaml). If you want to experiment ad-hoc, `skardi
+query` sends any SQL straight to the same server (same exported
+`SKARDI_SERVER_URL` from step 5):
+
+```bash
+skardi query -e "SELECT slug, title, page_type FROM wiki.main.wiki_pages ORDER BY updated_at DESC LIMIT 10" --table
+```
 
 ### Cleanup
 
 ```bash
+pkill -f skardi-server   # or Ctrl-C the shell it's running in
 rm demo/llm_wiki/wiki.db
 ```

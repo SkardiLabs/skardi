@@ -107,15 +107,28 @@ impl GatewayHandle {
 pub type OpenConnectorGateways = Arc<RwLock<HashMap<String, Arc<GatewayHandle>>>>;
 
 /// Register `open_connector_query` and `open_connector_scan` on a session.
-pub fn register_open_connector_udtfs(ctx: &SessionContext, gateways: OpenConnectorGateways) {
+///
+/// # Errors
+/// [`OpenConnectorError::SourcePackAssetInvalid`] when an embedded pack
+/// asset fails to parse or validate — surfaced here, at setup, instead of
+/// on first use.
+pub fn register_open_connector_udtfs(
+    ctx: &SessionContext,
+    gateways: OpenConnectorGateways,
+) -> Result<(), OpenConnectorError> {
+    let packs = SourcePackRegistry::builtins()?;
     ctx.register_udtf(
         "open_connector_query",
-        Arc::new(OpenConnectorQueryFunction::new(Arc::clone(&gateways))),
+        Arc::new(OpenConnectorQueryFunction::new(
+            Arc::clone(&gateways),
+            packs,
+        )),
     );
     ctx.register_udtf(
         "open_connector_scan",
         Arc::new(OpenConnectorScanFunction::new(gateways)),
     );
+    Ok(())
 }
 
 /// `open_connector_query('gateway', 'pack.table', '{resource json}'[, 'alias'])`.
@@ -126,12 +139,10 @@ pub struct OpenConnectorQueryFunction {
 }
 
 impl OpenConnectorQueryFunction {
-    /// Build the function over the shared gateway map.
-    pub fn new(gateways: OpenConnectorGateways) -> Self {
-        Self {
-            gateways,
-            packs: SourcePackRegistry::builtins(),
-        }
+    /// Build the function over the shared gateway map and a validated
+    /// pack registry (see [`SourcePackRegistry::builtins`]).
+    pub fn new(gateways: OpenConnectorGateways, packs: SourcePackRegistry) -> Self {
+        Self { gateways, packs }
     }
 }
 
@@ -311,6 +322,7 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 table_id: Arc::from(format!("raw:{action_id}")),
                 action_id: Arc::from(action_id),
                 pagination: PaginationStrategy::SinglePage,
+                error_path: None,
                 fixed_inputs: &[],
                 source_pack_version: 0,
             },
@@ -591,7 +603,7 @@ raw_action_allowlist:
         unsafe {
             std::env::remove_var(token_env);
         }
-        register_open_connector_udtfs(&ctx, gateways);
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         ctx
     }
 

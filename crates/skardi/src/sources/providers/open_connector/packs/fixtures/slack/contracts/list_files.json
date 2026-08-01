@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "properties": {
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "fileId": {
+            "type": "string",
+            "description": "The Slack file ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "The file name."
+          },
+          "title": {
+            "type": "string",
+            "description": "The file title."
+          },
+          "mimetype": {
+            "type": "string",
+            "description": "The file MIME type."
+          },
+          "urlPrivate": {
+            "type": "string",
+            "description": "The private Slack URL for the file when returned."
+          }
+        },
+        "additionalProperties": true,
+        "description": "A Slack file object returned by the Web API."
+      },
+      "description": "The Slack files returned by Slack."
+    },
+    "paging": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Slack paging metadata when returned."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "files",
+    "paging"
+  ],
+  "description": "The output payload for this action."
+}

@@ -1,0 +1,37 @@
+{
+  "conversations": [
+    {
+      "channelId": "C0001",
+      "name": "general",
+      "type": "public_channel",
+      "isArchived": false,
+      "isPrivate": false,
+      "isMember": true,
+      "memberCount": 42,
+      "topic": "Company-wide announcements",
+      "purpose": "This channel is for workspace-wide communication."
+    },
+    {
+      "channelId": "C0002",
+      "name": "eng-private",
+      "type": "private_channel",
+      "isArchived": false,
+      "isPrivate": true,
+      "isMember": true,
+      "topic": "",
+      "purpose": null
+    },
+    {
+      "channelId": "C0003",
+      "name": "old-project",
+      "type": "public_channel",
+      "isArchived": true,
+      "isPrivate": false,
+      "isMember": null,
+      "memberCount": 0,
+      "topic": "Archived 2025",
+      "purpose": ""
+    }
+  ],
+  "nextCursor": null
+}

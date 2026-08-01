@@ -554,8 +554,79 @@ jobs:
           # NULL-bearing row: no `category` attribute, exercising NULL handling.
           put '{"product_id":{"S":"PROD005"},"name":{"S":"Desk Chair"},"price":{"N":"199.99"},"in_stock":{"BOOL":true}}'
 
+      - name: Start skardi-server for CLI e2e smoke tests
+        run: |
+          # The CLI's #[ignore] e2e_smoke tests are integration tests whose
+          # backing service is skardi-server itself; they hit the default
+          # http://127.0.0.1:8080 (no ctx/pipelines needed). The nextest step
+          # above already compiled the server binary into the llvm-cov
+          # target dir, so this starts without rebuilding.
+          ./target/llvm-cov-target/debug/skardi-server --port 8080 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8080/health >/dev/null && exit 0
+            sleep 1
+          done
+          echo "skardi-server failed to become healthy" >&2
+          exit 1
+
       - name: Execute Integration tests
         run: cargo llvm-cov --no-report nextest --all-features -- --ignored
+
+      # MinIO gives the `documents` connector's object-store path real S3
+      # coverage without needing an AWS account or credentials in CI. Started
+      # with `docker run` rather than a `services:` entry because service
+      # containers cannot override the image command, and the MinIO image needs
+      # `server /data`.
+      - name: Start MinIO for documents S3 tests
+        run: |
+          docker run -d --name skardi-minio \
+            -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=skardiminio \
+            -e MINIO_ROOT_PASSWORD=skardiminio123 \
+            quay.io/minio/minio server /data
+          # The image has no shell tooling for a container healthcheck, so poll
+          # readiness from the runner (same approach as DynamoDB Local above).
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              echo "minio ready after ${i}s"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "minio failed to become ready"
+              docker logs skardi-minio
+              exit 1
+            fi
+            sleep 1
+          done
+          AWS_ACCESS_KEY_ID=skardiminio AWS_SECRET_ACCESS_KEY=skardiminio123 \
+            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://skardi-ci-documents
+
+      # These are `#[ignore]`d and skip themselves unless DOCUMENTS_S3_LIVE=1, so
+      # the step above's credentials are what actually arms them. Set at step
+      # scope, not job scope: the job-level AWS_* values are the `dummy`
+      # placeholders DynamoDB Local expects, and MinIO rejects a root password
+      # shorter than 8 characters.
+      - name: Execute documents S3 live tests against MinIO
+        env:
+          DOCUMENTS_S3_LIVE: "1"
+          DOCUMENTS_S3_BUCKET: skardi-ci-documents
+          # `AmazonS3Builder::from_env()` honours both of these, so the real S3
+          # HTTP client path is exercised, not a stub.
+          AWS_ENDPOINT: http://127.0.0.1:9000
+          AWS_ALLOW_HTTP: "true"
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: skardiminio
+          AWS_SECRET_ACCESS_KEY: skardiminio123
+        # `--no-tests=fail` is explicit rather than relying on the current
+        # default: if these tests are ever renamed out of the filter's reach, the
+        # step must fail loudly instead of reporting success having run nothing.
+        run: |
+          cargo llvm-cov --no-report nextest --all-features \
+            -E 'test(/live_s3_/)' --no-tests=fail -- --ignored
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f skardi-minio || true
 
       - name: Generate coverage report (lcov)
         run: cargo llvm-cov report --lcov --output-path lcov.info

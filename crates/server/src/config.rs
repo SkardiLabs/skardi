@@ -1695,6 +1695,29 @@ async fn register_data_source(
                         path: source.path.clone(),
                     })?;
 
+                // S3 registration checks (no-op when both `path` and
+                // `image_store` are local): reject credentials in config, enforce
+                // the same-bucket constraint, then verify read connectivity and
+                // image_store writability up front.
+                let image_store = source
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.get("image_store"))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let s3 = crate::remote_storage::S3Storage::new();
+                s3.validate_documents_configuration(path_str, image_store.as_deref(), source)
+                    .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: e.to_string(),
+                    })?;
+                s3.preflight_documents_s3(path_str, image_store.as_deref(), &source.name)
+                    .await
+                    .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                        name: source.name.clone(),
+                        error: e.to_string(),
+                    })?;
+
                 skardi::sources::providers::documents::register_documents_tables(
                     session_ctx,
                     &source.name,

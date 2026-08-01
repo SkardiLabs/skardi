@@ -29,6 +29,31 @@ pub enum Fidelity {
     Inexact,
 }
 
+/// How a mapping's literal renders into the provider input. Timestamps are
+/// the polymorphic case: JSON has no timestamp type and providers disagree
+/// — GitHub's `since` takes RFC 3339, Slack-style inputs take epoch
+/// seconds. Making the format part of the mapping keeps a future pack from
+/// silently sending the wrong spelling. Non-timestamp scalars render
+/// identically under every format, so `Verbatim` exists to *say* that no
+/// timestamp spelling applies rather than lean on that coincidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueFormat {
+    /// The literal's natural JSON rendering, for non-timestamp inputs
+    /// (strings, numbers, booleans). A timestamp literal reaching a
+    /// Verbatim mapping does NOT translate — the mapping never declared a
+    /// timestamp spelling, and guessing one risks sending the wrong
+    /// format, so the predicate stays local instead.
+    Verbatim,
+    /// Timestamps render as RFC 3339 UTC strings (`2026-01-01T00:00:00Z`).
+    Rfc3339,
+    /// Timestamps render as whole epoch seconds, flooring sub-second
+    /// precision. Flooring widens a *lower* bound (a superset — safe under
+    /// [`Fidelity::Inexact`] re-filtering); for an upper-bound provider
+    /// parameter it would narrow the fetch and drop rows, so epoch-seconds
+    /// mappings are for lower-bound inputs (`ts_from`-style) only.
+    EpochSeconds,
+}
+
 /// One allowlisted pushdown rule: `column <operator> literal` → `input_field: literal`.
 ///
 /// Exactly one operator per mapping, on purpose: a single
@@ -49,6 +74,8 @@ pub struct FilterMapping {
     /// Whether the provider input represents the predicate exactly or
     /// conservatively (see [`Fidelity`]).
     pub fidelity: Fidelity,
+    /// How the literal renders into the provider input (see [`ValueFormat`]).
+    pub value_format: ValueFormat,
 }
 
 /// Outcome of translating the scan's filters.
@@ -104,7 +131,7 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
         .iter()
         .find(|mapping| mapping.column == column.name && mapping.operator == operator)?;
 
-    let value = scalar_to_json(&literal)?;
+    let value = scalar_to_json(&literal, mapping.value_format)?;
     Some((mapping.input_field.to_string(), value, mapping.fidelity))
 }
 
@@ -128,12 +155,11 @@ fn resolve_literal(expr: &Expr) -> Option<ScalarValue> {
 /// Convert a DataFusion literal to a JSON value. Nulls and types outside the
 /// JSON scalar set make the filter untranslatable.
 ///
-/// Timestamps render as RFC 3339 UTC strings — the interchange form SaaS
-/// APIs take (`since=2026-01-01T00:00:00Z`). The scalar's epoch value is
-/// absolute, so any timezone annotation only affects display; a naive
-/// (timezone-less) literal is treated as UTC, matching the engine's
+/// Timestamps render per the mapping's [`ValueFormat`]. The scalar's epoch
+/// value is absolute, so any timezone annotation only affects display; a
+/// naive (timezone-less) literal is treated as UTC, matching the engine's
 /// `TimestampMillisUtc` column semantics.
-fn scalar_to_json(literal: &ScalarValue) -> Option<Value> {
+fn scalar_to_json(literal: &ScalarValue, format: ValueFormat) -> Option<Value> {
     match literal {
         // Utf8View included: DataFusion 52 can carry string literals as view
         // scalars after coercion, and a missed match here silently demotes an
@@ -155,16 +181,29 @@ fn scalar_to_json(literal: &ScalarValue) -> Option<Value> {
             serde_json::Number::from_f64(f64::from(*v)).map(Value::Number)
         }
         ScalarValue::Float64(Some(v)) => serde_json::Number::from_f64(*v).map(Value::Number),
-        ScalarValue::TimestampSecond(Some(v), _) => DateTime::from_timestamp(*v, 0).map(rfc3339),
-        ScalarValue::TimestampMillisecond(Some(v), _) => {
-            DateTime::from_timestamp_millis(*v).map(rfc3339)
-        }
-        ScalarValue::TimestampMicrosecond(Some(v), _) => {
-            DateTime::from_timestamp_micros(*v).map(rfc3339)
-        }
-        ScalarValue::TimestampNanosecond(Some(v), _) => {
-            Some(rfc3339(DateTime::from_timestamp_nanos(*v)))
-        }
+        // Verbatim arms return None on purpose: the mapping declared no
+        // timestamp spelling, so the predicate stays local rather than
+        // being pushed in a guessed format.
+        ScalarValue::TimestampSecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
+            ValueFormat::Rfc3339 => DateTime::from_timestamp(*v, 0).map(rfc3339),
+            ValueFormat::EpochSeconds => Some(Value::from(*v)),
+        },
+        ScalarValue::TimestampMillisecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
+            ValueFormat::Rfc3339 => DateTime::from_timestamp_millis(*v).map(rfc3339),
+            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1000))),
+        },
+        ScalarValue::TimestampMicrosecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
+            ValueFormat::Rfc3339 => DateTime::from_timestamp_micros(*v).map(rfc3339),
+            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000))),
+        },
+        ScalarValue::TimestampNanosecond(Some(v), _) => match format {
+            ValueFormat::Verbatim => None,
+            ValueFormat::Rfc3339 => Some(rfc3339(DateTime::from_timestamp_nanos(*v))),
+            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000_000))),
+        },
         _ => None,
     }
 }
@@ -186,24 +225,35 @@ mod tests {
             operator: Operator::Gt,
             input_field: "min_value",
             fidelity: Fidelity::Exact,
+            value_format: ValueFormat::Verbatim,
         },
         FilterMapping {
             column: "value",
             operator: Operator::GtEq,
             input_field: "min_value_inclusive",
             fidelity: Fidelity::Exact,
+            value_format: ValueFormat::Verbatim,
         },
         FilterMapping {
             column: "name",
             operator: Operator::Eq,
             input_field: "name",
             fidelity: Fidelity::Exact,
+            value_format: ValueFormat::Verbatim,
         },
         FilterMapping {
             column: "updated_at",
             operator: Operator::GtEq,
             input_field: "since",
             fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Rfc3339,
+        },
+        FilterMapping {
+            column: "created",
+            operator: Operator::GtEq,
+            input_field: "ts_from",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::EpochSeconds,
         },
     ];
 
@@ -259,12 +309,14 @@ mod tests {
                 operator: Operator::Gt,
                 input_field: "min_value",
                 fidelity: Fidelity::Exact,
+                value_format: ValueFormat::Rfc3339,
             },
             FilterMapping {
                 column: "value",
                 operator: Operator::Lt,
                 input_field: "max_value",
                 fidelity: Fidelity::Exact,
+                value_format: ValueFormat::Rfc3339,
             },
         ];
         let gt = Expr::BinaryExpr(BinaryExpr::new(
@@ -535,6 +587,82 @@ mod tests {
         ));
         let translated = translate_filters(&[filter], MAPPINGS);
         assert!(translated.inputs.is_empty());
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+    }
+
+    #[test]
+    fn epoch_seconds_mappings_render_whole_seconds_and_floor_lower_bounds() {
+        // Slack-style ts_from: every timestamp granularity renders as whole
+        // epoch seconds, and sub-second literals floor — widening the lower
+        // bound (superset), which Inexact re-filtering trims back.
+        let epoch_ms = 1_767_225_600_000i64; // 2026-01-01T00:00:00Z
+        for scalar in [
+            ScalarValue::TimestampSecond(Some(epoch_ms / 1000), None),
+            ScalarValue::TimestampMillisecond(Some(epoch_ms), Some("UTC".into())),
+            ScalarValue::TimestampMicrosecond(Some(epoch_ms * 1000), None),
+            ScalarValue::TimestampNanosecond(Some(epoch_ms * 1_000_000), None),
+            // Sub-second precision floors.
+            ScalarValue::TimestampMillisecond(Some(epoch_ms + 999), None),
+        ] {
+            let filter = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("created")),
+                Operator::GtEq,
+                Box::new(Expr::Literal(scalar, None)),
+            ));
+            let translated = translate_filters(&[filter], MAPPINGS);
+            assert_eq!(
+                translated.inputs,
+                vec![("ts_from".to_string(), Value::from(1_767_225_600i64))],
+            );
+            assert_eq!(
+                translated.pushdown,
+                vec![TableProviderFilterPushDown::Inexact]
+            );
+        }
+    }
+
+    #[test]
+    fn verbatim_mappings_push_plain_scalars_and_keep_timestamps_local() {
+        // Non-timestamp literals through Verbatim mappings push their
+        // natural JSON rendering — the fixture's numeric and string
+        // mappings above all declare Verbatim and every other test rides
+        // them. The distinctive arm: a timestamp literal reaching a
+        // Verbatim mapping does NOT translate (no declared spelling means
+        // no guessing), so the predicate stays local.
+        let translated = translate_filters(&[gt("value", 20)], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("min_value".to_string(), Value::from(20))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Exact]
+        );
+
+        let verbatim_timestamp: &[FilterMapping] = &[FilterMapping {
+            column: "created",
+            operator: Operator::GtEq,
+            input_field: "ts_from",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Verbatim,
+        }];
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("created")),
+            Operator::GtEq,
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(1_767_225_600_000), Some("UTC".into())),
+                None,
+            )),
+        ));
+        let translated = translate_filters(&[filter], verbatim_timestamp);
+        assert!(
+            translated.inputs.is_empty(),
+            "a timestamp under Verbatim must not reach the wire: {:?}",
+            translated.inputs
+        );
         assert_eq!(
             translated.pushdown,
             vec![TableProviderFilterPushDown::Unsupported]
