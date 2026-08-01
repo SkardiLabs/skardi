@@ -1189,8 +1189,14 @@ async fn archive_ingest_with_candle_embeddings() {
     use crate::sources::providers::sqlite::register_vec_to_binary_udf;
     use arrow::array::BinaryArray;
 
-    let model = std::env::var("SKARDI_TEST_EMBED_MODEL")
-        .expect("SKARDI_TEST_EMBED_MODEL must name a local embedding model directory");
+    // CI runs every `--ignored` test with `--all-features` and no model on
+    // disk; live-resource tests skip rather than panic when the resource is
+    // absent (the convention documents' LibreOffice tests and sqlite-vec's
+    // `SQLITE_VEC_PATH` tests already follow).
+    let Ok(model) = std::env::var("SKARDI_TEST_EMBED_MODEL") else {
+        eprintln!("skipping: SKARDI_TEST_EMBED_MODEL not set (needs a local embedding model dir)");
+        return;
+    };
     assert!(
         !model.contains('\''),
         "the model path is interpolated into SQL as a literal: {model:?}"
