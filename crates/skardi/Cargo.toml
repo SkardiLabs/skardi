@@ -29,6 +29,33 @@ chunking = ["dep:text-splitter"]
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
 documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
+# rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
+# reqwest/gzip: the fetcher decodes gzip-compressed feed responses itself
+# (the response-size cap is measured on the decoded stream), which needs the
+# builder's `.gzip(true)` — behind reqwest's own `gzip` Cargo feature, off by
+# default alongside the crate's other unconditional reqwest features.
+#
+# This flag's reach is at least workspace-wide, not scoped to the fetcher or
+# even to this crate: Cargo unifies features for one resolved package across
+# a whole build, and `crates/cli` depends on the same `reqwest 0.12`
+# resolution this crate does, so a build that includes both with `rss`
+# enabled (e.g. CI's `--all-features` run) turns gzip decoding on for
+# `crates/cli`'s client too. Within this crate, it also reaches Open
+# Connector's client (open_connector/client.rs, which never asks for it):
+# reqwest defaults gzip decoding to on for every `reqwest::Client` built once
+# the Cargo feature is compiled in, so OC's client gets transparent gzip
+# decoding and an `accept-encoding: gzip` header on its own requests. That
+# does not weaken its response-size bound — the bound is enforced again
+# while streaming the body regardless — but it does mean its
+# `content_length()` early reject simply does not fire for a compressed
+# response: reqwest strips both `Content-Encoding` and `Content-Length` from
+# the header set when it installs a gzip decoder, and `content_length()`
+# itself reads the body's size hint rather than the header, so it returns
+# `None` — not an under-reported wire size — the moment decoding is applied.
+rss = [
+    "dep:quick-xml",
+    "reqwest/gzip",
+]
 
 [dependencies]
 # engine
@@ -82,6 +109,18 @@ lance-index = { workspace = true }
 mongodb = "3.1"
 mysql_async = "0.36"
 percent-encoding = "2.3"
+# rss source connector (optional, behind the `rss` feature): parses OPML
+# subscription lists — the only hand-rolled XML in the provider besides
+# `feed-rs` (used for feed bodies themselves), whose own XML backend is also
+# quick-xml. `Cargo.lock` carries three quick-xml versions regardless of what
+# this line pins: `reqsign` requires exactly 0.37, `opendal` requires exactly
+# 0.38, and `feed-rs` 2.4 requires 0.41 (with its `encoding` feature) — three
+# mutually-incompatible minor versions from three deps this crate does not
+# control. This pin only decides which of those three our own direct usage
+# rides on; it cannot reduce the count to fewer than three either way.
+# Pinned to 0.41, `feed-rs`'s version, so this code exercises the same
+# quick-xml our own feed bodies already depend on.
+quick-xml = { version = "0.41", optional = true }
 redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster"] }
 # documents source connector (optional, behind the `documents` feature).
 # Pulls in native PDFium (downloaded by pdfium-sys build.rs).
