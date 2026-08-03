@@ -2,24 +2,254 @@
   "object": "list",
   "results": [
     {
-      "object": "page", "id": "p-0001",
-      "created_time": "2026-01-01T00:00:00.000Z",
-      "last_edited_time": "2026-01-02T10:30:00.000Z",
-      "archived": false, "in_trash": false,
-      "url": "https://www.notion.so/p-0001",
-      "public_url": null,
-      "parent": { "type": "workspace", "workspace": true },
-      "properties": { "title": { "id": "title", "type": "title", "title": [{ "plain_text": "Roadmap" }] } }
+      "object": "page",
+      "id": "00000000-0000-4000-8000-000000000006",
+      "created_time": "2026-04-23T09:49:00.000Z",
+      "last_edited_time": "2026-04-24T07:32:00.000Z",
+      "created_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "last_edited_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "cover": null,
+      "icon": null,
+      "parent": {
+        "type": "data_source_id",
+        "data_source_id": "00000000-0000-4000-8000-000000000007",
+        "database_id": "00000000-0000-4000-8000-000000000008"
+      },
+      "in_trash": false,
+      "is_archived": false,
+      "is_locked": false,
+      "properties": {
+        "Date Created": {
+          "id": "prop1",
+          "type": "created_time",
+          "created_time": "2026-04-23T09:49:00.000Z"
+        },
+        "Status": {
+          "id": "prop2",
+          "type": "status",
+          "status": {
+            "id": "prop3",
+            "name": "Redacted Name",
+            "color": "red"
+          }
+        },
+        "Name": {
+          "id": "title",
+          "type": "title",
+          "title": [
+            {
+              "type": "text",
+              "text": {
+                "content": "Redacted text",
+                "link": null
+              },
+              "annotations": {
+                "bold": false,
+                "italic": false,
+                "strikethrough": false,
+                "underline": false,
+                "code": false,
+                "color": "default"
+              },
+              "plain_text": "Redacted text",
+              "href": null
+            }
+          ]
+        }
+      },
+      "url": "https://app.notion.com/p/Redacted-00000000000040008000000000000009",
+      "public_url": null
     },
     {
-      "object": "page", "id": "p-0002",
-      "created_time": "2026-01-03T00:00:00.000Z",
-      "last_edited_time": null,
-      "archived": true,
-      "url": "https://www.notion.so/p-0002",
-      "parent": null,
-      "properties": null
+      "object": "page",
+      "id": "00000000-0000-4000-8000-000000000010",
+      "created_time": "2023-09-12T07:34:00.000Z",
+      "last_edited_time": "2023-09-12T07:34:00.000Z",
+      "created_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "last_edited_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "cover": null,
+      "icon": {
+        "type": "emoji",
+        "emoji": "🐶"
+      },
+      "parent": {
+        "type": "data_source_id",
+        "data_source_id": "00000000-0000-4000-8000-000000000007",
+        "database_id": "00000000-0000-4000-8000-000000000008"
+      },
+      "in_trash": false,
+      "is_archived": false,
+      "is_locked": false,
+      "properties": {
+        "Date Created": {
+          "id": "prop1",
+          "type": "created_time",
+          "created_time": "2023-09-12T07:34:00.000Z"
+        },
+        "Status": {
+          "id": "prop2",
+          "type": "status",
+          "status": {
+            "id": "00000000-0000-4000-8000-000000000011",
+            "name": "Redacted Name",
+            "color": "blue"
+          }
+        },
+        "Name": {
+          "id": "title",
+          "type": "title",
+          "title": [
+            {
+              "type": "text",
+              "text": {
+                "content": "Redacted text",
+                "link": null
+              },
+              "annotations": {
+                "bold": false,
+                "italic": false,
+                "strikethrough": false,
+                "underline": false,
+                "code": false,
+                "color": "default"
+              },
+              "plain_text": "Redacted text",
+              "href": null
+            }
+          ]
+        }
+      },
+      "url": "https://app.notion.com/p/Redacted-00000000000040008000000000000012",
+      "public_url": null
+    },
+    {
+      "object": "page",
+      "id": "00000000-0000-4000-8000-000000000013",
+      "created_time": "2023-09-12T07:34:00.000Z",
+      "last_edited_time": "2023-09-12T07:34:00.000Z",
+      "created_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "last_edited_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "cover": null,
+      "icon": null,
+      "parent": {
+        "type": "data_source_id",
+        "data_source_id": "00000000-0000-4000-8000-000000000007",
+        "database_id": "00000000-0000-4000-8000-000000000008"
+      },
+      "in_trash": false,
+      "is_archived": false,
+      "is_locked": false,
+      "properties": {
+        "Date Created": {
+          "id": "prop1",
+          "type": "created_time",
+          "created_time": "2023-09-12T07:34:00.000Z"
+        },
+        "Status": {
+          "id": "prop2",
+          "type": "status",
+          "status": {
+            "id": "prop3",
+            "name": "Redacted Name",
+            "color": "red"
+          }
+        },
+        "Name": {
+          "id": "title",
+          "type": "title",
+          "title": [
+            {
+              "type": "text",
+              "text": {
+                "content": "Redacted text",
+                "link": null
+              },
+              "annotations": {
+                "bold": false,
+                "italic": false,
+                "strikethrough": false,
+                "underline": false,
+                "code": false,
+                "color": "default"
+              },
+              "plain_text": "Redacted text",
+              "href": null
+            }
+          ]
+        }
+      },
+      "url": "https://app.notion.com/p/Redacted-00000000000040008000000000000014",
+      "public_url": null
+    },
+    {
+      "object": "page",
+      "id": "00000000-0000-4000-8000-000000000015",
+      "created_time": "2023-09-12T07:34:00.000Z",
+      "last_edited_time": "2023-09-12T07:34:00.000Z",
+      "created_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "last_edited_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "cover": null,
+      "icon": null,
+      "parent": {
+        "type": "data_source_id",
+        "data_source_id": "00000000-0000-4000-8000-000000000007",
+        "database_id": "00000000-0000-4000-8000-000000000008"
+      },
+      "in_trash": false,
+      "is_archived": false,
+      "is_locked": false,
+      "properties": {
+        "Date Created": {
+          "id": "prop1",
+          "type": "created_time",
+          "created_time": "2023-09-12T07:34:00.000Z"
+        },
+        "Status": {
+          "id": "prop2",
+          "type": "status",
+          "status": {
+            "id": "prop3",
+            "name": "Redacted Name",
+            "color": "red"
+          }
+        },
+        "Name": {
+          "id": "title",
+          "type": "title",
+          "title": []
+        }
+      },
+      "url": "https://app.notion.com/p/Redacted-00000000000040008000000000000016",
+      "public_url": null
     }
   ],
-  "next_cursor": null, "has_more": false
+  "next_cursor": null,
+  "has_more": false,
+  "type": "page_or_data_source",
+  "page_or_data_source": {},
+  "request_id": "00000000-0000-4000-8000-000000000017"
 }

@@ -10,7 +10,13 @@ API**: rows are Notion objects verbatim under `$.results`, with Notion's
 native cursor envelope beside them (`$.next_cursor`, null at
 end-of-collection; `has_more` is redundant and unused). Inputs are the
 gateway's camelCase strict schema (`startCursor`/`pageSize`/`blockId`).
-Everything below is reconciled against a live gateway.
+Everything below is reconciled against a live gateway **and verified end
+to end against a real Notion workspace** (2026-08-03). The gateway pins
+`Notion-Version: 2026-03-11`; that version is what makes the
+`data_source` filter spelling valid (pre-2025-09-03 versions spell it
+`database`) and what renames the page flag to `is_archived`. If the
+gateway's pinned Notion version ever changes, the action-contract
+fingerprints refuse registration rather than drifting silently.
 
 ## Binding
 
@@ -36,7 +42,7 @@ SELECT id, name, type FROM saas.notion_ws.users WHERE type = 'person';
 
 -- The same definition, ad hoc, without a binding:
 SELECT id, url FROM open_connector_query('saas', 'notion.pages', '{}')
-WHERE NOT archived LIMIT 20;
+WHERE NOT in_trash LIMIT 20;
 ```
 
 ## Tables
@@ -78,10 +84,15 @@ highlights and caveats:
   address; rendered content is a future markdown table.
 - **`users` excludes `person.email`** and the raw `person`/`bot` objects
   (capability-gated, privacy-sensitive).
+- **Deletion flags follow the real wire, not the declared contract**: on
+  Notion-Version 2026-03-11 pages carry `is_archived` + `in_trash`, while
+  data sources and blocks carry `in_trash` only — there is no `archived`
+  field on any live object, so the pack does not map one.
 - **Action-contract fingerprints are pinned** from a live capture
   (`packs/fixtures/notion/contracts/`); `pages`/`data_sources` share
-  `notion.search`'s pin. Note: the gateway declares an EMPTY item schema
-  for search results, so the two search tables' columns sit outside the
+  `notion.search`'s pin. Note: the gateway declares the search item
+  schema as an `anyOf` (page | data_source), which the coverage walker
+  does not descend, so the two search tables' columns sit outside the
   fingerprint gate entirely (pinned as such by the coverage test) — their
   drift surfaces at scan time under the conversion rules.
 

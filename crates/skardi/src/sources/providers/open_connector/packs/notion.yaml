@@ -4,6 +4,13 @@
 # Notion's native cursor envelope ($.next_cursor, null at end — has_more
 # is redundant with the null cursor and deliberately unused). Design
 # rationale lives in the module docs of packs/notion.rs.
+#
+# Column sets are reconciled against REAL rows from a live Notion
+# workspace through the gateway (2026-08-03, gateway pins
+# Notion-Version 2026-03-11): pages carry `is_archived` (not the
+# `archived` the captured contract declares), and data sources and
+# blocks carry no archived flag at all — `in_trash` is the deletion
+# signal on every object.
 kind: pack
 pack: notion
 version: 1
@@ -52,7 +59,7 @@ tables:
       - { name: id, path: id, type: utf8, nullable: false }
       - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
       - { name: last_edited_time, path: last_edited_time, type: timestamp_ms_utc, nullable: true }
-      - { name: archived, path: archived, type: boolean, nullable: true }
+      - { name: is_archived, path: is_archived, type: boolean, nullable: true }
       - { name: in_trash, path: in_trash, type: boolean, nullable: true }
       - { name: url, path: url, type: utf8, nullable: true }
       - { name: public_url, path: public_url, type: utf8, nullable: true }
@@ -79,8 +86,9 @@ tables:
       - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
       - { name: last_edited_time, path: last_edited_time, type: timestamp_ms_utc, nullable: true }
       - { name: title, path: title, type: utf8_list_from_object_key, key: plain_text, nullable: true }
-      - { name: archived, path: archived, type: boolean, nullable: true }
+      - { name: in_trash, path: in_trash, type: boolean, nullable: true }
       - { name: url, path: url, type: utf8, nullable: true }
+      - { name: public_url, path: public_url, type: utf8, nullable: true }
       - { name: parent, path: parent, type: json, nullable: true }
       - { name: properties, path: properties, type: json, nullable: true }
 
@@ -106,6 +114,5 @@ tables:
       - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
       - { name: last_edited_time, path: last_edited_time, type: timestamp_ms_utc, nullable: true }
       - { name: has_children, path: has_children, type: boolean, nullable: true }
-      - { name: archived, path: archived, type: boolean, nullable: true }
       - { name: in_trash, path: in_trash, type: boolean, nullable: true }
       - { name: parent, path: parent, type: json, nullable: true }

@@ -49,12 +49,25 @@
 //!   version; both spellings become SQL NULL, pinned by fixtures.
 //! - **Fingerprints are pinned** from a live gateway capture
 //!   (`fixtures/notion/contracts/`); `pages` and `data_sources` share
-//!   `notion.search`'s contract and therefore its pin. The declared
-//!   search item schema is EMPTY (`results.items` declares no
-//!   properties), so every mapped column of the two search tables rides
-//!   `additionalProperties` passthrough — the coverage-gap pin records
-//!   that honestly; their drift surfaces at scan time per conversion
-//!   rules.
+//!   `notion.search`'s contract and therefore its pin. The search item
+//!   schema is an `anyOf` (page | data_source) which the coverage
+//!   walker does not descend, so every mapped column of the two search
+//!   tables rides `additionalProperties` passthrough — the coverage-gap
+//!   pin records that honestly; their drift surfaces at scan time per
+//!   conversion rules.
+//! - **Column sets are reconciled against REAL wire rows**, not just the
+//!   declared contract: verified end to end against a live Notion
+//!   workspace through the gateway on 2026-08-03 (the gateway pins
+//!   `Notion-Version: 2026-03-11`, which is also what makes the
+//!   `data_source` filter spelling valid — pre-2025-09-03 API versions
+//!   spell it `database`). Live rows showed pages carry `is_archived`
+//!   (the contract's declared `archived` never appears on the wire),
+//!   and data sources and blocks carry no archived flag at all —
+//!   `in_trash` is the deletion signal on every object, so the pack
+//!   maps `in_trash` everywhere and `is_archived` on pages only. The
+//!   bundled fixtures are those live captures, redacted (synthetic
+//!   UUIDs, placeholder names/titles/URLs, real structure and
+//!   timestamp spellings kept verbatim).
 
 use std::sync::OnceLock;
 
@@ -79,7 +92,7 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
+        EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_ok,
         fingerprint_uncovered_columns,
     };
     use crate::sources::providers::open_connector::{
@@ -118,9 +131,12 @@ mod tests {
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
     }
 
-    // ── Contract tests: bundled redacted fixtures are the build-time
-    // conversion contract (null-bearing, nested, empty, extra upstream
-    // fields, and a schema mismatch per the source-pack admission gate). ─
+    // ── Contract tests: the bundled fixtures are redacted LIVE captures
+    // from a real Notion workspace (2026-08-03) — real envelope keys,
+    // field presence/absence, and timestamp spellings; synthetic UUIDs
+    // and placeholder text. They are the build-time conversion contract
+    // (null-bearing, nested, extra upstream fields, and a synthetic
+    // schema mismatch per the source-pack admission gate). ─
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -153,14 +169,18 @@ mod tests {
     }
 
     #[test]
-    fn users_fixture_converts_with_nulls_and_omissions() {
+    fn users_fixture_converts_with_explicit_nulls() {
         let batch = convert_fixture(table("users"), include_str!("fixtures/notion/users.json"));
         assert_eq!(batch.num_rows(), 3);
-        assert_eq!(utf8(&batch, "id").value(0), "u-0001");
-        assert_eq!(utf8(&batch, "name").value(0), "Ada Lovelace");
-        // Explicit null and omitted key both land as SQL NULL.
-        assert!(utf8(&batch, "name").is_null(1));
-        assert!(utf8(&batch, "avatar_url").is_null(1));
+        assert_eq!(
+            utf8(&batch, "id").value(0),
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(utf8(&batch, "name").value(0), "Redacted Name");
+        // Live rows null avatar_url explicitly (person and bot alike);
+        // the unmapped `person`/`bot` payloads ride along ignored.
+        assert!(utf8(&batch, "avatar_url").is_null(0));
+        assert!(!utf8(&batch, "avatar_url").is_null(1));
         assert!(utf8(&batch, "avatar_url").is_null(2));
         assert_eq!(utf8(&batch, "type").value(1), "bot");
     }
@@ -168,25 +188,27 @@ mod tests {
     #[test]
     fn pages_fixture_converts_with_dynamic_properties_as_json() {
         let batch = convert_fixture(table("pages"), include_str!("fixtures/notion/pages.json"));
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(utf8(&batch, "id").value(0), "p-0001");
-        assert!(!boolean(&batch, "archived").value(0));
-        assert!(boolean(&batch, "archived").value(1));
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(
+            utf8(&batch, "id").value(0),
+            "00000000-0000-4000-8000-000000000006"
+        );
+        // Live pages spell the flag `is_archived` (never the contract's
+        // declared `archived`) and null `public_url` on private pages.
+        assert!(!boolean(&batch, "is_archived").value(0));
+        assert!(!boolean(&batch, "in_trash").value(0));
         assert!(utf8(&batch, "public_url").is_null(0));
-        // Dynamic property map survives as opaque JSON text; JSON null →
-        // SQL NULL.
+        // Dynamic property map survives as opaque JSON text.
         let properties: Value =
             serde_json::from_str(utf8(&batch, "properties").value(0)).expect("valid JSON");
-        assert_eq!(properties["title"]["type"], "title");
-        assert!(utf8(&batch, "properties").is_null(1));
+        assert_eq!(properties["Name"]["type"], "title");
         let ts: &TimestampMillisecondArray = batch
             .column_by_name("last_edited_time")
             .expect("column")
             .as_any()
             .downcast_ref()
             .expect("timestamp");
-        assert!(!ts.is_null(0));
-        assert!(ts.is_null(1));
+        assert!((0..4).all(|i| !ts.is_null(i)), "live timestamps all parse");
     }
 
     #[test]
@@ -195,7 +217,7 @@ mod tests {
             table("data_sources"),
             include_str!("fixtures/notion/data_sources.json"),
         );
-        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_rows(), 1);
         let titles: &ListArray = batch
             .column_by_name("title")
             .expect("column")
@@ -209,9 +231,13 @@ mod tests {
             .expect("Utf8 items");
         assert_eq!(
             (0..first.len()).map(|i| first.value(i)).collect::<Vec<_>>(),
-            vec!["Tasks", " DB"]
+            vec!["Redacted text"],
+            "plain_text plucked from the live rich-text array"
         );
-        assert_eq!(titles.value(1).len(), 0, "empty title list stays empty");
+        // Live data sources carry no archived flag; in_trash is the
+        // deletion signal and public_url nulls when unpublished.
+        assert!(!boolean(&batch, "in_trash").value(0));
+        assert!(utf8(&batch, "public_url").is_null(0));
     }
 
     #[test]
@@ -220,10 +246,14 @@ mod tests {
             table("block_children"),
             include_str!("fixtures/notion/block_children.json"),
         );
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(utf8(&batch, "type").value(1), "heading_1");
-        assert!(boolean(&batch, "has_children").value(1));
-        assert!(boolean(&batch, "archived").is_null(1));
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(utf8(&batch, "type").value(0), "heading_1");
+        assert_eq!(utf8(&batch, "type").value(3), "paragraph");
+        // The type-specific payloads (heading_1/to_do/paragraph keys on
+        // the live rows) are deliberately unmapped and ride along
+        // ignored; blocks carry in_trash but no archived flag.
+        assert!(!boolean(&batch, "has_children").value(0));
+        assert!(!boolean(&batch, "in_trash").value(0));
     }
 
     #[test]
@@ -301,7 +331,8 @@ mod tests {
 
     #[test]
     fn fingerprint_coverage_gap_is_pinned() {
-        // notion.search declares an EMPTY results-item schema, so every
+        // notion.search's results-item schema is an anyOf (page |
+        // data_source) the coverage walker does not descend, so every
         // mapped column of the two search tables rides
         // additionalProperties passthrough — outside the fingerprint
         // gate, drift surfacing at scan time. users/block_children are
@@ -320,7 +351,7 @@ mod tests {
                     "id",
                     "created_time",
                     "last_edited_time",
-                    "archived",
+                    "is_archived",
                     "in_trash",
                     "url",
                     "public_url",
@@ -336,8 +367,9 @@ mod tests {
                     "created_time",
                     "last_edited_time",
                     "title",
-                    "archived",
+                    "in_trash",
                     "url",
+                    "public_url",
                     "parent",
                     "properties",
                 ],
@@ -345,7 +377,7 @@ mod tests {
             (
                 "block_children",
                 include_str!("fixtures/notion/contracts/list_block_children.json"),
-                &["created_time", "last_edited_time", "archived"],
+                &["created_time", "last_edited_time"],
             ),
         ] {
             let t = table(short);
