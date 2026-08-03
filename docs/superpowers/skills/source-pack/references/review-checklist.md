@@ -1,11 +1,11 @@
-# Phase 4 — Self-review checklist
+# Phase 5 — Self-review checklist
 
-This is the distilled record of every review round the GitHub and Slack
-packs went through — each item below caught (or would have caught) a
-real defect in this repo. Go through it against your actual diff, not
-from memory. For each item: verify, fix, or write down a technical
-rebuttal with evidence. Severity habits: correctness/data-loss → P1,
-test/doc hygiene → P2.
+This is the distilled record of every review round the GitHub, Slack,
+and Notion packs went through — each item below caught (or would have
+caught) a real defect in this repo. Go through it against your actual
+diff, not from memory. For each item: verify, fix, or write down a
+technical rebuttal with evidence. Severity habits: correctness/data-loss
+→ P1, test/doc hygiene → P2.
 
 ## Silent-truncation and termination correctness
 
@@ -43,6 +43,21 @@ The worst failure class: wrong results with a green status.
       is a runtime 400 that CI cannot see.
 - [ ] Field mappings match what the EXECUTOR emits (passthrough vs
       normalized), not the provider's raw API.
+- [ ] Phase-4 real-data evidence exists for every table: registration
+      passed the fingerprint gate against LIVE discovery, real rows
+      scanned through skardi-server, and every mapped column extracted
+      a real non-NULL value somewhere in a seeded dataset. A column no
+      live row ever populated is the always-NULL bug (declared-vs-wire
+      spelling, e.g. `archived` vs `is_archived`) until proven
+      otherwise.
+- [ ] Every pinned/fixed input proven to RETURN ROWS live, not just
+      HTTP 200 — version-coupled enum pins (Notion's `data_source` vs
+      pre-2025 `database`) look healthy while returning nothing. If the
+      gateway pins a provider API version header, it is recorded in the
+      pack doc and module doc.
+- [ ] Real multi-page pagination exercised live (small page size), the
+      continuation token observed at the declared path, and termination
+      observed on the documented spelling.
 - [ ] `Exact` fidelity only where faithful across the whole value
       domain; every string-enum push is `Inexact`.
 - [ ] Fingerprints pinned from the live capture; sync test locks pin ↔
@@ -80,7 +95,15 @@ The worst failure class: wrong results with a green status.
 - [ ] JSON *kinds* in errors, never values (rows can contain secrets).
 - [ ] Bounded quoting: error-response snippets ≤ 512 chars, provider
       error codes ≤ 128; tokens never in YAML/logs/`Debug`/errors.
-- [ ] Fixtures redacted (synthetic names, no real orgs/users/tokens).
+- [ ] Fixtures are REDACTED LIVE CAPTURES (real envelope keys, field
+      presence, timestamp spellings; synthetic UUIDs, placeholder
+      names/titles/URLs) — not hand-written shapes; the redaction was
+      audited mechanically (every surviving string matched against an
+      allowlist — real titles hide in URL slugs). Deliberately-broken
+      fixtures (schema-mismatch) stay synthetic and say so.
+- [ ] No real orgs/users/tokens anywhere; if a credential was ever
+      pasted into a conversation or log during verification, the user
+      was told to rotate it.
 
 ## Docs and spec sync
 

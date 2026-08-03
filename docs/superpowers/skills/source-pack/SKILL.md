@@ -3,7 +3,8 @@ name: source-pack
 description: >-
   Develop a new Open Connector source pack for Skardi end-to-end: research the
   provider's live gateway contract, implement the pack (tables, fixtures,
-  fingerprints, tests, docs), self-review against this repo's accumulated
+  fingerprints, tests, docs), verify every table against real provider data
+  through a live gateway, self-review against this repo's accumulated
   review standards, and submit a PR. Use this skill whenever the user asks to
   add, support, integrate, or onboard a data source or SaaS provider (Notion,
   Jira, Gmail, HubSpot, Discord, Feishu, …) as SQL tables, mentions "source
@@ -27,6 +28,16 @@ response envelope — all plausible from GitHub's own docs, all wrong
 against the real gateway, and all invisible to CI because the mocks
 encoded the same wrong assumptions. Every phase below exists to prevent
 that class of failure.
+
+The second lesson, learned on the Notion pack (PR #177): **the declared
+contract is not column truth either.** A pack can pass every
+contract-level check — fingerprints pinned, credential wall reached,
+full suite green — and still map columns that are always-NULL on the
+real wire, because declared schemas under-declare, misname
+(`archived` vs `is_archived`), or `anyOf`-hide the fields passthrough
+executors actually emit. Phase 4 exists to prevent THAT class of
+failure: no pack is submission-ready until every table has scanned real
+rows end to end.
 
 ## Required reading (before phase 1)
 
@@ -69,7 +80,9 @@ Non-negotiable outputs of this phase:
   `total_count`? authoritative `paging.pages`?) and how in-band provider
   errors are handled (most OC executors consume them and return a failure
   envelope; `error_path` is only for gateways that forward them).
-- Captured output schemas for fingerprint pinning (phase 3).
+- Captured output schemas for fingerprint pinning (phase 3). Treat them
+  as fingerprint input, NOT column truth — for passthrough rows the
+  final column sets are settled by real rows in phase 4.
 
 ## Phase 2 — Design the tables
 
@@ -110,7 +123,24 @@ reference's **Engine baseline** section; `main` carries the full
 baseline today, but an older base may lack part of it, and adding the
 missing invariant (with regression tests) is then prerequisite work.
 
-## Phase 4 — Self-review before any PR
+## Phase 4 — Verify against real data (integration test)
+
+Implementation done and tests green is NOT done. Follow
+[references/live-verification.md](references/live-verification.md):
+have the user configure a real (free-tier) provider account in the
+gateway — you never touch the credential — then probe every action with
+the pack's exact inputs, diff real row keys against the mapped columns
+in both directions, scan every table end to end through skardi-server
+(registration passes the fingerprint gate against LIVE discovery; every
+mapped column extracts a real non-NULL value somewhere; pinned filters
+actually return rows; a small page size forces real multi-page
+pagination), and re-derive the fixtures as redacted live captures.
+Where the wire contradicts the declared contract, the wire wins for
+columns; record the contradiction and the provider API version the
+gateway pins. Reviewers here block packs that skipped this phase, and
+they are right to.
+
+## Phase 5 — Self-review before any PR
 
 This phase is why the submitted code is good. Work through
 [references/review-checklist.md](references/review-checklist.md) — it is
@@ -132,7 +162,7 @@ severity. Then:
    line numbers stale, counts miscounted), and verifying against the
    code before acting is part of the standard.
 
-## Phase 5 — Submit the PR
+## Phase 6 — Submit the PR
 
 - Branch `feature/open-connector-<provider>-pack` off latest `main`
   (fetch first). If the work must stack on an unmerged PR's branch,
@@ -145,16 +175,17 @@ severity. Then:
   counted tests with the counting command).
 - PR body modeled on the merged pack PRs (#168-level per-module detail):
   what shipped per module, design decisions with rationale, engine
-  extensions, verification section with test counts, live-reconciliation
-  status, and any deliberate deferrals (e.g. fingerprint pins pending,
-  tables gated on upstream support).
+  extensions, verification section with test counts, the phase-4
+  real-data evidence (per-table live results, pinned provider API
+  version, what the live pass changed), and any deliberate deferrals
+  (e.g. fingerprint pins pending, tables gated on upstream support).
 - `gh pr create` with that body; use Draft when stacked or when the user
   asked for in-progress visibility.
 
 ## Working style
 
 - Evaluate before you fix: when review feedback arrives (from the user or
-  your own phase-4 pass), first verify the claim against the code —
+  your own phase-5 pass), first verify the claim against the code —
   some findings are already fixed, stale, or wrong, and saying so with
   evidence is as valuable as a fix.
 - No credentials in Skardi, ever. Provider credentials live in the

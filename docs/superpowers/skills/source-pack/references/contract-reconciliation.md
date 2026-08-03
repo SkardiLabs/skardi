@@ -168,3 +168,15 @@ the canonicalized schema (computed by
 `action_registry::fingerprint_schema` — never re-derive the
 canonicalization elsewhere) and locks pin ↔ fixture with a sync test.
 Record the gateway version you captured against.
+
+**The captured contract is fingerprint input, not column truth.** For
+passthrough executors the declared output schema can under-declare
+fields the wire carries, misname them (Notion declared `archived`;
+the wire spells `is_archived`), or hide them in `anyOf` branches the
+coverage walker does not descend — and a mis-declared column in that
+gap maps to an always-NULL column with no error at registration OR
+scan time. Design tables from the contract in phase 2, but treat every
+passthrough column set as provisional until phase 4's real rows
+confirm it. Also note which columns the coverage-gap pin reports as
+outside the fingerprint gate: those are exactly the ones only real
+data can verify.
