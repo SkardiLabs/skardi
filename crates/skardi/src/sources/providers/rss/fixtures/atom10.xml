@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Corpus Atom</title>
+  <subtitle>An Atom 1.0 feed.</subtitle>
+  <id>urn:uuid:8b3f0c3e-0000-4000-8000-000000000000</id>
+  <updated>2026-07-21T11:00:00Z</updated>
+  <link rel="self" type="application/atom+xml" href="https://corpus.example/atom.xml"/>
+  <link rel="alternate" type="text/html" href="https://corpus.example/"/>
+  <entry>
+    <id>urn:uuid:8b3f0c3e-0001-4000-8000-000000000000</id>
+    <title>Atom post</title>
+    <link rel="alternate" type="text/html" href="https://corpus.example/atom/1"/>
+    <link rel="enclosure" type="audio/mpeg" length="4242" href="https://corpus.example/audio/atom-1.mp3"/>
+    <author><name>Radia Perlman</name></author>
+    <published>2026-07-20T10:00:00Z</published>
+    <updated>2026-07-21T11:00:00Z</updated>
+    <category term="rust" label="Rust"/>
+    <category term="atom"/>
+    <content type="html">&lt;h2&gt;Atom body&lt;/h2&gt;&lt;p&gt;An &lt;em&gt;html&lt;/em&gt;-typed content element.&lt;/p&gt;</content>
+    <summary type="text">Plain 3 &lt; 4 summary, stored verbatim.</summary>
+  </entry>
+  <entry>
+    <id>urn:uuid:8b3f0c3e-0002-4000-8000-000000000000</id>
+    <title>Second Atom post</title>
+    <link rel="alternate" type="text/html" href="https://corpus.example/atom/2"/>
+    <updated>2026-07-21T12:00:00Z</updated>
+    <summary type="text">Second summary.</summary>
+  </entry>
+</feed>

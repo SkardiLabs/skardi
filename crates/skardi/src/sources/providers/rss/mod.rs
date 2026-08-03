@@ -6,8 +6,15 @@ pub mod cache;
 pub mod config;
 #[cfg(feature = "rss")]
 pub mod conformance;
+// The compatibility corpus: committed feed documents in `fixtures/` plus the
+// manifest-driven contract test over them. Test-only and additionally gated
+// behind `rss`, like `testutil` below, since everything it drives
+// (`parse_feed_document`, the sanitation rungs, the HTML→Markdown conversion)
+// is.
 #[cfg(feature = "rss")]
 pub mod convert;
+#[cfg(all(test, feature = "rss"))]
+mod corpus;
 pub mod error;
 // Reads OPML files and pulls in `quick-xml`; gated so the config/error types
 // above stay parseable — and `ResolvedSubscription` below stays nameable —
@@ -62,6 +69,22 @@ pub mod schema;
 // task adds can name them.
 #[cfg(feature = "rss")]
 pub mod table;
+
+// The acceptance-criteria crosswalk: full SQL against a registered catalog
+// whose feeds live on `testutil::MockFeedServer`. In-crate rather than in
+// `crates/skardi/tests/` because it drives `register_rss_tables_with_policy`
+// below, which is `#[cfg(test)] pub(crate)` and unreachable from an external
+// test crate — see that function's doc, and this module's own.
+#[cfg(all(test, feature = "rss"))]
+mod integration_tests;
+
+// One layer above `integration_tests`: the downstream composition the design
+// leaves to user-space SQL — a federated join, and the two-`INSERT` archive
+// that gives feed entries a history the live window does not. In-crate for the
+// same reason, and additionally gated behind `chunking` because the archive's
+// second statement is a `chunk()` call.
+#[cfg(all(test, feature = "rss", feature = "chunking"))]
+mod composition_tests;
 
 pub use config::{FeedSubscription, RssConfig};
 pub use error::RssError;

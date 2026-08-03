@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Markup a feed has no business serving: script and style bodies, an inline
+     event handler, a javascript: href, an unknown element, and an iframe. The
+     golden pins that no HTML tag survives into `items.content`. -->
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Hostile Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>A channel serving hostile markup.</description>
+    <item>
+      <guid>tag:corpus.example,2026:hostile-1</guid>
+      <title>Hostile markup</title>
+      <link>https://corpus.example/hostile/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+      <description>Summary of the hostile item.</description>
+      <content:encoded><![CDATA[<h2>Hostile</h2>
+<script>var leak = 1; alert("script leak");</script>
+<style>p { color: leak-red; }</style>
+<p onclick="alert('inline handler leak')">Body text survives its event handler.</p>
+<p><a href="javascript:void(0)" onclick="alert('leak')">javascript link</a></p>
+<custom-tag data-x="1">custom element text</custom-tag>
+<iframe src="https://evil.example/leak"></iframe>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

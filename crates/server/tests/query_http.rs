@@ -59,6 +59,7 @@ fn data_source(name: &str, access_mode: AccessMode) -> DataSource {
         enable_cache: false,
         description: None,
         open_connector: None,
+        rss: None,
     }
 }
 

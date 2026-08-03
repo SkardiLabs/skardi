@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One item whose content:encoded exercises every structure the HTML→Markdown
+     conversion has an opinion about: h1-h3, an unordered list, an ordered list,
+     a nested list, a table with a header row, an image, a preformatted code
+     block, and a blockquote. The golden is the whole conversion. -->
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Structures Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>Every structural conversion in one item.</description>
+    <item>
+      <guid>tag:corpus.example,2026:structures-1</guid>
+      <title>Structures</title>
+      <link>https://corpus.example/structures/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+      <description>Summary of the structures item.</description>
+      <content:encoded><![CDATA[<h1>Heading one</h1>
+<p>Intro paragraph with <strong>bold</strong>, <em>emphasis</em> and <code>inline code</code>.</p>
+<h2>Heading two</h2>
+<ul>
+  <li>flat one</li>
+  <li>flat two
+    <ul>
+      <li>nested a</li>
+      <li>nested b</li>
+    </ul>
+  </li>
+</ul>
+<h3>Heading three</h3>
+<ol>
+  <li>first</li>
+  <li>second</li>
+</ol>
+<table>
+  <thead><tr><th>column a</th><th>column b</th></tr></thead>
+  <tbody>
+    <tr><td>a1</td><td>b1</td></tr>
+    <tr><td>a2</td><td>b2</td></tr>
+  </tbody>
+</table>
+<p><img src="https://corpus.example/img/diagram.png" alt="a diagram"></p>
+<pre><code>fn main() {
+    println!("hello");
+}</code></pre>
+<blockquote><p>Quoted prose.</p></blockquote>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

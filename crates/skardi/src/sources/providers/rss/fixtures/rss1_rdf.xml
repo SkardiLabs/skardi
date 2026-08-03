@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns="http://purl.org/rss/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel rdf:about="https://corpus.example/rss1">
+    <title>Corpus RDF</title>
+    <link>https://corpus.example/</link>
+    <description>An RSS 1.0 (RDF) channel.</description>
+    <dc:language>en-us</dc:language>
+    <items>
+      <rdf:Seq>
+        <rdf:li rdf:resource="https://corpus.example/rss1/1"/>
+      </rdf:Seq>
+    </items>
+  </channel>
+  <!-- `rdf:about` is deliberately *not* the item's `<link>`, so the corpus can
+       tell which of the two supplies `items.guid`. -->
+  <item rdf:about="urn:corpus:rss1-item-1">
+    <title>RDF post</title>
+    <link>https://corpus.example/rss1/1</link>
+    <description>Summary of the RDF post.</description>
+    <dc:creator>Grace Hopper</dc:creator>
+    <dc:date>2026-07-20T10:00:00Z</dc:date>
+  </item>
+</rdf:RDF>

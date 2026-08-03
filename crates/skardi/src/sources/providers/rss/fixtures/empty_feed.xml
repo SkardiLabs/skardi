@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A complete, conformant channel that simply has no items yet: zero rows is
+     the correct answer here, and nothing about it is a fault to record. -->
+<rss version="2.0">
+  <channel>
+    <title>Empty Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>A channel with no items.</description>
+    <lastBuildDate>Tue, 21 Jul 2026 12:00:00 GMT</lastBuildDate>
+  </channel>
+</rss>
