@@ -116,14 +116,6 @@
 //! per-feed degrade, re-fetched on the next scan — rather than a cached
 //! window.
 
-// `FeedFetcher` has no production caller yet — the engine (a later PR in
-// this stack) is the first one, and hasn't landed. Until then, everything
-// here outside of this module's own tests is unreferenced from a build that
-// excludes test code (and, transitively, so is `egress.rs`, whose only
-// consumer is this module), and `cargo check`/`cargo build` would otherwise
-// flag both files. Remove this once the engine wires `FeedFetcher` in.
-#![allow(dead_code)]
-
 use std::error::Error as StdError;
 use std::net::IpAddr;
 use std::sync::Arc;

@@ -20,14 +20,6 @@
 //! on every hop whose host parses as an `IpAddr`. Under the `AllowAll` default
 //! both paths are no-ops.
 
-// This module's only consumer today is `fetch.rs`, and `fetch.rs` in turn
-// has no production caller yet — the engine (a later PR in this stack) is
-// the first one, and hasn't landed. Until then, everything here outside of
-// this module's own tests is unreferenced from a build that excludes test
-// code, and `cargo check`/`cargo build` would otherwise flag the whole
-// file. Remove this once the engine wires `FeedFetcher` in.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
