@@ -511,10 +511,25 @@ bindings:
 
         let inputs = execute_inputs(&gateway);
         assert_eq!(inputs.len(), 2, "two cursor pages");
-        assert!(inputs[0].get("startCursor").is_none(), "{}", inputs[0]);
         assert_eq!(inputs[1]["startCursor"], "cur-2");
-        for input in &inputs {
+        for (page, (input, expected_keys)) in inputs
+            .iter()
+            .zip([vec!["pageSize"], vec!["pageSize", "startCursor"]])
+            .enumerate()
+        {
             assert_eq!(input["pageSize"], 100, "page-size hint: {input}");
+            // Exactly the declared inputs, nothing else — the same
+            // nothing-extra-on-the-wire guard the search test applies, so
+            // users' wire declaration is pinned in full, absence included
+            // (page 1 carries no cursor).
+            let mut keys: Vec<&str> = input
+                .as_object()
+                .expect("input object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, expected_keys, "page {} input keys", page + 1);
         }
     }
 
