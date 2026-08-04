@@ -25,6 +25,13 @@ The worst failure class: wrong results with a green status.
       authoritative total) — a filtered count is never a termination
       signal, and a missing signal means upstream contribution or
       deferral, not a heuristic.
+- [ ] Termination verified on the REAL final page, not assumed from the
+      envelope shape: providers can return a non-empty continuation
+      token beside `has_more: false` (Feishu wiki), which null-token
+      termination refetches until the loop guard kills the scan.
+      Declare `has_more_path` where the envelope carries an
+      authoritative has-more boolean, and pin the live final-page shape
+      with an e2e.
 - [ ] Short/empty non-final pages cannot truncate: if the envelope has
       an authoritative total, the strategy declares `total_pages_path`;
       if not, the heuristic's limits are documented.
@@ -77,9 +84,22 @@ The worst failure class: wrong results with a green status.
 - [ ] Per-declaration coverage: every table's own wire declarations
       (row path, input keys, pagination params) pinned by its own e2e —
       shared constants are not shared coverage.
+- [ ] Every wire e2e asserts the EXACT input key set per request
+      (sorted keys equal, absence included — page 1 carries no cursor),
+      not key presence: presence-only assertions cannot catch an
+      undeclared extra leaking onto the wire, and strict action schemas
+      turn that extra into a runtime 400.
 - [ ] Both sides of every gate: the pass path (suite-wide) and the fail
       path (targeted test). A gate whose failure arm no test exercises
-      is dead code until proven otherwise.
+      is dead code until proven otherwise — and the failing input must
+      reach the gate THROUGH THE PUBLIC ENTRY POINT, not by calling the
+      guard function directly. Deserialization layers can destroy the
+      evidence before a post-hoc guard runs: serde_json's f64 visitor
+      converts a nested `.nan` to `null` during untagged buffering, so a
+      "reject non-finite" walk over the deserialized value could never
+      fire (the `first_non_finite` finding on the Notion PR — the fix
+      captures `serde_yaml::Value` and converts fallibly where the
+      evidence still exists).
 - [ ] Error tests assert the full identity (column/path/page/row/
       expected/found-kind) and that the offending VALUE never appears.
 - [ ] Negative-space guards for every "this deliberately doesn't

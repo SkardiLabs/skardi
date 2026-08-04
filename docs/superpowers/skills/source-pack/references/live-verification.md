@@ -55,6 +55,41 @@ accept it explicitly.
   the tables (e.g. for Notion: share a page and a database with the
   integration).
 
+### OAuth providers: the credential is a flow, and scopes are not the only gate
+
+For `authTypes: ["oauth2"]` providers the setup is heavier than an API
+key, and the Feishu pack's live pass (skardi PR #186) hit every trap in
+sequence — expect them:
+
+- **The flow**: the user creates the provider app themselves and
+  registers the gateway's redirect URI (`http://localhost:3000/oauth/callback`);
+  the user runs `PUT /api/oauth/configs/<service>` with
+  `{clientId, clientSecret}` from their env; then
+  `POST /api/oauth/authorizations {"service": "<service>"}` returns an
+  `authorizationUrl` the USER opens in a browser. You never touch the
+  secret or the browser session.
+- **The gateway may request an un-satisfiable scope set.** Providers
+  that build their OAuth scope list as the union of every action's
+  permissions can exceed what any real app enables (Feishu rejects the
+  authorize request outright, error 20027). Narrowing may require a
+  clearly-marked local patch to the provider definition plus an
+  upstream issue — precedent: oomol-lab/open-connector#267.
+- **Scopes granted ≠ scopes the API accepts.** A read can 401 with the
+  gateway-declared scopes present in the token: the provider error
+  often names the ACTUAL required scope, and the gateway's
+  `requiredScopes` metadata is then the bug (Feishu's 99991679 named
+  `im:message:readonly` while the actions declared `*.get_as_user` —
+  oomol-lab/open-connector#268). Read the provider's own error before
+  suspecting your pack.
+- **Capability gates sit beyond scopes entirely**: app-level abilities
+  (Feishu's bot capability, 232025) and tenant-admin approval of
+  high-sensitivity permissions are enforced independently of the OAuth
+  grant. Budget for console round-trips with the user.
+- **Every scope/permission change needs a FRESH token** — a
+  user_access_token snapshots its grants at authorization time, so
+  re-run the authorization after any change rather than debugging a
+  stale token.
+
 ## 1. Probe every action with real inputs first
 
 Before involving Skardi, call each chosen action directly
@@ -70,7 +105,20 @@ scratch directory (they become the fixture sources in §4). Check:
 - the real pagination envelope: force multi-page with a small page size
   (`pageSize: 1`) and confirm the continuation token appears where the
   pack's `next_cursor_path` / totals path expects it, and terminates on
-  the documented spelling.
+  the documented spelling;
+- **the declared input bounds, at the boundary**: send the pack's exact
+  page size and the schema's declared maximum — declared caps can
+  exceed the wire's (Feishu's `im/v1/messages` declares 100, hard-fails
+  above 50 with 99992402; skardi PR #186 shipped the corrected 50, and
+  oomol-lab/open-connector#269/#271 fixed the schema upstream);
+- **the termination signal on the REAL final page**: fetch to the end,
+  then deliberately follow whatever token the last page returns. Some
+  providers answer the final page with `has_more: false` beside a
+  NON-empty token (Feishu wiki's `"0||…"`), so null-token termination
+  refetches a finished scan and trips the loop guard — declare
+  `has_more_path` when the envelope carries an authoritative has-more
+  boolean, and pin the live shape with an e2e
+  (oomol-lab/open-connector#270 tracks the upstream normalization).
 
 ## 2. Diff real rows against the mapped columns — both directions
 
