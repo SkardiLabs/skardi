@@ -159,8 +159,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Install Rust
-        # Version comes from rust-toolchain.toml.
-        run: rustup toolchain install --component llvm-tools-preview
+        # Version comes from rust-toolchain.toml. Components are listed here
+        # rather than in the toolchain file so the Docker build doesn't pull
+        # them: rustfmt for `cargo fmt`, llvm-tools-preview for coverage.
+        # Runners install fresh pinned toolchains with the minimal profile,
+        # which includes neither.
+        run: rustup toolchain install --component llvm-tools-preview,rustfmt
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: install nextest
