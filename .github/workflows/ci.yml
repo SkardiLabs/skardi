@@ -24,7 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # No toolchain argument: rustup installs the version pinned in
+        # rust-toolchain.toml, keeping CI in lockstep with the Docker build.
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
@@ -157,7 +159,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Install Rust
-        run: rustup toolchain install stable --component llvm-tools-preview
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install --component llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: install nextest
