@@ -106,8 +106,9 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Install Rust
+        # Version comes from rust-toolchain.toml.
         run: |
-          rustup toolchain install stable
+          rustup toolchain install
           rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -273,7 +274,8 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust
-        run: rustup toolchain install stable
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 

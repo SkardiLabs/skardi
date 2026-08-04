@@ -31,7 +31,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # No toolchain argument: rustup installs the version pinned in
+        # rust-toolchain.toml, keeping CI in lockstep with the Docker build.
+        run: rustup toolchain install
 
       - name: Cache cargo registry
         uses: actions/cache@v4

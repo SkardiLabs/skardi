@@ -1,0 +1,8 @@
+# Single source of truth for the Rust version used by local dev, CI, and the
+# Docker image build. rustup resolves this file automatically for any cargo or
+# rustup invocation inside the repo, so all environments build with the same
+# compiler. Keep the builder tag in Dockerfile in sync when bumping: a matching
+# tag only avoids a toolchain download at image-build time — correctness comes
+# from this file either way.
+[toolchain]
+channel = "1.96.1"

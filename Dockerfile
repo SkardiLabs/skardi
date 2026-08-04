@@ -1,5 +1,8 @@
 # Build stage
-FROM rust:1.94.0-slim AS builder
+# The Rust version is pinned by rust-toolchain.toml (copied in with the source),
+# which rustup honors even if this tag drifts. Keep the tag matching the pin so
+# the build uses the preinstalled toolchain instead of downloading one.
+FROM rust:1.96.1-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \

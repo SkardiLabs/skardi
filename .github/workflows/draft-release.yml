@@ -62,7 +62,8 @@ jobs:
           echo "Next version: v${NEXT}-rc.${RC_NUM}"
 
       - name: Install Rust
-        run: rustup toolchain install stable
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install
 
       - name: Bump version in Cargo.toml and open PR
         id: pr
