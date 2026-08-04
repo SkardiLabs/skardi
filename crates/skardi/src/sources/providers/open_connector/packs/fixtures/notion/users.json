@@ -1,0 +1,47 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "user",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "Redacted Name",
+      "avatar_url": null,
+      "type": "person",
+      "person": {
+        "email": "redacted@example.test",
+        "email_verified": true
+      }
+    },
+    {
+      "object": "user",
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "Redacted Name",
+      "avatar_url": "https://img.example/redacted.png",
+      "type": "bot",
+      "bot": {}
+    },
+    {
+      "object": "user",
+      "id": "00000000-0000-4000-8000-000000000003",
+      "name": "Redacted Name",
+      "avatar_url": null,
+      "type": "bot",
+      "bot": {
+        "owner": {
+          "type": "workspace",
+          "workspace": true
+        },
+        "workspace_name": "Redacted Workspace",
+        "workspace_id": "00000000-0000-4000-8000-000000000004",
+        "workspace_limits": {
+          "max_file_upload_size_in_bytes": 5242880
+        }
+      }
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false,
+  "type": "user",
+  "user": {},
+  "request_id": "00000000-0000-4000-8000-000000000005"
+}

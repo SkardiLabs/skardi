@@ -1,0 +1,186 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "data_source",
+      "id": "00000000-0000-4000-8000-000000000007",
+      "cover": null,
+      "icon": {
+        "type": "icon",
+        "icon": {
+          "name": "Redacted Name",
+          "color": "lightgray"
+        }
+      },
+      "created_time": "2023-09-12T07:34:00.000Z",
+      "created_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "last_edited_by": {
+        "object": "user",
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "last_edited_time": "2026-08-03T03:24:00.000Z",
+      "title": [
+        {
+          "type": "text",
+          "text": {
+            "content": "Redacted text",
+            "link": null
+          },
+          "annotations": {
+            "bold": false,
+            "italic": false,
+            "strikethrough": false,
+            "underline": false,
+            "code": false,
+            "color": "default"
+          },
+          "plain_text": "Redacted text",
+          "href": null
+        }
+      ],
+      "description": [
+        {
+          "type": "text",
+          "text": {
+            "content": "Redacted text",
+            "link": null
+          },
+          "annotations": {
+            "bold": false,
+            "italic": false,
+            "strikethrough": false,
+            "underline": false,
+            "code": false,
+            "color": "default"
+          },
+          "plain_text": "Redacted text",
+          "href": null
+        },
+        {
+          "type": "text",
+          "text": {
+            "content": "Redacted text",
+            "link": null
+          },
+          "annotations": {
+            "bold": false,
+            "italic": false,
+            "strikethrough": false,
+            "underline": false,
+            "code": true,
+            "color": "default"
+          },
+          "plain_text": "Redacted text",
+          "href": null
+        },
+        {
+          "type": "text",
+          "text": {
+            "content": "Redacted text",
+            "link": null
+          },
+          "annotations": {
+            "bold": false,
+            "italic": false,
+            "strikethrough": false,
+            "underline": false,
+            "code": false,
+            "color": "default"
+          },
+          "plain_text": "Redacted text",
+          "href": null
+        }
+      ],
+      "is_inline": false,
+      "properties": {
+        "Date Created": {
+          "id": "prop1",
+          "name": "Redacted Name",
+          "description": null,
+          "type": "created_time",
+          "created_time": {}
+        },
+        "Status": {
+          "id": "prop2",
+          "name": "Redacted Name",
+          "description": null,
+          "type": "status",
+          "status": {
+            "options": [
+              {
+                "id": "prop3",
+                "name": "Redacted Name",
+                "color": "red",
+                "description": null
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000011",
+                "name": "Redacted Name",
+                "color": "blue",
+                "description": null
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000018",
+                "name": "Redacted Name",
+                "color": "green",
+                "description": null
+              }
+            ],
+            "groups": [
+              {
+                "id": "00000000-0000-4000-8000-000000000019",
+                "name": "Redacted Name",
+                "color": "gray",
+                "option_ids": [
+                  "1"
+                ]
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000020",
+                "name": "Redacted Name",
+                "color": "blue",
+                "option_ids": [
+                  "00000000-0000-4000-8000-000000000011"
+                ]
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000021",
+                "name": "Redacted Name",
+                "color": "green",
+                "option_ids": [
+                  "00000000-0000-4000-8000-000000000018"
+                ]
+              }
+            ]
+          }
+        },
+        "Name": {
+          "id": "title",
+          "name": "Redacted Name",
+          "description": null,
+          "type": "title",
+          "title": {}
+        }
+      },
+      "parent": {
+        "type": "database_id",
+        "database_id": "00000000-0000-4000-8000-000000000008"
+      },
+      "database_parent": {
+        "type": "workspace",
+        "workspace": true
+      },
+      "url": "https://app.notion.com/p/Redacted-00000000000040008000000000000022",
+      "public_url": null,
+      "in_trash": false
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false,
+  "type": "page_or_data_source",
+  "page_or_data_source": {},
+  "request_id": "00000000-0000-4000-8000-000000000023"
+}

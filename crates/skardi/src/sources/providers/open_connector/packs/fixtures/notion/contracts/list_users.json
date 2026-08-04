@@ -1,0 +1,100 @@
+{
+  "type": "object",
+  "properties": {
+    "object": {
+      "const": "list",
+      "type": "string",
+      "description": "The Notion object type."
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "object": {
+            "const": "user",
+            "type": "string",
+            "description": "The Notion object type."
+          },
+          "id": {
+            "type": "string",
+            "description": "The Notion user ID."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The user's display name."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The user's avatar URL."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "person",
+              "bot"
+            ],
+            "description": "The user type."
+          },
+          "person": {
+            "type": "object",
+            "properties": {
+              "email": {
+                "type": "string",
+                "description": "The person's email address.",
+                "format": "email"
+              }
+            },
+            "additionalProperties": true
+          },
+          "bot": {
+            "type": "object",
+            "additionalProperties": {
+              "description": "A Notion API field value."
+            },
+            "description": "A Notion API object."
+          }
+        },
+        "additionalProperties": true,
+        "description": "A Notion user object."
+      },
+      "description": "Returned Notion objects."
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Cursor for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "has_more": {
+      "type": "boolean",
+      "description": "Whether more results are available."
+    }
+  },
+  "additionalProperties": true,
+  "required": [
+    "object",
+    "results",
+    "has_more"
+  ],
+  "description": "Workspace users returned by Notion."
+}

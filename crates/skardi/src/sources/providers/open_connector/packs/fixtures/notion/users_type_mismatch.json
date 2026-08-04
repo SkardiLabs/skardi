@@ -1,0 +1,8 @@
+{
+  "object": "list",
+  "results": [
+    { "object": "user", "id": "u-0001", "name": "Ada Lovelace", "type": "person" },
+    { "object": "user", "id": 2, "name": "Broken", "type": "person" }
+  ],
+  "next_cursor": null, "has_more": false
+}

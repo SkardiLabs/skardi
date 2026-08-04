@@ -1,0 +1,143 @@
+{
+  "type": "object",
+  "properties": {
+    "object": {
+      "const": "list",
+      "type": "string",
+      "description": "The Notion object type."
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "object": {
+                "const": "page",
+                "type": "string",
+                "description": "The Notion object type."
+              },
+              "id": {
+                "type": "string",
+                "description": "The page ID."
+              },
+              "created_time": {
+                "type": "string",
+                "description": "The time when the page was created.",
+                "format": "date-time"
+              },
+              "last_edited_time": {
+                "type": "string",
+                "description": "The time when the page was last edited.",
+                "format": "date-time"
+              },
+              "parent": {
+                "type": "object",
+                "additionalProperties": {
+                  "description": "A Notion API field value."
+                },
+                "description": "The official Notion parent object."
+              },
+              "properties": {
+                "type": "object",
+                "additionalProperties": {
+                  "description": "A Notion API field value."
+                },
+                "description": "Notion properties keyed by property name."
+              },
+              "url": {
+                "type": "string",
+                "description": "The canonical Notion URL for the page.",
+                "format": "uri"
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Whether the page is archived."
+              },
+              "in_trash": {
+                "type": "boolean",
+                "description": "Whether the page is in the trash."
+              }
+            },
+            "additionalProperties": true,
+            "description": "A Notion page object."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "object": {
+                "const": "data_source",
+                "type": "string",
+                "description": "The Notion object type."
+              },
+              "id": {
+                "type": "string",
+                "description": "The data source ID."
+              },
+              "title": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "description": "A Notion API field value."
+                  },
+                  "description": "A Notion API object."
+                },
+                "description": "Notion rich text objects."
+              },
+              "properties": {
+                "type": "object",
+                "additionalProperties": {
+                  "description": "A Notion API field value."
+                },
+                "description": "Notion properties keyed by property name."
+              },
+              "parent": {
+                "type": "object",
+                "additionalProperties": {
+                  "description": "A Notion API field value."
+                },
+                "description": "The official Notion parent object."
+              },
+              "url": {
+                "type": "string",
+                "description": "The canonical Notion URL for the data source.",
+                "format": "uri"
+              },
+              "in_trash": {
+                "type": "boolean",
+                "description": "Whether the data source is in the trash."
+              }
+            },
+            "additionalProperties": true,
+            "description": "A Notion data source object."
+          }
+        ]
+      },
+      "description": "Returned Notion objects."
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Cursor for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "has_more": {
+      "type": "boolean",
+      "description": "Whether more results are available."
+    }
+  },
+  "additionalProperties": true,
+  "required": [
+    "object",
+    "results",
+    "has_more"
+  ],
+  "description": "Search results returned by Notion."
+}

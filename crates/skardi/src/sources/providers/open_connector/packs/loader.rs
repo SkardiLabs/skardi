@@ -106,15 +106,32 @@ fn convert_table(
         // YAML happily parses `.nan` / `.inf` / `-.inf`, but JSON has no
         // spelling for them — FixedValue::to_json would silently send null
         // at query time, bypassing the startup diagnostic this loader
-        // promises. Finite-only, enforced here.
-        if let FixedValueDoc::Float(v) = &value
-            && !v.is_finite()
-        {
-            return Err(format!(
-                "{id}: fixed input '{key}' is {v}, which has no JSON spelling;                  pin a finite number"
-            ));
-        }
-        fixed_inputs.push((leak_str(key), value.into_fixed()));
+        // promises. Finite-only, enforced here. The nested case CANNOT be
+        // checked after the fact on a `serde_json::Value`: serde_json's
+        // f64 visitor maps a non-finite to `Value::Null` during
+        // deserialization (`Number::from_f64(...).map_or(Value::Null, …)`),
+        // so the loss has already happened by then — which is why the
+        // `Json` variant captures `serde_yaml::Value` and converts here,
+        // where the non-finite is still observable.
+        let fixed = match value {
+            FixedValueDoc::Float(v) if !v.is_finite() => {
+                return Err(format!(
+                    "{id}: fixed input '{key}' contains {v}, which has no JSON \
+                     spelling; pin finite numbers only"
+                ));
+            }
+            FixedValueDoc::Bool(v) => FixedValue::Bool(v),
+            FixedValueDoc::Int(v) => FixedValue::Int(v),
+            FixedValueDoc::Float(v) => FixedValue::Float(v),
+            FixedValueDoc::Str(v) => FixedValue::Str(leak_str(v)),
+            FixedValueDoc::StrList(v) => FixedValue::StrList(leak_str_slice(v)),
+            FixedValueDoc::Json(v) => {
+                let json = yaml_to_json(v)
+                    .map_err(|reason| format!("{id}: fixed input '{key}' {reason}"))?;
+                FixedValue::Json(Box::leak(Box::new(json)))
+            }
+        };
+        fixed_inputs.push((leak_str(key), fixed));
     }
     let table = SourcePackTable {
         id,
@@ -490,18 +507,68 @@ enum FixedValueDoc {
     Float(f64),
     Str(String),
     StrList(Vec<String>),
+    /// Object-shaped inputs (e.g. Notion's search `filter`). Captured as a
+    /// YAML value — NOT `serde_json::Value`, whose f64 visitor converts a
+    /// nested `.nan`/`.inf` to `Value::Null` during deserialization,
+    /// destroying the evidence before any guard can run — and converted
+    /// fallibly by [`yaml_to_json`] at the call site, where non-finite
+    /// floats, non-string mapping keys, and YAML tags are rejected with
+    /// targeted messages.
+    Json(serde_yaml::Value),
 }
 
-impl FixedValueDoc {
-    fn into_fixed(self) -> FixedValue {
-        match self {
-            Self::Bool(v) => FixedValue::Bool(v),
-            Self::Int(v) => FixedValue::Int(v),
-            Self::Float(v) => FixedValue::Float(v),
-            Self::Str(v) => FixedValue::Str(leak_str(v)),
-            Self::StrList(v) => FixedValue::StrList(leak_str_slice(v)),
+/// Convert a YAML value to JSON, rejecting everything JSON cannot spell:
+/// non-finite floats (`.nan` / `.inf` / `-.inf`, which `serde_json` would
+/// silently write as `null`), non-string mapping keys, and YAML tags. The
+/// error is a reason fragment; callers prefix the table/key identity.
+fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value, String> {
+    use serde_yaml::Value as Yaml;
+    Ok(match value {
+        Yaml::Null => serde_json::Value::Null,
+        Yaml::Bool(b) => serde_json::Value::from(b),
+        Yaml::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::from(i)
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::from(u)
+            } else {
+                let f = n.as_f64().unwrap_or(f64::NAN);
+                if !f.is_finite() {
+                    return Err(format!(
+                        "contains {f}, which has no JSON spelling; pin finite numbers only"
+                    ));
+                }
+                serde_json::Value::from(f)
+            }
         }
-    }
+        Yaml::String(s) => serde_json::Value::from(s),
+        Yaml::Sequence(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(yaml_to_json)
+                .collect::<Result<_, _>>()?,
+        ),
+        Yaml::Mapping(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                let Yaml::String(k) = k else {
+                    return Err(
+                        "contains a non-string mapping key, which JSON cannot represent"
+                            .to_string(),
+                    );
+                };
+                out.insert(k, yaml_to_json(v)?);
+            }
+            serde_json::Value::Object(out)
+        }
+        // Unreachable through the untagged FixedValueDoc path (serde's
+        // untagged buffering rejects tags during deserialization, pinned by
+        // the loader test), kept as defense in depth for any future direct
+        // caller.
+        Yaml::Tagged(_) => {
+            return Err("contains a YAML tag, which JSON cannot represent".to_string());
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -560,12 +627,50 @@ mod tests {
             ("mock.yaml", include_str!("mock.yaml")),
             ("github.yaml", include_str!("github.yaml")),
             ("slack.yaml", include_str!("slack.yaml")),
+            ("notion.yaml", include_str!("notion.yaml")),
         ] {
             // parse_pack performs the full structural + cross-field
             // validation pass itself; parsing IS the gate.
             let pack = parse_pack(yaml).unwrap_or_else(|e| panic!("{asset}: {e}"));
             assert!(!pack.tables.is_empty(), "{asset}: no tables");
         }
+    }
+
+    /// The pass side of the nested-value conversion: a finite nested float
+    /// (and the rest of the JSON scalar set) survives the YAML→JSON
+    /// conversion faithfully — proving the strict rejection above is a
+    /// guard, not a ban on nesting.
+    #[test]
+    fn nested_finite_values_in_a_json_pin_convert_faithfully() {
+        let pack = parse_pack(
+            r#"kind: pack
+pack: demo
+version: 1
+tables:
+  things:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      filter:
+        threshold: 1.5
+        flags: [true, 2, "three"]
+        inner: { level: null }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("nested finite values are legal");
+        let (key, value) = &pack.tables[0].fixed_inputs[0];
+        assert_eq!(*key, "filter");
+        assert_eq!(
+            value.to_json(),
+            serde_json::json!({
+                "threshold": 1.5,
+                "flags": [true, 2, "three"],
+                "inner": { "level": null }
+            })
+        );
     }
 
     #[test]
@@ -782,6 +887,62 @@ tables:
     columns:
       - { name: id, path: id, type: uint64, nullable: false }"#,
                 "no JSON spelling",
+            ),
+            // NESTED non-finites, through the untagged Json variant. These
+            // are the regression for the dead first_non_finite guard: a
+            // `serde_json::Value` capture had already converted the nested
+            // `.nan` to null before any check could run (serde_json's f64
+            // visitor maps non-finite to Value::Null), so the pin silently
+            // became `{"threshold": null}`. The YAML capture keeps the
+            // non-finite observable and the conversion rejects it.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      filter:
+        threshold: .nan
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "no JSON spelling",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      filter:
+        bounds: [1.5, .inf]
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "no JSON spelling",
+            ),
+            // The other two YAML shapes JSON cannot spell, same variant.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      filter:
+        1: numeric-key
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "non-string mapping key",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    fixed_inputs:
+      filter:
+        payload: !custom tagged
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                // Rejected before yaml_to_json ever runs: serde's untagged
+                // buffering cannot represent a YAML tag, so deserialization
+                // itself fails — the Tagged arm in yaml_to_json is defense
+                // in depth behind this.
+                "do not support enum input",
             ),
             (
                 r#"    action: demo.list

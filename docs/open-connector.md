@@ -16,10 +16,12 @@ gateway **runtime token**.
 > **Status:** the shared foundation is complete, and the first real
 > provider packs have landed alongside the synthetic `mock` pack used by
 > the test suite: [GitHub](open-connector-github.md) (repositories, issues,
-> pull requests, reviews, commits, workflow runs, releases) and
+> pull requests, reviews, commits, workflow runs, releases),
 > [Slack](open-connector-slack.md) (conversations, users, files — message
-> tables are gated on upstream cursor support). Further
-> provider packs (Jira, Notion, …) ship one pack per release per the
+> tables are gated on upstream cursor support), and
+> [Notion](open-connector-notion.md) (users, pages, data sources, block
+> children — dynamic-schema rows are gated on binding-time schema
+> freeze). Further provider packs (Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.

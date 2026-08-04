@@ -250,7 +250,40 @@ event carrying the scan identity and error.
       zero required resources, UDTF parity for `slack.users`, and a two-page
       users cursor scan pinning that table's own wire declarations (`$.users`
       row path, `cursor`/`limit` inputs) independently of conversations'.
-- [ ] 5.3 Notion pack (explicit data-source binding, cursor pagination, dynamic properties with binding-time schema freeze): rows, pages, blocks, users
+- [x] 5.3 Notion pack (integration token, cursor pagination): `users`, `pages`,
+      `data_sources`, `block_children` as stable tables (`packs/notion.yaml`).
+      The wire contract is Open Connector's raw passthrough of the Notion API
+      (rows verbatim under `$.results`, native `$.next_cursor` envelope — null
+      terminates, `has_more` deliberately unused; camelCase strict inputs
+      `startCursor`/`pageSize`/`blockId`), reconciled against a live gateway.
+      `pages`/`data_sources` are two pinned views of `notion.search`: the
+      required `query` pinned to `""` plus per-table object `filter` pins —
+      which required the one engine extension this milestone adds,
+      **`FixedValue::Json`** (object-shaped fixed inputs, loader-parsed and
+      leaked, with the non-finite-float guard extended to nested values).
+      **No filter pushdown anywhere** (search's free-text relevance `query`
+      maps to no SQL predicate faithfully; the other actions declare no filter
+      inputs) — a wire guard test pins that requests carry exactly the declared
+      inputs. Dynamic property maps stay opaque JSON: the `rows` table over
+      `query_data_source` is deliberately absent pending the design's
+      binding-time schema freeze, and `block_children` excludes the
+      type-keyed payload (a fixed mapping cannot address a key named BY
+      `type`). `users` excludes `person.email` (capability-gated, privacy).
+      Fingerprints pinned from live capture (`fixtures/notion/contracts/`;
+      pages/data_sources share search's pin); the coverage-gap pin records
+      that search declares an EMPTY item schema, so both search tables'
+      columns ride additionalProperties passthrough. Live-verified: all four
+      tables register against a live gateway (pins match discovery) and every
+      scan reaches the credential wall with the exact pinned wire inputs
+      (`{"filter":{"property":"object","value":"page"},"query":"","pageSize":100}`
+      observed in the gateway's own run log). **Verification**: 260
+      open_connector tests (counted by `cargo test -p skardi --lib
+      sources::providers::open_connector`; 14 new) — four fixture contract
+      suites plus the schema-mismatch fixture, fingerprint sync + coverage
+      pins, drift-refusal e2e, and per-declaration e2e (users two-page cursor
+      with row identity, per-table search filter pins with an
+      exactly-the-declared-inputs guard, blockId resource forwarding +
+      pre-HTTP enforcement, LIMIT early-stop, UDTF parity).
 - [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
