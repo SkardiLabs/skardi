@@ -1,0 +1,29 @@
+# github × hybrid_search — the flagship chat-shaped recipe.
+#
+# `issues` on purpose, not `issue_comments`: the comments table cannot
+# carry repo-wide search against the real pack (its `issueNumber` is a
+# REQUIRED binding-time resource — one binding sees one issue — it has no
+# issue_number column for metadata, and it declares zero pushdowns). A
+# repo-wide comments table is pack-side future work (PRD §10, beside
+# slack.messages).
+#
+# timestamp: updated_at rides the pack's one real GtEq pushdown
+# (issues.updated_at → since) AND carries the edit-re-enters semantics
+# the design's refresh section (§6.8) assumes — an edited issue re-enters
+# the incremental window; with created_at it would be silently missed.
+kind: etl_recipe
+metadata:
+  pack: github
+  format: hybrid_search
+  version: 1
+spec:
+  tables:
+    issues:
+      roles:
+        id: number
+        content: body
+        title: title
+        author: author_login
+        timestamp: updated_at
+      metadata: [number, state]
+      incremental: auto

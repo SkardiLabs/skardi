@@ -1,0 +1,20 @@
+# mock × hybrid_search — keeps the whole generate → setup → job → search
+# path CI-testable with zero network. The mock pack's `items` shape maps
+# thinly but exercises every recipe feature: an id role, a content role,
+# a timestamp role WITHOUT a GtEq pushdown (so `incremental: auto`
+# resolves to full-load — the branch github's recipe never takes), and a
+# List<Utf8> metadata column (tags) through json_pack's array path.
+kind: etl_recipe
+metadata:
+  pack: mock
+  format: hybrid_search
+  version: 1
+spec:
+  tables:
+    items:
+      roles:
+        id: id
+        content: name
+        timestamp: created_at
+      metadata: [value, tags]
+      incremental: auto
