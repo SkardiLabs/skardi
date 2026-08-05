@@ -137,14 +137,14 @@ table, triggers), degrading vec0 to shape-only with an explicit warning
 when sqlite-vec isn't loadable — and hard-failing if a configured
 extension path fails to load.
 
-- [ ] 1b.5 `bundle.rs` — `Bundle` as `BTreeMap<RelPath, FileContents>`;
+- [x] 1b.5 `bundle.rs` — `Bundle` as `BTreeMap<RelPath, FileContents>`;
       one slug function feeding every artifact name (job files+names,
       pipeline files+names, ctx keys) with the 6-hex BLAKE3 suffix on
       lossy normalization; atomic write (stage in sibling
       `.etl-tmp-<pid>`, swap via rename, `.etl-bak-<pid>` under
       `--force` only, backup removed last; the between-renames crash
       window is documented and recoverable by one rename).
-- [ ] 1b.6 `validate.rs` — the four-gate valid-by-construction pipeline:
+- [x] 1b.6 `validate.rs` — the four-gate valid-by-construction pipeline:
       (1) loader round-trips through skardi's REAL job/pipeline/ctx
       loaders; (2) plan-check against a synthetic SessionContext (pack
       FieldMappings → MemTables, destination schema, real
@@ -155,6 +155,33 @@ extension path fails to load.
       the write is positional, so this assertion is the generator's own
       invariant, nobody else's; (3) dialect `validate_ddl`; (4)
       debug-build double-render byte-equality.
+
+**1b.5–1b.6 verification**: 37 `etl::` tests green (876 lib tests with
+`--features chunking`; 854 default — `validate` and generation are
+feature-gated because the plan-check registers the REAL `chunk_parts`).
+Bundle: the flagship renders exactly the PRD §6.2 six-file tree;
+double-render is byte-identical; `write` refuses a non-empty dir without
+`--force`, force-swaps cleanly, and leaves no `.etl-tmp-*`/`.etl-bak-*`
+siblings. Slug: identity on conforming names, 6-hex BLAKE3 suffix on any
+lossy normalization (`foo_bar` vs `foo-bar` stay distinct; case-only
+changes too). Validation: `generate_hybrid(flagship)` passes all four
+gates — real `JobDefinition`/`StandardPipeline` loaders round-trip the
+YAML against the synthetic context (pack FieldMapping MemTables under
+`saas.github_demo`, provider-derived destination schema under
+`gh_search.main`, real chunk/chunk_parts/json_pack/vec_to_binary, a
+volatile `candle` stub, dialect UDTF stubs), the ingest SELECT's planned
+`(name, type)` sequence equals the destination schema exactly, the DDL
+executes apply→re-apply→reset→re-apply in memory, and re-rendering is
+byte-equal. The order gate provably catches a swapped `source_table`/
+`source_id` projection that every other check would miss. Building the
+gate flushed out three real type bugs the executor's exact preflight
+would have hit at run time — all fixed in the dialect: SQL
+`CAST(… AS VARCHAR)`/concat plan as Utf8View (→ `arrow_cast(…, 'Utf8')`),
+`chunk_idx` Int32 vs INTEGER-column Int64 (→ `CAST(… AS BIGINT)`), and
+fts5's text-typed `doc_rowid` vs the vec arm's Int64 (→ CAST in the fts
+CTE). `created_at` is RFC 3339 TEXT on sqlite (no timestamp affinity;
+PRAGMA-derived schemas read Utf8), and the ctx fragment now matches the
+real `DataSource` model (`path` + `hierarchy_level: catalog`).
 
 ### 1c. The `skardi-etl` binary (`crates/skardi-etl`, new crate)
 

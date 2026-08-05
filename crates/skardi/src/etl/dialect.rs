@@ -12,6 +12,8 @@
 //! [`resolve_dialect`] answers them with the FR-5 capability refusal so a
 //! config naming them fails early with the engines that WOULD work.
 
+use arrow::datatypes::SchemaRef;
+
 use super::config::{EngineKind, EtlConfig, TargetFormatKind};
 use super::format::HybridPlan;
 
@@ -73,6 +75,21 @@ pub trait EngineDialect {
     /// `spec.destination.table` — engine-specific (the sqlite provider
     /// registers its file under `<catalog>.main`).
     fn destination_table(&self, config: &EtlConfig) -> String;
+
+    /// The destination table as the ENGINE'S provider will expose it to
+    /// DataFusion at run time (sqlite: PRAGMA-derived — `rid` Int64
+    /// leading, declared TEXT → Utf8, BLOB → Binary). The plan-check
+    /// registers this as a MemTable and asserts the ingest SELECT's
+    /// planned `(name, type)` sequence equals it — the positional-INSERT
+    /// invariant checked on PLANNED schemas, not rendered strings.
+    fn planned_destination_schema(&self, config: &EtlConfig) -> SchemaRef;
+
+    /// The engine's search UDTFs as the plan-check must stub them:
+    /// `(function name, result schema)`, mirroring the real functions'
+    /// planned schemas over this bundle's mirror tables (sqlite_knn:
+    /// non-vector mirror columns + `_score Float64`; sqlite_fts: all
+    /// mirror columns as Utf8 + `_score`).
+    fn udtf_stubs(&self, config: &EtlConfig) -> Vec<(&'static str, SchemaRef)>;
 }
 
 /// Resolve the config's engine to a dialect, enforcing the capability

@@ -25,10 +25,14 @@
 //! mirrors carry INSERT triggers only — there is nothing to update or
 //! delete outside `--reset`, which drops every bundle-owned artifact.
 
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use tokio_rusqlite::rusqlite;
+
 use super::super::config::EtlConfig;
 use super::super::dialect::{Capabilities, EngineDialect};
 use super::super::format::{DOCUMENT_COLUMNS, DocColumnKind, HybridPlan, IngestPlan};
-use tokio_rusqlite::rusqlite;
 
 pub struct SqliteDialect;
 
@@ -193,7 +197,11 @@ impl EngineDialect for SqliteDialect {
              \x20     {knn_n})\n\
              ),\n\
              fts AS (\n\
-             \x20 SELECT doc_rowid AS rid, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk\n\
+             \x20 -- fts5 columns read back as TEXT through the provider (PRAGMA\n\
+             \x20 -- reports empty types), so the rowid rides home as a string —\n\
+             \x20 -- cast it back before it meets the vec arm's Int64.\n\
+             \x20 SELECT CAST(doc_rowid AS BIGINT) AS rid,\n\
+             \x20        ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk\n\
              \x20 FROM sqlite_fts('{fts}', 'content', {{text_query}}, {fts_n})\n\
              ),\n\
              ranked AS (\n\
@@ -278,6 +286,48 @@ impl EngineDialect for SqliteDialect {
     fn destination_table(&self, config: &EtlConfig) -> String {
         Self::qualified(config, "documents")
     }
+
+    fn planned_destination_schema(&self, _config: &EtlConfig) -> SchemaRef {
+        // What read_schema_from_pragma will derive from the setup DDL:
+        // INTEGER → Int64 (rid, chunk_index), TEXT → Utf8 (including
+        // created_at — sqlite has no timestamp type), BLOB → Binary.
+        let mut fields = vec![Field::new("rid", DataType::Int64, true)];
+        for col in DOCUMENT_COLUMNS {
+            let dt = match col.kind {
+                DocColumnKind::Utf8 | DocColumnKind::Json | DocColumnKind::TimestampMs => {
+                    DataType::Utf8
+                }
+                DocColumnKind::Int32 => DataType::Int64,
+                DocColumnKind::Vector => DataType::Binary,
+            };
+            fields.push(Field::new(col.name, dt, col.nullable));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    fn udtf_stubs(&self, _config: &EtlConfig) -> Vec<(&'static str, SchemaRef)> {
+        vec![
+            // sqlite_knn over documents_vec: non-vector columns + _score.
+            // The vec0 rowid alias reads back Int64 (pk with empty type).
+            (
+                "sqlite_knn",
+                Arc::new(Schema::new(vec![
+                    Field::new("doc_rowid", DataType::Int64, true),
+                    Field::new("_score", DataType::Float64, true),
+                ])),
+            ),
+            // sqlite_fts over documents_fts: fts5 columns all read back as
+            // TEXT (hence the CAST in search_sql's fts arm) + _score.
+            (
+                "sqlite_fts",
+                Arc::new(Schema::new(vec![
+                    Field::new("content", DataType::Utf8, true),
+                    Field::new("doc_rowid", DataType::Utf8, true),
+                    Field::new("_score", DataType::Float64, true),
+                ])),
+            ),
+        ]
+    }
 }
 
 /// One setup statement plus what executing it requires, so
@@ -302,9 +352,11 @@ fn setup_statements(dims: u32) -> Vec<SetupStatement> {
         let sql_type = match col.kind {
             DocColumnKind::Utf8 | DocColumnKind::Json => "TEXT",
             DocColumnKind::Int32 => "INTEGER",
-            // SQLite has no timestamp type; the provider maps declared
-            // TIMESTAMP columns to Arrow timestamps.
-            DocColumnKind::TimestampMs => "TIMESTAMP",
+            // TEXT, honestly: SQLite has no timestamp type, and the provider
+            // derives Arrow schemas from PRAGMA table_info (a declared
+            // TIMESTAMP would read back as Utf8 anyway). The ingest SELECT
+            // writes RFC 3339 UTC text, which sorts chronologically.
+            DocColumnKind::TimestampMs => "TEXT",
             DocColumnKind::Vector => "BLOB",
         };
         let not_null = if col.nullable { "" } else { " NOT NULL" };
@@ -385,23 +437,28 @@ fn setup_statements(dims: u32) -> Vec<SetupStatement> {
 fn render_ingest_select(ingest: &IngestPlan, embedding_model: &str) -> String {
     let short = &ingest.source_table;
     let id = &ingest.id_column;
+    // arrow_cast(…, 'Utf8'), never CAST(… AS VARCHAR): DataFusion's SQL
+    // layer maps VARCHAR (and string concatenation) to Utf8View, while the
+    // provider-derived destination schema is plain Utf8 — and the
+    // executor's type preflight compares them verbatim.
     let title = match &ingest.title_column {
         Some(col) => format!("u.{col}"),
-        None => "CAST(NULL AS VARCHAR)".to_string(),
+        None => "arrow_cast(NULL, 'Utf8')".to_string(),
     };
     let author = match &ingest.author_column {
         Some(col) => format!("u.{col}"),
-        None => "CAST(NULL AS VARCHAR)".to_string(),
+        None => "arrow_cast(NULL, 'Utf8')".to_string(),
     };
+    // ISO-8601 text: SQLite has no timestamp type and the provider derives
+    // the destination schema from PRAGMA table_info, so created_at reads
+    // back as Utf8 — the SELECT must produce Utf8 too. RFC 3339 in one
+    // timezone sorts lexicographically = chronologically.
     let created_at = match &ingest.timestamp_column {
-        Some(col) => format!("u.{col}"),
-        // Exact-type NULL so the planned schema matches the destination's
-        // Timestamp(ms, UTC) — a bare CAST(NULL AS TIMESTAMP) is
-        // nanosecond-typed and would fail the order/type assertion.
-        None => "arrow_cast(NULL, 'Timestamp(Millisecond, Some(\"UTC\"))')".to_string(),
+        Some(col) => format!("arrow_cast(u.{col}, 'Utf8')"),
+        None => "arrow_cast(NULL, 'Utf8')".to_string(),
     };
     let metadata = if ingest.metadata_columns.is_empty() {
-        "CAST(NULL AS VARCHAR)".to_string()
+        "arrow_cast(NULL, 'Utf8')".to_string()
     } else {
         let args = ingest
             .metadata_columns
@@ -430,13 +487,15 @@ fn render_ingest_select(ingest: &IngestPlan, embedding_model: &str) -> String {
     format!(
         "SELECT\n\
          \x20 CAST(NULL AS BIGINT)                                    AS rid,\n\
-         \x20 '{short}:' || CAST(u.{id} AS VARCHAR) || ':'\n\
-         \x20   || CAST(u.part['chunk_idx'] AS VARCHAR)               AS doc_id,\n\
+         \x20 arrow_cast('{short}:' || arrow_cast(u.{id}, 'Utf8') || ':'\n\
+         \x20   || arrow_cast(u.part['chunk_idx'], 'Utf8'), 'Utf8')   AS doc_id,\n\
          \x20 '{short}'                                               AS source_table,\n\
-         \x20 CAST(u.{id} AS VARCHAR)                                 AS source_id,\n\
+         \x20 arrow_cast(u.{id}, 'Utf8')                              AS source_id,\n\
          \x20 {title}                                                 AS title,\n\
          \x20 u.part['chunk_text']                                    AS content,\n\
-         \x20 u.part['chunk_idx']                                     AS chunk_index,\n\
+         \x20 -- BIGINT: the INTEGER destination column reads back as Int64 and\n\
+         \x20 -- the executor's type preflight is exact (chunk_idx is Int32).\n\
+         \x20 CAST(u.part['chunk_idx'] AS BIGINT)                     AS chunk_index,\n\
          \x20 {author}                                                AS author,\n\
          \x20 {created_at}                                            AS created_at,\n\
          \x20 {metadata}                                              AS metadata,\n\
@@ -501,7 +560,7 @@ spec:
             "content TEXT NOT NULL",
             "chunk_index INTEGER NOT NULL",
             "author TEXT",
-            "created_at TIMESTAMP",
+            "created_at TEXT",
             "metadata TEXT",
             "embedding BLOB NOT NULL",
         ] {
@@ -575,6 +634,14 @@ spec:
         );
         assert!(sql.contains("u.part['chunk_text']"), "{sql}");
 
+        // Exact-type discipline against the PRAGMA-derived destination
+        // schema (the executor's preflight compares types verbatim):
+        // Int32 chunk ordinal → Int64 column; timestamp → RFC 3339 text —
+        // via arrow_cast, because SQL VARCHAR would plan as Utf8View.
+        assert!(sql.contains("CAST(u.part['chunk_idx'] AS BIGINT)"), "{sql}");
+        assert!(sql.contains("arrow_cast(u.updated_at, 'Utf8')"), "{sql}");
+        assert!(!sql.contains("AS VARCHAR)"), "no Utf8View leaks: {sql}");
+
         // Incremental: the pack pushdown rides the timestamp column, and
         // {limit} is KEPT (first-backfill bound).
         assert!(sql.contains("WHERE updated_at >= {since}"), "{sql}");
@@ -608,6 +675,9 @@ spec:
             sql.contains("JOIN gh_search.main.documents d ON d.rid = r.rid"),
             "{sql}"
         );
+        // The fts arm's doc_rowid reads back as TEXT (fts5 via PRAGMA);
+        // without this cast the FULL OUTER JOIN mixes Utf8 and Int64.
+        assert!(sql.contains("CAST(doc_rowid AS BIGINT) AS rid"), "{sql}");
         assert!(
             sql.contains("PARTITION BY d.doc_id ORDER BY r.rrf_score DESC"),
             "read-time doc_id dedup: {sql}"

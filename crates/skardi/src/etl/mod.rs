@@ -30,6 +30,11 @@ pub mod dialect;
 pub mod dialects;
 pub mod format;
 pub mod recipe;
+// The generator's validation gates plan real `chunk_parts` SQL, so they
+// (and the generate entry point) require the chunking feature — a
+// plan-check against a stub splitter would be theater.
+#[cfg(feature = "chunking")]
+pub mod validate;
 
 pub use bundle::{Bundle, render_hybrid_bundle, slug};
 pub use config::EtlConfig;
