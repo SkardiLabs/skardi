@@ -70,7 +70,7 @@ refuse. Registered on both server session contexts.
 
 ### 1b. The etl library (`crates/skardi/src/etl/`), bottom-up
 
-- [ ] 1b.1 `config.rs` — `kind: etl` envelope, strict parsing
+- [x] 1b.1 `config.rs` — `kind: etl` envelope, strict parsing
       (`deny_unknown_fields` everywhere), cross-field validation:
       `embedding`/`chunking` required for hybrid_search and rejected for
       okf, `overlap < size`, `dimensions > 0`, engine-specific
@@ -78,7 +78,7 @@ refuse. Registered on both server session contexts.
       `{host, port, database, user_env, pass_env}` — env var NAMES only;
       sqlite `{extensions_env}`), binding is `catalog.schema`, slug
       source `metadata.name` non-empty.
-- [ ] 1b.2 `recipe.rs` — recipe loader (same strictness), role typing
+- [x] 1b.2 `recipe.rs` — recipe loader (same strictness), role typing
       (`id` → non-null column; `content` exactly one, Utf8-family;
       `timestamp` → timestamp type; `title`/`author` nullable),
       `incremental: auto | full` (auto = the timestamp-role column has a
@@ -91,7 +91,7 @@ refuse. Registered on both server session contexts.
       express repo-wide search). Contract suite walks every embedded
       recipe against `SourcePackRegistry::packs()` column-by-column —
       pack drift fails the build.
-- [ ] 1b.3 `format.rs` — `TargetFormat` trait + `hybrid_search`
+- [x] 1b.3 `format.rs` — `TargetFormat` trait + `hybrid_search`
       implementation producing engine-neutral plans: the 10-column
       `documents` table (design's exact order — doc_id, source_table,
       source_id, title, content, chunk_index, author, created_at,
@@ -103,7 +103,7 @@ refuse. Registered on both server session contexts.
       source_table/source_id/chunk_index/doc_id per hit +
       read-time `doc_id` dedup; `<slug>-get-document` by
       `(source_table, source_id)` ordered by chunk_index).
-- [ ] 1b.4 `dialect.rs` + `dialects/sqlite.rs` — `EngineDialect` trait
+- [x] 1b.4 `dialect.rs` + `dialects/sqlite.rs` — `EngineDialect` trait
       (embedding expr, fts/knn call builders taking the FULL per-engine
       argument set, ingest SELECT rendering, ctx fragment, capabilities,
       `validate_ddl`/`apply_ddl`/`reset`). SQLite dialect: fts5
@@ -116,6 +116,27 @@ refuse. Registered on both server session contexts.
       in-memory connection (the strongest check in the matrix),
       `--reset` = `DROP … IF EXISTS` every bundle-owned artifact +
       re-apply; plain re-apply is a no-op (`IF NOT EXISTS` throughout).
+**1b.1–1b.4 verification**: 24 `etl::` tests green inside the 855-test
+lib suite. Config: the design's normative §6.1 example parses verbatim;
+13 table-driven cross-field rejections + 5 unknown-key probes each name
+the offending field. Recipes: the contract suite resolves every embedded
+recipe against the real registry column-by-column (flagship `issues`
+rides the real `updated_at` GtEq pushdown; drift mutations produce
+targeted errors). Format: `DOCUMENT_COLUMNS` pins the 10-column order;
+`inner_columns()` dedups the id/metadata overlap order-preservingly.
+SQLite dialect: DDL declares `rid INTEGER PRIMARY KEY` first then the
+ten neutral columns in DDL order, and the ingest SELECT's aliases are
+asserted to appear in exactly that order (the positional-INSERT
+invariant, lexical form — the plan-check in 1b.6 asserts it on planned
+schemas); the ingest uses the pinned projection-position
+`UNNEST(chunk_parts(...)) AS part` spelling with `{since}`+`{limit}`
+retained; search joins back on `rid`, dedups by `doc_id` at read time,
+and never packs the query vector; `validate_ddl` really executes
+apply → re-apply → reset → re-apply on an in-memory connection (fts5,
+table, triggers), degrading vec0 to shape-only with an explicit warning
+when sqlite-vec isn't loadable — and hard-failing if a configured
+extension path fails to load.
+
 - [ ] 1b.5 `bundle.rs` — `Bundle` as `BTreeMap<RelPath, FileContents>`;
       one slug function feeding every artifact name (job files+names,
       pipeline files+names, ctx keys) with the 6-hex BLAKE3 suffix on

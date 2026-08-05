@@ -25,7 +25,12 @@
 //!   no timestamps at generate time).
 
 pub mod config;
+pub mod dialect;
+pub mod dialects;
+pub mod format;
 pub mod recipe;
 
 pub use config::EtlConfig;
+pub use dialect::{EngineDialect, resolve_dialect};
+pub use format::hybrid_plan;
 pub use recipe::Recipe;
