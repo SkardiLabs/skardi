@@ -1,0 +1,46 @@
+kind: pipeline
+metadata:
+  name: mock-items-search-search-hybrid
+  version: "1.0.0"
+  description: >-
+    RRF hybrid search over the generated documents index. Parameters: {query} (embedded for the vector arm), {text_query} (FTS), {vector_weight}, {text_weight} (RRF weights, e.g. 0.5), {limit}.
+spec:
+  query: |
+    WITH vec AS (
+      SELECT doc_rowid AS rid, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
+      FROM sqlite_knn('gh_search.main.documents_vec', 'embedding',
+          (SELECT candle('models/generated/bge-small-en-v1.5', {query})),
+          80)
+    ),
+    fts AS (
+      -- fts5 columns read back as TEXT through the provider (PRAGMA
+      -- reports empty types), so the rowid rides home as a string —
+      -- cast it back before it meets the vec arm's Int64.
+      SELECT CAST(doc_rowid AS BIGINT) AS rid,
+             ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
+      FROM sqlite_fts('gh_search.main.documents_fts', 'content', {text_query}, 60)
+    ),
+    ranked AS (
+      SELECT COALESCE(v.rid, f.rid) AS rid,
+             COALESCE({vector_weight} / (60.0 + v.rk), 0)
+               + COALESCE({text_weight} / (60.0 + f.rk), 0) AS rrf_score
+      FROM vec v
+      FULL OUTER JOIN fts f ON v.rid = f.rid
+    ),
+    hits AS (
+      -- doc_id is not unique under {since} replay; keep each
+      -- chunk's best-scoring copy (read-time dedup — the no-PK
+      -- decision's other half).
+      SELECT d.doc_id, d.source_table, d.source_id, d.chunk_index, d.title,
+             d.content, d.author, d.created_at, r.rrf_score,
+             ROW_NUMBER() OVER (PARTITION BY d.doc_id ORDER BY r.rrf_score DESC)
+               AS dup_rank
+      FROM ranked r
+      JOIN gh_search.main.documents d ON d.rid = r.rid
+    )
+    SELECT doc_id, source_table, source_id, chunk_index, title, content,
+           author, created_at, rrf_score
+    FROM hits
+    WHERE dup_rank = 1
+    ORDER BY rrf_score DESC, doc_id
+    LIMIT {limit}

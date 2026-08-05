@@ -213,19 +213,49 @@ failure, 2 environment failure.
 
 ### 1d. Verification (the M1 gate)
 
-- [ ] 1d.1 Golden bundles: `mock × hybrid_search × sqlite` and
+- [x] 1d.1 Golden bundles: `mock × hybrid_search × sqlite` and
       `github(issues) × hybrid_search × sqlite` snapshotted;
       regeneration byte-equality pinned.
-- [ ] 1d.2 Plan-check self-test: deliberately corrupted SQL (typo'd
+- [x] 1d.2 Plan-check self-test: deliberately corrupted SQL (typo'd
       column, wrong column order vs DDL, unplannable construct) MUST
       fail validation — proving the gate can fail, not just pass.
-- [ ] 1d.3 Mock e2e in CI (the repo's first automated hybrid path):
+- [x] 1d.3 Mock e2e in CI (the repo's first automated hybrid path):
       generate → `setup` against a real SQLite file → run the generated
       job through the real executor → execute the generated search and
       get-document pipelines → assert RRF-ranked rows and ordered-chunk
       reassembly. Read-time dedup pinned by double-ingesting.
-- [ ] 1d.4 Full-suite regression zero; `cargo fmt` + clippy clean;
+- [x] 1d.4 Full-suite regression zero; `cargo fmt` + clippy clean;
       counted verification blurb recorded here.
+
+**1d verification (the M1 gate)**: 880 lib tests green with
+`--features chunking` (854 default; the delta is the feature-gated
+chunking + etl validation suites), plus 3 `skardi-etl` bin tests and the
+mock e2e — `cargo fmt --all --check` clean, zero clippy warnings in
+`etl/` and the new crate. 1d.1: both golden bundles
+(`github-issues-search`, `mock-items-search`) checked in under
+`src/etl/testdata/golden/` and compared byte-for-byte in BOTH directions
+(drift and stale files each fail; `UPDATE_ETL_GOLDEN=1` regenerates);
+gate 4 additionally re-renders on every generate. 1d.2: the gate
+provably fails — a typo'd column fails the plan naming the column, the
+`WITH ORDINALITY` spelling (the exact regression the plannability pin
+guards) fails to plan, and a swapped `source_table`/`source_id`
+projection — which still plans and still passes the executor's
+name-keyed preflight — is caught ONLY by the order assertion. 1d.3:
+`tests/etl_mock_e2e.rs` runs generate (vec0 DDL executed for real via
+`SQLITE_VEC_PATH`) → atomic write → setup.sql applied + re-applied on a
+real SQLite file → the generated job through the REAL `JobExecutor`
+twice (double-ingest; ≥5 rows/pass at character/40) → the generated
+search pipeline (RRF scores strictly descending, `doc_id`s unique
+despite 2× table rows — the read-time dedup pin — and the quantum
+document tops a quantum query) → get-document (0-based ordered
+chunk_index; whitespace-insensitive overlap-0 reassembly equals the
+source text; the splitter trims boundary whitespace). Source = MemTable
+with the pack's exact FieldMapping schema; embedding = deterministic
+`candle` fake (List<Float32>, text-derived) — the OC read path and real
+inference have their own suites. CI (`ci.yml`) installs the sqlite-vec
+wheel and exports `SQLITE_VEC_PATH` before the test step, so the e2e
+runs (not skips) on every push — the repo's first automated hybrid
+path.
 
 ## Milestone 2 — OKF format
 

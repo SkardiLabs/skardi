@@ -1,0 +1,12 @@
+# Merge this data source into your ctx.yaml's spec.data_sources.
+# hierarchy_level: catalog registers the file as the 'gh_search'
+# catalog — the generated SQL's 'gh_search.main.…' qualification
+# depends on it. access_mode: read_write is what the ingest job's
+# WRITE path requires.
+spec:
+  data_sources:
+    - name: gh_search
+      type: sqlite
+      path: data/gh.db
+      access_mode: read_write
+      hierarchy_level: catalog

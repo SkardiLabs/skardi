@@ -589,4 +589,127 @@ spec:
         let s = slug("My ETL_Config");
         assert!(s.starts_with("my-etl-config-"), "{s}");
     }
+
+    // ── 1d.2: the plan-check must be able to FAIL, not just pass ────────
+
+    async fn flagship_plan_ctx() -> (EtlConfig, HybridPlan, Arc<SessionContext>, String) {
+        let config = EtlConfig::from_yaml(FLAGSHIP).unwrap();
+        let dialect = resolve_dialect(&config).unwrap();
+        let registry = SourcePackRegistry::builtins().unwrap();
+        let recipe = find_embedded("github", TargetFormatKind::HybridSearch)
+            .unwrap()
+            .unwrap();
+        let resolved = recipe.resolve(registry.get("github").unwrap()).unwrap();
+        let plan = hybrid_plan(&config, &resolved).unwrap();
+        let ctx = synthetic_context(&config, &resolved, dialect.as_ref()).unwrap();
+        let sql = dialect.ingest_select_sql(&plan, 0, &config);
+        (config, plan, ctx, sql)
+    }
+
+    #[tokio::test]
+    async fn a_typoed_column_fails_the_plan_check() {
+        let (_config, _plan, ctx, sql) = flagship_plan_ctx().await;
+        let sabotaged = sql.replace("author_login", "author_logn");
+        let err = planned_fields(&ctx, &sabotaged).await.unwrap_err();
+        assert!(
+            err.contains("author_logn"),
+            "names the missing column: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_unplannable_unnest_spelling_fails_the_plan_check() {
+        // The exact regression the plannability pin guards: DataFusion
+        // cannot plan `UNNEST … WITH ORDINALITY` (apache/datafusion#11419).
+        // If someone "simplifies" the template back to it, this gate is
+        // what fails.
+        let (_config, _plan, ctx, sql) = flagship_plan_ctx().await;
+        let sabotaged = sql.replace(") AS part", ") WITH ORDINALITY AS part");
+        assert_ne!(sabotaged, sql, "mutation must apply");
+        planned_fields(&ctx, &sabotaged)
+            .await
+            .expect_err("WITH ORDINALITY must not plan");
+    }
+
+    // ── 1d.1: golden bundles ─────────────────────────────────────────────
+
+    /// Compare a freshly generated bundle to its checked-in golden copy,
+    /// both directions (missing + unexpected files). Regenerate with:
+    /// `UPDATE_ETL_GOLDEN=1 cargo test -p skardi --lib --features chunking golden`
+    async fn assert_matches_golden(config_yaml: &str, golden_name: &str) {
+        let config = EtlConfig::from_yaml(config_yaml).unwrap();
+        let generated = generate_hybrid(&config).await.unwrap();
+        let golden_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/etl/testdata/golden")
+            .join(golden_name);
+
+        if std::env::var("UPDATE_ETL_GOLDEN").is_ok() {
+            let _ = std::fs::remove_dir_all(&golden_dir);
+            for (rel, contents) in generated.bundle.files() {
+                let dest = golden_dir.join(rel);
+                std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                std::fs::write(dest, contents).unwrap();
+            }
+            return;
+        }
+
+        for (rel, contents) in generated.bundle.files() {
+            let golden_path = golden_dir.join(rel);
+            let golden = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
+                panic!(
+                    "golden file missing for generated '{rel}' ({e}) — if the change is \
+                     intentional, regenerate with UPDATE_ETL_GOLDEN=1"
+                )
+            });
+            assert_eq!(
+                contents, &golden,
+                "'{rel}' drifted from its golden — intentional changes regenerate with \
+                 UPDATE_ETL_GOLDEN=1"
+            );
+        }
+        // No stale goldens either.
+        for entry in walk_files(&golden_dir) {
+            let rel = entry
+                .strip_prefix(&golden_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            assert!(
+                generated.bundle.files().contains_key(rel.as_str()),
+                "golden '{rel}' has no generated counterpart — remove it or regenerate \
+                 with UPDATE_ETL_GOLDEN=1"
+            );
+        }
+    }
+
+    fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn golden_github_issues_hybrid_sqlite() {
+        assert_matches_golden(FLAGSHIP, "github-issues-search").await;
+    }
+
+    #[tokio::test]
+    async fn golden_mock_items_hybrid_sqlite() {
+        let config = FLAGSHIP
+            .replace("pack: github", "pack: mock")
+            .replace("binding: saas.github_demo", "binding: saas.mock_demo")
+            .replace("tables: [issues]", "tables: [items]")
+            .replace("name: github-issues-search", "name: mock-items-search");
+        assert_matches_golden(&config, "mock-items-search").await;
+    }
 }
