@@ -589,6 +589,7 @@ mod tests {
     use super::*;
     use crate::sources::providers::rss::egress::{AllowAll, EgressPolicy, EgressReason};
     use crate::sources::providers::rss::testutil::{MockFeedServer, MockResponse};
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
@@ -1089,59 +1090,85 @@ mod tests {
         assert!(matches!(err, FetchError::Egress(_)), "got {err}");
     }
 
+    /// The child half of `proxy_env_vars_do_not_bypass_the_egress_policy`:
+    /// the actual fetch-under-proxy-variables check, meant to run in a
+    /// subprocess whose environment the parent set at spawn. `#[ignore]`
+    /// keeps it out of the normal suite; the parent invokes it by exact
+    /// name with `--ignored`.
+    ///
+    /// Everything it needs lives in this process: its own mock server, its
+    /// own fetcher. Without `no_proxy()` in `FeedFetcher::new`, the request
+    /// would be routed to the proxy address the parent named instead of the
+    /// denied hostname — PolicyDns never sees `localhost`, no Egress error
+    /// is raised, and the fetch fails with the unreachable proxy's
+    /// Transport error instead, failing the assertion below.
     #[tokio::test]
-    async fn proxy_env_vars_do_not_bypass_the_egress_policy() {
-        // Same scenario as `injected_policy_refuses_hostname_via_resolver`,
-        // but with system proxy variables set while the client is built —
-        // reqwest reads them fresh at every `ClientBuilder::build`. Without
-        // `no_proxy()` in `FeedFetcher::new`, the request would be routed to
-        // the proxy address instead of the denied hostname: PolicyDns never
-        // sees `localhost`, no Egress error is raised, and this test fails
-        // with the Transport error from the unreachable proxy — which is
-        // exactly the bypass being pinned here. NO_PROXY is set to
-        // `127.0.0.1` (not `localhost`) so that, in that regressed scenario,
-        // concurrently running tests talking to their own loopback mock
-        // servers by IP stay unaffected while the `localhost` target of
-        // *this* test still goes through the proxy and fails loudly.
+    #[ignore = "subprocess half of proxy_env_vars_do_not_bypass_the_egress_policy"]
+    async fn proxy_env_check_in_child_process() {
+        assert!(
+            std::env::var("HTTP_PROXY").is_ok(),
+            "this check is meaningful only with proxy variables in the \
+             environment — run it through its parent test"
+        );
         let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
         let localhost_url = server.url().replace("127.0.0.1", "localhost");
-
-        let vars = ["HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"];
-        let saved: Vec<(&str, Option<String>)> =
-            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        unsafe {
-            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
-            std::env::set_var("http_proxy", "http://127.0.0.1:1");
-            std::env::set_var("NO_PROXY", "127.0.0.1");
-            std::env::set_var("no_proxy", "127.0.0.1");
-        }
-
         let policy = Arc::new(DenyList(vec![
             "127.0.0.1".parse().unwrap(),
             "::1".parse().unwrap(),
         ]));
-        // Built while the proxy variables are set — this is the moment
-        // reqwest would capture them.
+        // Built with the proxy variables in the environment — construction
+        // is the moment reqwest reads them.
         let f = fetcher_with_policy(policy);
-        let result = f.fetch(&format!("{localhost_url}/f"), None).await;
-
-        // Restore before asserting so a failure doesn't leak proxy settings
-        // into the rest of the test process.
-        unsafe {
-            for (key, value) in saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-
-        let err = result.unwrap_err();
+        let err = f
+            .fetch(&format!("{localhost_url}/f"), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchError::Egress(_)), "got {err}");
         assert_eq!(
             server.requests().len(),
             0,
             "the denied hostname must never be connected to, proxied or not"
+        );
+    }
+
+    #[test]
+    fn proxy_env_vars_do_not_bypass_the_egress_policy() {
+        // Same scenario as `injected_policy_refuses_hostname_via_resolver`,
+        // but with system proxy variables present — reqwest reads them
+        // fresh at every `ClientBuilder::build`. The check itself lives in
+        // `proxy_env_check_in_child_process`, run here as a subprocess of
+        // the test binary with the proxy variables established *at spawn*
+        // (`Command::env`): environment variables are process-global and
+        // this harness runs tests on concurrent threads, so mutating them
+        // in-process via `set_var` — even briefly, even restored — races
+        // any concurrent `getenv` and is exactly what edition 2024 made
+        // `unsafe`. A subprocess needs no mutation at all: its environment
+        // is complete before its first instruction runs, and nothing else
+        // shares it.
+        let exe = std::env::current_exe().expect("locate the running test binary");
+        let output = Command::new(exe)
+            .args([
+                "--exact",
+                "sources::providers::rss::fetch::tests::proxy_env_check_in_child_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("http_proxy", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn the child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child process failed — the egress policy did not hold under \
+             proxy variables\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        // status alone is not enough: a renamed child test would make the
+        // filter match nothing and the child exit 0 having proven nothing.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran zero tests — filter out of date?\nstdout:\n{stdout}"
         );
     }
 

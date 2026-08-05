@@ -272,6 +272,10 @@ mod tests {
     use super::*;
     use crate::sources::providers::rss::FeedSubscription;
     use crate::sources::providers::rss::config::inline_config;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::time::Instant;
 
     #[test]
     fn opml_outlines_resolve_to_subscriptions() {
@@ -412,7 +416,7 @@ mod tests {
         // one). Its fast failure is itself part of what is being asserted.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subs.fifo");
-        let status = std::process::Command::new("mkfifo")
+        let status = Command::new("mkfifo")
             .arg(&path)
             .status()
             .expect("run mkfifo");
@@ -421,7 +425,7 @@ mod tests {
             opml: Some(path),
             ..inline_config(vec![])
         };
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let err = resolve_subscriptions("news", &config).unwrap_err();
         assert!(
             start.elapsed() < OPML_READ_TIMEOUT,
@@ -468,7 +472,7 @@ mod tests {
         // cannot close.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stalled.fifo");
-        let status = std::process::Command::new("mkfifo")
+        let status = Command::new("mkfifo")
             .arg(&path)
             .status()
             .expect("run mkfifo");
