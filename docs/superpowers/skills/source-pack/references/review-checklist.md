@@ -89,6 +89,10 @@ The worst failure class: wrong results with a green status.
       not key presence: presence-only assertions cannot catch an
       undeclared extra leaking onto the wire, and strict action schemas
       turn that extra into a runtime 400.
+- [ ] Declared constants asserted by VALUE, not key presence — every
+      table's `page_size` pinned to its number on the wire (`pageSize`
+      is exactly where a live contract defect surfaced: declared 100,
+      wire caps at 50).
 - [ ] Both sides of every gate: the pass path (suite-wide) and the fail
       path (targeted test). A gate whose failure arm no test exercises
       is dead code until proven otherwise — and the failing input must
@@ -121,6 +125,18 @@ The worst failure class: wrong results with a green status.
       audited mechanically (every surviving string matched against an
       allowlist — real titles hide in URL slugs). Deliberately-broken
       fixtures (schema-mismatch) stay synthetic and say so.
+- [ ] The redaction audit DECODES nested JSON-encoded strings and
+      audits their leaves too (real names survived one decode level
+      down in a message payload), and it ships as an in-repo tripwire
+      test so CI enforces it. Person-linked capture timestamps are
+      coarsened; redacted cross-references stay self-consistent (an
+      id embedded in the row's own URL matches the row). If PII ever
+      reached a commit, the branch history was rewritten, not just the
+      tip.
+- [ ] Columns with ZERO fixture evidence (no captured row carries the
+      key) are annotated doc-derived at the declaration — under a
+      loose-schema pack, real rows are the only column truth, so an
+      evidence gap must be a reviewed fact, not an implicit one.
 - [ ] No real orgs/users/tokens anywhere; if a credential was ever
       pasted into a conversation or log during verification, the user
       was told to rotate it.
@@ -132,6 +148,12 @@ The worst failure class: wrong results with a green status.
 - [ ] No stale references: milestone numbers in Review notes, removed
       columns/tests still described, fixture-category lists, "pending"
       markers for work that has since landed.
+- [ ] The pack doc's table/pushdown matrix re-derived from the FINAL
+      yaml after the live pass — a pushdown the reconciliation dropped
+      must read `—`, not survive as a promise (the doc row is the
+      easiest artifact to forget when the wire invalidates a draft).
+- [ ] Upstream gateway defects found during verification are filed as
+      issues on the gateway repo and LINKED from the pack doc.
 - [ ] Operational consequences documented where behavior surprises:
       fingerprint pins fail on ANY schema change (additive included —
       re-capture and re-pin on upstream upgrades); raw-scan default-deny

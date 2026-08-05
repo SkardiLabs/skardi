@@ -188,8 +188,35 @@ timestamp spellings, real URL shapes. Redaction methodology:
   timestamps, known structural enums). Anything that survives the
   filter gets looked at by eye. Real page titles hiding inside URL
   slugs are exactly what this catches.
+- **decode one level deeper**: any string value that itself parses as
+  JSON (Feishu's `body.content`, Slack blocks) must be decoded and its
+  string leaves run through the SAME allowlist. The Feishu round-2
+  blocker was exactly this: real member names survived inside a
+  JSON-encoded payload the outer-tree audit treated as one opaque
+  string.
+- **ship the audit as a tripwire test**, not a one-off pass: an
+  in-repo test that re-walks every fixture (including the nested
+  decode) so the redaction guarantee is enforced by CI, not by memory.
+  A cheap broad net helps too — e.g. "no CJK text in any fixture" when
+  the workspace's real names share a script no placeholder uses.
+- **coarsen capture timestamps** when rows encode person-linked events
+  (joins, messages, task completions): zero the trailing digits so the
+  instant stops being correlatable while magnitude and ordering (and
+  any digit-count-sensitive parsing) survive. Update tests that pinned
+  exact values.
+- **verify redaction self-consistency**: the deterministic counter only
+  helps if cross-references actually still line up — after redacting,
+  check that ids repeated across fields (a task's `url` embedding its
+  own `guid`) still match, and that provider-unique ids stayed unique.
+  A fixture whose value is "internally consistent live capture" must
+  survive its own cross-references.
 - deliberately-broken fixtures (the admission gate's schema-mismatch
   case) stay synthetic — say so in a comment.
+
+**If PII ever lands in a commit**: fixing the tip is not enough — the
+names remain in every earlier commit. Rewrite the branch history
+(squash/amend and force-push) so no reachable commit carries them, and
+say so in the review reply.
 
 Then update the fixture-driven tests to assert the live shapes, and the
 coverage-gap pins if columns moved.
@@ -200,7 +227,9 @@ The PR must let a reviewer see the verification without re-running it:
 per-table live results (row counts, which pinned filters returned rows,
 which columns carried real values), the pinned provider API version,
 what the live pass CHANGED (renamed/dropped/added columns and why), and
-what remains outside the fingerprint gate. Put the durable facts in the
+what remains outside the fingerprint gate. Upstream gateway defects the
+pass uncovered get FILED as issues on the gateway repo and linked from
+the pack doc — findings that live only in a PR body get lost. Put the durable facts in the
 module doc and pack doc; put the run evidence in the PR description or
 a comment. Stop the gateway and skardi-server when done, and remind the
 user to rotate any credential that was exposed.
