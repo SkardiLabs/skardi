@@ -1,0 +1,27 @@
+{
+  "labels": [
+    {
+      "id": "INBOX",
+      "name": "INBOX",
+      "type": "system",
+      "messageListVisibility": "hide",
+      "labelListVisibility": "labelShow"
+    },
+    {
+      "id": "CHAT",
+      "name": "CHAT",
+      "type": "system"
+    },
+    {
+      "id": "Label_1",
+      "name": "Projects/Redacted",
+      "type": "user",
+      "messageListVisibility": "show",
+      "labelListVisibility": "labelShow",
+      "color": {
+        "textColor": "#000000",
+        "backgroundColor": "#fb4c2f"
+      }
+    }
+  ]
+}

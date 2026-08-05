@@ -1,0 +1,19 @@
+{
+  "drafts": [
+    {
+      "id": "r-1900000000000cc001",
+      "message": {
+        "messageId": "1900000000000bb010",
+        "threadId": "1900000000000aa010"
+      }
+    },
+    {
+      "id": "r-1900000000000cc002",
+      "message": {
+        "messageId": "",
+        "threadId": ""
+      }
+    }
+  ],
+  "nextPageToken": null
+}

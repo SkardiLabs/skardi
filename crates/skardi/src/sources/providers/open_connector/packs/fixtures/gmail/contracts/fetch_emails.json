@@ -1,0 +1,172 @@
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "messageId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Gmail message ID."
+              },
+              "threadId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Gmail thread ID."
+              },
+              "labelIds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "Gmail label IDs."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Message subject."
+              },
+              "sender": {
+                "type": "string",
+                "description": "Message sender."
+              },
+              "to": {
+                "type": "string",
+                "description": "Message recipients."
+              },
+              "messageTimestamp": {
+                "type": "string",
+                "description": "Message timestamp."
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "messageId",
+              "threadId",
+              "labelIds",
+              "subject",
+              "sender",
+              "to",
+              "messageTimestamp"
+            ],
+            "description": "Normalized Gmail message summary."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "messageId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Gmail message ID."
+              },
+              "threadId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Gmail thread ID."
+              },
+              "labelIds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "Gmail label IDs."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Message subject."
+              },
+              "sender": {
+                "type": "string",
+                "description": "Message sender."
+              },
+              "to": {
+                "type": "string",
+                "description": "Message recipients."
+              },
+              "messageTimestamp": {
+                "type": "string",
+                "description": "Message timestamp."
+              },
+              "preview": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Gmail API object."
+              },
+              "payload": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Gmail API object."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "messageText": {
+                "type": "string",
+                "description": "Extracted message body text."
+              },
+              "attachmentList": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "Gmail API object."
+                },
+                "description": "Message attachments."
+              },
+              "raw": {
+                "type": "string",
+                "description": "Raw RFC 2822 message when requested."
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "messageId",
+              "threadId",
+              "labelIds",
+              "subject",
+              "sender",
+              "to",
+              "messageTimestamp"
+            ],
+            "description": "Normalized Gmail message."
+          },
+          {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Gmail API object."
+          }
+        ]
+      },
+      "description": "Returned messages."
+    },
+    "nextPageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Opaque pagination token returned by Gmail."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resultSizeEstimate": {
+      "type": "integer",
+      "description": "Approximate result count."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "messages"
+  ],
+  "description": "Message list result."
+}

@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "filters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail filter ID."
+          },
+          "criteria": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Gmail API object."
+          },
+          "action": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Gmail API object."
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "id"
+        ],
+        "description": "Gmail filter."
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "filters"
+  ],
+  "description": "Filter list."
+}

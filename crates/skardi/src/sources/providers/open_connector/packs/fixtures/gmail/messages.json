@@ -1,0 +1,33 @@
+{
+  "messages": [
+    {
+      "messageId": "1900000000000bb001",
+      "threadId": "1900000000000aa001",
+      "labelIds": ["INBOX", "IMPORTANT"],
+      "subject": "Quarterly report",
+      "sender": "Redacted Sender <sender@example.com>",
+      "to": "Redacted Recipient <recipient@example.com>",
+      "messageTimestamp": "2026-07-30T08:15:42.000Z"
+    },
+    {
+      "messageId": "1900000000000bb002",
+      "threadId": "1900000000000aa002",
+      "labelIds": [],
+      "subject": "",
+      "sender": "no-reply@example.com",
+      "to": "",
+      "messageTimestamp": "2026-07-29T21:03:11.000Z"
+    },
+    {
+      "messageId": "1900000000000bb003",
+      "threadId": "1900000000000aa003",
+      "labelIds": ["SENT"],
+      "subject": "Re: onboarding checklist",
+      "sender": "Redacted Sender <sender@example.com>",
+      "to": "a@example.com, b@example.com",
+      "messageTimestamp": "2026-07-28T14:00:00.000Z"
+    }
+  ],
+  "nextPageToken": null,
+  "resultSizeEstimate": 3
+}

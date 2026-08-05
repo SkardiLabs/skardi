@@ -1,0 +1,24 @@
+{
+  "messages": [
+    {
+      "messageId": "1900000000000bb001",
+      "threadId": "1900000000000aa001",
+      "labelIds": ["INBOX"],
+      "subject": "Valid first row",
+      "sender": "sender@example.com",
+      "to": "recipient@example.com",
+      "messageTimestamp": "2026-07-30T08:15:42.000Z"
+    },
+    {
+      "messageId": 42,
+      "threadId": "1900000000000aa002",
+      "labelIds": [],
+      "subject": "Number where Utf8 is declared",
+      "sender": "sender@example.com",
+      "to": "recipient@example.com",
+      "messageTimestamp": "2026-07-29T21:03:11.000Z"
+    }
+  ],
+  "nextPageToken": null,
+  "resultSizeEstimate": 2
+}

@@ -1,0 +1,22 @@
+{
+  "threads": [
+    {
+      "threadId": "1900000000000aa001",
+      "snippet": "Quarterly report attached — please review before Friday.",
+      "historyId": "4200001"
+    },
+    {
+      "threadId": "1900000000000aa002",
+      "snippet": "",
+      "historyId": null
+    },
+    {
+      "threadId": "1900000000000aa003",
+      "snippet": "Re: onboarding checklist",
+      "historyId": "4200003",
+      "labels": ["synthetic-extra-field"]
+    }
+  ],
+  "nextPageToken": null,
+  "resultSizeEstimate": 3
+}

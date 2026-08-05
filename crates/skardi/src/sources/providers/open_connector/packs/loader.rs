@@ -460,6 +460,15 @@ enum PaginationDoc {
         #[serde(default)]
         has_more_path: Option<String>,
     },
+    /// One request is the complete collection: for actions whose strict
+    /// input schema declares no pagination keys at all (Gmail
+    /// `list_labels` / `list_filters`), where injecting a page or cursor
+    /// parameter would be rejected as `invalid_input`. The scan issues a
+    /// single request and never advances. A braced variant (not a unit
+    /// one) so `deny_unknown_fields` keeps rejecting stray keys — a
+    /// misspelled pagination field must fail loudly, not ride along
+    /// ignored.
+    SinglePage {},
 }
 
 impl PaginationDoc {
@@ -491,6 +500,7 @@ impl PaginationDoc {
                 page_size,
                 has_more_path: has_more_path.map(leak_str),
             },
+            Self::SinglePage {} => PaginationStrategy::SinglePage,
         }
     }
 }
@@ -667,6 +677,7 @@ mod tests {
         for (asset, yaml) in [
             ("mock.yaml", include_str!("mock.yaml")),
             ("github.yaml", include_str!("github.yaml")),
+            ("gmail.yaml", include_str!("gmail.yaml")),
             ("slack.yaml", include_str!("slack.yaml")),
             ("notion.yaml", include_str!("notion.yaml")),
             ("feishu.yaml", include_str!("feishu.yaml")),
@@ -735,6 +746,52 @@ tables:
         )
         .unwrap_err();
         assert!(err.contains("total_page_path"), "{err}");
+    }
+
+    #[test]
+    fn single_page_strategy_parses_and_rejects_stray_keys() {
+        // The pass side: an action with no pagination inputs at all
+        // (Gmail list_labels-style) declares `single_page` and converts
+        // to the engine's SinglePage strategy.
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("single_page is a valid strategy");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::SinglePage
+        ));
+
+        // The refusal side: single_page takes no parameters, and a stray
+        // key (a page size someone expected to matter) fails loudly
+        // instead of riding along ignored.
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("page_size"), "{err}");
     }
 
     #[test]

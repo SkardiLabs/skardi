@@ -135,6 +135,7 @@ impl SourcePackRegistry {
         for pack in [
             super::packs::mock::pack()?,
             super::packs::github::pack()?,
+            super::packs::gmail::pack()?,
             super::packs::notion::pack()?,
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
@@ -306,6 +307,25 @@ mod tests {
     }
 
     #[test]
+    fn builtin_gmail_pack_is_registered() {
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let pack = registry.require("gmail").unwrap();
+        assert_eq!(pack.name, "gmail");
+        assert_eq!(pack.version, 1);
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gmail.drafts",
+                "gmail.filters",
+                "gmail.labels",
+                "gmail.messages",
+                "gmail.threads",
+            ]
+        );
+    }
+
+    #[test]
     fn unknown_table_is_a_targeted_error() {
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
@@ -359,7 +379,7 @@ mod tests {
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
-        for name in ["mock", "github", "slack"] {
+        for name in ["mock", "github", "gmail", "slack", "notion", "feishu"] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for table in pack.tables {
