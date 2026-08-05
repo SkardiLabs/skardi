@@ -41,6 +41,20 @@ pub enum FieldType {
     /// would silently misparse them as millis (dates in January 1970).
     /// Strictly integers: fractional or string values fail with their kind.
     TimestampSecondsUtc,
+    /// JSON string of decimal digits carrying epoch **milliseconds** ↔
+    /// Arrow Timestamp(Millisecond, UTC). For Feishu-style APIs whose
+    /// `create_time` / `update_time` fields are millisecond epochs
+    /// serialized as STRINGS (`"1609296809000"`) — neither an RFC 3339
+    /// string nor a JSON number, so [`FieldType::TimestampMillisUtc`]
+    /// rejects them. Strictly ASCII-digit strings: anything else fails
+    /// with its kind or a shape description, never parses as zero.
+    TimestampMillisStringUtc,
+    /// JSON string of decimal digits carrying epoch **seconds** ↔ Arrow
+    /// Timestamp(Millisecond, UTC) — the seconds-as-string sibling of
+    /// [`FieldType::TimestampMillisStringUtc`] (Feishu wiki
+    /// `obj_create_time`), with the same strict digit-string rule and the
+    /// same overflow guard as [`FieldType::TimestampSecondsUtc`].
+    TimestampSecondsStringUtc,
     /// JSON array of strings ↔ Arrow List\<Utf8\>.
     Utf8List,
     /// JSON array of objects, each contributing the string under the given
@@ -63,7 +77,10 @@ impl FieldType {
             Self::UInt64 => DataType::UInt64,
             Self::Float64 => DataType::Float64,
             Self::Utf8 | Self::Json => DataType::Utf8,
-            Self::TimestampMillisUtc | Self::TimestampSecondsUtc => {
+            Self::TimestampMillisUtc
+            | Self::TimestampSecondsUtc
+            | Self::TimestampMillisStringUtc
+            | Self::TimestampSecondsStringUtc => {
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
             }
             Self::Utf8List | Self::Utf8ListFromObjectKey(_) => {
@@ -81,6 +98,8 @@ impl FieldType {
             Self::Utf8 => "string",
             Self::TimestampMillisUtc => "RFC 3339 timestamp or epoch millis",
             Self::TimestampSecondsUtc => "epoch-seconds timestamp",
+            Self::TimestampMillisStringUtc => "epoch-millis digit string",
+            Self::TimestampSecondsStringUtc => "epoch-seconds digit string",
             Self::Utf8List => "array of strings",
             Self::Utf8ListFromObjectKey(_) => "array of objects each carrying a string key",
             Self::Json => "any JSON value",
@@ -318,6 +337,24 @@ impl RowConverter {
                 )?)
                 .with_timezone("UTC"),
             )),
+            FieldType::TimestampMillisStringUtc => Ok(Arc::new(
+                TimestampMillisecondArray::from(collect_cells_described(
+                    &cells,
+                    spec,
+                    |v| parse_epoch_digit_string(v, 1),
+                    fail,
+                )?)
+                .with_timezone("UTC"),
+            )),
+            FieldType::TimestampSecondsStringUtc => Ok(Arc::new(
+                TimestampMillisecondArray::from(collect_cells_described(
+                    &cells,
+                    spec,
+                    |v| parse_epoch_digit_string(v, 1000),
+                    fail,
+                )?)
+                .with_timezone("UTC"),
+            )),
             FieldType::Utf8List => self.convert_string_list(field, &cells, page, None),
             FieldType::Utf8ListFromObjectKey(key) => {
                 self.convert_string_list(field, &cells, page, Some(key))
@@ -484,6 +521,25 @@ where
         }
     }
     Ok(out)
+}
+
+/// Digit-string epoch → epoch millis at the given scale (1 for
+/// millis-valued strings, 1000 for seconds-valued strings). Only
+/// non-empty ASCII-digit strings convert — an arbitrary string is shape
+/// drift and must fail with a description, never parse as zero.
+fn parse_epoch_digit_string(value: &Value, scale: i64) -> Result<i64, String> {
+    let Some(text) = value.as_str() else {
+        return Err(json_kind(value).to_string());
+    };
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("a non-epoch string".to_string());
+    }
+    let epoch: i64 = text
+        .parse()
+        .map_err(|_| "an epoch out of range for millisecond timestamps".to_string())?;
+    epoch
+        .checked_mul(scale)
+        .ok_or_else(|| "an epoch out of range for millisecond timestamps".to_string())
 }
 
 /// RFC 3339 string or epoch-millis number → epoch millis.
@@ -918,6 +974,100 @@ mod tests {
                     err,
                     OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
                         if f == found && expected == "epoch-seconds timestamp"
+                ),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_digit_strings_convert_at_both_scales_and_reject_other_shapes() {
+        // Feishu-style timestamps are DIGIT STRINGS — millis for im
+        // (`create_time: "1609296809000"`), seconds for wiki
+        // (`obj_create_time: "1642402790"`). Each variant converts only
+        // non-empty ASCII-digit strings; numbers, RFC 3339 strings, and
+        // arbitrary text fail with their kind or shape — never parse as
+        // zero.
+        let converter = RowConverter::new(&[
+            FieldMapping {
+                name: "create_time",
+                path: "create_time",
+                field_type: FieldType::TimestampMillisStringUtc,
+                nullable: true,
+            },
+            FieldMapping {
+                name: "obj_create_time",
+                path: "obj_create_time",
+                field_type: FieldType::TimestampSecondsStringUtc,
+                nullable: true,
+            },
+        ])
+        .unwrap();
+
+        let batch = converter
+            .convert(
+                &[
+                    serde_json::json!({
+                        "create_time": "1735689600000", // 2025-01-01T00:00:00Z
+                        "obj_create_time": "1735689600",
+                    }),
+                    serde_json::json!({"create_time": null}),
+                ],
+                1,
+            )
+            .unwrap();
+        for column in [0, 1] {
+            let ts = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            assert_eq!(ts.value(0), 1_735_689_600_000);
+            assert!(ts.is_null(1), "null and absent keys stay NULL");
+        }
+
+        for (bad, found, expected) in [
+            // A JSON number is the OTHER spelling — accepting it here
+            // would blur the two variants' contracts.
+            (
+                serde_json::json!({"create_time": 1735689600000_i64}),
+                "number",
+                "epoch-millis digit string",
+            ),
+            (
+                serde_json::json!({"create_time": "2025-01-01T00:00:00Z"}),
+                "a non-epoch string",
+                "epoch-millis digit string",
+            ),
+            (
+                serde_json::json!({"create_time": ""}),
+                "a non-epoch string",
+                "epoch-millis digit string",
+            ),
+            (
+                serde_json::json!({"obj_create_time": "-5"}),
+                "a non-epoch string",
+                "epoch-seconds digit string",
+            ),
+            // Overflow is its own diagnosis, at both the parse and the
+            // seconds→millis scale step.
+            (
+                serde_json::json!({"obj_create_time": "99999999999999999999"}),
+                "an epoch out of range for millisecond timestamps",
+                "epoch-seconds digit string",
+            ),
+            (
+                serde_json::json!({"obj_create_time": i64::MAX.to_string()}),
+                "an epoch out of range for millisecond timestamps",
+                "epoch-seconds digit string",
+            ),
+        ] {
+            let err = converter.convert(&[bad], 1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, expected: ref e, .. }
+                        if f == found && e == expected
                 ),
                 "got {err}"
             );

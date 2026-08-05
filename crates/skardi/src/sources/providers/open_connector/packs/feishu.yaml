@@ -1,0 +1,228 @@
+# Feishu source pack. Wire contract is Open Connector's HYBRID shape,
+# reconciled against a live gateway (v1.3.3): every list executor
+# rebuilds the pagination ENVELOPE (camelCase `$.items` / `$.pageToken` /
+# `$.hasMore`, with `page_token` absent-or-empty normalized to a null
+# `pageToken` at end-of-collection) while passing the Feishu API's item
+# objects through RAW — snake_case keys, timestamps as epoch DIGIT
+# STRINGS (millis for im and tasks, seconds for wiki), the reason the
+# timestamp_*_string_utc column types exist. Inputs are camelCase strict
+# (`pageSize` / `pageToken` / `chatId`; `additionalProperties: false`).
+# Design rationale lives in the module docs of packs/feishu.rs.
+#
+# COLUMN STATUS: item schemas are declared LOOSE by the gateway (empty
+# properties + additionalProperties), so every column below rides
+# passthrough and none is protected by the fingerprint gate — real rows
+# are the only column truth. tasks / wiki_spaces / wiki_nodes are
+# reconciled against a live workspace (2026-08-04): tasks carry
+# status/completed_at (no `completed` boolean), wiki spaces answer the
+# final page with a NON-empty pageToken and hasMore:false (the reason
+# has_more_path exists). chats, chat_members, and messages are
+# live-verified too: chats gained chat_mode/chat_status from the pass;
+# messages' real page_size cap is 50 (99992402 above it) and reading
+# them under the user identity requires the im:message:readonly (or
+# im:message / im:message.history:readonly) scope — the get_as_user
+# scopes the gateway declares are NOT honored for this path (99991679).
+# `message_position` (a digit string on every row) is deliberately
+# unmapped: it appears in no public Feishu doc we could pin semantics
+# to.
+kind: pack
+pack: feishu
+version: 1
+
+tables:
+  chats:
+    action: feishu.list_chats
+    row_path: "$.items"
+    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+      has_more_path: "$.hasMore"
+    # ByCreateTimeAsc is the STABLE ordering. The API default
+    # (ByActiveTimeDesc) reshuffles rows whenever a chat receives a
+    # message mid-scan, which can skip or duplicate chats across cursor
+    # pages — creation order is immutable.
+    fixed_inputs:
+      sortType: ByCreateTimeAsc
+    columns:
+      - { name: id, path: chat_id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: owner_id, path: owner_id, type: utf8, nullable: true }
+      - { name: owner_id_type, path: owner_id_type, type: utf8, nullable: true }
+      - { name: external, path: external, type: boolean, nullable: true }
+      - { name: tenant_key, path: tenant_key, type: utf8, nullable: true }
+      - { name: avatar, path: avatar, type: utf8, nullable: true }
+      - { name: chat_mode, path: chat_mode, type: utf8, nullable: true }
+      - { name: chat_status, path: chat_status, type: utf8, nullable: true }
+
+  messages:
+    action: feishu.list_messages
+    row_path: "$.items"
+    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      # 50, NOT the schema's declared max of 100: Feishu's im/v1/messages
+      # caps page_size at 50 and hard-fails larger values (99992402,
+      # live-verified 2026-08-04) — the gateway's declared maximum is
+      # wrong on the wire.
+      page_size: 50
+      has_more_path: "$.hasMore"
+    # containerIdType is pinned to `chat`: this table IS chat history
+    # (thread listing is a different action, list_thread_messages).
+    # ByCreateTimeAsc for the same cursor-stability reason as chats —
+    # and it makes the startTime lower-bound pushdown coherent with the
+    # scan direction.
+    fixed_inputs:
+      containerIdType: chat
+      sortType: ByCreateTimeAsc
+    resources:
+      required: [containerId]
+    filters:
+      # Lower bound only: startTime is inclusive epoch seconds (a digit
+      # STRING in the strict schema — the reason epoch_seconds_string
+      # exists). Flooring widens the fetch; Inexact re-filtering trims.
+      # endTime is deliberately unmapped: it is EXCLUSIVE and flooring an
+      # upper bound would drop rows.
+      - { column: create_time, op: gt_eq, input: startTime, fidelity: inexact, format: epoch_seconds_string }
+    columns:
+      - { name: id, path: message_id, type: utf8, nullable: false }
+      - { name: chat_id, path: chat_id, type: utf8, nullable: true }
+      - { name: msg_type, path: msg_type, type: utf8, nullable: true }
+      - { name: create_time, path: create_time, type: timestamp_ms_string_utc, nullable: true }
+      - { name: update_time, path: update_time, type: timestamp_ms_string_utc, nullable: true }
+      - { name: deleted, path: deleted, type: boolean, nullable: true }
+      - { name: updated, path: updated, type: boolean, nullable: true }
+      - { name: root_id, path: root_id, type: utf8, nullable: true }
+      - { name: parent_id, path: parent_id, type: utf8, nullable: true }
+      - { name: thread_id, path: thread_id, type: utf8, nullable: true }
+      # sender carries id/id_type/sender_type/tenant_key — a small stable
+      # object, kept opaque; mentions is an array of user references.
+      - { name: sender, path: sender, type: json, nullable: true }
+      # body.content is Feishu's message payload: itself a JSON-encoded
+      # string whose inner schema varies BY msg_type — opaque by design,
+      # searchable as text.
+      - { name: content, path: body.content, type: utf8, nullable: true }
+      - { name: mentions, path: mentions, type: json, nullable: true }
+      # DOC-DERIVED: no captured row carries upper_message_id (it appears
+      # only on merge-forwarded messages) — under this pack's loose-schema
+      # doctrine that means zero evidence trail; kept because the Feishu
+      # message resource documents it, typed utf8 like every other id.
+      - { name: upper_message_id, path: upper_message_id, type: utf8, nullable: true }
+
+  chat_members:
+    action: feishu.list_chat_members
+    row_path: "$.items"
+    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+      has_more_path: "$.hasMore"
+    resources:
+      required: [chatId]
+    columns:
+      - { name: member_id, path: member_id, type: utf8, nullable: false }
+      - { name: member_id_type, path: member_id_type, type: utf8, nullable: true }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: tenant_key, path: tenant_key, type: utf8, nullable: true }
+
+  tasks:
+    action: feishu.list_tasks
+    row_path: "$.items"
+    fingerprint: f8d062dc87c010a03a76e6b1b0bc252f2de8b7004365042422de3f89b13f6382
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+      has_more_path: "$.hasMore"
+    # `my_tasks` is the executor's default; pinned explicitly so the
+    # table's population is declared, not inherited. Omitting the
+    # action's `completed` input returns tasks in BOTH states — the
+    # state=all default. The input is deliberately unmapped as a filter:
+    # real rows carry NO `completed` boolean (live-verified 2026-08-04 —
+    # completion is `status: todo|done` plus `completed_at`), and a
+    # string-enum column cannot render into a boolean input without a
+    # value transform the engine deliberately lacks.
+    fixed_inputs:
+      type: my_tasks
+    columns:
+      - { name: guid, path: guid, type: utf8, nullable: false }
+      - { name: summary, path: summary, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: status, path: status, type: utf8, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_string_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_string_utc, nullable: true }
+      # Feishu spells "not completed" as the digit string "0", which
+      # decodes to 1970-01-01T00:00:00Z — filter on `status = 'done'`
+      # rather than on this column's epoch-zero sentinel.
+      - { name: completed_at, path: completed_at, type: timestamp_ms_string_utc, nullable: true }
+      # DOC-DERIVED shape: the live pass saw `due` on 2 of 9 rows, but no
+      # row with it survived the redacted fixture subset — the column has
+      # no fixture evidence; kept opaque json per the documented resource.
+      - { name: due, path: due, type: json, nullable: true }
+      - { name: members, path: members, type: json, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }
+
+  wiki_spaces:
+    action: feishu.list_wiki_spaces
+    row_path: "$.items"
+    fingerprint: e6b2676fbe15e20f408f30c5d2f4aafee1cd628c434f699f1520f780fc940a6a
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 50
+      has_more_path: "$.hasMore"
+    columns:
+      - { name: space_id, path: space_id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: space_type, path: space_type, type: utf8, nullable: true }
+      - { name: visibility, path: visibility, type: utf8, nullable: true }
+      - { name: open_sharing, path: open_sharing, type: utf8, nullable: true }
+
+  wiki_nodes:
+    action: feishu.list_wiki_nodes
+    row_path: "$.items"
+    fingerprint: e6b2676fbe15e20f408f30c5d2f4aafee1cd628c434f699f1520f780fc940a6a
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 50
+      has_more_path: "$.hasMore"
+    # One level per scan: the action lists the children of ONE parent
+    # (space root when parentNodeToken is omitted) — same shape as
+    # Notion's block_children. Full-tree traversal is a client-side
+    # recursion, documented in the pack doc.
+    resources:
+      required: [spaceId]
+      optional: [parentNodeToken]
+    columns:
+      - { name: node_token, path: node_token, type: utf8, nullable: false }
+      - { name: obj_token, path: obj_token, type: utf8, nullable: true }
+      - { name: obj_type, path: obj_type, type: utf8, nullable: true }
+      - { name: title, path: title, type: utf8, nullable: true }
+      - { name: parent_node_token, path: parent_node_token, type: utf8, nullable: true }
+      - { name: node_type, path: node_type, type: utf8, nullable: true }
+      - { name: origin_node_token, path: origin_node_token, type: utf8, nullable: true }
+      - { name: has_child, path: has_child, type: boolean, nullable: true }
+      - { name: obj_create_time, path: obj_create_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: obj_edit_time, path: obj_edit_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: node_create_time, path: node_create_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: owner, path: owner, type: utf8, nullable: true }
+      - { name: creator, path: creator, type: utf8, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }

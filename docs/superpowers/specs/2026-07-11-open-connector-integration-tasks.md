@@ -284,7 +284,28 @@ event carrying the scan identity and error.
       with row identity, per-table search filter pins with an
       exactly-the-declared-inputs guard, blockId resource forwarding +
       pre-HTTP enforcement, LIMIT early-stop, UDTF parity).
-- [ ] 5.4 Later waves per the design rollout (Google Workspace, Discord, Feishu, HubSpot, Jira, …) through the source-pack admission gate
+- [x] 5.4 Feishu pack (OAuth user token, cursor pagination, hybrid wire shape — normalized envelope with raw snake_case items): chats, messages, chat_members, tasks, wiki_spaces, wiki_nodes.
+      Live contract reconciliation (gateway v1.3.3; all six input sets
+      validated to the credential wall, then all six tables verified against a
+      REAL workspace end to end on 2026-08-04 — the loose items schemas make
+      real rows the only column truth, and every fixture is a redacted live
+      capture). The live pass caught three contract defects no mock could:
+      tasks' `completed` boolean does not exist on the wire (status/
+      completed_at do; the draft column + pushdown are gone), Feishu wiki
+      answers its final page with `has_more:false` beside a NON-empty
+      `page_token` (new Cursor `has_more_path` engine field, authoritative
+      termination, both failure arms typed), and `im/v1/messages` caps
+      page_size at 50 on the wire against a declared max of 100. Engine
+      extensions: `timestamp_ms_string_utc`/`timestamp_s_string_utc` column
+      types, `epoch_seconds_string` filter format, simplified-boolean pushdown
+      normalization, `has_more_path`. Live e2e evidence: registration through
+      LIVE discovery; 86 messages over two real cursor pages, zero duplicate
+      ids; `create_time >=` pushdown narrowing a live scan to 15 rows; every
+      mapped column of every table non-NULL on real rows. Verification: 285
+      tests (`cargo test -p skardi --lib sources::providers::open_connector`,
+      post-merge with 5.3), 17 pack-scoped (`… packs::feishu`), 842 full
+      library suite.
+- [ ] 5.5 Later waves per the design rollout (Google Workspace, Discord, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,

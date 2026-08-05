@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "description": "Redacted description",
+      "name": "Redacted name",
+      "open_sharing": "closed",
+      "space_id": "700000038",
+      "space_type": "team",
+      "visibility": "private"
+    }
+  ],
+  "hasMore": false,
+  "pageToken": "0||7000000000000000001"
+}

@@ -187,6 +187,34 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 filter.column, filter.operator
             ));
         }
+        // Epoch renderings floor sub-second precision, which only ever
+        // WIDENS a lower bound; under any other operator the floored
+        // literal compares at a different instant and the provider drops
+        // rows that Inexact re-filtering cannot recover — and under Exact,
+        // DataFusion never re-filters the widened fetch at all. Both rules
+        // enforced here so the drift is a load failure, not silent row
+        // loss (the ValueFormat docs state the same contract).
+        if matches!(
+            filter.value_format,
+            ValueFormat::EpochSeconds | ValueFormat::EpochSecondsString
+        ) {
+            if !matches!(filter.operator, Operator::Gt | Operator::GtEq) {
+                return Err(format!(
+                    "{id}: filter on '{}' renders as flooring epoch seconds, which is only \
+                     sound for lower bounds — operator {:?} would drop rows; declare gt/gt_eq \
+                     or use the rfc3339 format",
+                    filter.column, filter.operator
+                ));
+            }
+            if filter.fidelity != Fidelity::Inexact {
+                return Err(format!(
+                    "{id}: filter on '{}' floors sub-second literals into a WIDER fetch, so it \
+                     must be declared inexact (DataFusion re-filters locally); exact would \
+                     surface rows the predicate excludes",
+                    filter.column
+                ));
+            }
+        }
     }
     for required in table.required_resources {
         if table.optional_resources.contains(required) {
@@ -318,6 +346,8 @@ fn convert_column(table_id: &str, doc: ColumnDoc) -> Result<FieldMapping, String
         (ColumnType::Utf8, None) => FieldType::Utf8,
         (ColumnType::TimestampMsUtc, None) => FieldType::TimestampMillisUtc,
         (ColumnType::TimestampSUtc, None) => FieldType::TimestampSecondsUtc,
+        (ColumnType::TimestampMsStringUtc, None) => FieldType::TimestampMillisStringUtc,
+        (ColumnType::TimestampSStringUtc, None) => FieldType::TimestampSecondsStringUtc,
         (ColumnType::Utf8List, None) => FieldType::Utf8List,
         (ColumnType::Json, None) => FieldType::Json,
     };
@@ -346,6 +376,7 @@ fn convert_filter(doc: FilterDoc) -> FilterMapping {
             FormatDoc::Verbatim => ValueFormat::Verbatim,
             FormatDoc::Rfc3339 => ValueFormat::Rfc3339,
             FormatDoc::EpochSeconds => ValueFormat::EpochSeconds,
+            FormatDoc::EpochSecondsString => ValueFormat::EpochSecondsString,
         },
     }
 }
@@ -426,6 +457,8 @@ enum PaginationDoc {
         #[serde(default)]
         page_size_input: Option<String>,
         page_size: u32,
+        #[serde(default)]
+        has_more_path: Option<String>,
     },
 }
 
@@ -450,11 +483,13 @@ impl PaginationDoc {
                 next_cursor_path,
                 page_size_input,
                 page_size,
+                has_more_path,
             } => PaginationStrategy::Cursor {
                 cursor_param: leak_str(cursor_input),
                 next_cursor_path: leak_str(next_cursor_path),
                 page_size_param: page_size_input.map(leak_str),
                 page_size,
+                has_more_path: has_more_path.map(leak_str),
             },
         }
     }
@@ -489,6 +524,10 @@ enum ColumnType {
     TimestampMsUtc,
     #[serde(rename = "timestamp_s_utc")]
     TimestampSUtc,
+    #[serde(rename = "timestamp_ms_string_utc")]
+    TimestampMsStringUtc,
+    #[serde(rename = "timestamp_s_string_utc")]
+    TimestampSStringUtc,
     #[serde(rename = "utf8_list")]
     Utf8List,
     #[serde(rename = "utf8_list_from_object_key")]
@@ -612,6 +651,8 @@ enum FormatDoc {
     Rfc3339,
     #[serde(rename = "epoch_seconds")]
     EpochSeconds,
+    #[serde(rename = "epoch_seconds_string")]
+    EpochSecondsString,
 }
 
 #[cfg(test)]
@@ -628,6 +669,7 @@ mod tests {
             ("github.yaml", include_str!("github.yaml")),
             ("slack.yaml", include_str!("slack.yaml")),
             ("notion.yaml", include_str!("notion.yaml")),
+            ("feishu.yaml", include_str!("feishu.yaml")),
         ] {
             // parse_pack performs the full structural + cross-field
             // validation pass itself; parsing IS the gate.
@@ -724,6 +766,54 @@ tables:
         ))
         .unwrap_err();
         assert!(err.contains("only"), "{err}");
+    }
+
+    #[test]
+    fn epoch_formats_are_lower_bound_inexact_only() {
+        // Flooring widens LOWER bounds only; any other operator (or an
+        // Exact claim over the widened fetch) drops or surfaces wrong
+        // rows silently — so both are load failures, not runtime hazards.
+        let base = |filter: &str| {
+            format!(
+                r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }}
+    columns:
+      - {{ name: created, path: created, type: timestamp_ms_utc, nullable: true }}
+    filters:
+{filter}
+"#
+            )
+        };
+        let err = parse_pack(&base(
+            "      - { column: created, op: eq, input: at, fidelity: inexact, format: epoch_seconds }",
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("only") && err.contains("lower bounds"),
+            "{err}"
+        );
+
+        // (The YAML op enum admits only eq/gt/gt_eq today, so eq is the one
+        // declarable non-lower-bound operator; the validation still guards
+        // any future upper-bound additions.)
+        let err = parse_pack(&base(
+            "      - { column: created, op: gt_eq, input: since, fidelity: exact, format: epoch_seconds }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("inexact"), "{err}");
+
+        // The sound shape — Feishu's startTime — still loads.
+        parse_pack(&base(
+            "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: epoch_seconds_string }",
+        ))
+        .expect("lower-bound inexact epoch mapping is legal");
     }
 
     #[test]
