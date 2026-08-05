@@ -1105,11 +1105,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "subprocess half of proxy_env_vars_do_not_bypass_the_egress_policy"]
     async fn proxy_env_check_in_child_process() {
-        assert!(
-            std::env::var("HTTP_PROXY").is_ok(),
-            "this check is meaningful only with proxy variables in the \
-             environment — run it through its parent test"
-        );
+        // This repo's CI runs every `#[ignore]`d test wholesale as its
+        // integration pass (`nextest run -- --ignored`), so being ignored
+        // does not mean only the parent ever runs this. Without proxy
+        // variables there is nothing to check — skip rather than fail. The
+        // parent always sets them, so the real check cannot be skipped on
+        // the path that matters, and its own "1 passed" assertion would
+        // catch this arm ever swallowing that run.
+        if std::env::var("HTTP_PROXY").is_err() {
+            eprintln!(
+                "skipping: no proxy variables in the environment — run via \
+                 proxy_env_vars_do_not_bypass_the_egress_policy"
+            );
+            return;
+        }
         let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
         let localhost_url = server.url().replace("127.0.0.1", "localhost");
         let policy = Arc::new(DenyList(vec![
