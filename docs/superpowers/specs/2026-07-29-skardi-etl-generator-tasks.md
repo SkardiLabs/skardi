@@ -29,7 +29,7 @@ repo. Three layers, in dependency order.
 
 ### 1a. Runtime prerequisites (library-wide, independently testable)
 
-- [ ] 1a.1 `chunk_parts(mode, text, size [, overlap])` UDF →
+- [x] 1a.1 `chunk_parts(mode, text, size [, overlap])` UDF →
       `List<Struct<chunk_idx Int32, chunk_text Utf8>>`. The ONLY sound
       stable-ordinal path: datafusion-sql 52.5.0 rejects
       `UNNEST … WITH ORDINALITY` (`not_impl_err`; apache/datafusion#11419
@@ -42,7 +42,7 @@ repo. Three layers, in dependency order.
       the exact unnest spelling this proves out is what the generator's
       job SQL templates will emit (the design defers that spelling to
       this task on purpose).
-- [ ] 1a.2 `json_pack(key, value [, key, value …])` UDF → Utf8 (a JSON
+- [x] 1a.2 `json_pack(key, value [, key, value …])` UDF → Utf8 (a JSON
       object). The only SQL-callable JSON *encoder* (DataFusion core has
       none through 54.x; `datafusion-functions-json` is read-side only
       and not a dependency). Keys are Utf8 literals; values accept the
@@ -52,10 +52,21 @@ repo. Three layers, in dependency order.
       backslashes, control chars, non-BMP) are the core of its suite.
       Odd argument counts, non-literal keys, and unsupported value types
       fail with targeted errors.
-- [ ] 1a.3 `SourcePackRegistry::packs()` iterator (name-sorted,
+- [x] 1a.3 `SourcePackRegistry::packs()` iterator (name-sorted,
       deterministic). `builtins()` currently exposes lookup only; the
       recipe contract suite and `skardi-etl recipes` both need
       enumeration.
+
+**1a verification**: 839 lib tests green (`cargo test -p skardi --lib
+--features chunking`). The plannability pin
+(`sql_chunk_parts_unnest_yields_ordered_indexed_rows`) settles the ingest
+templates' unnest spelling: projection-position
+`UNNEST(chunk_parts(...)) AS part` in a subquery, `part['chunk_idx']` /
+`part['chunk_text']` field access outside — per-source ordinal restart
+and overlap-0 reassembly asserted end to end. `json_pack`'s
+injection-boundary test round-trips quotes/backslashes/control
+chars/non-ASCII byte-exact through a real JSON parser; non-finite floats
+refuse. Registered on both server session contexts.
 
 ### 1b. The etl library (`crates/skardi/src/etl/`), bottom-up
 
