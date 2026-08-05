@@ -148,6 +148,15 @@ impl SourcePackRegistry {
         self.packs.get(name).copied()
     }
 
+    /// Every built-in pack, name-sorted so enumeration is deterministic —
+    /// the etl generator's recipe contract suite and its `recipes` coverage
+    /// listing both iterate this (the map itself is private and unordered).
+    pub fn packs(&self) -> impl Iterator<Item = &'static SourcePack> + '_ {
+        let mut packs: Vec<&'static SourcePack> = self.packs.values().copied().collect();
+        packs.sort_by_key(|pack| pack.name);
+        packs.into_iter()
+    }
+
     /// Resolve `pack` + `table` to a table definition, with targeted errors
     /// for unknown packs and unknown tables.
     pub fn table(
@@ -225,6 +234,16 @@ mod tests {
         assert_eq!(pack.version, 1);
         assert_eq!(pack.tables.len(), 1);
         assert_eq!(pack.tables[0].id, "mock.items");
+    }
+
+    #[test]
+    fn packs_iterates_every_builtin_in_name_order() {
+        // The enumeration surface the etl generator's contract suite and
+        // `recipes` listing depend on: complete and deterministic — the
+        // backing map is unordered, so the sort here is load-bearing.
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let names: Vec<&str> = registry.packs().map(|p| p.name).collect();
+        assert_eq!(names, vec!["github", "mock", "notion", "slack"]);
     }
 
     #[test]

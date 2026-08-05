@@ -193,6 +193,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register chunk UDF (text-splitter wrapper for inline ingestion)
     #[cfg(feature = "chunking")]
     register_chunk_udf(&mut session_ctx);
+    // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
+    // metadata/frontmatter serialization boundary)
+    skardi::util::json_pack::register_json_pack_udf(&mut session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;

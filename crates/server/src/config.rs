@@ -423,6 +423,9 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register chunk UDF (text-splitter wrapper for inline ingestion)
     #[cfg(feature = "chunking")]
     register_chunk_udf(&mut session_ctx);
+    // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
+    // metadata/frontmatter serialization boundary)
+    skardi::util::json_pack::register_json_pack_udf(&mut session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
