@@ -9421,18 +9421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "skardi-etl"
-version = "0.5.0"
-dependencies = [
- "clap",
- "serde_yaml",
- "skardi",
- "tempfile",
- "tokio",
- "tokio-rusqlite",
-]
-
-[[package]]
 name = "skardi-server"
 version = "0.5.0"
 dependencies = [

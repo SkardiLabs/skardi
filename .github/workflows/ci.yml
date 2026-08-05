@@ -208,16 +208,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check the package for errors
         run: cargo check --all
-      - name: Install sqlite-vec (etl mock e2e needs the vec0 loadable)
-        # The pip wheel ships the prebuilt vec0 shared library; the etl
-        # mock e2e (crates/skardi/tests/etl_mock_e2e.rs) SKIPS itself when
-        # SQLITE_VEC_PATH is unset, so this step is what makes CI actually
-        # exercise the generated hybrid path end to end.
-        run: |
-          python3 -m pip install --quiet --target "$HOME/sqlite-vec-pkg" sqlite-vec
-          VEC0="$(find "$HOME/sqlite-vec-pkg" -name 'vec0.*' -type f | head -1)"
-          test -n "$VEC0" || { echo "vec0 loadable not found in the sqlite-vec wheel"; exit 1; }
-          echo "SQLITE_VEC_PATH=$VEC0" >> "$GITHUB_ENV"
       - name: Execute rust tests
         run: cargo llvm-cov --no-report nextest --all-features
 
