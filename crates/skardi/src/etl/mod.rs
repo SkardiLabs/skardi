@@ -36,6 +36,12 @@ pub mod recipe;
 #[cfg(feature = "chunking")]
 pub mod validate;
 
+// The real-Open-Connector-source ingest e2e (mock gateway over HTTP →
+// real provider pagination → real executor → real SQLite). In-crate
+// because the gateway test double is pub(crate).
+#[cfg(all(test, feature = "chunking"))]
+mod oc_e2e;
+
 pub use bundle::{Bundle, render_hybrid_bundle, slug};
 pub use config::EtlConfig;
 pub use dialect::{EngineDialect, resolve_dialect};
