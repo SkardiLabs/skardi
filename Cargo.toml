@@ -10,6 +10,7 @@ license = "Apache-2.0"
 [workspace]
 members = [ "crates/cli",
             "crates/skardi",
+            "crates/skardi-etl",
             "crates/server"]
 
 resolver = "2"

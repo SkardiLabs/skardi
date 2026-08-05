@@ -250,6 +250,13 @@ pub fn find_embedded(pack: &str, format: TargetFormatKind) -> Result<Option<Reci
         .find(|r| r.pack == pack && r.format == format))
 }
 
+/// The raw embedded assets as `(asset name, YAML text)` — what
+/// `skardi-etl recipes --show` dumps as the starting point for
+/// `--recipe` customization.
+pub fn embedded_recipe_assets() -> &'static [(&'static str, &'static str)] {
+    EMBEDDED
+}
+
 const EMBEDDED: &[(&str, &str)] = &[
     (
         "github.hybrid_search.yaml",

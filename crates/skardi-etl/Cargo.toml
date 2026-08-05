@@ -1,0 +1,27 @@
+[package]
+name = "skardi-etl"
+version.workspace = true
+edition.workspace = true
+description = "Compiler from `kind: etl` configs to validated skardi bundles (DDL, jobs, pipelines, ctx fragment, README)"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+# NOT a `crates/cli` subcommand: since the reframe (#170) that CLI is a
+# pure HTTP client with no library dependency, and an offline generator
+# must link the library — hence its own binary.
+[[bin]]
+name = "skardi-etl"
+path = "src/main.rs"
+
+[dependencies]
+# chunking: the validation gates plan real `chunk_parts` SQL.
+skardi = { path = "../skardi", features = ["chunking"] }
+clap = { version = "4.5", features = ["derive"] }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

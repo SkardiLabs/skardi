@@ -69,6 +69,17 @@ pub struct GeneratedBundle {
 /// validate. The bundle it returns has passed all four gates; writing it
 /// is the caller's (CLI's) one remaining step.
 pub async fn generate_hybrid(config: &EtlConfig) -> Result<GeneratedBundle, String> {
+    generate_hybrid_with(config, None).await
+}
+
+/// [`generate_hybrid`] with an optional `--recipe` override (FR-3): a
+/// user recipe loaded through the SAME parser replaces the built-in for
+/// this run, and everything downstream — resolution against the real
+/// pack, the four gates — treats it identically.
+pub async fn generate_hybrid_with(
+    config: &EtlConfig,
+    recipe_override: Option<super::recipe::Recipe>,
+) -> Result<GeneratedBundle, String> {
     if config.format != TargetFormatKind::HybridSearch {
         return Err(
             "format 'okf' is milestone 2; 'hybrid_search' is what generates today".to_string(),
@@ -83,14 +94,29 @@ pub async fn generate_hybrid(config: &EtlConfig) -> Result<GeneratedBundle, Stri
             available.join(", ")
         )
     })?;
-    let recipe = find_embedded(&config.source.pack, config.format)?.ok_or_else(|| {
-        format!(
-            "no embedded recipe covers pack '{}' with format '{}' — pass --recipe <file> \
-             or pick a covered pack (`skardi-etl recipes` lists coverage)",
-            config.source.pack,
-            config.format.as_str()
-        )
-    })?;
+    let recipe = match recipe_override {
+        Some(recipe) => {
+            if recipe.pack != config.source.pack || recipe.format != config.format {
+                return Err(format!(
+                    "--recipe covers pack '{}' / format '{}', but the config asks for \
+                     '{}' / '{}'",
+                    recipe.pack,
+                    recipe.format.as_str(),
+                    config.source.pack,
+                    config.format.as_str()
+                ));
+            }
+            recipe
+        }
+        None => find_embedded(&config.source.pack, config.format)?.ok_or_else(|| {
+            format!(
+                "no embedded recipe covers pack '{}' with format '{}' — pass --recipe <file> \
+                 or pick a covered pack (`skardi-etl recipes` lists coverage)",
+                config.source.pack,
+                config.format.as_str()
+            )
+        })?,
+    };
     let resolved = recipe.resolve(pack)?;
 
     // config.tables ∩ recipe, in config order; empty = the recipe's full set.

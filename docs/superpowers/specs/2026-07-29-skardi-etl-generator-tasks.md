@@ -185,7 +185,7 @@ real `DataSource` model (`path` + `hierarchy_level: catalog`).
 
 ### 1c. The `skardi-etl` binary (`crates/skardi-etl`, new crate)
 
-- [ ] 1c.1 `generate -f etl.yaml -o out/ [--recipe r.yaml] [--force]`,
+- [x] 1c.1 `generate -f etl.yaml -o out/ [--recipe r.yaml] [--force]`,
       `setup -f out/setup.sql --dest <path> | --dest-env <VAR> | --ctx
       <ctx.yaml> --catalog <name> [--reset]`, `recipes [--pack]
       [--format] [--show <pack> <format>]`. Exit codes 0/1/2; no
@@ -193,6 +193,23 @@ real `DataSource` model (`path` + `hierarchy_level: catalog`).
       enforced in M3 when the dialect lands, the flag surface ships
       now). NOT a `crates/cli` subcommand: that CLI is a pure HTTP
       client since #170 and an offline generator must link the library.
+
+**1c verification**: `crates/skardi-etl` builds as a workspace member
+(skardi dep with `features = ["chunking"]`); server and skardi-cli still
+build. Live run against the flagship config: `generate` wrote the
+six-file tree with the vec0 shape-only warning surfaced; regenerating
+without `--force` refused with exit 1; `--force` swapped cleanly leaving
+no `.etl-tmp-*`/`.etl-bak-*` siblings; `setup --dest` on a machine
+without sqlite-vec failed with the pointed `--extension`/$SQLITE_VEC_PATH
+hint (the fts5/table/trigger lifecycle apply→re-apply→reset→re-apply is
+unit-tested against a real file DB); `recipes` lists both built-ins and
+`--show github hybrid_search` dumps the annotated YAML; a wrong table
+errors naming the recipe's actual tables. `--recipe` loads a user file
+through the SAME parser and refuses pack/format mismatches
+(`generate_hybrid_with`). `setup --reset` derives its DROP list from
+setup.sql's own CREATE statements in reverse creation order, so the
+command stays bundle-agnostic. Exit codes: 0 success, 1 expected
+failure, 2 environment failure.
 
 ### 1d. Verification (the M1 gate)
 
