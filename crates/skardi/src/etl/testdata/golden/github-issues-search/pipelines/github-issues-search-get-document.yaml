@@ -8,9 +8,9 @@ spec:
   query: |
     -- One document's ordered chunks: reassembly and neighbor-chunk
     -- context in one call, drivable from any search hit (FR-9 returns
-    -- source_table/source_id with every row). Same read-time doc_id
-    -- dedup as search: under {since} replay each chunk keeps its
-    -- newest copy (max rid = latest insert).
+    -- source_table/source_id with every row). Same defense-in-depth
+    -- doc_id dedup as search (write-time replacement already keeps one
+    -- copy): newest wins (max rid = latest insert).
     WITH chunks AS (
       SELECT doc_id, source_table, source_id, chunk_index, title, content,
              author, created_at,

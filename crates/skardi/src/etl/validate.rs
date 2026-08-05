@@ -219,11 +219,15 @@ fn synthetic_context(
     Arc::new(ChunkingRegistry::new()).register_chunk_udf(&mut ctx);
     register_json_pack_udf(&mut ctx);
     register_vec_to_binary_udf(&mut ctx);
-    // The embedding stub: same name + return type as the real UDF, marked
-    // volatile so constant folding never tries to invoke it (the search
-    // query's `candle('model', NULL)` is all-literal after placeholder
-    // substitution).
-    ctx.register_udf(ScalarUDF::new_from_impl(EmbeddingStubUDF::new()));
+    // The embedding stubs: same names + return type as the real UDFs,
+    // marked volatile so constant folding never tries to invoke them (the
+    // search query's embedding call is all-literal after placeholder
+    // substitution). Both are registered so whichever UDF the config
+    // selects plans.
+    ctx.register_udf(ScalarUDF::new_from_impl(EmbeddingStubUDF::new("candle")));
+    ctx.register_udf(ScalarUDF::new_from_impl(EmbeddingStubUDF::new(
+        "remote_embed",
+    )));
 
     for (name, schema) in dialect.udtf_stubs(config) {
         ctx.register_udtf(name, Arc::new(StubTableFunction { schema }));
@@ -282,12 +286,14 @@ fn synthetic_context(
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct EmbeddingStubUDF {
+    name: &'static str,
     signature: Signature,
 }
 
 impl EmbeddingStubUDF {
-    fn new() -> Self {
+    fn new(name: &'static str) -> Self {
         Self {
+            name,
             // Volatile: keeps the constant folder from invoking the stub.
             signature: Signature::variadic_any(Volatility::Volatile),
         }
@@ -299,7 +305,7 @@ impl ScalarUDFImpl for EmbeddingStubUDF {
         self
     }
     fn name(&self) -> &str {
-        "candle"
+        self.name
     }
     fn signature(&self) -> &Signature {
         &self.signature
@@ -501,14 +507,100 @@ spec:
             "{}",
             generated.bundle.tree()
         );
-        // …and the only warning is the expected vec0 shape-only note (no
-        // sqlite-vec extension is configured here).
-        assert_eq!(generated.warnings.len(), 1, "{:?}", generated.warnings);
-        assert!(
-            generated.warnings[0].contains("vec0"),
-            "{:?}",
-            generated.warnings
-        );
+        // …and warnings depend only on whether the default SQLITE_VEC_PATH
+        // resolves here: none when it does (the full DDL + replay smoke
+        // executed), else exactly the vec0 shape-only note.
+        if std::env::var("SQLITE_VEC_PATH").is_ok() {
+            assert!(generated.warnings.is_empty(), "{:?}", generated.warnings);
+        } else {
+            assert_eq!(generated.warnings.len(), 1, "{:?}", generated.warnings);
+            assert!(
+                generated.warnings[0].contains("vec0"),
+                "{:?}",
+                generated.warnings
+            );
+        }
+    }
+
+    /// The reviewer-requested contract: every README `skardi job run`
+    /// command must carry EXACTLY the parameters the job's SQL requires —
+    /// the executor rejects submissions with missing parameters, so an
+    /// under-parameterized command fails synchronously.
+    #[tokio::test]
+    async fn readme_job_commands_carry_every_inferred_required_parameter() {
+        let config = EtlConfig::from_yaml(FLAGSHIP).unwrap();
+        let generated = generate_hybrid(&config).await.unwrap();
+        let readme = &generated.bundle.files()["README.md"];
+
+        // Load each generated job through the real loader to get its
+        // inferred request schema.
+        let dialect = resolve_dialect(&config).unwrap();
+        let registry = SourcePackRegistry::builtins().unwrap();
+        let recipe = find_embedded("github", TargetFormatKind::HybridSearch)
+            .unwrap()
+            .unwrap();
+        let resolved = recipe.resolve(registry.get("github").unwrap()).unwrap();
+        let ctx = synthetic_context(&config, &resolved, dialect.as_ref()).unwrap();
+        let staged = stage_for_loaders(&generated.bundle).unwrap();
+
+        for rel in generated.bundle.files().keys() {
+            let Some(file) = rel.strip_prefix("jobs/") else {
+                continue;
+            };
+            let job_name = file.trim_end_matches(".yaml");
+            let job = JobDefinition::load_from_file(staged.dir.join(rel), Arc::clone(&ctx))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut required: Vec<String> = job
+                .pipeline
+                .request_schema()
+                .fields
+                .keys()
+                .cloned()
+                .collect();
+            required.sort();
+
+            let command_line = readme
+                .lines()
+                .find(|l| l.contains(&format!("skardi job run {job_name}")))
+                .unwrap_or_else(|| panic!("README has a command for {job_name}"));
+            let mut supplied: Vec<String> = command_line
+                .split("-p ")
+                .skip(1)
+                .filter_map(|chunk| chunk.split('=').next())
+                .map(|s| s.trim().to_string())
+                .collect();
+            supplied.sort();
+
+            assert_eq!(
+                supplied, required,
+                "README command for {job_name} must supply exactly its required \
+                 parameters\n  command: {command_line}"
+            );
+        }
+        staged.cleanup();
+    }
+
+    #[tokio::test]
+    async fn remote_embed_configs_pass_all_four_gates() {
+        let config = EtlConfig::from_yaml(
+            &FLAGSHIP.replace(
+                "embedding: { udf: candle, model: models/generated/bge-small-en-v1.5, dimensions: 384 }",
+                "embedding: { udf: remote_embed, provider: openai, model: text-embedding-3-small, dimensions: 1536 }",
+            ),
+        )
+        .unwrap();
+        let generated = generate_hybrid(&config).await.unwrap_or_else(|e| {
+            panic!("remote_embed must generate and validate:\n{e}");
+        });
+        let job = &generated.bundle.files()["jobs/github-issues-search-ingest-issues.yaml"];
+        assert!(job.contains("remote_embed('openai'"), "{job}");
+        let search = &generated.bundle.files()["pipelines/github-issues-search-search-hybrid.yaml"];
+        assert!(search.contains("remote_embed('openai'"), "{search}");
+        // The README surfaces the provider's API-key env.
+        let readme = &generated.bundle.files()["README.md"];
+        assert!(readme.contains("$OPENAI_API_KEY"), "{readme}");
     }
 
     #[tokio::test]

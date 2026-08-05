@@ -4,12 +4,15 @@
 --
 -- doc_id is deliberately NOT a primary key: jobs are append-only
 -- (no ON CONFLICT path in the executor), so a unique constraint
--- would hard-fail {since} replay mid-stream. Replay accumulates
--- rows; the search pipeline deduplicates by doc_id at read time,
--- and the PRIMARY KEY arrives with v2 upsert. `rid` is the
--- INTEGER rowid alias the vec0 mirror requires (and the join key
--- the pipelines use); SQLite assigns it on the NULL the ingest
--- SELECT emits.
+-- would hard-fail {since} replay mid-stream. Uniqueness is
+-- enforced by the documents_bi_replace trigger below instead:
+-- every INSERT first deletes the previous copy of its doc_id (and
+-- that copy's mirror rows), so replay REPLACES rather than
+-- accumulates and the search candidate pools never fill with
+-- stale copies. The declared PRIMARY KEY arrives with v2 upsert.
+-- `rid` is the INTEGER rowid alias the vec0 mirror requires (and
+-- the join key the pipelines use); SQLite assigns it on the NULL
+-- the ingest SELECT emits.
 CREATE TABLE IF NOT EXISTS documents (
   rid INTEGER PRIMARY KEY,
   doc_id TEXT NOT NULL,
@@ -24,8 +27,12 @@ CREATE TABLE IF NOT EXISTS documents (
   embedding BLOB NOT NULL
 );
 
--- Text arm: standalone fts5 mirror (rebuild-first keeps triggers
--- insert-only).
+-- The replace trigger's lookup path (doc_id is not a key).
+CREATE INDEX IF NOT EXISTS documents_doc_id_idx ON documents(doc_id);
+
+-- Text arm: standalone fts5 mirror. Rows are inserted with an
+-- explicit rowid = documents.rid so the replace trigger can
+-- delete them by integer key.
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   content,
   doc_rowid UNINDEXED
@@ -37,12 +44,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_vec USING vec0(
   embedding float[384]
 );
 
--- Sync triggers: INSERT-only by design (append-only jobs;
--- rebuild-first refresh). NEW.rid carries the join key.
+-- Replace-on-insert: one live copy per doc_id. Deleting the old
+-- copy's mirror rows is inlined here (not chained through DELETE
+-- triggers) so the behavior never depends on recursive-trigger
+-- settings.
+CREATE TRIGGER IF NOT EXISTS documents_bi_replace
+BEFORE INSERT ON documents BEGIN
+  DELETE FROM documents_fts
+    WHERE rowid IN (SELECT rid FROM documents WHERE doc_id = NEW.doc_id);
+  DELETE FROM documents_vec
+    WHERE doc_rowid IN (SELECT rid FROM documents WHERE doc_id = NEW.doc_id);
+  DELETE FROM documents WHERE doc_id = NEW.doc_id;
+END;
+
+-- Sync triggers: NEW.rid carries the join key into both mirrors
+-- (and pins the fts row's OWN rowid so replacement can find it).
 CREATE TRIGGER IF NOT EXISTS documents_ai_fts
 AFTER INSERT ON documents BEGIN
-  INSERT INTO documents_fts(doc_rowid, content)
-  VALUES (NEW.rid, NEW.content);
+  INSERT INTO documents_fts(rowid, doc_rowid, content)
+  VALUES (NEW.rid, NEW.rid, NEW.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS documents_ai_vec

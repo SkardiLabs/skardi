@@ -138,6 +138,40 @@ pub struct EmbeddingSpec {
     pub dimensions: u32,
 }
 
+impl EmbeddingSpec {
+    /// The SQL call embedding `text_expr` — the ONE place the configured
+    /// UDF choice becomes SQL, used by both the ingest projection and the
+    /// search pipeline's query vector so they can never diverge.
+    pub fn call_expr(&self, text_expr: &str) -> String {
+        match self.udf {
+            EmbeddingUdf::Candle => format!("candle('{}', {text_expr})", self.model),
+            EmbeddingUdf::RemoteEmbed => format!(
+                "remote_embed('{}', '{}', {text_expr})",
+                self.provider
+                    .as_deref()
+                    .expect("remote_embed always carries a provider (validated)"),
+                self.model
+            ),
+        }
+    }
+
+    /// The environment variable the configured UDF needs on the SERVER at
+    /// run time, if any — surfaced by the generated README's first-contact
+    /// checklist.
+    pub fn runtime_env(&self) -> Option<String> {
+        match self.udf {
+            EmbeddingUdf::Candle => None,
+            EmbeddingUdf::RemoteEmbed => Some(format!(
+                "{}_API_KEY",
+                self.provider
+                    .as_deref()
+                    .expect("remote_embed always carries a provider (validated)")
+                    .to_uppercase()
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkSplitter {
     Character,

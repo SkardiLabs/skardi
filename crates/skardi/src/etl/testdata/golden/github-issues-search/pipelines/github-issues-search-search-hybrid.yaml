@@ -28,9 +28,9 @@ spec:
       FULL OUTER JOIN fts f ON v.rid = f.rid
     ),
     hits AS (
-      -- doc_id is not unique under {since} replay; keep each
-      -- chunk's best-scoring copy (read-time dedup — the no-PK
-      -- decision's other half).
+      -- Write-time replacement (documents_bi_replace) keeps one live
+      -- copy per doc_id; this read-time dedup stays as defense in
+      -- depth (e.g. rows written outside the generated jobs).
       SELECT d.doc_id, d.source_table, d.source_id, d.chunk_index, d.title,
              d.content, d.author, d.created_at, r.rrf_score,
              ROW_NUMBER() OVER (PARTITION BY d.doc_id ORDER BY r.rrf_score DESC)

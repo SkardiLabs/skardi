@@ -13,6 +13,30 @@ refuses to overwrite a non-empty directory without `--force`.
 - `pipelines/` — `github-issues-search-search-hybrid` (RRF) and `github-issues-search-get-document`.
 - `ctx.fragment.yaml` — the data-source entry to merge into your `ctx.yaml`.
 
+## Before you ingest — read this first
+
+> **⚠ Source permissions are NOT preserved.** Ingestion flattens access
+> control: EVERY document the source binding can see — including private
+> repositories, channels, or pages — lands in `data/gh.db` and becomes
+> searchable by ANYONE who can reach that file or the pipelines served
+> over it. Scope the binding to what the destination's audience may see,
+> and protect the destination like you protect the source.
+
+First-contact checklist:
+
+- **Source binding**: the Open Connector binding behind
+  `saas.github_demo` exists, is authorized, and is scoped to the data
+  you intend to expose (see the warning above).
+- **sqlite-vec**: the vec0 loadable resolves via the env var named in
+  `ctx.fragment.yaml` (`options.extensions_env`) — for both `setup`
+  and the server.
+- **Embedding dimensions**: the DDL sizes vectors at the DECLARED
+  `dimensions` (384); it is not verified against `models/generated/bge-small-en-v1.5`. A
+  mismatch surfaces on the first ingest — fix the config and rebuild.
+- **Destination access = search access**: whoever can read
+  `data/gh.db` (or call the served pipelines) can read everything
+  ingested.
+
 ## Run it (five steps)
 
 ```bash
@@ -26,8 +50,12 @@ skardi-etl setup -f setup.sql --dest data/gh.db
 # 3. Serve the bundle.
 skardi-server --ctx ctx.yaml --jobs jobs/ --pipeline pipelines/
 
-# 4. Ingest (append-only; {limit} bounds each run).
-skardi job run github-issues-search-ingest-issues -p limit=500
+# 4. Ingest ({limit} bounds each run; every listed parameter is
+#    required — the executor rejects submissions missing one).
+#    since is required: the epoch watermark below is the full first
+#    backfill; later runs pass your last watermark (overlap is safe —
+#    each doc_id's previous copy is replaced at write time).
+skardi job run github-issues-search-ingest-issues -p limit=500 -p since="1970-01-01T00:00:00Z"
 
 # 5. Search.
 skardi run github-issues-search-search-hybrid \
@@ -46,12 +74,14 @@ The v1 refresh model is rebuild-first: `skardi-etl setup -f setup.sql \
 --dest data/gh.db --reset` drops every bundle-owned artifact and
 re-applies the DDL; then re-run the jobs.
 
-- `github-issues-search-ingest-issues` is incremental: pass `-p since=<ISO-8601 watermark>` to load only rows updated since. Choose the watermark to OVERLAP the last run — duplicates accumulate harmlessly (the search pipeline deduplicates by `doc_id` at read time); a gap loses rows. `{limit}` stays as the first-backfill bound.
+- `github-issues-search-ingest-issues` is incremental: pass `-p since=<ISO-8601 watermark>` to load only rows updated since. Choose the watermark to OVERLAP the last run — replayed rows REPLACE their previous copies at write time (per `doc_id`); a gap loses rows. `{limit}` stays as the first-backfill bound. One caveat: a document that shrinks to fewer chunks leaves its old tail chunks behind until a rebuild (`doc_id` embeds the chunk index).
 
-`doc_id` (`<source_table>:<source_id>:<chunk_index>`) is deterministic but
-deliberately NOT unique in v1 — replay accumulates rows instead of
-hard-failing mid-job, and reads deduplicate. A chunking-config change moves
-chunk boundaries: that is a rebuild.
+`doc_id` (`<source_table>:<source_id>:<chunk_index>`) is deterministic.
+It carries no UNIQUE constraint (replay must not hard-fail mid-job), but a
+write-time trigger replaces each incoming `doc_id`'s previous copy, so
+re-ingesting never bloats the index or crowds the search candidate pools;
+the pipelines keep a read-time dedup as defense in depth. A chunking-config
+change moves chunk boundaries: that is a rebuild.
 
 ## Troubleshooting
 
@@ -61,8 +91,8 @@ chunk boundaries: that is a rebuild.
   output directory.
 - **`no such module: vec0`** — the sqlite-vec extension isn't loadable;
   set the extension env var (see `ctx.fragment.yaml`) and re-apply setup.
-- **Search returns stale/duplicate-looking rows** — expected under
-  incremental overlap; reads keep each chunk's best copy. `--reset` +
-  re-run clears history completely.
+- **Stale content after a document shrank or chunking changed** — old
+  tail chunks survive replacement (see Refresh); `--reset` + re-run
+  rebuilds cleanly.
 
 Destination: `gh_search` → `data/gh.db`.

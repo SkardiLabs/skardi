@@ -163,9 +163,10 @@ pub struct SearchPlan {
     pub knn_candidates: u32,
     /// Candidate depth for the text arm.
     pub fts_candidates: u32,
-    /// Embedding model (the query vector must use the same model the
-    /// ingest embedded with).
-    pub embedding_model: String,
+    /// The embedding config (the query vector must use the same UDF and
+    /// model the ingest embedded with — [`super::config::EmbeddingSpec::call_expr`]
+    /// is the single renderer for both).
+    pub embedding: super::config::EmbeddingSpec,
 }
 
 /// `get-document`: one document's ordered chunks by
@@ -215,7 +216,7 @@ pub fn hybrid_plan(config: &EtlConfig, tables: &[ResolvedTable]) -> Result<Hybri
         search: SearchPlan {
             knn_candidates: 80,
             fts_candidates: 60,
-            embedding_model: embedding.model.clone(),
+            embedding: embedding.clone(),
         },
         get_document: GetDocumentPlan,
     })

@@ -2,10 +2,14 @@
 //! end-to-end hybrid path:
 //!
 //! generate → `setup` against a real SQLite file (fts5 + vec0 + triggers)
-//! → run the generated ingest job through the REAL job executor (positional
-//! write, preflight and all) → execute the generated search and
-//! get-document pipelines → assert RRF-ranked rows and ordered-chunk
-//! reassembly. Read-time `doc_id` dedup is pinned by double-ingesting.
+//! → register the destination FROM the generated ctx fragment → run the
+//! generated ingest job through the REAL job executor (positional write,
+//! preflight and all) → execute the generated search and get-document
+//! pipelines → assert RRF-ranked rows and ordered-chunk reassembly.
+//! Replay safety is pinned at the storage level: three identical ingests
+//! plus 100 direct re-inserts of one doc_id leave exactly one live copy
+//! per doc_id, so the fixed KNN/FTS candidate pools can never be crowded
+//! out by replayed history.
 //!
 //! Two substitutions, on purpose:
 //! - The mock SOURCE is a MemTable with the pack's exact FieldMapping
@@ -230,7 +234,6 @@ spec:
     type: sqlite
     path: {db}
     catalog: mock_search
-    sqlite: {{ extensions_env: SQLITE_VEC_PATH }}
   embedding: {{ udf: candle, model: fake-e2e-model, dimensions: {DIMS} }}
   chunking: {{ splitter: character, size: 40, overlap: 0 }}
 "#,
@@ -277,25 +280,55 @@ spec:
     saas.register_schema("mock_demo", mock_schema).unwrap();
     ctx.register_catalog("saas", Arc::new(saas));
 
+    // The destination registers FROM the generated ctx fragment — name,
+    // path, and (crucially) options.extensions_env all come from the
+    // artifact, so a fragment that couldn't load vec0 would fail right
+    // here instead of being masked by hand-wired options. The config above
+    // sets no extensions_env: the generated default (SQLITE_VEC_PATH) is
+    // exactly what this test exercises.
+    let fragment: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(out_dir.join("ctx.fragment.yaml")).unwrap())
+            .expect("ctx fragment parses");
+    let entry = fragment["spec"]["data_sources"][0].clone();
+    assert_eq!(entry["type"].as_str(), Some("sqlite"));
+    assert_eq!(entry["hierarchy_level"].as_str(), Some("catalog"));
+    assert_eq!(entry["access_mode"].as_str(), Some("read_write"));
+    let source_name = entry["name"].as_str().expect("fragment names the source");
+    let source_path = entry["path"].as_str().expect("fragment carries the path");
+    let options: HashMap<String, String> = entry["options"]
+        .as_mapping()
+        .expect("fragment carries options (extensions_env is required for vec0)")
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().unwrap().to_string(),
+                v.as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        options.get("extensions_env").map(String::as_str),
+        Some("SQLITE_VEC_PATH"),
+        "the fragment defaults the extension env"
+    );
+
     let registry: DatasetRegistry = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    let mut options = HashMap::new();
-    options.insert("extensions_env".to_string(), "SQLITE_VEC_PATH".to_string());
     register_sqlite_tables(
         &mut ctx,
-        "mock_search",
-        &db_path.display().to_string(),
+        source_name,
+        source_path,
         Some(&options),
         true,
         Some(&registry),
         HierarchyLevel::Catalog,
     )
     .await
-    .expect("register destination catalog");
+    .expect("register destination catalog from the generated fragment");
     register_sqlite_knn_udtf(&ctx, Arc::clone(&registry));
     register_sqlite_fts_udtf(&ctx, Arc::clone(&registry));
     let ctx = Arc::new(ctx);
 
-    // ── ingest through the REAL executor (twice: dedup pin) ─────────────
+    // ── ingest through the REAL executor (thrice: the replay pin) ───────
     let job_path = out_dir.join("jobs/mock-items-search-ingest-items.yaml");
     let job = JobDefinition::load_from_file(&job_path, Arc::clone(&ctx))
         .await
@@ -312,8 +345,8 @@ spec:
         HashMap::new(),
     );
 
-    let mut total_rows = 0u64;
-    for pass in 1..=2u32 {
+    let mut first_pass_rows = 0u64;
+    for pass in 1..=3u32 {
         let run_id = executor
             .submit(
                 &job_name,
@@ -333,7 +366,66 @@ spec:
             rows >= 5,
             "3 items at character/40 chunk to ≥5 rows, got {rows}"
         );
-        total_rows += rows;
+        if pass == 1 {
+            first_pass_rows = rows;
+        }
+    }
+
+    // Replay-safety at the STORAGE level (the reviewer's candidate-pool
+    // concern): after three identical ingests the table holds exactly one
+    // copy per doc_id — replacement happens at write time, so the fixed
+    // KNN/FTS candidate depths can never fill with stale copies no matter
+    // how many replays history accumulates. Then push one document past
+    // the candidate depth (100 direct re-inserts > knn 80 / fts 60) and
+    // prove the pools still see everything else.
+    {
+        let count_one = |sql: &str| {
+            let conn = rusqlite::Connection::open(&db_path).expect("open destination");
+            unsafe { conn.load_extension_enable().unwrap() };
+            unsafe { conn.load_extension(&vec_path, None::<&str>).unwrap() };
+            conn.load_extension_disable().unwrap();
+            conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(
+            count_one("SELECT COUNT(*) FROM documents") as u64,
+            first_pass_rows,
+            "three ingests, one live copy per doc_id"
+        );
+        assert_eq!(
+            count_one("SELECT COUNT(*) FROM documents"),
+            count_one("SELECT COUNT(*) FROM documents_vec"),
+            "vec mirror tracks the live set"
+        );
+        assert_eq!(
+            count_one("SELECT COUNT(*) FROM documents"),
+            count_one("SELECT COUNT(*) FROM documents_fts"),
+            "fts mirror tracks the live set"
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open destination");
+        unsafe { conn.load_extension_enable().unwrap() };
+        unsafe { conn.load_extension(&vec_path, None::<&str>).unwrap() };
+        conn.load_extension_disable().unwrap();
+        for _ in 0..100 {
+            conn.execute(
+                "INSERT INTO documents \
+                 SELECT NULL, doc_id, source_table, source_id, title, content, \
+                 chunk_index, author, created_at, metadata, embedding \
+                 FROM documents WHERE doc_id = 'items:1:0'",
+                [],
+            )
+            .expect("direct replay insert");
+        }
+        assert_eq!(
+            count_one("SELECT COUNT(*) FROM documents WHERE doc_id = 'items:1:0'"),
+            1,
+            "100 replays of one doc_id keep exactly one live copy"
+        );
+        assert_eq!(
+            count_one("SELECT COUNT(*) FROM documents") as u64,
+            first_pass_rows,
+            "beyond-candidate-depth replay never grows the index"
+        );
     }
 
     // ── search: RRF-ranked, parameterized, doc_id-deduped ────────────────
@@ -385,7 +477,8 @@ spec:
             scores.push(rrf.value(i));
         }
     }
-    // Dedup despite the double ingest (2× rows in the table).
+    // Unique doc_ids in the results (write-time replacement + the
+    // pipelines' defense-in-depth dedup).
     let unique: std::collections::BTreeSet<&String> = doc_ids.iter().collect();
     assert_eq!(unique.len(), doc_ids.len(), "doc_id dedup: {doc_ids:?}");
     assert!(
@@ -398,7 +491,6 @@ spec:
         top_source, "1",
         "top hit {top_doc} should come from item 1: {doc_ids:?}"
     );
-    let _ = total_rows;
 
     // ── get-document: ordered chunks, overlap-0 reassembly ──────────────
     let get_sql = pipeline_query(&out_dir.join("pipelines/mock-items-search-get-document.yaml"))

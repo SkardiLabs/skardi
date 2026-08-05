@@ -261,7 +261,7 @@ fn indent(text: &str, pad: &str) -> String {
 fn render_job_yaml(name: &str, incremental: bool, sql: &str, dest_table: &str) -> String {
     let refresh = if incremental {
         "re-run with -p since=<last watermark> for incremental refresh (overlap is \
-         safe; the search pipeline deduplicates)"
+         safe; each doc_id's previous copy is replaced at write time)"
     } else {
         "the source exposes no timestamp pushdown, so refresh = setup --reset + full re-run"
     };
@@ -303,21 +303,41 @@ fn render_pipeline_yaml(name: &str, description: &str, sql: &str) -> String {
 fn render_readme(config: &EtlConfig, plan: &HybridPlan, slug: &str) -> String {
     let catalog = &config.destination.catalog;
     let dest_path = config.destination.path.as_deref().unwrap_or_default();
-    let model = &plan.search.embedding_model;
+    let embedding = plan.search.embedding.clone();
+    let model = &embedding.model;
+    let embedding_env_note = match embedding.runtime_env() {
+        Some(env) => format!(
+            "- **Embedding credentials**: the `remote_embed` provider reads its API key\n\
+             \x20 from `${env}` — export it in the SERVER's environment before serving.\n"
+        ),
+        None => String::new(),
+    };
 
+    // Every parameter the job's SQL declares appears in its command —
+    // the executor rejects submissions with missing parameters, so a
+    // command that omits one fails synchronously. Incremental jobs get
+    // the epoch watermark as the explicit first backfill.
     let mut job_runs = String::new();
     let mut refresh_notes = String::new();
     for ingest in &plan.ingests {
         let job = format!("{slug}-ingest-{}", ingest.source_table);
-        job_runs.push_str(&format!("skardi job run {job} -p limit=500\n"));
         if ingest.incremental {
+            job_runs.push_str(&format!(
+                "#    since is required: the epoch watermark below is the full first\n\
+                 #    backfill; later runs pass your last watermark (overlap is safe —\n\
+                 #    each doc_id's previous copy is replaced at write time).\n\
+                 skardi job run {job} -p limit=500 -p since=\"1970-01-01T00:00:00Z\"\n"
+            ));
             refresh_notes.push_str(&format!(
                 "- `{job}` is incremental: pass `-p since=<ISO-8601 watermark>` to load only \
-                 rows updated since. Choose the watermark to OVERLAP the last run — duplicates \
-                 accumulate harmlessly (the search pipeline deduplicates by `doc_id` at read \
-                 time); a gap loses rows. `{{limit}}` stays as the first-backfill bound.\n"
+                 rows updated since. Choose the watermark to OVERLAP the last run — replayed \
+                 rows REPLACE their previous copies at write time (per `doc_id`); a gap loses \
+                 rows. `{{limit}}` stays as the first-backfill bound. One caveat: a document \
+                 that shrinks to fewer chunks leaves its old tail chunks behind until a \
+                 rebuild (`doc_id` embeds the chunk index).\n"
             ));
         } else {
+            job_runs.push_str(&format!("skardi job run {job} -p limit=500\n"));
             refresh_notes.push_str(&format!(
                 "- `{job}` is full-load (its pack exposes no timestamp pushdown): refresh = \
                  `skardi-etl setup --reset` + re-run. `{{limit}}` bounds each run.\n"
@@ -341,6 +361,31 @@ fn render_readme(config: &EtlConfig, plan: &HybridPlan, slug: &str) -> String {
          - `pipelines/` — `{slug}-search-hybrid` (RRF) and `{slug}-get-document`.\n\
          - `ctx.fragment.yaml` — the data-source entry to merge into your `ctx.yaml`.\n\
          \n\
+         ## Before you ingest — read this first\n\
+         \n\
+         > **⚠ Source permissions are NOT preserved.** Ingestion flattens access\n\
+         > control: EVERY document the source binding can see — including private\n\
+         > repositories, channels, or pages — lands in `{dest_path}` and becomes\n\
+         > searchable by ANYONE who can reach that file or the pipelines served\n\
+         > over it. Scope the binding to what the destination's audience may see,\n\
+         > and protect the destination like you protect the source.\n\
+         \n\
+         First-contact checklist:\n\
+         \n\
+         - **Source binding**: the Open Connector binding behind\n\
+         \x20 `{source_binding}` exists, is authorized, and is scoped to the data\n\
+         \x20 you intend to expose (see the warning above).\n\
+         - **sqlite-vec**: the vec0 loadable resolves via the env var named in\n\
+         \x20 `ctx.fragment.yaml` (`options.extensions_env`) — for both `setup`\n\
+         \x20 and the server.\n\
+         - **Embedding dimensions**: the DDL sizes vectors at the DECLARED\n\
+         \x20 `dimensions` ({dims}); it is not verified against `{model}`. A\n\
+         \x20 mismatch surfaces on the first ingest — fix the config and rebuild.\n\
+         {embedding_env_note}\
+         - **Destination access = search access**: whoever can read\n\
+         \x20 `{dest_path}` (or call the served pipelines) can read everything\n\
+         \x20 ingested.\n\
+         \n\
          ## Run it (five steps)\n\
          \n\
          ```bash\n\
@@ -354,7 +399,8 @@ fn render_readme(config: &EtlConfig, plan: &HybridPlan, slug: &str) -> String {
          # 3. Serve the bundle.\n\
          skardi-server --ctx ctx.yaml --jobs jobs/ --pipeline pipelines/\n\
          \n\
-         # 4. Ingest (append-only; {{limit}} bounds each run).\n\
+         # 4. Ingest ({{limit}} bounds each run; every listed parameter is\n\
+         #    required — the executor rejects submissions missing one).\n\
          {job_runs}\
          \n\
          # 5. Search.\n\
@@ -376,10 +422,12 @@ fn render_readme(config: &EtlConfig, plan: &HybridPlan, slug: &str) -> String {
          \n\
          {refresh_notes}\
          \n\
-         `doc_id` (`<source_table>:<source_id>:<chunk_index>`) is deterministic but\n\
-         deliberately NOT unique in v1 — replay accumulates rows instead of\n\
-         hard-failing mid-job, and reads deduplicate. A chunking-config change moves\n\
-         chunk boundaries: that is a rebuild.\n\
+         `doc_id` (`<source_table>:<source_id>:<chunk_index>`) is deterministic.\n\
+         It carries no UNIQUE constraint (replay must not hard-fail mid-job), but a\n\
+         write-time trigger replaces each incoming `doc_id`'s previous copy, so\n\
+         re-ingesting never bloats the index or crowds the search candidate pools;\n\
+         the pipelines keep a read-time dedup as defense in depth. A chunking-config\n\
+         change moves chunk boundaries: that is a rebuild.\n\
          \n\
          ## Troubleshooting\n\
          \n\
@@ -389,12 +437,14 @@ fn render_readme(config: &EtlConfig, plan: &HybridPlan, slug: &str) -> String {
          \x20 output directory.\n\
          - **`no such module: vec0`** — the sqlite-vec extension isn't loadable;\n\
          \x20 set the extension env var (see `ctx.fragment.yaml`) and re-apply setup.\n\
-         - **Search returns stale/duplicate-looking rows** — expected under\n\
-         \x20 incremental overlap; reads keep each chunk's best copy. `--reset` +\n\
-         \x20 re-run clears history completely.\n\
+         - **Stale content after a document shrank or chunking changed** — old\n\
+         \x20 tail chunks survive replacement (see Refresh); `--reset` + re-run\n\
+         \x20 rebuilds cleanly.\n\
          \n\
          Destination: `{catalog}` → `{dest_path}`.\n",
         name = config.name,
+        source_binding = config.source.binding(),
+        dims = embedding.dimensions,
     )
 }
 
@@ -523,12 +573,47 @@ spec:
         for needle in [
             "skardi-etl setup -f setup.sql --dest data/gh.db",
             "skardi-server --ctx ctx.yaml --jobs jobs/ --pipeline pipelines/",
-            "skardi job run github-issues-search-ingest-issues",
+            // The incremental job's command carries EVERY required
+            // parameter — omitting {since} would fail at submission.
+            "skardi job run github-issues-search-ingest-issues -p limit=500 \
+             -p since=\"1970-01-01T00:00:00Z\"",
             "skardi run github-issues-search-search-hybrid",
             "skardi run github-issues-search-get-document",
             "--reset",
             ".etl-bak-<pid>",
             "models/generated/bge-small-en-v1.5",
+        ] {
+            assert!(
+                readme.contains(needle),
+                "missing '{needle}' in README:\n{readme}"
+            );
+        }
+    }
+
+    #[test]
+    fn readme_discloses_acl_flattening_before_the_first_ingest_command() {
+        // PRD requirement: source ACLs are NOT preserved, and the README
+        // must say so BEFORE the ingest commands.
+        let bundle = flagship_bundle();
+        let readme = &bundle.files()["README.md"];
+        let warning_at = readme
+            .find("Source permissions are NOT preserved")
+            .expect("ACL flattening warning present");
+        let ingest_at = readme
+            .find("skardi job run")
+            .expect("ingest command present");
+        assert!(
+            warning_at < ingest_at,
+            "the ACL warning must come before the first ingest command"
+        );
+        // The first-contact checklist items.
+        for needle in [
+            "First-contact checklist",
+            "Source binding",
+            "sqlite-vec",
+            "Embedding dimensions",
+            "Destination access = search access",
+            "saas.github_demo",
         ] {
             assert!(
                 readme.contains(needle),

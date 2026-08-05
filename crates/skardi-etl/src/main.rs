@@ -369,6 +369,10 @@ fn reset_statements(setup_sql: &str) -> Vec<String> {
             .or_else(|| {
                 line.strip_prefix("CREATE TRIGGER IF NOT EXISTS ")
                     .map(|r| ("TRIGGER", r))
+            })
+            .or_else(|| {
+                line.strip_prefix("CREATE INDEX IF NOT EXISTS ")
+                    .map(|r| ("INDEX", r))
             });
         if let Some((kind, rest)) = rest {
             let name: String = rest
@@ -455,8 +459,10 @@ mod tests {
     fn reset_list_is_reverse_creation_order_and_complete() {
         let setup = "\
 CREATE TABLE IF NOT EXISTS documents (\n  x TEXT\n);\n\
+CREATE INDEX IF NOT EXISTS documents_doc_id_idx ON documents(doc_id);\n\
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(content);\n\
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_vec USING vec0(embedding float[3]);\n\
+CREATE TRIGGER IF NOT EXISTS documents_bi_replace\nBEFORE INSERT ON documents BEGIN\nEND;\n\
 CREATE TRIGGER IF NOT EXISTS documents_ai_fts\nAFTER INSERT ON documents BEGIN\nEND;\n\
 CREATE TRIGGER IF NOT EXISTS documents_ai_vec\nAFTER INSERT ON documents BEGIN\nEND;\n";
         assert_eq!(
@@ -464,8 +470,10 @@ CREATE TRIGGER IF NOT EXISTS documents_ai_vec\nAFTER INSERT ON documents BEGIN\n
             vec![
                 "DROP TRIGGER IF EXISTS documents_ai_vec;",
                 "DROP TRIGGER IF EXISTS documents_ai_fts;",
+                "DROP TRIGGER IF EXISTS documents_bi_replace;",
                 "DROP TABLE IF EXISTS documents_vec;",
                 "DROP TABLE IF EXISTS documents_fts;",
+                "DROP INDEX IF EXISTS documents_doc_id_idx;",
                 "DROP TABLE IF EXISTS documents;",
             ]
         );
