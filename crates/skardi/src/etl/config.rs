@@ -6,7 +6,7 @@
 //! own surface (it is deliberately NOT a repo-wide convention; see the
 //! design's Research Findings).
 //!
-//! Parsing yields a [`RawEtlConfig`] shaped exactly like the YAML;
+//! Parsing yields a `RawEtlConfig` (private) shaped exactly like the YAML;
 //! [`EtlConfig::from_yaml`] then runs the cross-field rules the design's
 //! §Generation Config declares and produces the validated form the rest
 //! of the generator consumes. Every rejection names the field and the
