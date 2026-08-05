@@ -347,8 +347,9 @@ event carrying the scan identity and error.
       the real gateway); **phase-4 real-mailbox verification pending a
       Google OAuth connection** — fixtures are provider-shaped synthetic
       pages until that pass re-derives them as redacted captures.
-      **Verification**: 285 open_connector tests (counted by `cargo test
-      -p skardi --lib sources::providers::open_connector`; 22 new) — five
+      **Verification**: 283 open_connector tests (counted by `cargo test
+      -p skardi --lib sources::providers::open_connector`, confirmed
+      against the PR's CI run; 22 new) — five
       fixture contract suites plus the schema-mismatch and null-parent
       pins, fingerprint sync + coverage pins, drift-refusal e2e, loader
       single_page pass/refusal, registry pin, and per-declaration e2e
