@@ -495,7 +495,7 @@ mod tests {
             ),
             (
                 "content: body",
-                "content: number",
+                "content: comments",
                 "content must be a plain Utf8 text column",
             ),
             (
