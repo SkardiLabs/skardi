@@ -260,17 +260,23 @@ impl EngineDialect for SqliteDialect {
         };
         format!(
             "# Merge this data source into your ctx.yaml's spec.data_sources.\n\
-             # access_mode: read_write is what the job's WRITE path requires (at\n\
-             # the provider layer); the hybrid UDTFs themselves are\n\
-             # registry-keyed and need no particular hierarchy level.\n\
+             # hierarchy_level: catalog registers the file as the '{catalog}'\n\
+             # catalog — the generated SQL's '{catalog}.main.…' qualification\n\
+             # depends on it. access_mode: read_write is what the ingest job's\n\
+             # WRITE path requires.\n\
              spec:\n\
              \x20 data_sources:\n\
              \x20   - name: {catalog}\n\
              \x20     type: sqlite\n\
-             \x20     connection_string: {path}\n\
+             \x20     path: {path}\n\
              \x20     access_mode: read_write\n\
+             \x20     hierarchy_level: catalog\n\
              {options}"
         )
+    }
+
+    fn destination_table(&self, config: &EtlConfig) -> String {
+        Self::qualified(config, "documents")
     }
 }
 
@@ -685,14 +691,19 @@ spec:
         let fragment = SqliteDialect.ctx_fragment(&config);
         assert!(fragment.contains("name: gh_search"), "{fragment}");
         assert!(fragment.contains("type: sqlite"), "{fragment}");
-        assert!(
-            fragment.contains("connection_string: data/gh.db"),
-            "{fragment}"
-        );
+        // The real DataSource model's keys: `path` (not connection_string)
+        // and catalog-level registration, which the generated SQL's
+        // `gh_search.main.…` qualification depends on.
+        assert!(fragment.contains("path: data/gh.db"), "{fragment}");
         assert!(fragment.contains("access_mode: read_write"), "{fragment}");
+        assert!(fragment.contains("hierarchy_level: catalog"), "{fragment}");
         assert!(
             fragment.contains("extensions_env: SQLITE_VEC_PATH"),
             "{fragment}"
+        );
+        assert_eq!(
+            SqliteDialect.destination_table(&config),
+            "gh_search.main.documents"
         );
         let _ = plan;
     }

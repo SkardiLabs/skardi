@@ -68,6 +68,11 @@ pub trait EngineDialect {
 
     /// The ctx data-source fragment registering the destination.
     fn ctx_fragment(&self, config: &EtlConfig) -> String;
+
+    /// The fully-qualified `documents` identifier for the generated job's
+    /// `spec.destination.table` — engine-specific (the sqlite provider
+    /// registers its file under `<catalog>.main`).
+    fn destination_table(&self, config: &EtlConfig) -> String;
 }
 
 /// Resolve the config's engine to a dialect, enforcing the capability

@@ -24,12 +24,14 @@
 //!   byte-identical output (BTreeMap iteration, insertion-ordered JSON,
 //!   no timestamps at generate time).
 
+pub mod bundle;
 pub mod config;
 pub mod dialect;
 pub mod dialects;
 pub mod format;
 pub mod recipe;
 
+pub use bundle::{Bundle, render_hybrid_bundle, slug};
 pub use config::EtlConfig;
 pub use dialect::{EngineDialect, resolve_dialect};
 pub use format::hybrid_plan;
