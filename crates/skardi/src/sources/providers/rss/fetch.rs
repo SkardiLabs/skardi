@@ -58,7 +58,18 @@
 //! Each hop gets its own budget of [`MAX_ATTEMPTS`] tries: `429` and
 //! transient `5xx` (`500`/`502`/`503`/`504`) are retried, as are timeouts
 //! and other transport errors — an egress refusal is not, since it can
-//! never succeed on retry. The wait between attempts is whichever is longer
+//! never succeed on retry. Timeouts and transport errors spend that budget
+//! wherever they strike: a connection that dies midway through streaming
+//! the body is no less transient than one that dies before the response
+//! headers arrived, so [`FeedFetcher::read_body`] failures re-enter the
+//! same attempt loop rather than terminating the fetch. A body-phase retry
+//! reissues the full `GET` and discards the partial body — no `Range`
+//! resume, because a feed body is small enough that resumption buys
+//! nothing and a spliced body from two server states is worse than none.
+//! [`FetchError::TooLarge`] is the one body-phase error that is *not*
+//! retried: it is a policy verdict on the response's size, not a transient
+//! fault, and a retry would only stream the same oversized body back to
+//! the same cap. The wait between attempts is whichever is longer
 //! of the response's `Retry-After` and an exponential backoff with jitter
 //! (see [`backoff`]), capped at [`MAX_RETRY_WAIT`] either way —
 //! `crate::util::http::parse_retry_after`'s own doc contract is that callers
@@ -88,9 +99,10 @@
 // flag both files. Remove this once the engine wires `FeedFetcher` in.
 #![allow(dead_code)]
 
+use std::error::Error as StdError;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use reqwest::header::{
@@ -399,7 +411,27 @@ impl FeedFetcher {
                         continue;
                     }
                     if status.is_success() {
-                        return Ok(HopOutcome::Done(self.read_body(resp).await?));
+                        // Body-phase failures spend the same attempt budget
+                        // as send() failures: a connection that dies
+                        // mid-body is no less transient than one that dies
+                        // before the headers, and the retry below reissues
+                        // the full GET, discarding the partial body.
+                        // `TooLarge` (and anything else) stays terminal —
+                        // see the module doc's Retries section.
+                        match self.read_body(resp).await {
+                            Ok(outcome) => return Ok(HopOutcome::Done(outcome)),
+                            Err(
+                                err @ (FetchError::Timeout { .. } | FetchError::Transport { .. }),
+                            ) => {
+                                if attempt + 1 >= MAX_ATTEMPTS {
+                                    return Err(err);
+                                }
+                                tokio::time::sleep(backoff(attempt)).await;
+                                last_err = Some(err);
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
                     return Err(FetchError::Status {
                         status: status.as_u16(),
@@ -506,8 +538,8 @@ fn backoff(attempt: u32) -> Duration {
     let shift = attempt.min(6);
     let base_ms = RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << shift);
     let half = base_ms / 2;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()))
         .unwrap_or(0);
     let span = half.saturating_mul(2).saturating_add(1);
@@ -538,7 +570,7 @@ fn header_string(resp: &Response, name: HeaderName) -> Option<String> {
 /// fixed depth (an implementation detail of a stack this module does not
 /// own), this walks `source()` until either a match or the chain ends.
 fn find_egress_denied(err: &reqwest::Error) -> Option<EgressDenied> {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    let mut source: Option<&(dyn StdError + 'static)> = StdError::source(err);
     while let Some(e) = source {
         if let Some(denied) = e.downcast_ref::<EgressDenied>() {
             return Some(EgressDenied {
@@ -763,6 +795,50 @@ mod tests {
         assert!(
             matches!(err, FetchError::TooLarge { limit: 1_048_576 }),
             "got {err}"
+        );
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "TooLarge is a policy verdict, not a transient fault — a retry \
+             would only stream the same oversized body again"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_body_is_retried_and_recovers() {
+        // The regression this pins: the headers arrive fine (200), then the
+        // connection dies mid-body. Before body-phase errors re-entered the
+        // attempt loop, only send() failures were retried — the same
+        // transient fault got MAX_ATTEMPTS tries before the headers and
+        // zero after them. The mock declares the full content-length but
+        // sends 4 bytes, so the client sees a mid-transfer connection loss;
+        // the retry must be a fresh full GET (the partial body is
+        // discarded, never resumed) and must succeed on the intact second
+        // response.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let server = MockFeedServer::start(move |_req| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                MockResponse::xml("<rss>complete</rss>").with_truncated_body(4)
+            } else {
+                MockResponse::xml("<rss>complete</rss>")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let out = f.fetch(&format!("{}/f", server.url()), None).await.unwrap();
+        match out {
+            FetchOutcome::Fetched { body, .. } => assert_eq!(
+                body, b"<rss>complete</rss>",
+                "the retry's intact body, not the truncated first transfer"
+            ),
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "a mid-body connection loss must be retried within the hop's \
+             attempt budget, not treated as terminal"
         );
     }
 

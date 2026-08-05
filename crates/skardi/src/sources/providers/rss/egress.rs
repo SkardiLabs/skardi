@@ -29,6 +29,7 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
+use std::error::Error as StdError;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -82,7 +83,7 @@ impl fmt::Display for EgressDenied {
     }
 }
 
-impl std::error::Error for EgressDenied {}
+impl StdError for EgressDenied {}
 
 /// Check every address a lookup returned against `policy`, failing the *whole*
 /// resolution if any one is refused rather than narrowing to the addresses

@@ -30,6 +30,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use url::Url;
 
 use super::ResolvedSubscription;
 use super::error::RssError;
@@ -247,7 +248,7 @@ pub(crate) fn finalize(
     let mut resolved = Vec::with_capacity(raw.len());
 
     for (url, sub_name) in raw {
-        let parsed = url::Url::parse(&url)
+        let parsed = Url::parse(&url)
             .map_err(|e| invalid_config(format!("invalid subscription URL '{url}': {e}")))?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
             return Err(invalid_config(format!(

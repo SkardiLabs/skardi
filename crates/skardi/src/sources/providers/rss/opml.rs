@@ -19,9 +19,12 @@
 //! bodies themselves — see the dependency comment in `Cargo.toml` for how
 //! the two crate versions are kept from diverging.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -33,11 +36,26 @@ use super::error::RssError;
 /// Byte cap on an OPML file, enforced by [`read_opml`] *while* reading — the
 /// file handle is `take`n at this bound, never read to EOF first. The
 /// configured path is operator-controlled but otherwise arbitrary: without
-/// the cap, a huge file is an unbounded allocation, and an infinite special
-/// file (`/dev/zero`) is a read that never returns. 1 MiB is
+/// the cap, a huge (regular) file is an unbounded allocation. 1 MiB is
 /// far above any real subscription list — an OPML outline runs ~100 bytes,
 /// so this admits on the order of ten thousand feeds.
+///
+/// One of three independent bounds `read_opml` places on the read; see its
+/// doc for how this, the regular-file check, and [`OPML_READ_TIMEOUT`]
+/// divide the failure modes between them.
 pub(crate) const MAX_OPML_BYTES: u64 = 1024 * 1024;
+
+/// Wall-clock bound on one OPML read, enforced by [`read_opml`] via
+/// [`read_to_string_bounded`]. [`MAX_OPML_BYTES`] bounds how *much* is read,
+/// not how *long* reading takes: a FIFO whose writer never sends enough
+/// bytes (or never closes) blocks a bounded read forever without ever
+/// touching the byte cap. The regular-file check catches a FIFO that is
+/// already at the configured path, but only this timeout covers the
+/// race where the path changes between that check and the open, or a
+/// regular file on storage that has stopped answering (a wedged network
+/// mount). 5s is three orders of magnitude above what a 1 MiB local read
+/// needs, so it can only fire when something is genuinely wrong.
+pub(crate) const OPML_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve `config`'s inline `feeds:` list or `opml:` file into one flat,
 /// ready-to-fetch subscription list.
@@ -52,10 +70,12 @@ pub(crate) const MAX_OPML_BYTES: u64 = 1024 * 1024;
 /// per-feed partitions) consumes only the [`ResolvedSubscription`]s this
 /// returns and never looks at `RssConfig`'s input shape again.
 ///
-/// Blocking, but boundedly so: the `opml:` form performs synchronous file
-/// I/O capped at [`MAX_OPML_BYTES`] — never a read to EOF. Callers on an
-/// async runtime (registration, when a later task adds it) should still
-/// wrap the call in `spawn_blocking`, as with any filesystem touch.
+/// Blocking, but boundedly so: the `opml:` form refuses non-regular files,
+/// then performs synchronous file I/O capped at [`MAX_OPML_BYTES`] and
+/// [`OPML_READ_TIMEOUT`] — never a read to EOF, never an unbounded wait.
+/// Callers on an async runtime (registration, when a later task adds it)
+/// should still wrap the call in `spawn_blocking`, as with any filesystem
+/// touch.
 pub fn resolve_subscriptions(
     name: &str,
     config: &RssConfig,
@@ -96,14 +116,26 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
         reason,
     };
 
+    // Only regular files are read at all. A FIFO or device file is not a
+    // subscription list under any encoding, and several of them defeat the
+    // byte cap below by blocking rather than delivering bytes — a FIFO with
+    // no writer blocks at open(), one with an idle writer blocks mid-read.
+    // `fs::metadata` follows symlinks, so a symlink *to* a regular file
+    // still registers fine; a symlink to anything else is refused like the
+    // thing it points at.
+    let meta = fs::metadata(path).map_err(|e| unreadable(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(unreadable(
+            "not a regular file (FIFOs and device files are refused)".to_string(),
+        ));
+    }
+
     // Bounded read: take one byte past the cap so "exactly at the cap" and
     // "over it" are distinguishable, without ever reading further than that —
-    // see MAX_OPML_BYTES for why reading to EOF first is not an option.
-    let file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
-    let mut content = String::new();
-    file.take(MAX_OPML_BYTES + 1)
-        .read_to_string(&mut content)
-        .map_err(|e| unreadable(e.to_string()))?;
+    // see MAX_OPML_BYTES for why reading to EOF first is not an option. The
+    // wall-clock bound backstops the check above against a path that changes
+    // between stat and open — see OPML_READ_TIMEOUT.
+    let content = read_to_string_bounded(path, OPML_READ_TIMEOUT).map_err(unreadable)?;
     if content.len() as u64 > MAX_OPML_BYTES {
         return Err(unreadable(format!(
             "file exceeds the {MAX_OPML_BYTES}-byte OPML size limit"
@@ -191,6 +223,48 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
     // reached without `validate()` having run first gets the same check
     // instead of silently resolving to zero subscriptions.
     Ok(subs)
+}
+
+/// Open `path` and read it to a `String`, bounded two ways: at most
+/// [`MAX_OPML_BYTES`] `+ 1` bytes (via `take`, so the extra byte is how the
+/// caller distinguishes at-cap from over-cap), and at most `timeout` of
+/// wall-clock time for the whole open-and-read.
+///
+/// std has no timed read for files, so the bound is imposed from outside:
+/// the open and read run on a dedicated helper thread, and this function
+/// waits on a channel with `recv_timeout`. On timeout the helper thread is
+/// *abandoned*, not killed — there is no portable way to interrupt a read
+/// stuck in the kernel. That leak is deliberately acceptable here: it is at
+/// most one thread per failed registration attempt, holding at most the
+/// `take`-bounded ~1 MiB, and the alternative (no timeout) is the
+/// registration path itself hanging instead — the thing this bound exists
+/// to prevent.
+///
+/// Errors are returned as bare reason strings: only the caller knows the
+/// source `name` that [`RssError::OpmlUnreadable`] wants.
+fn read_to_string_bounded(path: &Path, timeout: Duration) -> Result<String, String> {
+    let (tx, rx) = mpsc::channel();
+    let path: PathBuf = path.to_path_buf();
+    thread::spawn(move || {
+        let result = (|| {
+            let file = File::open(&path).map_err(|e| e.to_string())?;
+            let mut content = String::new();
+            file.take(MAX_OPML_BYTES + 1)
+                .read_to_string(&mut content)
+                .map_err(|e| e.to_string())?;
+            Ok(content)
+        })();
+        // The receiver is gone if the timeout already fired; nothing to do
+        // with the result in that case.
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "did not finish reading within {}s (OPML read timeout)",
+            timeout.as_secs()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +401,85 @@ mod tests {
         let subs = resolve_subscriptions("news", &config).unwrap();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].name, "A");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_file_is_rejected_before_any_read() {
+        // A FIFO is the dangerous case: opening it for read blocks until a
+        // writer appears, so if this rejection regressed to happen *after*
+        // open, this test would hit the read timeout (slow) or hang (without
+        // one). Its fast failure is itself part of what is being asserted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subs.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let config = RssConfig {
+            opml: Some(path),
+            ..inline_config(vec![])
+        };
+        let start = std::time::Instant::now();
+        let err = resolve_subscriptions("news", &config).unwrap_err();
+        assert!(
+            start.elapsed() < OPML_READ_TIMEOUT,
+            "rejection must come from the metadata check, not the read timeout"
+        );
+        match err {
+            RssError::OpmlUnreadable { reason, .. } => assert!(
+                reason.contains("not a regular file"),
+                "reason should name the file-type refusal: {reason}"
+            ),
+            other => panic!("expected OpmlUnreadable, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_file_is_rejected_before_any_read() {
+        // /dev/zero would defeat the byte cap by supply rather than by
+        // blocking (infinite bytes, no EOF); the regular-file check refuses
+        // it before a single byte is read.
+        let config = RssConfig {
+            opml: Some("/dev/zero".into()),
+            ..inline_config(vec![])
+        };
+        let err = resolve_subscriptions("news", &config).unwrap_err();
+        match err {
+            RssError::OpmlUnreadable { reason, .. } => assert!(
+                reason.contains("not a regular file"),
+                "reason should name the file-type refusal: {reason}"
+            ),
+            other => panic!("expected OpmlUnreadable, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_read_hits_the_wall_clock_timeout() {
+        // Exercises read_to_string_bounded's timeout arm directly (with a
+        // short timeout — the 5s production value would just slow the suite):
+        // a FIFO with no writer blocks at open(), which is exactly the shape
+        // of stall the timeout exists to bound. Going through read_opml
+        // instead would be rejected earlier by the metadata check — this is
+        // the backstop *behind* that check, for the stat-to-open race it
+        // cannot close.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stalled.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let err = read_to_string_bounded(&path, Duration::from_millis(50)).unwrap_err();
+        assert!(
+            err.contains("OPML read timeout"),
+            "error should name the timeout: {err}"
+        );
+        // The helper thread stays parked in open() — the documented,
+        // deliberate leak; the tempdir unlink at drop does not wake it.
     }
 
     #[test]

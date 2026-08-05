@@ -6,9 +6,10 @@
 //! It differs from the Open Connector mock in exactly the ways feed
 //! responses differ from gateway envelopes: bodies are raw bytes (so a
 //! future gzip fixture can be served without a text detour), every response
-//! header is caller-controlled rather than a hardcoded `content-type`, and a
+//! header is caller-controlled rather than a hardcoded `content-type`, a
 //! response can carry an artificial delay for exercising the fetcher's
-//! timeout path.
+//! timeout path, and a response body can be cut off mid-transfer for
+//! exercising the fetcher's body-phase retry path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,6 +47,7 @@ pub(crate) struct MockResponse {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     delay: Option<Duration>,
+    truncate_body_at: Option<usize>,
 }
 
 impl MockResponse {
@@ -56,6 +58,7 @@ impl MockResponse {
             headers: Vec::new(),
             body: body.into(),
             delay: None,
+            truncate_body_at: None,
         }
     }
 
@@ -82,6 +85,16 @@ impl MockResponse {
     /// for the fetcher's timeout tests.
     pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    /// Advertise the full body's length in `content-length` but send only
+    /// its first `sent_bytes` bytes before closing the connection —
+    /// simulating an upstream that dies mid-transfer. The declared/actual
+    /// length mismatch is what makes the client see a body-read error
+    /// rather than mistaking the prefix for a short-but-complete response.
+    pub(crate) fn with_truncated_body(mut self, sent_bytes: usize) -> Self {
+        self.truncate_body_at = Some(sent_bytes);
         self
     }
 }
@@ -243,7 +256,15 @@ async fn serve_connection(
     head_out.push_str("\r\n");
 
     stream.write_all(head_out.as_bytes()).await?;
-    stream.write_all(&response.body).await?;
+    // `content-length` above always declares the full body; sending less
+    // (see `MockResponse::with_truncated_body`) is deliberate, so the
+    // client observes a mid-body connection loss instead of a complete
+    // response.
+    let sent = match response.truncate_body_at {
+        Some(n) => &response.body[..n.min(response.body.len())],
+        None => &response.body[..],
+    };
+    stream.write_all(sent).await?;
     stream.shutdown().await
 }
 
