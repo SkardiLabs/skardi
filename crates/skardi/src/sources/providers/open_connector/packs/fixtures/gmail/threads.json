@@ -1,22 +1,21 @@
 {
   "threads": [
     {
-      "threadId": "1900000000000aa001",
-      "snippet": "Quarterly report attached — please review before Friday.",
+      "threadId": "1900000000000a00",
+      "snippet": "Redacted thread snippet 1.",
       "historyId": "4200001"
     },
     {
-      "threadId": "1900000000000aa002",
-      "snippet": "",
-      "historyId": null
+      "threadId": "1900000000000a01",
+      "snippet": "Redacted thread snippet 2.",
+      "historyId": "4200002"
     },
     {
-      "threadId": "1900000000000aa003",
-      "snippet": "Re: onboarding checklist",
-      "historyId": "4200003",
-      "labels": ["synthetic-extra-field"]
+      "threadId": "1900000000000a02",
+      "snippet": "Redacted thread snippet 3.",
+      "historyId": "4200003"
     }
   ],
-  "nextPageToken": null,
-  "resultSizeEstimate": 3
+  "nextPageToken": "00000000000000000001",
+  "resultSizeEstimate": 201
 }

@@ -1,22 +1,14 @@
 {
   "filters": [
     {
-      "id": "ANe1Bmj0000000000000000000000000000000001",
+      "id": "ANe1Bmg0000000000000000000000000000001",
       "criteria": {
         "from": "alerts@example.com"
       },
       "action": {
-        "addLabelIds": ["Label_1"],
-        "removeLabelIds": ["INBOX"]
-      }
-    },
-    {
-      "id": "ANe1Bmj0000000000000000000000000000000002",
-      "criteria": {
-        "query": "has:attachment larger:10M"
-      },
-      "action": {
-        "addLabelIds": ["TRASH"]
+        "addLabelIds": [
+          "Label_1"
+        ]
       }
     }
   ]

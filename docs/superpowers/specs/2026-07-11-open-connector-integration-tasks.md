@@ -341,15 +341,28 @@ event carrying the scan identity and error.
       pinned from live capture (`fixtures/gmail/contracts/`, gateway
       v1.3.4); the coverage-gap pin records that `fetch_emails` declares
       its items as an `anyOf` the walker does not descend, so all
-      `messages` columns ride passthrough. Contract-level live
-      reconciliation done (every table's exact input set reaches the
-      credential wall; bounds `[1,500]` and the `detail` enum enforced by
-      the real gateway); **phase-4 real-mailbox verification pending a
-      Google OAuth connection** — fixtures are provider-shaped synthetic
-      pages until that pass re-derives them as redacted captures.
-      **Verification**: 283 open_connector tests (counted by `cargo test
+      `messages` columns ride passthrough. **Live-verified end to end
+      against a real mailbox (2026-08-05, gateway v1.3.4 + Google OAuth
+      through the gateway)**: registration passed the fingerprint gate
+      against live discovery for all five actions; every mapped column
+      of every table extracted a real non-NULL value through
+      skardi-server; real multi-page cursor chaining (`maxResults: 1`,
+      three pages) and real final-page null-token termination observed;
+      `query`/`labelIds`/`includeSpamTrash` resources observed narrowing
+      real listings; input bounds `[1,500]` and the `detail` enum
+      enforced by the real gateway. The live pass settled two synthetic
+      guesses (which system labels omit visibility fields; a fresh
+      draft's threadId equals its messageId) and caught one upstream
+      bug: a zero-filter mailbox fails `list_filters` with
+      `internal_error` (Gmail returns an empty body the executor's
+      `response.json()` does not tolerate) — documented in the pack doc,
+      fix belongs upstream. Fixtures are redacted live captures from
+      that pass (mechanically audited against an allowlist); executor
+      absent-spellings the capture lacked are pinned by an inline
+      converter test.
+      **Verification**: 284 open_connector tests (counted by `cargo test
       -p skardi --lib sources::providers::open_connector`, confirmed
-      against the PR's CI run; 22 new) — five
+      against the PR's CI run; 23 new) — five
       fixture contract suites plus the schema-mismatch and null-parent
       pins, fingerprint sync + coverage pins, drift-refusal e2e, loader
       single_page pass/refusal, registry pin, and per-declaration e2e
@@ -372,10 +385,10 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 - **Current PR**: milestone 5.4 (Gmail pack — threads, messages, drafts,
   labels, filters). Milestones 1–4 and 5.1–5.3 (GitHub, Slack, Notion
   packs) are merged; this PR adds the first Google Workspace pack against
-  Open Connector's normalized Gmail contract (reconciled live at the
-  contract level; real-mailbox verification gates the merge), plus the
-  one engine extension it required (the loader's `single_page` strategy
-  spelling for actions that declare no pagination inputs).
+  Open Connector's normalized Gmail contract (reconciled live and
+  verified end to end against a real mailbox), plus the one engine
+  extension it required (the loader's `single_page` strategy spelling
+  for actions that declare no pagination inputs).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

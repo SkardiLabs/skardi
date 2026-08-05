@@ -98,10 +98,35 @@
 //!   coverage walker does not descend, so every `messages` column rides
 //!   outside the fingerprint gate — the coverage-gap pin records that
 //!   honestly; drift there surfaces at scan time per conversion rules.
-//! - **Fixtures are provider-shaped synthetic pages** derived from the
-//!   executor source and declared contracts; phase-4 live verification
-//!   (pending a Google OAuth connection) re-derives them as redacted
-//!   live captures, per the Notion precedent.
+//! - **Column sets are verified against REAL wire rows**, end to end
+//!   against a live mailbox through the gateway (2026-08-05, gateway
+//!   v1.3.4): registration passed the fingerprint gate against live
+//!   discovery for all five actions; every mapped column of every table
+//!   extracted a real non-NULL value through skardi-server; real
+//!   multi-page cursor chaining and real final-page termination were
+//!   observed at the wire (`maxResults: 1` chained three pages; the full
+//!   listing terminated on the null token); and the
+//!   `query`/`labelIds`/`includeSpamTrash` resources were seen narrowing
+//!   real listings. Live rows also settled two guesses: which system
+//!   labels omit visibility fields (SENT/INBOX/DRAFT/STARRED/UNREAD do;
+//!   CHAT does not), and a fresh draft's `threadId` equals its
+//!   `messageId`.
+//! - **A mailbox with zero filters currently fails the `filters` scan**
+//!   with the gateway's `internal_error`: Gmail answers
+//!   `settings/filters` with an empty body when no filters exist, and
+//!   the upstream executor's unconditional `response.json()` throws
+//!   before its own null-tolerant normalization can run — verified live
+//!   (creating one filter makes the same call succeed). An upstream fix
+//!   belongs in open-connector; until it lands, the pack doc documents
+//!   the empty-mailbox caveat.
+//! - **Fixtures are redacted live captures** (2026-08-05, same live
+//!   pass): real envelope keys, field presence/absence, and timestamp
+//!   spellings, with synthetic identifiers and placeholder text, audited
+//!   mechanically against an allowlist. The absent-spellings the
+//!   executor source guarantees but the capture happened not to contain
+//!   (null `historyId`, `""` headers, empty `labelIds`) are pinned by an
+//!   inline converter test; the schema-mismatch fixture stays synthetic
+//!   and says so.
 
 use std::sync::OnceLock;
 
@@ -199,54 +224,47 @@ mod tests {
     }
 
     #[test]
-    fn threads_fixture_converts_with_null_history_and_extra_field() {
+    fn threads_fixture_converts_the_live_page_shape() {
+        // Redacted live capture (2026-08-05): every listed thread carried
+        // all three fields — the null/empty spellings the executor can
+        // emit are pinned separately by the inline edge-spelling test.
         let batch = convert_fixture(
             table("threads"),
             include_str!("fixtures/gmail/threads.json"),
         );
         assert_eq!(batch.num_rows(), 3);
-        assert_eq!(utf8(&batch, "thread_id").value(0), "1900000000000aa001");
-        // The executor spells an absent history checkpoint as an explicit
-        // null (`?? null`) and an empty snippet as "" — the empty string
-        // stays an empty string, never NULL.
-        assert!(utf8(&batch, "history_id").is_null(1));
-        assert_eq!(utf8(&batch, "snippet").value(1), "");
-        // An undeclared upstream field on a row rides along ignored.
-        assert_eq!(utf8(&batch, "thread_id").value(2), "1900000000000aa003");
+        assert_eq!(utf8(&batch, "thread_id").value(0), "1900000000000a00");
+        assert_eq!(utf8(&batch, "history_id").value(0), "4200001");
+        assert!((0..3).all(|i| !utf8(&batch, "snippet").is_null(i)));
     }
 
     #[test]
-    fn messages_fixture_converts_with_empty_string_conventions() {
+    fn messages_fixture_converts_the_live_summary_shape() {
+        // Redacted live capture: detail=summary rows carry exactly the
+        // seven mapped fields, labelIds is a non-empty array on real mail,
+        // and messageTimestamp is the executor's RFC 3339 re-emission of
+        // internalDate (millisecond spelling, `.000Z` on real rows).
         let batch = convert_fixture(
             table("messages"),
             include_str!("fixtures/gmail/messages.json"),
         );
         assert_eq!(batch.num_rows(), 3);
-        assert_eq!(utf8(&batch, "message_id").value(0), "1900000000000bb001");
-        // Header-derived fields spell "absent" as "" (readHeader's
-        // fallback): empty subject and recipients stay empty strings.
-        assert_eq!(utf8(&batch, "subject").value(1), "");
-        assert_eq!(utf8(&batch, "to_addresses").value(1), "");
-        // labelIds is always an array on the wire; empty stays an empty
-        // list, not NULL.
+        assert_eq!(utf8(&batch, "message_id").value(0), "1900000000000b00");
         let labels: &ListArray = batch
             .column_by_name("label_ids")
             .expect("column")
             .as_any()
             .downcast_ref()
             .expect("List column");
-        assert!(!labels.is_null(1));
-        assert_eq!(labels.value(1).len(), 0);
-        let first = labels.value(0);
-        let first = first
+        let third = labels.value(2);
+        let third = third
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("Utf8 items");
         assert_eq!(
-            (0..first.len()).map(|i| first.value(i)).collect::<Vec<_>>(),
-            vec!["INBOX", "IMPORTANT"]
+            (0..third.len()).map(|i| third.value(i)).collect::<Vec<_>>(),
+            vec!["IMPORTANT", "CATEGORY_UPDATES", "INBOX"]
         );
-        // The executor's RFC 3339 messageTimestamp parses on every row.
         let ts: &TimestampMillisecondArray = batch
             .column_by_name("message_timestamp")
             .expect("column")
@@ -258,14 +276,58 @@ mod tests {
 
     #[test]
     fn drafts_fixture_converts_through_nested_paths() {
+        // Redacted live capture: a draft's message identity nests under
+        // `message`, and on the live wire a fresh draft's threadId equals
+        // its messageId.
         let batch = convert_fixture(table("drafts"), include_str!("fixtures/gmail/drafts.json"));
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(utf8(&batch, "id").value(0), "r-1900000000000cc001");
-        assert_eq!(utf8(&batch, "message_id").value(0), "1900000000000bb010");
-        assert_eq!(utf8(&batch, "thread_id").value(0), "1900000000000aa010");
-        // The executor backfills a missing message identity as "" — kept
-        // verbatim, same empty-string rule as headers.
-        assert_eq!(utf8(&batch, "message_id").value(1), "");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(utf8(&batch, "id").value(0), "r-4000000000000000001");
+        assert_eq!(utf8(&batch, "message_id").value(0), "1900000000000c01");
+        assert_eq!(utf8(&batch, "thread_id").value(0), "1900000000000c01");
+    }
+
+    #[test]
+    fn executor_absent_spellings_convert_as_pinned() {
+        // Converter pins for the absent spellings the executor source
+        // guarantees but the live capture happened not to contain: an
+        // absent history checkpoint is an explicit null (`?? null`),
+        // header-derived fields and a missing draft-message identity fall
+        // back to "" (kept verbatim, never NULL), labelIds defaults to an
+        // empty array (an empty list, not NULL), and an undeclared
+        // upstream field rides along ignored.
+        let batch = convert_page(
+            table("threads"),
+            &json!({"threads": [
+                {"threadId": "t-1", "snippet": "", "historyId": null, "extra": true},
+            ]}),
+        );
+        assert!(utf8(&batch, "history_id").is_null(0));
+        assert_eq!(utf8(&batch, "snippet").value(0), "");
+
+        let batch = convert_page(
+            table("messages"),
+            &json!({"messages": [{
+                "messageId": "m-1", "threadId": "t-1", "labelIds": [],
+                "subject": "", "sender": "", "to": "",
+                "messageTimestamp": "2026-07-30T08:15:42.000Z",
+            }]}),
+        );
+        assert_eq!(utf8(&batch, "subject").value(0), "");
+        assert_eq!(utf8(&batch, "to_addresses").value(0), "");
+        let labels: &ListArray = batch
+            .column_by_name("label_ids")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("List column");
+        assert!(!labels.is_null(0));
+        assert_eq!(labels.value(0).len(), 0);
+
+        let batch = convert_page(
+            table("drafts"),
+            &json!({"drafts": [{"id": "r-1", "message": {"messageId": "", "threadId": ""}}]}),
+        );
+        assert_eq!(utf8(&batch, "message_id").value(0), "");
     }
 
     #[test]
@@ -284,28 +346,38 @@ mod tests {
 
     #[test]
     fn labels_fixture_converts_with_absent_visibility_and_color() {
+        // Redacted live capture (verbatim system labels): raw passthrough
+        // rows OMIT keys instead of nulling them, and which labels omit
+        // visibility surprised the synthetic guess — on the real wire
+        // SENT/INBOX/DRAFT/STARRED/UNREAD carry no visibility fields
+        // while CHAT does (hide/labelHide). Omitted keys become SQL NULL;
+        // no system label carries color.
         let batch = convert_fixture(table("labels"), include_str!("fixtures/gmail/labels.json"));
-        assert_eq!(batch.num_rows(), 3);
-        assert_eq!(utf8(&batch, "id").value(0), "INBOX");
-        // Raw passthrough rows OMIT keys instead of nulling them: CHAT
-        // carries no visibility fields and system labels no color — the
-        // omitted-key spelling of absent becomes SQL NULL.
+        assert_eq!(batch.num_rows(), 15);
+        assert_eq!(utf8(&batch, "id").value(0), "CHAT");
+        assert_eq!(utf8(&batch, "message_list_visibility").value(0), "hide");
+        assert_eq!(utf8(&batch, "id").value(1), "SENT");
         assert!(utf8(&batch, "message_list_visibility").is_null(1));
         assert!(utf8(&batch, "label_list_visibility").is_null(1));
+        assert_eq!(utf8(&batch, "id").value(2), "INBOX");
+        assert!(utf8(&batch, "message_list_visibility").is_null(2));
         assert!(utf8(&batch, "color").is_null(0));
-        // A user label's color survives as opaque JSON text.
+        // The one user label's color survives as opaque JSON text.
+        assert_eq!(utf8(&batch, "type").value(14), "user");
         let color: Value =
-            serde_json::from_str(utf8(&batch, "color").value(2)).expect("valid JSON");
+            serde_json::from_str(utf8(&batch, "color").value(14)).expect("valid JSON");
         assert_eq!(color["backgroundColor"], "#fb4c2f");
     }
 
     #[test]
     fn filters_fixture_converts_with_opaque_json() {
+        // Redacted live capture: Gmail's sparse criteria/action objects
+        // survive as opaque JSON.
         let batch = convert_fixture(
             table("filters"),
             include_str!("fixtures/gmail/filters.json"),
         );
-        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_rows(), 1);
         let criteria: Value =
             serde_json::from_str(utf8(&batch, "criteria").value(0)).expect("valid JSON");
         assert_eq!(criteria["from"], "alerts@example.com");

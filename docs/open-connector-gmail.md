@@ -13,8 +13,11 @@ headers flattened into `sender`/`to`/`subject`, and Gmail's epoch-millis
 exceptions are `labels` and `filters`, whose rows are the provider
 objects passed through raw. Inputs are the gateway's camelCase strict
 schema (`pageToken`/`maxResults`/`labelIds`). Everything below is
-reconciled against a live gateway (v1.3.4); end-to-end verification
-against a real mailbox is the pack's phase-4 gate before general use.
+reconciled against a live gateway (v1.3.4) **and verified end to end
+against a real mailbox** (2026-08-05): live registration through the
+fingerprint gate, every mapped column extracting real non-NULL values,
+real multi-page cursor pagination and final-page termination, and the
+binding resources observed narrowing real listings.
 
 ## Binding
 
@@ -97,6 +100,13 @@ highlights and caveats:
   termination.
 - **`filters.criteria` / `filters.action` are opaque JSON** — Gmail's
   own sparse matcher and mutation objects.
+- **A mailbox with zero filters currently fails the `filters` scan**
+  with the gateway's `internal_error`: Gmail answers `settings/filters`
+  with an empty body when no filters exist, which the upstream
+  executor's JSON parsing does not tolerate (verified live; one existing
+  filter makes the scan succeed). Fix pending upstream in
+  open-connector; bind `filters` only for mailboxes that have at least
+  one filter until then.
 - **Excluded actions, and why**: `search_threads` (a strict subset of
   `list_threads`), `list_history` (an incremental-sync checkpoint API,
   not a collection), `list_forwarding_addresses` (no output schema to
