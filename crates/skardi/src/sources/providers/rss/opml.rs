@@ -19,7 +19,8 @@
 //! bodies themselves — see the dependency comment in `Cargo.toml` for how
 //! the two crate versions are kept from diverging.
 
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use quick_xml::Reader;
@@ -28,6 +29,15 @@ use quick_xml::events::Event;
 use super::ResolvedSubscription;
 use super::config::{RssConfig, finalize};
 use super::error::RssError;
+
+/// Byte cap on an OPML file, enforced by [`read_opml`] *while* reading — the
+/// file handle is `take`n at this bound, never read to EOF first. The
+/// configured path is operator-controlled but otherwise arbitrary: without
+/// the cap, a huge file is an unbounded allocation, and an infinite special
+/// file (`/dev/zero`) is a read that never returns. 1 MiB is
+/// far above any real subscription list — an OPML outline runs ~100 bytes,
+/// so this admits on the order of ten thousand feeds.
+pub(crate) const MAX_OPML_BYTES: u64 = 1024 * 1024;
 
 /// Resolve `config`'s inline `feeds:` list or `opml:` file into one flat,
 /// ready-to-fetch subscription list.
@@ -41,6 +51,11 @@ use super::error::RssError;
 /// Every later stage of the provider (fetcher, TTL cache, freshness engine,
 /// per-feed partitions) consumes only the [`ResolvedSubscription`]s this
 /// returns and never looks at `RssConfig`'s input shape again.
+///
+/// Blocking, but boundedly so: the `opml:` form performs synchronous file
+/// I/O capped at [`MAX_OPML_BYTES`] — never a read to EOF. Callers on an
+/// async runtime (registration, when a later task adds it) should still
+/// wrap the call in `spawn_blocking`, as with any filesystem touch.
 pub fn resolve_subscriptions(
     name: &str,
     config: &RssConfig,
@@ -75,11 +90,25 @@ pub fn resolve_subscriptions(
 /// subscription. A grouping outline with no `xmlUrl` of its own — like the
 /// "Tech" folder above — is silently skipped; it is structure, not a feed.
 fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, RssError> {
-    let content = fs::read_to_string(path).map_err(|e| RssError::OpmlUnreadable {
+    let unreadable = |reason: String| RssError::OpmlUnreadable {
         name: name.to_string(),
         path: path.display().to_string(),
-        reason: e.to_string(),
-    })?;
+        reason,
+    };
+
+    // Bounded read: take one byte past the cap so "exactly at the cap" and
+    // "over it" are distinguishable, without ever reading further than that —
+    // see MAX_OPML_BYTES for why reading to EOF first is not an option.
+    let file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
+    let mut content = String::new();
+    file.take(MAX_OPML_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| unreadable(e.to_string()))?;
+    if content.len() as u64 > MAX_OPML_BYTES {
+        return Err(unreadable(format!(
+            "file exceeds the {MAX_OPML_BYTES}-byte OPML size limit"
+        )));
+    }
 
     let invalid = |reason: String| RssError::InvalidConfig { reason };
 
@@ -257,6 +286,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn oversized_opml_is_rejected_without_reading_it_all() {
+        // One byte over the cap. The content never needs to parse: the size
+        // check fires before the XML reader ever sees it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.opml");
+        std::fs::write(&path, vec![b' '; (MAX_OPML_BYTES + 1) as usize]).unwrap();
+        let config = RssConfig {
+            opml: Some(path),
+            ..inline_config(vec![])
+        };
+        let err = resolve_subscriptions("news", &config).unwrap_err();
+        match err {
+            RssError::OpmlUnreadable { reason, .. } => assert!(
+                reason.contains("OPML size limit"),
+                "reason should name the size limit: {reason}"
+            ),
+            other => panic!("expected OpmlUnreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opml_exactly_at_the_size_cap_is_accepted() {
+        // The bound is "over the cap", not "at it": a valid document padded
+        // with trailing whitespace to exactly MAX_OPML_BYTES still resolves.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("at-cap.opml");
+        let body = r#"<opml version="2.0"><body><outline text="A" xmlUrl="https://a.example/f.xml"/></body></opml>"#;
+        let mut content = body.to_string();
+        content.push_str(&" ".repeat(MAX_OPML_BYTES as usize - body.len()));
+        assert_eq!(content.len() as u64, MAX_OPML_BYTES);
+        std::fs::write(&path, content).unwrap();
+        let config = RssConfig {
+            opml: Some(path),
+            ..inline_config(vec![])
+        };
+        let subs = resolve_subscriptions("news", &config).unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].name, "A");
     }
 
     #[test]

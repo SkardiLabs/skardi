@@ -24,6 +24,18 @@
 //!
 //! [`AllowAll`]: super::egress::AllowAll
 //!
+//! ## Proxies are disabled
+//!
+//! [`FeedFetcher::new`] builds its client with `no_proxy()`. reqwest
+//! otherwise honors system proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`,
+//! read fresh from the environment at every `ClientBuilder::build`), and in
+//! proxy mode the *proxy's* address is what gets connected to — the target
+//! hostname travels inside the request for the proxy to resolve, so
+//! [`PolicyDns`] never sees the destination and the injected `EgressPolicy`
+//! is silently bypassed for every hostname URL. Feed fetches therefore
+//! always connect directly; an operator who must route egress through a
+//! proxy is choosing to enforce destination policy at that proxy instead.
+//!
 //! ## Validators only cover the first hop
 //!
 //! `If-None-Match`/`If-Modified-Since` are meaningful only against the
@@ -224,6 +236,10 @@ impl FeedFetcher {
         let http = reqwest::Client::builder()
             .dns_resolver(resolver)
             .redirect(Policy::none())
+            // Without this, system proxy variables would hand every hostname
+            // to the proxy and PolicyDns would never see the destination —
+            // see the module doc's "Proxies are disabled" section.
+            .no_proxy()
             .gzip(true)
             .timeout(request_timeout)
             .user_agent(user_agent)
@@ -995,6 +1011,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Egress(_)), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn proxy_env_vars_do_not_bypass_the_egress_policy() {
+        // Same scenario as `injected_policy_refuses_hostname_via_resolver`,
+        // but with system proxy variables set while the client is built —
+        // reqwest reads them fresh at every `ClientBuilder::build`. Without
+        // `no_proxy()` in `FeedFetcher::new`, the request would be routed to
+        // the proxy address instead of the denied hostname: PolicyDns never
+        // sees `localhost`, no Egress error is raised, and this test fails
+        // with the Transport error from the unreachable proxy — which is
+        // exactly the bypass being pinned here. NO_PROXY is set to
+        // `127.0.0.1` (not `localhost`) so that, in that regressed scenario,
+        // concurrently running tests talking to their own loopback mock
+        // servers by IP stay unaffected while the `localhost` target of
+        // *this* test still goes through the proxy and fails loudly.
+        let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
+        let localhost_url = server.url().replace("127.0.0.1", "localhost");
+
+        let vars = ["HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
+            std::env::set_var("http_proxy", "http://127.0.0.1:1");
+            std::env::set_var("NO_PROXY", "127.0.0.1");
+            std::env::set_var("no_proxy", "127.0.0.1");
+        }
+
+        let policy = Arc::new(DenyList(vec![
+            "127.0.0.1".parse().unwrap(),
+            "::1".parse().unwrap(),
+        ]));
+        // Built while the proxy variables are set — this is the moment
+        // reqwest would capture them.
+        let f = fetcher_with_policy(policy);
+        let result = f.fetch(&format!("{localhost_url}/f"), None).await;
+
+        // Restore before asserting so a failure doesn't leak proxy settings
+        // into the rest of the test process.
+        unsafe {
+            for (key, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, FetchError::Egress(_)), "got {err}");
+        assert_eq!(
+            server.requests().len(),
+            0,
+            "the denied hostname must never be connected to, proxied or not"
+        );
     }
 
     #[tokio::test]
