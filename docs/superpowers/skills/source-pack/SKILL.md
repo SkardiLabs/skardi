@@ -128,9 +128,15 @@ missing invariant (with regression tests) is then prerequisite work.
 Implementation done and tests green is NOT done. Follow
 [references/live-verification.md](references/live-verification.md):
 have the user configure a real (free-tier) provider account in the
-gateway — you never touch the credential — then probe every action with
-the pack's exact inputs, diff real row keys against the mapped columns
-in both directions, scan every table end to end through skardi-server
+gateway — you never touch the credential; for OAuth providers the
+reference maps the full flow and its layered gates (scope unions the
+app cannot enable, gateway-declared scopes the API does not honor,
+capability flags and admin approvals beyond scopes, stale-token
+snapshots) — then probe every action with
+the pack's exact inputs AND the declared input bounds, diff real row
+keys against the mapped columns
+in both directions, verify termination on the real final page, scan
+every table end to end through skardi-server
 (registration passes the fingerprint gate against LIVE discovery; every
 mapped column extracts a real non-NULL value somewhere; pinned filters
 actually return rows; a small page size forces real multi-page

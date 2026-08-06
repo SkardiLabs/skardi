@@ -1,0 +1,18 @@
+{
+  "items": [
+    {
+      "member_id": "ou_0003",
+      "member_id_type": "open_id",
+      "name": "Redacted name",
+      "tenant_key": "t-0001"
+    },
+    {
+      "member_id": "ou_0006",
+      "member_id_type": "open_id",
+      "name": "Redacted name",
+      "tenant_key": "t-0001"
+    }
+  ],
+  "hasMore": false,
+  "pageToken": null
+}

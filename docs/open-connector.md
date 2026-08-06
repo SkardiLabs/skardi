@@ -21,7 +21,9 @@ gateway **runtime token**.
 > tables are gated on upstream cursor support), and
 > [Notion](open-connector-notion.md) (users, pages, data sources, block
 > children — dynamic-schema rows are gated on binding-time schema
-> freeze). Further provider packs (Jira, …) ship one pack per release per the
+> freeze), and [Feishu](open-connector-feishu.md) (chats, messages,
+> chat members, tasks, wiki — live-verified against a real workspace).
+> Further provider packs (Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.
@@ -260,6 +262,13 @@ already run. Cursor pagination that stops advancing fails as a detected
 loop instead of spinning forever; a continuation cursor of the wrong JSON
 type fails the scan as itself (only an absent, `null`, or empty-string
 cursor means end-of-collection — anything else would silently truncate).
+A pack may additionally declare `has_more_path` for providers whose FINAL
+page carries a non-empty cursor beside an explicit has-more flag (Feishu's
+wiki listings): the flag is then consulted first and is MANDATORY on every
+page — a page without it fails as contract drift rather than guessing.
+Declare it only for providers that always emit the signal; for the
+omit-when-false pattern (Slack's `response_metadata`), leave it undeclared
+and let the cursor spellings terminate the scan.
 Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
 *kind*, never the value.

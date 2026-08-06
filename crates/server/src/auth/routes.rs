@@ -382,11 +382,13 @@ mod tests {
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
+                query_audit_db: None,
+                query_audit_retention_days: None,
             },
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState::new(config, engine, session_ctx, AuthLayer::None, None)
+        AppState::new(config, engine, session_ctx, AuthLayer::None, None, None)
     }
 
     #[tokio::test]
@@ -428,11 +430,13 @@ mod tests {
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
+                query_audit_db: None,
+                query_audit_retention_days: None,
             },
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState::new(config, engine, session_ctx, layer, None)
+        AppState::new(config, engine, session_ctx, layer, None, None)
     }
 
     #[tokio::test]

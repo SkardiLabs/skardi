@@ -257,6 +257,19 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// The declared has-more signal was absent or not a boolean. Guessing
+    /// either way could truncate or loop the scan; carries the JSON *kind*
+    /// only, never the value.
+    #[error(
+        "Open Connector pagination has-more signal at '{path}' on page {page} is {found}, \
+         expected a boolean"
+    )]
+    PaginationHasMoreInvalid {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// Pagination failed to advance: the gateway returned an already-seen
     /// cursor, which would loop the scan forever.
     #[error(

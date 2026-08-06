@@ -18,6 +18,7 @@ use tower::ServiceExt;
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::auth::mode::AuthMode;
 use skardi_server::config::{AccessMode, CliArgs, DataSource, DataSourceType, ServerConfig};
+use skardi_server::query_audit::QueryAuditStore;
 use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
 
@@ -63,6 +64,12 @@ fn data_source(name: &str, access_mode: AccessMode) -> DataSource {
 
 /// AppState with `products` (read_only) and `scratch` (read_write) MemTables.
 fn make_state() -> AppState {
+    make_state_with_audit(None)
+}
+
+/// Same as [`make_state`] but wires an operator audit ledger, so tests can
+/// assert what does (and does not) get recorded.
+fn make_state_with_audit(query_audit: Option<Arc<QueryAuditStore>>) -> AppState {
     let ctx = Arc::new(SessionContext::new());
     ctx.register_batch("products", products_batch()).unwrap();
     ctx.register_batch("scratch", scratch_batch()).unwrap();
@@ -82,9 +89,11 @@ fn make_state() -> AppState {
             ctx_file: None,
             semantics_path: None,
             port: 0,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         },
     };
-    AppState::new(config, engine, ctx, AuthLayer::None, None)
+    AppState::new(config, engine, ctx, AuthLayer::None, None, query_audit)
 }
 
 async fn post_query(state: AppState, body: Value) -> axum::response::Response {
@@ -386,4 +395,246 @@ async fn prepare_insert_into_read_only_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("sql_validation_error"));
+}
+
+// ---------------------------------------------------------------------------
+// ai_context field
+
+#[tokio::test]
+async fn ai_context_is_accepted() {
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT id FROM products",
+            "ai_context": {
+                "purpose": "weekly pricing dashboard",
+                "session_id": "sess-1",
+                "agent_id": "pricing-bot",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["success"], json!(true));
+}
+
+#[tokio::test]
+async fn ai_context_omitted_is_accepted() {
+    // Application/console queries omit ai_context entirely.
+    let resp = post_query(make_state(), json!({"sql": "SELECT id FROM products"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["success"], json!(true));
+}
+
+#[tokio::test]
+async fn ai_context_not_an_object_rejected() {
+    for bad in [json!("just a string"), json!(["a", "b"]), json!(42)] {
+        let resp = post_query(make_state(), json!({"sql": "SELECT 1", "ai_context": bad})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "ai_context: {bad}");
+        let body = body_to_json(resp).await;
+        assert_eq!(body["error_type"], json!("parameter_validation_error"));
+    }
+}
+
+#[tokio::test]
+async fn ai_context_missing_purpose_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "ai_context": {"session_id": "sess-1"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn ai_context_missing_session_id_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "ai_context": {"purpose": "audit"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn ai_context_empty_purpose_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "ai_context": {"purpose": "", "session_id": "sess-1"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn over_long_purpose_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT 1",
+            "ai_context": {"purpose": "x".repeat(2001), "session_id": "sess-1"},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn over_long_session_id_rejected() {
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT 1",
+            "ai_context": {"purpose": "audit", "session_id": "x".repeat(201)},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn over_size_ai_context_rejected() {
+    // A free-form key large enough to push the serialized object past 4096 B.
+    let resp = post_query(
+        make_state(),
+        json!({
+            "sql": "SELECT 1",
+            "ai_context": {
+                "purpose": "audit",
+                "session_id": "sess-1",
+                "blob": "x".repeat(5000),
+            },
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+#[tokio::test]
+async fn explicit_null_ai_context_rejected() {
+    // `"ai_context": null` is *present but malformed*, not absent — a plain
+    // `Option<Value>` would collapse it to `None` and wave it through.
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT 1", "ai_context": Value::Null}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+}
+
+// ---------------------------------------------------------------------------
+// operator query audit ledger
+
+#[tokio::test]
+async fn audit_records_raw_sql_ai_context_and_success() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let state = make_state_with_audit(Some(Arc::clone(&store)));
+
+    let resp = post_query(
+        state,
+        json!({
+            "sql": "SELECT id FROM products WHERE brand = 'Apple'",
+            "ai_context": {"purpose": "brand audit", "session_id": "sess-42"},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let records = store.list_by_session("sess-42").await.unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(
+        record["sql"],
+        json!("SELECT id FROM products WHERE brand = 'Apple'")
+    );
+    assert_eq!(record["ai_context"]["purpose"], json!("brand audit"));
+    assert_eq!(record["session_id"], json!("sess-42"));
+    assert_eq!(record["statement_kind"], json!("Query"));
+    assert_eq!(record["status"], json!("succeeded"));
+    assert_eq!(record["row_count"], json!(3));
+    assert!(!record["finished_at"].is_null(), "{record:?}");
+}
+
+#[tokio::test]
+async fn audit_records_execution_failure() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let state = make_state_with_audit(Some(Arc::clone(&store)));
+
+    // Passes statement validation, fails in the engine (unknown table).
+    let resp = post_query(
+        state,
+        json!({
+            "sql": "SELECT * FROM no_such_table",
+            "ai_context": {"purpose": "typo", "session_id": "sess-fail"},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let records = store.list_by_session("sess-fail").await.unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["status"], json!("failed"));
+    assert!(!records[0]["error"].is_null(), "{:?}", records[0]);
+}
+
+#[tokio::test]
+async fn rejected_statements_are_not_audited() {
+    // Validation runs before the audit write, so a statement that never
+    // reaches the engine leaves no record.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let state = make_state_with_audit(Some(Arc::clone(&store)));
+
+    let resp = post_query(
+        state,
+        json!({"sql": "DROP TABLE products", "ai_context": {"purpose": "nope", "session_id": "s"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(store.count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn query_is_refused_when_the_audit_write_fails() {
+    // Fail closed: with auditing enabled, a statement that cannot be recorded
+    // must not execute. A closed store stands in for an unwritable one.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    store.close_for_test().await;
+    let state = make_state_with_audit(Some(Arc::clone(&store)));
+
+    let resp = post_query(state, json!({"sql": "SELECT id FROM products"})).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("query_audit_error"));
+    assert!(
+        body["data"].is_null(),
+        "no results should be returned: {body}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_recorded_when_audit_not_configured() {
+    // Default state has no --query-audit-db; the request must still succeed
+    // and nothing is persisted. (Regression guard: recording is opt-in.)
+    let resp = post_query(
+        make_state(),
+        json!({"sql": "SELECT id FROM products WHERE brand = 'Apple'"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

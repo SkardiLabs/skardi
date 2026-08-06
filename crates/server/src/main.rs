@@ -1,24 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use skardi::pipeline::pipeline::Pipeline;
+use skardi_server::logging::{allow_plan_value_logging_from_env, build_env_filter};
 use skardi_server::{CliArgs, create_server, load_server_config, telemetry};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-/// Build the tracing filter from the given `RUST_LOG` value (`None` when the
-/// variable is unset or invalid unicode), defaulting to `info`.
-///
-/// aws_config logs the AWS access key id in plaintext at INFO when resolving
-/// credentials, so cap it at WARN unless RUST_LOG explicitly opts in.
-fn build_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
-    let mut env_filter = rust_log
-        .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| "info".into());
-    if !rust_log.is_some_and(|v| v.contains("aws_config")) {
-        env_filter = env_filter.add_directive("aws_config=warn".parse().expect("valid directive"));
-    }
-    env_filter
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,9 +18,14 @@ async fn main() -> Result<()> {
         None => (None, None),
     };
 
-    // Initialize tracing subscriber: fmt to stdout, plus OTel layer when enabled.
+    // Initialize tracing subscriber: fmt to stdout, plus OTel layer when
+    // enabled. The filter is the single choke point that keeps DataFusion's
+    // value-bearing plan output off both sinks — see `skardi_server::logging`.
     tracing_subscriber::registry()
-        .with(build_env_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with(build_env_filter(
+            std::env::var("RUST_LOG").ok().as_deref(),
+            allow_plan_value_logging_from_env(),
+        ))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
@@ -96,37 +87,4 @@ async fn main() -> Result<()> {
 
     info!("👋 Skardi server shutting down");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_filter_defaults_to_info_and_caps_aws_config() {
-        let filter = build_env_filter(None).to_string();
-        assert!(filter.contains("info"), "got {filter}");
-        assert!(filter.contains("aws_config=warn"), "got {filter}");
-    }
-
-    #[test]
-    fn env_filter_caps_aws_config_for_unrelated_rust_log() {
-        let filter = build_env_filter(Some("debug")).to_string();
-        assert!(filter.contains("debug"), "got {filter}");
-        assert!(filter.contains("aws_config=warn"), "got {filter}");
-    }
-
-    #[test]
-    fn env_filter_honors_explicit_aws_config_opt_in() {
-        let filter = build_env_filter(Some("info,aws_config=debug")).to_string();
-        assert!(filter.contains("aws_config=debug"), "got {filter}");
-        assert!(!filter.contains("aws_config=warn"), "got {filter}");
-    }
-
-    #[test]
-    fn env_filter_falls_back_to_info_on_invalid_rust_log() {
-        let filter = build_env_filter(Some("not a [valid directive")).to_string();
-        assert!(filter.contains("info"), "got {filter}");
-        assert!(filter.contains("aws_config=warn"), "got {filter}");
-    }
 }

@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "description": "A raw Feishu IM object."
+      },
+      "description": "The objects returned on this page."
+    },
+    "hasMore": {
+      "type": "boolean",
+      "description": "Whether another page is available."
+    },
+    "pageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The token for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "items",
+    "hasMore",
+    "pageToken"
+  ],
+  "description": "A normalized page of Feishu IM objects."
+}
