@@ -29,10 +29,12 @@ tables:
     action: discord.list_my_guilds
     row_path: "$.guilds"
     fingerprint: 04ff174011522d95adaf7399d2a53ed0a6351bacee0ea880386b35bc05c13853
-    # Keyset: cursor = last row's id, short/empty page terminates. A
-    # single page at the 200 cap would ALSO cover today's account limit
-    # (200 joined guilds with Nitro), but that equality is coincidence,
-    # not contract — keyset keeps the scan complete if either cap moves.
+    # Keyset: cursor = last row's id; ONLY an empty page terminates
+    # (short pages continue, so a silent page-size clamp cannot read as
+    # completion). A single page at the 200 cap would ALSO cover today's
+    # account limit (200 joined guilds with Nitro), but that equality is
+    # coincidence, not contract — keyset keeps the scan complete if
+    # either cap moves.
     pagination:
       strategy: keyset
       cursor_input: after

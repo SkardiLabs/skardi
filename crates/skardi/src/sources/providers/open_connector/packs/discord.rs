@@ -26,10 +26,12 @@
 //!
 //! - **`guilds` paginates by KEYSET** (the engine strategy this pack
 //!   introduced): Discord's `/users/@me/guilds` takes
-//!   `after = <last guild id>` and publishes no cursor of its own. A
-//!   single page at the 200 cap would coincidentally also cover today's
-//!   account limit (200 joined guilds with Nitro), but that equality is
-//!   a coincidence, not a contract — keyset keeps the scan complete and
+//!   `after = <last guild id>` and publishes no cursor of its own; only
+//!   an EMPTY page terminates (short pages continue, so a silent
+//!   page-size clamp cannot read as completion). A single page at the
+//!   200 cap would coincidentally also cover today's account limit
+//!   (200 joined guilds with Nitro), but that equality is a
+//!   coincidence, not a contract — keyset keeps the scan complete and
 //!   terminating if either cap ever moves, where single-page would
 //!   silently truncate at exactly the moment it matters.
 //! - **`with_counts: true` is a fixed input**: the `approximate_*`
@@ -407,10 +409,11 @@ bindings:
     }
 
     #[tokio::test]
-    async fn guilds_keyset_scan_walks_pages_and_terminates_on_the_short_page() {
-        // Page 1 is exactly FULL (200 rows), so the scan must continue
-        // from the last row's id; page 2 is short, ending the walk. This
-        // is the multi-page shape a single-page design would truncate.
+    async fn guilds_keyset_scan_walks_pages_and_terminates_on_the_empty_page() {
+        // Page 1 is full (200 rows) and page 2 is SHORT — but only the
+        // EMPTY page 3 ends the walk (short pages continue: a page-size
+        // clamp must not read as completion). This is the multi-page
+        // shape a single-page design would truncate.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -423,6 +426,7 @@ bindings:
                 let rows: Vec<Value> = match body["input"]["after"].as_str() {
                     None => (1..=200).map(|i| guild_row(&format!("g-{i:04}"))).collect(),
                     Some("g-0200") => vec![guild_row("g-0201")],
+                    Some("g-0201") => vec![],
                     Some(other) => panic!("unexpected after cursor {other}"),
                 };
                 return MockResponse::ok(&envelope_ok(&json!({ "guilds": rows }).to_string()));
@@ -449,20 +453,21 @@ bindings:
         assert_eq!(ids, expected, "both pages scanned, boundary row intact");
 
         let inputs = execute_inputs(&gateway);
-        assert_eq!(inputs.len(), 2, "exactly two pages requested");
+        // Three requests: two row pages plus the terminating empty page —
+        // the standard keyset tax.
+        assert_eq!(inputs.len(), 3, "two row pages plus the empty terminator");
         // Exact input key sets: page 1 carries no cursor; the fixed input
         // and the page size ride every request.
         assert_eq!(sorted_keys(&inputs[0]), vec!["limit", "with_counts"]);
         assert_eq!(inputs[0]["limit"], 200, "declared page size rides the wire");
         assert_eq!(inputs[0]["with_counts"], true, "fixed input pinned");
-        assert_eq!(
-            sorted_keys(&inputs[1]),
-            vec!["after", "limit", "with_counts"]
-        );
-        assert_eq!(
-            inputs[1]["after"], "g-0200",
-            "the cursor is the previous page's LAST row id"
-        );
+        for (input, after) in [(&inputs[1], "g-0200"), (&inputs[2], "g-0201")] {
+            assert_eq!(sorted_keys(input), vec!["after", "limit", "with_counts"]);
+            assert_eq!(
+                input["after"], after,
+                "the cursor is the previous page's LAST row id"
+            );
+        }
     }
 
     #[tokio::test]

@@ -312,9 +312,12 @@ event carrying the scan identity and error.
       provider surface, not deferral; entitlements is deferred because the
       upstream executor exposes no pagination inputs (first-page-only). Engine
       extensions: `PaginationStrategy::Keyset` (cursor = a field of the previous
-      page's LAST ROW, `after`-style; short/empty page terminates; missing or
-      non-string cursor on a full page is typed drift, not a quiet stop; loop
-      guard) and an explicit `single_page` YAML spelling. Contract reconciled
+      page's LAST ROW, `after`-style; ONLY an empty page terminates — short
+      pages continue, so a silent page-size clamp of the kind the Feishu live
+      pass observed cannot read as completion; missing or non-string cursor on
+      a non-empty page is typed drift, not a quiet stop; a repeated cursor
+      fails with identity only, never quoting the row value) and an explicit
+      `single_page` YAML spelling. Contract reconciled
       against a live gateway on 2026-08-07 (action IDs, executor passthrough
       confirmed in source, strict inputs validated to the credential wall via
       the 403-vs-400 probe, three output schemas captured and fingerprint-

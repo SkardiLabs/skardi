@@ -60,7 +60,9 @@ Design notes:
 
 - **`guilds` paginates by keyset** — Discord emits no pagination
   envelope; the next request's `after` is the previous page's last
-  guild id, and a short or empty page ends the scan. A single page at
+  guild id, and only an *empty* page ends the scan (short pages
+  continue, so a silently clamped page size cannot read as completion;
+  the cost is one extra empty request per scan). A single page at
   the 200 cap would coincidentally also cover today's account limit
   (200 joined guilds with Nitro), but that equality is a coincidence,
   not a contract — keyset stays complete if either cap moves.
