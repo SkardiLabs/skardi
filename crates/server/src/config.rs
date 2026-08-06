@@ -20,6 +20,7 @@ use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
 use skardi::sources::sql_validator::{AdhocSqlPolicy, SqlValidatorConfig, validate_sql};
+use skardi::util::json_pack::register_json_pack_udf;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -445,7 +446,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     register_chunk_udf(&mut session_ctx);
     // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
     // metadata/frontmatter serialization boundary)
-    skardi::util::json_pack::register_json_pack_udf(&mut session_ctx);
+    register_json_pack_udf(&mut session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.

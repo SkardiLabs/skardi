@@ -92,8 +92,12 @@ impl ScalarUDFImpl for JsonPackUDF {
         let mut keys: Vec<String> = Vec::with_capacity(args.len() / 2);
         for pair in args.chunks(2) {
             let key = match &pair[0] {
+                // Utf8View included: DataFusion 52 carries computed string
+                // literals as view scalars (the filters.rs precedent) — a
+                // key produced by a coercion must not fail the pack.
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some(k)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(k))) => k.clone(),
+                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(k)))
+                | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(k))) => k.clone(),
                 ColumnarValue::Array(_) => {
                     return Err(DataFusionError::Execution(
                         "json_pack: keys must be Utf8 literals, not columns".to_string(),
@@ -143,7 +147,7 @@ fn value_at(arg: &ColumnarValue, row: usize) -> DFResult<Value> {
 fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
     Ok(match scalar {
         ScalarValue::Null => Value::Null,
-        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) => {
+        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v) => {
             v.as_ref().map_or(Value::Null, |s| Value::from(s.as_str()))
         }
         ScalarValue::Boolean(v) => v.map_or(Value::Null, Value::from),
@@ -172,6 +176,18 @@ fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
         }
         ScalarValue::TimestampNanosecond(v, _) => {
             v.map_or(Value::Null, |ns| Value::from(ns.div_euclid(1_000_000)))
+        }
+        // A List<Utf8> LITERAL: the docs promise "column or literal" for
+        // every supported type, and a `make_array('a','b')` argument
+        // const-folds to exactly this scalar — routing it through the same
+        // list conversion the array path uses keeps one contract.
+        ScalarValue::List(list) => {
+            debug_assert_eq!(list.len(), 1, "a list scalar wraps one row");
+            if list.is_null(0) {
+                Value::Null
+            } else {
+                utf8_list_value(&list.value(0))?
+            }
         }
         other => {
             return Err(DataFusionError::Execution(format!(
@@ -206,31 +222,37 @@ fn array_value_at(array: &ArrayRef, row: usize) -> DFResult<Value> {
     }
     // List<Utf8> → JSON string array (recipe `tags`-style columns).
     if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
-        let inner = list.value(row);
-        let strings = inner
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "json_pack: unsupported list element type {} (only List<Utf8>)",
-                    inner.data_type()
-                ))
-            })?;
-        let items: Vec<Value> = (0..strings.len())
-            .map(|i| {
-                if strings.is_null(i) {
-                    Value::Null
-                } else {
-                    Value::from(strings.value(i))
-                }
-            })
-            .collect();
-        return Ok(Value::Array(items));
+        return utf8_list_value(&list.value(row));
     }
     // Everything scalar-shaped funnels through ScalarValue for one
     // conversion path (and one error vocabulary).
     let scalar = ScalarValue::try_from_array(array, row)?;
     scalar_to_value(&scalar)
+}
+
+/// One list row's elements as a JSON string array — the single conversion
+/// both the `List<Utf8>` column path and the const-folded list-literal
+/// path use, so the two spellings of the same value cannot diverge.
+fn utf8_list_value(inner: &ArrayRef) -> DFResult<Value> {
+    let strings = inner
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "json_pack: unsupported list element type {} (only List<Utf8>)",
+                inner.data_type()
+            ))
+        })?;
+    let items: Vec<Value> = (0..strings.len())
+        .map(|i| {
+            if strings.is_null(i) {
+                Value::Null
+            } else {
+                Value::from(strings.value(i))
+            }
+        })
+        .collect();
+    Ok(Value::Array(items))
 }
 
 #[cfg(test)]
@@ -275,6 +297,179 @@ mod tests {
         )
         .unwrap();
         ctx
+    }
+
+    /// Every documented timestamp granularity converts to epoch millis —
+    /// seconds multiply (checked), micros and nanos floor. These are the
+    /// conversions with sign/rounding/overflow subtleties, so each is
+    /// pinned by value, including a pre-epoch (negative) instant.
+    #[tokio::test]
+    async fn every_timestamp_granularity_encodes_as_epoch_millis() {
+        let ctx = ctx_with_docs().await;
+        let batches = ctx
+            .sql(
+                "SELECT json_pack(\
+                   's',  arrow_cast(1735689600, 'Timestamp(Second, None)'), \
+                   'us', arrow_cast(1735689600000001, 'Timestamp(Microsecond, None)'), \
+                   'ns', arrow_cast(1735689600000000001, 'Timestamp(Nanosecond, None)'), \
+                   'neg', arrow_cast(-1500, 'Timestamp(Millisecond, None)')) AS m",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let row: Value = serde_json::from_str(col.value(0)).expect("valid JSON");
+        assert_eq!(row["s"], 1_735_689_600_000_i64, "seconds × 1000");
+        assert_eq!(row["us"], 1_735_689_600_000_i64, "micros floor toward −∞");
+        assert_eq!(row["ns"], 1_735_689_600_000_i64, "nanos floor toward −∞");
+        assert_eq!(row["neg"], -1500_i64, "pre-epoch instants keep their sign");
+    }
+
+    /// A seconds timestamp too large for a millis i64 refuses with a
+    /// targeted error rather than wrapping.
+    #[tokio::test]
+    async fn a_seconds_timestamp_overflowing_millis_refuses() {
+        let ctx = ctx_with_docs().await;
+        let err = ctx
+            .sql(&format!(
+                "SELECT json_pack('t', arrow_cast({}, 'Timestamp(Second, None)'))",
+                i64::MAX / 500
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .expect_err("must not wrap");
+        assert!(
+            err.to_string().contains("out of range"),
+            "targeted overflow error: {err}"
+        );
+    }
+
+    /// The documented `List<Utf8>` path, both spellings: a real list COLUMN
+    /// (null element and null list included) and a const-folded
+    /// `make_array` LITERAL — the docs promise "column or literal", and the
+    /// literal arrives as `ScalarValue::List`, not an array.
+    #[tokio::test]
+    async fn utf8_lists_encode_as_json_string_arrays_in_both_spellings() {
+        let mut ctx = SessionContext::new();
+        register_json_pack_udf(&mut ctx);
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let mut tags = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
+        tags.values().append_value("physics");
+        tags.values().append_null();
+        tags.values().append_value("qc");
+        tags.append(true); // ["physics", null, "qc"]
+        tags.append(false); // NULL list
+        let batch = RecordBatch::try_new(
+            Arc::new((*schema).clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(tags.finish()),
+            ],
+        )
+        .unwrap();
+        ctx.register_table(
+            "items",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+
+        let batches = ctx
+            .sql("SELECT json_pack('tags', tags) AS m FROM items ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), r#"{"tags":["physics",null,"qc"]}"#);
+        assert_eq!(col.value(1), r#"{"tags":null}"#, "a NULL list is JSON null");
+
+        // The literal spelling: make_array const-folds to ScalarValue::List.
+        let batches = ctx
+            .sql("SELECT json_pack('tags', make_array('a', 'b')) AS m")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), r#"{"tags":["a","b"]}"#);
+    }
+
+    /// A list whose elements are not Utf8 refuses, naming the element type
+    /// and never the value.
+    #[tokio::test]
+    async fn non_utf8_list_elements_refuse_with_the_type_named() {
+        let ctx = ctx_with_docs().await;
+        let err = ctx
+            .sql("SELECT json_pack('xs', make_array(1, 2))")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .expect_err("only List<Utf8> encodes");
+        let message = err.to_string();
+        assert!(
+            message.contains("unsupported list element type") && message.contains("Int64"),
+            "{message}"
+        );
+    }
+
+    /// View-typed strings — how DataFusion 52 carries computed string
+    /// expressions — encode like their classic layouts, for keys and
+    /// values alike (the filters.rs precedent).
+    #[tokio::test]
+    async fn utf8view_keys_and_values_encode_like_classic_strings() {
+        let ctx = ctx_with_docs().await;
+        let batches = ctx
+            .sql(
+                "SELECT json_pack(\
+                   arrow_cast('k', 'Utf8View'), arrow_cast('v', 'Utf8View'), \
+                   'cast', arrow_cast(title, 'Utf8View')) AS m \
+                 FROM docs ORDER BY id",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let row0: Value = serde_json::from_str(col.value(0)).expect("valid JSON");
+        assert_eq!(row0["k"], "v");
+        assert_eq!(
+            row0["cast"].as_str().unwrap(),
+            "he said \"hi\" \\ \n\t\u{0000}控制",
+            "a view-typed column value survives byte-exact"
+        );
+        let row1: Value = serde_json::from_str(col.value(1)).expect("valid JSON");
+        assert_eq!(row1["cast"], Value::Null);
     }
 
     /// The injection boundary: adversarial strings round-trip through a real

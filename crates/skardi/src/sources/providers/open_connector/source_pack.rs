@@ -244,7 +244,16 @@ mod tests {
         // backing map is unordered, so the sort here is load-bearing.
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let names: Vec<&str> = registry.packs().map(|p| p.name).collect();
-        assert_eq!(names, vec!["github", "mock", "notion", "slack"]);
+        // Sortedness, asserted independently of the roster so THIS pin
+        // survives future pack additions untouched…
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "packs() must iterate name-sorted with no duplicates: {names:?}"
+        );
+        // …and completeness as an explicit roster, the one line a new pack
+        // must extend (a stale list here means the generator's coverage
+        // listing silently omits the newcomer).
+        assert_eq!(names, vec!["feishu", "github", "mock", "notion", "slack"]);
     }
 
     #[test]

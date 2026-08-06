@@ -26,7 +26,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Int32Builder, ListBuilder, StringArray, StringBuilder, StructBuilder,
+    Array, ArrayRef, Int32Builder, ListBuilder, StringArray, StringBuilder, StringViewArray,
+    StructBuilder,
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::Result as DfResult;
@@ -142,35 +143,7 @@ impl ScalarUDFImpl for ChunkingUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
         let args = args.args;
-
-        if args.len() < 3 || args.len() > 4 {
-            return Err(DataFusionError::Execution(format!(
-                "chunk expects 3 or 4 arguments (mode, text, size [, overlap]); got {}",
-                args.len()
-            )));
-        }
-
-        let mode = read_scalar_string("chunk", &args[0], "mode")?;
-        let size = read_scalar_usize("chunk", &args[2], "size")?;
-        if size == 0 {
-            return Err(DataFusionError::Execution(
-                "chunk: 'size' must be > 0".to_string(),
-            ));
-        }
-        let overlap = if args.len() == 4 {
-            read_scalar_usize("chunk", &args[3], "overlap")?
-        } else {
-            0
-        };
-        // text-splitter's ChunkConfig::with_overlap also rejects this; the explicit
-        // check exists so the error names both values instead of a generic message.
-        if overlap >= size {
-            return Err(DataFusionError::Execution(format!(
-                "chunk: 'overlap' ({overlap}) must be strictly less than 'size' ({size})"
-            )));
-        }
-
-        let texts = read_text_column("chunk", &args[1], "text")?;
+        let (mode, texts, size, overlap) = parse_chunk_args("chunk", &args)?;
 
         let array: ArrayRef = match mode.as_str() {
             "character" => {
@@ -257,33 +230,7 @@ impl ScalarUDFImpl for ChunkPartsUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
         let args = args.args;
-
-        if args.len() < 3 || args.len() > 4 {
-            return Err(DataFusionError::Execution(format!(
-                "chunk_parts expects 3 or 4 arguments (mode, text, size [, overlap]); got {}",
-                args.len()
-            )));
-        }
-
-        let mode = read_scalar_string("chunk_parts", &args[0], "mode")?;
-        let size = read_scalar_usize("chunk_parts", &args[2], "size")?;
-        if size == 0 {
-            return Err(DataFusionError::Execution(
-                "chunk_parts: 'size' must be > 0".to_string(),
-            ));
-        }
-        let overlap = if args.len() == 4 {
-            read_scalar_usize("chunk_parts", &args[3], "overlap")?
-        } else {
-            0
-        };
-        if overlap >= size {
-            return Err(DataFusionError::Execution(format!(
-                "chunk_parts: 'overlap' ({overlap}) must be strictly less than 'size' ({size})"
-            )));
-        }
-
-        let texts = read_text_column("chunk_parts", &args[1], "text")?;
+        let (mode, texts, size, overlap) = parse_chunk_args("chunk_parts", &args)?;
 
         let array: ArrayRef = match mode.as_str() {
             "character" => {
@@ -349,6 +296,46 @@ where
 // Argument decoding helpers
 // =============================================================================
 
+/// Parse the shared `(mode, text, size [, overlap])` argument contract —
+/// one implementation for `chunk` and `chunk_parts`, so the two UDFs'
+/// argument semantics cannot drift (identical arity, literal rules, and
+/// bounds; only the element type downstream differs). `udf` names the
+/// caller in every diagnostic.
+fn parse_chunk_args<'a>(
+    udf: &str,
+    args: &'a [ColumnarValue],
+) -> DfResult<(String, Vec<Option<&'a str>>, usize, usize)> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(DataFusionError::Execution(format!(
+            "{udf} expects 3 or 4 arguments (mode, text, size [, overlap]); got {}",
+            args.len()
+        )));
+    }
+
+    let mode = read_scalar_string(udf, &args[0], "mode")?;
+    let size = read_scalar_usize(udf, &args[2], "size")?;
+    if size == 0 {
+        return Err(DataFusionError::Execution(format!(
+            "{udf}: 'size' must be > 0"
+        )));
+    }
+    let overlap = if args.len() == 4 {
+        read_scalar_usize(udf, &args[3], "overlap")?
+    } else {
+        0
+    };
+    // text-splitter's ChunkConfig::with_overlap also rejects this; the explicit
+    // check exists so the error names both values instead of a generic message.
+    if overlap >= size {
+        return Err(DataFusionError::Execution(format!(
+            "{udf}: 'overlap' ({overlap}) must be strictly less than 'size' ({size})"
+        )));
+    }
+
+    let texts = read_text_column(udf, &args[1], "text")?;
+    Ok((mode, texts, size, overlap))
+}
+
 fn read_scalar_string(udf: &str, arg: &ColumnarValue, name: &str) -> DfResult<String> {
     match arg {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
@@ -397,7 +384,22 @@ fn read_text_column<'a>(
     name: &str,
 ) -> DfResult<Vec<Option<&'a str>>> {
     match arg {
+        // Utf8View included alongside the classic layouts: DataFusion 52
+        // carries computed string expressions as view arrays/scalars (the
+        // same reality open_connector/filters.rs handles), and a text
+        // column fed through a CAST or concat must not fail the split.
         ColumnarValue::Array(arr) => {
+            if let Some(view_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
+                return Ok((0..view_arr.len())
+                    .map(|i| {
+                        if view_arr.is_null(i) {
+                            None
+                        } else {
+                            Some(view_arr.value(i))
+                        }
+                    })
+                    .collect());
+            }
             let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
                 DataFusionError::Execution(format!("{udf}: '{name}' must be a Utf8 column"))
             })?;
@@ -412,10 +414,11 @@ fn read_text_column<'a>(
                 .collect())
         }
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(vec![Some(s.as_str())]),
-        ColumnarValue::Scalar(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {
-            Ok(vec![None])
-        }
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
+        | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s))) => Ok(vec![Some(s.as_str())]),
+        ColumnarValue::Scalar(
+            ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) | ScalarValue::Utf8View(None),
+        ) => Ok(vec![None]),
         _ => Err(DataFusionError::Execution(format!(
             "{udf}: '{name}' must be Utf8"
         ))),

@@ -8,6 +8,7 @@ use skardi::engine::datafusion::DataFusionEngine;
 use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
 use skardi::sources::sql_validator::AdhocSqlPolicy;
+use skardi::util::json_pack::register_json_pack_udf;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -190,7 +191,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     register_chunk_udf(&mut session_ctx);
     // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
     // metadata/frontmatter serialization boundary)
-    skardi::util::json_pack::register_json_pack_udf(&mut session_ctx);
+    register_json_pack_udf(&mut session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;
@@ -594,6 +595,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
         let config = crate::config::load_server_config(args)
             .await
