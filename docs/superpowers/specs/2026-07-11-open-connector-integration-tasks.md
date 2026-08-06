@@ -305,7 +305,26 @@ event carrying the scan identity and error.
       tests (`cargo test -p skardi --lib sources::providers::open_connector`,
       post-merge with 5.3), 17 pack-scoped (`… packs::feishu`), 842 full
       library suite.
-- [ ] 5.5 Later waves per the design rollout (Google Workspace, Discord, HubSpot, Jira, …) through the source-pack admission gate
+- [ ] 5.5 Discord pack (OAuth user-identity surface, raw passthrough rows, no
+      pagination envelope): guilds, connections, sticker_packs. **In progress —
+      live verification pending.** The provider is @me-only (its own get_user
+      rejects any other id), so channels/messages/members are out of scope by
+      provider surface, not deferral; entitlements is deferred because the
+      upstream executor exposes no pagination inputs (first-page-only). Engine
+      extensions: `PaginationStrategy::Keyset` (cursor = a field of the previous
+      page's LAST ROW, `after`-style; short/empty page terminates; missing or
+      non-string cursor on a full page is typed drift, not a quiet stop; loop
+      guard) and an explicit `single_page` YAML spelling. Contract reconciled
+      against a live gateway on 2026-08-07 (action IDs, executor passthrough
+      confirmed in source, strict inputs validated to the credential wall via
+      the 403-vs-400 probe, three output schemas captured and fingerprint-
+      pinned). Verification so far: 306 tests (`cargo test -p skardi --lib
+      sources::providers::open_connector`; 18 new — 8 keyset engine, 1 loader,
+      9 pack-scoped `… packs::discord`), 863 full library suite. Remaining
+      before tick: live end-to-end pass against a real Discord account
+      (columns are DRAFT until real rows settle them), fixture re-derivation
+      from redacted live captures, upstream issue for entitlements pagination.
+- [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,

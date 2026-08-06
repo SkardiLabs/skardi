@@ -1,0 +1,25 @@
+{
+  "guilds": [
+    {
+      "id": "100000000000000001",
+      "name": "Redacted Guild One",
+      "icon": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+      "banner": null,
+      "owner": true,
+      "permissions": "2251799813685247",
+      "features": ["COMMUNITY", "NEWS"],
+      "approximate_member_count": 42,
+      "approximate_presence_count": 7
+    },
+    {
+      "id": "100000000000000002",
+      "name": "Redacted Guild Two",
+      "icon": null,
+      "owner": false,
+      "permissions": "104189505",
+      "features": [],
+      "approximate_member_count": 3,
+      "approximate_presence_count": 1
+    }
+  ]
+}

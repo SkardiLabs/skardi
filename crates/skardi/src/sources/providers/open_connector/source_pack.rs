@@ -138,6 +138,7 @@ impl SourcePackRegistry {
             super::packs::notion::pack()?,
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
+            super::packs::discord::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }

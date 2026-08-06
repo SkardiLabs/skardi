@@ -242,6 +242,11 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         } => std::iter::once(cursor_param)
             .chain(page_size_param)
             .collect(),
+        PaginationStrategy::Keyset {
+            cursor_param,
+            page_size_param,
+            ..
+        } => vec![cursor_param, page_size_param],
         PaginationStrategy::SinglePage => Vec::new(),
     };
     match table.pagination {
@@ -272,6 +277,23 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 ));
             }
             if page_size_param.is_some() && page_size == 0 {
+                return Err(format!("{id}: pagination page size must be positive"));
+            }
+        }
+        PaginationStrategy::Keyset {
+            cursor_param,
+            page_size_param,
+            page_size,
+            ..
+        } => {
+            if page_size_param == cursor_param {
+                return Err(format!(
+                    "{id}: pagination declares '{cursor_param}' as both the cursor and page-size input"
+                ));
+            }
+            // The page size doubles as the short-page termination
+            // threshold, so zero would terminate every scan on page 1.
+            if page_size == 0 {
                 return Err(format!("{id}: pagination page size must be positive"));
             }
         }
@@ -460,6 +482,16 @@ enum PaginationDoc {
         #[serde(default)]
         has_more_path: Option<String>,
     },
+    Keyset {
+        cursor_input: String,
+        row_cursor_field: String,
+        page_size_input: String,
+        page_size: u32,
+    },
+    /// One request is the whole collection — for actions whose API has no
+    /// pagination at all (Discord's `/users/@me/connections`). Complete by
+    /// definition; the pack doc must say why one page is the full set.
+    SinglePage {},
 }
 
 impl PaginationDoc {
@@ -491,6 +523,18 @@ impl PaginationDoc {
                 page_size,
                 has_more_path: has_more_path.map(leak_str),
             },
+            Self::Keyset {
+                cursor_input,
+                row_cursor_field,
+                page_size_input,
+                page_size,
+            } => PaginationStrategy::Keyset {
+                cursor_param: leak_str(cursor_input),
+                row_cursor_field: leak_str(row_cursor_field),
+                page_size_param: leak_str(page_size_input),
+                page_size,
+            },
+            Self::SinglePage {} => PaginationStrategy::SinglePage,
         }
     }
 }
@@ -814,6 +858,57 @@ tables:
             "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: epoch_seconds_string }",
         ))
         .expect("lower-bound inexact epoch mapping is legal");
+    }
+
+    #[test]
+    fn keyset_and_single_page_pagination_parse_and_validate() {
+        let base = |pagination: &str| {
+            format!(
+                r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {pagination}
+    columns:
+      - {{ name: id, path: id, type: utf8, nullable: false }}
+"#
+            )
+        };
+        // The two new spellings load…
+        let pack = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: id, page_size_input: limit, page_size: 200 }",
+        ))
+        .expect("keyset parses");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::Keyset { page_size: 200, .. }
+        ));
+        let pack = parse_pack(&base("{ strategy: single_page }")).expect("single_page parses");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::SinglePage
+        ));
+
+        // …and keyset's authoring mistakes fail at load.
+        let err = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: limit, row_cursor_field: id, page_size_input: limit, page_size: 200 }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("both the cursor and page-size input"), "{err}");
+        let err = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: id, page_size_input: limit, page_size: 0 }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("page size must be positive"), "{err}");
+        let err = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: \"$.id\", page_size_input: limit, page_size: 200 }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("relative to the row"), "{err}");
     }
 
     #[test]

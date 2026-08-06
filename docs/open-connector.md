@@ -21,8 +21,10 @@ gateway **runtime token**.
 > tables are gated on upstream cursor support), and
 > [Notion](open-connector-notion.md) (users, pages, data sources, block
 > children — dynamic-schema rows are gated on binding-time schema
-> freeze), and [Feishu](open-connector-feishu.md) (chats, messages,
-> chat members, tasks, wiki — live-verified against a real workspace).
+> freeze), [Feishu](open-connector-feishu.md) (chats, messages,
+> chat members, tasks, wiki — live-verified against a real workspace),
+> and [Discord](open-connector-discord.md) (guilds, connections, sticker
+> packs — DRAFT pending live verification).
 > Further provider packs (Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the

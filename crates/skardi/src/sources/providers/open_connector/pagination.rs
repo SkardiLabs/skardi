@@ -76,6 +76,33 @@ pub enum PaginationStrategy {
         /// before.
         has_more_path: Option<&'static str>,
     },
+    /// Keyset pagination: the provider emits NO pagination envelope at all
+    /// — the next request's cursor is a field of the previous page's LAST
+    /// ROW (Discord's `/users/@me/guilds` takes `after=<last guild id>`).
+    ///
+    /// Termination: a page shorter than the requested size (including
+    /// empty) ends the scan. That heuristic is exactly what keyset
+    /// providers contract — with no envelope there is no post-filter
+    /// signal to publish, so the returned rows ARE the raw page — unlike
+    /// PageNumber, where the same heuristic is a fallback with documented
+    /// holes. An exactly-full final page costs one extra (empty) request,
+    /// the standard keyset tax.
+    ///
+    /// The scan assumes the provider orders rows by the cursor field in
+    /// the direction the cursor input walks; the loop guard converts a
+    /// provider that violates this (repeating a cursor) into a
+    /// `PaginationLoop` instead of an infinite scan.
+    Keyset {
+        /// Action input field for the cursor (e.g. `after`).
+        cursor_param: &'static str,
+        /// Field of the last row whose value is the next cursor — a plain
+        /// key or dotted path relative to the ROW (not the envelope).
+        row_cursor_field: &'static str,
+        /// Action input field for the page size.
+        page_size_param: &'static str,
+        /// Page size to request; also the short-page termination threshold.
+        page_size: u32,
+    },
     /// One request, one page: no pagination inputs are injected and the scan
     /// completes after the first response. Used by `open_connector_scan`,
     /// whose raw actions declare no pagination contract — callers pass any
@@ -142,6 +169,21 @@ impl PaginationStrategy {
                     });
                 }
             }
+            // A row-relative path: plain key or dotted segments, no `$.`
+            // envelope syntax and no empty segment.
+            PaginationStrategy::Keyset {
+                row_cursor_field, ..
+            } if row_cursor_field.is_empty()
+                || row_cursor_field.starts_with('$')
+                || row_cursor_field.split('.').any(str::is_empty) =>
+            {
+                return Err(OpenConnectorError::InvalidRowPath {
+                    path: (*row_cursor_field).to_string(),
+                    reason: "keyset row_cursor_field must be a plain key or dotted path \
+                             relative to the row (no `$.` prefix, no empty segment)"
+                        .to_string(),
+                });
+            }
             _ => {}
         }
         Ok(())
@@ -157,13 +199,17 @@ impl Pagination {
     pub fn new(strategy: PaginationStrategy) -> Result<Self, OpenConnectorError> {
         let next_token = match &strategy {
             PaginationStrategy::PageNumber { .. } => Some("1".to_string()),
-            PaginationStrategy::Cursor { .. } | PaginationStrategy::SinglePage => None,
+            PaginationStrategy::Cursor { .. }
+            | PaginationStrategy::Keyset { .. }
+            | PaginationStrategy::SinglePage => None,
         };
         let cursor_path = match &strategy {
             PaginationStrategy::Cursor {
                 next_cursor_path, ..
             } => Some(RowPath::parse(next_cursor_path)?),
-            PaginationStrategy::PageNumber { .. } | PaginationStrategy::SinglePage => None,
+            PaginationStrategy::PageNumber { .. }
+            | PaginationStrategy::Keyset { .. }
+            | PaginationStrategy::SinglePage => None,
         };
         let total_pages_path = match &strategy {
             PaginationStrategy::PageNumber {
@@ -186,6 +232,7 @@ impl Pagination {
             } => Some(RowPath::parse(path)?),
             _ => None,
         };
+        strategy.validate()?;
         Ok(Self {
             strategy,
             page: 1,
@@ -233,6 +280,17 @@ impl Pagination {
                     input.insert((*param).to_string(), Value::from(*page_size));
                 }
             }
+            PaginationStrategy::Keyset {
+                cursor_param,
+                page_size_param,
+                page_size,
+                ..
+            } => {
+                if let Some(token) = &self.next_token {
+                    input.insert((*cursor_param).to_string(), Value::from(token.as_str()));
+                }
+                input.insert((*page_size_param).to_string(), Value::from(*page_size));
+            }
             PaginationStrategy::SinglePage => {}
         }
     }
@@ -246,6 +304,7 @@ impl Pagination {
         &mut self,
         envelope: &Value,
         rows_in_page: usize,
+        last_row: Option<&Value>,
     ) -> Result<bool, OpenConnectorError> {
         match &self.strategy {
             PaginationStrategy::PageNumber { per_page, .. } => {
@@ -376,6 +435,64 @@ impl Pagination {
                 self.next_token = Some(next);
                 Ok(true)
             }
+            PaginationStrategy::Keyset {
+                row_cursor_field,
+                page_size,
+                ..
+            } => {
+                // A short (or empty) page is the end of the keyset walk —
+                // the one termination signal a no-envelope provider has.
+                if rows_in_page < *page_size as usize {
+                    return Ok(false);
+                }
+                // A full page continues from the last row's cursor field.
+                // rows_in_page == page_size ≥ 1, so the row exists; the
+                // defensive arm covers a caller passing inconsistent args.
+                let Some(row) = last_row else {
+                    return Err(OpenConnectorError::PaginationCursorInvalid {
+                        path: (*row_cursor_field).to_string(),
+                        page: self.page,
+                        found: "a full page with no last row (caller bug)".to_string(),
+                    });
+                };
+                let mut value = row;
+                for segment in row_cursor_field.split('.') {
+                    value = match value.get(segment) {
+                        Some(v) => v,
+                        None => {
+                            // The pack declared a cursor field real rows do
+                            // not carry — contract drift, never a quiet stop
+                            // (stopping would silently truncate the scan).
+                            return Err(OpenConnectorError::PaginationCursorInvalid {
+                                path: (*row_cursor_field).to_string(),
+                                page: self.page,
+                                found: "absent from the page's last row".to_string(),
+                            });
+                        }
+                    };
+                }
+                let next = match value {
+                    Value::String(s) if !s.is_empty() => s.clone(),
+                    other => {
+                        // Snowflakes are strings on the wire; a number here
+                        // is drift (and stringifying it would silently paper
+                        // over a provider change).
+                        return Err(OpenConnectorError::PaginationCursorInvalid {
+                            path: (*row_cursor_field).to_string(),
+                            page: self.page,
+                            found: json_kind(other),
+                        });
+                    }
+                };
+                // A provider violating its own ordering (repeating the
+                // cursor) fails as a loop, not an infinite scan.
+                if !self.seen_tokens.insert(next.clone()) {
+                    return Err(OpenConnectorError::PaginationLoop { token: next });
+                }
+                self.page += 1;
+                self.next_token = Some(next);
+                Ok(true)
+            }
             PaginationStrategy::SinglePage => Ok(false),
         }
     }
@@ -406,6 +523,136 @@ mod tests {
             has_more_path: None,
         })
         .unwrap()
+    }
+
+    fn keyset() -> Pagination {
+        Pagination::new(PaginationStrategy::Keyset {
+            cursor_param: "after",
+            row_cursor_field: "id",
+            page_size_param: "limit",
+            page_size: 2,
+        })
+        .unwrap()
+    }
+
+    fn row(id: &str) -> Value {
+        json!({ "id": id, "name": "x" })
+    }
+
+    #[test]
+    fn keyset_walks_from_the_last_rows_field_and_stops_on_a_short_page() {
+        let mut p = keyset();
+
+        // Page 1: no cursor yet, page size injected.
+        let mut input = Map::new();
+        p.apply(&mut input);
+        assert!(input.get("after").is_none(), "first page carries no cursor");
+        assert_eq!(input.get("limit"), Some(&Value::from(2)));
+
+        // Full page → continue from the LAST row's id.
+        let rows = [row("100"), row("200")];
+        let more = p.advance(&json!({}), rows.len(), rows.last()).unwrap();
+        assert!(more);
+        let mut input = Map::new();
+        p.apply(&mut input);
+        assert_eq!(input.get("after"), Some(&Value::from("200")));
+        assert_eq!(p.page(), 2);
+
+        // Short page → done (the one termination signal keyset has).
+        let rows = [row("300")];
+        let more = p.advance(&json!({}), rows.len(), rows.last()).unwrap();
+        assert!(!more, "a short page ends the walk");
+    }
+
+    #[test]
+    fn keyset_empty_first_page_terminates_immediately() {
+        let mut p = keyset();
+        let more = p.advance(&json!({}), 0, None).unwrap();
+        assert!(!more);
+    }
+
+    #[test]
+    fn keyset_exactly_full_final_page_costs_one_empty_request_then_ends() {
+        let mut p = keyset();
+        let rows = [row("1"), row("2")];
+        assert!(p.advance(&json!({}), rows.len(), rows.last()).unwrap());
+        // The provider has nothing after "2": the extra request comes back
+        // empty and the scan completes — the standard keyset tax.
+        assert!(!p.advance(&json!({}), 0, None).unwrap());
+    }
+
+    #[test]
+    fn keyset_missing_cursor_field_on_a_full_page_is_drift_not_a_quiet_stop() {
+        let mut p = keyset();
+        let rows = [row("1"), json!({ "name": "no id" })];
+        let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
+        match err {
+            OpenConnectorError::PaginationCursorInvalid { path, page, found } => {
+                assert_eq!(path, "id");
+                assert_eq!(page, 1);
+                assert!(found.contains("absent"), "{found}");
+            }
+            other => panic!("expected PaginationCursorInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyset_non_string_cursor_fails_with_the_json_kind_named() {
+        let mut p = keyset();
+        // Snowflakes are strings on the wire; a number is contract drift,
+        // and stringifying it would paper over a provider change.
+        let rows = [row("1"), json!({ "id": 42 })];
+        let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
+        match err {
+            OpenConnectorError::PaginationCursorInvalid { found, .. } => {
+                assert_eq!(found, "a number");
+            }
+            other => panic!("expected PaginationCursorInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyset_repeated_cursor_fails_as_a_loop() {
+        let mut p = keyset();
+        let rows = [row("1"), row("7")];
+        assert!(p.advance(&json!({}), rows.len(), rows.last()).unwrap());
+        // A provider violating its own ordering re-serves the same last id.
+        let rows = [row("3"), row("7")];
+        let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
+        assert!(matches!(err, OpenConnectorError::PaginationLoop { token } if token == "7"));
+    }
+
+    #[test]
+    fn keyset_dotted_row_cursor_field_traverses_nested_rows() {
+        let mut p = Pagination::new(PaginationStrategy::Keyset {
+            cursor_param: "after",
+            row_cursor_field: "meta.id",
+            page_size_param: "limit",
+            page_size: 1,
+        })
+        .unwrap();
+        let rows = [json!({ "meta": { "id": "abc" } })];
+        assert!(p.advance(&json!({}), rows.len(), rows.last()).unwrap());
+        let mut input = Map::new();
+        p.apply(&mut input);
+        assert_eq!(input.get("after"), Some(&Value::from("abc")));
+    }
+
+    #[test]
+    fn keyset_rejects_malformed_row_cursor_fields_at_construction() {
+        for bad in ["", "$.id", "a..b", "a."] {
+            let err = Pagination::new(PaginationStrategy::Keyset {
+                cursor_param: "after",
+                row_cursor_field: Box::leak(bad.to_string().into_boxed_str()),
+                page_size_param: "limit",
+                page_size: 2,
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, OpenConnectorError::InvalidRowPath { .. }),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -446,19 +693,19 @@ mod tests {
         assert_eq!(input.get("per_page"), Some(&json!(2)));
 
         // Full page → advance to page 2.
-        assert!(pagination.advance(&json!({}), 2).unwrap());
+        assert!(pagination.advance(&json!({}), 2, None).unwrap());
         let mut input = Map::new();
         pagination.apply(&mut input);
         assert_eq!(input.get("page"), Some(&json!(2)));
 
         // Short page → done.
-        assert!(!pagination.advance(&json!({}), 1).unwrap());
+        assert!(!pagination.advance(&json!({}), 1, None).unwrap());
     }
 
     #[test]
     fn page_number_stops_on_empty_page() {
         let mut pagination = page_number(10);
-        assert!(!pagination.advance(&json!({}), 0).unwrap());
+        assert!(!pagination.advance(&json!({}), 0, None).unwrap());
     }
 
     fn page_number_with_raw(per_page: u32) -> Pagination {
@@ -480,19 +727,19 @@ mod tests {
         let mut pagination = page_number_with_raw(100);
         assert!(
             pagination
-                .advance(&json!({"pageInfo": {"fetched": 100}}), 37)
+                .advance(&json!({"pageInfo": {"fetched": 100}}), 37, None)
                 .unwrap(),
             "full raw page with a short filtered page continues"
         );
         assert!(
             pagination
-                .advance(&json!({"pageInfo": {"fetched": 100}}), 0)
+                .advance(&json!({"pageInfo": {"fetched": 100}}), 0, None)
                 .unwrap(),
             "an all-filtered (empty) page continues while the raw page was full"
         );
         assert!(
             !pagination
-                .advance(&json!({"pageInfo": {"fetched": 99}}), 99)
+                .advance(&json!({"pageInfo": {"fetched": 99}}), 99, None)
                 .unwrap(),
             "a short raw page terminates"
         );
@@ -504,13 +751,13 @@ mod tests {
         // end-of-collection — reading it as termination would truncate.
         let mut pagination = page_number_with_raw(100);
         assert!(matches!(
-            pagination.advance(&json!({"issues": []}), 0),
+            pagination.advance(&json!({"issues": []}), 0, None),
             Err(OpenConnectorError::RowPathNotFound { .. })
         ));
 
         let mut pagination = page_number_with_raw(100);
         assert!(matches!(
-            pagination.advance(&json!({"pageInfo": {"fetched": "100"}}), 0),
+            pagination.advance(&json!({"pageInfo": {"fetched": "100"}}), 0, None),
             Err(OpenConnectorError::PaginationRawPageSizeInvalid { page: 1, ref found, .. })
                 if found == "a string"
         ));
@@ -544,7 +791,7 @@ mod tests {
 
         assert!(
             pagination
-                .advance(&json!({"next_cursor": "c2"}), 50)
+                .advance(&json!({"next_cursor": "c2"}), 50, None)
                 .unwrap()
         );
         let mut input = Map::new();
@@ -555,15 +802,19 @@ mod tests {
     #[test]
     fn cursor_ends_on_missing_null_or_empty_next() {
         let mut pagination = cursor();
-        assert!(!pagination.advance(&json!({}), 50).unwrap());
-
-        let mut pagination = cursor();
-        assert!(!pagination.advance(&json!({"next_cursor": ""}), 50).unwrap());
+        assert!(!pagination.advance(&json!({}), 50, None).unwrap());
 
         let mut pagination = cursor();
         assert!(
             !pagination
-                .advance(&json!({"next_cursor": null}), 50)
+                .advance(&json!({"next_cursor": ""}), 50, None)
+                .unwrap()
+        );
+
+        let mut pagination = cursor();
+        assert!(
+            !pagination
+                .advance(&json!({"next_cursor": null}), 50, None)
                 .unwrap()
         );
     }
@@ -578,7 +829,7 @@ mod tests {
             (json!({"next_cursor": true}), "a boolean"),
         ] {
             let mut pagination = cursor();
-            let err = pagination.advance(&envelope, 50).unwrap_err();
+            let err = pagination.advance(&envelope, 50, None).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -603,7 +854,7 @@ mod tests {
         })
         .unwrap();
         let err = pagination
-            .advance(&json!({"meta": [1, 2]}), 50)
+            .advance(&json!({"meta": [1, 2]}), 50, None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -620,7 +871,7 @@ mod tests {
             has_more_path: None,
         })
         .unwrap();
-        assert!(!pagination.advance(&json!({"other": 1}), 50).unwrap());
+        assert!(!pagination.advance(&json!({"other": 1}), 50, None).unwrap());
     }
 
     /// A cursor strategy with a declared has-more signal.
@@ -646,7 +897,8 @@ mod tests {
             !pagination
                 .advance(
                     &json!({"hasMore": false, "pageToken": "0||7027059242666328066"}),
-                    1
+                    1,
+                    None
                 )
                 .unwrap()
         );
@@ -657,7 +909,7 @@ mod tests {
         let mut pagination = cursor_with_has_more();
         assert!(
             pagination
-                .advance(&json!({"hasMore": true, "pageToken": "tok-2"}), 50)
+                .advance(&json!({"hasMore": true, "pageToken": "tok-2"}), 50, None)
                 .unwrap()
         );
         let mut input = Map::new();
@@ -675,7 +927,7 @@ mod tests {
             json!({"hasMore": true}),
         ] {
             let mut pagination = cursor_with_has_more();
-            let err = pagination.advance(&envelope, 50).unwrap_err();
+            let err = pagination.advance(&envelope, 50, None).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -697,7 +949,7 @@ mod tests {
             (json!({"pageToken": "t"}), "absent"),
         ] {
             let mut pagination = cursor_with_has_more();
-            let err = pagination.advance(&envelope, 50).unwrap_err();
+            let err = pagination.advance(&envelope, 50, None).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -713,12 +965,12 @@ mod tests {
         let mut pagination = cursor();
         assert!(
             pagination
-                .advance(&json!({"next_cursor": "same"}), 50)
+                .advance(&json!({"next_cursor": "same"}), 50, None)
                 .unwrap()
         );
         // Gateway returns the same cursor again — must fail, not loop.
         let err = pagination
-            .advance(&json!({"next_cursor": "same"}), 50)
+            .advance(&json!({"next_cursor": "same"}), 50, None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -744,20 +996,23 @@ mod tests {
         // count the scan must keep going until page >= pages.
         let mut pagination = page_number_with_total(2);
         let envelope = json!({"paging": {"pages": 3}});
-        assert!(pagination.advance(&envelope, 2).unwrap(), "full page 1");
         assert!(
-            pagination.advance(&envelope, 1).unwrap(),
+            pagination.advance(&envelope, 2, None).unwrap(),
+            "full page 1"
+        );
+        assert!(
+            pagination.advance(&envelope, 1, None).unwrap(),
             "short page 2 continues"
         );
         assert!(
-            !pagination.advance(&envelope, 0).unwrap(),
+            !pagination.advance(&envelope, 0, None).unwrap(),
             "page 3 is the last"
         );
 
         let mut pagination = page_number_with_total(2);
         assert!(
             pagination
-                .advance(&json!({"paging": {"pages": 2}}), 0)
+                .advance(&json!({"paging": {"pages": 2}}), 0, None)
                 .unwrap(),
             "an empty non-final page continues"
         );
@@ -766,7 +1021,7 @@ mod tests {
         let mut pagination = page_number_with_total(2);
         assert!(
             !pagination
-                .advance(&json!({"paging": {"pages": 0}}), 0)
+                .advance(&json!({"paging": {"pages": 0}}), 0, None)
                 .unwrap()
         );
     }
@@ -777,12 +1032,14 @@ mod tests {
         // kind must fail loudly, never fall back to the truncating
         // heuristic.
         let mut pagination = page_number_with_total(2);
-        let err = pagination.advance(&json!({"ok": true}), 2).unwrap_err();
+        let err = pagination
+            .advance(&json!({"ok": true}), 2, None)
+            .unwrap_err();
         assert!(matches!(err, OpenConnectorError::RowPathNotFound { .. }));
 
         let mut pagination = page_number_with_total(2);
         let err = pagination
-            .advance(&json!({"paging": {"pages": "three"}}), 2)
+            .advance(&json!({"paging": {"pages": "three"}}), 2, None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -823,7 +1080,7 @@ mod tests {
         // pagination contract, so there is nothing to advance.
         assert!(
             !pagination
-                .advance(&json!({"next_cursor": "c2"}), 100)
+                .advance(&json!({"next_cursor": "c2"}), 100, None)
                 .unwrap()
         );
         PaginationStrategy::SinglePage
@@ -836,17 +1093,17 @@ mod tests {
         let mut pagination = cursor();
         assert!(
             pagination
-                .advance(&json!({"next_cursor": "c2"}), 50)
+                .advance(&json!({"next_cursor": "c2"}), 50, None)
                 .unwrap()
         );
         assert!(
             pagination
-                .advance(&json!({"next_cursor": "c3"}), 50)
+                .advance(&json!({"next_cursor": "c3"}), 50, None)
                 .unwrap()
         );
         assert!(
             !pagination
-                .advance(&json!({"next_cursor": null}), 10)
+                .advance(&json!({"next_cursor": null}), 10, None)
                 .unwrap()
         );
     }

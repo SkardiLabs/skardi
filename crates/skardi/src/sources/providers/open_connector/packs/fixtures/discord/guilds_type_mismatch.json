@@ -1,0 +1,11 @@
+{
+  "guilds": [
+    {
+      "id": 100000000000000001,
+      "name": "A guild whose id drifted to a JSON number",
+      "owner": false,
+      "permissions": "0",
+      "features": []
+    }
+  ]
+}
