@@ -133,9 +133,12 @@ spec:
             NULL means never parsed. Note shapes: 'sanitation: reencoded-to-utf8'
             / 'stripped-control-chars' / 'escaped-naked-ampersands' (repairs
             that were actually applied), 'content-type-mismatch: served <type>,
-            parsed <family>', 'missing-required-field: <path>', and
+            parsed <family>', 'missing-required-field: <path>',
             'entries-without-identity: <n>' (entries dropped for having neither
-            an id nor a link). Deviations never reject a feed that parsed.
+            an id nor a link), and 'duplicate-identity: <n>' (later entries
+            dropped because an earlier entry in the same document already
+            claimed the same guid — first occurrence in document order wins).
+            Deviations never reject a feed that parsed.
         - name: item_count
           description: >-
             Entries in the currently cached window. NULL when no window was ever

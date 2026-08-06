@@ -371,6 +371,11 @@ pub fn rung_escape_naked_ampersands(input: &[u8]) -> (Vec<u8>, bool) {
     (out, changed)
 }
 
+/// Longest run of leading `0` bytes `valid_reference_len` will skip in a
+/// numeric character reference before the significant-digit window applies —
+/// well beyond any real encoder's fixed-width padding.
+const MAX_LEADING_ZEROS: usize = 16;
+
 /// Byte length of the reference at the start of `rest` (which begins with `&`),
 /// or `None` when the `&` is naked or names an entity XML does not define.
 fn valid_reference_len(rest: &[u8]) -> Option<usize> {
@@ -383,25 +388,36 @@ fn valid_reference_len(rest: &[u8]) -> Option<usize> {
         }
     }
 
-    // `&#[0-9]{1,7};` or `&#x[0-9A-Fa-f]{1,6};` (XML allows only a lowercase `x`).
-    // The digit caps bound how far this scans looking for the terminating
-    // `;`, but they are a byte-count cap, not a leading-zero-aware one: a
-    // well-formed reference whose leading zeros push its digits past the cap
-    // (e.g. `&#000000169;`, 9 digits against the 7-digit window) is treated as
-    // unterminated within the window
-    // and its `&` gets escaped to `&amp;`, corrupting an otherwise-valid
-    // reference. Accepted tradeoff: a fixed, cheap-to-check cap over a
-    // leading-zero-stripping scan.
+    // Numeric references (XML allows only a lowercase `x`): a two-segment
+    // constant-bound scan. First a bounded run of leading `0` bytes
+    // (`MAX_LEADING_ZEROS`, well beyond any real encoder's fixed-width
+    // padding), then the significant-digit window — 7 decimal / 6 hex digits,
+    // from U+10FFFF being `1114111` decimal / `10FFFF` hex — then the
+    // terminating `;`. A reference with more leading zeros than the cap is
+    // still treated as naked and escaped: the scan bound remains, it is just
+    // leading-zero-aware now.
     let digits = tail.strip_prefix(b"#")?;
     let (body, max, is_digit): (&[u8], usize, fn(&u8) -> bool) = match digits.strip_prefix(b"x") {
         Some(hex) => (hex, 6, u8::is_ascii_hexdigit),
         None => (digits, 7, u8::is_ascii_digit),
     };
-    let n = body.iter().take(max).take_while(|b| is_digit(b)).count();
-    if n == 0 || body.get(n) != Some(&b';') {
+    let zeros = body
+        .iter()
+        .take(MAX_LEADING_ZEROS + 1)
+        .take_while(|&&b| b == b'0')
+        .count();
+    if zeros > MAX_LEADING_ZEROS {
         return None;
     }
-    Some(rest.len() - body.len() + n + 1)
+    let n = body[zeros..]
+        .iter()
+        .take(max)
+        .take_while(|b| is_digit(b))
+        .count();
+    if zeros + n == 0 || body.get(zeros + n) != Some(&b';') {
+        return None;
+    }
+    Some(rest.len() - body.len() + zeros + n + 1)
 }
 
 /// A rung: a pure byte transform reporting whether it changed anything.
@@ -428,6 +444,11 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>t &amp; u</title></channel></rss>"#,
             r#"<rss version="2.0"><channel><description><![CDATA[a & b && c]]></description></channel></rss>"#,
             r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>&#169; &#x2014; &lt;ok&gt;</title></feed>"#,
+            // Leading-zero numeric references pin the conservativeness
+            // contract over zero padding: the old fixed 7/6-digit window
+            // treated these as unterminated and escaped their `&`.
+            r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>&#000000169;</title></feed>"#,
+            r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>&#x0002014;</title></feed>"#,
             "<!-- a & naked amp in a comment --><rss version=\"2.0\"/>",
             "<?pi with & inside?><rss version=\"2.0\"/>",
             // All five predefined entities (the brief's own fixture list
@@ -468,6 +489,17 @@ mod tests {
         let (out, changed) = rung_escape_naked_ampersands(input);
         assert!(changed);
         assert_eq!(out, expect);
+    }
+
+    /// The leading-zero run is bounded (`MAX_LEADING_ZEROS`) so the reference
+    /// scan stays constant; beyond the cap the `&` is treated as naked and
+    /// escaped.
+    #[test]
+    fn references_with_more_leading_zeros_than_the_cap_are_escaped() {
+        let input = format!("<x>&#{}169;</x>", "0".repeat(MAX_LEADING_ZEROS + 1));
+        let (out, changed) = rung_escape_naked_ampersands(input.as_bytes());
+        assert!(changed);
+        assert!(String::from_utf8(out).unwrap().contains("&amp;#"));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! actually changed bytes are recorded as repairs, so a document fixed by
 //! ampersand escaping alone does not claim to have been re-encoded.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use feed_rs::model::{Category, Entry, Feed, Link};
 use serde_json::{Value, json};
@@ -206,9 +206,14 @@ pub struct ItemRow {
 #[derive(Debug, Clone)]
 pub struct ExtractedFeed {
     pub meta: FeedMeta,
+    /// Each `guid` appears at most once; the first entry in document order
+    /// claims it.
     pub items: Vec<ItemRow>,
     /// Entries dropped because they had neither an id nor a link.
     pub skipped_without_identity: usize,
+    /// Entries dropped because an earlier entry in the same document already
+    /// claimed their guid.
+    pub duplicate_identity: usize,
 }
 
 /// Everything the engine needs from one fetched document.
@@ -222,6 +227,10 @@ pub struct ParsedDocument {
 }
 
 /// Project a parsed feed onto `FeedMeta` + `ItemRow`s per the Field Mapping table.
+///
+/// `(feed, guid)` is the item identity, so a guid may appear only once: the
+/// first entry in document order keeps it, and later claimants are dropped
+/// and counted in `duplicate_identity`.
 pub fn extract(feed: Feed) -> ExtractedFeed {
     let meta = FeedMeta {
         title: feed.title.as_ref().map(|t| t.content.clone()),
@@ -231,9 +240,12 @@ pub fn extract(feed: Feed) -> ExtractedFeed {
 
     let mut items = Vec::with_capacity(feed.entries.len());
     let mut skipped_without_identity = 0;
+    let mut duplicate_identity = 0;
+    let mut seen_guids: HashSet<String> = HashSet::with_capacity(feed.entries.len());
     for entry in &feed.entries {
         match extract_entry(entry) {
-            Some(row) => items.push(row),
+            Some(row) if seen_guids.insert(row.guid.clone()) => items.push(row),
+            Some(_) => duplicate_identity += 1,
             None => skipped_without_identity += 1,
         }
     }
@@ -242,6 +254,7 @@ pub fn extract(feed: Feed) -> ExtractedFeed {
         meta,
         items,
         skipped_without_identity,
+        duplicate_identity,
     }
 }
 
@@ -500,6 +513,12 @@ pub fn parse_feed_document(
         conformance_notes.push(format!(
             "entries-without-identity: {}",
             extracted.skipped_without_identity
+        ));
+    }
+    if extracted.duplicate_identity > 0 {
+        conformance_notes.push(format!(
+            "duplicate-identity: {}",
+            extracted.duplicate_identity
         ));
     }
 
@@ -1068,6 +1087,70 @@ mod tests {
             a.conformance_notes
                 .iter()
                 .any(|n| n == "entries-without-identity: 1")
+        );
+    }
+
+    /// `(feed, guid)` is the item identity, so two entries claiming the same
+    /// guid cannot both become rows: the first in document order wins and the
+    /// rest are dropped and counted.
+    #[test]
+    fn duplicate_guid_keeps_the_first_entry_in_document_order() {
+        let doc = br#"<rss version="2.0"><channel><title>C</title><link>https://e.com</link><description>D</description>
+<item><guid>dup</guid><title>First</title></item>
+<item><guid>dup</guid><title>Second</title></item>
+</channel></rss>"#;
+        let extracted = extract(parse_with_ladder(doc).unwrap().feed);
+        assert_eq!(extracted.items.len(), 1);
+        assert_eq!(
+            extracted.items[0].title.as_deref(),
+            Some("First"),
+            "the first occurrence wins"
+        );
+        assert_eq!(extracted.duplicate_identity, 1);
+
+        let parsed = parse_feed_document(doc, None).unwrap();
+        assert!(
+            parsed
+                .conformance_notes
+                .iter()
+                .any(|n| n == "duplicate-identity: 1")
+        );
+    }
+
+    /// A link-fallback guid dedupes the same way an explicit one does.
+    #[test]
+    fn duplicate_link_fallback_collapses_to_one_row() {
+        let doc = br#"<rss version="2.0"><channel><title>C</title><link>https://e.com</link><description>D</description>
+<item><title>First</title><link>https://site.example/p</link></item>
+<item><title>Second</title><link>https://site.example/p</link></item>
+</channel></rss>"#;
+        let extracted = extract(parse_with_ladder(doc).unwrap().feed);
+        assert_eq!(extracted.items.len(), 1);
+        assert_eq!(extracted.items[0].guid, "https://site.example/p");
+        assert_eq!(
+            extracted.items[0].title.as_deref(),
+            Some("First"),
+            "the first occurrence wins"
+        );
+        assert_eq!(extracted.duplicate_identity, 1);
+    }
+
+    #[test]
+    fn distinct_identities_are_not_counted_as_duplicates() {
+        let doc = br#"<rss version="2.0"><channel><title>C</title><link>https://e.com</link><description>D</description>
+<item><guid>1</guid><title>A</title></item>
+<item><guid>2</guid><title>B</title></item>
+</channel></rss>"#;
+        let extracted = extract(parse_with_ladder(doc).unwrap().feed);
+        assert_eq!(extracted.items.len(), 2);
+        assert_eq!(extracted.duplicate_identity, 0);
+
+        let parsed = parse_feed_document(doc, None).unwrap();
+        assert!(
+            !parsed
+                .conformance_notes
+                .iter()
+                .any(|n| n.starts_with("duplicate-identity"))
         );
     }
 
