@@ -83,6 +83,26 @@ pub struct CliArgs {
     /// Server port number
     #[arg(long, default_value = "8080", help = "Server port number")]
     pub port: u16,
+
+    /// Path to the SQLite audit ledger for ad-hoc `/query` statements. When
+    /// unset (the default), raw SQL is never persisted and never written to
+    /// logs or traces. The ledger records raw SQL (which may embed
+    /// secrets/PII); it is created owner-only, and a failure to open it is
+    /// fatal rather than a silent downgrade. See [`crate::query_audit`].
+    #[arg(
+        long = "query-audit-db",
+        help = "Record /query statements in this SQLite audit ledger (off by default; created 0600)"
+    )]
+    pub query_audit_db: Option<PathBuf>,
+
+    /// Delete audit records older than this many days, at startup and hourly
+    /// thereafter. Unset means keep everything. Ignored without
+    /// `--query-audit-db`.
+    #[arg(
+        long = "query-audit-retention-days",
+        help = "Prune /query audit records older than N days (default: keep forever)"
+    )]
+    pub query_audit_retention_days: Option<u32>,
 }
 
 /// Main server configuration containing pipelines and data sources
@@ -1966,6 +1986,8 @@ spec:
             ctx_file: Some(context_path),
             semantics_path: None,
             port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -1991,6 +2013,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 3000,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2045,6 +2069,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 3000,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2073,6 +2099,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let result = load_server_config(args).await;
@@ -2097,6 +2125,8 @@ spec:
             ctx_file: None,
             semantics_path: None,
             port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
         };
 
         let config = load_server_config(args).await.unwrap();

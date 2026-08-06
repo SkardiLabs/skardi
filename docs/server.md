@@ -109,6 +109,7 @@ and updates automatically when pipelines, jobs, or semantics reload.
 | `/pipeline/:name` | GET | Metadata for one pipeline. |
 | `/health/:name` | GET | Per-pipeline health check (includes upstream data-source status). |
 | `/:name/execute` | POST | Execute a pipeline by name. Body is the JSON param map. See [pipelines.md](pipelines.md). |
+| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "ai_context": { "purpose": "...", "session_id": "..." } }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
 | `/jobs` | GET | List all registered jobs with destinations. |
 | `/jobs/:name/run` | POST | Submit a new job run. Body is the JSON param map. See [jobs.md](jobs.md). |
 | `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
@@ -119,6 +120,88 @@ Request / response bodies for pipeline execution are documented in
 [pipelines.md § Response format](pipelines.md#response-format); job run
 submission and the run lifecycle are documented in
 [jobs.md § HTTP endpoints](jobs.md#http-endpoints).
+
+### Ad-hoc queries
+
+`POST /query` runs a single SQL statement against the registered data sources.
+DDL/COPY are always rejected; DML is allowed only against `access_mode:
+read_write` sources. Results are capped at `max_rows` (default 1000) and the
+response carries a `truncated` flag.
+
+Request fields:
+
+- `sql` (string, required) — one SQL statement.
+- `max_rows` (positive integer, optional, default 1000) — result row cap.
+- `ai_context` (object, optional) — agent-supplied context describing and
+  grouping the query. Application/console queries omit it. When present it must
+  be a JSON object carrying two required non-empty strings — `purpose`
+  (≤ 2000 chars, why the query runs) and `session_id` (≤ 200 chars, groups
+  queries from one agent session) — plus any free-form keys of the caller's
+  choosing. The whole object must serialize to ≤ 4096 bytes. Recorded for
+  observability; never executed. Any violation → `400
+  parameter_validation_error`. Omitting the field is valid; sending
+  `"ai_context": null` is *not* — an explicit null is a present-but-malformed
+  value and is rejected like any other non-object.
+
+#### Query confidentiality
+
+Callers may inline literal secrets or PII into `sql`, so by default **no query
+text or literal value reaches the log/trace/OTLP stream.** Two things enforce
+that:
+
+- The handler's INFO audit marker is value-free: it carries `ai_context`,
+  `max_rows`, statement kind and timing, never the statement.
+- The tracing filter pins every plan-printing target (`datafusion*`,
+  `sqlparser`, and the server's own `skardi_query_plan` instrumentation spans)
+  to INFO, and drops any `RUST_LOG` directive that would lower them.
+  Suppressing the handler's `sql` field alone is not enough — DataFusion's
+  analyzer/optimizer reprint the same literals inside the plans they log at
+  DEBUG (`Projection: Utf8("…")`), and those records fan out to every
+  configured collector.
+
+  An operator debugging a planning problem on non-sensitive data can lift the
+  floor with `SKARDI_ALLOW_PLAN_VALUE_LOGGING=1`. It is a separate, explicit
+  opt-in because it re-enables value export.
+
+#### Query audit ledger
+
+`--query-audit-db <path>` turns on a durable, queryable record of what ran.
+Off by default; when off, raw SQL is never persisted anywhere.
+
+Each accepted statement is committed to a SQLite `query_audit` table **before**
+execution and updated with its outcome afterwards:
+
+| column | notes |
+| --- | --- |
+| `id` | stable record id |
+| `created_at` / `finished_at` | RFC 3339 |
+| `sql` | raw statement text |
+| `ai_context` | the caller's object, verbatim JSON |
+| `session_id` | denormalised from `ai_context` for indexed session lookup |
+| `max_rows`, `statement_kind` | request shape |
+| `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
+| `row_count`, `error` | outcome detail |
+
+Indexed on `(session_id, created_at)`, `created_at` and `status`, so an agent
+session can be reconstructed with plain SQL.
+
+Failure semantics are explicit:
+
+- **Startup.** Opening or migrating the ledger is fatal — a server configured
+  to audit never runs silently unaudited.
+- **Before execution.** If the pre-execution write fails, the request is
+  rejected with `503 query_audit_error` and the statement is **not executed**.
+- **After execution.** A failed outcome update is logged only; the query
+  already ran. The row stays `started` and the next startup reconciles it to
+  `unknown`, as it does for statements killed mid-flight.
+
+Retention is opt-in: `--query-audit-retention-days <n>` deletes records older
+than `n` days at startup and hourly thereafter. Without it, records are kept
+forever and pruning is the operator's call.
+
+The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
+including the WAL sidecars). It is a local database, never the OTLP/tracing
+pipeline, so enabling it does not push query text to external collectors.
 
 ---
 
