@@ -62,6 +62,19 @@ pub enum PaginationStrategy {
         page_size_param: Option<&'static str>,
         /// Page size to request (ignored when `page_size_param` is None).
         page_size: u32,
+        /// Row-path-style location of the provider's authoritative
+        /// has-more boolean (e.g. Feishu's `$.hasMore`). Some providers
+        /// return a NON-empty cursor on the final page and signal the end
+        /// only here — Feishu's wiki `list_spaces` answers `has_more:
+        /// false` with `page_token: "0||…"`, so null-cursor termination
+        /// alone would refetch and fail as a `PaginationLoop`. When
+        /// declared: `false` ends the scan regardless of the cursor;
+        /// `true` requires a usable cursor, and its absence is contract
+        /// drift (`PaginationCursorInvalid`), never a quiet stop. A
+        /// non-boolean value fails as `PaginationHasMoreInvalid`. When
+        /// absent, the cursor's null/empty/missing spellings terminate as
+        /// before.
+        has_more_path: Option<&'static str>,
     },
     /// One request, one page: no pagination inputs are injected and the scan
     /// completes after the first response. Used by `open_connector_scan`,
@@ -87,6 +100,8 @@ pub struct Pagination {
     total_pages_path: Option<RowPath>,
     /// Pre-parsed raw-page-size path (PageNumber only).
     raw_page_size_path: Option<RowPath>,
+    /// Pre-parsed has-more path (Cursor only, when declared).
+    has_more_path: Option<RowPath>,
 }
 
 impl PaginationStrategy {
@@ -95,9 +110,14 @@ impl PaginationStrategy {
     pub fn validate(&self) -> Result<(), OpenConnectorError> {
         match self {
             PaginationStrategy::Cursor {
-                next_cursor_path, ..
+                next_cursor_path,
+                has_more_path,
+                ..
             } => {
                 RowPath::parse(next_cursor_path)?;
+                if let Some(path) = has_more_path {
+                    RowPath::parse(path)?;
+                }
             }
             PaginationStrategy::PageNumber {
                 total_pages_path,
@@ -159,6 +179,13 @@ impl Pagination {
             } => Some(RowPath::parse(path)?),
             _ => None,
         };
+        let has_more_path = match &strategy {
+            PaginationStrategy::Cursor {
+                has_more_path: Some(path),
+                ..
+            } => Some(RowPath::parse(path)?),
+            _ => None,
+        };
         Ok(Self {
             strategy,
             page: 1,
@@ -167,6 +194,7 @@ impl Pagination {
             cursor_path,
             total_pages_path,
             raw_page_size_path,
+            has_more_path,
         })
     }
 
@@ -267,6 +295,37 @@ impl Pagination {
                 Ok(more)
             }
             PaginationStrategy::Cursor { .. } => {
+                // The authoritative has-more signal, when the pack declares
+                // one, is consulted FIRST: some providers return a non-empty
+                // cursor on the final page (Feishu wiki spaces answer
+                // `has_more: false` with `page_token: "0||…"`), so the
+                // cursor's spellings alone would refetch a finished scan.
+                if let Some(path) = &self.has_more_path {
+                    let has_more = match path.extract(envelope, self.page) {
+                        Ok(Value::Bool(b)) => *b,
+                        Ok(other) => {
+                            return Err(OpenConnectorError::PaginationHasMoreInvalid {
+                                path: path.as_str().to_string(),
+                                page: self.page,
+                                found: json_kind(other).to_string(),
+                            });
+                        }
+                        // The pack declared the signal; a page without it is
+                        // contract drift, not a quiet stop or continue.
+                        Err(OpenConnectorError::RowPathNotFound { .. }) => {
+                            return Err(OpenConnectorError::PaginationHasMoreInvalid {
+                                path: path.as_str().to_string(),
+                                page: self.page,
+                                found: "absent".to_string(),
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if !has_more {
+                        return Ok(false);
+                    }
+                }
+
                 let path = self.cursor_path.as_ref().ok_or_else(|| {
                     OpenConnectorError::InvalidRowPath {
                         path: "<cursor>".to_string(),
@@ -297,6 +356,17 @@ impl Pagination {
                 };
 
                 let Some(next) = next else {
+                    // With a declared has-more signal saying `true`, a missing
+                    // cursor is drift — stopping here would silently truncate
+                    // the scan the provider says is unfinished.
+                    if self.has_more_path.is_some() {
+                        return Err(OpenConnectorError::PaginationCursorInvalid {
+                            path: path.as_str().to_string(),
+                            page: self.page,
+                            found: "null, empty, or absent while the has-more signal is true"
+                                .to_string(),
+                        });
+                    }
                     return Ok(false);
                 };
                 if !self.seen_tokens.insert(next.clone()) {
@@ -333,6 +403,7 @@ mod tests {
             next_cursor_path: "$.next_cursor",
             page_size_param: Some("limit"),
             page_size: 50,
+            has_more_path: None,
         })
         .unwrap()
     }
@@ -344,6 +415,7 @@ mod tests {
             next_cursor_path: "not-a-path",
             page_size_param: None,
             page_size: 50,
+            has_more_path: None,
         })
         .unwrap_err();
         assert!(matches!(err, OpenConnectorError::InvalidRowPath { .. }));
@@ -356,6 +428,7 @@ mod tests {
             next_cursor_path: "$.a..b",
             page_size_param: None,
             page_size: 50,
+            has_more_path: None,
         };
         assert!(matches!(
             bad.validate(),
@@ -526,6 +599,7 @@ mod tests {
             next_cursor_path: "$.meta.next",
             page_size_param: None,
             page_size: 50,
+            has_more_path: None,
         })
         .unwrap();
         let err = pagination
@@ -543,9 +617,95 @@ mod tests {
             next_cursor_path: "$.meta.next",
             page_size_param: None,
             page_size: 50,
+            has_more_path: None,
         })
         .unwrap();
         assert!(!pagination.advance(&json!({"other": 1}), 50).unwrap());
+    }
+
+    /// A cursor strategy with a declared has-more signal.
+    fn cursor_with_has_more() -> Pagination {
+        Pagination::new(PaginationStrategy::Cursor {
+            cursor_param: "pageToken",
+            next_cursor_path: "$.pageToken",
+            page_size_param: Some("pageSize"),
+            page_size: 50,
+            has_more_path: Some("$.hasMore"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn has_more_false_terminates_even_with_a_nonempty_cursor() {
+        // The Feishu wiki shape this field exists for: the final page still
+        // carries a non-empty page token ("0||…"), and only has_more says
+        // the scan is over. Null-cursor termination alone would refetch and
+        // trip the loop guard.
+        let mut pagination = cursor_with_has_more();
+        assert!(
+            !pagination
+                .advance(
+                    &json!({"hasMore": false, "pageToken": "0||7027059242666328066"}),
+                    1
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn has_more_true_continues_with_the_cursor() {
+        let mut pagination = cursor_with_has_more();
+        assert!(
+            pagination
+                .advance(&json!({"hasMore": true, "pageToken": "tok-2"}), 50)
+                .unwrap()
+        );
+        let mut input = Map::new();
+        pagination.apply(&mut input);
+        assert_eq!(input.get("pageToken"), Some(&Value::from("tok-2")));
+    }
+
+    #[test]
+    fn has_more_true_without_a_cursor_is_drift_not_termination() {
+        // The provider says more pages exist but hands nothing to follow —
+        // stopping would silently truncate a scan the signal says is
+        // unfinished.
+        for envelope in [
+            json!({"hasMore": true, "pageToken": null}),
+            json!({"hasMore": true}),
+        ] {
+            let mut pagination = cursor_with_has_more();
+            let err = pagination.advance(&envelope, 50).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::PaginationCursorInvalid { ref found, .. }
+                        if found.contains("has-more")
+                ),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_boolean_or_absent_has_more_fails_with_its_kind() {
+        // The pack declared the signal, so a page without a usable one is
+        // contract drift — guessing either way could truncate or loop.
+        for (envelope, found) in [
+            (json!({"hasMore": "yes", "pageToken": "t"}), "a string"),
+            (json!({"hasMore": 1, "pageToken": "t"}), "a number"),
+            (json!({"pageToken": "t"}), "absent"),
+        ] {
+            let mut pagination = cursor_with_has_more();
+            let err = pagination.advance(&envelope, 50).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::PaginationHasMoreInvalid { found: ref f, .. } if f == found
+                ),
+                "for {envelope}: got {err}"
+            );
+        }
     }
 
     #[test]

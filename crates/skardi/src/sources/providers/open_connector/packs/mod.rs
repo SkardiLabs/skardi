@@ -2,6 +2,7 @@
 
 pub(crate) mod loader;
 
+pub mod feishu;
 pub mod github;
 pub mod mock;
 pub mod notion;

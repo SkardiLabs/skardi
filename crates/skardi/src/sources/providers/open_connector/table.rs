@@ -226,6 +226,7 @@ mod tests {
             next_cursor_path: "not-a-path",
             page_size_param: None,
             page_size: 50,
+            has_more_path: None,
         });
         let err = OpenConnectorTableProvider::new(
             offline_client(),
@@ -254,6 +255,7 @@ mod tests {
             next_cursor_path: "$.next_cursor",
             page_size_param: None,
             page_size: 50,
+            has_more_path: None,
         });
         OpenConnectorTableProvider::new(
             offline_client(),

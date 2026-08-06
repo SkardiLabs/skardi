@@ -50,8 +50,18 @@ pub enum ValueFormat {
     /// precision. Flooring widens a *lower* bound (a superset — safe under
     /// [`Fidelity::Inexact`] re-filtering); for an upper-bound provider
     /// parameter it would narrow the fetch and drop rows, so epoch-seconds
-    /// mappings are for lower-bound inputs (`ts_from`-style) only.
+    /// mappings are for lower-bound inputs (`ts_from`-style) only — the
+    /// pack loader REJECTS any other operator (and any fidelity but
+    /// Inexact) at load time. Pre-epoch instants clamp to `0`: still a
+    /// lower-bound superset, and providers with unsigned epoch inputs
+    /// (Feishu 400s a `-` sign) never see a negative.
     EpochSeconds,
+    /// [`ValueFormat::EpochSeconds`] rendered as a JSON *string* of decimal
+    /// digits, for providers whose strict input schemas type their epoch
+    /// inputs as strings (Feishu's `startTime`, `minLength: 1`) — a JSON
+    /// number there is a hard 400. Same flooring semantics, so the same
+    /// lower-bound-only rule applies.
+    EpochSecondsString,
 }
 
 /// One allowlisted pushdown rule: `column <operator> literal` → `input_field: literal`.
@@ -113,6 +123,39 @@ pub fn translate_filters(filters: &[Expr], mappings: &[FilterMapping]) -> Transl
 
 /// Translate one filter, returning `(input_field, value, fidelity)` on a match.
 fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, Value, Fidelity)> {
+    // DataFusion's simplifier rewrites boolean equality to the bare
+    // column (`completed = true` → `completed`) or its negation
+    // (`completed = false` → `NOT completed`) before pushdown, so an Eq
+    // mapping on a boolean column would otherwise never fire. Normalize
+    // both spellings back to the equality they mean.
+    //
+    // Invariant: these two arms fabricate a Boolean literal without
+    // checking the mapped column's declared type, because only a
+    // boolean-typed column can appear as a bare predicate in a
+    // type-checked DataFusion plan — an Eq mapping on a non-boolean
+    // column is reachable solely through the BinaryExpr arm below, where
+    // the literal comes from the query.
+    match filter {
+        Expr::Column(column) => {
+            let mapping = mappings.iter().find(|mapping| {
+                mapping.column == column.name && mapping.operator == Operator::Eq
+            })?;
+            let value = scalar_to_json(&ScalarValue::Boolean(Some(true)), mapping.value_format)?;
+            return Some((mapping.input_field.to_string(), value, mapping.fidelity));
+        }
+        Expr::Not(inner) => {
+            let Expr::Column(column) = inner.as_ref() else {
+                return None;
+            };
+            let mapping = mappings.iter().find(|mapping| {
+                mapping.column == column.name && mapping.operator == Operator::Eq
+            })?;
+            let value = scalar_to_json(&ScalarValue::Boolean(Some(false)), mapping.value_format)?;
+            return Some((mapping.input_field.to_string(), value, mapping.fidelity));
+        }
+        _ => {}
+    }
+
     let Expr::BinaryExpr(binary) = filter else {
         return None;
     };
@@ -184,25 +227,40 @@ fn scalar_to_json(literal: &ScalarValue, format: ValueFormat) -> Option<Value> {
         // Verbatim arms return None on purpose: the mapping declared no
         // timestamp spelling, so the predicate stays local rather than
         // being pushed in a guessed format.
+        // Epoch renderings clamp pre-epoch instants to 0 (see the
+        // ValueFormat docs): a negative would render with a `-` sign that
+        // strict digit-string schemas 400 on, failing the whole scan where
+        // no pushdown at all would have succeeded — and 0 is still a
+        // superset for the lower bounds these formats are restricted to.
         ScalarValue::TimestampSecond(Some(v), _) => match format {
             ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => DateTime::from_timestamp(*v, 0).map(rfc3339),
-            ValueFormat::EpochSeconds => Some(Value::from(*v)),
+            ValueFormat::EpochSeconds => Some(Value::from((*v).max(0))),
+            ValueFormat::EpochSecondsString => Some(Value::from((*v).max(0).to_string())),
         },
         ScalarValue::TimestampMillisecond(Some(v), _) => match format {
             ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => DateTime::from_timestamp_millis(*v).map(rfc3339),
-            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1000))),
+            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1000).max(0))),
+            ValueFormat::EpochSecondsString => {
+                Some(Value::from(v.div_euclid(1000).max(0).to_string()))
+            }
         },
         ScalarValue::TimestampMicrosecond(Some(v), _) => match format {
             ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => DateTime::from_timestamp_micros(*v).map(rfc3339),
-            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000))),
+            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000).max(0))),
+            ValueFormat::EpochSecondsString => {
+                Some(Value::from(v.div_euclid(1_000_000).max(0).to_string()))
+            }
         },
         ScalarValue::TimestampNanosecond(Some(v), _) => match format {
             ValueFormat::Verbatim => None,
             ValueFormat::Rfc3339 => Some(rfc3339(DateTime::from_timestamp_nanos(*v))),
-            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000_000))),
+            ValueFormat::EpochSeconds => Some(Value::from(v.div_euclid(1_000_000_000).max(0))),
+            ValueFormat::EpochSecondsString => {
+                Some(Value::from(v.div_euclid(1_000_000_000).max(0).to_string()))
+            }
         },
         _ => None,
     }
@@ -254,6 +312,20 @@ mod tests {
             input_field: "ts_from",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::EpochSeconds,
+        },
+        FilterMapping {
+            column: "create_time",
+            operator: Operator::GtEq,
+            input_field: "startTime",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::EpochSecondsString,
+        },
+        FilterMapping {
+            column: "completed",
+            operator: Operator::Eq,
+            input_field: "completed",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Verbatim,
         },
     ];
 
@@ -616,6 +688,99 @@ mod tests {
             assert_eq!(
                 translated.inputs,
                 vec![("ts_from".to_string(), Value::from(1_767_225_600i64))],
+            );
+            assert_eq!(
+                translated.pushdown,
+                vec![TableProviderFilterPushDown::Inexact]
+            );
+        }
+    }
+
+    #[test]
+    fn simplified_boolean_predicates_normalize_back_to_equality() {
+        // DataFusion's simplifier hands pushdown `completed` instead of
+        // `completed = true` and `NOT completed` instead of
+        // `completed = false`; both must still reach the mapped input —
+        // otherwise a boolean Eq mapping is dead code.
+        let translated = translate_filters(&[col("completed")], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("completed".to_string(), Value::from(true))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+
+        let translated = translate_filters(&[Expr::Not(Box::new(col("completed")))], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("completed".to_string(), Value::from(false))]
+        );
+
+        // A bare column without an Eq mapping stays local — and NOT over
+        // anything but a bare column is never translated.
+        let translated = translate_filters(&[col("value")], MAPPINGS);
+        assert!(translated.inputs.is_empty());
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+        let translated = translate_filters(&[Expr::Not(Box::new(gt("value", 5)))], MAPPINGS);
+        assert!(translated.inputs.is_empty());
+    }
+
+    #[test]
+    fn pre_epoch_instants_clamp_to_zero_never_a_signed_string() {
+        // `create_time >= '1965-01-01'` would otherwise render "-157766400"
+        // — not a digit string, so a strict provider schema (Feishu's
+        // startTime) 400s and the whole scan fails where no pushdown at
+        // all would have succeeded. Zero is still a superset for the
+        // lower bounds these formats are restricted to.
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("create_time")),
+            Operator::GtEq,
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(-157_766_400_000), Some("UTC".into())),
+                None,
+            )),
+        ));
+        let translated = translate_filters(&[filter], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("startTime".to_string(), Value::from("0"))],
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+    }
+
+    #[test]
+    fn epoch_seconds_string_mappings_render_digit_strings() {
+        // Feishu-style startTime: same flooring semantics as epoch_seconds,
+        // but the provider's strict schema types the input as a STRING —
+        // the rendered literal must be a JSON string of digits, never a
+        // number.
+        let epoch_ms = 1_767_225_600_000i64; // 2026-01-01T00:00:00Z
+        for scalar in [
+            ScalarValue::TimestampSecond(Some(epoch_ms / 1000), None),
+            ScalarValue::TimestampMillisecond(Some(epoch_ms), Some("UTC".into())),
+            ScalarValue::TimestampMicrosecond(Some(epoch_ms * 1000), None),
+            ScalarValue::TimestampNanosecond(Some(epoch_ms * 1_000_000), None),
+            // Sub-second precision floors — widening the lower bound,
+            // which Inexact re-filtering trims back.
+            ScalarValue::TimestampMillisecond(Some(epoch_ms + 999), None),
+        ] {
+            let filter = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("create_time")),
+                Operator::GtEq,
+                Box::new(Expr::Literal(scalar, None)),
+            ));
+            let translated = translate_filters(&[filter], MAPPINGS);
+            assert_eq!(
+                translated.inputs,
+                vec![("startTime".to_string(), Value::from("1767225600"))],
             );
             assert_eq!(
                 translated.pushdown,

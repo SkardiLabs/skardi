@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "description": "A Feishu task object."
+      },
+      "description": "The returned task objects."
+    },
+    "hasMore": {
+      "type": "boolean",
+      "description": "Whether another page is available."
+    },
+    "pageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The token for the next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "items",
+    "hasMore",
+    "pageToken"
+  ],
+  "description": "A normalized page of tasks."
+}
