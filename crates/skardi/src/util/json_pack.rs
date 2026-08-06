@@ -116,8 +116,11 @@ impl ScalarUDFImpl for JsonPackUDF {
         let mut builder = StringBuilder::new();
         for row in 0..number_rows {
             // Argument order IS object order — serde_json::Map preserves
-            // insertion order (default feature set), which is what makes
-            // the generator's output deterministic byte-for-byte.
+            // insertion order because THIS crate enables `preserve_order`
+            // explicitly (see Cargo.toml; without the feature Map is a
+            // BTreeMap and silently re-sorts keys lexicographically),
+            // which is what makes the generator's output deterministic
+            // byte-for-byte.
             let mut object = serde_json::Map::with_capacity(keys.len());
             for (key, pair) in keys.iter().zip(args.chunks(2)) {
                 object.insert(key.clone(), value_at(&pair[1], row)?);
@@ -313,6 +316,33 @@ mod tests {
             col.value(1),
             r#"{"id":8,"title":null,"updated":null}"#,
             "byte-deterministic encoding"
+        );
+    }
+
+    /// Argument order must survive as object order under keys whose
+    /// insertion order DISAGREES with lexicographic order — `id, title,
+    /// updated` above happens to be alphabetical, so it passes under a
+    /// BTreeMap fallback too and cannot detect the loss of serde_json's
+    /// `preserve_order` feature. `z, a, m` can.
+    #[tokio::test]
+    async fn key_order_is_argument_order_not_lexicographic() {
+        let ctx = ctx_with_docs().await;
+        let batches = ctx
+            .sql("SELECT json_pack('z', id, 'a', title, 'm', updated) AS m FROM docs ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            col.value(1),
+            r#"{"z":8,"a":null,"m":null}"#,
+            "insertion order beats lexicographic order"
         );
     }
 

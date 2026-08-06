@@ -460,6 +460,66 @@ spec:
         assert!(!state.auth_layer.is_enabled());
     }
 
+    /// Both PRODUCTION registration paths for the etl runtime UDFs,
+    /// exercised end to end: the planning context (`load_server_config` —
+    /// a pipeline calling both UDFs must plan during schema inference)
+    /// and the runtime context (`setup_app_state` — the same call must
+    /// execute). The UDF unit tests register the functions directly, so
+    /// they stay green if either production call is removed; THIS test
+    /// is what fails in that case.
+    #[cfg(feature = "chunking")]
+    #[tokio::test]
+    async fn production_contexts_register_the_etl_runtime_udfs() {
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline_path = temp_dir.path().join("etl-udf-wiring.yaml");
+        fs::write(
+            &pipeline_path,
+            r#"
+kind: pipeline
+metadata:
+  name: "etl-udf-wiring"
+  version: "1.0.0"
+spec:
+  query: |
+    SELECT json_pack('z', 'v') AS metadata,
+           chunk_parts('character', 'hello world and beyond', 8) AS parts
+"#,
+        )
+        .unwrap();
+        let args = CliArgs {
+            pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+        };
+        let config = crate::config::load_server_config(args)
+            .await
+            .expect("the PLANNING context plans chunk_parts + json_pack");
+        assert!(config.pipelines.contains_key("etl-udf-wiring"));
+
+        let state = setup_app_state(config).await.expect("app state");
+        let batches = state
+            .session_ctx
+            .sql(
+                "SELECT json_pack('z', 'v') AS m,                  chunk_parts('character', 'hello world and beyond', 8) AS p",
+            )
+            .await
+            .expect("the RUNTIME context plans both UDFs")
+            .collect()
+            .await
+            .expect("and executes them");
+        assert_eq!(batches[0].num_rows(), 1);
+        let packed = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(packed, r#"{"z":"v"}"#);
+    }
+
     #[tokio::test]
     async fn test_setup_app_state_with_data_sources() {
         let (config, _temp_dir) = create_test_config_with_data_sources_and_temp_dir().await;

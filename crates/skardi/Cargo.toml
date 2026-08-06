@@ -44,7 +44,12 @@ tracing = { workspace = true }
 # pipeline
 log = { workspace = true }
 regex = { workspace = true }
-serde_json = { workspace = true }
+# preserve_order is LOAD-BEARING: json_pack's argument-order-is-object-order
+# contract (and the etl golden bundles' byte determinism) rides on
+# serde_json::Map preserving insertion order. Without the explicit feature
+# it held only through transitive unification (bson enables it) — a dep
+# change away from silently becoming lexicographic.
+serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
 # model
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
