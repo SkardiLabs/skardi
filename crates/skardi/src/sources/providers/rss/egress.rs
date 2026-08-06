@@ -7,9 +7,9 @@
 //! targets). An operator — or Skardi Cloud — supplies a real [`EgressPolicy`]
 //! through the fetcher's constructor to restrict egress; the reserved-range
 //! taxonomy that would refuse loopback/link-local/private/CGNAT/unique-local
-//! targets is Cloud policy, specified in
-//! `docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`, not shipped
-//! here.
+//! targets is Cloud policy, specified in the RSS Cloud egress design doc
+//! (`docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`, added
+//! later in this stack), not shipped here.
 //!
 //! The seam is enforced at the DNS-resolver layer ([`PolicyDns`]) so an
 //! injected policy holds against DNS rebinding: reqwest only ever connects to
@@ -97,14 +97,22 @@ pub(crate) fn check_addrs(
     addrs: Vec<SocketAddr>,
 ) -> Result<Vec<SocketAddr>, EgressDenied> {
     for addr in &addrs {
-        if let Err(reason) = policy.check_ip(addr.ip()) {
+        // Canonicalize for the CHECK only: a dual-stack connect to an
+        // IPv4-mapped v6 (an AAAA answer like `::ffff:10.0.0.1`) reaches the
+        // unmapped V4, so the policy must judge that V4 or the mapped form
+        // bypasses a V4-private rule. `to_canonical` unmaps mapped-v6 to V4 and
+        // leaves everything else unchanged.
+        let ip = addr.ip().to_canonical();
+        if let Err(reason) = policy.check_ip(ip) {
             return Err(EgressDenied {
                 host: host.to_string(),
-                ip: addr.ip(),
+                ip,
                 reason,
             });
         }
     }
+    // Return the ORIGINAL addrs: canonicalization gated the check, but the
+    // caller must connect to exactly what the lookup returned.
     Ok(addrs)
 }
 
@@ -140,6 +148,7 @@ impl Resolve for PolicyDns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     /// Test-only denying policy: refuses every address. OSS ships no such
     /// policy — the seam exists so a caller can inject one.
@@ -148,6 +157,22 @@ mod tests {
     impl EgressPolicy for DenyAll {
         fn check_ip(&self, _ip: IpAddr) -> Result<(), EgressReason> {
             Err("test-denied".into())
+        }
+    }
+
+    /// Test-only policy that denies exactly one V4 address and nothing else.
+    /// It cannot match a raw IPv4-mapped v6 (`::ffff:10.0.0.1` arrives as
+    /// `IpAddr::V6`), so it only refuses if `check_addrs` canonicalized first —
+    /// which is precisely what the mapped-v6 test relies on.
+    #[derive(Debug)]
+    struct DenyV4(Ipv4Addr);
+    impl EgressPolicy for DenyV4 {
+        fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+            if ip == IpAddr::V4(self.0) {
+                Err("test-denied".into())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -178,6 +203,18 @@ mod tests {
         assert_eq!(err.host, "evil.example");
         assert_eq!(err.ip, "10.0.0.5".parse::<IpAddr>().unwrap());
         assert_eq!(err.reason, "test-denied");
+    }
+
+    #[test]
+    fn check_addrs_canonicalizes_mapped_ipv6_before_policy() {
+        // The resolver/AAAA-record equivalent of the fetcher's mapped-literal
+        // case: a lookup answer of `::ffff:10.0.0.1` is a v6 spelling of the V4
+        // 10.0.0.1 that a dual-stack connect reaches. DenyV4 refuses only the
+        // raw V4, so this passes only because check_addrs canonicalizes before
+        // consulting the policy.
+        let policy = DenyV4("10.0.0.1".parse().unwrap());
+        let addrs: Vec<SocketAddr> = vec!["[::ffff:10.0.0.1]:80".parse().unwrap()];
+        assert!(check_addrs(&policy, "evil.example", addrs).is_err());
     }
 
     #[test]

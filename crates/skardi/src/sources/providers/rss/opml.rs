@@ -26,8 +26,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::{Reader, XmlVersion};
 
 use super::ResolvedSubscription;
 use super::config::{RssConfig, finalize};
@@ -46,7 +46,7 @@ use super::error::RssError;
 pub(crate) const MAX_OPML_BYTES: u64 = 1024 * 1024;
 
 /// Wall-clock bound on one OPML read, enforced by [`read_opml`] via
-/// [`read_to_string_bounded`]. [`MAX_OPML_BYTES`] bounds how *much* is read,
+/// [`read_bytes_bounded`]. [`MAX_OPML_BYTES`] bounds how *much* is read,
 /// not how *long* reading takes: a FIFO whose writer never sends enough
 /// bytes (or never closes) blocks a bounded read forever without ever
 /// touching the byte cap. The regular-file check catches a FIFO that is
@@ -135,12 +135,22 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
     // see MAX_OPML_BYTES for why reading to EOF first is not an option. The
     // wall-clock bound backstops the check above against a path that changes
     // between stat and open — see OPML_READ_TIMEOUT.
-    let content = read_to_string_bounded(path, OPML_READ_TIMEOUT).map_err(unreadable)?;
-    if content.len() as u64 > MAX_OPML_BYTES {
+    let bytes = read_bytes_bounded(path, OPML_READ_TIMEOUT).map_err(unreadable)?;
+    // Size check before decoding: `take` cuts at a byte offset, so an
+    // over-cap file can end mid-UTF-8-sequence. Decoding first would then
+    // report an "invalid UTF-8" error for what is really an over-size file,
+    // sending the operator after an encoding bug that isn't there.
+    if bytes.len() as u64 > MAX_OPML_BYTES {
         return Err(unreadable(format!(
             "file exceeds the {MAX_OPML_BYTES}-byte OPML size limit"
         )));
     }
+    let content = String::from_utf8(bytes).map_err(|e| {
+        unreadable(format!(
+            "OPML file '{}' is not valid UTF-8: {e}",
+            path.display()
+        ))
+    })?;
 
     let invalid = |reason: String| RssError::InvalidConfig { reason };
 
@@ -188,7 +198,7 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
                 // module's tests). That is the spec-correct reading of an
                 // attribute value, and it only ever touches whitespace inside a
                 // feed's display name or URL, so it is kept deliberately.
-                attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
                     .map(|v| v.into_owned())
                     .map_err(|e| {
                         invalid(format!(
@@ -225,10 +235,18 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
     Ok(subs)
 }
 
-/// Open `path` and read it to a `String`, bounded two ways: at most
+/// Open `path` and read its raw bytes, bounded two ways: at most
 /// [`MAX_OPML_BYTES`] `+ 1` bytes (via `take`, so the extra byte is how the
 /// caller distinguishes at-cap from over-cap), and at most `timeout` of
 /// wall-clock time for the whole open-and-read.
+///
+/// Raw bytes, not a `String`, on purpose: `take` slices at a byte offset
+/// with no regard for UTF-8 character boundaries, so an over-cap file can
+/// leave a multibyte sequence cut in half at the end of the buffer. Decoding
+/// here would then fail with an "invalid UTF-8" error for what is really an
+/// over-size file — the caller must apply the size check to these bytes
+/// *before* attempting to decode, so the size limit is the diagnostic the
+/// operator sees.
 ///
 /// std has no timed read for files, so the bound is imposed from outside:
 /// the open and read run on a dedicated helper thread, and this function
@@ -242,17 +260,17 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
 ///
 /// Errors are returned as bare reason strings: only the caller knows the
 /// source `name` that [`RssError::OpmlUnreadable`] wants.
-fn read_to_string_bounded(path: &Path, timeout: Duration) -> Result<String, String> {
+fn read_bytes_bounded(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
     let (tx, rx) = mpsc::channel();
     let path: PathBuf = path.to_path_buf();
     thread::spawn(move || {
         let result = (|| {
             let file = File::open(&path).map_err(|e| e.to_string())?;
-            let mut content = String::new();
+            let mut bytes = Vec::new();
             file.take(MAX_OPML_BYTES + 1)
-                .read_to_string(&mut content)
+                .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            Ok(content)
+            Ok(bytes)
         })();
         // The receiver is gone if the timeout already fired; nothing to do
         // with the result in that case.
@@ -388,6 +406,37 @@ mod tests {
     }
 
     #[test]
+    fn oversized_opml_ending_mid_utf8_still_reports_the_size_limit() {
+        // Regression: `take(cap + 1)` cuts at a byte offset, so an over-cap
+        // file whose truncation point lands inside a multibyte character
+        // leaves an incomplete UTF-8 sequence at the buffer's end. Decoding
+        // before the size check would surface an "invalid UTF-8" error —
+        // sending the operator after an encoding bug that isn't there —
+        // instead of the size-limit message. The `oversized_*` test above
+        // uses ASCII padding, which never triggers this, so it is pinned
+        // separately here with a multibyte pad ('é' is two UTF-8 bytes,
+        // which cannot tile an odd overflow without a boundary landing
+        // mid-character somewhere past the cap).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-utf8.opml");
+        let bytes = "é".repeat((MAX_OPML_BYTES as usize / 2) + 1).into_bytes();
+        assert!(bytes.len() as u64 > MAX_OPML_BYTES);
+        std::fs::write(&path, bytes).unwrap();
+        let config = RssConfig {
+            opml: Some(path),
+            ..inline_config(vec![])
+        };
+        let err = resolve_subscriptions("news", &config).unwrap_err();
+        match err {
+            RssError::OpmlUnreadable { reason, .. } => assert!(
+                reason.contains("OPML size limit"),
+                "over-size file must report the size limit, not a UTF-8 error: {reason}"
+            ),
+            other => panic!("expected OpmlUnreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn opml_exactly_at_the_size_cap_is_accepted() {
         // The bound is "over the cap", not "at it": a valid document padded
         // with trailing whitespace to exactly MAX_OPML_BYTES still resolves.
@@ -463,7 +512,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stalled_read_hits_the_wall_clock_timeout() {
-        // Exercises read_to_string_bounded's timeout arm directly (with a
+        // Exercises read_bytes_bounded's timeout arm directly (with a
         // short timeout — the 5s production value would just slow the suite):
         // a FIFO with no writer blocks at open(), which is exactly the shape
         // of stall the timeout exists to bound. Going through read_opml
@@ -477,7 +526,7 @@ mod tests {
             .status()
             .expect("run mkfifo");
         assert!(status.success(), "mkfifo failed");
-        let err = read_to_string_bounded(&path, Duration::from_millis(50)).unwrap_err();
+        let err = read_bytes_bounded(&path, Duration::from_millis(50)).unwrap_err();
         assert!(
             err.contains("OPML read timeout"),
             "error should name the timeout: {err}"

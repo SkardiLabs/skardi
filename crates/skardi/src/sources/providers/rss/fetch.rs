@@ -338,6 +338,12 @@ impl FeedFetcher {
             _ => None,
         };
         if let Some(ip) = ip {
+            // Canonicalize before checking: a dual-stack OS connect to an
+            // IPv4-mapped v6 literal (`::ffff:10.0.0.1`) reaches the unmapped
+            // V4 (10.0.0.1), so the policy must judge that same V4 — otherwise
+            // a V4-private rule is bypassed by the mapped form. Report the
+            // canonical address too, so the error names the rule that matched.
+            let ip = ip.to_canonical();
             self.policy.check_ip(ip).map_err(|reason| EgressDenied {
                 host: ip.to_string(),
                 ip,
@@ -708,6 +714,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_validators_answered_with_304_is_a_status_error() {
+        // The `Some`-but-empty companion to
+        // `unconditional_304_without_validators_is_a_status_error`:
+        // `attempt_hop` maps a `304` to `NotModified` only when a conditional
+        // header was *actually sent*, tracked by `sent_validator` — not merely
+        // whether a `Validators` was passed. A `Some(Validators { etag: None,
+        // last_modified: None })` attaches no `If-None-Match`/`If-Modified-Since`
+        // header, so a `304` answering it has no validator behind it and must
+        // surface as the terminal status it is, exactly as the `None` case does
+        // — never a fabricated `NotModified` with no cached body to back it up.
+        let server = MockFeedServer::start(|_req| MockResponse::status(304)).await;
+        let f = test_fetcher();
+        let v = Validators {
+            etag: None,
+            last_modified: None,
+        };
+        let err = f
+            .fetch(&format!("{}/f", server.url()), Some(&v))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Status { status: 304 }),
+            "got {err}"
+        );
+        let req = &server.requests()[0];
+        assert!(
+            req.header("if-none-match").is_none(),
+            "an empty Validators must attach no If-None-Match"
+        );
+        assert!(
+            req.header("if-modified-since").is_none(),
+            "an empty Validators must attach no If-Modified-Since"
+        );
+    }
+
+    #[tokio::test]
     async fn validators_are_not_resent_after_redirect() {
         // The module doc devotes a section to "validators cover only the
         // first hop"; pin it directly rather than relying on
@@ -1047,6 +1089,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_policy_refuses_mapped_ipv6_literal_on_initial_url() {
+        // The IPv4-mapped-v6 literal path: `::ffff:10.0.0.1` is a v6 spelling of
+        // the V4 10.0.0.1 that a dual-stack connect actually reaches. The deny
+        // list holds the V4, so check_hop_target must canonicalize before the
+        // check. Before the fix the policy saw an unmatched V6, allowed it, and
+        // the fetch failed with a Transport error from the attempted connect to
+        // port 9 — so this pins the canonicalization.
+        let policy = Arc::new(DenyList(vec!["10.0.0.1".parse().unwrap()]));
+        let f = fetcher_with_policy(policy);
+        let err = f
+            .fetch("http://[::ffff:10.0.0.1]:9/f", None)
+            .await
+            .unwrap_err();
+        match err {
+            FetchError::Egress(e) => assert_eq!(e.reason, "test-denied", "got {e}"),
+            other => panic!("expected Egress, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn injected_policy_refuses_redirect_target() {
         // The redirect path: the loopback mock (allowed) 302s to a denied
         // IP-literal target, which check_hop_target must refuse before connect.
@@ -1055,6 +1117,33 @@ mod tests {
         })
         .await;
         let policy = Arc::new(DenyList(vec!["10.255.255.1".parse().unwrap()]));
+        let f = fetcher_with_policy(policy);
+        let err = f
+            .fetch(&format!("{}/start", server.url()), None)
+            .await
+            .unwrap_err();
+        match err {
+            FetchError::Egress(e) => assert_eq!(e.reason, "test-denied", "got {e}"),
+            other => panic!("expected Egress, got {other:?}"),
+        }
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "the denied redirect target must never be connected to"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_policy_refuses_mapped_ipv6_redirect_target() {
+        // The redirect path with an IPv4-mapped-v6 target: the loopback mock
+        // (allowed) 302s to `::ffff:10.0.0.1`, a v6 spelling of the denied V4.
+        // check_hop_target must canonicalize before the check so the V4 deny
+        // rule matches and the mapped target is never connected to.
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(302).with_header("location", "http://[::ffff:10.0.0.1]/f")
+        })
+        .await;
+        let policy = Arc::new(DenyList(vec!["10.0.0.1".parse().unwrap()]));
         let f = fetcher_with_policy(policy);
         let err = f
             .fetch(&format!("{}/start", server.url()), None)
@@ -1088,6 +1177,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Egress(_)), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn injected_policy_refuses_hostname_redirect_target_via_resolver() {
+        // The DNS-rebinding-via-redirect path, composing the two preceding
+        // tests: `injected_policy_refuses_redirect_target` refuses a redirect
+        // to an IP *literal*, and `injected_policy_refuses_hostname_via_resolver`
+        // refuses an initial-URL *hostname* via PolicyDns — this refuses a
+        // redirect whose target is a hostname the resolver then denies.
+        //
+        // Making it work on loopback turns on the IPv4/IPv6 asymmetry: hop 0 is
+        // `server.url()`, the 127.0.0.1 literal `check_hop_target`'s IP arm must
+        // ALLOW so the first hop connects; the 302 then points at `localhost`
+        // (same port, via the recorded `host` header — the handler runs before
+        // `server` exists, so it cannot read `server.url()` directly), which
+        // PolicyDns resolves to the dual-stack set and `check_addrs` denies as a
+        // whole because `::1` is on the deny list. Denying only `::1` while
+        // allowing 127.0.0.1 is exactly what lets hop 0 through yet refuses hop
+        // 1's hostname — otherwise both hops share loopback and no policy could
+        // allow one without the other. This relies on `localhost` resolving
+        // dual-stack (a set containing `::1`), which holds on the CI runner.
+        let server = MockFeedServer::start(|req| {
+            let host = req.header("host").expect("reqwest sends a host header");
+            let redirect_to = format!("http://{}/denied", host.replace("127.0.0.1", "localhost"));
+            MockResponse::status(302).with_header("location", &redirect_to)
+        })
+        .await;
+        let policy = Arc::new(DenyList(vec!["::1".parse().unwrap()]));
+        let f = fetcher_with_policy(policy);
+        let err = f
+            .fetch(&format!("{}/start", server.url()), None)
+            .await
+            .unwrap_err();
+        match err {
+            FetchError::Egress(e) => assert_eq!(e.reason, "test-denied", "got {e}"),
+            other => panic!("expected Egress, got {other:?}"),
+        }
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "only /start was ever connected; the denied hostname target was \
+             refused before any connection"
+        );
     }
 
     /// The child half of `proxy_env_vars_do_not_bypass_the_egress_policy`:

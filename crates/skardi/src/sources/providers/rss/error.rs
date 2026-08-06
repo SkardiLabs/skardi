@@ -22,9 +22,10 @@ use thiserror::Error;
 /// A bound on *length* only. What content may reach `feeds.last_error` at all is
 /// a separate question, argued in `engine.rs`'s module doc.
 ///
-/// `docs/rss.md` and `docs/rss/semantics.yaml` publish the number as a bare
-/// `512`; neither is Rust and neither can reference this constant, so both name
-/// it as `MAX_ERROR_CHARS`'s value and this is where it is defined.
+/// The RSS docs (`docs/rss.md` and `docs/rss/semantics.yaml`, published later
+/// in this stack) will spell the number as a bare `512`; neither is Rust and
+/// neither can reference this constant, so both name it as `MAX_ERROR_CHARS`'s
+/// value and this is where it is defined.
 pub const MAX_ERROR_CHARS: usize = 512;
 
 /// Bound `text` to `max_chars` *characters*, cutting on a char boundary so a
@@ -115,21 +116,22 @@ mod tests {
 
     /// The published number, spelled literally.
     ///
-    /// `docs/rss.md:974` ("bounded at 512 characters") and
-    /// `docs/rss/semantics.yaml:85` (the `last_error` column description) both
-    /// state 512 as this provider's diagnostic-length contract, and neither is
-    /// Rust: neither can reference the constant, so neither would notice it
-    /// changing. Every other assertion in this crate compares against
-    /// `MAX_ERROR_CHARS` itself and so agrees with any value it is given —
-    /// verified by mutation (512 → 200 and 512 → 999 both left the suite
-    /// green). Same discipline as `mod.rs`'s
+    /// The RSS docs (`docs/rss.md` and `docs/rss/semantics.yaml`, published
+    /// later in this stack) will state 512 as this provider's
+    /// diagnostic-length contract, and neither is Rust: neither can reference
+    /// the constant, so neither would notice it changing. Every other
+    /// assertion in this crate compares against `MAX_ERROR_CHARS` itself and so
+    /// agrees with any value it is given — verified by mutation (512 → 200 and
+    /// 512 → 999 both left the suite green). Same discipline as `mod.rs`'s
     /// `schema_metadata_carries_surface_version`, which spells `"1"` rather than
-    /// reading `RSS_SURFACE_VERSION`.
+    /// reading `RSS_SURFACE_VERSION`. Once those docs land, the phase that adds
+    /// them owns keeping their literal in step with this test (see the phase-4
+    /// note); until then this pins the value against silent drift.
     #[test]
     fn max_error_chars_is_the_number_the_docs_publish() {
         assert_eq!(
             MAX_ERROR_CHARS, 512,
-            "docs/rss.md and docs/rss/semantics.yaml both publish 512; change them together"
+            "the RSS docs (published later in this stack) will state 512; keep them in step"
         );
     }
 
