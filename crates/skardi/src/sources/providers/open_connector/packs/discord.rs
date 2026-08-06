@@ -434,8 +434,19 @@ bindings:
             setup_with_gateway(gateway, "SKARDI_TEST_OC_DISCORD_KEYSET", "guilds").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.me.guilds").await;
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(rows, 201, "both pages scanned, no duplicates dropped");
+        // Row identity, not just cardinality: the exact ids of both pages
+        // survive, in wire order, with no duplicate and no boundary drop.
+        let ids: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col: &StringArray = b.column(0).as_any().downcast_ref().expect("Utf8 ids");
+                (0..col.len())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected: Vec<String> = (1..=201).map(|i| format!("g-{i:04}")).collect();
+        assert_eq!(ids, expected, "both pages scanned, boundary row intact");
 
         let inputs = execute_inputs(&gateway);
         assert_eq!(inputs.len(), 2, "exactly two pages requested");
