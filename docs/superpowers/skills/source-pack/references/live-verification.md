@@ -55,6 +55,41 @@ accept it explicitly.
   the tables (e.g. for Notion: share a page and a database with the
   integration).
 
+### OAuth providers: the credential is a flow, and scopes are not the only gate
+
+For `authTypes: ["oauth2"]` providers the setup is heavier than an API
+key, and the Feishu pack's live pass (skardi PR #186) hit every trap in
+sequence — expect them:
+
+- **The flow**: the user creates the provider app themselves and
+  registers the gateway's redirect URI (`http://localhost:3000/oauth/callback`);
+  the user runs `PUT /api/oauth/configs/<service>` with
+  `{clientId, clientSecret}` from their env; then
+  `POST /api/oauth/authorizations {"service": "<service>"}` returns an
+  `authorizationUrl` the USER opens in a browser. You never touch the
+  secret or the browser session.
+- **The gateway may request an un-satisfiable scope set.** Providers
+  that build their OAuth scope list as the union of every action's
+  permissions can exceed what any real app enables (Feishu rejects the
+  authorize request outright, error 20027). Narrowing may require a
+  clearly-marked local patch to the provider definition plus an
+  upstream issue — precedent: oomol-lab/open-connector#267.
+- **Scopes granted ≠ scopes the API accepts.** A read can 401 with the
+  gateway-declared scopes present in the token: the provider error
+  often names the ACTUAL required scope, and the gateway's
+  `requiredScopes` metadata is then the bug (Feishu's 99991679 named
+  `im:message:readonly` while the actions declared `*.get_as_user` —
+  oomol-lab/open-connector#268). Read the provider's own error before
+  suspecting your pack.
+- **Capability gates sit beyond scopes entirely**: app-level abilities
+  (Feishu's bot capability, 232025) and tenant-admin approval of
+  high-sensitivity permissions are enforced independently of the OAuth
+  grant. Budget for console round-trips with the user.
+- **Every scope/permission change needs a FRESH token** — a
+  user_access_token snapshots its grants at authorization time, so
+  re-run the authorization after any change rather than debugging a
+  stale token.
+
 ## 1. Probe every action with real inputs first
 
 Before involving Skardi, call each chosen action directly
@@ -70,7 +105,20 @@ scratch directory (they become the fixture sources in §4). Check:
 - the real pagination envelope: force multi-page with a small page size
   (`pageSize: 1`) and confirm the continuation token appears where the
   pack's `next_cursor_path` / totals path expects it, and terminates on
-  the documented spelling.
+  the documented spelling;
+- **the declared input bounds, at the boundary**: send the pack's exact
+  page size and the schema's declared maximum — declared caps can
+  exceed the wire's (Feishu's `im/v1/messages` declares 100, hard-fails
+  above 50 with 99992402; skardi PR #186 shipped the corrected 50, and
+  oomol-lab/open-connector#269/#271 fixed the schema upstream);
+- **the termination signal on the REAL final page**: fetch to the end,
+  then deliberately follow whatever token the last page returns. Some
+  providers answer the final page with `has_more: false` beside a
+  NON-empty token (Feishu wiki's `"0||…"`), so null-token termination
+  refetches a finished scan and trips the loop guard — declare
+  `has_more_path` when the envelope carries an authoritative has-more
+  boolean, and pin the live shape with an e2e
+  (oomol-lab/open-connector#270 tracks the upstream normalization).
 
 ## 2. Diff real rows against the mapped columns — both directions
 
@@ -140,8 +188,35 @@ timestamp spellings, real URL shapes. Redaction methodology:
   timestamps, known structural enums). Anything that survives the
   filter gets looked at by eye. Real page titles hiding inside URL
   slugs are exactly what this catches.
+- **decode one level deeper**: any string value that itself parses as
+  JSON (Feishu's `body.content`, Slack blocks) must be decoded and its
+  string leaves run through the SAME allowlist. The Feishu round-2
+  blocker was exactly this: real member names survived inside a
+  JSON-encoded payload the outer-tree audit treated as one opaque
+  string.
+- **ship the audit as a tripwire test**, not a one-off pass: an
+  in-repo test that re-walks every fixture (including the nested
+  decode) so the redaction guarantee is enforced by CI, not by memory.
+  A cheap broad net helps too — e.g. "no CJK text in any fixture" when
+  the workspace's real names share a script no placeholder uses.
+- **coarsen capture timestamps** when rows encode person-linked events
+  (joins, messages, task completions): zero the trailing digits so the
+  instant stops being correlatable while magnitude and ordering (and
+  any digit-count-sensitive parsing) survive. Update tests that pinned
+  exact values.
+- **verify redaction self-consistency**: the deterministic counter only
+  helps if cross-references actually still line up — after redacting,
+  check that ids repeated across fields (a task's `url` embedding its
+  own `guid`) still match, and that provider-unique ids stayed unique.
+  A fixture whose value is "internally consistent live capture" must
+  survive its own cross-references.
 - deliberately-broken fixtures (the admission gate's schema-mismatch
   case) stay synthetic — say so in a comment.
+
+**If PII ever lands in a commit**: fixing the tip is not enough — the
+names remain in every earlier commit. Rewrite the branch history
+(squash/amend and force-push) so no reachable commit carries them, and
+say so in the review reply.
 
 Then update the fixture-driven tests to assert the live shapes, and the
 coverage-gap pins if columns moved.
@@ -152,7 +227,9 @@ The PR must let a reviewer see the verification without re-running it:
 per-table live results (row counts, which pinned filters returned rows,
 which columns carried real values), the pinned provider API version,
 what the live pass CHANGED (renamed/dropped/added columns and why), and
-what remains outside the fingerprint gate. Put the durable facts in the
+what remains outside the fingerprint gate. Upstream gateway defects the
+pass uncovered get FILED as issues on the gateway repo and linked from
+the pack doc — findings that live only in a PR body get lost. Put the durable facts in the
 module doc and pack doc; put the run evidence in the PR description or
 a comment. Stop the gateway and skardi-server when done, and remind the
 user to rotate any credential that was exposed.

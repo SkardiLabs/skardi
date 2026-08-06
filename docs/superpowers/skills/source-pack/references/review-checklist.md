@@ -25,6 +25,13 @@ The worst failure class: wrong results with a green status.
       authoritative total) — a filtered count is never a termination
       signal, and a missing signal means upstream contribution or
       deferral, not a heuristic.
+- [ ] Termination verified on the REAL final page, not assumed from the
+      envelope shape: providers can return a non-empty continuation
+      token beside `has_more: false` (Feishu wiki), which null-token
+      termination refetches until the loop guard kills the scan.
+      Declare `has_more_path` where the envelope carries an
+      authoritative has-more boolean, and pin the live final-page shape
+      with an e2e.
 - [ ] Short/empty non-final pages cannot truncate: if the envelope has
       an authoritative total, the strategy declares `total_pages_path`;
       if not, the heuristic's limits are documented.
@@ -77,9 +84,26 @@ The worst failure class: wrong results with a green status.
 - [ ] Per-declaration coverage: every table's own wire declarations
       (row path, input keys, pagination params) pinned by its own e2e —
       shared constants are not shared coverage.
+- [ ] Every wire e2e asserts the EXACT input key set per request
+      (sorted keys equal, absence included — page 1 carries no cursor),
+      not key presence: presence-only assertions cannot catch an
+      undeclared extra leaking onto the wire, and strict action schemas
+      turn that extra into a runtime 400.
+- [ ] Declared constants asserted by VALUE, not key presence — every
+      table's `page_size` pinned to its number on the wire (`pageSize`
+      is exactly where a live contract defect surfaced: declared 100,
+      wire caps at 50).
 - [ ] Both sides of every gate: the pass path (suite-wide) and the fail
       path (targeted test). A gate whose failure arm no test exercises
-      is dead code until proven otherwise.
+      is dead code until proven otherwise — and the failing input must
+      reach the gate THROUGH THE PUBLIC ENTRY POINT, not by calling the
+      guard function directly. Deserialization layers can destroy the
+      evidence before a post-hoc guard runs: serde_json's f64 visitor
+      converts a nested `.nan` to `null` during untagged buffering, so a
+      "reject non-finite" walk over the deserialized value could never
+      fire (the `first_non_finite` finding on the Notion PR — the fix
+      captures `serde_yaml::Value` and converts fallibly where the
+      evidence still exists).
 - [ ] Error tests assert the full identity (column/path/page/row/
       expected/found-kind) and that the offending VALUE never appears.
 - [ ] Negative-space guards for every "this deliberately doesn't
@@ -101,6 +125,18 @@ The worst failure class: wrong results with a green status.
       audited mechanically (every surviving string matched against an
       allowlist — real titles hide in URL slugs). Deliberately-broken
       fixtures (schema-mismatch) stay synthetic and say so.
+- [ ] The redaction audit DECODES nested JSON-encoded strings and
+      audits their leaves too (real names survived one decode level
+      down in a message payload), and it ships as an in-repo tripwire
+      test so CI enforces it. Person-linked capture timestamps are
+      coarsened; redacted cross-references stay self-consistent (an
+      id embedded in the row's own URL matches the row). If PII ever
+      reached a commit, the branch history was rewritten, not just the
+      tip.
+- [ ] Columns with ZERO fixture evidence (no captured row carries the
+      key) are annotated doc-derived at the declaration — under a
+      loose-schema pack, real rows are the only column truth, so an
+      evidence gap must be a reviewed fact, not an implicit one.
 - [ ] No real orgs/users/tokens anywhere; if a credential was ever
       pasted into a conversation or log during verification, the user
       was told to rotate it.
@@ -112,6 +148,12 @@ The worst failure class: wrong results with a green status.
 - [ ] No stale references: milestone numbers in Review notes, removed
       columns/tests still described, fixture-category lists, "pending"
       markers for work that has since landed.
+- [ ] The pack doc's table/pushdown matrix re-derived from the FINAL
+      yaml after the live pass — a pushdown the reconciliation dropped
+      must read `—`, not survive as a promise (the doc row is the
+      easiest artifact to forget when the wire invalidates a draft).
+- [ ] Upstream gateway defects found during verification are filed as
+      issues on the gateway repo and LINKED from the pack doc.
 - [ ] Operational consequences documented where behavior surprises:
       fingerprint pins fail on ANY schema change (additive included —
       re-capture and re-pin on upstream upgrades); raw-scan default-deny
