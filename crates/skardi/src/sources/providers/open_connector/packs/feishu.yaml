@@ -146,8 +146,9 @@ tables:
       page_size_input: pageSize
       page_size: 100
       has_more_path: "$.hasMore"
-    # `my_tasks` is the executor's default; pinned explicitly so the
-    # table's population is declared, not inherited. Omitting the
+    # `my_tasks` is the ONLY value Feishu accepts (1470400 for
+    # assigned/created/followed — field-verified), pinned explicitly so
+    # the table's population is declared, not inherited. Omitting the
     # action's `completed` input returns tasks in BOTH states — the
     # state=all default. The input is deliberately unmapped as a filter:
     # real rows carry NO `completed` boolean (live-verified 2026-08-04 —

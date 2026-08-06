@@ -41,14 +41,30 @@ spec:
       open_connector:
         runtime_token_env: OPEN_CONNECTOR_TOKEN
         bindings:
+          # The three tables that need NO resource — a first ctx can only
+          # cover these; the other three each require an id you get by
+          # querying chats / wiki_spaces first, then coming back.
           - name: team               # schema name in SQL
             source_pack: feishu
             tables: [chats, tasks, wiki_spaces]
+          # Each of the remaining tables needs one resource, so each
+          # needs its own binding — adding them to `team` fails startup
+          # with `missing required resource input`.
           - name: standup            # per-chat binding for chat history
             source_pack: feishu
             resource:
               containerId: oc_a1b2c3d4e5f6   # chat_id from the chats table
             tables: [messages]
+          - name: standup_members
+            source_pack: feishu
+            resource:
+              chatId: oc_a1b2c3d4e5f6        # chat_id from the chats table
+            tables: [chat_members]
+          - name: handbook
+            source_pack: feishu
+            resource:
+              spaceId: "7034502641455497244" # space_id from wiki_spaces
+            tables: [wiki_nodes]
 ```
 
 ```sql
@@ -90,8 +106,10 @@ Design notes:
   unmapped — it is exclusive, and flooring an upper bound would drop
   rows. `body.content` maps to the `content` column as the provider's
   own JSON-encoded payload text (its inner schema varies by `msg_type`).
-- **`tasks` pins `type: my_tasks`** and always omits the `completed`
-  input — Feishu's spelling of a state=all listing. Nothing pushes it:
+- **`tasks` sends `type: my_tasks`** — the only value Feishu accepts
+  (`1470400: Invalid Param 'type'. Only 'my_tasks' is supported.` for
+  `assigned`/`created`/`followed`), not a tunable choice — and always
+  omits the `completed` input, Feishu's spelling of a state=all listing. Nothing pushes it:
   real rows carry no `completed` boolean (completion on the wire is
   `status: todo|done` plus `completed_at`), so filter on `status`
   locally.
@@ -109,6 +127,22 @@ The gateway's feishu provider uses the OAuth authorization-code flow
 creates. Rows are the authorizing user's view — a chat the user left or
 a wiki space they cannot read is simply absent, not an error.
 
+**Gateway version is a floor, not a fact**: the six actions this pack
+needs were added to Open Connector after older mid-2025 builds (which
+expose only docs/bitable feishu actions); a too-old gateway fails
+registration with `action 'feishu.list_chats' was not found`, which
+reads like a typo but means "upgrade the gateway". Self-check before
+going further:
+
+```bash
+curl -s -H "Authorization: Bearer $OPEN_CONNECTOR_TOKEN" \
+  "$GATEWAY/v1/actions?service=feishu&limit=500" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); \
+    ids=[i['id'] for i in d['data']['items']]; print(len(ids)); \
+    print([n for n in ['feishu.list_chats','feishu.list_messages','feishu.list_chat_members','feishu.list_tasks','feishu.list_wiki_spaces','feishu.list_wiki_nodes'] if n not in ids])"
+# expect: a few hundred actions, then an empty list []
+```
+
 Operational findings from the live verification, all three of which the
 Feishu console gates independently of each other:
 
@@ -123,10 +157,46 @@ Feishu console gates independently of each other:
   (99992402 above it) despite the gateway schema declaring 100 — the
   pack requests 50.
 - Upstream gateway caveat: its authorization URL requests the union of
-  ALL feishu actions' scopes with no narrowing surface, which Feishu
-  rejects (20027) unless the app enables every one — deployments should
-  expect to narrow the provider's scope list until upstream grows a
-  config-level override.
+  ALL feishu actions' scopes with no narrowing surface — measured at
+  164 scopes on the live authorize URL, including destructive write
+  scopes, to read six tables — which Feishu rejects (20027) unless the
+  app enables every one. Until upstream grows a config-level override
+  ([#267](https://github.com/oomol-lab/open-connector/issues/267)),
+  narrow `feishuOAuthScopes` in the gateway's
+  `src/providers/feishu/definition.ts` to what these tables need:
+
+  ```ts
+  const feishuOAuthScopes = [
+    "offline_access",
+    "im:chat:read",                       // chats
+    "im:chat.members:read",               // chat_members
+    "im:message:readonly",                // messages (next three also messages)
+    "im:message.group_msg:get_as_user",
+    "im:message.p2p_msg:get_as_user",
+    "im:message.reactions:read",
+    "task:task:read",                     // tasks
+    "wiki:space:retrieve",                // wiki_spaces
+    "wiki:node:retrieve",                 // wiki_nodes
+  ];
+  ```
+
+  The Feishu console bulk-imports scopes, so enabling them is one paste:
+
+  ```json
+  {"scopes":{"tenant":[],"user":["offline_access","im:chat:read","im:chat.members:read",
+  "im:message:readonly","im:message.group_msg:get_as_user","im:message.p2p_msg:get_as_user",
+  "im:message.reactions:read","task:task:read","wiki:space:retrieve","wiki:node:retrieve"]}}
+  ```
+
+- Zero-trust corporate VPNs (aTrust / EasyConnect class) that map
+  external domains into `198.18.0.0/15` trip the gateway's egress guard
+  BEFORE any request leaves the process: the OAuth exchange fails in
+  tens of milliseconds with only `oauth_token_exchange_failed` and no
+  resolved address — the speed is the tell. The guard checks reserved
+  ranges unconditionally (`OOMOL_CONNECT_ALLOW_PRIVATE_NETWORK` cannot
+  open them, and it does not reach provider egress at all); tracked
+  upstream as
+  [#275](https://github.com/oomol-lab/open-connector/issues/275).
 
 Filed upstream (oomol-lab/open-connector) from this verification pass:
 [#267](https://github.com/oomol-lab/open-connector/issues/267)
