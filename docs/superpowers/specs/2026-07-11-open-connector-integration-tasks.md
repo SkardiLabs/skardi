@@ -338,9 +338,14 @@ event carrying the scan identity and error.
       guilds/sticker_packs fixtures are redacted live captures with a
       mechanical allowlist tripwire test on every person-linked fixture.
       Operational: Discord 429s rapid probes; the gateway surfaces them loudly.
-      Verification: 307 tests (`cargo test -p skardi --lib
-      sources::providers::open_connector`; 19 new — 8 keyset engine, 1 loader,
-      10 pack-scoped `… packs::discord`), 864 full library suite.
+      Keyset failures carry precise, value-free diagnostics
+      (`PaginationKeysetCursorInvalid` with per-case reasons,
+      `PaginationKeysetLoop` withholding the repeated row value), pinned by
+      full rendered-message assertions. Verification: 311 tests (`cargo test
+      -p skardi --lib sources::providers::open_connector`; 23 new — 9 keyset
+      engine, 1 loader, 13 pack-scoped `… packs::discord` including
+      per-table wire-declaration e2e for all three tables, UDTF parity, and
+      empty-page schema stability), 868 full library suite.
 - [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,

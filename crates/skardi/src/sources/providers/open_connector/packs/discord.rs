@@ -111,7 +111,8 @@ mod tests {
         fingerprint_uncovered_columns,
     };
     use crate::sources::providers::open_connector::{
-        OpenConnectorConfig, register_open_connector_tables,
+        OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
+        register_open_connector_udtfs,
     };
     use arrow::array::{Array, BooleanArray, ListArray, StringArray, UInt64Array};
     use arrow::record_batch::RecordBatch;
@@ -437,6 +438,7 @@ bindings:
         tables: &str,
     ) -> (MockGateway, SessionContext) {
         let _token = EnvVarGuard::set(token_env, "test-token");
+        let gateways = OpenConnectorGateways::default();
         let mut ctx = SessionContext::new();
         register_open_connector_tables(
             &mut ctx,
@@ -445,10 +447,11 @@ bindings:
             Some(&discord_config(token_env, tables)),
             false,
             HierarchyLevel::Catalog,
-            None,
+            Some(&gateways),
         )
         .await
         .expect("gateway registration succeeds");
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
     }
 
@@ -592,6 +595,115 @@ bindings:
         // single_page injects none — a stray key would be a strict-schema
         // 400 on the real gateway.
         assert_eq!(sorted_keys(&inputs[0]), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn sticker_packs_single_page_scan_pins_its_own_wire_declarations() {
+        // Per-declaration coverage: shared constants are not shared
+        // coverage — this table's OWN row path, action ID, and exact
+        // (empty) input set get their own e2e.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return discord_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/discord.list_sticker_packs" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"sticker_packs": [
+                        {"id": "sp-2", "sku_id": "sku-2", "name": "Pack Two",
+                         "description": "d", "cover_sticker_id": "cs-2",
+                         "banner_asset_id": "ba-2", "stickers": [{"id": "st-9"}]},
+                        {"id": "sp-1", "sku_id": "sku-1", "name": "Pack One",
+                         "description": "d", "cover_sticker_id": "cs-1",
+                         "banner_asset_id": "ba-1", "stickers": []}
+                    ]})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_DISCORD_STICKERS", "sticker_packs").await;
+
+        // Row identity in wire order, not cardinality.
+        let batches = collect(&ctx, "SELECT id FROM saas.me.sticker_packs").await;
+        let ids: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col: &StringArray = b.column(0).as_any().downcast_ref().expect("Utf8 ids");
+                (0..col.len())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, ["sp-2", "sp-1"]);
+
+        let inputs = execute_inputs(&gateway);
+        assert_eq!(inputs.len(), 1, "single_page = exactly one request");
+        assert_eq!(sorted_keys(&inputs[0]), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn udtf_parity_for_sticker_packs() {
+        // The bound table and the ad-hoc UDTF spelling of the same action
+        // must agree on schema and rows.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return discord_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/discord.list_sticker_packs" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"sticker_packs": [
+                        {"id": "sp-1", "sku_id": "sku-1", "name": "Pack One",
+                         "description": null, "cover_sticker_id": "cs-1",
+                         "banner_asset_id": "ba-1", "stickers": [{"id": "st-1"}]}
+                    ]})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_DISCORD_UDTF", "sticker_packs").await;
+
+        let from_table = collect(&ctx, "SELECT * FROM saas.me.sticker_packs").await;
+        let from_udtf = collect(
+            &ctx,
+            "SELECT * FROM open_connector_query('saas', 'discord.sticker_packs', '{}')",
+        )
+        .await;
+        assert_eq!(from_table[0].schema(), from_udtf[0].schema());
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&from_table)
+                .unwrap()
+                .to_string(),
+            arrow::util::pretty::pretty_format_batches(&from_udtf)
+                .unwrap()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn empty_pages_preserve_every_table_schema() {
+        // A zero-row response is a complete result, not a schema change —
+        // connections proved this live (the account had no links at first
+        // scan): every declared column must exist on the empty batch.
+        for (table, empty) in [
+            (table("guilds"), r#"{"guilds":[]}"#),
+            (table("connections"), r#"{"connections":[]}"#),
+            (table("sticker_packs"), r#"{"sticker_packs":[]}"#),
+        ] {
+            let batch = convert_fixture(table, empty);
+            assert_eq!(batch.num_rows(), 0);
+            assert_eq!(batch.num_columns(), table.fields.len(), "{}", table.id);
+        }
     }
 
     #[tokio::test]

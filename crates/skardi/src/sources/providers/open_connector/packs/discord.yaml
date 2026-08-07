@@ -17,9 +17,10 @@
 # COLUMN STATUS: item schemas are declared LOOSE by the gateway (empty
 # properties + additionalProperties: true), so every column below rides
 # passthrough and none is protected by the fingerprint gate — real rows
-# are the only column truth. DRAFT pending the milestone's live pass;
-# shapes follow Discord's documented guild / connection / sticker-pack
-# resources.
+# are the only column truth. Live-verified against a real account on
+# 2026-08-07 (all three tables end to end through skardi-server); the
+# per-column annotations below record what the live pass settled and
+# what stays doc-derived.
 kind: pack
 pack: discord
 version: 1

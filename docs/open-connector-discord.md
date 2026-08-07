@@ -42,6 +42,7 @@ spec:
           # No table needs a resource — everything is @me or public.
           - name: me                # schema name in SQL
             source_pack: discord
+            source_pack_version: 1  # optional pin
             tables: [guilds, connections, sticker_packs]
 ```
 
@@ -51,6 +52,10 @@ FROM saas.me.guilds
 ORDER BY approximate_member_count DESC;
 
 SELECT connection_type, name, verified FROM saas.me.connections;
+
+-- The same contract, ad hoc, without a binding:
+SELECT name, sku_id
+FROM open_connector_query('saas', 'discord.sticker_packs', '{}');
 ```
 
 ## Tables
@@ -93,8 +98,10 @@ Design notes:
   doc links it once filed.
 - **Rate limits are tight**: rapid successive calls to
   `/users/@me/guilds` return HTTP 429, which the gateway surfaces as a
-  loud scan failure (not a silent stop). At the pack's 200-row pages a
-  scan makes one request per 200 guilds and stays comfortably clear.
+  loud scan failure (not a silent stop). A full scan of *n* guilds
+  makes `ceil(n / 200) + 1` requests — the `+1` is the terminating
+  empty page keyset requires — so a typical account costs two requests
+  and stays comfortably clear.
 - **`entitlements` is deferred, not shipped incomplete**: Discord's
   entitlements API paginates (`before`/`after`/`limit`), but the
   gateway's executor exposes only `exclude_ended`/`exclude_deleted` —

@@ -451,13 +451,25 @@ impl Pagination {
                 }
                 // A non-empty page continues from the last row's cursor
                 // field. rows_in_page ≥ 1, so the row exists; the defensive
-                // arm covers a caller passing inconsistent args.
-                let Some(row) = last_row else {
-                    return Err(OpenConnectorError::PaginationCursorInvalid {
+                // arm covers a caller passing inconsistent args. Every
+                // failure below is `PaginationKeysetCursorInvalid` (or the
+                // value-free `PaginationKeysetLoop`), whose wording is
+                // supplied here — reusing `PaginationCursorInvalid` would
+                // graft its fixed "not a string" tail onto reasons where it
+                // is wrong or self-contradictory (an empty string IS a
+                // string).
+                let invalid =
+                    |page, reason: &str| OpenConnectorError::PaginationKeysetCursorInvalid {
                         path: (*row_cursor_field).to_string(),
-                        page: self.page,
-                        found: "a non-empty page with no last row (caller bug)".to_string(),
-                    });
+                        page,
+                        reason: reason.to_string(),
+                    };
+                let Some(row) = last_row else {
+                    return Err(invalid(
+                        self.page,
+                        "cannot be read: the page is non-empty but no last row was \
+                         supplied (caller bug)",
+                    ));
                 };
                 let mut value = row;
                 for segment in row_cursor_field.split('.') {
@@ -467,25 +479,23 @@ impl Pagination {
                             // The pack declared a cursor field real rows do
                             // not carry — contract drift, never a quiet stop
                             // (stopping would silently truncate the scan).
-                            return Err(OpenConnectorError::PaginationCursorInvalid {
-                                path: (*row_cursor_field).to_string(),
-                                page: self.page,
-                                found: "absent from the page's last row".to_string(),
-                            });
+                            return Err(invalid(self.page, "is absent from the page's last row"));
                         }
                     };
                 }
                 let next = match value {
                     Value::String(s) if !s.is_empty() => s.clone(),
+                    Value::String(_) => {
+                        return Err(invalid(self.page, "is an empty string"));
+                    }
                     other => {
                         // Snowflakes are strings on the wire; a number here
                         // is drift (and stringifying it would silently paper
                         // over a provider change).
-                        return Err(OpenConnectorError::PaginationCursorInvalid {
-                            path: (*row_cursor_field).to_string(),
-                            page: self.page,
-                            found: json_kind(other),
-                        });
+                        return Err(invalid(
+                            self.page,
+                            &format!("is {}, not a string", json_kind(other)),
+                        ));
                     }
                 };
                 // A provider violating its own ordering (repeating the
@@ -495,12 +505,9 @@ impl Pagination {
                 // ROW data — a field a future pack can point anywhere — and
                 // row values never appear in errors.
                 if !self.seen_tokens.insert(next.clone()) {
-                    return Err(OpenConnectorError::PaginationCursorInvalid {
+                    return Err(OpenConnectorError::PaginationKeysetLoop {
                         path: (*row_cursor_field).to_string(),
                         page: self.page,
-                        found: "a cursor already consumed by an earlier page (the provider \
-                                repeated itself)"
-                            .to_string(),
                     });
                 }
                 self.page += 1;
@@ -609,14 +616,13 @@ mod tests {
         let mut p = keyset();
         let rows = [row("1"), json!({ "name": "no id" })];
         let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
-        match err {
-            OpenConnectorError::PaginationCursorInvalid { path, page, found } => {
-                assert_eq!(path, "id");
-                assert_eq!(page, 1);
-                assert!(found.contains("absent"), "{found}");
-            }
-            other => panic!("expected PaginationCursorInvalid, got {other:?}"),
-        }
+        // The RENDERED diagnostic is the contract, not just the variant: a
+        // wrong wording here misdirects the person debugging a real drift.
+        assert_eq!(
+            err.to_string(),
+            "Open Connector keyset cursor field 'id' on page 1 is absent from the \
+             page's last row; refusing to treat it as end-of-collection"
+        );
     }
 
     #[test]
@@ -626,33 +632,45 @@ mod tests {
         // and stringifying it would paper over a provider change.
         let rows = [row("1"), json!({ "id": 42 })];
         let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
-        match err {
-            OpenConnectorError::PaginationCursorInvalid { found, .. } => {
-                assert_eq!(found, "a number");
-            }
-            other => panic!("expected PaginationCursorInvalid, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "Open Connector keyset cursor field 'id' on page 1 is a number, not a \
+             string; refusing to treat it as end-of-collection"
+        );
+        assert!(!err.to_string().contains("42"), "the value never appears");
     }
 
     #[test]
-    fn keyset_repeated_cursor_fails_without_quoting_the_row_value() {
+    fn keyset_empty_string_cursor_fails_without_calling_a_string_not_a_string() {
+        let mut p = keyset();
+        // An empty string IS a string — the diagnosis must say "empty",
+        // not the self-contradictory "is a string, not a string" that a
+        // json-kind rendering would produce.
+        let rows = [row("1"), json!({ "id": "" })];
+        let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Open Connector keyset cursor field 'id' on page 1 is an empty string; \
+             refusing to treat it as end-of-collection"
+        );
+    }
+
+    #[test]
+    fn keyset_repeated_cursor_fails_as_a_loop_without_quoting_the_row_value() {
         let mut p = keyset();
         let rows = [row("1"), row("sensitive-row-value")];
         assert!(p.advance(&json!({}), rows.len(), rows.last()).unwrap());
         // A provider violating its own ordering re-serves the same last id.
-        // The failure carries identity only: the cursor is ROW data, and
-        // row values never appear in errors (unlike PaginationLoop's
-        // envelope-level token).
+        // The failure names the loop and carries identity only: the cursor
+        // is ROW data, and row values never appear in errors (unlike
+        // PaginationLoop's envelope-level token).
         let rows = [row("3"), row("sensitive-row-value")];
         let err = p.advance(&json!({}), rows.len(), rows.last()).unwrap_err();
-        match &err {
-            OpenConnectorError::PaginationCursorInvalid { path, page, found } => {
-                assert_eq!(path, "id");
-                assert_eq!(*page, 2);
-                assert!(found.contains("already consumed"), "{found}");
-            }
-            other => panic!("expected PaginationCursorInvalid, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "Open Connector keyset cursor field 'id' on page 2 repeats a value \
+             already consumed by an earlier page; refusing to loop the scan"
+        );
         assert!(
             !err.to_string().contains("sensitive-row-value"),
             "the row value must not appear in the error"
