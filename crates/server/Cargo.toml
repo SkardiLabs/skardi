@@ -13,7 +13,14 @@ name = "skardi-server"
 path = "src/main.rs"
 
 [features]
-default = []
+# `chunking` is default: generated etl bundles (skardi-cloud) call
+# chunk_parts at job run time, and the etl PRD's contract is that a
+# STOCK server runs them — a feature-gated runtime function would fail
+# the plain `cargo build -p skardi-server` / no-FEATURES Docker artifact
+# at `chunk_parts`. The skardi LIBRARY keeps `default = []`; this is a
+# server-artifact decision only (text-splitter is a small pure-Rust
+# dep). Opt out with --no-default-features.
+default = ["chunking"]
 candle = ["skardi/candle"]
 onnx = ["skardi/onnx"]
 embedding = ["candle", "gguf", "onnx", "remote-embed"]

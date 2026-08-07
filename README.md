@@ -439,7 +439,8 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [x] Hybrid search — combine keyword and semantic search results in one SQL query (RRF merge), no Python re-ranking layer
    - [x] Inline embeddings — `candle()` UDF (local GGUF / Candle models, or remote embedding APIs) called inside SQL, so content + vector stay on the same row atomically
    - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
-   - [x] Chunking UDF — `chunk()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
+   - [x] Chunking UDFs — `chunk()` and index-carrying `chunk_parts()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
+   - [x] JSON encoding UDF — `json_pack()` builds JSON objects in SQL through `serde_json` (deterministic key order, no injection path) ([docs](docs/json_pack.md))
    - [ ] Memory primitive — give your agent a memory store (keyword + semantic recall, TTL/expiration, per-session provenance) defined in one YAML block
 
 `3` Online serving (pipelines)
