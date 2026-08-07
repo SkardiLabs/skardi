@@ -219,6 +219,18 @@ impl RssConfig {
         if self.user_agent.trim().is_empty() {
             return Err(invalid_config("user_agent must not be empty"));
         }
+        // Reject a UA that is non-empty but not a legal HTTP header value (an
+        // embedded control character, say) here, at config load, where the
+        // source name is still in scope to attribute it — rather than letting
+        // it slip through to fetcher construction and surface as the nameless
+        // `HttpClientBuild`. This mirrors the `HeaderValue` conversion reqwest
+        // applies to `.user_agent(...)`, so validate() and the fetcher agree
+        // on exactly which strings are legal.
+        if reqwest::header::HeaderValue::from_str(&self.user_agent).is_err() {
+            return Err(invalid_config(
+                "user_agent is not a valid HTTP header value (control characters and other illegal bytes are refused)",
+            ));
+        }
 
         Ok(())
     }
@@ -442,6 +454,23 @@ feeds:
             name: None,
         }]);
         config.user_agent = String::new();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("user_agent"), "{err}");
+    }
+
+    #[test]
+    fn user_agent_with_a_control_char_is_rejected_at_config_load() {
+        // A non-empty UA that is not a legal HTTP header value (embedded
+        // newline) must fail in validate() — at config load, attributable to
+        // the source — not survive to fetcher construction and surface as the
+        // nameless `HttpClientBuild`. `fetch.rs`'s
+        // `invalid_user_agent_fails_client_construction` covers the residual
+        // direct-construction path that bypasses validate().
+        let mut config = inline_config(vec![FeedSubscription {
+            url: "https://a.example/f.xml".to_string(),
+            name: None,
+        }]);
+        config.user_agent = "bad\nua".to_string();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("user_agent"), "{err}");
     }

@@ -1344,10 +1344,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_user_agent_fails_client_construction() {
-        // RssError::HttpClientBuild: a contractual error variant, reachable
-        // from caller-supplied config (RssConfig::validate only checks
-        // user_agent is non-empty, not that it survives HeaderValue's
-        // stricter validation), otherwise unexercised.
+        // RssError::HttpClientBuild: a contractual error variant. Config-load
+        // validation now rejects a UA that is not a legal HeaderValue
+        // (RssConfig::validate applies the same check), so this is reached only
+        // by constructing the fetcher directly from typed parameters, bypassing
+        // validate() — the residual path this test pins.
         let err = FeedFetcher::new(
             Arc::new(AllowAll),
             Duration::from_secs(2),
