@@ -323,8 +323,11 @@ event carrying the scan identity and error.
       three tables verified against a REAL account end to end through
       skardi-server (registration through LIVE discovery; guilds 6 rows and
       sticker_packs 14 rows with every mapped column non-NULL on real rows;
-      connections a clean zero-row scan — columns stay doc-derived until the
-      account links one). The real keyset walk (limit 2) covered 3 full pages
+      connections 1 real linked-account row — all nine wire keys mapped, the
+      connection_type rename extracting, `revoked` genuinely absent on a
+      non-revoked row with its non-NULL arm on a synthetic fixture row, since
+      capturing it live would revoke a real account link). The real keyset
+      walk (limit 2) covered 3 full pages
       plus the empty terminator, no duplicate/boundary drop, ascending-
       snowflake ordering confirmed. The live pass caught one contract defect no
       mock could: the gateway calls the UNVERSIONED discord.com/api, where

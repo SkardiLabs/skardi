@@ -10,10 +10,12 @@ public Nitro sticker-pack catalog, as SQL tables over Open Connector's
 > scanned end to end with every mapped column non-NULL on real rows; the
 > real keyset walk (`limit: 2`) covered 3 full pages plus the empty
 > terminator with no duplicate and no boundary drop. `connections`
-> scanned live as a clean zero-row table (the account has no linked
-> accounts), so its columns remain doc-derived until a row exists. The
-> live pass caught one contract defect no mock could: `permissions` is a
-> NUMBER on the real wire (see below).
+> scanned live with a real linked account (1 row): all nine wire keys
+> mapped, `revoked` genuinely absent on a non-revoked row (its non-NULL
+> arm rides a synthetic fixture row — capturing it live would mean
+> revoking a real account link). The live pass caught one contract
+> defect no mock could: `permissions` is a NUMBER on the real wire (see
+> below).
 
 ## What this provider can see
 
@@ -96,9 +98,9 @@ Design notes:
 - **`entitlements` is deferred, not shipped incomplete**: Discord's
   entitlements API paginates (`before`/`after`/`limit`), but the
   gateway's executor exposes only `exclude_ended`/`exclude_deleted` —
-  first-page-only through no fault of a pack. Upstream issue pending
-  (linked here once filed); the
-  table joins when the executor grows the pagination inputs.
+  first-page-only through no fault of a pack. Filed upstream as
+  [oomol-lab/open-connector#283](https://github.com/oomol-lab/open-connector/issues/283);
+  the table joins when the executor grows the pagination inputs.
 - No table declares `error_path`: the provider's executors consume
   Discord's error responses themselves and return the gateway's
   failure envelope.

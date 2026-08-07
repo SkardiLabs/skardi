@@ -46,9 +46,9 @@
 //! - **`entitlements` is DEFERRED, not shipped incomplete**: Discord's
 //!   entitlements API paginates (`before`/`after`/`limit`), but the
 //!   gateway's executor exposes only `exclude_ended`/`exclude_deleted` —
-//!   first-page-only through no fault of a pack. Upstream issue pending
-//!   (linked from the pack doc once filed); the
-//!   table joins when the executor grows the pagination inputs.
+//!   first-page-only through no fault of a pack. Filed upstream
+//!   (oomol-lab/open-connector#283); the table joins when the executor
+//!   grows the pagination inputs.
 //! - **`error_path: None`**: the provider's executors consume Discord's
 //!   error responses themselves and return the gateway failure envelope;
 //!   nothing in-band reaches the row path.
@@ -75,11 +75,14 @@
 //! mapped column non-NULL on real rows, real keyset walk `limit: 2`
 //! over 3 full pages + the empty terminator, no duplicate and no
 //! boundary drop, ascending-snowflake ordering confirmed); their
-//! fixtures are redacted live captures. `connections` scanned live as a
-//! clean ZERO-row table (the account has no linked accounts), so its
-//! columns remain doc-derived and its fixture synthetic until a row
-//! exists. Discord rate-limits these routes aggressively (rapid probes
-//! hit HTTP 429, surfaced loudly by the gateway).
+//! fixtures are redacted live captures. `connections` is live-verified
+//! on a real linked account (1 row through skardi-server: all nine wire
+//! keys present and mapped, the `connection_type` rename extracting,
+//! `revoked` genuinely ABSENT on a non-revoked row — its non-NULL arm
+//! rides a synthetic fixture row, since capturing it live would mean
+//! revoking a real account link). Discord rate-limits these routes
+//! aggressively (rapid probes hit HTTP 429, surfaced loudly by the
+//! gateway).
 
 use std::sync::OnceLock;
 
@@ -164,13 +167,16 @@ mod tests {
     }
 
     // ── Contract tests: bundled fixtures are the build-time conversion
-    // contract (null-bearing, empty-list, nested, and a schema mismatch
-    // per the admission gate). guilds and sticker_packs are REDACTED
-    // LIVE CAPTURES (2026-08-07): real key sets and spellings, synthetic
-    // ids/names/hashes/permission bits, lists truncated. The live wire
-    // always carries every guild key (with_counts pinned), so absent-key
-    // coverage rides connections' `revoked`, not a fabricated omission
-    // here. The schema-mismatch fixture stays synthetic by design. ──────
+    // contract (null-bearing, absent-key, empty-list, nested, and a
+    // schema mismatch per the admission gate). guilds, sticker_packs,
+    // and connections row 1 are REDACTED LIVE CAPTURES (2026-08-07):
+    // real key sets and spellings, synthetic ids/names/hashes/permission
+    // bits, lists truncated. The live wire always carries every guild
+    // key (with_counts pinned), so absent-key coverage rides
+    // connections' `revoked` — genuinely absent on the live row.
+    // connections row 2 (the revoked arm) and the schema-mismatch
+    // fixture stay synthetic by design: capturing a real revoked row
+    // would mean revoking a real account link. ──────────────────────────
 
     #[test]
     fn guilds_fixture_converts_raw_passthrough_with_counts() {

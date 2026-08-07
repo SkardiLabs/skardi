@@ -15,13 +15,13 @@
       "id": "10000000000000000102",
       "name": "Redacted Player Two",
       "type": "steam",
-      "friend_sync": true,
-      "metadata_visibility": 0,
-      "revoked": true,
-      "show_activity": false,
+      "friend_sync": false,
+      "metadata_visibility": 1,
+      "show_activity": true,
       "two_way_link": false,
       "verified": false,
-      "visibility": 0
+      "visibility": 0,
+      "revoked": true
     }
   ]
 }
