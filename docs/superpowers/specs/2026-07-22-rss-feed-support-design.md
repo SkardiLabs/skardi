@@ -183,7 +183,7 @@ Eight components in four layers: configuration (boot-time, zero network), the en
 
 #### Fetcher
 
-The fetcher owns bounded HTTP: per-request timeout, total scan deadline, a response-size cap enforced on the decompressed body (so a compressed payload cannot inflate past it), bounded jittered retries honoring `Retry-After`, cancellation, and conditional GET with stored ETag / Last-Modified validators. Concurrency is capped by `max_concurrent`, which doubles as the per-host politeness bound — scoped to a single process: each replica counts independently, so N replicas (or a crash/restart loop) can present a feed host with up to N× this bound. A self-identifying `User-Agent` is sent by default — feed servers routinely ban anonymous clients.
+The fetcher owns bounded HTTP: per-request timeout, total scan deadline, a response-size cap enforced on the decompressed body (so a compressed payload cannot inflate past it), bounded jittered retries honoring `Retry-After`, cancellation, and conditional GET with stored ETag / Last-Modified validators. Concurrency is capped by `max_concurrent` — a bound on total fetch parallelism per source, not a per-host bound: nothing accounts per host, so feeds sharing a host can receive up to `max_concurrent` concurrent requests. It is per-process — each replica counts independently, so N replicas (or a crash/restart loop) can present a feed host with up to N× this bound. Politeness toward any single host rests on honoring `Retry-After` and per-feed TTL pacing, not on a per-host concurrency cap (a real per-host bound is left to the engine phase to consider — see the code comment on `max_concurrent`). A self-identifying `User-Agent` is sent by default — feed servers routinely ban anonymous clients.
 
 The fetcher exposes an `EgressPolicy` seam: a trait consulted for every resolved address, on the initial URL and on every redirect hop, enforced at the DNS-resolver layer (`PolicyDns`) so an injected policy holds against DNS rebinding. OSS ships only the `AllowAll` implementation — by default the fetcher reaches any address the host can route to, including link-local (`169.254.169.254`) and RFC 1918 targets — and performs no destination filtering of its own. Feed URLs are agent-authored, i.e. attacker-influenceable, and constraining where they may point is delegated to the operator's infrastructure or to a policy injected through this seam (see Security and the [Cloud egress design](2026-08-03-rss-cloud-egress-design.md)). The manual per-hop redirect loop and IP-literal re-check remain regardless of policy: they carry the per-hop retry budget, validator suppression, and unconditional-`304` handling, which are correctness concerns independent of egress.
 
@@ -262,7 +262,7 @@ spec:
           - url: https://this-week-in-rust.org/rss.xml
         # or: opml: subscriptions.opml # mutually exclusive with feeds:
         ttl_seconds: 900               # 0 = always live
-        max_concurrent: 6              # fetch parallelism and per-host politeness bound (per process)
+        max_concurrent: 6              # total fetch parallelism per source (per process); not a per-host bound
         request_timeout_seconds: 10
         max_response_bytes: 5242880
         user_agent: "skardi-rss/<version> (+https://github.com/SkardiLabs/skardi)"

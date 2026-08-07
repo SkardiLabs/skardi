@@ -38,7 +38,11 @@ use super::error::RssError;
 /// Default per-feed cache TTL, in seconds (15 minutes).
 const DEFAULT_TTL_SECONDS: u64 = 900;
 /// Default in-flight fetch bound for one `rss` source. See
-/// [`RssConfig::max_concurrent`] for what it does and does not bound.
+/// [`RssConfig::max_concurrent`] for what it does and does not bound. `6`
+/// borrows the classic HTTP/1.1 browser per-host connection limit as a
+/// conservative default — large enough that a sizable subscription list is not
+/// fetched one feed at a time, small enough not to hammer, and tunable per
+/// source; here it caps total parallelism rather than per-host connections.
 const DEFAULT_MAX_CONCURRENT: usize = 6;
 /// Default timeout for a single feed HTTP request.
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 10;
@@ -124,11 +128,16 @@ pub struct RssConfig {
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
 
-    /// Maximum number of feeds fetched concurrently: both the fetch
-    /// parallelism for THIS source's feeds. It is neither a per-host nor a
-    /// per-process bound: the semaphore lives on one `RssEngine` and one engine
-    /// is built per registered source (`mod.rs`), so two `rss` sources in one
-    /// process permit the sum, and nothing anywhere accounts per host.
+    /// Maximum number of feeds fetched concurrently for THIS source — a bound
+    /// on fetch parallelism, and only that. It is neither a per-host nor a
+    /// per-process bound: the engine (a later phase in this stack) holds one
+    /// semaphore per registered source, so two `rss` sources in one process
+    /// permit the sum, and nothing anywhere accounts per host — feeds sharing a
+    /// host can receive up to `max_concurrent` concurrent requests. A real
+    /// per-host politeness bound is left for the engine phase to weigh (the
+    /// hostname-vs-resolved-IP-vs-CDN question has to be settled first);
+    /// meanwhile host-level politeness rests on honoring `Retry-After` and TTL
+    /// pacing, not on this bound.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 
