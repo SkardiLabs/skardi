@@ -1197,7 +1197,26 @@ mod tests {
         // allowing 127.0.0.1 is exactly what lets hop 0 through yet refuses hop
         // 1's hostname — otherwise both hops share loopback and no policy could
         // allow one without the other. This relies on `localhost` resolving
-        // dual-stack (a set containing `::1`), which holds on the CI runner.
+        // dual-stack (a set containing `::1`); the guard below skips rather than
+        // fails on a host where it does not (IPv6 off, or no `::1` hosts entry),
+        // so the test is portable and not merely correct on the CI runner.
+        let localhost_resolves_v6 = tokio::net::lookup_host("localhost:0")
+            .await
+            .map(|addrs| {
+                addrs
+                    .map(|a| a.ip())
+                    .any(|ip| ip.is_loopback() && ip.is_ipv6())
+            })
+            .unwrap_or(false);
+        if !localhost_resolves_v6 {
+            eprintln!(
+                "skipping: `localhost` does not resolve to ::1 on this host \
+                 (IPv6 disabled or no `::1 localhost` entry); the IPv4-allow/\
+                 IPv6-deny asymmetry this test turns on needs a dual-stack \
+                 localhost"
+            );
+            return;
+        }
         let server = MockFeedServer::start(|req| {
             let host = req.header("host").expect("reqwest sends a host header");
             let redirect_to = format!("http://{}/denied", host.replace("127.0.0.1", "localhost"));

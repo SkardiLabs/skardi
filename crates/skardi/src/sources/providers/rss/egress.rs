@@ -50,6 +50,14 @@ pub type EgressReason = Cow<'static, str>;
 /// supplies an implementation that refuses reserved ranges.
 pub trait EgressPolicy: Send + Sync + fmt::Debug {
     /// `Ok(())` to allow the connection to `ip`, `Err(reason)` to refuse it.
+    ///
+    /// `ip` is always canonical: every call site unmaps IPv4-mapped IPv6
+    /// (`::ffff:a.b.c.d`) to the plain V4 with [`IpAddr::to_canonical`] before
+    /// calling this, so an implementation judges only the address a connect
+    /// actually reaches and never has to unmap the mapped form itself. A rule
+    /// written against `10.0.0.1` therefore also refuses `::ffff:10.0.0.1`. The
+    /// two call sites are [`check_addrs`] (the resolver path) and the fetcher's
+    /// IP-literal hop check.
     fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason>;
 }
 
