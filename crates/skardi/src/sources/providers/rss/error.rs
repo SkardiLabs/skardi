@@ -6,9 +6,11 @@ use thiserror::Error;
 /// Length cap, in characters, on any feed-influenced diagnostic string this
 /// provider stores or logs.
 ///
-/// Three call sites share it, and they share it because they are bounded by the
-/// same thing — how many characters of feed-chosen text a document can push into
-/// a diagnostic — rather than by coincidence:
+/// Three call sites will share it — all landing in later phases of this stack,
+/// none present in this PR, so the constant is exercised only by its own test
+/// for now. They will share it because they are bounded by the same thing —
+/// how many characters of feed-chosen text a document can push into a
+/// diagnostic — rather than by coincidence:
 ///
 /// - `feeds.last_error` (`engine.rs`, the column's only writer), including the
 ///   fixed literal `cache.rs` writes for an evicted-window `304`;
@@ -16,11 +18,11 @@ use thiserror::Error;
 ///   (`conformance.rs`), built from a raw root element name of whatever length
 ///   the document supplies;
 /// - the `debug`-level parse-failure line (`parse.rs`), which logs the
-///   dependency's own reason and was otherwise bounded only by
+///   dependency's own reason and would otherwise be bounded only by
 ///   `max_response_bytes`.
 ///
 /// A bound on *length* only. What content may reach `feeds.last_error` at all is
-/// a separate question, argued in `engine.rs`'s module doc.
+/// a separate question, to be argued in `engine.rs`'s module doc when it lands.
 ///
 /// The RSS docs (`docs/rss.md` and `docs/rss/semantics.yaml`, published later
 /// in this stack) will spell the number as a bare `512`; neither is Rust and
