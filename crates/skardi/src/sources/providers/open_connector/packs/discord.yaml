@@ -52,10 +52,14 @@ tables:
       - { name: icon, path: icon, type: utf8, nullable: true }
       - { name: banner, path: banner, type: utf8, nullable: true }
       - { name: owner, path: owner, type: boolean, nullable: true }
-      # A permission BITFIELD serialized as a decimal string (Discord
-      # sends it as a string because it exceeds JSON's safe-integer
-      # range) — kept verbatim; decoding bits is query-side work.
-      - { name: permissions, path: permissions, type: utf8, nullable: true }
+      # LIVE-PASS CORRECTION: this endpoint serves TWO permission fields —
+      # legacy `permissions` is a NUMBER (truncated to the bits that fit),
+      # and `permissions_new` is the full bitfield as a decimal string
+      # (it exceeds JSON's safe-integer range). The draft mapped
+      # `permissions` as utf8, which fails conversion on every real row.
+      # The column maps the authoritative string; the legacy number is
+      # deliberately unmapped. Decoding bits stays query-side work.
+      - { name: permissions, path: permissions_new, type: utf8, nullable: true }
       - { name: features, path: features, type: utf8_list, nullable: true }
       - { name: approximate_member_count, path: approximate_member_count, type: uint64, nullable: true }
       - { name: approximate_presence_count, path: approximate_presence_count, type: uint64, nullable: true }
@@ -96,6 +100,12 @@ tables:
       strategy: single_page
     columns:
       - { name: id, path: id, type: utf8, nullable: false }
+      # Nullability of the four optional catalog fields is DOC-DERIVED:
+      # every row of the live catalog (14 packs, 2026-08-07) carries all
+      # of them non-null, so the live pass could not exercise the null
+      # arms — Discord documents cover_sticker_id and banner_asset_id as
+      # optional, and nullable-true only risks accepting a null, never
+      # rejecting a value.
       - { name: sku_id, path: sku_id, type: utf8, nullable: true }
       - { name: name, path: name, type: utf8, nullable: false }
       - { name: description, path: description, type: utf8, nullable: true }

@@ -46,21 +46,40 @@
 //! - **`entitlements` is DEFERRED, not shipped incomplete**: Discord's
 //!   entitlements API paginates (`before`/`after`/`limit`), but the
 //!   gateway's executor exposes only `exclude_ended`/`exclude_deleted` —
-//!   first-page-only through no fault of a pack. Filed upstream; the
+//!   first-page-only through no fault of a pack. Upstream issue pending
+//!   (linked from the pack doc once filed); the
 //!   table joins when the executor grows the pagination inputs.
 //! - **`error_path: None`**: the provider's executors consume Discord's
 //!   error responses themselves and return the gateway failure envelope;
 //!   nothing in-band reaches the row path.
+//! - **`permissions` maps the wire key `permissions_new`** (live-pass
+//!   correction): the gateway calls the UNVERSIONED `discord.com/api`,
+//!   which Discord serves as its legacy default version — there
+//!   `permissions` is a truncated NUMBER and `permissions_new` carries
+//!   the full bitfield as a decimal string. The draft mapped
+//!   `permissions` as utf8 and failed conversion on every real row.
+//!   Version-coupled risk, documented in the pack doc: if the gateway
+//!   ever pins `/api/v10` (where `permissions` IS the string and
+//!   `permissions_new` is gone), this column goes always-NULL — the
+//!   loose item schemas mean no fingerprint can catch that move.
 //!
-//! ## Column status
+//! ## Column status (live pass, 2026-08-07)
 //!
 //! Item schemas are declared LOOSE by the gateway (empty `properties` +
 //! `additionalProperties: true`; `sticker_packs`' whole output schema is
 //! a bare raw object), so **no column here is protected by the
 //! fingerprint gate** — the pinned fingerprints freeze the envelope
-//! contract only, and real rows are the only column truth. Fixtures are
-//! DRAFT (documented Discord resource shapes) pending this milestone's
-//! live pass.
+//! contract only, and real rows are the only column truth. `guilds` and
+//! `sticker_packs` are live-verified end to end through skardi-server
+//! against a real account (registration through LIVE discovery, every
+//! mapped column non-NULL on real rows, real keyset walk `limit: 2`
+//! over 3 full pages + the empty terminator, no duplicate and no
+//! boundary drop, ascending-snowflake ordering confirmed); their
+//! fixtures are redacted live captures. `connections` scanned live as a
+//! clean ZERO-row table (the account has no linked accounts), so its
+//! columns remain doc-derived and its fixture synthetic until a row
+//! exists. Discord rate-limits these routes aggressively (rapid probes
+//! hit HTTP 429, surfaced loudly by the gateway).
 
 use std::sync::OnceLock;
 
@@ -145,9 +164,13 @@ mod tests {
     }
 
     // ── Contract tests: bundled fixtures are the build-time conversion
-    // contract (null-bearing, absent-key, empty-list, nested, and a
-    // schema mismatch per the admission gate). DRAFT: synthetic shapes,
-    // re-derived from redacted live captures in the real-data phase. ────
+    // contract (null-bearing, empty-list, nested, and a schema mismatch
+    // per the admission gate). guilds and sticker_packs are REDACTED
+    // LIVE CAPTURES (2026-08-07): real key sets and spellings, synthetic
+    // ids/names/hashes/permission bits, lists truncated. The live wire
+    // always carries every guild key (with_counts pinned), so absent-key
+    // coverage rides connections' `revoked`, not a fabricated omission
+    // here. The schema-mismatch fixture stays synthetic by design. ──────
 
     #[test]
     fn guilds_fixture_converts_raw_passthrough_with_counts() {
@@ -158,16 +181,16 @@ mod tests {
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(utf8(&batch, "id").value(0), "100000000000000001");
         assert_eq!(utf8(&batch, "name").value(1), "Redacted Guild Two");
-        // Present-null and absent both decode to SQL NULL: row 0 carries
-        // `banner: null`, row 1 omits the key entirely.
-        assert!(utf8(&batch, "banner").is_null(0));
+        // The wire's null spelling is present-null (`banner: null`), never
+        // an omitted key.
+        assert!(!utf8(&batch, "banner").is_null(0));
         assert!(utf8(&batch, "banner").is_null(1));
         assert!(!utf8(&batch, "icon").is_null(0));
-        assert!(utf8(&batch, "icon").is_null(1));
-        assert!(boolean(&batch, "owner").value(0));
-        // The permission bitfield stays a verbatim decimal string —
-        // Discord serializes it as a string because it exceeds JSON's
-        // safe-integer range.
+        assert!(!boolean(&batch, "owner").value(0));
+        // LIVE-PASS CORRECTION pinned: the column reads `permissions_new`
+        // (the full bitfield as a decimal string) — the legacy sibling
+        // `permissions` is a NUMBER on this fixture row, and mapping it
+        // as utf8 failed on every real row.
         assert_eq!(utf8(&batch, "permissions").value(0), "2251799813685247");
         // features: a populated list and an EMPTY list (not NULL).
         let features = batch
@@ -179,8 +202,8 @@ mod tests {
         assert_eq!(features.value(0).len(), 2);
         assert_eq!(features.value(1).len(), 0);
         assert!(!features.is_null(1), "an empty list is not NULL");
-        assert_eq!(uint64(&batch, "approximate_member_count").value(0), 42);
-        assert_eq!(uint64(&batch, "approximate_presence_count").value(1), 1);
+        assert_eq!(uint64(&batch, "approximate_member_count").value(0), 43);
+        assert_eq!(uint64(&batch, "approximate_presence_count").value(1), 2);
     }
 
     #[test]
@@ -205,23 +228,34 @@ mod tests {
 
     #[test]
     fn sticker_packs_fixture_converts_with_opaque_stickers_json() {
+        // Public Nitro catalog rows, captured live (stickers truncated to
+        // one element each): every optional field is populated on the
+        // real catalog, so the null arms of the four doc-derived nullable
+        // columns are declared in the yaml, not exercised here.
         let batch = convert_fixture(
             table("sticker_packs"),
             include_str!("fixtures/discord/sticker_packs.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(utf8(&batch, "name").value(0), "Wumpus Beyond");
-        // Present-null description; absent cover/banner ids.
-        assert!(utf8(&batch, "description").is_null(1));
-        assert!(utf8(&batch, "cover_sticker_id").is_null(1));
-        assert!(utf8(&batch, "banner_asset_id").is_null(1));
-        // Sticker objects survive as opaque JSON, including the empty set.
-        let stickers: Value =
-            serde_json::from_str(utf8(&batch, "stickers").value(0)).expect("valid JSON");
-        assert_eq!(stickers.as_array().map(Vec::len), Some(1));
-        let empty: Value =
-            serde_json::from_str(utf8(&batch, "stickers").value(1)).expect("valid JSON");
-        assert_eq!(empty.as_array().map(Vec::len), Some(0));
+        assert_eq!(utf8(&batch, "name").value(0), "Mallow The Rascal");
+        assert_eq!(utf8(&batch, "name").value(1), "Wumpus Beyond");
+        assert!(!utf8(&batch, "description").is_null(1));
+        assert!(!utf8(&batch, "cover_sticker_id").is_null(0));
+        assert!(!utf8(&batch, "banner_asset_id").is_null(0));
+        assert!(!utf8(&batch, "sku_id").is_null(0));
+        // Sticker objects survive as opaque JSON, and the embedded
+        // pack_id stays self-consistent with the row's own id.
+        for row in 0..2 {
+            let stickers: Value =
+                serde_json::from_str(utf8(&batch, "stickers").value(row)).expect("valid JSON");
+            let arr = stickers.as_array().expect("array");
+            assert_eq!(arr.len(), 1);
+            assert_eq!(
+                arr[0]["pack_id"],
+                Value::String(utf8(&batch, "id").value(row).to_string()),
+                "sticker pack_id cross-reference is self-consistent"
+            );
+        }
     }
 
     #[test]
@@ -255,6 +289,54 @@ mod tests {
                 assert_eq!(found, "number");
             }
             other => panic!("expected ConversionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn person_linked_fixtures_stay_redacted() {
+        // guilds is the one person-linked fixture (the authorizing user's
+        // guild MEMBERSHIP list); connections will be too once captured.
+        // Mechanical audit: every string leaf must match the redaction
+        // allowlist — synthetic snowflake prefix, placeholder names, the
+        // two synthetic asset hashes, ALL_CAPS feature enums (public
+        // platform constants), digit-only permission bitfields. A real
+        // guild name or id has no way to satisfy any arm. sticker_packs
+        // is deliberately NOT here: it is a public catalog kept verbatim.
+        fn audit(name: &str, value: &Value) {
+            match value {
+                Value::String(s) => {
+                    let allowed = s.starts_with("10000000000000000")
+                        || s.starts_with("Redacted ")
+                        || s == "0123456789abcdef0123456789abcdef"
+                        || s == "fedcba9876543210fedcba9876543210"
+                        || s.bytes().all(|b| b.is_ascii_digit())
+                        || (!s.is_empty()
+                            && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+                        // Public platform enums a connection's `type` takes.
+                        || ["github", "steam"].contains(&s.as_str());
+                    assert!(
+                        allowed,
+                        "{name}: string {s:?} is not on the redaction allowlist"
+                    );
+                }
+                Value::Array(items) => items.iter().for_each(|v| audit(name, v)),
+                Value::Object(map) => map.values().for_each(|v| audit(name, v)),
+                _ => {}
+            }
+        }
+        for (name, text) in [
+            ("guilds", include_str!("fixtures/discord/guilds.json")),
+            (
+                "guilds_type_mismatch",
+                include_str!("fixtures/discord/guilds_type_mismatch.json"),
+            ),
+            (
+                "connections",
+                include_str!("fixtures/discord/connections.json"),
+            ),
+        ] {
+            let root: Value = serde_json::from_str(text).expect("fixture parses");
+            audit(name, &root);
         }
     }
 

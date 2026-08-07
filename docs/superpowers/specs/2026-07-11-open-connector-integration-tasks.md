@@ -305,28 +305,39 @@ event carrying the scan identity and error.
       tests (`cargo test -p skardi --lib sources::providers::open_connector`,
       post-merge with 5.3), 17 pack-scoped (`… packs::feishu`), 842 full
       library suite.
-- [ ] 5.5 Discord pack (OAuth user-identity surface, raw passthrough rows, no
-      pagination envelope): guilds, connections, sticker_packs. **In progress —
-      live verification pending.** The provider is @me-only (its own get_user
-      rejects any other id), so channels/messages/members are out of scope by
-      provider surface, not deferral; entitlements is deferred because the
-      upstream executor exposes no pagination inputs (first-page-only). Engine
-      extensions: `PaginationStrategy::Keyset` (cursor = a field of the previous
-      page's LAST ROW, `after`-style; ONLY an empty page terminates — short
-      pages continue, so a silent page-size clamp of the kind the Feishu live
-      pass observed cannot read as completion; missing or non-string cursor on
-      a non-empty page is typed drift, not a quiet stop; a repeated cursor
-      fails with identity only, never quoting the row value) and an explicit
-      `single_page` YAML spelling. Contract reconciled
-      against a live gateway on 2026-08-07 (action IDs, executor passthrough
-      confirmed in source, strict inputs validated to the credential wall via
-      the 403-vs-400 probe, three output schemas captured and fingerprint-
-      pinned). Verification so far: 306 tests (`cargo test -p skardi --lib
-      sources::providers::open_connector`; 18 new — 8 keyset engine, 1 loader,
-      9 pack-scoped `… packs::discord`), 863 full library suite. Remaining
-      before tick: live end-to-end pass against a real Discord account
-      (columns are DRAFT until real rows settle them), fixture re-derivation
-      from redacted live captures, upstream issue for entitlements pagination.
+- [x] 5.5 Discord pack (OAuth user-identity surface, raw passthrough rows, no
+      pagination envelope): guilds, connections, sticker_packs. The provider is
+      @me-only (its own get_user rejects any other id), so channels/messages/
+      members are out of scope by provider surface, not deferral; entitlements
+      is deferred because the upstream executor exposes no pagination inputs
+      (first-page-only). Engine extensions: `PaginationStrategy::Keyset`
+      (cursor = a field of the previous page's LAST ROW, `after`-style; ONLY an
+      empty page terminates — short pages continue, so a silent page-size clamp
+      of the kind the Feishu live pass observed cannot read as completion;
+      missing or non-string cursor on a non-empty page is typed drift, not a
+      quiet stop; a repeated cursor fails with identity only, never quoting the
+      row value) and an explicit `single_page` YAML spelling. Live contract
+      reconciliation 2026-08-07: action IDs + executor passthrough confirmed in
+      source, strict inputs validated to the credential wall via the 403-vs-400
+      probe, three output schemas captured and fingerprint-pinned, then all
+      three tables verified against a REAL account end to end through
+      skardi-server (registration through LIVE discovery; guilds 6 rows and
+      sticker_packs 14 rows with every mapped column non-NULL on real rows;
+      connections a clean zero-row scan — columns stay doc-derived until the
+      account links one). The real keyset walk (limit 2) covered 3 full pages
+      plus the empty terminator, no duplicate/boundary drop, ascending-
+      snowflake ordering confirmed. The live pass caught one contract defect no
+      mock could: the gateway calls the UNVERSIONED discord.com/api, where
+      `permissions` is a truncated NUMBER and the full bitfield string lives in
+      `permissions_new` — the column now maps `permissions_new`, and the
+      version-coupled risk (a future /api/v10 pin removes that key) is
+      documented in the pack doc with an upstream ask to pin the version.
+      guilds/sticker_packs fixtures are redacted live captures with a
+      mechanical allowlist tripwire test on every person-linked fixture.
+      Operational: Discord 429s rapid probes; the gateway surfaces them loudly.
+      Verification: 307 tests (`cargo test -p skardi --lib
+      sources::providers::open_connector`; 19 new — 8 keyset engine, 1 loader,
+      10 pack-scoped `… packs::discord`), 864 full library suite.
 - [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,

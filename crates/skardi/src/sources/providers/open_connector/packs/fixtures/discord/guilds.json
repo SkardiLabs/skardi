@@ -3,23 +3,29 @@
     {
       "id": "100000000000000001",
       "name": "Redacted Guild One",
-      "icon": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-      "banner": null,
-      "owner": true,
-      "permissions": "2251799813685247",
-      "features": ["COMMUNITY", "NEWS"],
-      "approximate_member_count": 42,
-      "approximate_presence_count": 7
+      "icon": "0123456789abcdef0123456789abcdef",
+      "banner": "fedcba9876543210fedcba9876543210",
+      "owner": false,
+      "permissions": 66560,
+      "permissions_new": "2251799813685247",
+      "features": [
+        "INVITE_SPLASH",
+        "CREATOR_MONETIZABLE"
+      ],
+      "approximate_member_count": 43,
+      "approximate_presence_count": 1
     },
     {
       "id": "100000000000000002",
       "name": "Redacted Guild Two",
-      "icon": null,
+      "icon": "0123456789abcdef0123456789abcdef",
+      "banner": null,
       "owner": false,
-      "permissions": "104189505",
+      "permissions": 66560,
+      "permissions_new": "66560",
       "features": [],
-      "approximate_member_count": 3,
-      "approximate_presence_count": 1
+      "approximate_member_count": 44,
+      "approximate_presence_count": 2
     }
   ]
 }

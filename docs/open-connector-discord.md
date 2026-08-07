@@ -4,13 +4,16 @@ The current OAuth user's guilds, external-account connections, and the
 public Nitro sticker-pack catalog, as SQL tables over Open Connector's
 `discord` provider.
 
-> **Status: DRAFT pending live verification.** The wire contract below
-> is reconciled against a live gateway's registered schemas and executor
-> source (2026-08-07), and inputs were validated without credentials via
-> the 403-vs-400 probe — but no table has scanned real workspace rows
-> yet. Column sets follow Discord's documented resources and may still
-> move when the live pass runs (loose item schemas leave real rows as
-> the only column truth).
+> **Status: live-verified 2026-08-07** against a real Discord account
+> through skardi-server: registration through LIVE discovery passed the
+> fingerprint gate; `guilds` (6 rows) and `sticker_packs` (14 rows)
+> scanned end to end with every mapped column non-NULL on real rows; the
+> real keyset walk (`limit: 2`) covered 3 full pages plus the empty
+> terminator with no duplicate and no boundary drop. `connections`
+> scanned live as a clean zero-row table (the account has no linked
+> accounts), so its columns remain doc-derived until a row exists. The
+> live pass caught one contract defect no mock could: `permissions` is a
+> NUMBER on the real wire (see below).
 
 ## What this provider can see
 
@@ -73,13 +76,28 @@ Design notes:
 - **`connection_type`, not `type`**: the wire key collides with a SQL
   keyword and would force quoting into every query. The wire key is
   unchanged (`path: type`).
-- **`permissions` stays a decimal string** — Discord serializes the
-  permission bitfield as a string because it exceeds JSON's
-  safe-integer range; decoding bits is query-side work.
+- **`permissions` maps the wire key `permissions_new`** (live-pass
+  correction). The gateway calls the *unversioned* `discord.com/api`,
+  which Discord serves as its legacy default version: there
+  `permissions` is a truncated **number** and `permissions_new` is the
+  full bitfield as a decimal string (it exceeds JSON's safe-integer
+  range). The column keeps the natural name and maps the authoritative
+  string; the legacy number is deliberately unmapped; decoding bits is
+  query-side work. **Version-coupled risk**: if the gateway ever pins
+  `/api/v10` — where `permissions` *is* the string and
+  `permissions_new` does not exist — this column goes always-NULL, and
+  the loose item schemas mean no fingerprint pin can catch the move.
+  Upstream issue pending (the gateway should pin an API version); this
+  doc links it once filed.
+- **Rate limits are tight**: rapid successive calls to
+  `/users/@me/guilds` return HTTP 429, which the gateway surfaces as a
+  loud scan failure (not a silent stop). At the pack's 200-row pages a
+  scan makes one request per 200 guilds and stays comfortably clear.
 - **`entitlements` is deferred, not shipped incomplete**: Discord's
   entitlements API paginates (`before`/`after`/`limit`), but the
   gateway's executor exposes only `exclude_ended`/`exclude_deleted` —
-  first-page-only through no fault of a pack. Tracked upstream; the
+  first-page-only through no fault of a pack. Upstream issue pending
+  (linked here once filed); the
   table joins when the executor grows the pagination inputs.
 - No table declares `error_path`: the provider's executors consume
   Discord's error responses themselves and return the gateway's
