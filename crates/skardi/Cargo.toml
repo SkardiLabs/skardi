@@ -110,16 +110,15 @@ mongodb = "3.1"
 mysql_async = "0.36"
 percent-encoding = "2.3"
 # rss source connector (optional, behind the `rss` feature): parses OPML
-# subscription lists — the only hand-rolled XML in the provider besides
-# `feed-rs` (used for feed bodies themselves), whose own XML backend is also
-# quick-xml. `Cargo.lock` carries three quick-xml versions regardless of what
-# this line pins: `reqsign` requires exactly 0.37, `opendal` requires exactly
-# 0.38, and `feed-rs` 2.4 requires 0.41 (with its `encoding` feature) — three
-# mutually-incompatible minor versions from three deps this crate does not
-# control. This pin only decides which of those three our own direct usage
-# rides on; it cannot reduce the count to fewer than three either way.
-# Pinned to 0.41, `feed-rs`'s version, so this code exercises the same
-# quick-xml our own feed bodies already depend on.
+# subscription lists — this phase's only quick-xml user, and it could ride any
+# version. `Cargo.lock` today carries two quick-xml versions from deps this
+# crate does not control — `reqsign` requires exactly 0.37 and
+# `opendal`/`object_store` require exactly 0.38 — plus 0.41, pulled solely by
+# this line's own direct dependency. We pin 0.41 in anticipation of `feed-rs`
+# (added later in this stack, for feed bodies themselves), whose own XML
+# backend is also quick-xml and will want 0.41. Pinning now means feed-rs's
+# arrival adds no fourth quick-xml version: our own direct usage already rides
+# the version it will pull.
 quick-xml = { version = "0.41", optional = true }
 redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster"] }
 # documents source connector (optional, behind the `documents` feature).
