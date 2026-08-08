@@ -69,6 +69,7 @@ Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surf
 - Enable federated `JOIN`s between graph results and existing Skardi sources.
 - Keep provider credentials out of Skardi process memory/logs/YAML.
 - Prove the design against a real Neo4j or Kuzu instance in phase-4 live verification.
+- Provide a `graph_schema(connection)` introspection UDTF so agents can discover labels, relationship types, and properties before generating Cypher.
 
 ## Non-goals
 
@@ -247,6 +248,57 @@ Errors carry identity:
 - Integration tests against a testcontainer Neo4j and an on-disk Kuzu database for real round-trips.
 - Live verification phase: run a real Cypher workload end-to-end through `skardi-server`, assert rows and schema, verify credentials never appear in logs.
 
+## Agent and LLM interaction
+
+The primary consumer of Skardi is an agent runtime backed by a large language model. The design must therefore be explicit about how an agent discovers graph content, generates safe Cypher, and interprets results.
+
+### The expected workflow
+
+1. **Discovery** — the agent asks Skardi what graph sources exist and what they contain.
+2. **Generation** — the agent asks its LLM to translate the user's natural-language intent into Cypher.
+3. **Execution** — the agent sends the Cypher to Skardi through `cypher_query` or a YAML-bound catalog view.
+4. **Consumption** — Skardi returns JSON rows; the agent either passes them back to the LLM for summarization or answers the user directly.
+
+### What the agent needs from Skardi
+
+An agent cannot write Cypher blindly. It needs machine-readable answers to:
+
+- *What graph backends are configured?* → the existing data-source metadata endpoint (`GET /data_source`) already lists registered sources; `type: graph` sources should appear with their declared views.
+- *What labels, relationship types, and properties exist?* → a lightweight **graph introspection surface** is required. Two options:
+  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type with a sample of properties;
+  - a YAML view author who declares `nodes` / `edges` metadata tables alongside the Cypher views.
+  The design chooses the first option as an engine-provided helper in milestone 1, because requiring every YAML view to also declare metadata duplicates effort.
+- *What shape does a `cypher_query` result have?* → the UDTF returns an Arrow schema, and Skardi's JSON response preserves that schema; agents can rely on stable `STRUCT` shapes for nodes and relationships.
+- *Is this query allowed?* → read-only is enforced engine-side, so an agent-generated mutating Cypher fails before touching the backend.
+
+### Agent-friendly error messages
+
+Errors from `cypher_query` must be actionable for an LLM:
+
+- `GraphError::MutationRejected { query }` should state the blocked keyword so the LLM can rewrite the query read-only.
+- `GraphError::Backend { source, action, message }` should quote the backend's error code and a bounded message snippet, so the LLM can adapt Cypher syntax to the backend dialect.
+- No raw node/relationship values in errors — only kinds and identifiers — so sensitive graph properties never leak into prompts or logs.
+
+### Why read-only matters for agents
+
+Agents generate SQL and Cypher probabilistically. A write path would require:
+
+- idempotency guarantees (retries of agent-generated mutations),
+- human-in-the-loop confirmation,
+- a stricter audit trail.
+
+Deferring writes to milestone 4+ lets milestone 1 land a safe, useful read surface first. The agent can still ask the LLM to produce `CREATE`/`DELETE` Cypher; Skardi will reject it with a clear error, and the agent can fall back to explaining that the operation is not yet supported.
+
+### Natural language to Cypher is outside Skardi's scope
+
+Skardi does not ship an LLM, prompt template, or RAG chain for generating Cypher. The agent runtime owns that. Skardi's responsibility is to provide:
+
+- the metadata the LLM needs to write correct Cypher (`graph_schema`, view docs, stable schemas);
+- a safe execution surface (`cypher_query`, read-only guard);
+- results in a form the LLM can consume (JSON rows with stable types).
+
+This separation keeps the engine deterministic and the prompt/LLM layer replaceable.
+
 ## Milestones
 
 ### Milestone 1 — Neo4j read-only UDTF
@@ -255,6 +307,7 @@ Errors carry identity:
 - `neo4rs`-based Neo4j driver.
 - `GraphValue` → Arrow conversion for scalars, nodes, relationships, paths, lists, maps.
 - `cypher_query` UDTF with execution-time schema probe.
+- `graph_schema` introspection UDTF (labels, relationship types, property samples).
 - Read-only mutation guard.
 - Basic error taxonomy.
 - Integration tests against testcontainer Neo4j.
