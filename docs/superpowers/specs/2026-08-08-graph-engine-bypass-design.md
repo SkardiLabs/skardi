@@ -110,6 +110,7 @@ Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surf
   ', '{"userId": "u-123"}');
   ```
 - **Catalog interface:** `type: graph` sources register stable views from YAML as catalog tables, e.g. `kg.main.user_posts`.
+- **Capability provider:** `cypher_query` is implemented as a DataFusion `TableFunctionImpl` in `crates/skardi/src/sources/providers/graph/udtf.rs`. Skardi does not parse or plan Cypher itself; the UDTF delegates execution to a backend-agnostic `GraphClient` trait (`crates/skardi/src/sources/providers/graph/client.rs`), whose concrete drivers (`Neo4jClient`, `KuzuClient`) speak Bolt or the Kuzu API. DataFusion owns UDTF registration, SQL planning, and result streaming; the graph engine owns storage, indexing, and Cypher execution.
 
 ### Backend abstraction
 
@@ -243,6 +244,8 @@ flowchart LR
     Rows --> DF
     DF --> Join["JOIN with other Skardi sources"]
 ```
+
+> **Component ownership:** The `cypher_query` UDTF and `kg.main.user_posts` catalog views are Skardi surfaces (left side); both route Cypher to the same `GraphClient` abstraction and out to Neo4j or Kuzu. DataFusion never sees graph storage directly — it only sees the Arrow rows coming back.
 
 ## Detailed Design
 
