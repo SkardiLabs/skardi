@@ -171,6 +171,11 @@ fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
                 )
             })
         })?,
+        // Sub-millisecond precision is TRUNCATED (floor division), by
+        // design: the contract is epoch milliseconds, and micro/nano
+        // inputs give up their remainder. Asymmetric with the Second arm
+        // above on purpose — narrowing can overflow and must be checked,
+        // widening cannot.
         ScalarValue::TimestampMicrosecond(v, _) => {
             v.map_or(Value::Null, |us| Value::from(us.div_euclid(1000)))
         }

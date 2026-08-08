@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Int32Builder, ListBuilder, StringArray, StringBuilder, StringViewArray,
-    StructBuilder,
+    Array, ArrayRef, Int32Builder, LargeStringArray, ListBuilder, StringArray, StringBuilder,
+    StringViewArray, StructBuilder,
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::Result as DfResult;
@@ -384,10 +384,12 @@ fn read_text_column<'a>(
     name: &str,
 ) -> DfResult<Vec<Option<&'a str>>> {
     match arg {
-        // Utf8View included alongside the classic layouts: DataFusion 52
-        // carries computed string expressions as view arrays/scalars (the
-        // same reality open_connector/filters.rs handles), and a text
-        // column fed through a CAST or concat must not fail the split.
+        // Utf8View and LargeUtf8 included alongside the classic layout:
+        // DataFusion 52 carries computed string expressions as view
+        // arrays/scalars (the same reality open_connector/filters.rs
+        // handles), LargeUtf8 columns arrive from large-string sources,
+        // and the scalar arm below already accepts all three spellings —
+        // a text COLUMN must not be stricter than a text LITERAL.
         ColumnarValue::Array(arr) => {
             if let Some(view_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
                 return Ok((0..view_arr.len())
@@ -396,6 +398,17 @@ fn read_text_column<'a>(
                             None
                         } else {
                             Some(view_arr.value(i))
+                        }
+                    })
+                    .collect());
+            }
+            if let Some(large_arr) = arr.as_any().downcast_ref::<LargeStringArray>() {
+                return Ok((0..large_arr.len())
+                    .map(|i| {
+                        if large_arr.is_null(i) {
+                            None
+                        } else {
+                            Some(large_arr.value(i))
                         }
                     })
                     .collect());
@@ -620,6 +633,29 @@ mod tests {
         assert!(list_at(list, 0).len() >= 3); // 250 chars / 100 → ≥3
         assert_eq!(list_at(list, 1).len(), 1); // 50 chars fits in one
         assert!(list.is_null(2)); // null in → null out
+    }
+
+    #[test]
+    fn large_utf8_text_column_chunks_like_utf8() {
+        // A text COLUMN must not be stricter than a text LITERAL: the
+        // scalar arm accepts LargeUtf8, so the array arm must too
+        // (large-string sources hand DataFusion LargeUtf8 columns).
+        let texts = LargeStringArray::from(vec![Some("a".repeat(250)), None]);
+        let result = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(texts)),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap();
+        let arr = match result {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list_at(list, 0).len() >= 3);
+        assert!(list.is_null(1), "null in → null out");
     }
 
     #[test]
