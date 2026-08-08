@@ -56,6 +56,43 @@ Because Cypher can return dynamic structures (`RETURN n, r, p`), the UDTF cannot
 
 Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surface, with a small per-backend driver trait. Kuzu's static schema is an upgrade the design should not squander: its `graph_schema` output is exact (read from the catalog, not sampled), and a future optimization can convert Kuzu properties as typed columns instead of JSON text — the uniform JSON-text spelling is the floor both backends meet, not a ceiling.
 
+### Apache AGE (candidate third backend)
+
+[Apache AGE](https://age.apache.org/) is a PostgreSQL extension that
+executes openCypher *inside* Postgres: queries travel over the ordinary
+Postgres wire protocol as
+`SELECT * FROM cypher('graph_name', $$ MATCH ... $$) AS (a agtype, …)`,
+and results come back as `agtype` values (a JSON superset whose node/
+edge/path serializations map directly onto `GraphValue`).
+
+Why it matters here: **GraphRAG pipelines commonly land their graph in
+Postgres.** With AGE as a backend, that data becomes Cypher-queryable
+through the same `cypher_query` surface with no sync pipeline into
+Neo4j/Kuzu — and the graph lives next to the text/embedding tables
+Skardi already federates with.
+
+How it fits the abstraction (deliberately unchanged):
+
+- A `GraphClient` implementation over `tokio-postgres` instead of Bolt —
+  no new SQL surface, no new value model.
+- Read-only enforcement maps cleanly onto the backend-enforced model:
+  the adapter runs every call inside a `READ ONLY` Postgres transaction,
+  with a read-only role as the deployment recommendation — the same
+  two-layer story as Neo4j's read transactions.
+- The declared-columns mode aligns with AGE's own requirement that the
+  `cypher()` call declare its result arity (`AS (col agtype, …)`).
+  The JSON-`record` fallback needs the adapter to know the arity too —
+  either by wrapping the `RETURN` into a single map or by requiring
+  declared columns for AGE; which spelling wins is an open question for
+  the AGE milestone, not for this design.
+- `graph_schema` reads AGE's catalog tables (`ag_catalog.ag_label` and
+  friends) — names and types only, as everywhere else.
+
+AGE speaks an openCypher *subset* (as does Kuzu), which the
+backend-divergence risk already covers. It stays a **candidate**: not in
+milestone 1 or 2, promoted to a concrete milestone if
+GraphRAG-in-Postgres proves to be the dominant deployment.
+
 ### Existing patterns in Skardi
 
 - `open_connector_query` and `open_connector_scan` already prove the UDTF-bypass pattern: a SQL function wraps an external HTTP action and returns rows.
@@ -423,6 +460,16 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 - Live schema validation at registration.
 - Docs: per-backend guides, examples, and spec entry.
 
+### Milestone 3+ — Apache AGE backend (candidate)
+
+- `GraphClient` over `tokio-postgres` calling AGE's `cypher()` function;
+  `READ ONLY` transactions as the backend-enforced read guarantee.
+- Settle the `record`-fallback arity question (wrap `RETURN` in a map vs
+  require declared columns for AGE).
+- `graph_schema` from `ag_catalog`.
+- Promoted to a numbered milestone if GraphRAG-in-Postgres is the
+  dominant deployment; otherwise stays behind Neo4j/Kuzu.
+
 ### Milestone 4+ — Write path (future)
 
 - Design mutation guard, idempotency keys, and transaction semantics.
@@ -433,7 +480,7 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 1. **Declared-type drift on dynamically-typed properties.** Neo4j property types vary per node: a view declaring `n.value AS Int64` meets a `string` value mid-scan and fails with a typed error (column, row, expected, found-kind). Conversion is page-atomic, but batches already emitted stay emitted — the same mid-scan failure trade-off the Open Connector adapters accept. Views over heterogeneous properties should declare `Utf8` (JSON text) instead of a scalar type, or normalize with Cypher `toInteger()`/`toString()` before `RETURN`.
 2. **Cypher injection.** Parameter binding prevents interpolation attacks. The keyword guard is string-based and bypassable by construction — which is why it is *not* the security boundary: the backend's read-transaction mode (Neo4j) / read-only database open (Kuzu) is what guarantees no write executes. Open question: confirm the pinned `neo4rs` version exposes transaction access mode; if not, wiring or upstreaming it is a milestone-1 prerequisite, with a read-only database user as the documented interim requirement.
 3. **Path representation.** The parallel-lists struct (`nodes` + `relationships`) is lossless and type-homogeneous but positional — consumers must know relationship *i* joins node *i* to node *i+1*. Row-per-hop consumers flatten with Cypher `UNWIND` in the query or view instead of asking Skardi to restructure paths.
-4. **Backend divergence.** Kuzu Cypher is a subset. The design must avoid features that work on Neo4j but fail on Kuzu unless the view/backend is explicit.
+4. **Backend divergence.** Kuzu Cypher — and Apache AGE's openCypher, if that candidate backend lands — are subsets of Neo4j's dialect. The design must avoid features that work on Neo4j but fail on the others unless the view/backend is explicit; backend errors surface the dialect gap through `GraphError::Backend { code, … }` so an agent can adapt.
 
 ## References
 
@@ -441,3 +488,4 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 - [DataFusion](https://arrow.apache.org/datafusion/) — the SQL engine Skardi builds on.
 - [Neo4j Cypher Manual](https://neo4j.com/docs/cypher-manual/current/)
 - [Kuzu Documentation](https://docs.kuzudb.com/)
+- [Apache AGE](https://age.apache.org/) — openCypher inside PostgreSQL; the candidate backend for GraphRAG data already living in Postgres.
