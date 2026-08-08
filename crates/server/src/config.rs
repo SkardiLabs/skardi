@@ -30,6 +30,7 @@ use thiserror::Error;
 use crate::OptimizerRegistry;
 use crate::remote_storage::{RemoteStorage, S3Storage};
 use crate::semantics::{SemanticsRegistry, resolve_semantics_source};
+pub use skardi::config::{ConfigError, DataSource, validator_config_from_sources};
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -124,182 +125,14 @@ pub struct ServerConfig {
     pub args: CliArgs,
 }
 
-/// Data source configuration for context loading
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DataSource {
-    /// Unique name for the data source (used as table name in SQL)
-    pub name: String,
-    /// Type of data source (CSV, Parquet, etc.)
-    #[serde(rename = "type")]
-    pub source_type: DataSourceType,
-    /// File path to the data source (for file-based sources)
-    #[serde(default)]
-    pub path: PathBuf,
-    /// Connection string for database sources (e.g., PostgreSQL)
-    pub connection_string: Option<String>,
-    /// Optional explicit schema (field name -> type mapping)
-    pub schema: Option<HashMap<String, String>>,
-    /// Optional format-specific options
-    pub options: Option<HashMap<String, String>>,
-    /// Registration hierarchy level for database sources (omitted → table)
-    #[serde(default)]
-    pub hierarchy_level: HierarchyLevel,
-    /// Access mode: read_only (default) or read_write
-    #[serde(default)]
-    pub access_mode: AccessMode,
-    /// If true, load the entire table into memory at startup (only for Csv, Parquet, Iceberg)
-    #[serde(default)]
-    pub enable_cache: bool,
-    /// Optional natural-language description of the table this data source exposes.
-    /// Used as a fallback table-level description on the catalog endpoint when no
-    /// matching entry is present in a loaded `kind: semantics` file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Typed Open Connector gateway configuration. Required when `type` is
-    /// `open_connector`, rejected for every other type: nested bindings and
-    /// resources do not fit the flat `options` map.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_connector: Option<OpenConnectorConfig>,
-}
+// `DataSource` and the `kind: context` envelope now live in `skardi::config`
+// (re-exported above), so this crate and the control plane share one model and
+// one parser. See `load_context_config` / `extract_pipeline_sql`, which parse
+// through `skardi::config::parse_context` / `parse_pipeline`.
 
-/// Top-level envelope for context YAML files:
-/// `{ kind: context, metadata: {...}, spec: { data_sources: [...] } }`.
-///
-/// `kind` is an `Option` so the loader can distinguish "missing kind" from
-/// "wrong kind" and produce a targeted error for each. `metadata` is
-/// required — making it mandatory means a missing or typo'd key (e.g.
-/// `metdata:`) surfaces at parse time rather than being silently dropped.
-/// The value is kept as an opaque `serde_yaml::Value` because nothing at
-/// runtime reads inside it.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ContextFile {
-    #[serde(default)]
-    kind: Option<String>,
-    metadata: serde_yaml::Value,
-    spec: ContextSpec,
-}
-
-/// Context configuration file structure (`spec:` block).
-#[derive(Debug, Deserialize)]
-struct ContextSpec {
-    data_sources: Vec<DataSource>,
-}
-
-/// Configuration-related errors
-#[derive(Error, Debug)]
-pub enum ConfigError {
-    #[error("Pipeline file not found: {path}")]
-    PipelineFileNotFound { path: PathBuf },
-
-    #[error("Pipeline directory not found: {path}")]
-    PipelineDirectoryNotFound { path: PathBuf },
-
-    #[error("No pipeline files found in directory: {path}")]
-    NoPipelineFilesInDirectory { path: PathBuf },
-
-    #[error("Context file not found: {path}")]
-    ContextFileNotFound { path: PathBuf },
-
-    #[error("Invalid YAML in context file: {error}")]
-    InvalidContextYaml { error: String },
-
-    #[error("Data source file not found: {name} -> {path}")]
-    DataSourceFileNotFound { name: String, path: PathBuf },
-
-    #[error("Duplicate data source name: {name}")]
-    DuplicateDataSourceName { name: String },
-
-    #[error("Data source registration failed: {name} - {error}")]
-    DataSourceRegistrationFailed { name: String, error: String },
-
-    #[error("Invalid schema type: {field} -> {type_name}")]
-    InvalidSchemaType { field: String, type_name: String },
-
-    #[error("Missing connection string for data source: {name}")]
-    MissingConnectionString { name: String },
-
-    #[error("PostgreSQL connection failed: {name} - {error}")]
-    PostgresConnectionFailed { name: String, error: String },
-
-    #[error("MySQL connection failed: {name} - {error}")]
-    MySQLConnectionFailed { name: String, error: String },
-
-    #[error("SQLite connection failed: {name} - {error}")]
-    SQLiteConnectionFailed { name: String, error: String },
-
-    #[error("SeekDB connection failed: {name} - {error}")]
-    SeekDbConnectionFailed { name: String, error: String },
-
-    #[error("S3 path must start with 's3://' prefix: {path}")]
-    InvalidS3Path { path: String },
-
-    #[error("Missing required AWS configuration for S3 data source: {name} - missing {field}")]
-    MissingAwsConfig { name: String, field: String },
-
-    #[error("S3 object store registration failed: {name} - {error}")]
-    S3ObjectStoreRegistrationFailed { name: String, error: String },
-
-    #[error(
-        "Data source '{name}' has access_mode 'read_write' but type '{source_type:?}' does not support write operations. Only 'postgres', 'mysql', 'sqlite', 'mongo', 'redis', 'seekdb', and 'dynamodb' sources support read_write mode."
-    )]
-    UnsupportedWriteMode {
-        name: String,
-        source_type: DataSourceType,
-    },
-
-    #[error(
-        "DDL operation not allowed: {operation} on data source '{table_name}'. DDL operations (CREATE, DROP, ALTER, etc.) are not permitted."
-    )]
-    DdlOperationNotAllowed {
-        operation: String,
-        table_name: String,
-    },
-
-    #[error(
-        "Write operation not allowed on data source '{table_name}'. The data source is configured with 'read_only' access mode. Set access_mode to 'read_write' to enable write operations."
-    )]
-    WriteOperationNotAllowed { table_name: String },
-
-    #[error(
-        "Data source '{name}' uses hierarchy_level 'catalog' but also specifies the '{option}' option. In catalog mode use 'allowed_schemas' to filter schemas; 'table' and 'schema' are not allowed."
-    )]
-    CatalogModeConflictingOptions { name: String, option: String },
-
-    #[error(
-        "Data source '{name}' has an empty 'allowed_schemas' option. Either omit it to load all schemas, or provide a non-empty comma-separated list such as \"public,analytics\"."
-    )]
-    EmptyAllowedSchemas { name: String },
-
-    #[error(
-        "Data source '{name}' has an empty 'allowed_tables' option. Either omit it to load all DynamoDB tables, or provide a non-empty comma-separated list such as \"products,orders\"."
-    )]
-    EmptyAllowedTables { name: String },
-
-    #[error(
-        "Data source '{name}' has type 'open_connector' but no 'open_connector' config block. The typed gateway configuration (runtime_token_env, bindings, …) is required."
-    )]
-    MissingOpenConnectorConfig { name: String },
-
-    #[error(
-        "Data source '{name}' sets an 'open_connector' config block but its type is '{source_type}'. The 'open_connector' field is only valid for type 'open_connector'."
-    )]
-    UnexpectedOpenConnectorConfig {
-        name: String,
-        source_type: DataSourceType,
-    },
-
-    #[error("Data source '{name}' has an invalid 'open_connector' config: {reason}")]
-    InvalidOpenConnectorConfig { name: String, reason: String },
-
-    #[error(
-        "Data source '{name}' has type 'open_connector' but does not set hierarchy_level to 'catalog'. Open Connector gateways are exposed as DataFusion catalogs; add `hierarchy_level: catalog`."
-    )]
-    OpenConnectorHierarchyRequired { name: String },
-
-    #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
-    NonUtf8Path { name: String, path: PathBuf },
-}
+// `ConfigError` moved to `skardi::config` (re-exported above) so the shared
+// parse/structural validation and this crate's registration paths raise the same
+// error type.
 
 // ============================================================================
 // FUNCTION SIGNATURES - Implementation to be added later
@@ -595,34 +428,18 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     })
 }
 
-/// Extract SQL query from pipeline file for early validation
-/// This reads just the query field without full pipeline loading
+/// Extract SQL query from pipeline file for early validation.
+/// Reads the file, then parses just `metadata.name` + `spec.query` through the
+/// shared `skardi::config::parse_pipeline` so the server and the control plane
+/// agree on the pipeline envelope.
 fn extract_pipeline_sql(path: &Path) -> Result<(String, String)> {
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    struct PipelineMetadata {
-        name: String,
-    }
-
-    #[derive(Deserialize)]
-    struct MinimalSpec {
-        query: String,
-    }
-
-    #[derive(Deserialize)]
-    struct MinimalPipeline {
-        metadata: PipelineMetadata,
-        spec: MinimalSpec,
-    }
-
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read pipeline file: {:?}", path))?;
 
-    let pipeline: MinimalPipeline = serde_yaml::from_str(&content)
+    let pipeline = skardi::config::parse_pipeline(&content)
         .with_context(|| format!("Failed to parse pipeline YAML: {:?}", path))?;
 
-    Ok((pipeline.metadata.name, pipeline.spec.query))
+    Ok((pipeline.name, pipeline.sql))
 }
 
 /// Load pipeline configuration from YAML file
@@ -725,239 +542,45 @@ fn load_context_config(path: &Path) -> Result<Vec<DataSource>> {
         .into());
     }
 
-    // Read and parse YAML
+    // Read and parse YAML. The `kind: context` envelope parse is shared with the
+    // control plane via `skardi::config::parse_context` (strict kind check: a
+    // misfiled pipeline/job is rejected rather than silently loaded as an empty
+    // context).
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read context file: {:?}", path))?;
 
-    let context_file: ContextFile =
-        serde_yaml::from_str(&content).map_err(|e| ConfigError::InvalidContextYaml {
-            error: e.to_string(),
-        })?;
-
-    // The envelope is uniform with pipelines/jobs/aliases: `kind: context`,
-    // then `metadata:` and `spec:`. The kind check is strict — unknown or
-    // missing values are rejected so a misfiled pipeline/job does not get
-    // silently partially-loaded as a context.
-    match context_file.kind.as_deref() {
-        Some("context") => {}
-        Some(other) => {
-            return Err(ConfigError::InvalidContextYaml {
-                error: format!("Expected `kind: context`, got `kind: {other}`"),
-            }
-            .into());
-        }
-        None => {
-            return Err(ConfigError::InvalidContextYaml {
-                error: "Missing `kind: context` at the root of the context file".to_string(),
-            }
-            .into());
-        }
-    }
+    let data_sources = skardi::config::parse_context(&content)?;
 
     // Validate data sources
-    validate_data_sources(&context_file.spec.data_sources)?;
+    validate_data_sources(&data_sources)?;
 
-    tracing::info!(
-        "Loaded {} data sources from context",
-        context_file.spec.data_sources.len()
-    );
+    tracing::info!("Loaded {} data sources from context", data_sources.len());
 
-    Ok(context_file.spec.data_sources)
+    Ok(data_sources)
 }
 
-/// Data source types that support catalog (whole-database) registration mode.
-const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
-    DataSourceType::Postgres,
-    DataSourceType::Mysql,
-    DataSourceType::Sqlite,
-    DataSourceType::Seekdb,
-    DataSourceType::Dynamodb,
-    DataSourceType::Clickhouse,
-    // OpenConnector is catalog-only; its tables come from typed bindings, so
-    // the same catalog-mode guards (no per-table `options`) must apply.
-    DataSourceType::OpenConnector,
-];
-
-/// Data source types that support read_write access mode
-const WRITABLE_SOURCE_TYPES: &[DataSourceType] = &[
-    DataSourceType::Postgres,
-    DataSourceType::Mysql,
-    DataSourceType::Sqlite,
-    DataSourceType::Mongo,
-    DataSourceType::Redis,
-    DataSourceType::Seekdb,
-    DataSourceType::Dynamodb,
-];
-
-/// Validate data source configurations
+/// Validate data source configurations.
+///
+/// The credential-free structural checks — unique names, access-mode/type
+/// compatibility, Open Connector config, catalog-mode option conflicts, and a
+/// connection string for database sources — are shared with the control plane in
+/// [`skardi::config::validate_source_decls`]. This function adds the one check
+/// that needs this crate's remote-storage layer: S3 credential configuration for
+/// remote file-backed sources.
 fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
     tracing::debug!("Validating {} data sources", data_sources.len());
 
-    // Check for duplicate names
-    let mut names = std::collections::HashSet::new();
-    for source in data_sources {
-        if !names.insert(&source.name) {
-            return Err(ConfigError::DuplicateDataSourceName {
-                name: source.name.clone(),
-            }
-            .into());
-        }
-    }
+    skardi::config::validate_source_decls(data_sources)?;
 
-    // Initialize S3 storage handler for remote validation
     let s3_storage = S3Storage::new();
-
-    // Validate each data source based on its path type
     for source in data_sources {
-        // Validate access_mode compatibility
-        if source.access_mode.is_read_write()
-            && !WRITABLE_SOURCE_TYPES.contains(&source.source_type)
-        {
-            return Err(ConfigError::UnsupportedWriteMode {
-                name: source.name.clone(),
-                source_type: source.source_type,
-            }
-            .into());
-        }
-
-        // Open Connector typed config: required for that type, rejected for
-        // every other type. `config.validate()` is pure (no network I/O), so
-        // misconfigurations surface here at config load, not at first query.
-        match (&source.source_type, &source.open_connector) {
-            (DataSourceType::OpenConnector, Some(config)) => {
-                // Hierarchy defaults to Table, so a minimal config would
-                // otherwise pass validation and fail at registration with a
-                // Debug-wrapped CatalogHierarchyRequired — catch it here.
-                if source.hierarchy_level != HierarchyLevel::Catalog {
-                    return Err(ConfigError::OpenConnectorHierarchyRequired {
-                        name: source.name.clone(),
-                    }
-                    .into());
-                }
-                config
-                    .validate()
-                    .map_err(|e| ConfigError::InvalidOpenConnectorConfig {
-                        name: source.name.clone(),
-                        reason: e.to_string(),
-                    })?;
-            }
-            (DataSourceType::OpenConnector, None) => {
-                return Err(ConfigError::MissingOpenConnectorConfig {
-                    name: source.name.clone(),
-                }
-                .into());
-            }
-            (_, Some(_)) => {
-                return Err(ConfigError::UnexpectedOpenConnectorConfig {
-                    name: source.name.clone(),
-                    source_type: source.source_type,
-                }
-                .into());
-            }
-            (_, None) => {}
-        }
-
-        // Catalog mode must not mix with per-table / per-schema options
-        // ("database" is ClickHouse's schema-analog spelling)
-        if CATALOG_SUPPORTED_SOURCES.contains(&source.source_type)
-            && source.hierarchy_level == HierarchyLevel::Catalog
-        {
-            for conflicting in &["table", "schema", "database"] {
-                if source
-                    .options
-                    .as_ref()
-                    .map(|o| o.contains_key(*conflicting))
-                    .unwrap_or(false)
-                {
-                    return Err(ConfigError::CatalogModeConflictingOptions {
-                        name: source.name.clone(),
-                        option: conflicting.to_string(),
-                    }
-                    .into());
-                }
-            }
-
-            // allowed_schemas, if present, must not be an empty string
-            if let Some(value) = source
-                .options
-                .as_ref()
-                .and_then(|o| o.get("allowed_schemas"))
-            {
-                let has_entry = value.split(',').any(|s| !s.trim().is_empty());
-                if !has_entry {
-                    return Err(ConfigError::EmptyAllowedSchemas {
-                        name: source.name.clone(),
-                    }
-                    .into());
-                }
-            }
-
-            if source.source_type == DataSourceType::Dynamodb
-                && let Some(value) = source
-                    .options
-                    .as_ref()
-                    .and_then(|o| o.get("allowed_tables"))
-            {
-                let has_entry = value.split(',').any(|s| !s.trim().is_empty());
-                if !has_entry {
-                    return Err(ConfigError::EmptyAllowedTables {
-                        name: source.name.clone(),
-                    }
-                    .into());
-                }
-            }
-        }
-
-        match (&source.source_type, s3_storage.is_remote_path(&source.path)) {
-            (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, true) => {
-                // Validate S3 configuration for S3 paths
-                s3_storage.validate_configuration(source)?;
-            }
-            (
-                DataSourceType::Postgres
-                | DataSourceType::Mysql
-                | DataSourceType::Mongo
-                | DataSourceType::Redis
-                | DataSourceType::Seekdb
-                | DataSourceType::Influxdb
-                | DataSourceType::Clickhouse
-                | DataSourceType::OpenConnector
-                | DataSourceType::Dynamodb,
-                false,
-            ) => {
-                // For database connections, ensure connection string is provided
-                if source.connection_string.is_none() {
-                    return Err(ConfigError::MissingConnectionString {
-                        name: source.name.clone(),
-                    }
-                    .into());
-                }
-            }
-            (DataSourceType::Iceberg, _) => {
-                // Validation happened during data source registration
-            }
-            _ => {
-                // Other combinations are valid without additional checks
-            }
-        }
-
-        let location_type = if s3_storage.is_remote_path(&source.path) {
-            "remote_s3"
-        } else {
-            "local"
-        };
-        let access_mode_str = if source.access_mode.is_read_write() {
-            "read_write"
-        } else {
-            "read_only"
-        };
-        tracing::debug!(
-            "✓ Validated data source: {} (type: {:?}, location: {}, access: {})",
-            source.name,
+        if matches!(
             source.source_type,
-            location_type,
-            access_mode_str
-        );
+            DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance
+        ) && s3_storage.is_remote_path(&source.path)
+        {
+            s3_storage.validate_configuration(source)?;
+        }
     }
 
     tracing::info!(
@@ -975,15 +598,9 @@ fn validate_schema_types(_schema: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// Build the access-mode map for every data source. Shared by both the
-/// trusted pipeline-load path and the untrusted `/query` policy below.
-pub fn validator_config_from_sources(data_sources: &[DataSource]) -> SqlValidatorConfig {
-    let mut validator_config = SqlValidatorConfig::new();
-    for ds in data_sources {
-        validator_config = validator_config.with_table(&ds.name, ds.access_mode);
-    }
-    validator_config
-}
+// `validator_config_from_sources` (the access-mode map builder) now lives in
+// `skardi::config` and is re-exported above — it is the same map the shared SQL
+// validator consumes.
 
 /// Build the statement policy for the untrusted ad-hoc `/query` endpoint:
 /// the access-mode map plus the reserved [`AUTH_SCHEMA`] denial (auth.users /
