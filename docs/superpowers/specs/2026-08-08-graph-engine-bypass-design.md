@@ -151,8 +151,8 @@ Kuzu's Rust API can be embedded, avoiding a separate process. This is attractive
 ```mermaid
 flowchart LR
     SQL["SQL query"] --> DF["DataFusion"]
-    DF --> Catalog["graph.main.user_posts<br/>(YAML-declared view)"]
-    DF --> UDTF["cypher_query('neo4j', 'MATCH ...')"]
+    DF --> Catalog["graph.main.user_posts"]
+    DF --> UDTF["cypher_query UDTF"]
     Catalog --> Client["GraphClient"]
     UDTF --> Client
     Client --> Neo4j["Neo4j Bolt / HTTP"]
