@@ -6,7 +6,7 @@
 
 ## Summary
 
-Skardi will support property-graph data sources through a **dedicated graph engine bypass** rather than by teaching DataFusion Cypher. The graph engine (Neo4j or Kuzu) lives outside the Skardi process and owns graph storage, indexing, and traversal. Skardi exposes a single SQL interface — the `cypher_query(connection, cypher, params)` UDTF — that forwards read-only Cypher queries to the engine and maps the returned nodes, relationships, and paths into ordinary Arrow-backed relational rows.
+Skardi will support property-graph data sources through a **dedicated graph engine bypass** rather than by teaching DataFusion Cypher. The graph engine (Neo4j or Kuzu) lives outside the Skardi process and owns graph storage, indexing, and traversal. Skardi exposes a single SQL interface — the `cypher_query(connection, cypher, params, columns)` UDTF — that forwards read-only Cypher queries to the engine and maps the returned nodes, relationships, and paths into ordinary Arrow-backed relational rows. The schema is always fixed at planning time: declared columns when the caller provides them, one JSON-text `record` column otherwise.
 
 A second, optional surface lets users declare stable catalog views from context YAML: a `type: graph` data source binds a connection and a list of named Cypher queries, each exposed as a table under the source catalog. This gives agents predictable table names while the engine remains the graph expert.
 
@@ -37,10 +37,11 @@ A Cypher `RETURN` clause produces rows of heterogeneous values. Each column can 
 | path | `List<STRUCT<...>>` or flattened rows | paths are ordered sequences of alternating nodes and relationships |
 | list / map | `List<...>` or JSON text | nested values JSON-serialized where no stable schema exists |
 
-Because Cypher can return dynamic structures (`RETURN n, r, p`), the UDTF cannot infer a deterministic schema from the query string alone at planning time. The design therefore requires either:
+Because Cypher can return dynamic structures (`RETURN n, r, p`), the UDTF cannot infer a deterministic schema from the query string alone at planning time. Three candidates were evaluated and the first two rejected:
 
-- a **declared output schema** in the YAML view surface, or
-- an **execution-time schema probe** for the ad-hoc UDTF: run the Cypher with a small `LIMIT`, inspect the first returned row, and derive the Arrow schema from the actual `GraphValue` kinds.
+- **Execution-time schema probe** (run the Cypher with a small `LIMIT`, inspect the first row): rejected for three reasons. (1) DataFusion needs the UDTF schema at *planning* time, so the probe is planning-time network I/O — it fires on `EXPLAIN`, and the same query runs twice unless probe results are cached and reused. (2) An empty result has no rows to infer from, degrading the schema to a fallback shape; the same query then returns `(u_name, post_title)` when data exists and a different schema when it does not, breaking downstream `JOIN ... ON g.u_name` — empty results must be complete results, not a schema change. (3) First-row inference is unsound for Neo4j's dynamically-typed properties: `RETURN n.value` with an `int` first row and a `string` fifth row fails mid-scan against the already-fixed `Int64` column.
+- **Parsing `RETURN` for column names**: rejected as a fragile half-parser of Cypher — the design deliberately has no Cypher parser.
+- **Declared schema at the call site**: chosen. The caller declares the output columns explicitly; without a declaration, the UDTF falls back to a single `record` column carrying the whole Cypher row as JSON text. Both modes have a planning-time-stable schema with no network I/O.
 
 ### Neo4j vs Kuzu
 
@@ -62,9 +63,9 @@ Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surf
 
 ## Goals
 
-- Expose graph data through a read-only `cypher_query(connection, cypher, params)` UDTF.
+- Expose graph data through a read-only `cypher_query(connection, cypher, params, columns)` UDTF.
 - Support Neo4j (Bolt) and Kuzu as backend engines in milestone one.
-- Map Cypher result values (scalars, nodes, relationships, paths, lists, maps) into Arrow rows with a deterministic schema.
+- Map Cypher result values (scalars, nodes, relationships, paths, lists, maps) into Arrow rows with a planning-time-stable schema — declared columns when provided, one JSON-text `record` column otherwise.
 - Allow `type: graph` catalog data sources with pre-declared Cypher views, registered from context YAML.
 - Enable federated `JOIN`s between graph results and existing Skardi sources.
 - Keep provider credentials out of Skardi process memory/logs/YAML.
@@ -75,7 +76,8 @@ Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surf
 
 - A native Cypher parser or planner inside DataFusion.
 - Mutating graph operations (`CREATE`, `SET`, `DELETE`) in milestone one.
-- Automatic schema inference from arbitrary ad-hoc Cypher (ad-hoc queries use execution-time probe or explicit `RETURN` aliases).
+- Automatic schema inference from arbitrary ad-hoc Cypher (no probes, no `RETURN` parsing; columns are declared or the whole row is JSON text).
+- Network I/O at query planning time.
 - Graph-specific SQL extensions (`MATCH`, `()-[]->()` syntax).
 - Embedding the graph engine inside Skardi process by default (Kuzu embedded mode is a later optimization, not the milestone-one default).
 - Transaction or snapshot semantics across graph and relational sources.
@@ -85,15 +87,26 @@ Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surf
 
 ### SQL surface
 
-- **Primary interface:** `cypher_query(connection_name TEXT, cypher TEXT, params JSON OBJECT optional)` returns a table.
+- **Primary interface:** `cypher_query(connection_name TEXT, cypher TEXT, params JSON OBJECT optional, columns JSON OBJECT optional)` returns a table.
   ```sql
-  SELECT u.name, p.title
+  -- Declared columns: typed multi-column output.
+  SELECT user_name, post_title
   FROM cypher_query('neo4j', '
       MATCH (u:User)-[:POSTED]->(p:Post)
       WHERE u.id = $userId
       RETURN u.name, p.title
       LIMIT 10
-  ', '{"userId": "u-123"}') AS g(u_name, post_title);
+  ', '{"userId": "u-123"}',
+     '{"user_name": "Utf8", "post_title": "Utf8"}');
+
+  -- No declaration: one JSON-text column per row, stable schema always.
+  SELECT json_get(record, '$.u.name') AS user_name
+  FROM cypher_query('neo4j', '
+      MATCH (u:User)-[:POSTED]->(p:Post)
+      WHERE u.id = $userId
+      RETURN u, p
+      LIMIT 10
+  ', '{"userId": "u-123"}');
   ```
 - **Catalog interface:** `type: graph` sources register stable views from YAML as catalog tables, e.g. `kg.main.user_posts`.
 
@@ -111,8 +124,11 @@ Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surf
 
 ### Schema handling
 
-- **YAML views:** the user declares the output schema explicitly. Skardi validates at registration that the Cypher query returns columns compatible with the declared schema (live probe, not static parse).
-- **Ad-hoc UDTF:** the first returned row determines the Arrow schema. Empty results produce an empty batch with a schema derived from the Cypher result summary if the driver provides one, otherwise a single `result_json` text column.
+There is no schema probe anywhere in the design: planning performs no network I/O, and every query has a planning-time-stable schema.
+
+- **YAML views:** the user declares the output schema explicitly. Skardi validates at registration that the Cypher query returns columns compatible with the declared schema (one live validation call at registration — registration is allowed to do network I/O; query planning is not).
+- **Ad-hoc UDTF with declared columns:** an optional fourth argument declares the output columns and their Arrow types as a JSON object (`'{"user_name": "Utf8", "post_title": "Utf8"}'`). The declared object is the planning-time schema; each returned `GraphValue` is converted against its declared type, and a mismatch fails with a typed error carrying column name, row index, expected type, and found JSON kind. Conversion is page-atomic — rows are buffered into one batch, converted as a unit, then emitted — so a mid-scan type failure never emits a partially-converted batch (batches already emitted before the failure may have been consumed downstream; this matches the Open Connector page-atomic semantics).
+- **Ad-hoc UDTF without declared columns:** every row is returned as one `record: Utf8` column containing the whole Cypher record as canonical JSON text (column names from `RETURN` become keys of the JSON object). Empty results are empty batches with the same one-column schema; downstream extraction uses SQL JSON functions on `record` (a small `json_get(record, '$.key')` UDF is included so `WHERE` clauses can filter on extracted keys without leaving SQL).
 
 ### Result flattening
 
@@ -217,15 +233,17 @@ For Kuzu file mode:
 
 ```sql
 cypher_query(
-    connection TEXT,      -- references a registered graph data source name
-    cypher TEXT,          -- read-only Cypher query
-    params TEXT optional  -- JSON object of query parameters
+    connection TEXT,       -- references a registered graph data source name
+    cypher TEXT,           -- read-only Cypher query
+    params TEXT optional,  -- JSON object of query parameters
+    columns TEXT optional  -- JSON object declaring output columns and Arrow types;
+                           -- omitted → one `record: Utf8` JSON column per row
 ) RETURNS TABLE(...)
 ```
 
 - `connection` must name a registered `type: graph` source.
 - The UDTF is registered per source by `register_graph_udtf(session_ctx, name)`.
-- The UDTF returns rows using the execution-time schema probe described above.
+- The schema is fixed at planning time from `columns` (or the single-column fallback) — no backend call happens before execution.
 
 ### Projection and limit pushdown
 
@@ -238,13 +256,13 @@ cypher_query(
 Errors carry identity:
 - `GraphError::Backend { source, action, message }` for driver failures.
 - `GraphError::MutationRejected { query }` when a read-only guard blocks a mutating query.
-- `GraphError::SchemaMismatch { column, expected, found }` when a YAML view's declared schema disagrees with the live probe.
+- `GraphError::SchemaMismatch { column, expected, found }` when a YAML view's declared schema disagrees with the registration-time live validation.
 - Values are never quoted in error messages; only kinds and identifiers.
 
 ### Testing strategy
 
 - Unit tests for `GraphValue` → Arrow conversion using synthetic values.
-- Mock `GraphClient` tests for the UDTF schema-probe path and mutation guard.
+- Mock `GraphClient` tests for the declared-columns conversion path (including a mid-scan type-mismatch failing page-atomically), the single-column JSON fallback (including empty results keeping the one-column schema), and the mutation guard.
 - Integration tests against a testcontainer Neo4j and an on-disk Kuzu database for real round-trips.
 - Live verification phase: run a real Cypher workload end-to-end through `skardi-server`, assert rows and schema, verify credentials never appear in logs.
 
@@ -268,7 +286,7 @@ An agent cannot write Cypher blindly. It needs machine-readable answers to:
   - a UDTF `graph_schema(connection)` that returns one row per label/relationship type with a sample of properties;
   - a YAML view author who declares `nodes` / `edges` metadata tables alongside the Cypher views.
   The design chooses the first option as an engine-provided helper in milestone 1, because requiring every YAML view to also declare metadata duplicates effort.
-- *What shape does a `cypher_query` result have?* → the UDTF returns an Arrow schema, and Skardi's JSON response preserves that schema; agents can rely on stable `STRUCT` shapes for nodes and relationships.
+- *What shape does a `cypher_query` result have?* → the schema is fixed at planning time and stated in the function's documentation: either the caller-declared columns, or one `record: Utf8` JSON column. Agents can rely on stable `STRUCT` shapes for nodes and relationships inside those columns.
 - *Is this query allowed?* → read-only is enforced engine-side, so an agent-generated mutating Cypher fails before touching the backend.
 
 ### Agent-friendly error messages
@@ -306,7 +324,7 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 - `GraphClient` trait.
 - `neo4rs`-based Neo4j driver.
 - `GraphValue` → Arrow conversion for scalars, nodes, relationships, paths, lists, maps.
-- `cypher_query` UDTF with execution-time schema probe.
+- `cypher_query` UDTF with declared-columns and JSON-text fallback schema modes.
 - `graph_schema` introspection UDTF (labels, relationship types, property samples).
 - Read-only mutation guard.
 - Basic error taxonomy.
@@ -332,7 +350,7 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 
 ## Risks and Open Questions
 
-1. **Dynamic schema in ad-hoc UDTF.** If the first row of a Cypher result has different types than later rows (e.g., `RETURN n` where some `n` are nodes and some are null), the Arrow schema remains stable but null handling must be correct. The design handles this by making nodes nullable structs.
+1. **Declared-type drift on dynamically-typed properties.** Neo4j property types vary per node: a view declaring `n.value AS Int64` meets a `string` value mid-scan and fails with a typed error (column, row, expected, found-kind). Conversion is page-atomic, but batches already emitted stay emitted — the same mid-scan failure trade-off the Open Connector adapters accept. Views over heterogeneous properties should declare `Utf8` (JSON text) instead of a scalar type, or normalize with Cypher `toInteger()`/`toString()` before `RETURN`.
 2. **Cypher injection.** Parameter binding prevents interpolation attacks, but the read-only guard is string-based and could be bypassed by clever Cypher. The guard should be conservative: reject any query containing mutating keywords, regardless of context.
 3. **Path representation.** Returning a path as `List<STRUCT>` is convenient but may be awkward for consumers. The YAML view surface lets users `UNWIND` paths into rows when needed.
 4. **Backend divergence.** Kuzu Cypher is a subset. The design must avoid features that work on Neo4j but fail on Kuzu unless the view/backend is explicit.
