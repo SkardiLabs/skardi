@@ -249,7 +249,11 @@ spec:
           description: >-
             URL of the entry's primary attachment (podcast audio, video). RSS
             2.0 <enclosure url>, Atom <link rel="enclosure">, JSON Feed
-            `attachments[0]`. Stored, never fetched by Skardi.
+            `attachments[0]`. Stored, never fetched by Skardi. An entry may
+            carry SEVERAL attachments — one episode in several audio formats,
+            say — and only the first reaches these three columns; the rest are
+            in `extensions_json`'s `attachments` array, so read both when you
+            want them all.
         - name: enclosure_type
           description: "MIME type of the attachment named by `enclosure_url`."
         - name: enclosure_length
@@ -272,6 +276,14 @@ spec:
             Non-core fields as a JSON object with deterministic key order, or
             NULL when there are none. Bounded by what the feed-rs model exposes
             — NOT a catch-all for arbitrary unknown namespaces, which are
-            dropped at parse time. Keys seen today: `media` (MediaRSS objects
-            beyond the one surfaced as the enclosure), `source`, `rights`,
-            `language`.
+            dropped at parse time. Keys seen today: `attachments`, `source`,
+            `rights`, `language`. `attachments` is every attachment past the
+            one in the `enclosure_*` columns, one flat object per downloadable
+            file with `url` / `content_type` / `size`, and the dialect it came
+            in does not change that shape — MediaRSS and Atom/JSON Feed
+            attachment links both land here, so two renditions of one podcast
+            episode survive whether the feed is RSS or JSON Feed. MediaRSS
+            objects add `title`, `description`, `thumbnails`, and
+            `duration_secs` when they carry them, copied onto each of their
+            renditions; such an object whose renditions were all consumed
+            leaves an element with that metadata and no `url`.

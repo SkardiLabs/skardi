@@ -6,20 +6,28 @@ use thiserror::Error;
 /// Length cap, in characters, on any feed-influenced diagnostic string this
 /// provider stores or logs.
 ///
-/// Three call sites will share it — all landing in later phases of this stack,
-/// none present in this PR, so the constant is exercised only by its own test
-/// for now. They will share it because they are bounded by the same thing —
-/// how many characters of feed-chosen text a document can push into a
-/// diagnostic — rather than by coincidence:
+/// Its call sites share it because they are bounded by the same thing — how
+/// many characters of feed-chosen text a document can push into a diagnostic —
+/// rather than by coincidence:
 ///
 /// - `feeds.last_error` (`engine.rs`, the column's only writer), including the
 ///   fixed literal `cache.rs` writes for an evicted-window `304`;
 /// - `feeds.dialect_declared`'s `unknown:<root element>` form
 ///   (`conformance.rs`), built from a raw root element name of whatever length
 ///   the document supplies;
+/// - `feeds.conformance_notes`, both per-note at the source
+///   (`conformance.rs`) and over the joined string;
+/// - `feeds.site_url`, a feed-authored link — not a diagnostic, but an
+///   identifier rather than prose, so this is the bound that fits it and not
+///   [`MAX_FEED_TEXT_CHARS`];
 /// - the `debug`-level parse-failure line (`parse.rs`), which logs the
 ///   dependency's own reason and would otherwise be bounded only by
 ///   `max_response_bytes`.
+///
+/// The columns among those are held to it structurally by
+/// [`super::cache::FeedObservation::capped`], the one boundary every
+/// observation the cache retains passes through. The two sites that land in
+/// later phases of this stack (`engine.rs`, `parse.rs`) are not present yet.
 ///
 /// A bound on *length* only. What content may reach `feeds.last_error` at all is
 /// a separate question, to be argued in `engine.rs`'s module doc when it lands.
@@ -29,6 +37,21 @@ use thiserror::Error;
 /// neither can reference this constant, so both name it as `MAX_ERROR_CHARS`'s
 /// value and this is where it is defined.
 pub const MAX_ERROR_CHARS: usize = 512;
+
+/// Length cap, in characters, on the feed-authored *prose* fields —
+/// `feeds.title` and `feeds.description` — that enter a
+/// [`super::cache::FeedObservation`].
+///
+/// Deliberately looser than [`MAX_ERROR_CHARS`]. Those two columns are not
+/// diagnostics: they carry the feed's own editorial text, where a channel
+/// description running past 512 characters is ordinary rather than hostile,
+/// and cutting there would truncate legitimate values. They still need *a*
+/// bound, and it is the same invariant [`MAX_ERROR_CHARS`] serves — the
+/// observation store is never byte-bounded by the cache, whose budget meters
+/// `RecordBatch` bytes only (`MemoryFeedCache::record_success`), so a
+/// `max_response_bytes`-sized `<title>` would otherwise be retained whole and
+/// outlive the window it described.
+pub const MAX_FEED_TEXT_CHARS: usize = 4096;
 
 /// Bound `text` to `max_chars` *characters*, cutting on a char boundary so a
 /// multi-byte sequence is never split.

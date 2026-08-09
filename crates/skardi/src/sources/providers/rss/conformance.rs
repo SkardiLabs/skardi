@@ -23,12 +23,17 @@ pub fn sniff_declared_dialect(bytes: &[u8], family: DocFamily) -> Option<String>
             let local = name.rsplit(':').next().unwrap_or(&name);
             let version = attr_value(&attrs, "version");
             // `name` is a raw root element name off the wire, so this is
-            // feed-controlled text of whatever length the document supplies —
-            // and it is retained in a `FeedObservation`, which
-            // `MemoryFeedCache` never byte-bounds (its budget meters
-            // `RecordBatch` bytes only, `cache.rs:505`). Capped at the same
-            // bound its sibling `feeds.last_error` gets: a 4 KB root element
-            // name was measured producing a 4,104-character column value, and
+            // feed-controlled text of whatever length the document supplies.
+            // Every such string that reaches a `FeedObservation` is bounded —
+            // `MemoryFeedCache` never byte-bounds observations (its budget
+            // meters `RecordBatch` bytes only), and
+            // `FeedObservation::capped()` is where that invariant is enforced
+            // for the store as a whole. This is the local, at-the-source
+            // instance of it: capping each note and identifier where it is
+            // built keeps one hostile value from consuming the whole column's
+            // allowance and crowding out the rest. Capped at the same bound
+            // its sibling `feeds.last_error` gets — a 4 KB root element name
+            // was measured producing a 4,104-character column value, and
             // nothing stopped a 5 MiB one from producing 5 MiB.
             let unknown = || truncate(&format!("unknown:{name}"), MAX_ERROR_CHARS);
 
@@ -197,8 +202,18 @@ pub fn content_type_family_note(content_type: Option<&str>, parsed: FeedType) ->
     if served == family {
         return None;
     }
-    Some(format!(
-        "content-type-mismatch: served {essence}, parsed {family}"
+    // `essence` is a served response header, i.e. server-controlled text of
+    // whatever length, and this note lands in `feeds.conformance_notes` — so
+    // it is bounded here, at the source, like `unknown:<root>` above. The
+    // `served` match is what makes this a no-op today: only the eight literals
+    // it names get past it, and the longest is 20 characters. It stands so
+    // that widening that match — a prefix arm, a wildcard, a vendor `+xml`
+    // suffix rule — cannot quietly put an unbounded header value into the
+    // column, and so that no single note can consume the whole allowance
+    // `FeedObservation::capped()` gives the joined string.
+    Some(truncate(
+        &format!("content-type-mismatch: served {essence}, parsed {family}"),
+        MAX_ERROR_CHARS,
     ))
 }
 
@@ -276,8 +291,10 @@ mod tests {
         );
     }
 
-    /// `unknown:<root>` is feed-controlled text and is capped, because it is
-    /// retained in a `FeedObservation` that nothing else byte-bounds.
+    /// `unknown:<root>` is feed-controlled text and is capped at the source,
+    /// because it is retained in a `FeedObservation` that nothing else
+    /// byte-bounds — the same invariant `FeedObservation::capped()` holds for
+    /// the store as a whole.
     #[test]
     fn an_absurd_root_element_name_is_capped_like_last_error() {
         let doc = format!("<{}/>", "x".repeat(4_096));
@@ -363,6 +380,49 @@ mod tests {
             content_type_family_note(Some("application/rss+xml"), FeedType::RSS1),
             None
         );
+    }
+
+    /// A served `Content-Type` is server-controlled text of whatever length,
+    /// and the note quoting it lands in `feeds.conformance_notes`, so the note
+    /// is bounded however long the header is.
+    ///
+    /// Two ways that holds, and the distinction is the point. An absurd type
+    /// carries no family opinion, so it produces no note at all — it never
+    /// reaches the format string, which is why the cap there is a no-op today
+    /// rather than the thing keeping this column bounded. The cap is the
+    /// backstop for a `served` match that later recognises more than eight
+    /// exact literals; what this pins is that the column is bounded either
+    /// way, and that a note that *is* produced is still the exact string an
+    /// operator reads.
+    #[test]
+    fn a_pathological_content_type_cannot_produce_an_unbounded_note() {
+        let absurd = format!("application/{}+xml", "x".repeat(10_000));
+        assert_eq!(
+            content_type_family_note(Some(&absurd), FeedType::Atom),
+            None,
+            "an unrecognised type names no family and so can disagree with none"
+        );
+        // Same, with the length pushed into a parameter the essence split
+        // discards rather than into the essence itself.
+        let padded = format!("application/rss+xml; charset={}", "x".repeat(10_000));
+        assert_eq!(
+            content_type_family_note(Some(&padded), FeedType::Atom)
+                .expect("the essence still names rss, which disagrees with atom"),
+            "content-type-mismatch: served application/rss+xml, parsed atom",
+            "a recognised essence yields the note verbatim, parameters and all dropped"
+        );
+        for note in [
+            content_type_family_note(Some(&padded), FeedType::Atom),
+            content_type_family_note(Some("application/atom+xml"), FeedType::RSS2),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                note.chars().count() <= MAX_ERROR_CHARS,
+                "no note may exceed the per-note cap: {note}"
+            );
+        }
     }
 
     #[test]

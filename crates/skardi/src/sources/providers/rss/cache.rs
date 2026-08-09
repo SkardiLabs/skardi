@@ -79,13 +79,13 @@
 //! there is no request coalescing here, matching `open_connector`'s cache.
 //! That is a documented future extension, not this module's job.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 
-use super::error::{MAX_ERROR_CHARS, truncate};
+use super::error::{MAX_ERROR_CHARS, MAX_FEED_TEXT_CHARS, truncate};
 
 /// A feed's freshness state, and the single source of the exact strings the
 /// `feeds.last_status` column serves.
@@ -149,6 +149,23 @@ impl FeedStatus {
 ///
 /// `Default` is the state of a feed that has never been attempted: every
 /// field `None` and [`FeedStatus::Never`].
+///
+/// Every feed- or server-controlled string retained here is length-capped.
+/// Six of the fields below are written from the wire: `title` and
+/// `description` carry the document's own text, `site_url` its alternate
+/// link, `dialect_declared` and `conformance_notes` sniffs that quote it, and
+/// `last_error` a diagnostic that may. Nothing downstream bounds any of them —
+/// [`MemoryFeedCache`]'s budget meters `RecordBatch` bytes only (see
+/// [`MemoryFeedCache::record_success`]), so an observation is never charged
+/// against `max_bytes` at all — and an observation deliberately outlives the
+/// window it describes (the module doc's "eviction keeps the observation"), so
+/// an uncapped string here is retained past the point where the bytes it came
+/// from are gone. A single `<title>` may be as large as `max_response_bytes`.
+///
+/// [`FeedObservation::capped`] is where that holds: it is applied where an
+/// observation is stored, so the bound is a property of this boundary rather
+/// than something each construction site has to remember. Adding a
+/// feed-controlled string field means adding it there too.
 #[derive(Debug, Clone, Default)]
 pub struct FeedObservation {
     pub last_fetch_ms: Option<i64>,
@@ -162,6 +179,37 @@ pub struct FeedObservation {
     pub site_url: Option<String>,
     pub description: Option<String>,
     pub item_count: Option<u64>,
+}
+
+impl FeedObservation {
+    /// This observation with every feed- or server-controlled string bounded
+    /// to its column's cap — see the struct doc for why one is needed at all.
+    ///
+    /// Two caps, because the fields divide into two kinds of text.
+    /// `title` and `description` are the feed's own prose and get the looser
+    /// [`MAX_FEED_TEXT_CHARS`]; `site_url`, `dialect_declared`,
+    /// `conformance_notes`, and `last_error` are identifiers and diagnostics
+    /// and get [`MAX_ERROR_CHARS`], the bound every other feed-influenced
+    /// diagnostic in this provider is held to.
+    ///
+    /// `dialect` is absent because it is never feed-controlled: its only
+    /// writer is [`super::conformance::parsed_dialect`], which returns a
+    /// `&'static str` from a closed set. `last_error` is included even though
+    /// its writers cap it already, so the guarantee at this boundary is total
+    /// rather than inherited from every upstream remembering to. Non-string
+    /// fields are untouched — this is a length bound and nothing else.
+    pub fn capped(mut self) -> Self {
+        fn cap(text: Option<String>, max_chars: usize) -> Option<String> {
+            text.map(|t| truncate(&t, max_chars))
+        }
+        self.last_error = cap(self.last_error, MAX_ERROR_CHARS);
+        self.dialect_declared = cap(self.dialect_declared, MAX_ERROR_CHARS);
+        self.conformance_notes = cap(self.conformance_notes, MAX_ERROR_CHARS);
+        self.site_url = cap(self.site_url, MAX_ERROR_CHARS);
+        self.title = cap(self.title, MAX_FEED_TEXT_CHARS);
+        self.description = cap(self.description, MAX_FEED_TEXT_CHARS);
+        self
+    }
 }
 
 /// A feed's cached window: the parsed `items` batch plus the conditional-GET
@@ -318,69 +366,143 @@ struct WindowEntry {
 
 /// One feed's full cache entry: an always-present observation, and an
 /// optional window that the byte/entry budget can evict independently.
+///
+/// Recency lives here, as a tick per entry, rather than in a list of keys
+/// held beside the map. A key list has to be *searched* to move a feed to the
+/// front, so every access costs a scan of every other feed — and `snapshot`
+/// runs once per feed per scan, against a list `max_observations` (8x
+/// `max_entries`) long, with `max_entries` itself sized to the subscription
+/// count. That is quadratic in the number of subscriptions for bookkeeping a
+/// cache hit does not need. The order is only ever *read* when a bound is
+/// exceeded, so it is recorded here in O(1) and derived by the scans in
+/// `evict`/`evict_observations`, which are the rare path.
 struct Entry {
     observation: FeedObservation,
     window: Option<WindowEntry>,
     armed_until: Instant,
+    /// Tick of the last access of any kind — the order `max_observations`
+    /// evicts by. Set by every one of the four [`FeedCache`] methods, so an
+    /// observation-only entry that keeps getting queried or refreshed is
+    /// exactly as protected from the backstop as a windowed one.
+    last_used: u64,
+    /// Tick of the last access that served or stored `window` — the order
+    /// `max_bytes`/`max_entries` evict by. Meaningless while `window` is
+    /// `None`, which is why the scan that reads it filters on that first.
+    window_last_used: u64,
+}
+
+impl Entry {
+    fn new(armed_until: Instant) -> Self {
+        Self {
+            observation: FeedObservation::default(),
+            window: None,
+            armed_until,
+            last_used: 0,
+            window_last_used: 0,
+        }
+    }
 }
 
 struct Inner {
     map: HashMap<String, Entry>,
-    /// Feeds that currently hold a window, most-recently-used first. Feeds
-    /// with no window (never fetched, or evicted) are not tracked here —
-    /// see [`MemoryFeedCache`]'s doc for why `max_entries` bounds this list
-    /// rather than the whole map.
-    window_order: VecDeque<String>,
     window_bytes: usize,
-    /// Every feed key currently in `map`, most-recently-used first, where
-    /// "used" means touched by any of the four [`FeedCache`] methods —
-    /// unlike `window_order` above, this includes feeds with no window.
-    /// Backs the `max_observations` last-resort bound; see
-    /// [`MemoryFeedCache`]'s doc.
-    entry_order: VecDeque<String>,
+    /// How many entries in `map` hold a window — what `max_entries` bounds,
+    /// kept as a count so the check stays O(1) instead of a scan on every
+    /// write. See [`MemoryFeedCache`]'s doc for why `max_entries` bounds this
+    /// rather than the whole map. It changes in exactly two places,
+    /// [`Inner::store_window`] and [`Inner::drop_window`], so it cannot drift
+    /// from the map it describes.
+    windowed: usize,
+    /// Hands out the strictly increasing ticks the entries above record. At
+    /// one tick per nanosecond a `u64` lasts ~584 years, so wrap-around is not
+    /// a case this reasons about.
+    clock: u64,
 }
 
 impl Inner {
-    /// Drop `feed`'s window (if any) and remove it from the LRU list,
-    /// crediting its bytes back to the budget. A no-op if `feed` has no
-    /// entry or no window.
-    fn drop_window(&mut self, feed: &str) {
-        if let Some(entry) = self.map.get_mut(feed)
-            && let Some(w) = entry.window.take()
-        {
-            self.window_bytes = self.window_bytes.saturating_sub(w.bytes);
+    /// The next tick. Strictly increasing, so no two accesses ever compare
+    /// equal and the eviction scans always have a single minimum — the
+    /// eviction order is therefore total, not merely a partial one broken by
+    /// `HashMap` iteration order.
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// Store `feed`'s window, charging its bytes and marking it used now.
+    fn store_window(&mut self, feed: &str, window: CachedWindow, bytes: usize) {
+        let tick = self.tick();
+        let Some(entry) = self.map.get_mut(feed) else {
+            return;
+        };
+        entry.window_last_used = tick;
+        let previous = entry.window.replace(WindowEntry { window, bytes });
+
+        match previous {
+            // Replacing in place would otherwise leak the old window's bytes.
+            // `record_success` drops first, so this arm is defensive.
+            Some(old) => self.window_bytes = self.window_bytes.saturating_sub(old.bytes),
+            None => self.windowed += 1,
         }
-        self.window_order.retain(|k| k != feed);
+        self.window_bytes += bytes;
     }
 
-    /// Move `feed` to the front of the window LRU list.
+    /// Drop `feed`'s window (if any), crediting its bytes and the windowed
+    /// count back. A no-op if `feed` has no entry or no window.
+    fn drop_window(&mut self, feed: &str) {
+        let Some(entry) = self.map.get_mut(feed) else {
+            return;
+        };
+        let Some(w) = entry.window.take() else {
+            return;
+        };
+        self.window_bytes = self.window_bytes.saturating_sub(w.bytes);
+        self.windowed -= 1;
+    }
+
+    /// Mark `feed`'s window used now.
     fn touch_window(&mut self, feed: &str) {
-        self.window_order.retain(|k| k != feed);
-        self.window_order.push_front(feed.to_string());
+        let tick = self.tick();
+        if let Some(entry) = self.map.get_mut(feed) {
+            entry.window_last_used = tick;
+        }
     }
 
-    /// Move `feed` to the front of the whole-entry LRU list. Called on every
-    /// access or update, whether or not `feed` currently holds a window, so
-    /// an observation-only entry that keeps getting queried or refreshed is
-    /// exactly as protected from the `max_observations` backstop as a
-    /// windowed one.
+    /// Mark `feed` used now, whether or not it currently holds a window.
     fn touch_entry(&mut self, feed: &str) {
-        self.entry_order.retain(|k| k != feed);
-        self.entry_order.push_front(feed.to_string());
+        let tick = self.tick();
+        if let Some(entry) = self.map.get_mut(feed) {
+            entry.last_used = tick;
+        }
+    }
+
+    /// The windowed feed whose window was least recently used. `None` when no
+    /// feed holds one. O(map), and reached only from [`Inner::evict`].
+    fn oldest_windowed(&self) -> Option<String> {
+        self.map
+            .iter()
+            .filter(|(_, entry)| entry.window.is_some())
+            .min_by_key(|(_, entry)| entry.window_last_used)
+            .map(|(feed, _)| feed.clone())
+    }
+
+    /// The least recently used entry of any kind. O(map), and reached only
+    /// from [`Inner::evict_observations`].
+    fn oldest_entry(&self) -> Option<String> {
+        self.map
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(feed, _)| feed.clone())
     }
 
     /// Evict least-recently-used windows (dropping only the window, never
     /// the observation) until both the byte and entry budgets hold.
     fn evict(&mut self, max_bytes: usize, max_entries: usize) {
-        while self.window_order.len() > max_entries || self.window_bytes > max_bytes {
-            let Some(oldest) = self.window_order.pop_back() else {
+        while self.windowed > max_entries || self.window_bytes > max_bytes {
+            let Some(oldest) = self.oldest_windowed() else {
                 break;
             };
-            if let Some(entry) = self.map.get_mut(&oldest)
-                && let Some(w) = entry.window.take()
-            {
-                self.window_bytes = self.window_bytes.saturating_sub(w.bytes);
-            }
+            self.drop_window(&oldest);
         }
     }
 
@@ -391,15 +513,14 @@ impl Inner {
     /// preserving eviction above.
     fn evict_observations(&mut self, max_observations: usize) {
         while self.map.len() > max_observations {
-            let Some(oldest) = self.entry_order.pop_back() else {
+            let Some(oldest) = self.oldest_entry() else {
                 break;
             };
-            if let Some(entry) = self.map.remove(&oldest)
-                && let Some(w) = entry.window
-            {
-                self.window_bytes = self.window_bytes.saturating_sub(w.bytes);
-            }
-            self.window_order.retain(|k| k != &oldest);
+            // Through `drop_window` so the byte and windowed counts are
+            // credited by the one place that maintains them, rather than by a
+            // second copy of that arithmetic here.
+            self.drop_window(&oldest);
+            self.map.remove(&oldest);
         }
     }
 }
@@ -407,7 +528,9 @@ impl Inner {
 /// In-memory [`FeedCache`], bounded by window bytes, window count, and
 /// (as a last resort) total observation count, behind a `Mutex`
 /// (hand-rolled LRU, following `open_connector/cache.rs`'s precedent rather
-/// than adding the `lru` crate).
+/// than adding the `lru` crate). Recency is a tick recorded on each entry
+/// rather than a list of keys kept beside the map — see [`Entry`] for why
+/// that shape and not the other.
 ///
 /// `max_entries` bounds how many feeds may hold a cached window at once —
 /// it does not bound the map itself, since a feed that is only failing or
@@ -447,9 +570,9 @@ impl MemoryFeedCache {
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
-                window_order: VecDeque::new(),
                 window_bytes: 0,
-                entry_order: VecDeque::new(),
+                windowed: 0,
+                clock: 0,
             }),
             max_bytes,
             max_entries,
@@ -512,12 +635,14 @@ impl FeedCache for MemoryFeedCache {
         // ends up fitting.
         inner.drop_window(feed);
 
-        let entry = inner.map.entry(feed.to_string()).or_insert_with(|| Entry {
-            observation: FeedObservation::default(),
-            window: None,
-            armed_until,
-        });
-        entry.observation = observation;
+        let entry = inner
+            .map
+            .entry(feed.to_string())
+            .or_insert_with(|| Entry::new(armed_until));
+        // The one place a whole observation enters the store, and so where its
+        // strings are bounded — see [`FeedObservation::capped`]. Applied here
+        // rather than at the caller so no future construction site can omit it.
+        entry.observation = observation.capped();
         entry.armed_until = armed_until;
 
         // A window that alone exceeds the whole byte budget can never fit no
@@ -525,9 +650,7 @@ impl FeedCache for MemoryFeedCache {
         // observation (already done above) but skip the window entirely
         // rather than insert-then-immediately-evict it.
         if bytes <= self.max_bytes {
-            entry.window = Some(WindowEntry { window, bytes });
-            inner.window_bytes += bytes;
-            inner.window_order.push_front(feed.to_string());
+            inner.store_window(feed, window, bytes);
             inner.evict(self.max_bytes, self.max_entries);
         }
 
@@ -543,11 +666,10 @@ impl FeedCache for MemoryFeedCache {
         armed_until: Instant,
     ) {
         let mut inner = self.lock();
-        let entry = inner.map.entry(feed.to_string()).or_insert_with(|| Entry {
-            observation: FeedObservation::default(),
-            window: None,
-            armed_until,
-        });
+        let entry = inner
+            .map
+            .entry(feed.to_string())
+            .or_insert_with(|| Entry::new(armed_until));
 
         // An attempt happened and it is the caller's `armed_until` that
         // decides when the next one may, so the fetch metadata and the re-arm
@@ -600,11 +722,10 @@ impl FeedCache for MemoryFeedCache {
         armed_until: Instant,
     ) {
         let mut inner = self.lock();
-        let entry = inner.map.entry(feed.to_string()).or_insert_with(|| Entry {
-            observation: FeedObservation::default(),
-            window: None,
-            armed_until,
-        });
+        let entry = inner
+            .map
+            .entry(feed.to_string())
+            .or_insert_with(|| Entry::new(armed_until));
         // A failed refresh does not invalidate a previously cached window —
         // it is left exactly as it was, available to serve stale, and
         // determines which of the two failure statuses applies.
@@ -622,6 +743,13 @@ impl FeedCache for MemoryFeedCache {
             entry.observation.dialect_declared = dialect_declared;
         }
         entry.armed_until = armed_until;
+        // The other path that writes feed- and server-controlled strings into a
+        // retained observation, so it is held to the same bound `record_success`
+        // is, through the same entry point. Both fields it just wrote are capped
+        // by their own writers too; going through `capped()` here is what keeps
+        // that a redundancy rather than the only thing holding the invariant up.
+        let observation = std::mem::take(&mut entry.observation);
+        entry.observation = observation.capped();
 
         inner.touch_entry(feed);
         inner.evict_observations(self.max_observations);
@@ -663,6 +791,199 @@ mod tests {
             description: Some("desc".into()),
             item_count: Some(item_count),
         }
+    }
+
+    /// Every field an over-long value, so a cap that is missing or applied to
+    /// the wrong field shows up as a wrong length rather than passing by luck.
+    fn obs_all_strings_long(chars: usize) -> FeedObservation {
+        let long = "x".repeat(chars);
+        FeedObservation {
+            last_fetch_ms: Some(1_700_000_000_000),
+            last_status: FeedStatus::Fresh,
+            http_status: Some(200),
+            last_error: Some(long.clone()),
+            dialect: Some("rss-2.0".into()),
+            dialect_declared: Some(long.clone()),
+            conformance_notes: Some(long.clone()),
+            title: Some(long.clone()),
+            site_url: Some(long.clone()),
+            description: Some(long),
+            item_count: Some(7),
+        }
+    }
+
+    /// Every feed- or server-controlled string is bounded, each at its own
+    /// column's cap: prose (`title`, `description`) at `MAX_FEED_TEXT_CHARS`,
+    /// identifiers and diagnostics at `MAX_ERROR_CHARS`. Nothing downstream
+    /// bounds these — the cache's budget meters `RecordBatch` bytes only — so
+    /// this is the only place the length is decided.
+    #[test]
+    fn capped_bounds_every_feed_controlled_string_at_its_own_cap() {
+        let capped = obs_all_strings_long(10_000).capped();
+
+        assert_eq!(
+            capped.title.as_ref().unwrap().chars().count(),
+            MAX_FEED_TEXT_CHARS
+        );
+        assert_eq!(
+            capped.description.as_ref().unwrap().chars().count(),
+            MAX_FEED_TEXT_CHARS
+        );
+        assert_eq!(
+            capped.site_url.as_ref().unwrap().chars().count(),
+            MAX_ERROR_CHARS
+        );
+        assert_eq!(
+            capped.dialect_declared.as_ref().unwrap().chars().count(),
+            MAX_ERROR_CHARS
+        );
+        assert_eq!(
+            capped.conformance_notes.as_ref().unwrap().chars().count(),
+            MAX_ERROR_CHARS
+        );
+        assert_eq!(
+            capped.last_error.as_ref().unwrap().chars().count(),
+            MAX_ERROR_CHARS,
+            "capped again here even though its writers cap it, so the bound at \
+             this boundary does not depend on them"
+        );
+    }
+
+    /// The conservativeness direction: a realistic observation passes through
+    /// unchanged. A cap applied to the wrong field, or one off by a character,
+    /// is visible here as a value that no longer matches what went in.
+    #[test]
+    fn capped_leaves_values_within_bounds_byte_identical() {
+        let before = FeedObservation {
+            last_fetch_ms: Some(1_700_000_000_000),
+            last_status: FeedStatus::Fresh,
+            http_status: Some(200),
+            last_error: None,
+            dialect: Some("rss-2.0".into()),
+            dialect_declared: Some("rss-2.0".into()),
+            conformance_notes: Some("duplicate-identity: 1".into()),
+            title: Some("Daily Notes on Distributed Systems".into()),
+            site_url: Some("https://example.com/blog/index.html".into()),
+            description: Some("Occasional writing about storage engines.".into()),
+            item_count: Some(42),
+        };
+        let after = before.clone().capped();
+
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.description, before.description);
+        assert_eq!(after.site_url, before.site_url);
+        assert_eq!(after.dialect_declared, before.dialect_declared);
+        assert_eq!(after.conformance_notes, before.conformance_notes);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(
+            after.dialect, before.dialect,
+            "never feed-controlled, never cut"
+        );
+    }
+
+    /// The cap counts characters, not bytes, so a feed writing in a script
+    /// whose scalars are 3 or 4 bytes wide is not cut to a third of the
+    /// allowance — and never mid-scalar. `truncate` decides this; the point
+    /// here is that the field-level use inherits it.
+    #[test]
+    fn capped_counts_characters_on_multi_byte_text() {
+        let title = "标题".repeat(10_000);
+        // Spelled as an escape: a single 4-byte scalar, with no chance of a
+        // variation selector riding along and making the byte count ambiguous.
+        let description = "\u{1F680}".repeat(10_000);
+        let capped = FeedObservation {
+            title: Some(title),
+            description: Some(description),
+            ..FeedObservation::default()
+        }
+        .capped();
+
+        let title = capped.title.expect("title survives");
+        assert_eq!(title.chars().count(), MAX_FEED_TEXT_CHARS);
+        // 3-byte scalars: a byte-counting cap would have kept a third of these.
+        assert_eq!(title.len(), MAX_FEED_TEXT_CHARS * 3);
+        let description = capped.description.expect("description survives");
+        assert_eq!(description.chars().count(), MAX_FEED_TEXT_CHARS);
+        assert_eq!(description.len(), MAX_FEED_TEXT_CHARS * 4);
+    }
+
+    /// A pure length bound: the fields that carry no feed text are the feed's
+    /// health, and `capped()` must not be a place where health can change.
+    #[test]
+    fn capped_leaves_non_string_fields_alone() {
+        let before = obs_all_strings_long(10_000);
+        let after = before.clone().capped();
+
+        assert_eq!(after.item_count, before.item_count);
+        assert_eq!(after.http_status, before.http_status);
+        assert_eq!(after.last_fetch_ms, before.last_fetch_ms);
+        assert!(matches!(after.last_status, FeedStatus::Fresh));
+    }
+
+    /// The bound is reached through the cache's own API, not only by calling
+    /// `capped()` directly: `record_success` is where an observation enters the
+    /// store, so a caller that never heard of the cap still cannot get an
+    /// unbounded string retained. The window it stored alongside is untouched —
+    /// `items` content is bounded by the byte budget instead, and must stay
+    /// verbatim.
+    #[test]
+    fn record_success_caps_the_observation_it_stores_and_leaves_the_window_whole() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        cache.record_success(
+            "a",
+            window_with_rows(3),
+            obs_all_strings_long(10_000),
+            t0 + Duration::from_secs(900),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert_eq!(
+            snap.observation.title.as_ref().unwrap().chars().count(),
+            MAX_FEED_TEXT_CHARS
+        );
+        assert_eq!(
+            snap.observation.site_url.as_ref().unwrap().chars().count(),
+            MAX_ERROR_CHARS
+        );
+        assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 3);
+    }
+
+    /// `record_failure` writes feed- and server-controlled strings straight
+    /// into a retained observation, so it is held to the same bound rather
+    /// than trusting its caller to have applied one.
+    #[test]
+    fn record_failure_caps_the_strings_it_writes() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        cache.record_failure(
+            "a",
+            Some(500),
+            "x".repeat(10_000),
+            Some(format!("unknown:{}", "y".repeat(10_000))),
+            1,
+            t0 + Duration::from_secs(30),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert_eq!(
+            snap.observation
+                .last_error
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_ERROR_CHARS
+        );
+        assert_eq!(
+            snap.observation
+                .dialect_declared
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_ERROR_CHARS
+        );
     }
 
     #[test]
@@ -1001,6 +1322,52 @@ mod tests {
         assert!(
             matches!(survivor.observation.last_status, FeedStatus::Error),
             "the recently touched entry survives with its observation intact"
+        );
+    }
+
+    /// `windowed` and `window_bytes` are counters kept beside the map rather
+    /// than derived from it, so what the eviction bounds test is only as true
+    /// as the two places that maintain them. This drives every path that
+    /// stores or drops a window — a first success, a replacing success, a
+    /// failure that must leave the window alone, a byte-budget eviction, and
+    /// the whole-entry backstop — and then compares both counters against the
+    /// map itself.
+    #[test]
+    fn window_accounting_agrees_with_the_map_after_every_path() {
+        let bytes = window_with_rows(1).batch.get_array_memory_size();
+        // Room for two windows, so the third success evicts.
+        let cache = MemoryFeedCache::new(bytes * 2 + 8, 8);
+        let t0 = Instant::now();
+        let armed = t0 + Duration::from_secs(900);
+
+        cache.record_success("a", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("b", window_with_rows(1), obs_fresh(1), armed);
+        // Replacing an existing window must credit the old bytes back.
+        cache.record_success("a", window_with_rows(1), obs_fresh(1), armed);
+        // A failure leaves "a"'s window in place to serve stale.
+        cache.record_failure("a", Some(500), "boom".into(), None, 1, armed);
+        // Over the byte budget: one window is evicted, its observation kept.
+        cache.record_success("c", window_with_rows(1), obs_fresh(1), armed);
+        // Windowless keys, driving the whole-entry backstop at 8 * 8 = 64.
+        for i in 0..70 {
+            cache.record_failure(&format!("f{i}"), Some(500), "boom".into(), None, 1, armed);
+        }
+
+        let inner = cache.lock();
+        assert_eq!(
+            inner.windowed,
+            inner.map.values().filter(|e| e.window.is_some()).count(),
+            "the windowed count must equal the windows the map actually holds"
+        );
+        assert_eq!(
+            inner.window_bytes,
+            inner
+                .map
+                .values()
+                .filter_map(|e| e.window.as_ref())
+                .map(|w| w.bytes)
+                .sum::<usize>(),
+            "the byte total must equal the bytes the map actually holds"
         );
     }
 

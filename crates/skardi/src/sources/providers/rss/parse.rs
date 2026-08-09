@@ -46,10 +46,13 @@ type Rung = (fn(&[u8]) -> (Vec<u8>, bool), Repair);
 
 /// Sanitize `bytes` with the applicable rungs, then parse them into a feed.
 pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
-    let family = detect_family(bytes);
-    let dialect_declared = sniff_declared_dialect(bytes, family);
+    // The family of the bytes as they arrived. It decides the pre-sanitation
+    // guard and the declared-dialect sniff, both of which read those same raw
+    // bytes; the rungs below are chosen from a second, post-transcode reading.
+    let raw_family = detect_family(bytes);
+    let dialect_declared = sniff_declared_dialect(bytes, raw_family);
 
-    if family == DocFamily::Xml
+    if raw_family == DocFamily::Xml
         && let Err(reason) = refuse_internal_dtd(bytes)
     {
         tracing::debug!(stage = "refused-internal-dtd", %reason, "rss parse refused");
@@ -60,17 +63,6 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
         });
     }
 
-    // Rungs 2 and 3 repair XML lexis and would corrupt a JSON document (a naked
-    // `&` is legal inside a JSON string), so JSON climbs only the re-encode rung.
-    let rungs: &[Rung] = match family {
-        DocFamily::Xml => &[
-            (rung_reencode_utf8, Repair::ReencodedToUtf8),
-            (rung_strip_control_chars, Repair::StrippedControlChars),
-            (rung_escape_naked_ampersands, Repair::EscapedNakedAmpersands),
-        ],
-        DocFamily::Json => &[(rung_reencode_utf8, Repair::ReencodedToUtf8)],
-    };
-
     // Sanitation runs *before* the parse rather than as a failure-triggered
     // fallback. feed-rs does not reject malformed lexis — it succeeds while
     // silently discarding the offending element, so a single naked `&` costs the
@@ -79,8 +71,36 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
     // is safe because each one is a byte-level no-op on well-formed input (spec
     // AC16, pinned by the conservativeness test in `sanitize.rs`): a well-formed
     // document comes through byte-identical and parses exactly as it would have.
-    let mut current = bytes.to_vec();
     let mut repairs = Vec::new();
+
+    // Rung 1 applies to both families, and it runs first because the family is
+    // only reliable once it has. `detect_family` reads the first non-whitespace
+    // *byte*, which a UTF-16 document does not begin with: UTF-16LE `{` is
+    // `7B 00` and classifies as JSON by accident of byte order, while UTF-16BE
+    // `{` is `00 7B` — `0x00` is not ASCII whitespace, so the same document
+    // classifies as XML and rung 3 then escapes a naked `&` that was inside a
+    // JSON string all along, which is the corruption the `DocFamily::Json` arm
+    // exists to prevent. Deciding the remaining rungs from the transcoded bytes
+    // makes the two byte orders agree, and generalizes: any document rung 1
+    // rewrites is classified from what it turned out to be rather than from
+    // what its encoding made it look like.
+    let (mut current, changed) = rung_reencode_utf8(bytes);
+    if changed {
+        let repair = Repair::ReencodedToUtf8;
+        tracing::debug!(?repair, "rss sanitation rung changed bytes");
+        repairs.push(repair);
+    }
+
+    // Rungs 2 and 3 repair XML lexis and would corrupt a JSON document (a naked
+    // `&` is legal inside a JSON string), so JSON climbs only the re-encode rung.
+    let family = detect_family(&current);
+    let rungs: &[Rung] = match family {
+        DocFamily::Xml => &[
+            (rung_strip_control_chars, Repair::StrippedControlChars),
+            (rung_escape_naked_ampersands, Repair::EscapedNakedAmpersands),
+        ],
+        DocFamily::Json => &[],
+    };
     for (rung, repair) in rungs {
         let (next, changed) = rung(&current);
         current = next;
@@ -108,6 +128,9 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
     // to `max_response_bytes`, and it is the only guard that can refuse a
     // document whose prolog the rungs mangle past recognition (pinned by
     // `a_mislabelled_utf16_documents_subset_is_refused_before_the_rungs_run`).
+    //
+    // Gated on the post-transcode family, like the rungs: a document that only
+    // looked like XML before rung 1 ran has no prolog to scan for.
     if family == DocFamily::Xml
         && let Err(reason) = refuse_internal_dtd(&current)
     {
@@ -367,6 +390,11 @@ struct Enclosure {
 /// Atom `rel="enclosure"` links or JSON Feed attachments — both of those stay in
 /// `links` (a JSON attachment arrives `rel`-less but carries a `media_type`,
 /// which is what distinguishes it from the item's own URL).
+///
+/// Only one attachment fits the `enclosure_*` columns; an entry may carry
+/// several, and [`attachments`] folds the rest into `extensions_json` from
+/// both places, so which one this picks decides the columns and never whether
+/// a file is recorded at all.
 fn enclosure(entry: &Entry) -> Enclosure {
     if let Some(mc) = entry
         .media
@@ -399,14 +427,19 @@ fn enclosure(entry: &Entry) -> Enclosure {
     }
 }
 
-/// Whatever the `feed-rs` model exposes beyond the pinned columns, as a compact
-/// JSON object with deterministic key order. `None` when nothing is present.
+/// The non-core fields the `feed-rs` model exposes beyond the pinned columns,
+/// as a compact JSON object with deterministic key order. `None` when none are
+/// present.
+///
+/// A named set rather than a catch-all: `attachments`, `source`, `rights`, and
+/// `language` are what the model carries and this projects. Unknown namespaces
+/// are dropped at parse time and can never appear here.
 fn extensions_json(entry: &Entry, enclosure_from_media: bool) -> Option<String> {
     let mut fields: BTreeMap<&str, Value> = BTreeMap::new();
 
-    let media = remaining_media(entry, enclosure_from_media);
-    if !media.is_empty() {
-        fields.insert("media", Value::Array(media));
+    let attached = attachments(entry, enclosure_from_media);
+    if !attached.is_empty() {
+        fields.insert("attachments", Value::Array(attached));
     }
     if let Some(source) = non_blank(entry.source.as_deref()) {
         fields.insert("source", Value::String(source.to_string()));
@@ -428,47 +461,45 @@ fn non_blank(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// Media objects minus the single content already surfaced as the enclosure.
-fn remaining_media(entry: &Entry, enclosure_from_media: bool) -> Vec<Value> {
+/// Every attachment the entry carries beyond the one already surfaced in the
+/// `enclosure_*` columns, from both of the places `feed-rs` keeps them.
+///
+/// One element per downloadable file, whatever dialect it arrived in, because
+/// that is the concept these rows are about. `feed-rs` folds RSS 2.0
+/// `<enclosure>` and MediaRSS into `media` but leaves Atom `rel="enclosure"`
+/// links and JSON Feed `attachments[]` in `links`, so reading only `media`
+/// would keep the second rendition of a podcast published as RSS and drop it
+/// for the same podcast published as JSON Feed — one episode in several audio
+/// formats being the JSON Feed spec's own example for that array. Both fold
+/// here, in one shape, so the dialect does not decide whether the file is
+/// recorded.
+///
+/// MediaRSS carries per-object metadata a link cannot (`title`, `description`,
+/// `thumbnails`, `duration_secs`), and one object may hold several renditions
+/// under a single set of it. Flattening copies that metadata onto each
+/// rendition rather than nesting them, so every element is self-describing and
+/// the array has one shape. An object whose renditions were all consumed — the
+/// enclosure's own, say — still yields an element carrying its metadata alone,
+/// so nothing the model exposes is dropped.
+///
+/// Order is the model's: media objects first, then attachment links, each in
+/// document order.
+fn attachments(entry: &Entry, enclosure_from_media: bool) -> Vec<Value> {
     let mut enclosure_still_to_skip = enclosure_from_media;
-    let mut objects = Vec::new();
+    let mut out = Vec::new();
 
     for object in &entry.media {
-        let mut contents = Vec::new();
-        for c in &object.content {
-            if enclosure_still_to_skip && c.url.is_some() {
-                enclosure_still_to_skip = false;
-                continue;
-            }
-            let mut one: BTreeMap<&str, Value> = BTreeMap::new();
-            if let Some(url) = &c.url {
-                one.insert("url", Value::String(url.to_string()));
-            }
-            if let Some(ct) = &c.content_type {
-                one.insert("content_type", Value::String(ct.to_string()));
-            }
-            if let Some(size) = c.size {
-                one.insert("size", Value::from(size));
-            }
-            if !one.is_empty() {
-                contents.push(json!(one));
-            }
-        }
-
-        let mut fields: BTreeMap<&str, Value> = BTreeMap::new();
-        if !contents.is_empty() {
-            fields.insert("content", Value::Array(contents));
-        }
+        let mut meta: BTreeMap<&str, Value> = BTreeMap::new();
         if let Some(title) = non_blank(object.title.as_ref().map(|t| t.content.as_str())) {
-            fields.insert("title", Value::String(title.to_string()));
+            meta.insert("title", Value::String(title.to_string()));
         }
         if let Some(description) =
             non_blank(object.description.as_ref().map(|t| t.content.as_str()))
         {
-            fields.insert("description", Value::String(description.to_string()));
+            meta.insert("description", Value::String(description.to_string()));
         }
         if !object.thumbnails.is_empty() {
-            fields.insert(
+            meta.insert(
                 "thumbnails",
                 Value::Array(
                     object
@@ -480,14 +511,56 @@ fn remaining_media(entry: &Entry, enclosure_from_media: bool) -> Vec<Value> {
             );
         }
         if let Some(duration) = object.duration {
-            fields.insert("duration_secs", Value::from(duration.as_secs()));
+            meta.insert("duration_secs", Value::from(duration.as_secs()));
         }
 
-        if !fields.is_empty() {
-            objects.push(json!(fields));
+        let mut rendered = 0;
+        for c in &object.content {
+            if enclosure_still_to_skip && c.url.is_some() {
+                enclosure_still_to_skip = false;
+                continue;
+            }
+            let mut one = meta.clone();
+            if let Some(url) = &c.url {
+                one.insert("url", Value::String(url.to_string()));
+            }
+            if let Some(ct) = &c.content_type {
+                one.insert("content_type", Value::String(ct.to_string()));
+            }
+            if let Some(size) = c.size {
+                one.insert("size", Value::from(size));
+            }
+            if !one.is_empty() {
+                out.push(json!(one));
+                rendered += 1;
+            }
+        }
+
+        if rendered == 0 && !meta.is_empty() {
+            out.push(json!(meta));
         }
     }
-    objects
+
+    // The link path surfaced its first attachment only when `media` had none to
+    // give, so that is exactly when one is skipped here.
+    let mut link_still_to_skip = !enclosure_from_media;
+    for link in entry.links.iter().filter(|l| is_attachment(l)) {
+        if link_still_to_skip {
+            link_still_to_skip = false;
+            continue;
+        }
+        let mut one: BTreeMap<&str, Value> = BTreeMap::new();
+        one.insert("url", Value::String(link.href.clone()));
+        if let Some(ct) = &link.media_type {
+            one.insert("content_type", Value::String(ct.clone()));
+        }
+        if let Some(size) = link.length {
+            one.insert("size", Value::from(size));
+        }
+        out.push(json!(one));
+    }
+
+    out
 }
 
 /// Parse and extract in one call — the entry point the engine uses.
@@ -775,6 +848,66 @@ mod tests {
         assert!(ok.repairs.is_empty(), "{:?}", ok.repairs);
     }
 
+    /// A JSON Feed with a BOM, in the requested byte order. JSON Feed 1.1
+    /// mandates UTF-8, so this is a non-conforming document — rescuing one
+    /// without corrupting it is what the ladder is for.
+    fn utf16_json_feed(big_endian: bool) -> Vec<u8> {
+        let text =
+            r#"{"version":"https://jsonfeed.org/version/1.1","title":"Fish & Chips","items":[]}"#;
+        let mut doc = if big_endian {
+            vec![0xFE, 0xFF]
+        } else {
+            vec![0xFF, 0xFE]
+        };
+        for unit in text.encode_utf16() {
+            let bytes = if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            };
+            doc.extend_from_slice(&bytes);
+        }
+        doc
+    }
+
+    /// The family the rungs are chosen from is read after rung 1, not before,
+    /// so both UTF-16 byte orders take the JSON path. Read from the raw bytes,
+    /// UTF-16BE `{` is `00 7B` — `0x00` is not ASCII whitespace, so the first
+    /// byte decides XML, and rung 3 then escapes a naked `&` that was inside a
+    /// JSON string, silently turning the title into `Fish &amp; Chips` while
+    /// recording a repair the document never needed.
+    #[test]
+    fn utf16be_json_feed_title_survives_the_ladder() {
+        let ok = parse_with_ladder(&utf16_json_feed(true)).unwrap();
+
+        assert_eq!(ok.feed.title.as_ref().unwrap().content, "Fish & Chips");
+        assert_eq!(ok.dialect, "json-feed-1.x", "took the JSON path");
+        assert_eq!(
+            ok.repairs,
+            vec![Repair::ReencodedToUtf8],
+            "transcoding is the only repair this document needs; an \
+             `EscapedNakedAmpersands` here is both the corruption and a repair \
+             note attributed to a document that needed none"
+        );
+        // The declared-dialect sniff still reads the *raw* bytes, where an
+        // ASCII marker interleaved with NULs is not found. Known gap, separate
+        // from the family decision fixed here; this pins today's answer so that
+        // closing it has to update this line.
+        assert_eq!(ok.dialect_declared, None);
+    }
+
+    /// The same document in the other byte order, which classifies correctly
+    /// today only because UTF-16LE `{` is `7B 00` and the first byte happens to
+    /// be the `{` itself. Pinned so the two orders are held to one answer.
+    #[test]
+    fn utf16le_json_feed_title_survives_the_ladder() {
+        let ok = parse_with_ladder(&utf16_json_feed(false)).unwrap();
+
+        assert_eq!(ok.feed.title.as_ref().unwrap().content, "Fish & Chips");
+        assert_eq!(ok.dialect, "json-feed-1.x", "took the JSON path");
+        assert_eq!(ok.repairs, vec![Repair::ReencodedToUtf8]);
+    }
+
     #[test]
     fn rss2_maps_per_field_mapping_table() {
         let doc = br#"<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>
@@ -960,12 +1093,12 @@ mod tests {
 
     /// M1: the previous version of this test only asserted `.expect(...)`
     /// on the whole object, so a `<source>` alone (which never touches
-    /// `remaining_media`) satisfied it just as well as real leftover media
+    /// `attachments`) satisfied it just as well as a real leftover attachment
     /// would — the brief's most intricate rule went untested. This asserts
-    /// on the parsed JSON's actual keys instead, so `media` and `source`
+    /// on the parsed JSON's actual keys instead, so `attachments` and `source`
     /// can't stand in for each other.
     #[test]
-    fn extensions_json_media_key_is_only_leftover_media_beyond_the_enclosure() {
+    fn extensions_json_attachments_key_is_only_what_the_enclosure_left_over() {
         let doc = br#"<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
 <title>C</title><link>https://e.com</link><description>D</description>
 <item><guid>1</guid><title>T</title>
@@ -981,21 +1114,123 @@ mod tests {
         let obj = value.as_object().expect("extensions_json is a JSON object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>(),
-            vec!["media"],
-            "only the leftover media, not source/rights/language: {ext}"
+            vec!["attachments"],
+            "only the leftover attachment, not source/rights/language: {ext}"
         );
-        let media = obj["media"].as_array().expect("media is an array");
-        assert_eq!(media.len(), 1, "the enclosure's own content is excluded");
+        let attachments = obj["attachments"]
+            .as_array()
+            .expect("attachments is an array");
         assert_eq!(
-            media[0]["content"][0]["url"], "https://e.com/b.jpg",
+            attachments.len(),
+            1,
+            "the enclosure's own content is excluded"
+        );
+        assert_eq!(
+            attachments[0]["url"], "https://e.com/b.jpg",
             "the *other* media:content survives, not the enclosure's: {ext}"
         );
+        assert_eq!(attachments[0]["content_type"], "image/jpeg");
+        assert_eq!(attachments[0]["size"], 2);
         assert_eq!(ext, serde_json::to_string(&value).unwrap(), "keys sorted");
     }
 
-    /// M1: `<source>` alone — with no media beyond the single enclosure —
+    /// The same two-attachment entry in a dialect whose extras `feed-rs` keeps
+    /// in `links` rather than `media`: one episode in two audio formats, the
+    /// JSON Feed spec's own example for the array. Reading only `media` kept
+    /// the second rendition for RSS and dropped it here, with nothing in any
+    /// column recording that it existed.
+    #[test]
+    fn json_feed_second_attachment_survives_in_extensions() {
+        let doc = br#"{"version":"https://jsonfeed.org/version/1.1","title":"C",
+"items":[{"id":"1","title":"Ep",
+"attachments":[{"url":"https://e.com/ep.mp3","mime_type":"audio/mpeg","size_in_bytes":7},
+{"url":"https://e.com/ep.m4a","mime_type":"audio/mp4","size_in_bytes":9}]}]}"#;
+        let parsed = parse_feed_document(doc, None).unwrap();
+        let it = &parsed.items[0];
+
+        assert_eq!(it.enclosure_url.as_deref(), Some("https://e.com/ep.mp3"));
+        let value: serde_json::Value =
+            serde_json::from_str(it.extensions_json.as_deref().expect("second attachment"))
+                .expect("valid JSON");
+        let attachments = value["attachments"]
+            .as_array()
+            .expect("attachments is an array");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "only the one the columns did not take"
+        );
+        assert_eq!(attachments[0]["url"], "https://e.com/ep.m4a");
+        assert_eq!(attachments[0]["content_type"], "audio/mp4");
+        assert_eq!(attachments[0]["size"], 9);
+    }
+
+    /// Atom keeps its extra attachments in `links` too, so the same entry
+    /// published as Atom records the same set of files.
+    #[test]
+    fn atom_second_enclosure_link_survives_in_extensions() {
+        let doc = br#"<feed xmlns="http://www.w3.org/2005/Atom">
+<title>C</title><updated>2026-07-20T10:00:00Z</updated>
+<entry><id>1</id><title>Ep</title>
+<link rel="enclosure" href="https://e.com/ep.mp3" type="audio/mpeg" length="7"/>
+<link rel="enclosure" href="https://e.com/ep.m4a" type="audio/mp4" length="9"/>
+</entry></feed>"#;
+        let parsed = parse_feed_document(doc, None).unwrap();
+        let it = &parsed.items[0];
+
+        assert_eq!(it.enclosure_url.as_deref(), Some("https://e.com/ep.mp3"));
+        let value: serde_json::Value =
+            serde_json::from_str(it.extensions_json.as_deref().expect("second attachment"))
+                .expect("valid JSON");
+        let attachments = value["attachments"]
+            .as_array()
+            .expect("attachments is an array");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["url"], "https://e.com/ep.m4a");
+        assert_eq!(attachments[0]["content_type"], "audio/mp4");
+        assert_eq!(attachments[0]["size"], 9);
+    }
+
+    /// When `media` supplies the enclosure, no attachment link was surfaced —
+    /// so every one of them is left over, not all but the first. Getting this
+    /// backwards would silently drop the first link of any entry carrying both
+    /// kinds.
+    #[test]
+    fn a_media_sourced_enclosure_leaves_every_attachment_link_over() {
+        let enclosure_link = |href: &str, media_type: &str| Link {
+            href: href.to_string(),
+            rel: Some("enclosure".to_string()),
+            media_type: Some(media_type.to_string()),
+            href_lang: None,
+            title: None,
+            length: None,
+        };
+        let entry = Entry {
+            links: vec![
+                enclosure_link("https://e.com/one.mp3", "audio/mpeg"),
+                enclosure_link("https://e.com/two.m4a", "audio/mp4"),
+            ],
+            ..Entry::default()
+        };
+        let folded = attachments(&entry, true);
+        assert_eq!(
+            folded.len(),
+            2,
+            "media took the columns, so both links remain"
+        );
+        assert_eq!(folded[0]["url"], "https://e.com/one.mp3");
+        assert_eq!(folded[1]["url"], "https://e.com/two.m4a");
+
+        // The same entry with no media to surface: the first link took the
+        // columns and only the second is left.
+        let folded = attachments(&entry, false);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0]["url"], "https://e.com/two.m4a");
+    }
+
+    /// M1: `<source>` alone — with no attachment beyond the single enclosure —
     /// was meant to populate `extensions_json` with a `source` key and *no*
-    /// `media` key, distinguishing this from the media-key test above. But
+    /// `attachments` key, distinguishing this from the test above. But
     /// `entry.source` (the field this crate's `extensions_json` reads) is
     /// never actually assigned by feed-rs 2.4.0, for *any* dialect: there is
     /// no `.source =` anywhere under `feed-rs-2.4.0/src/parser/**` (checked
@@ -1011,19 +1246,19 @@ mod tests {
     /// mapping this crate's own code performs so the property is still
     /// covered if a future feed-rs starts populating the field.
     #[test]
-    fn extensions_json_source_key_present_without_a_media_key() {
+    fn extensions_json_source_key_present_without_an_attachments_key() {
         let entry = Entry {
             source: Some("Origin".to_string()),
             ..Entry::default()
         };
         let ext = extensions_json(&entry, false)
-            .expect("source populates extensions even with no leftover media");
+            .expect("source populates extensions even with no leftover attachment");
         let value: serde_json::Value = serde_json::from_str(&ext).expect("valid JSON");
         let obj = value.as_object().expect("extensions_json is a JSON object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>(),
             vec!["source"],
-            "source only, no media key when nothing is left over: {ext}"
+            "source only, no attachments key when nothing is left over: {ext}"
         );
         assert_eq!(obj["source"], "Origin");
     }
