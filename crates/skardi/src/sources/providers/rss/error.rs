@@ -25,9 +25,12 @@ use thiserror::Error;
 ///   `max_response_bytes`.
 ///
 /// The columns among those are held to it structurally by
-/// [`super::cache::FeedObservation::capped`], the one boundary every
-/// observation the cache retains passes through. The two sites that land in
-/// later phases of this stack (`engine.rs`, `parse.rs`) are not present yet.
+/// `FeedObservation::capped` (`cache.rs`), the one boundary every observation
+/// the cache retains passes through. Named in code font, not linked: this
+/// module compiles without the `rss` feature while `cache` exists only behind
+/// it, so an intra-doc link here is broken in exactly the builds this module
+/// stays parseable for. The two sites that land in later phases of this stack
+/// (`engine.rs`, `parse.rs`) are not present yet.
 ///
 /// A bound on *length* only. What content may reach `feeds.last_error` at all is
 /// a separate question, to be argued in `engine.rs`'s module doc when it lands.
@@ -39,8 +42,9 @@ use thiserror::Error;
 pub const MAX_ERROR_CHARS: usize = 512;
 
 /// Length cap, in characters, on the feed-authored *prose* fields —
-/// `feeds.title` and `feeds.description` — that enter a
-/// [`super::cache::FeedObservation`].
+/// `feeds.title` and `feeds.description` — that enter a `FeedObservation`
+/// (`cache.rs`; code font rather than a link for the reason given on
+/// [`MAX_ERROR_CHARS`]).
 ///
 /// Deliberately looser than [`MAX_ERROR_CHARS`]. Those two columns are not
 /// diagnostics: they carry the feed's own editorial text, where a channel
