@@ -16,7 +16,7 @@
 //! rss:
 //!   feeds:
 //!     - url: https://blog.rust-lang.org/feed.xml
-//!       name: rust-blog            # optional; defaults to the URL
+//!       name: rust-blog            # optional; defaults to the URL minus credentials/query
 //!     - url: https://this-week-in-rust.org/rss.xml
 //!   # or: opml: subscriptions.opml # mutually exclusive with feeds:
 //!   ttl_seconds: 900               # 0 = always live
@@ -170,7 +170,8 @@ pub struct FeedSubscription {
     pub url: String,
 
     /// Human-readable subscription name, surfaced as the `feed` column in
-    /// `main.items`/`main.feeds`. Defaults to `url` when omitted, empty, or
+    /// `main.items`/`main.feeds`. Defaults to `url` stripped of credentials,
+    /// query, and fragment (see `default_name`) when omitted, empty, or
     /// whitespace-only — the same "blank is absent" normalization the
     /// `user_agent` check applies, and what a title-less OPML outline needs:
     /// OPML 2.0 requires the `text` attribute, so exporters emit `text=""`
@@ -250,10 +251,45 @@ fn invalid_config(reason: impl Into<String>) -> RssError {
     }
 }
 
+/// `parsed` re-serialized with userinfo, query, and fragment stripped — the
+/// three parts of a URL that can carry a private token. One definition
+/// shared by name defaulting ([`default_name`]) and the fetcher's error
+/// redaction (`fetch.rs`), so "the URL minus its secrets" cannot drift
+/// between the two.
+pub(crate) fn redact_url(parsed: &Url) -> String {
+    let mut stripped = parsed.clone();
+    // Infallible for the URLs that reach here: `set_username`/`set_password`
+    // refuse only cannot-be-a-base or host-less URLs, and every caller
+    // starts from a parsed http/https URL, which cannot parse without a
+    // host.
+    let _ = stripped.set_username("");
+    let _ = stripped.set_password(None);
+    stripped.set_query(None);
+    stripped.set_fragment(None);
+    String::from(stripped)
+}
+
+/// The name an unnamed subscription gets: its URL with userinfo, query, and
+/// fragment stripped.
+///
+/// The name is public surface — the `feed` column in `items`/`feeds`, the
+/// pruning key, a field on `info`-and-above log events — while a
+/// subscription URL can carry a private token in exactly those three parts
+/// (`user:pass@`, `?token=…`, `#…`). Stripping them here means a secret
+/// never becomes the feed's identity, however the subscription was written.
+/// What remains (scheme, host, path) is stable across config reordering and
+/// self-describing, which is what an identity needs to be. Serialized from
+/// the *parsed* URL, so the name is also normalized (lowercased host,
+/// default port dropped) rather than an echo of the raw string.
+fn default_name(parsed: &Url) -> String {
+    redact_url(parsed)
+}
+
 /// Check and resolve a flat `(url, name)` subscription list — the single
 /// implementation of the per-subscription rules both input forms share: a
 /// non-empty list, name defaulting (an omitted, empty, or whitespace-only
-/// name falls back to the URL — see [`FeedSubscription::name`]),
+/// name falls back to the URL stripped of credentials, query, and fragment
+/// — see [`default_name`]),
 /// http/https scheme validation, and effective-name uniqueness.
 ///
 /// Run twice by design, against the same rules both times:
@@ -290,12 +326,24 @@ pub(crate) fn finalize(
         // two such outlines, a `duplicate subscription name ''` the operator
         // cannot grep their OPML for. Same normalization as the
         // `user_agent` check. Non-blank names stay exactly as written.
-        let effective_name = sub_name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| url.clone());
+        let (effective_name, name_was_derived) =
+            match sub_name.filter(|name| !name.trim().is_empty()) {
+                Some(name) => (name, false),
+                None => (default_name(&parsed), true),
+            };
         if !seen_names.insert(effective_name.clone()) {
+            // A derived-name collision can arise from two *distinct* URLs
+            // (same endpoint, different query), which the plain message
+            // would make baffling — the user wrote no duplicate anywhere.
+            let hint = if name_was_derived {
+                " (an unnamed subscription is named by its URL stripped of \
+                 credentials, query, and fragment; set an explicit `name:` \
+                 to keep both)"
+            } else {
+                ""
+            };
             return Err(invalid_config(format!(
-                "duplicate subscription name '{effective_name}'"
+                "duplicate subscription name '{effective_name}'{hint}"
             )));
         }
 
@@ -426,6 +474,39 @@ feeds:
             err.to_string().contains("duplicate subscription name"),
             "{err}"
         );
+    }
+
+    /// Userinfo, query, and fragment are exactly the URL parts that can
+    /// carry a credential, so none of them may become the feed's public
+    /// name — the name reaches the `feed` column and `warn`-level logs.
+    #[test]
+    fn an_unnamed_subscription_is_named_by_its_stripped_url() {
+        let subs = finalize(vec![(
+            "https://user:pass@news.example/feed.xml?token=secret#frag".to_string(),
+            None,
+        )])
+        .unwrap();
+        assert_eq!(subs[0].name, "https://news.example/feed.xml");
+        // Only the *name* is stripped; the fetch target keeps the full URL.
+        assert!(subs[0].url.contains("token=secret"));
+    }
+
+    /// Two distinct URLs can now share a derived name (same endpoint,
+    /// different token). The rejection must say how to resolve it, because
+    /// the user wrote no duplicate anywhere they can see.
+    #[test]
+    fn unnamed_subscriptions_differing_only_by_query_collide_with_a_hint() {
+        let err = finalize(vec![
+            (
+                "https://news.example/feed.xml?token=alice".to_string(),
+                None,
+            ),
+            ("https://news.example/feed.xml?token=bob".to_string(), None),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate subscription name"), "{msg}");
+        assert!(msg.contains("explicit `name:`"), "{msg}");
     }
 
     #[test]

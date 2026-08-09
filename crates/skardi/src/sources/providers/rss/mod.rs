@@ -114,8 +114,10 @@ pub const RSS_SURFACE_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSubscription {
     /// Effective subscription name: an explicit `name`/`text`/`title`, or
-    /// the feed's URL when none was given. Unique across the whole
-    /// resolved list.
+    /// the feed's URL stripped of credentials, query, and fragment when
+    /// none was given — the name is public surface (the `feed` column,
+    /// log fields), and those are the URL parts that can carry a private
+    /// token. Unique across the whole resolved list.
     pub name: String,
     /// Feed URL; already checked to be `http://` or `https://`.
     pub url: String,

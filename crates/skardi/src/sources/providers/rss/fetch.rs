@@ -117,6 +117,7 @@
 //! window.
 
 use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -131,6 +132,7 @@ use reqwest::{Response, StatusCode};
 use thiserror::Error;
 use url::{Host, Url};
 
+use super::config::redact_url;
 use super::egress::{AllowAll, EgressDenied, EgressPolicy, PolicyDns};
 use super::error::RssError;
 use crate::util::http::parse_retry_after;
@@ -341,8 +343,13 @@ impl FeedFetcher {
     /// Parse the feed URL and apply [`FeedFetcher::check_hop_target`] to it
     /// — the same checks every redirect target gets.
     fn parse_and_check(&self, url: &str) -> Result<Url, FetchError> {
+        // The unparsed URL is not quoted: it can carry a private query token,
+        // and this string reaches `feeds.last_error` and the degraded-feed
+        // `warn` (whose `feed` field already locates the subscription).
+        // Config validation runs the same parse at load, so this arm is
+        // defence in depth, not the primary report.
         let parsed = Url::parse(url).map_err(|e| FetchError::InvalidUrl {
-            reason: format!("'{url}' is not a valid URL: {e}"),
+            reason: e.to_string(),
         })?;
         self.check_hop_target(&parsed)?;
         Ok(parsed)
@@ -354,9 +361,14 @@ impl FeedFetcher {
     /// IP-literal target on its own, on any hop, so every resolved redirect
     /// target is re-checked here before the next request is built.
     fn resolve_redirect_target(&self, current: &Url, location: &str) -> Result<Url, FetchError> {
+        // `current` is quoted redacted: a hop URL can carry a private query
+        // token, and this string reaches `feeds.last_error` and `warn` logs.
+        // The location is the server's own header, kept verbatim — it is the
+        // datum being diagnosed.
         let target = current.join(location).map_err(|e| FetchError::InvalidUrl {
             reason: format!(
-                "redirect location '{location}' does not resolve against '{current}': {e}"
+                "redirect location '{location}' does not resolve against '{}': {e}",
+                redact_url(current)
             ),
         })?;
         self.check_hop_target(&target)?;
@@ -525,7 +537,7 @@ impl FeedFetcher {
                         }
                     } else {
                         FetchError::Transport {
-                            reason: e.to_string(),
+                            reason: transport_reason(e),
                         }
                     };
                     if attempt + 1 >= MAX_ATTEMPTS {
@@ -566,7 +578,7 @@ impl FeedFetcher {
                     }
                 } else {
                     FetchError::Transport {
-                        reason: format!("failed to read response body: {e}"),
+                        reason: format!("failed to read response body: {}", transport_reason(e)),
                     }
                 }
             })?;
@@ -633,6 +645,31 @@ fn header_string(resp: &Response, name: HeaderName) -> Option<String> {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+/// `reason` for a [`FetchError::Transport`]: the reqwest error with its URL
+/// dropped and its `source()` chain folded in.
+///
+/// Both halves matter, for the same destination: this string is stored
+/// verbatim as `feeds.last_error` and logged at `warn` when a feed
+/// degrades. reqwest's `Display` appends the request URL (`" for url (…)"`
+/// — reqwest-0.12.28 `src/error.rs`, the `Display` impl), and on a
+/// redirected fetch that URL is the *hop's*, i.e. wherever the server's
+/// `Location` pointed; either way it can carry a private query token, so it
+/// must not ride along. And reqwest's `Display` names only the error's kind
+/// — the cause ("Connection refused", a DNS failure) lives in the
+/// `source()` chain — so dropping the URL without folding the chain in
+/// would leave nothing to diagnose with. What the chain contributes is at
+/// most a host or an ip:port, never a query string or userinfo.
+fn transport_reason(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut reason = e.to_string();
+    let mut source = StdError::source(&e);
+    while let Some(cause) = source {
+        let _ = write!(reason, ": {cause}");
+        source = cause.source();
+    }
+    reason
 }
 
 /// Walk a failed request's source chain for an [`EgressDenied`] that
@@ -963,6 +1000,78 @@ mod tests {
             "a mid-body connection loss must be retried within the hop's \
              attempt budget, not treated as terminal"
         );
+    }
+
+    /// A transport error's string reaches `feeds.last_error` and the
+    /// degraded-feed `warn`, so it must carry the cause but never the URL —
+    /// a feed URL's query can be a private token. Without stripping,
+    /// reqwest's `Display` appends ` for url (…)` with the query intact.
+    #[tokio::test]
+    async fn a_transport_error_names_the_cause_but_never_the_url() {
+        // Bind-then-drop yields a port that refuses connections.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let f = test_fetcher();
+        let err = f
+            .fetch(
+                &format!("http://127.0.0.1:{port}/feed.xml?token=secret"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Transport { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("token=secret") && !msg.contains("for url"),
+            "reqwest's URL clause must be stripped: {msg}"
+        );
+        assert!(
+            msg.contains("refused") || msg.contains("connect"),
+            "the folded source chain carries the actual cause: {msg}"
+        );
+    }
+
+    /// A `Location` that cannot be resolved is quoted verbatim — it is the
+    /// server's own header and the datum being diagnosed — but the current
+    /// hop's URL is quoted with its query stripped: that query can be a
+    /// private token, and the string reaches `feeds.last_error` and `warn`.
+    #[tokio::test]
+    async fn an_unresolvable_location_redacts_the_current_url() {
+        let server = MockFeedServer::start(|_req| {
+            // `http://` alone cannot parse (a special scheme requires a
+            // host), so joining it against any base fails.
+            MockResponse::status(302).with_header("location", "http://")
+        })
+        .await;
+        let f = test_fetcher();
+        let url = format!("{}/feed.xml?token=secret", server.url());
+        let err = f.fetch(&url, None).await.unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(!msg.contains("token=secret"), "{msg}");
+        assert!(
+            msg.contains("redirect location 'http://'"),
+            "the offending location itself is the diagnostic: {msg}"
+        );
+        assert!(
+            msg.contains("/feed.xml'"),
+            "the redacted current URL still locates the hop: {msg}"
+        );
+    }
+
+    /// An unparseable feed URL is not echoed into the error: even a string
+    /// that fails `Url::parse` can carry a readable `?token=…`, and config
+    /// validation already reports parse failures at load with the URL in
+    /// hand — this arm only feeds `last_error` and logs.
+    #[tokio::test]
+    async fn an_unparseable_url_is_not_echoed_into_the_error() {
+        let f = test_fetcher();
+        let err = f.fetch("not a url?token=secret", None).await.unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(!msg.contains("token=secret"), "{msg}");
     }
 
     #[tokio::test]

@@ -258,7 +258,7 @@ spec:
       rss:
         feeds:
           - url: https://blog.rust-lang.org/feed.xml
-            name: rust-blog            # optional; defaults to the URL
+            name: rust-blog            # optional; defaults to the URL minus credentials/query
           - url: https://this-week-in-rust.org/rss.xml
         # or: opml: subscriptions.opml # mutually exclusive with feeds:
         ttl_seconds: 900               # 0 = always live
@@ -320,7 +320,7 @@ FROM news.main.items;
 
 | Column | Arrow type | Nullability | Notes |
 |---|---|---|---|
-| `name` | `Utf8` | not null | configured name; defaults to URL; unique |
+| `name` | `Utf8` | not null | configured name; defaults to the URL stripped of credentials, query, and fragment (a subscription URL can carry a private token, and the name is public surface); unique |
 | `url` | `Utf8` | not null | subscription URL |
 | `title` | `Utf8` | nullable | wire title, once fetched |
 | `site_url` | `Utf8` | nullable | feed's HTML alternate |

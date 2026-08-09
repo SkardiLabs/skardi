@@ -49,6 +49,13 @@
 //! writing health state, so the feed behaves exactly like one the plan
 //! pruned.
 //!
+//! ## Parsing runs off the worker threads
+//!
+//! `parse_feed_document` is synchronous CPU over attacker-authored bytes.
+//! [`parse_off_worker`] moves it to the blocking pool and fuses it with
+//! [`PARSE_TIMEOUT`] — its doc has the full account. The politeness permit,
+//! held across that await, is what bounds how many parses run at once.
+//!
 //! ## Feed keys never come from a query
 //!
 //! `MemoryFeedCache` keys entries by `&str` and bounds observation-only
@@ -163,11 +170,37 @@
 //!   feed URL, or a redirect `Location`. A `Location` is attacker-influenced
 //!   but is not body content, and the cap bounds it.
 //!
-//! ## No in-flight coalescing
+//! ## No in-flight coalescing, but generation-checked commits
 //!
 //! Two concurrent scans that both find the same feed expired can both fetch
-//! it. That is a documented future extension, and `open_connector`'s cache
-//! has the same property.
+//! it: fetches are query-driven, queries are not coordinated, and
+//! `open_connector`'s cache set the same precedent. What a double fetch is
+//! *not* allowed to do is corrupt the cache. Each commit carries the
+//! generation of the snapshot its fetch was decided from, and a commit that
+//! lost the race is dropped instead of applied in completion order —
+//! `cache.rs`'s trait doc has the rules. Without that gate a slower, older
+//! `200` could overwrite a newer window wholesale, a `304` could stamp
+//! `revalidated` on a window its validators never came from, and a slow
+//! failure could arm the fuse against a window a faster fetch just
+//! refreshed.
+//!
+//! The alternative — per-feed *singleflight*, where the second scan awaits
+//! the first's result instead of fetching — remains a deliberate
+//! non-feature. Recorded here so a future decision starts from the
+//! trade-offs rather than rediscovering them:
+//!
+//! - **What it buys**: no duplicate `GET` (politeness toward feed servers —
+//!   the one cost the generation gate does not remove), and concurrent
+//!   scans serving one agreed window instead of two legitimate reads.
+//! - **What it costs**: an in-flight registry keyed by feed, and leader
+//!   hand-off on cancellation — a leader dropped by its scan deadline or
+//!   LIMIT gate must not strand its waiters, and waiter-becomes-leader
+//!   under drop-at-any-await is easy to get subtly wrong. It also couples
+//!   scans: one query's partition inherits the tail latency of another
+//!   query's fetch.
+//! - **When to revisit**: duplicate fetches showing up in feed-server logs
+//!   or politeness complaints — not cache correctness, which the
+//!   generation gate already owns.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -185,7 +218,7 @@ use super::config::RssConfig;
 use super::egress::EgressPolicy;
 use super::error::{MAX_ERROR_CHARS, RssError, truncate};
 use super::fetch::{FeedFetcher, FetchError, FetchOutcome, Validators};
-use super::parse::{ParsedDocument, parse_feed_document};
+use super::parse::{ParseFailure, ParsedDocument, parse_feed_document};
 use super::schema::{FeedsRow, build_feeds_batch, build_items_batch, with_window_status};
 
 /// Byte budget for the window cache, shared across every feed of one source.
@@ -204,6 +237,22 @@ const WINDOW_ENTRY_HEADROOM: usize = 8;
 /// meaningful feed TTL, so clamping here costs nothing and keeps the arming
 /// arithmetic in a range the platform can represent.
 const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Ceiling on one feed's parse before the scan abandons it.
+///
+/// [`parse_off_worker`] runs the parse on the blocking pool, so a slow parse
+/// no longer pins a runtime worker — but the partition still awaits the
+/// result, and without a fuse a pathological document would hold its
+/// partition (and its politeness permit) for the rest of the scan deadline.
+/// Parsing is linear in a capped body (internal DTDs are refused, HTML
+/// deeper than `convert::MAX_HTML_DEPTH` degrades to tag-stripping), and a
+/// legitimate `max_response_bytes`-sized document parses in well under a
+/// second — so ten seconds is not a tuning knob but headroom: anything that
+/// reaches it is hostile or broken, most plausibly a super-linear corner in
+/// the parsing stack this crate does not own. Negative caching
+/// ([`failure_fuse`]) then keeps the offender from being re-parsed on every
+/// scan.
+const PARSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The freshness state machine for one `rss` data source.
 pub struct RssEngine {
@@ -333,9 +382,11 @@ impl RssEngine {
         };
         let started = Instant::now();
         let (batch, log) = self.serve_subscription(sub, launch_gate).await;
-        // One record per serve. Feed URLs are safe to log; response bodies
-        // are never logged, and `bytes`/`rows` describe the body without
-        // quoting it.
+        // One record per serve. This `debug` line is the only place a feed
+        // URL is logged — a subscription URL can carry a private query
+        // token, so it stays out of `info`-and-above events (the degraded
+        // `warn` names the feed, not the URL). Response bodies are never
+        // logged, and `bytes`/`rows` describe the body without quoting it.
         tracing::debug!(
             source = %self.source_name,
             feed = %sub.name,
@@ -422,20 +473,21 @@ impl RssEngine {
             Ok(FetchOutcome::NotModified { http_status }) => {
                 self.cache.record_not_modified(
                     &sub.name,
+                    snapshot.generation,
                     http_status,
                     now_ms(),
                     arm(Instant::now(), self.ttl),
                 );
                 // The `304` confirms exactly the window whose validators this
                 // attempt sent, which is the one in `snapshot` — read before
-                // the permit, so with no in-flight coalescing a concurrent
-                // scan may have replaced the cached window in between. This
-                // serve then emits the older rows while `feeds.item_count`,
-                // read from the observation, describes the newer ones. That is
-                // the one observable consequence of allowing double fetches:
-                // serving the window this `304` actually vouches for is more
-                // defensible than stamping `revalidated` on rows no server
-                // confirmed, and both windows are legitimate reads of the feed.
+                // the permit, so a concurrent scan may have committed a
+                // different window in between. The generation carried above
+                // makes this commit a no-op in that case: `revalidated` must
+                // not be stamped on rows this `304` never saw (the cache
+                // trait's commit-generation doc has the rules). This serve
+                // still emits its own snapshot's rows either way — they are a
+                // real window the `304` really did vouch for, and both
+                // windows are legitimate reads of the feed.
                 let batch = snapshot
                     .window
                     .as_ref()
@@ -460,11 +512,12 @@ impl RssEngine {
                 content_type,
             }) => {
                 let bytes = body.len();
-                match parse_feed_document(&body, content_type.as_deref()) {
+                match parse_off_worker(body, content_type, PARSE_TIMEOUT).await {
                     Ok(document) => {
                         let notes = document.conformance_notes.len();
                         let batch = self.record_fresh_window(
                             sub,
+                            snapshot.generation,
                             document,
                             http_status,
                             etag,
@@ -488,6 +541,7 @@ impl RssEngine {
                     // read off the raw bytes before parsing.
                     Err(failure) => self.degrade(
                         sub,
+                        snapshot.generation,
                         Some(http_status),
                         parse_error_message(failure.stage, &failure.reason),
                         failure.dialect_declared,
@@ -502,6 +556,7 @@ impl RssEngine {
                 };
                 self.degrade(
                     sub,
+                    snapshot.generation,
                     http_status,
                     truncate(&error.to_string(), MAX_ERROR_CHARS),
                     None,
@@ -514,9 +569,16 @@ impl RssEngine {
     /// Store a freshly parsed window and its observation, and hand back the
     /// batch to serve. `build_items_batch` already stamps `fresh`, so the
     /// served batch needs no relabelling.
+    ///
+    /// The batch is built — and returned — before the cache commit, on
+    /// purpose: `record_success` may drop the commit as stale (the cache
+    /// trait's commit-generation doc), but this serve's fetch was a
+    /// legitimate read of the feed either way, so its own query is still
+    /// answered from what it fetched.
     fn record_fresh_window(
         &self,
         sub: &ResolvedSubscription,
+        expected_generation: u64,
         document: ParsedDocument,
         http_status: u16,
         etag: Option<String>,
@@ -541,6 +603,7 @@ impl RssEngine {
         };
         self.cache.record_success(
             &sub.name,
+            expected_generation,
             CachedWindow {
                 batch: batch.clone(),
                 etag,
@@ -562,6 +625,7 @@ impl RssEngine {
     fn degrade(
         &self,
         sub: &ResolvedSubscription,
+        expected_generation: u64,
         http_status: Option<u16>,
         error: String,
         dialect_declared: Option<String>,
@@ -569,16 +633,20 @@ impl RssEngine {
     ) -> (Option<RecordBatch>, ServeLog) {
         self.cache.record_failure(
             &sub.name,
+            expected_generation,
             http_status,
             error.clone(),
             dialect_declared,
             now_ms(),
             arm(Instant::now(), failure_fuse(self.ttl)),
         );
+        // No `url` field: a subscription URL can carry a private query
+        // token, and this event fires at `warn` — a level ordinary
+        // deployments export. `source` + `feed` locate the subscription;
+        // the URL is one `feeds.url` lookup away.
         tracing::warn!(
             source = %self.source_name,
             feed = %sub.name,
-            url = %sub.url,
             %error,
             "rss feed degraded"
         );
@@ -586,7 +654,11 @@ impl RssEngine {
         // Read back after recording: `record_failure` is what decides
         // between `StaleError` (a window survived to serve) and `Error` (none
         // did), so the status stamped on the rows comes from the cache rather
-        // than from a second guess here.
+        // than from a second guess here. If the commit was dropped as stale
+        // (the cache trait's commit-generation doc), the read-back returns
+        // whatever the intervening commit left — e.g. a concurrent fetch's
+        // fresh window — and serving that freshest known state is exactly
+        // right for a serve whose own attempt failed.
         let snapshot = self.cache.snapshot(&sub.name, Instant::now());
         let batch = snapshot
             .window
@@ -726,6 +798,56 @@ fn window_lost(snapshot: &FeedSnapshot) -> bool {
 /// The `feeds.last_error` text for a failed parse: the stage that gave up plus
 /// the parser's own reason.
 ///
+/// Run `parse_feed_document` on the blocking pool, fused by `fuse`
+/// (production passes [`PARSE_TIMEOUT`]).
+///
+/// The parse is synchronous CPU over an attacker-authored body of up to
+/// `max_response_bytes` — sanitation, XML/JSON parsing, and per-item
+/// HTML→Markdown. Run inline it pins a runtime worker for its whole
+/// duration: the runtime schedules cooperatively, so between two `.await`s
+/// neither the exec layer's `timeout_at` nor any other task sharing the
+/// runtime (the server's query handling included) gets a look-in, and
+/// `max_concurrent` simultaneous parses can sit on that many workers at
+/// once. On the blocking pool the workers stay free, and this `.await` is a
+/// real yield point the scan deadline can fire at. Concurrency needs no new
+/// bound: the caller holds its politeness permit across this await, so at
+/// most `max_concurrent` parses run per source.
+///
+/// Both synthesized failures degrade the one feed, preserving the engine's
+/// no-`Err` contract:
+/// - `"timeout"`: the fuse elapsed. The partition moves on; the detached
+///   parse runs to completion on its blocking thread and its result is
+///   dropped — a running thread cannot be preempted, so the fuse bounds the
+///   *stall*, while the burn it abandons is itself bounded by parse being
+///   linear in a capped body.
+/// - `"panic"`: `parse_feed_document` is designed not to panic on any
+///   input; if it ever does, the feed degrades instead of the scan
+///   unwinding.
+async fn parse_off_worker(
+    body: Vec<u8>,
+    content_type: Option<String>,
+    fuse: Duration,
+) -> Result<ParsedDocument, ParseFailure> {
+    let parse =
+        tokio::task::spawn_blocking(move || parse_feed_document(&body, content_type.as_deref()));
+    match tokio::time::timeout(fuse, parse).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_error)) => Err(ParseFailure {
+            stage: "panic",
+            reason: format!("feed parse aborted: {join_error}"),
+            dialect_declared: None,
+        }),
+        Err(_elapsed) => Err(ParseFailure {
+            stage: "timeout",
+            reason: format!(
+                "feed parse did not finish within {}s; abandoned",
+                fuse.as_secs()
+            ),
+            dialect_declared: None,
+        }),
+    }
+}
+
 /// The cap applies to the *composed* string, not just to `reason`. Bounding the
 /// reason alone would let the `"parse failed at …: "` prefix push the stored
 /// value past [`MAX_ERROR_CHARS`], which is a cap on what lands in the column.
@@ -833,28 +955,36 @@ mod tests {
         fn record_success(
             &self,
             feed: &str,
+            expected_generation: u64,
             window: CachedWindow,
             observation: FeedObservation,
             armed_until: Instant,
         ) {
             self.0
-                .record_success(feed, window, observation, armed_until);
+                .record_success(feed, expected_generation, window, observation, armed_until);
         }
 
         fn record_not_modified(
             &self,
             feed: &str,
+            expected_generation: u64,
             http_status: u16,
             last_fetch_ms: i64,
             armed_until: Instant,
         ) {
-            self.0
-                .record_not_modified(feed, http_status, last_fetch_ms, armed_until);
+            self.0.record_not_modified(
+                feed,
+                expected_generation,
+                http_status,
+                last_fetch_ms,
+                armed_until,
+            );
         }
 
         fn record_failure(
             &self,
             feed: &str,
+            expected_generation: u64,
             http_status: Option<u16>,
             error: String,
             dialect_declared: Option<String>,
@@ -863,6 +993,7 @@ mod tests {
         ) {
             self.0.record_failure(
                 feed,
+                expected_generation,
                 http_status,
                 error,
                 dialect_declared,
@@ -905,28 +1036,36 @@ mod tests {
         fn record_success(
             &self,
             feed: &str,
+            expected_generation: u64,
             window: CachedWindow,
             observation: FeedObservation,
             armed_until: Instant,
         ) {
             self.inner
-                .record_success(feed, window, observation, armed_until);
+                .record_success(feed, expected_generation, window, observation, armed_until);
         }
 
         fn record_not_modified(
             &self,
             feed: &str,
+            expected_generation: u64,
             http_status: u16,
             last_fetch_ms: i64,
             armed_until: Instant,
         ) {
-            self.inner
-                .record_not_modified(feed, http_status, last_fetch_ms, armed_until);
+            self.inner.record_not_modified(
+                feed,
+                expected_generation,
+                http_status,
+                last_fetch_ms,
+                armed_until,
+            );
         }
 
         fn record_failure(
             &self,
             feed: &str,
+            expected_generation: u64,
             http_status: Option<u16>,
             error: String,
             dialect_declared: Option<String>,
@@ -939,6 +1078,7 @@ mod tests {
                 .push(armed_until);
             self.inner.record_failure(
                 feed,
+                expected_generation,
                 http_status,
                 error,
                 dialect_declared,
@@ -1687,6 +1827,10 @@ mod tests {
             warning.fields.get("source").map(String::as_str),
             Some("rss_test")
         );
+        assert!(
+            warning.fields.get("url").is_none(),
+            "no URL at warn — a subscription URL can carry a private query token"
+        );
         let error = warning
             .fields
             .get("error")
@@ -2036,6 +2180,147 @@ mod tests {
             parse_error_message("refused-internal-dtd", "internal DTD subset refused"),
             "parse failed at refused-internal-dtd: internal DTD subset refused"
         );
+    }
+
+    /// A parse that outlives its fuse degrades to a `"timeout"` failure
+    /// instead of holding the partition. `Duration::ZERO` stands in for "any
+    /// parse outlives it"; the body is non-trivial so the blocking thread
+    /// cannot have finished before the fuse is first polled.
+    #[tokio::test]
+    async fn a_parse_that_outlives_the_fuse_degrades_to_a_timeout_failure() {
+        let mut body = String::from(r#"<rss version="2.0"><channel><title>t</title>"#);
+        for i in 0..2_000 {
+            body.push_str(&format!("<item><guid>g{i}</guid><title>x</title></item>"));
+        }
+        body.push_str("</channel></rss>");
+
+        let failure = parse_off_worker(body.into_bytes(), None, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.stage, "timeout");
+        assert!(
+            failure.reason.contains("did not finish"),
+            "{}",
+            failure.reason
+        );
+    }
+
+    /// The same body parses fine under the production fuse — the fuse
+    /// degrades slow parses, it does not tax normal ones.
+    #[tokio::test]
+    async fn a_parse_within_the_fuse_returns_the_document() {
+        let document = parse_off_worker(RSS2_MINIMAL.as_bytes().to_vec(), None, PARSE_TIMEOUT)
+            .await
+            .expect("a well-formed document parses within the fuse");
+        assert_eq!(document.items.len(), 1);
+    }
+
+    /// A well-formed two-item document, distinguishable from [`RSS2_MINIMAL`]
+    /// by row count — the "fresher content" side of the commit-race tests.
+    const RSS2_TWO_ITEMS: &str = concat!(
+        r#"<rss version="2.0"><channel>"#,
+        r#"<title>Minimal Feed</title>"#,
+        r#"<link>https://feed.example/</link>"#,
+        r#"<description>d</description>"#,
+        r#"<item><guid>g1</guid><title>one</title></item>"#,
+        r#"<item><guid>g2</guid><title>two</title></item>"#,
+        r#"</channel></rss>"#
+    );
+
+    /// The 200/200 commit race, end to end: two concurrent serves of the same
+    /// always-live feed, where the first request's response is delayed until
+    /// after the second has committed. The generation gate drops the slower
+    /// commit — the cache keeps the fresher window instead of applying
+    /// commits in completion order.
+    #[tokio::test]
+    async fn a_slower_concurrent_fetch_cannot_regress_the_window() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let server = MockFeedServer::start(move |_req| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The first request in flight: a delayed, older single-item
+                // body.
+                MockResponse::xml(RSS2_MINIMAL).with_delay(Duration::from_millis(400))
+            } else {
+                MockResponse::xml(RSS2_TWO_ITEMS)
+            }
+        })
+        .await;
+        let cache = Arc::new(MemoryFeedCache::new(CACHE_MAX_BYTES, 64));
+        let feeds = vec![("a".to_string(), format!("{}/f.xml", server.url()))];
+        let engine = engine_with_cache(&feeds, 0, 6, Arc::clone(&cache) as Arc<dyn FeedCache>);
+
+        let slow = engine.serve_feed("a", || true);
+        let fast = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            engine.serve_feed("a", || true).await
+        };
+        let (slow_batch, fast_batch) = tokio::join!(slow, fast);
+
+        // Each serve answers its own query from its own legitimate read...
+        assert_eq!(slow_batch.expect("slow serve emits its read").num_rows(), 1);
+        assert_eq!(fast_batch.expect("fast serve emits its read").num_rows(), 2);
+        // ...but the cache keeps the first-committed, fresher window.
+        let snap = cache.snapshot("a", Instant::now());
+        assert_eq!(
+            snap.window.as_ref().unwrap().batch.num_rows(),
+            2,
+            "the slower fetch's commit must be dropped, not applied last"
+        );
+        assert_eq!(snap.observation.item_count, Some(2));
+    }
+
+    /// The 200/304 commit race, end to end: a delayed `304` answering
+    /// validators minted from the primed window arrives after a concurrent
+    /// full `200` replaced that window. The stale `304` must neither stamp
+    /// `revalidated` on the new window nor re-arm it — while its own serve
+    /// still emits the rows its validators really did vouch for.
+    #[tokio::test]
+    async fn a_stale_304_end_to_end_does_not_relabel_the_new_window() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let server = MockFeedServer::start(move |_req| {
+            match calls2.fetch_add(1, Ordering::SeqCst) {
+                // Prime: a window with validators, so the racing scans below
+                // send conditional requests.
+                0 => MockResponse::xml(RSS2_MINIMAL).with_header("etag", "\"v1\""),
+                // The slow racer's conditional request: a delayed 304.
+                1 => MockResponse::status(304).with_delay(Duration::from_millis(400)),
+                // The fast racer: fresh content.
+                _ => MockResponse::xml(RSS2_TWO_ITEMS),
+            }
+        })
+        .await;
+        let cache = Arc::new(MemoryFeedCache::new(CACHE_MAX_BYTES, 64));
+        let feeds = vec![("a".to_string(), format!("{}/f.xml", server.url()))];
+        let engine = engine_with_cache(&feeds, 0, 6, Arc::clone(&cache) as Arc<dyn FeedCache>);
+
+        engine.serve_feed("a", || true).await.expect("primed");
+
+        let slow_304 = engine.serve_feed("a", || true);
+        let fast_200 = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            engine.serve_feed("a", || true).await
+        };
+        let (revalidated_read, fresh_read) = tokio::join!(slow_304, fast_200);
+
+        // The 304 serve emits the window its validators vouched for...
+        assert_eq!(
+            revalidated_read
+                .expect("the 304 serves its snapshot window")
+                .num_rows(),
+            1
+        );
+        assert_eq!(fresh_read.expect("the 200 serves its fetch").num_rows(), 2);
+        // ...while the cache keeps the fresh window unrelabelled: the stale
+        // 304's commit was dropped.
+        let snap = cache.snapshot("a", Instant::now());
+        assert!(
+            matches!(snap.observation.last_status, FeedStatus::Fresh),
+            "not `revalidated` — the 304 never saw this window: {:?}",
+            snap.observation.last_status
+        );
+        assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
     }
 
     /// `ttl_seconds` is stored raw by `RssConfig` — validation puts no ceiling
