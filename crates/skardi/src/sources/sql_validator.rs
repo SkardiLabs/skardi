@@ -109,6 +109,44 @@ pub fn validate_sql(sql: &str, config: &SqlValidatorConfig) -> Result<(), SqlVal
     Ok(())
 }
 
+/// The distinct **source names** a SQL statement references, normalized the way
+/// [`validate_sql`]'s access checks normalize them: default catalog/schema
+/// qualifiers (`datafusion.public.*`) are stripped, and a hierarchical
+/// reference (`mydb.public.orders`, `mysrc.child`) resolves to its source
+/// (`mydb`, `mysrc`) rather than a flat table. Names are lowercased, sorted, and
+/// de-duplicated.
+///
+/// This is the parse-time, credential-free primitive a config validator uses to
+/// check that every source a pipeline reads is declared in the ctx. It is
+/// computed with the engine's own re-exported sqlparser — the same parser
+/// [`validate_sql`] uses — so the reference set can never disagree with how the
+/// engine later resolves the same SQL. `{param}` placeholders are preprocessed
+/// exactly as [`validate_sql`] does, so parameterized pipeline SQL parses.
+///
+/// It reports *which* sources are referenced, not whether they are allowed —
+/// pair it with [`validate_sql`] for the DDL/access-mode verdict.
+pub fn referenced_sources(sql: &str) -> Result<Vec<String>, SqlValidationError> {
+    let preprocessed_sql = preprocess_parameters(sql);
+
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, &preprocessed_sql)
+        .map_err(|e| SqlValidationError::ParseError(e.to_string()))?;
+
+    let mut sources = std::collections::BTreeSet::new();
+    for statement in &statements {
+        visit_relations(statement, |relation: &ObjectName| {
+            let raw: Vec<String> = relation.0.iter().map(object_name_part_value).collect();
+            let raw_refs: Vec<&str> = raw.iter().map(String::as_str).collect();
+            if let Some(source) = strip_default_qualifiers(&raw_refs).into_iter().next() {
+                sources.insert(source);
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+
+    Ok(sources.into_iter().collect())
+}
+
 /// Shape of a statement validated by [`validate_single_sql`], so callers can
 /// pick an execution path without depending on sqlparser types (crates
 /// outside this one may link a different sqlparser version).
@@ -495,6 +533,68 @@ mod tests {
         assert!(validate_sql("SELECT * FROM users", &config).is_ok());
         assert!(validate_sql("SELECT * FROM orders", &config).is_ok());
         assert!(validate_sql("SELECT * FROM unknown_table", &config).is_ok());
+    }
+
+    #[test]
+    fn referenced_sources_lists_every_table_sorted_and_deduped() {
+        let got =
+            referenced_sources("SELECT u.*, o.* FROM users u JOIN orders o ON u.id = o.user_id")
+                .unwrap();
+        assert_eq!(got, vec!["orders".to_string(), "users".to_string()]);
+    }
+
+    #[test]
+    fn referenced_sources_strips_default_catalog_and_schema() {
+        // `users`, `public.users`, and `datafusion.public.users` all resolve to
+        // the same flat source — the reference must normalize to `users`.
+        assert_eq!(
+            referenced_sources("SELECT * FROM datafusion.public.users").unwrap(),
+            vec!["users".to_string()]
+        );
+        assert_eq!(
+            referenced_sources("SELECT * FROM public.users").unwrap(),
+            vec!["users".to_string()]
+        );
+    }
+
+    #[test]
+    fn referenced_sources_resolves_a_hierarchical_reference_to_its_source() {
+        // Hierarchical/catalog sources register their tables under the source
+        // name, so `mydb.public.orders` and `mysrc.child` reference the source
+        // `mydb` / `mysrc`, not a flat table.
+        assert_eq!(
+            referenced_sources("SELECT * FROM mydb.public.orders").unwrap(),
+            vec!["mydb".to_string()]
+        );
+        assert_eq!(
+            referenced_sources("SELECT * FROM mysrc.child").unwrap(),
+            vec!["mysrc".to_string()]
+        );
+    }
+
+    #[test]
+    fn referenced_sources_descends_into_subqueries_and_dedupes() {
+        let got = referenced_sources(
+            "SELECT * FROM users \
+             WHERE id IN (SELECT user_id FROM orders) \
+             AND id IN (SELECT id FROM users)",
+        )
+        .unwrap();
+        assert_eq!(got, vec!["orders".to_string(), "users".to_string()]);
+    }
+
+    #[test]
+    fn referenced_sources_preprocesses_parameters_like_validate_sql() {
+        let got = referenced_sources("SELECT * FROM users WHERE id = {id}").unwrap();
+        assert_eq!(got, vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn referenced_sources_surfaces_parse_errors() {
+        assert!(matches!(
+            referenced_sources("SELEKT * FROM users"),
+            Err(SqlValidationError::ParseError(_))
+        ));
     }
 
     #[test]
