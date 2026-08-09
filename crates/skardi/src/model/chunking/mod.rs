@@ -64,7 +64,8 @@ impl ChunkingRegistry {
     /// chunk(mode, text, size [, overlap]) -> List<Utf8>
     /// ```
     /// - `mode`: `'character'` or `'markdown'`
-    /// - `text`: `Utf8` literal, scalar subquery, or column
+    /// - `text`: string literal, scalar subquery, or column — any string
+    ///   layout (`Utf8`, `LargeUtf8`, `Utf8View`)
     /// - `size`: target max chunk length (characters), positive integer literal
     /// - `overlap`: optional characters of overlap between adjacent chunks; must be `< size`
     pub fn register_chunk_udf(self: &Arc<Self>, ctx: &mut SessionContext) {
@@ -389,42 +390,49 @@ fn read_text_column<'a>(
         // arrays/scalars (the same reality open_connector/filters.rs
         // handles), LargeUtf8 columns arrive from large-string sources,
         // and the scalar arm below already accepts all three spellings —
-        // a text COLUMN must not be stricter than a text LITERAL.
+        // a text COLUMN must not be stricter than a text LITERAL. Each
+        // arm is `iter().collect()`: all three arrow string arrays yield
+        // `Option<&str>` with identical null/offset behavior, and one
+        // spelling keeps the arms from diverging.
         ColumnarValue::Array(arr) => {
             if let Some(view_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
-                return Ok((0..view_arr.len())
-                    .map(|i| {
-                        if view_arr.is_null(i) {
-                            None
-                        } else {
-                            Some(view_arr.value(i))
-                        }
-                    })
-                    .collect());
+                return Ok(view_arr.iter().collect());
             }
             if let Some(large_arr) = arr.as_any().downcast_ref::<LargeStringArray>() {
-                return Ok((0..large_arr.len())
-                    .map(|i| {
-                        if large_arr.is_null(i) {
-                            None
-                        } else {
-                            Some(large_arr.value(i))
-                        }
-                    })
-                    .collect());
+                // Pre-flight: chunk output flows through i32-offset
+                // builders (`StringBuilder`), whose offset overflow is a
+                // PANIC in arrow, not an error — and LargeUtf8 is the one
+                // layout whose contract makes >2 GiB legal input. Chunk
+                // output ≈ input bytes (more with overlap), so reject
+                // early with a real error instead of unwinding mid-batch.
+                // (A near-2 GiB Utf8 column plus overlap can still
+                // overflow — that exposure predates LargeUtf8 support and
+                // is shared with every i32-offset producer.)
+                let total_bytes = large_arr
+                    .value_offsets()
+                    .last()
+                    .copied()
+                    .unwrap_or_default()
+                    - large_arr
+                        .value_offsets()
+                        .first()
+                        .copied()
+                        .unwrap_or_default();
+                if total_bytes > i64::from(i32::MAX) {
+                    return Err(DataFusionError::Execution(format!(
+                        "{udf}: '{name}' carries more than 2 GiB of text in one batch; \
+                         chunk output is built as 32-bit-offset Utf8 and cannot hold it — \
+                         split the input into smaller batches"
+                    )));
+                }
+                return Ok(large_arr.iter().collect());
             }
             let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                DataFusionError::Execution(format!("{udf}: '{name}' must be a Utf8 column"))
+                DataFusionError::Execution(format!(
+                    "{udf}: '{name}' must be a string column (Utf8, LargeUtf8, or Utf8View)"
+                ))
             })?;
-            Ok((0..str_arr.len())
-                .map(|i| {
-                    if str_arr.is_null(i) {
-                        None
-                    } else {
-                        Some(str_arr.value(i))
-                    }
-                })
-                .collect())
+            Ok(str_arr.iter().collect())
         }
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
         | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
@@ -433,7 +441,7 @@ fn read_text_column<'a>(
             ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) | ScalarValue::Utf8View(None),
         ) => Ok(vec![None]),
         _ => Err(DataFusionError::Execution(format!(
-            "{udf}: '{name}' must be Utf8"
+            "{udf}: '{name}' must be a string (Utf8, LargeUtf8, or Utf8View)"
         ))),
     }
 }

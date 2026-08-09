@@ -171,11 +171,13 @@ fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
                 )
             })
         })?,
-        // Sub-millisecond precision is TRUNCATED (floor division), by
-        // design: the contract is epoch milliseconds, and micro/nano
-        // inputs give up their remainder. Asymmetric with the Second arm
-        // above on purpose — narrowing can overflow and must be checked,
-        // widening cannot.
+        // Sub-millisecond precision is dropped by FLOOR division
+        // (`div_euclid`, rounds toward -inf — a pre-epoch instant rounds
+        // EARLIER, never toward zero: -1500us becomes -2ms), by design:
+        // the contract is epoch milliseconds, and micro/nano inputs give
+        // up their remainder. Asymmetric with the Second arm above on
+        // purpose — narrowing can overflow and must be checked, widening
+        // cannot.
         ScalarValue::TimestampMicrosecond(v, _) => {
             v.map_or(Value::Null, |us| Value::from(us.div_euclid(1000)))
         }
@@ -317,7 +319,9 @@ mod tests {
                    's',  arrow_cast(1735689600, 'Timestamp(Second, None)'), \
                    'us', arrow_cast(1735689600000001, 'Timestamp(Microsecond, None)'), \
                    'ns', arrow_cast(1735689600000000001, 'Timestamp(Nanosecond, None)'), \
-                   'neg', arrow_cast(-1500, 'Timestamp(Millisecond, None)')) AS m",
+                   'neg', arrow_cast(-1500, 'Timestamp(Millisecond, None)'), \
+                   'neg_us', arrow_cast(-1500, 'Timestamp(Microsecond, None)'), \
+                   'neg_ns', arrow_cast(-1500, 'Timestamp(Nanosecond, None)')) AS m",
             )
             .await
             .unwrap()
@@ -334,6 +338,12 @@ mod tests {
         assert_eq!(row["us"], 1_735_689_600_000_i64, "micros floor toward −∞");
         assert_eq!(row["ns"], 1_735_689_600_000_i64, "nanos floor toward −∞");
         assert_eq!(row["neg"], -1500_i64, "pre-epoch instants keep their sign");
+        // The negative micro/nano contract, pinned by value: floor rounds
+        // pre-epoch instants EARLIER (-1500µs → -2ms), never toward zero
+        // (truncation would give -1ms). The comment at the conversion says
+        // "floor"; this is what keeps it honest.
+        assert_eq!(row["neg_us"], -2_i64, "pre-epoch micros floor toward −∞");
+        assert_eq!(row["neg_ns"], -1_i64, "pre-epoch nanos floor toward −∞");
     }
 
     /// A seconds timestamp too large for a millis i64 refuses with a
