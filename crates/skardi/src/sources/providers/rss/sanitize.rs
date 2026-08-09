@@ -9,6 +9,8 @@
 //! malformed lexis, it silently drops the offending element, so there is no
 //! per-rung parse failure for a retry loop to react to.
 
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
+
 /// Which document family a feed body belongs to, decided lexically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocFamily {
@@ -53,12 +55,12 @@ fn strip_utf8_bom(bytes: &[u8]) -> (&[u8], bool) {
 }
 
 /// A UTF-16 byte-order mark and the bytes after it, if present.
-fn utf16_bom(bytes: &[u8]) -> Option<(&'static encoding_rs::Encoding, &[u8])> {
+fn utf16_bom(bytes: &[u8]) -> Option<(&'static Encoding, &[u8])> {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE][..]) {
-        return Some((encoding_rs::UTF_16LE, rest));
+        return Some((UTF_16LE, rest));
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF][..]) {
-        return Some((encoding_rs::UTF_16BE, rest));
+        return Some((UTF_16BE, rest));
     }
     None
 }
@@ -207,10 +209,8 @@ pub fn rung_reencode_utf8(input: &[u8]) -> (Vec<u8>, bool) {
     // result would be `text` by construction.
     if let Ok(text) = std::str::from_utf8(body) {
         let declaration_misleads = xml_decl_encoding_label(body)
-            .and_then(|label| encoding_rs::Encoding::for_label(&label))
-            .is_some_and(|enc| {
-                enc != encoding_rs::UTF_8 && enc.decode_without_bom_handling(body).0 != text
-            });
+            .and_then(|label| Encoding::for_label(&label))
+            .is_some_and(|enc| enc != UTF_8 && enc.decode_without_bom_handling(body).0 != text);
         if declaration_misleads {
             return (rewrite_decl_encoding(text), true);
         }
@@ -220,10 +220,10 @@ pub fn rung_reencode_utf8(input: &[u8]) -> (Vec<u8>, bool) {
     // Not UTF-8. Trust the declared label unless it claims UTF-8 (a lie, since
     // the bytes just failed UTF-8 validation) — then sniff.
     let declared = xml_decl_encoding_label(body)
-        .and_then(|label| encoding_rs::Encoding::for_label(&label))
-        .filter(|enc| *enc != encoding_rs::UTF_8);
+        .and_then(|label| Encoding::for_label(&label))
+        .filter(|enc| *enc != UTF_8);
     // windows-1252 is the sniff fallback: it maps every byte, so decoding cannot fail.
-    let enc = declared.unwrap_or(encoding_rs::WINDOWS_1252);
+    let enc = declared.unwrap_or(WINDOWS_1252);
     let (text, _, _) = enc.decode(body);
     (rewrite_decl_encoding(&text), true)
 }

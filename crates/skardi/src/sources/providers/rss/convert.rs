@@ -41,7 +41,10 @@ use super::sanitize::find_sub;
 /// shapes, not a proof — and the whole argument presupposes the scan really is
 /// an upper bound on open-tag depth, which it only became once the stale
 /// `foreign` undercount was fixed (see the `foreign` counter in
-/// [`max_open_tag_depth`]).
+/// [`max_open_tag_depth`]). The figure also predates the sibling-closing pops
+/// ([`implied_end_pops`]): those lower the scan only on shapes html5ever
+/// flattens the same way, so they should not widen the gap the sweep measured
+/// — an argument, not a re-measurement.
 const MAX_HTML_DEPTH: usize = 100;
 
 /// Convert an HTML fragment to Markdown.
@@ -123,6 +126,61 @@ fn is_void_element(tag: &str) -> bool {
     VOID_ELEMENTS.iter().any(|v| tag.eq_ignore_ascii_case(v))
 }
 
+/// Whether a start tag `incoming` implicitly closes a still-open `top`, per
+/// html5ever's sibling-closing rules — the reason `<p>one<p>two<p>three`
+/// builds three siblings at depth ~4, not a nest 3 deep.
+///
+/// Omitting `</p>`, `</li>`, `</td>`, `</tr>` is both legal HTML5 and the
+/// single most common shape of legacy feed HTML, so a scan that never pops on
+/// it scored `"<p>para".repeat(150)` as depth 150 against a real DOM depth of
+/// ~4 and degraded the whole document to tag-stripped text — an over-count in
+/// the technically-safe direction that turned a rare guard into routine
+/// content damage.
+///
+/// The obligation is [`max_open_tag_depth`]'s: never let a pop *under*-count.
+/// Each rule below fires only where the same token closes the same element in
+/// html5ever — `p` is closed by every sibling-closer here on its way in
+/// (`li`/`dd`/`dt` explicitly, the table tags via the cell they close), `li`
+/// by `li`, the definition and cell pairs by either sibling, `tr` by the next
+/// row, `option` by the next option. The scan consults only the top of its
+/// stack, so an element html5ever would *not* close — an `li` under a nested
+/// `<ul>`, a `p` sitting below any other element — is shielded by whatever
+/// sits above it, and genuinely nested input keeps its full count. And when
+/// the scan's stack disagrees with html5ever's, the disagreement is a stale
+/// entry for a token html5ever ignored outright (`<td>` outside any table,
+/// say) — this scan pushed that entry itself, so popping it retires the
+/// scan's own surplus while the push that follows restores it: the estimate
+/// stays an upper bound.
+fn implied_end_pops(incoming: &str, top: &str) -> bool {
+    let is = |t: &str, n: &str| t.eq_ignore_ascii_case(n);
+    let cell = |t: &str| is(t, "td") || is(t, "th");
+    let definition = |t: &str| is(t, "dd") || is(t, "dt");
+
+    if is(top, "p") {
+        return is(incoming, "p")
+            || is(incoming, "li")
+            || definition(incoming)
+            || cell(incoming)
+            || is(incoming, "tr");
+    }
+    if is(top, "li") {
+        return is(incoming, "li");
+    }
+    if definition(top) {
+        return definition(incoming);
+    }
+    if cell(top) {
+        return cell(incoming) || is(incoming, "tr");
+    }
+    if is(top, "tr") {
+        return is(incoming, "tr");
+    }
+    if is(top, "option") {
+        return is(incoming, "option");
+    }
+    false
+}
+
 /// The two elements that switch the tree builder into foreign content, where
 /// [`VOID_ELEMENTS`] stops applying and a self-closing tag really does close.
 fn is_foreign_root(tag: &str) -> bool {
@@ -157,7 +215,11 @@ fn is_foreign_root(tag: &str) -> bool {
 /// A matching close tag can still close *more* than this pops (implied end
 /// tags, the adoption agency), and tags inside a `script`/`style`/`title` body
 /// are counted even though the tokenizer treats them as raw text: both make the
-/// real tree shallower than this estimate. The one direction html5ever goes
+/// real tree shallower than this estimate. One family of implied end tags *is*
+/// popped — the sibling-closers (`<p>one<p>two`, unclosed `<li>`/`<td>`/`<tr>`
+/// runs), because there the over-count landed on the most common shape of
+/// legacy feed HTML rather than on an attacker; see [`implied_end_pops`] for
+/// the rules and why they cannot under-count. The one direction html5ever goes
 /// *deeper* than the open-tag count is implied *start* tags — `<table><td>`
 /// builds `table > tbody > tr > td`, four levels from two tags, roughly
 /// doubling it — on top of the fixed `document > html > body` wrapper worth 3.
@@ -253,6 +315,17 @@ fn max_open_tag_depth(html: &str) -> usize {
             }
             if is_foreign_root(tag) {
                 foreign += 1;
+            }
+            // Implied end tags: `<p>one<p>two` and unclosed `<li>`/`<td>`/`<tr>`
+            // runs — the most common legacy feed HTML — build siblings, not
+            // nests, so the sibling-closers pop what html5ever would close (see
+            // [`implied_end_pops`]). Suspended in foreign content like the
+            // [`VOID_ELEMENTS`] skip, and for the same reason: `foreign` can
+            // only be trusted where believing it too readily over-counts.
+            if foreign == 0 {
+                while open.last().is_some_and(|top| implied_end_pops(tag, top)) {
+                    open.pop();
+                }
             }
             open.push(tag);
             max_depth = max_depth.max(open.len());
@@ -827,6 +900,64 @@ mod tests {
         assert!(
             md.contains("*innermost*") || md.contains("_innermost_"),
             "1000 balanced paragraphs are depth 1, not 1000: {md}"
+        );
+    }
+
+    /// `</p>` is optional HTML5 and legacy feeds omit it as a matter of course:
+    /// a new `<p>` closes the previous one, so 150 unclosed paragraphs are 150
+    /// siblings at real depth ~4. A scan that never popped on the implied end
+    /// scored this 150, tripped the ceiling, and degraded ordinary content to
+    /// tag-stripped text — the exact shape from review.
+    #[test]
+    fn unclosed_paragraph_runs_are_siblings_not_nesting() {
+        let html = "<p>para".repeat(150);
+        assert_eq!(max_open_tag_depth(&html), 1);
+
+        let md = html_to_markdown(&html);
+        assert!(
+            md.contains("para\n\npara"),
+            "unclosed paragraphs must convert as paragraphs, not degrade to a \
+             single run of text: {md:?}"
+        );
+    }
+
+    /// The rest of the sibling-closing set, in the shapes legacy HTML actually
+    /// uses them: list items without `</li>`, definition pairs, table rows and
+    /// cells without `</td>`/`</tr>`, options without `</option>`.
+    #[test]
+    fn unclosed_sibling_runs_do_not_trip_the_ceiling() {
+        for (name, html) in [
+            ("li", format!("<ul>{}</ul>", "<li>item".repeat(150))),
+            ("dd/dt", format!("<dl>{}</dl>", "<dt>t<dd>d".repeat(150))),
+            (
+                "tr/td",
+                format!("<table>{}</table>", "<tr><td>a<td>b".repeat(150)),
+            ),
+            (
+                "option",
+                format!("<select>{}</select>", "<option>o".repeat(150)),
+            ),
+            // li closing the p left open inside the previous li.
+            ("li over p", format!("<ul>{}</ul>", "<li><p>x".repeat(150))),
+        ] {
+            let depth = max_open_tag_depth(&html);
+            assert!(
+                depth <= 10,
+                "{name}: unclosed sibling runs are flat, scanned {depth}"
+            );
+        }
+    }
+
+    /// The pops must not fire through a real container: `<ul><li><ul><li>…`
+    /// genuinely nests (html5ever's li rule stops at the `ul`, and so does the
+    /// scan, which only consults the top of its stack), and deep genuine
+    /// nesting is exactly what the ceiling exists to catch.
+    #[test]
+    fn genuinely_nested_lists_still_count_and_still_degrade() {
+        let html = "<ul><li>".repeat(60);
+        assert!(
+            max_open_tag_depth(&html) > MAX_HTML_DEPTH,
+            "60 nested ul/li pairs are real nesting, not siblings"
         );
     }
 

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use feed_rs::model::{Category, Entry, Feed, Link};
+use feed_rs::parser::{Builder, Parser};
 use serde_json::{Value, json};
 
 use super::conformance::{
@@ -46,15 +47,22 @@ type Rung = (fn(&[u8]) -> (Vec<u8>, bool), Repair);
 
 /// Sanitize `bytes` with the applicable rungs, then parse them into a feed.
 pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
-    // The family of the bytes as they arrived. It decides the pre-sanitation
-    // guard and the declared-dialect sniff, both of which read those same raw
-    // bytes; the rungs below are chosen from a second, post-transcode reading.
+    // The family of the bytes as they arrived. It decides only the
+    // pre-sanitation guard, which reads those same raw bytes; the rungs and
+    // the declared-dialect sniff work from a second, post-transcode reading.
     let raw_family = detect_family(bytes);
-    let dialect_declared = sniff_declared_dialect(bytes, raw_family);
 
     if raw_family == DocFamily::Xml
         && let Err(reason) = refuse_internal_dtd(bytes)
     {
+        // The one sniff over raw bytes, because this path refuses before the
+        // rungs run and there is nothing else to sniff. It cannot produce the
+        // NUL-laden `unknown:` a UTF-16 document yields (the reason every
+        // other path sniffs after rung 1): this guard fired on a literal
+        // ASCII `<!DOCTYPE`, which UTF-16's interleaved NULs hide — a UTF-16
+        // subset is caught by the post-sanitation guard below instead, after
+        // the transcode has already happened.
+        let dialect_declared = sniff_declared_dialect(bytes, raw_family);
         tracing::debug!(stage = "refused-internal-dtd", %reason, "rss parse refused");
         return Err(ParseFailure {
             stage: "refused-internal-dtd",
@@ -91,9 +99,21 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
         repairs.push(repair);
     }
 
+    // The sniff reads the transcoded bytes for the same reason the rungs are
+    // chosen from them. Lexical scanning assumes ASCII-visible structure, and
+    // a valid BOM'd UTF-16 document has none until rung 1 runs: its `<?xml`
+    // arrives as `3C 00 3F 00 …`, so the `<?` check misses the interleaved
+    // NUL, the declaration is mistaken for the root element, and
+    // `dialect_declared` becomes `unknown:\0?\0x\0m\0l` — control characters
+    // in a user-facing column, for a feed that parses fine. Sniffing after
+    // the transcode reads the same bytes the parser will. What the sniff is
+    // *for* is unchanged: rung 1 converts encodings, it does not parse, so a
+    // document too broken to parse is exactly as sniffable as before.
+    let family = detect_family(&current);
+    let dialect_declared = sniff_declared_dialect(&current, family);
+
     // Rungs 2 and 3 repair XML lexis and would corrupt a JSON document (a naked
     // `&` is legal inside a JSON string), so JSON climbs only the re-encode rung.
-    let family = detect_family(&current);
     let rungs: &[Rung] = match family {
         DocFamily::Xml => &[
             (rung_strip_control_chars, Repair::StrippedControlChars),
@@ -179,8 +199,8 @@ pub fn parse_with_ladder(bytes: &[u8]) -> Result<ParseSuccess, ParseFailure> {
 /// `feed-rs` a generator that yields nothing leaves `entry.id` empty unless the
 /// feed really supplied one, so the Field Mapping fallback chain (id → link →
 /// skip) is what decides identity, deterministically.
-fn parser() -> feed_rs::parser::Parser {
-    feed_rs::parser::Builder::new()
+fn parser() -> Parser {
+    Builder::new()
         .id_generator(|_links, _title, _uri| String::new())
         .build()
 }
@@ -889,11 +909,44 @@ mod tests {
              `EscapedNakedAmpersands` here is both the corruption and a repair \
              note attributed to a document that needed none"
         );
-        // The declared-dialect sniff still reads the *raw* bytes, where an
-        // ASCII marker interleaved with NULs is not found. Known gap, separate
-        // from the family decision fixed here; this pins today's answer so that
-        // closing it has to update this line.
-        assert_eq!(ok.dialect_declared, None);
+        // The sniff reads the transcoded bytes too, so the version marker —
+        // invisible in UTF-16, where its ASCII is interleaved with NULs — is
+        // found. This asserted `None` while the sniff still read raw bytes.
+        assert_eq!(ok.dialect_declared.as_deref(), Some("json-feed-1.1"));
+    }
+
+    /// A valid BOM'd UTF-16 RSS 2.0 feed parses fine after rung 1, and its
+    /// declared dialect must come from those same transcoded bytes. Sniffed
+    /// raw, the `<?` check misses the NUL inside `3C 00 3F 00`, the XML
+    /// declaration is mistaken for the root element, and `dialect_declared`
+    /// becomes `unknown:\0?\0x\0m\0l` — control characters in a user-facing
+    /// column, for a healthy feed.
+    #[test]
+    fn utf16_rss_feed_declares_its_dialect_without_nul_garbage() {
+        let text = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><link>https://e.com</link><description>D</description></channel></rss>"#;
+        for big_endian in [false, true] {
+            let mut doc = if big_endian {
+                vec![0xFE, 0xFF]
+            } else {
+                vec![0xFF, 0xFE]
+            };
+            for unit in text.encode_utf16() {
+                let bytes = if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                };
+                doc.extend_from_slice(&bytes);
+            }
+
+            let ok = parse_with_ladder(&doc).unwrap();
+            assert_eq!(
+                ok.dialect_declared.as_deref(),
+                Some("rss-2.0"),
+                "big_endian: {big_endian}"
+            );
+            assert_eq!(ok.repairs, vec![Repair::ReencodedToUtf8]);
+        }
     }
 
     /// The same document in the other byte order, which classifies correctly
