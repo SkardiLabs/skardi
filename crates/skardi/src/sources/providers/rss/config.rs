@@ -133,14 +133,14 @@ pub struct RssConfig {
 
     /// Maximum number of feeds fetched concurrently for THIS source — a bound
     /// on fetch parallelism, and only that. It is neither a per-host nor a
-    /// per-process bound: the engine (a later phase in this stack) holds one
-    /// semaphore per registered source, so two `rss` sources in one process
-    /// permit the sum, and nothing anywhere accounts per host — feeds sharing a
-    /// host can receive up to `max_concurrent` concurrent requests. A real
-    /// per-host politeness bound is left for the engine phase to weigh (the
-    /// hostname-vs-resolved-IP-vs-CDN question has to be settled first);
-    /// meanwhile host-level politeness rests on honoring `Retry-After` and TTL
-    /// pacing, not on this bound.
+    /// per-process bound: the engine holds one semaphore per registered
+    /// source, so two `rss` sources in one process permit the sum, and nothing
+    /// anywhere accounts per host — feeds sharing a host can receive up to
+    /// `max_concurrent` concurrent requests. A real per-host bound remains an
+    /// open decision rather than a promise, and host-level politeness rests
+    /// meanwhile on honoring `Retry-After` and TTL pacing, not on this bound;
+    /// the engine module doc's "No per-host bound" holds the reasoning and
+    /// what a per-host cap would have to settle first.
     ///
     /// Stored raw — validation rejects only `0`. The engine clamps the
     /// effective value to tokio's `Semaphore::MAX_PERMITS` at construction

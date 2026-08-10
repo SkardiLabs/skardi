@@ -202,6 +202,41 @@
 //! - **When to revisit**: duplicate fetches showing up in feed-server logs
 //!   or politeness complaints — not cache correctness, which the
 //!   generation gate already owns.
+//!
+//! ## No per-host bound
+//!
+//! The semaphore this module holds is a **total** fetch-parallelism bound
+//! for one source, and nothing here accounts per host: feeds that share a
+//! host can receive up to `max_concurrent` concurrent requests. That is the
+//! framing PR #180's review settled on — the spec's Fetcher section and its
+//! YAML example were corrected to match — so the naming here says
+//! "fetch-parallelism", not "politeness", wherever it defines the bound. A
+//! `politeness permit` elsewhere in this module is the same object under its
+//! operational name; it does not re-assert a per-host promise.
+//!
+//! Baseline host-level politeness rests instead on honoring `Retry-After`
+//! (`fetch.rs`, capped by `MAX_RETRY_WAIT`) and on TTL pacing — a feed is
+//! not refetched until its window expires.
+//!
+//! A proactive per-host cap is an **open decision, not a promise**, and this
+//! semaphore is where it would go. What has to be settled before writing
+//! any of it:
+//!
+//! - **Count by hostname?** Misses shared infrastructure: Substack,
+//!   Feedburner and Cloudflare front thousands of distinct feed hostnames
+//!   behind a few addresses, so a per-hostname cap would let all of them
+//!   through and bound nothing that the far end actually experiences.
+//! - **Count by resolved IP?** Tangles with the egress/DNS-resolver layer
+//!   (`egress::PolicyDns` is where addresses become known, and a hostname's
+//!   answer can change between fetches), and it throttles unrelated feeds
+//!   that merely share a CDN address.
+//! - **Count by inferred CDN/operator?** Needs a classification this
+//!   provider has no source of truth for.
+//!
+//! Until one of those is chosen, no per-host guarantee should be advertised
+//! in code, docs, or config comments. Revisit when a feed operator actually
+//! complains, or when `429`s can be attributed to this source's own
+//! concurrency rather than to its request rate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -294,10 +329,13 @@ pub struct RssEngine {
     by_name: HashMap<String, usize>,
     fetcher: FeedFetcher,
     cache: Arc<dyn FeedCache>,
-    /// Politeness bound: at most `max_concurrent` of this source's feeds in
-    /// flight, and the queue a closed launch gate cancels a feed out of. One
-    /// engine is built per registered source, so this bounds a source — not a
-    /// process, and not a host.
+    /// Total fetch-parallelism bound (not per-host): at most
+    /// `max_concurrent` of this source's feeds in flight, and the queue a
+    /// closed launch gate cancels a feed out of. One engine is built per
+    /// registered source, so this bounds a source — not a process, and not a
+    /// host. See the module doc's "No per-host bound" for why the accurate
+    /// label matters here and what a real per-host cap would have to settle
+    /// first.
     semaphore: Arc<Semaphore>,
     ttl: Duration,
     scan_timeout: Duration,
@@ -500,8 +538,9 @@ impl RssEngine {
             );
         }
 
-        // Politeness: at most `max_concurrent` of *this source's* feeds in
-        // flight. Not per host and not per process — see the field's doc.
+        // Total fetch parallelism for *this source*: at most
+        // `max_concurrent` feeds in flight. Not per host and not per process
+        // — see the field's doc.
         // The permit is released when this guard drops, whether this future
         // completes or is cancelled mid-fetch — `SemaphorePermit`'s `Drop`
         // calls `Semaphore::add_permits` (tokio 1.52.3,
