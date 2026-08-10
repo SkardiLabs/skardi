@@ -131,6 +131,11 @@ impl RssTableKind {
 
 /// State every partition of one scan shares, built once in
 /// [`RssScanExec::new`].
+///
+/// Living on the plan rather than the stream makes the plan object
+/// single-execution unless `reset_state` rebuilds it — the consumer-facing
+/// statement of that contract is in `table.rs`'s module doc ("The plan
+/// `scan()` returns is single-execution").
 struct ScanShared {
     /// Rows served by this scan so far, across all partitions — the value the
     /// launch gate compares against the LIMIT. Counts rows *served*, not rows

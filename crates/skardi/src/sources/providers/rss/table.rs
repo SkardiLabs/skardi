@@ -99,6 +99,24 @@
 //! (`feeds LEFT JOIN items … WHERE items.feed IS NULL`) is only meaningful if
 //! every subscription has a row. `a_feeds_scan_is_total_over_subscriptions`
 //! covers that query end to end.
+//!
+//! ## The plan `scan()` returns is single-execution
+//!
+//! LIMIT bookkeeping and the scan deadline are *scan-scoped* state, minted
+//! when the plan is constructed (`exec.rs`'s `ScanShared`): they have to
+//! live on the plan object, because one execution's partitions are just N
+//! `execute(i)` calls on that object and DataFusion offers no other place
+//! for cross-partition state. The consequences for anyone holding a plan:
+//! executing the same plan object a second time finds its own already
+//! satisfied LIMIT and serves zero rows, and executing a plan more than
+//! `scan_timeout_seconds` after it was built finds its deadline already
+//! passed — both silently, by design. DataFusion's own re-execution path
+//! (`RecursiveQueryExec` driving `WITH RECURSIVE`) rebuilds the state by
+//! calling `reset_state`, which this plan overrides; any caller that caches
+//! a physical plan and re-collects it outside that path must do the same,
+//! or the scan silently shrinks.
+//! `reset_state_rebuilds_a_scan_whose_limit_was_already_satisfied` in
+//! `exec.rs` pins both halves.
 
 use std::any::Any;
 use std::fmt;
