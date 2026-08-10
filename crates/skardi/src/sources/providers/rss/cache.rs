@@ -216,15 +216,43 @@ impl FeedObservation {
     }
 }
 
-/// A feed's cached window: the parsed `items` batch plus the conditional-GET
-/// validators that produced it. The two travel together — a batch is never
-/// kept without the validators that would let a future fetch revalidate it,
-/// and eviction drops both at once by dropping this whole struct.
+/// A feed's cached window: the parsed `items` batch, the conditional-GET
+/// validators that produced it, and where they came from. They all travel
+/// together — a batch is never kept without the validators that would let a
+/// future fetch revalidate it, nor without the address those validators are
+/// good against — and eviction drops the lot at once by dropping this whole
+/// struct.
 #[derive(Debug, Clone)]
 pub struct CachedWindow {
     pub batch: RecordBatch,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// The URL that produced this batch and issued these validators — the
+    /// subscription's own URL when nothing redirected, the landing URL
+    /// otherwise.
+    ///
+    /// Stored because validators are only meaningful against the resource
+    /// that issued them: a redirected feed's `etag` comes from the final
+    /// hop, and a conditional request carrying it must go *there*. Sending
+    /// it to the subscription's URL instead reaches a redirector, which
+    /// answers with another redirect rather than a `304` — so the feed can
+    /// never revalidate and re-downloads in full on every scan. The engine
+    /// aims its next conditional request here for that reason.
+    pub fetched_from: String,
+    /// When a fetch last started from the *subscription's configured* URL —
+    /// the clock behind the engine's redirect re-probe.
+    ///
+    /// Fetching `fetched_from` directly is what buys the `304`, but it also
+    /// stops observing the configured URL, so a redirect that later moves
+    /// somewhere else would go unnoticed (`301` is nominally permanent and
+    /// drifts in practice). The engine periodically starts from the
+    /// configured URL again to catch that, and this is what tells it when.
+    ///
+    /// Living on the window rather than the observation is deliberate:
+    /// losing it to eviction is harmless, because a feed with no window
+    /// refetches from its configured URL unconditionally anyway — which is
+    /// itself a probe.
+    pub probed_at: Instant,
 }
 
 /// A point-in-time read of one feed's cached state.
@@ -971,6 +999,8 @@ mod tests {
             batch,
             etag: Some("\"etag\"".into()),
             last_modified: Some("Mon, 20 Jul 2026 10:00:00 GMT".into()),
+            fetched_from: "https://feed.example/f.xml".into(),
+            probed_at: Instant::now(),
         }
     }
 

@@ -203,6 +203,37 @@
 //!   or politeness complaints — not cache correctness, which the
 //!   generation gate already owns.
 //!
+//! ## A redirected feed is fetched at its landing URL
+//!
+//! Conditional GET only works if the validators go back to the address that
+//! issued them, and for a redirected feed that address is the *final* hop,
+//! not the subscription's configured URL — the fetcher sends validators on
+//! the first hop only, because an `etag` means nothing to a different
+//! resource. So the landing URL is stored with the validators
+//! (`CachedWindow::fetched_from`) and the next conditional request is aimed
+//! there. Without that, the ubiquitous `http`→`https` feed presents its
+//! validators to a redirector, which answers with another redirect rather
+//! than a `304`, and the feed re-downloads and re-parses in full on every
+//! single scan — forever, and silently, since a mismatched validator only
+//! ever yields a correct `200`.
+//!
+//! Fetching the landing URL directly costs one thing: the configured URL
+//! stops being observed, so a `301` that later moves somewhere else would go
+//! unnoticed (permanent redirects drift in practice, and get used as
+//! temporary ones). Hence a third expiry clock alongside the TTL and
+//! [`failure_fuse`]: every [`reprobe_interval`], one fetch starts from the
+//! configured URL again and re-derives the landing URL, unconditionally —
+//! carrying the landing URL's validators *to* the configured URL would be
+//! the same mistake in reverse. [`RssEngine::reprobe_due`] is the check, and
+//! the drift clock rides on the window (see `CachedWindow::probed_at` for
+//! why losing it to eviction is harmless).
+//!
+//! What does *not* change is the subscription's identity: `items.feed_url`
+//! and `feeds.url` stay the configured URL — the value an operator wrote and
+//! pruning matches against. Where the bytes came from is cache state, not a
+//! row value. Exposing it as a column is a possible future addition, not a
+//! promise.
+//!
 //! ## No per-host bound
 //!
 //! The semaphore this module holds is a **total** fetch-parallelism bound
@@ -293,6 +324,40 @@ const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// scan.
 const PARSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many refresh cycles a redirected feed goes without re-probing its
+/// configured URL — see [`reprobe_interval`].
+const REPROBE_EVERY_REFRESHES: u32 = 24;
+
+/// Bounds on the re-probe interval, whatever the configured TTL. The floor
+/// keeps an always-live feed (`ttl_seconds: 0`) from probing on every scan,
+/// which would forfeit the entire point of storing the landing URL; the
+/// ceiling keeps a very long TTL from parking drift detection for months.
+const MIN_REPROBE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_REPROBE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long a redirected feed may be fetched at its landing URL before a
+/// fetch starts from the configured URL again: `ttl × 24`, clamped.
+///
+/// The cost of a probe is exactly *one un-optimized fetch* — starting from
+/// the configured URL spends an extra round trip on the redirect and cannot
+/// carry the landing URL's validators, so that fetch pays for a full body
+/// where the others get a `304`. One probe every N refreshes therefore keeps
+/// `(N-1)/N` of the saving, which is what sets the magnitude: at 24 the feed
+/// keeps ~96% of it while drift surfaces within hours rather than never.
+/// Expressed as a multiple of the TTL, and clamped, in the same shape as
+/// [`failure_fuse`].
+///
+/// A cheaper probe is possible and deliberately not built yet: request the
+/// configured URL without following its redirect, and when the `Location`
+/// still points at the stored landing URL, stop there and revalidate as
+/// usual — one round trip, no body. It would make this interval nearly
+/// cost-free, at the price of a "probe without following" mode in the
+/// fetcher. Revisit if the probe fetches ever show up as a real cost.
+fn reprobe_interval(ttl: Duration) -> Duration {
+    ttl.saturating_mul(REPROBE_EVERY_REFRESHES)
+        .clamp(MIN_REPROBE_INTERVAL, MAX_REPROBE_INTERVAL)
+}
+
 /// Ceiling on the scaled parse fuse. Past an hour — the exec layer's own
 /// ceiling on the scan timeout — a fuse protects nothing, and an absurd
 /// `max_response_bytes` must not manufacture an absurd duration out of
@@ -342,6 +407,9 @@ pub struct RssEngine {
     /// One parse's wait budget, scaled from `max_response_bytes` — see
     /// [`parse_fuse`].
     parse_fuse: Duration,
+    /// How long a redirected feed may be fetched at its landing URL before a
+    /// fetch starts from the configured URL again — see [`reprobe_interval`].
+    reprobe_interval: Duration,
 }
 
 impl RssEngine {
@@ -447,6 +515,7 @@ impl RssEngine {
             ttl,
             scan_timeout,
             parse_fuse,
+            reprobe_interval: reprobe_interval(ttl),
         }
     }
 
@@ -565,20 +634,49 @@ impl RssEngine {
             return (None, ServeLog::bare("gate-closed"));
         }
 
-        // The validators live on the window, so a feed that reached here
-        // through [`window_lost`] has none to send and this is an
-        // unconditional `GET`. That is the right request to make: there is no
-        // cached copy left for a `304` to confirm, so a conditional one could
-        // only answer "still current" about rows this process no longer holds
-        // — the state `record_not_modified` has to record as an error
-        // (`cache.rs:561-577`). A full body is what actually refills the
-        // window.
-        let validators = snapshot.window.as_ref().map(|window| Validators {
-            etag: window.etag.clone(),
-            last_modified: window.last_modified.clone(),
-        });
+        // Where this fetch goes, and whether the cached validators are good
+        // against it.
+        //
+        // A redirected feed's validators were issued by its landing URL, so
+        // that is where the conditional request has to go: sending them to
+        // the subscription's URL reaches the redirector, which answers with
+        // another redirect instead of a `304`, and the feed re-downloads in
+        // full forever. Aiming at `fetched_from` is what lets it revalidate.
+        //
+        // The exception is a re-probe. Fetching the landing URL directly
+        // stops observing the configured one, so a redirect that later moves
+        // would go unnoticed; every [`reprobe_interval`] a fetch starts from
+        // the configured URL again to re-derive it. Such a fetch is
+        // deliberately unconditional — presenting the landing URL's
+        // validators to the configured URL is the very mistake above, in
+        // reverse.
+        let window = snapshot.window.as_ref();
+        let target = match window {
+            Some(cached) if !self.reprobe_due(cached, &sub.url) => cached.fetched_from.clone(),
+            // Also the `window_lost` path: with no window there are no
+            // validators to send and no cached copy for a `304` to confirm,
+            // so an unconditional `GET` from the configured URL is the
+            // request that actually refills the window.
+            _ => sub.url.clone(),
+        };
+        // `Some` only when the validators belong to `target` — which covers
+        // the un-redirected feed whose landing URL *is* its configured URL,
+        // where a re-probe and a normal conditional fetch are the same thing.
+        let validators = window
+            .filter(|cached| cached.fetched_from == target)
+            .map(|cached| Validators {
+                etag: cached.etag.clone(),
+                last_modified: cached.last_modified.clone(),
+            });
+        // Carried forward unless this fetch is the probe: a content refresh
+        // at the landing URL must not reset the drift clock, or a feed that
+        // updates often would never re-probe at all.
+        let probed_at = match window {
+            Some(cached) if target != sub.url => cached.probed_at,
+            _ => Instant::now(),
+        };
 
-        match self.fetcher.fetch(&sub.url, validators.as_ref()).await {
+        match self.fetcher.fetch(&target, validators.as_ref()).await {
             Ok(FetchOutcome::NotModified { http_status }) => {
                 self.cache.record_not_modified(
                     &sub.name,
@@ -619,6 +717,7 @@ impl RssEngine {
                 etag,
                 last_modified,
                 content_type,
+                final_url,
             }) => {
                 let bytes = body.len();
                 match parse_off_worker(body, content_type, self.parse_fuse).await {
@@ -631,6 +730,10 @@ impl RssEngine {
                             http_status,
                             etag,
                             last_modified,
+                            // The hop that issued those validators, which is
+                            // where the next conditional request goes.
+                            final_url,
+                            probed_at,
                         );
                         let rows = batch.num_rows();
                         (
@@ -684,6 +787,19 @@ impl RssEngine {
         }
     }
 
+    /// Whether this window's landing URL is due to be re-derived from
+    /// `configured_url` — see [`reprobe_interval`].
+    ///
+    /// Never true for a feed that does not redirect: with
+    /// `fetched_from == configured_url` there is no derived address to drift,
+    /// and every fetch is already a fetch of the configured URL.
+    /// `saturating_sub` rather than an `Instant` add, so no clock arithmetic
+    /// can panic here.
+    fn reprobe_due(&self, window: &CachedWindow, configured_url: &str) -> bool {
+        window.fetched_from != configured_url
+            && Instant::now().saturating_duration_since(window.probed_at) >= self.reprobe_interval
+    }
+
     /// Store a freshly parsed window and its observation, and hand back the
     /// batch to serve. `build_items_batch` already stamps `fresh`, so the
     /// served batch needs no relabelling.
@@ -701,7 +817,13 @@ impl RssEngine {
         http_status: u16,
         etag: Option<String>,
         last_modified: Option<String>,
+        fetched_from: String,
+        probed_at: Instant,
     ) -> RecordBatch {
+        // `items.feed_url` stays the *configured* URL, not the landing one:
+        // it is the subscription's identity, the value pruning matches
+        // against, and the address the operator wrote. Where the bytes came
+        // from is cache state, not a row value.
         let batch = build_items_batch(&sub.name, &sub.url, &document.items);
         let observation = FeedObservation {
             last_fetch_ms: Some(now_ms()),
@@ -726,6 +848,8 @@ impl RssEngine {
                 batch: batch.clone(),
                 etag,
                 last_modified,
+                fetched_from,
+                probed_at,
             },
             observation,
             arm(Instant::now(), self.ttl),
@@ -2499,6 +2623,209 @@ mod tests {
             .await
             .expect("a well-formed document parses within the fuse");
         assert_eq!(document.items.len(), 1);
+    }
+
+    /// The regression this feature exists for: a feed whose configured URL
+    /// `301`s must revalidate at its landing URL, not re-download in full
+    /// forever.
+    ///
+    /// Before the landing URL was stored, the `etag` issued by `/b` was kept
+    /// under the subscription's `/a`, so every later scan sent
+    /// `If-None-Match` to `/a` — a redirector, which answers with another
+    /// `301` and never a `304` — and then fetched `/b` unconditionally. This
+    /// asserts the whole corrected shape: the second scan asks `/b` directly,
+    /// conditionally, and gets a `304`; and the third scan proves the landing
+    /// URL survived a revalidation that does not touch the window.
+    #[tokio::test]
+    async fn a_redirected_feed_revalidates_at_its_landing_url() {
+        let server = MockFeedServer::start(|req| {
+            if req.path.starts_with("/a") {
+                // The permanent redirect the subscription URL is stuck behind.
+                MockResponse::status(301).with_header("location", "/b.xml")
+            } else if req.header("if-none-match").as_deref() == Some("\"v1\"") {
+                MockResponse::status(304)
+            } else {
+                MockResponse::xml(RSS2_MINIMAL).with_header("etag", "\"v1\"")
+            }
+        })
+        .await;
+        // ttl 0: every serve refetches, so each scan below is a live request
+        // rather than a cache hit.
+        let engine = test_engine(&server, &[("a", "/a.xml")], 0);
+
+        assert_eq!(
+            engine
+                .serve_feed("a", || true)
+                .await
+                .expect("the redirect is followed and the body served")
+                .num_rows(),
+            1
+        );
+        let first = server.requests();
+        assert_eq!(
+            first.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/a.xml", "/b.xml"],
+            "scan 1 follows the redirect"
+        );
+
+        // Scan 2 must go straight to the landing URL, carrying the validators
+        // that URL issued.
+        let batch = engine
+            .serve_feed("a", || true)
+            .await
+            .expect("the 304 serves the cached window");
+        assert_eq!(str_col(&batch, "window_status"), vec!["revalidated"]);
+        let second: Vec<String> = server.requests()[first.len()..]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            second,
+            vec!["/b.xml"],
+            "no hop through the redirector: the conditional request goes to \
+             the URL that issued the validators"
+        );
+        assert_eq!(
+            server.requests().last().unwrap().header("if-none-match"),
+            Some("\"v1\"".to_string()),
+            "and it is conditional — otherwise the 304 is unreachable"
+        );
+        assert_eq!(
+            str_col(&engine.feeds_row("a"), "last_status"),
+            vec!["revalidated"]
+        );
+        // `feeds.url` is still the subscription's own URL: the landing URL is
+        // cache state, not identity.
+        assert!(str_col(&engine.feeds_row("a"), "url")[0].ends_with("/a.xml"));
+
+        // Scan 3: the landing URL survived a `304` (which never rebuilds the
+        // window), so it is still used.
+        let before_third = server.requests().len();
+        engine.serve_feed("a", || true).await.expect("served again");
+        let third: Vec<String> = server.requests()[before_third..]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(third, vec!["/b.xml"]);
+    }
+
+    /// The drift half: a re-probe starts from the configured URL again,
+    /// unconditionally, and adopts wherever it now leads.
+    ///
+    /// `reprobe_interval` is at least six hours in production, so the field
+    /// is set to zero here — every fetch is a probe — which is exactly the
+    /// state the interval bounds rather than a different code path.
+    #[tokio::test]
+    async fn a_reprobe_starts_from_the_configured_url_and_follows_drift() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let server = MockFeedServer::start(move |req| {
+            if req.path.starts_with("/a") {
+                // The redirect target moves after the first scan: /b, then /c.
+                let nth = calls2.fetch_add(1, Ordering::SeqCst);
+                let to = if nth == 0 { "/b.xml" } else { "/c.xml" };
+                MockResponse::status(301).with_header("location", to)
+            } else {
+                MockResponse::xml(RSS2_MINIMAL).with_header("etag", "\"v1\"")
+            }
+        })
+        .await;
+        let mut engine = test_engine(&server, &[("a", "/a.xml")], 0);
+        engine.reprobe_interval = Duration::ZERO;
+
+        engine.serve_feed("a", || true).await.expect("first serve");
+        let before = server.requests().len();
+
+        engine.serve_feed("a", || true).await.expect("second serve");
+        let probe: Vec<String> = server.requests()[before..]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            probe,
+            vec!["/a.xml", "/c.xml"],
+            "the probe re-derives the landing URL and follows it to its new target"
+        );
+        assert_eq!(
+            server.requests()[before].header("if-none-match"),
+            None,
+            "a probe is unconditional: /b's validators mean nothing to /a"
+        );
+
+        // The new landing URL is what the next conditional request uses.
+        engine.reprobe_interval = Duration::from_secs(3600);
+        let before_third = server.requests().len();
+        engine.serve_feed("a", || true).await.expect("third serve");
+        let third: Vec<String> = server.requests()[before_third..]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(third, vec!["/c.xml"], "drift adopted");
+    }
+
+    /// A refresh at the landing URL must not reset the drift clock — only a
+    /// probe does. Otherwise a feed that changes on every scan would keep
+    /// rebuilding its window with a fresh `probed_at` and never probe again.
+    #[tokio::test]
+    async fn a_content_refresh_does_not_reset_the_drift_clock() {
+        let server = MockFeedServer::start(|req| {
+            if req.path.starts_with("/a") {
+                MockResponse::status(301).with_header("location", "/b.xml")
+            } else {
+                // Never a 304: every scan is a full refresh.
+                MockResponse::xml(RSS2_MINIMAL)
+            }
+        })
+        .await;
+        let mut engine = test_engine(&server, &[("a", "/a.xml")], 0);
+        engine.reprobe_interval = Duration::from_millis(400);
+
+        // The probe that establishes the clock, at T0.
+        engine.serve_feed("a", || true).await.expect("first serve");
+
+        // A refresh at T0+300ms: inside the interval, so it goes to /b and
+        // must carry the clock forward rather than restart it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        engine.serve_feed("a", || true).await.expect("refresh");
+        let before = server.requests().len();
+        assert_eq!(
+            server.requests()[before - 1].path,
+            "/b.xml",
+            "the refresh went straight to the landing URL"
+        );
+
+        // T0+500ms: past the interval measured from the probe, but only
+        // 200ms past the refresh — so this probes only if the refresh left
+        // the clock alone.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        engine.serve_feed("a", || true).await.expect("probe due");
+        let probe: Vec<String> = server.requests()[before..]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            probe,
+            vec!["/a.xml", "/b.xml"],
+            "the interval elapsed since the *probe*, not since the last refresh"
+        );
+    }
+
+    /// The interval is a multiple of the TTL, clamped — the same shape as
+    /// [`failure_fuse`], and never zero, which would make every fetch a probe
+    /// and forfeit the point of storing the landing URL.
+    #[test]
+    fn the_reprobe_interval_is_a_clamped_multiple_of_the_ttl() {
+        assert_eq!(
+            reprobe_interval(Duration::from_secs(900)),
+            Duration::from_secs(900 * 24),
+            "the default TTL gives 24 refreshes between probes"
+        );
+        assert_eq!(
+            reprobe_interval(Duration::ZERO),
+            MIN_REPROBE_INTERVAL,
+            "an always-live feed still does not probe on every scan"
+        );
+        assert_eq!(reprobe_interval(MAX_TTL), MAX_REPROBE_INTERVAL);
     }
 
     /// A panicking parse must not carry its payload into `feeds.last_error`:

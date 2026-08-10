@@ -56,6 +56,14 @@
 //! resent past the first hop, even though each hop still gets its own fresh
 //! retry budget (see below).
 //!
+//! This is why [`FetchOutcome::Fetched`] reports a `final_url`. A redirected
+//! feed's validators are issued by the *last* hop, so a caller that keeps
+//! them under the URL it originally asked for will send them somewhere that
+//! never issued them — to a redirector, which answers with another redirect
+//! rather than a `304`, forever. Reporting the landing URL lets the caller
+//! store the two together and aim the next conditional request where the
+//! validators actually mean something.
+//!
 //! ## The size cap is measured on the decoded stream
 //!
 //! [`FeedFetcher::new`] enables gzip decoding on the client, and
@@ -178,6 +186,12 @@ pub struct Validators {
 #[derive(Debug)]
 pub enum FetchOutcome {
     /// The server confirmed the cached copy is still current (`304`).
+    ///
+    /// Carries no landing URL, and needs none: a `304` can only answer a hop
+    /// that actually sent validators, validators go out on the first hop
+    /// only, and [`FeedFetcher::attempt_hop`] maps an unconditional `304` to
+    /// [`FetchError::Status`] rather than this variant. So the URL that
+    /// produced a `NotModified` is always the one the caller asked for.
     NotModified { http_status: u16 },
     /// A fresh body, bounded by the fetcher's configured byte cap.
     Fetched {
@@ -186,6 +200,16 @@ pub enum FetchOutcome {
         etag: Option<String>,
         last_modified: Option<String>,
         content_type: Option<String>,
+        /// The URL of the hop that produced this body — the caller's URL
+        /// when nothing redirected, the final target otherwise.
+        ///
+        /// Reported because `etag`/`last_modified` above belong to *this*
+        /// URL, not to the one the caller passed: a conditional request
+        /// carrying them has to go here, or the validators are presented to
+        /// an address that never issued them. That is exactly what a
+        /// redirected feed used to do — see the engine's landing-URL
+        /// handling.
+        final_url: String,
     },
 }
 
@@ -508,7 +532,7 @@ impl FeedFetcher {
                         // the full GET, discarding the partial body.
                         // `TooLarge` (and anything else) stays terminal —
                         // see the module doc's Retries section.
-                        match self.read_body(resp).await {
+                        match self.read_body(resp, url).await {
                             Ok(outcome) => return Ok(HopOutcome::Done(outcome)),
                             Err(
                                 err @ (FetchError::Timeout { .. } | FetchError::Transport { .. }),
@@ -561,7 +585,7 @@ impl FeedFetcher {
 
     /// Capture the validator/content-type headers, then stream the body,
     /// enforcing the byte cap on the *decoded* stream — see the module doc.
-    async fn read_body(&self, resp: Response) -> Result<FetchOutcome, FetchError> {
+    async fn read_body(&self, resp: Response, url: &Url) -> Result<FetchOutcome, FetchError> {
         let http_status = resp.status().as_u16();
         let etag = header_string(&resp, ETAG);
         let last_modified = header_string(&resp, LAST_MODIFIED);
@@ -594,6 +618,9 @@ impl FeedFetcher {
             etag,
             last_modified,
             content_type,
+            // The hop this body came off, not the URL `fetch` was called
+            // with — see the variant's doc.
+            final_url: url.to_string(),
         })
     }
 }
@@ -766,6 +793,7 @@ mod tests {
                 etag,
                 last_modified,
                 content_type,
+                ..
             } => {
                 assert_eq!(body, b"<rss/>");
                 assert_eq!(http_status, 200);
@@ -1093,6 +1121,52 @@ mod tests {
         let requests = server.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].path, "/moved");
+    }
+
+    /// `final_url` names the hop the body came off, not the URL `fetch` was
+    /// called with. The caller needs it because the validators reported
+    /// beside it were issued by *that* hop — see the module doc's
+    /// first-hop section.
+    #[tokio::test]
+    async fn a_redirected_fetch_reports_its_landing_url() {
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                MockResponse::xml("<rss/>").with_header("etag", "\"landing\"")
+            } else {
+                MockResponse::status(301).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let requested = format!("{}/feed.xml", server.url());
+        let out = f.fetch(&requested, None).await.unwrap();
+        match out {
+            FetchOutcome::Fetched {
+                final_url, etag, ..
+            } => {
+                assert_eq!(final_url, format!("{}/moved", server.url()));
+                assert_ne!(final_url, requested, "the landing URL, not the request");
+                assert_eq!(
+                    etag.as_deref(),
+                    Some("\"landing\""),
+                    "and the validators beside it are the landing hop's"
+                );
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+    }
+
+    /// An un-redirected fetch lands where it was aimed, so caller logic that
+    /// compares the two needs no special case.
+    #[tokio::test]
+    async fn an_undirected_fetch_reports_the_requested_url() {
+        let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
+        let f = test_fetcher();
+        let requested = format!("{}/feed.xml", server.url());
+        match f.fetch(&requested, None).await.unwrap() {
+            FetchOutcome::Fetched { final_url, .. } => assert_eq!(final_url, requested),
+            other => panic!("expected Fetched, got {other:?}"),
+        }
     }
 
     #[tokio::test]
