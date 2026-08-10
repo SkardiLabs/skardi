@@ -48,8 +48,11 @@ const DEFAULT_MAX_CONCURRENT: usize = 6;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 /// Default deadline for one full scan across every subscribed feed.
 const DEFAULT_SCAN_TIMEOUT_SECONDS: u64 = 60;
-/// Default cap on one decoded feed response body (5 MiB).
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = 5_242_880;
+/// Default cap on one decoded feed response body (5 MiB). `pub(crate)`
+/// because it is also the unit the engine's parse fuse scales by: ten
+/// seconds of parse budget per this many licensed bytes (see
+/// `engine::parse_fuse`).
+pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: u64 = 5_242_880;
 
 fn default_ttl_seconds() -> u64 {
     DEFAULT_TTL_SECONDS
@@ -155,6 +158,15 @@ pub struct RssConfig {
     pub scan_timeout_seconds: u64,
 
     /// Byte bound on one decoded feed response body.
+    ///
+    /// Stored raw — validation rejects only `0`, and there is no upper
+    /// bound: raising it licenses proportionally more parse work, and the
+    /// engine's parse fuse scales with it (ten seconds per 5 MiB — see
+    /// `engine::parse_fuse`) rather than misfiring on the larger documents
+    /// this field now permits. An operator raising it far above the default
+    /// should raise `scan_timeout_seconds` alongside, or parse timeouts
+    /// surface as traceless scan-deadline drops; the engine warns at
+    /// registration when the two fall out of order.
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: u64,
 

@@ -52,9 +52,10 @@
 //! ## Parsing runs off the worker threads
 //!
 //! `parse_feed_document` is synchronous CPU over attacker-authored bytes.
-//! [`parse_off_worker`] moves it to the blocking pool and fuses it with
-//! [`PARSE_TIMEOUT`] — its doc has the full account. The politeness permit,
-//! held across that await, is what bounds how many parses run at once.
+//! [`parse_off_worker`] moves it to the blocking pool and fuses it with a
+//! budget scaled from `max_response_bytes` ([`parse_fuse`]) — their docs
+//! have the full account. The politeness permit, held across that await, is
+//! what bounds how many parses run at once.
 //!
 //! ## Feed keys never come from a query
 //!
@@ -214,7 +215,7 @@ use super::cache::{
     CachedWindow, FeedCache, FeedObservation, FeedSnapshot, FeedStatus, MemoryFeedCache,
     failure_fuse,
 };
-use super::config::RssConfig;
+use super::config::{DEFAULT_MAX_RESPONSE_BYTES, RssConfig};
 use super::egress::EgressPolicy;
 use super::error::{MAX_ERROR_CHARS, RssError, truncate};
 use super::fetch::{FeedFetcher, FetchError, FetchOutcome, Validators};
@@ -238,7 +239,10 @@ const WINDOW_ENTRY_HEADROOM: usize = 8;
 /// arithmetic in a range the platform can represent.
 const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// Ceiling on one feed's parse before the scan abandons it.
+/// Base of one feed's parse fuse: ten seconds of parse budget per
+/// [`DEFAULT_MAX_RESPONSE_BYTES`] of licensed body. [`parse_fuse`] scales it
+/// by the configured `max_response_bytes`, so the time budget tracks the
+/// input budget instead of silently diverging from it.
 ///
 /// [`parse_off_worker`] runs the parse on the blocking pool, so a slow parse
 /// no longer pins a runtime worker — but the partition still awaits the
@@ -246,13 +250,38 @@ const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// partition (and its politeness permit) for the rest of the scan deadline.
 /// Parsing is linear in a capped body (internal DTDs are refused, HTML
 /// deeper than `convert::MAX_HTML_DEPTH` degrades to tag-stripping), and a
-/// legitimate `max_response_bytes`-sized document parses in well under a
-/// second — so ten seconds is not a tuning knob but headroom: anything that
-/// reaches it is hostile or broken, most plausibly a super-linear corner in
-/// the parsing stack this crate does not own. Negative caching
+/// legitimate document at the *default* cap parses in well under a second —
+/// so ten seconds per unit is not a tuning knob but headroom: anything that
+/// reaches the fuse is hostile, broken, or a super-linear corner in the
+/// parsing stack this crate does not own. Negative caching
 /// ([`failure_fuse`]) then keeps the offender from being re-parsed on every
 /// scan.
 const PARSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on the scaled parse fuse. Past an hour — the exec layer's own
+/// ceiling on the scan timeout — a fuse protects nothing, and an absurd
+/// `max_response_bytes` must not manufacture an absurd duration out of
+/// [`parse_fuse`]'s multiplication.
+const MAX_PARSE_FUSE: Duration = Duration::from_secs(60 * 60);
+
+/// One feed's parse fuse: [`PARSE_TIMEOUT`] per
+/// [`DEFAULT_MAX_RESPONSE_BYTES`] unit of the configured
+/// `max_response_bytes`, partial units rounded up, capped at
+/// [`MAX_PARSE_FUSE`].
+///
+/// The ten-second base was calibrated against the default body cap. The
+/// cap itself is operator-raisable with no upper bound, and an operator who
+/// raises it has licensed proportionally more parse *work* — parse is
+/// linear in the body — so a constant fuse would misfire on exactly the
+/// larger documents the raised cap now permits. Scaling the time budget
+/// with the input budget keeps the fuse meaning what it meant at the
+/// default: generous headroom over any legitimate document.
+fn parse_fuse(max_response_bytes: u64) -> Duration {
+    let units = max_response_bytes
+        .div_ceil(DEFAULT_MAX_RESPONSE_BYTES)
+        .max(1);
+    Duration::from_secs(PARSE_TIMEOUT.as_secs().saturating_mul(units)).min(MAX_PARSE_FUSE)
+}
 
 /// The freshness state machine for one `rss` data source.
 pub struct RssEngine {
@@ -272,6 +301,9 @@ pub struct RssEngine {
     semaphore: Arc<Semaphore>,
     ttl: Duration,
     scan_timeout: Duration,
+    /// One parse's wait budget, scaled from `max_response_bytes` — see
+    /// [`parse_fuse`].
+    parse_fuse: Duration,
 }
 
 impl RssEngine {
@@ -348,6 +380,25 @@ impl RssEngine {
                 "rss max_concurrent clamped to the semaphore's ceiling"
             );
         }
+        let scan_timeout = Duration::from_secs(config.scan_timeout_seconds);
+        let parse_fuse = parse_fuse(config.max_response_bytes);
+        if parse_fuse >= scan_timeout {
+            // The parse fuse exists to fail *diagnosably* (degrade +
+            // `last_error`) before the scan deadline fails tracelessly (a
+            // deadline drop writes no health state). A `max_response_bytes`
+            // large enough to push the fuse past `scan_timeout_seconds`
+            // inverts that order: parse timeouts will surface as deadline
+            // drops instead. Warn rather than clamp — the operator's remedy
+            // is raising `scan_timeout_seconds` to match the body budget
+            // they configured, not a shorter fuse misfiring on the
+            // legitimate documents that budget now permits.
+            tracing::warn!(
+                source = %source_name,
+                parse_fuse_seconds = parse_fuse.as_secs(),
+                scan_timeout_seconds = config.scan_timeout_seconds,
+                "rss parse fuse meets or exceeds the scan timeout; raise scan_timeout_seconds"
+            );
+        }
         Self {
             source_name,
             subscriptions,
@@ -356,7 +407,8 @@ impl RssEngine {
             cache,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             ttl,
-            scan_timeout: Duration::from_secs(config.scan_timeout_seconds),
+            scan_timeout,
+            parse_fuse,
         }
     }
 
@@ -530,7 +582,7 @@ impl RssEngine {
                 content_type,
             }) => {
                 let bytes = body.len();
-                match parse_off_worker(body, content_type, PARSE_TIMEOUT).await {
+                match parse_off_worker(body, content_type, self.parse_fuse).await {
                     Ok(document) => {
                         let notes = document.conformance_notes.len();
                         let batch = self.record_fresh_window(
@@ -863,7 +915,7 @@ fn window_lost(snapshot: &FeedSnapshot) -> bool {
 /// the parser's own reason.
 ///
 /// Run `parse_feed_document` on the blocking pool, fused by `fuse`
-/// (production passes [`PARSE_TIMEOUT`]).
+/// (production passes the engine's [`parse_fuse`]-scaled budget).
 ///
 /// The parse is synchronous CPU over an attacker-authored body of up to
 /// `max_response_bytes` — sanitation, XML/JSON parsing, and per-item
@@ -2387,6 +2439,81 @@ mod tests {
             .await
             .expect("a well-formed document parses within the fuse");
         assert_eq!(document.items.len(), 1);
+    }
+
+    /// The fuse scales with the licensed input — ten seconds per 5 MiB unit,
+    /// partial units rounded up, floored at one unit, capped at an hour —
+    /// so raising `max_response_bytes` cannot make the fuse misfire on the
+    /// legitimate large documents it now permits.
+    #[test]
+    fn the_parse_fuse_tracks_max_response_bytes() {
+        assert_eq!(
+            parse_fuse(DEFAULT_MAX_RESPONSE_BYTES),
+            Duration::from_secs(10),
+            "the default cap keeps the original ten-second fuse"
+        );
+        assert_eq!(
+            parse_fuse(1),
+            Duration::from_secs(10),
+            "floored at one unit"
+        );
+        assert_eq!(
+            parse_fuse(DEFAULT_MAX_RESPONSE_BYTES + 1),
+            Duration::from_secs(20),
+            "partial units round up"
+        );
+        assert_eq!(
+            parse_fuse(DEFAULT_MAX_RESPONSE_BYTES * 10),
+            Duration::from_secs(100)
+        );
+        assert_eq!(
+            parse_fuse(u64::MAX),
+            MAX_PARSE_FUSE,
+            "capped, not overflowing"
+        );
+    }
+
+    /// A body budget big enough to push the fuse past the scan timeout
+    /// inverts the diagnosable-before-traceless ordering (parse timeouts
+    /// would surface as deadline drops with no `last_error`); the engine
+    /// says so at construction instead of leaving it to be discovered from
+    /// a `never` row.
+    #[tokio::test]
+    async fn a_parse_fuse_past_the_scan_timeout_warns_at_construction() {
+        let (_guard, events) = capture_events();
+        let subscriptions = vec![ResolvedSubscription {
+            name: "a".to_string(),
+            url: "https://feed.example/f.xml".to_string(),
+        }];
+        let mut config = inline_config(vec![FeedSubscription {
+            url: "https://feed.example/f.xml".to_string(),
+            name: Some("a".to_string()),
+        }]);
+        // 7 units × 10s = 70s ≥ the 60s default scan timeout.
+        config.max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES * 7;
+        let fetcher = FeedFetcher::new(
+            Arc::new(AllowAll),
+            Duration::from_secs(5),
+            config.max_response_bytes,
+            config.user_agent.clone(),
+        )
+        .expect("build the test fetcher");
+        let _engine = RssEngine::with_parts(
+            "rss_test".to_string(),
+            subscriptions,
+            &config,
+            fetcher,
+            Arc::new(MemoryFeedCache::new(CACHE_MAX_BYTES, 8)),
+        );
+
+        let warned = events_with_message(
+            &events,
+            "rss parse fuse meets or exceeds the scan timeout; raise scan_timeout_seconds",
+        );
+        assert_eq!(warned.len(), 1, "one warning per engine built");
+        assert_eq!(warned[0].level, tracing::Level::WARN);
+        assert_eq!(warned[0].field("parse_fuse_seconds"), Some("70"));
+        assert_eq!(warned[0].field("scan_timeout_seconds"), Some("60"));
     }
 
     /// A well-formed two-item document, distinguishable from [`RSS2_MINIMAL`]
