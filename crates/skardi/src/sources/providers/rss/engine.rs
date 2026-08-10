@@ -977,7 +977,17 @@ fn window_lost(snapshot: &FeedSnapshot) -> bool {
 ///   linear in a capped body.
 /// - `"panic"`: `parse_feed_document` is designed not to panic on any
 ///   input; if it ever does, the feed degrades instead of the scan
-///   unwinding.
+///   unwinding. The `JoinError` is *not* interpolated into the reason:
+///   its `Display` quotes the panic payload (tokio-1.52.3
+///   `src/runtime/task/error.rs`, the `Repr::Panic` arm), and a payload
+///   can carry feed-authored bytes — a library panicking through an
+///   `unwrap` or an `assert` on parsed input prints them — which would
+///   put attacker-authored text in `feeds.last_error` and from there into
+///   an agent's context. Nothing is lost by dropping it: the panic hook
+///   has already written the payload *and* a backtrace to the process
+///   log, which is where a bug report against the parsing stack starts
+///   anyway. The same arm also catches the runtime-shutdown
+///   cancellation, which is why the reason distinguishes the two.
 async fn parse_off_worker(
     body: Vec<u8>,
     content_type: Option<String>,
@@ -987,11 +997,7 @@ async fn parse_off_worker(
         tokio::task::spawn_blocking(move || parse_feed_document(&body, content_type.as_deref()));
     match tokio::time::timeout(fuse, parse).await {
         Ok(Ok(result)) => result,
-        Ok(Err(join_error)) => Err(ParseFailure {
-            stage: "panic",
-            reason: format!("feed parse aborted: {join_error}"),
-            dialect_declared: None,
-        }),
+        Ok(Err(join_error)) => Err(join_failure(&join_error)),
         Err(_elapsed) => Err(ParseFailure {
             stage: "timeout",
             reason: format!(
@@ -1000,6 +1006,21 @@ async fn parse_off_worker(
             ),
             dialect_declared: None,
         }),
+    }
+}
+
+/// The `"panic"` [`ParseFailure`] for a parse task that did not return a
+/// value — see [`parse_off_worker`]'s doc for why the `JoinError` itself is
+/// never quoted.
+fn join_failure(join_error: &tokio::task::JoinError) -> ParseFailure {
+    ParseFailure {
+        stage: "panic",
+        reason: if join_error.is_panic() {
+            "feed parse panicked; the payload and backtrace are in the server log".to_string()
+        } else {
+            "feed parse did not complete: its task was cancelled".to_string()
+        },
+        dialect_declared: None,
     }
 }
 
@@ -2478,6 +2499,40 @@ mod tests {
             .await
             .expect("a well-formed document parses within the fuse");
         assert_eq!(document.items.len(), 1);
+    }
+
+    /// A panicking parse must not carry its payload into `feeds.last_error`:
+    /// `JoinError`'s own `Display` quotes it, and a payload can hold
+    /// feed-authored bytes (a library `unwrap`/`assert` on parsed input
+    /// prints them), which the column feeds into an agent's context. The
+    /// panic hook has already written payload and backtrace to the process
+    /// log, so the column loses no diagnostic reach by naming it instead.
+    ///
+    /// The panicking task prints to stderr while this test runs; that is the
+    /// hook doing exactly what the assertion below relies on.
+    #[tokio::test]
+    async fn a_panicked_parse_does_not_quote_the_payload() {
+        let join_error = tokio::task::spawn_blocking(|| panic!("feed-authored payload"))
+            .await
+            .expect_err("the task panicked");
+        assert!(join_error.is_panic());
+        assert!(
+            join_error.to_string().contains("feed-authored payload"),
+            "guard: if JoinError stops quoting payloads, this test's premise is gone"
+        );
+
+        let failure = join_failure(&join_error);
+        assert_eq!(failure.stage, "panic");
+        assert!(
+            !failure.reason.contains("feed-authored payload"),
+            "the payload must not reach last_error: {}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("server log"),
+            "and the reason must say where the payload actually is: {}",
+            failure.reason
+        );
     }
 
     /// The fuse scales with the licensed input — ten seconds per 5 MiB unit,
