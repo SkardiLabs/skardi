@@ -233,11 +233,22 @@ pub struct FeedFetcher {
 
 impl FeedFetcher {
     /// Build the fetcher's one shared client. `policy` is consulted in two
-    /// ways: wrapped in a [`PolicyDns`] as the client's DNS resolver (so
-    /// every hostname connection is checked structurally, including
-    /// pooled-connection reuse), and held directly for the IP-literal
-    /// checks [`FeedFetcher::check_hop_target`] runs before the initial
-    /// request and before every redirect hop.
+    /// ways: wrapped in a [`PolicyDns`] as the client's DNS resolver (so every
+    /// hostname is checked structurally when a connection is *established* —
+    /// reqwest resolves through [`PolicyDns`] before each new connect), and
+    /// held directly for the IP-literal checks
+    /// [`FeedFetcher::check_hop_target`] runs before the initial request and
+    /// before every redirect hop.
+    ///
+    /// The resolver check gates connection *establishment*, not every request:
+    /// a warm pooled connection is reused without re-resolving, so
+    /// [`EgressPolicy::check_ip`] is not re-consulted while it lives. This is
+    /// not a bypass — a reused connection only ever talks to the address that
+    /// was approved when it was opened — but the guarantee is temporal: a
+    /// policy that begins refusing a host does not sever connections already
+    /// warm to it, which linger up to reqwest's pool idle timeout (~90s by
+    /// default). An [`EgressPolicy`] must therefore treat an approval as valid
+    /// for the life of a connection.
     pub fn new(
         policy: Arc<dyn EgressPolicy>,
         request_timeout: Duration,
