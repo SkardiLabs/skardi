@@ -105,6 +105,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
+use percent_encoding::{CONTROLS, percent_encode};
 use reqwest::header::{
     CONTENT_TYPE, ETAG, HeaderName, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
 };
@@ -420,10 +421,19 @@ impl FeedFetcher {
                     if status.is_redirection()
                         && let Some(location) = resp.headers().get(LOCATION)
                     {
-                        let location = location.to_str().map_err(|e| FetchError::InvalidUrl {
-                            reason: format!("redirect Location header is not valid ASCII: {e}"),
-                        })?;
-                        return Ok(HopOutcome::Redirect(location.to_string()));
+                        // A `Location` may carry raw, unencoded non-ASCII in
+                        // its path — many servers (non-English sites especially)
+                        // emit UTF-8 octets directly. A strict client rejects
+                        // the header as non-ASCII and permanently kills the
+                        // feed; browsers percent-encode those octets and follow.
+                        // Do the same: `CONTROLS` encodes every non-ASCII byte
+                        // (and C0 controls / DEL), while printable ASCII —
+                        // including `%`, the URL delimiters, and any existing
+                        // %-escapes — passes through untouched, so structure and
+                        // prior encoding are preserved. `resolve_redirect_target`
+                        // still re-runs every egress check on the parsed target.
+                        let location = percent_encode(location.as_bytes(), CONTROLS).to_string();
+                        return Ok(HopOutcome::Redirect(location));
                     }
                     if is_retryable_status(status) {
                         let err = FetchError::Status {
@@ -924,6 +934,35 @@ mod tests {
         let requests = server.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].path, "/moved");
+    }
+
+    #[tokio::test]
+    async fn redirect_location_with_raw_utf8_is_percent_encoded_and_followed() {
+        // A non-conformant server redirects to a path carrying raw, unencoded
+        // UTF-8 — `í` as the two octets 0xC3 0xAD. A strict client rejects the
+        // header as non-ASCII and permanently kills the feed; this follows it
+        // like a browser, percent-encoding the octets to `/art%C3%ADculo`
+        // before the next hop.
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/art%C3%ADculo" {
+                MockResponse::xml("<rss/>")
+            } else {
+                MockResponse::status(302).with_header("location", "/artículo")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let out = f
+            .fetch(&format!("{}/feed.xml", server.url()), None)
+            .await
+            .unwrap();
+        assert!(matches!(out, FetchOutcome::Fetched { .. }));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].path, "/art%C3%ADculo",
+            "raw-UTF-8 Location octets must be percent-encoded before the hop"
+        );
     }
 
     #[tokio::test]
