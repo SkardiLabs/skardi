@@ -6,7 +6,7 @@
 
 ## Summary
 
-Skardi will support property-graph data sources through a **dedicated graph engine bypass** rather than by teaching DataFusion Cypher. The graph engine (Neo4j or Kuzu) lives outside the Skardi process and owns graph storage, indexing, and traversal. Skardi exposes a single SQL interface — the `cypher_query(connection, cypher, params, columns)` UDTF — that forwards read-only Cypher queries to the engine and maps the returned nodes, relationships, and paths into ordinary Arrow-backed relational rows. The schema is always fixed at planning time: declared columns when the caller provides them, one JSON-text `record` column otherwise.
+Skardi will support property-graph data sources through a **dedicated graph engine bypass** rather than by teaching DataFusion Cypher. The graph engine (Apache AGE inside Postgres, Neo4j, or Kuzu) lives outside the Skardi process and owns graph storage, indexing, and traversal. Skardi exposes a single SQL interface — the `cypher_query(connection, cypher, params, columns)` UDTF — that forwards read-only Cypher queries to the engine and maps the returned nodes, relationships, and paths into ordinary Arrow-backed relational rows. The schema is always fixed at planning time: declared columns when the caller provides them, one JSON-text `record` column otherwise.
 
 A second, optional surface lets users declare stable catalog views from context YAML: a `type: graph` data source binds a connection and a list of named Cypher queries, each exposed as a table under the source catalog. This gives agents predictable table names while the engine remains the graph expert.
 
@@ -56,7 +56,7 @@ Because Cypher can return dynamic structures (`RETURN n, r, p`), the UDTF cannot
 
 Both speak Cypher. The Skardi adapter should be backend-agnostic at the SQL surface, with a small per-backend driver trait. Kuzu's static schema is an upgrade the design should not squander: its `graph_schema` output is exact (read from the catalog, not sampled), and a future optimization can convert Kuzu properties as typed columns instead of JSON text — the uniform JSON-text spelling is the floor both backends meet, not a ceiling.
 
-### Apache AGE (candidate third backend)
+### Apache AGE (the first backend — milestone 1)
 
 [Apache AGE](https://age.apache.org/) is a PostgreSQL extension that
 executes openCypher *inside* Postgres: queries travel over the ordinary
@@ -81,17 +81,20 @@ How it fits the abstraction (deliberately unchanged):
   two-layer story as Neo4j's read transactions.
 - The declared-columns mode aligns with AGE's own requirement that the
   `cypher()` call declare its result arity (`AS (col agtype, …)`).
-  The JSON-`record` fallback needs the adapter to know the arity too —
-  either by wrapping the `RETURN` into a single map or by requiring
-  declared columns for AGE; which spelling wins is an open question for
-  the AGE milestone, not for this design.
+  The JSON-`record` fallback cannot know that arity, so on AGE an
+  omitted `columns` is a targeted error telling the caller to declare
+  them (settled); the fallback ships with the Neo4j milestone, where
+  Bolt needs no declared arity.
 - `graph_schema` reads AGE's catalog tables (`ag_catalog.ag_label` and
   friends) — names and types only, as everywhere else.
 
 AGE speaks an openCypher *subset* (as does Kuzu), which the
-backend-divergence risk already covers. It stays a **candidate**: not in
-milestone 1 or 2, promoted to a concrete milestone if
-GraphRAG-in-Postgres proves to be the dominant deployment.
+backend-divergence risk covers. **Review round 1 promoted AGE from
+candidate to milestone 1**: GraphRAG-in-Postgres is the deployment in
+hand, the Postgres plugin needs zero new infrastructure, and Postgres
+`READ ONLY` transactions give the first milestone a security boundary
+with no driver-capability risk. Neo4j and Kuzu follow as milestones 2
+and 3 behind the same trait.
 
 ### Existing patterns in Skardi
 
@@ -102,12 +105,12 @@ GraphRAG-in-Postgres proves to be the dominant deployment.
 ## Goals
 
 - Expose graph data through a read-only `cypher_query(connection, cypher, params, columns)` UDTF.
-- Support Neo4j (Bolt) and Kuzu as backend engines in milestone one.
+- Support Apache AGE (openCypher inside Postgres) in milestone one, then Neo4j (Bolt) and Kuzu behind the same `GraphClient` trait.
 - Map Cypher result values (scalars, nodes, relationships, paths, lists, maps) into Arrow rows with a planning-time-stable schema — declared columns when provided, one JSON-text `record` column otherwise.
 - Allow `type: graph` catalog data sources with pre-declared Cypher views, registered from context YAML.
 - Enable federated `JOIN`s between graph results and existing Skardi sources.
 - Keep credentials out of YAML, logs, and error messages. (Unlike Open Connector there is no gateway to hold them: Skardi speaks Bolt directly, so the credential itself necessarily lives in process memory — read once from environment variables at registration, never serialized.)
-- Prove the design against a real Neo4j or Kuzu instance in phase-4 live verification.
+- Prove the design against a real Postgres+AGE instance in milestone 1's live verification (then Neo4j/Kuzu per milestone).
 - Provide a `graph_schema(connection)` introspection UDTF so agents can discover labels, relationship types, and property names/types before generating Cypher.
 
 ## Non-goals
@@ -135,7 +138,7 @@ GraphRAG-in-Postgres proves to be the dominant deployment.
       RETURN u.name, p.title
       LIMIT 10
   ', '{"userId": "u-123"}',
-     '{"user_name": "Utf8", "post_title": "Utf8"}');
+     '{"user_name": "string", "post_title": "string"}');
 
   -- No declaration: one JSON-text column per row, stable schema always.
   SELECT json_get(record, '$.u.name') AS user_name
@@ -146,12 +149,18 @@ GraphRAG-in-Postgres proves to be the dominant deployment.
       LIMIT 10
   ', '{"userId": "u-123"}');
   ```
+- **Numeric `params` mapping:** JSON has one number type but Cypher
+  distinguishes Integer from Float, and some operations and index
+  lookups are type-sensitive. The rule: a JSON number with no fraction
+  or exponent binds as Integer; one with a fraction or exponent binds
+  as Float — write `1.0` to force a Float parameter. Strings are never
+  numerically coerced.
 - **Catalog interface:** `type: graph` sources register stable views from YAML as catalog tables, e.g. `kg.main.user_posts`.
-- **Capability provider:** `cypher_query` is implemented as a DataFusion `TableFunctionImpl` in `crates/skardi/src/sources/providers/graph/udtf.rs`. Skardi does not parse or plan Cypher itself; the UDTF delegates execution to a backend-agnostic `GraphClient` trait (`crates/skardi/src/sources/providers/graph/client.rs`), whose concrete drivers (`Neo4jClient`, `KuzuClient`) speak Bolt or the Kuzu API. DataFusion owns UDTF registration, SQL planning, and result streaming; the graph engine owns storage, indexing, and Cypher execution.
+- **Capability provider:** `cypher_query` is implemented as a DataFusion `TableFunctionImpl` in `crates/skardi/src/sources/providers/graph/udtf.rs`. Skardi does not parse or plan Cypher itself; the UDTF delegates execution to a backend-agnostic `GraphClient` trait (`crates/skardi/src/sources/providers/graph/client.rs`), whose concrete drivers (`AgeClient`, `Neo4jClient`, `KuzuClient`) speak the Postgres wire protocol, Bolt, or the Kuzu API. DataFusion owns UDTF registration, SQL planning, and result streaming; the graph engine owns storage, indexing, and Cypher execution.
 
 ### Backend abstraction
 
-- A `GraphClient` trait hides Neo4j Bolt vs Kuzu details:
+- A `GraphClient` trait hides AGE (Postgres wire) vs Neo4j Bolt vs Kuzu details:
   ```rust
   #[async_trait]
   trait GraphClient: Send + Sync {
@@ -173,18 +182,27 @@ GraphRAG-in-Postgres proves to be the dominant deployment.
 - A `GraphRow` is a vector of `GraphValue` (scalar, node, relationship, path, list, map).
 - Conversion from `GraphValue` to Arrow arrays is centralized and backend-agnostic.
 - Node identity: the `id` field carries Neo4j 5's `elementId()` (a
-  string). Against a Neo4j 4 server the numeric id is stringified; the
-  driver pins which server versions are supported and the docs state
-  that ids are opaque tokens for joining within one scan, not stable
-  keys across backends or upgrades.
+  string); Neo4j 4 numeric ids, AGE graphids, and Kuzu internal ids are
+  stringified into the same field. The stability contract, stated
+  precisely because federated `JOIN`s are a headline use case: an id is
+  **stable for the life of the entity within one database instance**,
+  which makes it join-safe across the scans of a single federated query
+  AND against ids previously exported from the same server (the
+  graph-to-Postgres join). What it is NOT is a durable foreign key:
+  engines may reuse ids after entity deletion, and no id survives a
+  restore, a server migration, or a major-version upgrade — persist
+  business keys from properties for that, not engine ids.
 
 ### Schema handling
 
 There is no schema probe anywhere in the design: planning performs no network I/O, and every query has a planning-time-stable schema.
 
-- **YAML views:** the user declares the output schema explicitly. Skardi validates at registration that the Cypher query returns columns compatible with the declared schema (one live validation call at registration — registration is allowed to do network I/O; query planning is not). An unreachable backend **fails registration hard**, the same contract as Open Connector's health check: a server that starts is a server whose declared views work.
-- **Ad-hoc UDTF with declared columns:** an optional fourth argument declares the output columns and their Arrow types as a JSON object (`'{"user_name": "Utf8", "post_title": "Utf8"}'`). The declared object is the planning-time schema; each returned `GraphValue` is converted against its declared type, and a mismatch fails with a typed error carrying column name, row index, expected type, and found JSON kind. Conversion is page-atomic — rows are buffered into one batch, converted as a unit, then emitted — so a mid-scan type failure never emits a partially-converted batch (batches already emitted before the failure may have been consumed downstream; this matches the Open Connector page-atomic semantics).
-- **Ad-hoc UDTF without declared columns:** every row is returned as one `record: Utf8` column containing the whole Cypher record as canonical JSON text (column names from `RETURN` become keys of the JSON object). Empty results are empty batches with the same one-column schema; downstream extraction uses SQL JSON functions on `record` (a small `json_get(record, '$.key')` UDF is included so `WHERE` clauses can filter on extracted keys without leaving SQL).
+- **YAML views:** the user declares the output schema explicitly. Skardi validates at registration that the Cypher query returns columns compatible with the declared schema (one live validation call at registration — registration is allowed to do network I/O; query planning is not). Availability and contract violations part ways here, deliberately diverging from Open Connector's hard-fail health check: OC probes a gateway Skardi deploys, while this backend is a shared external database whose transient blip must not hold every unrelated Postgres/CSV/Lance source hostage at server startup. An **unreachable backend registers the source DEGRADED** — views register with their declared (planning-sufficient) schemas, the source is marked unhealthy in `GET /data_source`, and the first scan retries the validation and fails loudly if the backend is still gone or the view no longer matches. A **reachable backend whose view fails validation refuses registration** — that is a contract violation, not an outage.
+- **Declared-type vocabulary — the repo's friendly lowercase names, not Arrow PascalCase** (every existing config-parsed type in the tree spells types this way — dynamodb, mongo, seekdb, llm_extract — and this surface will not introduce a second spelling). The accepted set, exactly: `string` (aliases `str`, `utf8`) → `Utf8`; `int` (aliases `integer`, `bigint`) → `Int64`; `float` (alias `double`) → `Float64`; `bool` (alias `boolean`) → `Boolean`; `json` → `Utf8` carrying JSON text verbatim; `node`, `relationship`, `path` → the canonical `STRUCT` shapes from Result flattening. Anything else fails planning with the accepted set listed. The same vocabulary is used by YAML views' `type:` fields — one spelling everywhere.
+- **Ad-hoc declared columns are always nullable.** Cypher can produce `null` in any position (`OPTIONAL MATCH`, missing properties), so the ad-hoc JSON object is name→type only and every field is `nullable: true` — there is no way to declare otherwise. YAML views default to `nullable: true` too and may declare `nullable: false` as an author'ed assertion about the view's Cypher; the two declaration paths cannot silently disagree because the stricter bit exists only where an author explicitly wrote it.
+- **Ad-hoc UDTF with declared columns:** an optional fourth argument declares the output columns and their Arrow types as a JSON object (`'{"user_name": "string", "post_title": "string"}'`). The declared object is the planning-time schema; each returned `GraphValue` is converted against its declared type, and a mismatch fails with a typed error carrying column name, row index, expected type, and found JSON kind. Conversion is **batch-atomic, and the batch is the unit this design defines** (a Cypher stream has no upstream "page" the way Open Connector does): the driver stream is consumed in conversion batches of a fixed implementation constant (order 1024 rows, never more than `max_rows`), each batch converts as a unit before it is emitted, and a type mismatch fails the CURRENT batch before emission — batches already emitted may have been consumed downstream, the same trade-off Open Connector's page-atomic conversion accepts. Peak conversion memory is one batch, not one result. Milestone 1 may implement the stream as a single batch of up to `max_rows`, in which case nothing at all is emitted before a mid-scan failure.
+- **Ad-hoc UDTF without declared columns:** every row is returned as one `record: Utf8` column containing the whole Cypher record as canonical JSON text (column names from `RETURN` become keys of the JSON object). Empty results are empty batches with the same one-column schema. **Backend note:** AGE's `cypher()` call must declare its result arity, which the fallback by definition does not know — on AGE, omitting `columns` is an error telling the caller to declare them; the fallback ships with the Neo4j milestone, where Bolt needs no declared arity.
+- **JSON extraction is a named dependency, not a parenthetical:** the fallback's ergonomics (and property extraction from node/relationship `properties` columns generally) hinge on a JSON getter. The repo has `json_pack` (an encoder) and no getter today. Decision: adopt the `datafusion-functions-json` crate's `json_get` family rather than hand-rolling — ecosystem-standard names and semantics, no collision risk with a homegrown twin. Verifying the crate against the pinned DataFusion is milestone-1 work; only if the pin conflicts does a minimal same-named getter get written in-tree, documented as a subset.
 
 ### Result flattening
 
@@ -211,16 +229,23 @@ There is no schema probe anywhere in the design: planning performs no network I/
 
 **Read-only enforcement is backend-enforced; the string guard is UX, not the security boundary.**
 
-- **Primary enforcement — the backend refuses writes.** Neo4j: every query
-  runs in an explicit READ-access-mode transaction (Bolt carries the access
-  mode in `BEGIN`/`RUN` metadata, and the *server* rejects writes inside a
-  read transaction — Community edition included). Deployments should
-  additionally use least-privilege credentials (a reader role where RBAC is
-  available). If the pinned `neo4rs` version does not expose transaction
-  access mode, wiring it (or upstreaming it) is a milestone-1 prerequisite,
-  and a read-only database user is the documented deployment fallback in
-  the meantime. Kuzu: the database is opened with `read_only` set, which
-  the engine enforces.
+- **Primary enforcement — the backend refuses writes.** Per backend:
+  AGE runs every call inside a Postgres `READ ONLY` transaction — native
+  to Postgres and `tokio-postgres`, no driver capability in question,
+  which is one reason AGE ships first. Neo4j runs every query in an
+  explicit READ-access-mode transaction (Bolt carries the access mode in
+  `BEGIN`/`RUN` metadata, and the *server* rejects writes inside a read
+  transaction — Community edition included); **the `neo4rs` access-mode
+  spike is a hard precondition of the Neo4j milestone** — if the pinned
+  driver cannot express it, wiring or upstreaming it is part of that
+  milestone, and the milestone does not ship on the keyword guard alone.
+  Registration of a `neo4j` source performs a **read-mode proof**: open a
+  read transaction, attempt a trivial `CREATE`, require the SERVER to
+  refuse it, and roll back regardless — a misconfigured driver/server
+  combination fails closed at registration instead of silently at
+  runtime. Kuzu: the database is opened with `read_only` set, which the
+  engine enforces. Deployments should additionally use least-privilege
+  credentials (a reader role / read-only DB user) everywhere.
 - **Secondary, fast-path guard — keyword screening for agent UX.** Before
   any network round-trip, the wrapper rejects Cypher containing mutating
   or escape-hatch keywords on **word boundaries** (`CREATE`, `SET`,
@@ -231,7 +256,12 @@ There is no schema probe anywhere in the design: planning performs no network I/
   conservative and will false-positive on keyword-shaped string literals
   (`RETURN 'DELETE'`) — an accepted tax, since the backend read mode
   behind it is what actually guarantees read-only. Word-boundary matching
-  keeps identifiers like `created_at` out of the blast radius.
+  keeps identifiers like `created_at` out of the blast radius. **Scope:
+  the guard screens CALLER-supplied Cypher (the text passed to
+  `cypher_query` or declared in a view) only** — `graph_schema` issues
+  fixed, engine-authored introspection queries (`db.schema.*`,
+  `ag_catalog` reads) that never pass through it, so rejecting `CALL`
+  does not self-block discovery.
 - **Parameterized queries only:** parameters are bound by the driver,
   never interpolated into the string.
 - **Connection URLs are operator trust, not query trust.** The URL comes
@@ -240,8 +270,9 @@ There is no schema probe anywhere in the design: planning performs no network I/
   connection *name*, never a URL. No SSRF guard is applied (localhost
   Bolt is the normal dev deployment, and no other Skardi data source
   guards its operator-authored URL); registration validates the scheme
-  against an allowlist (`bolt`, `bolt+s`, `neo4j`, `neo4j+s`; `http`/
-  `https` for Kuzu server mode) and rejects anything else.
+  against an allowlist (`postgres`/`postgresql` for AGE; `bolt`,
+  `bolt+s`, `neo4j`, `neo4j+s`; `http`/`https` for Kuzu server mode) and
+  rejects anything else.
 - **Every query is bounded.** Two per-source limits with config overrides:
   `query_timeout_seconds` (default 30) is passed to the backend as the
   transaction timeout so runaway traversals die server-side, and
@@ -274,9 +305,11 @@ flowchart LR
     DF --> UDTF["cypher_query UDTF"]
     Catalog --> Client["GraphClient"]
     UDTF --> Client
+    Client --> AGE["Apache AGE (Postgres)"]
     Client --> Neo4j["Neo4j Bolt / HTTP"]
     Client --> Kuzu["Kuzu"]
-    Neo4j --> Rows["Arrow RecordBatch"]
+    AGE --> Rows["Arrow RecordBatch"]
+    Neo4j --> Rows
     Kuzu --> Rows
     Rows --> DF
     DF --> Join["JOIN with other Skardi sources"]
@@ -291,7 +324,7 @@ flowchart LR
 ```
 crates/skardi/src/sources/providers/graph/
 ├── mod.rs              # registration, GraphTableProvider, GraphDataSource
-├── client.rs           # GraphClient trait + Neo4j/Kuzu impls
+├── client.rs           # GraphClient trait + AGE/Neo4j/Kuzu impls
 ├── value.rs            # GraphValue enum and Arrow conversion
 ├── udtf.rs             # cypher_query UDTF
 ├── config.rs           # GraphConfig typed YAML
@@ -306,26 +339,38 @@ spec:
   data_sources:
     - name: kg
       type: graph
-      connection_string: bolt://localhost:7687
+      # Milestone 1: AGE — the graph lives inside Postgres.
+      connection_string: postgres://localhost:5432/graphrag
       graph:
-        backend: neo4j
-        username_env: NEO4J_USER
-        password_env: NEO4J_PASS
+        backend: age
+        graph_name: knowledge          # AGE graphs are named per database
+        username_env: AGE_PG_USER
+        password_env: AGE_PG_PASS
         views:
           - name: user_posts
             cypher: |
               MATCH (u:User)-[:POSTED]->(p:Post)
               RETURN u.name AS user_name, p.title AS post_title
-            schema:
-              - name: user_name
-                type: Utf8
+            schema:                    # same lowercase vocabulary as the
+              - name: user_name        # ad-hoc `columns` argument
+                type: string
                 nullable: true
               - name: post_title
-                type: Utf8
+                type: string
                 nullable: true
 ```
 
-For Kuzu file mode:
+For Neo4j (milestone 2) the connection swaps protocol and credentials:
+
+```yaml
+      connection_string: bolt://localhost:7687
+      graph:
+        backend: neo4j
+        username_env: NEO4J_USER
+        password_env: NEO4J_PASS
+```
+
+For Kuzu file mode (milestone 3):
 
 ```yaml
       graph:
@@ -348,6 +393,21 @@ cypher_query(
 - `connection` must name a registered `type: graph` source.
 - `cypher_query` and `graph_schema` are registered **once** as global UDTFs by `register_graph_udtfs(session_ctx, sources)` and resolve the connection by name at call time — the same shape as `open_connector_query('saas', …)`, not one function per source (the first argument would be redundant otherwise).
 - The schema is fixed at planning time from `columns` (or the single-column fallback) — no backend call happens before execution.
+- **Call-shape constraints (stated because agents generate these calls):**
+  the arguments are positional, so declaring `columns` requires passing
+  `params` — `'{}'` is the no-parameters spelling, and `NULL` is
+  rejected (schema-shaping arguments are strict string literals, the
+  `open_connector_query` precedent). And because the schema comes from
+  `columns` at PLANNING time, both `params` and `columns` must be
+  string **literals** in the SQL text — a column reference, CTE output,
+  or subquery there fails planning with a targeted error, it does not
+  get evaluated first.
+  ```sql
+  -- columns with no parameters: '{}' holds the params slot.
+  SELECT n_name FROM cypher_query('kg',
+      'MATCH (n:User) RETURN n.name LIMIT 5', '{}',
+      '{"n_name": "string"}');
+  ```
 
 ### Projection and limit pushdown
 
@@ -399,7 +459,7 @@ An agent cannot write Cypher blindly. It needs machine-readable answers to:
 
 - *What graph backends are configured?* → the existing data-source metadata endpoint (`GET /data_source`) already lists registered sources; `type: graph` sources should appear with their declared views.
 - *What labels, relationship types, and properties exist?* → a lightweight **graph introspection surface** is required. Two options:
-  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type with its property **names and types** (Neo4j: `db.schema.nodeTypeProperties()` / `db.schema.relTypeProperties()`; Kuzu: its typed catalog, which is exact because Kuzu is schema-full). Deliberately **names and types only, never property values** — sampled values would flow straight into agent prompts, the exact leak the error-handling rules exist to prevent;
+  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type with its property **names and types** (AGE: `ag_catalog`; Neo4j: `db.schema.nodeTypeProperties()` / `db.schema.relTypeProperties()`; Kuzu: its typed catalog, which is exact because Kuzu is schema-full). Deliberately **names and types only, never property values** — sampled values would flow straight into agent prompts, the exact leak the error-handling rules exist to prevent;
   - a YAML view author who declares `nodes` / `edges` metadata tables alongside the Cypher views.
   The design chooses the first option as an engine-provided helper in milestone 1, because requiring every YAML view to also declare metadata duplicates effort.
 - *What shape does a `cypher_query` result have?* → the schema is fixed at planning time and stated in the function's documentation: either the caller-declared columns, or one `record: Utf8` JSON column. Agents can rely on stable `STRUCT` shapes for nodes and relationships inside those columns.
@@ -435,42 +495,67 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 
 ## Milestones
 
-### Milestone 1 — Neo4j read-only UDTF
+### Milestone 1 — Apache AGE read-only UDTF (Postgres first)
 
-- `GraphClient` trait.
-- `neo4rs`-based Neo4j driver.
-- `GraphValue` → Arrow conversion for scalars, nodes, relationships, paths, lists, maps.
-- `cypher_query` UDTF with declared-columns and JSON-text fallback schema modes.
-- `graph_schema` introspection UDTF (labels, relationship types, property **names and types** via `db.schema.*` procedures — never values).
-- Backend-enforced read-only (read-transaction access mode; verify/wire `neo4rs` support) plus the fast-path keyword guard.
-- Query timeout and row cap with typed errors.
-- Basic error taxonomy.
+Reviewer-directed ordering (review round 1): the Postgres plugin ships
+before any new server dependency — GraphRAG-style deployments already
+hold their graph in Postgres, so AGE delivers value with zero new
+infrastructure. It also de-risks the security boundary: milestone 1's
+read-only guarantee is a Postgres `READ ONLY` transaction, native to
+`tokio-postgres`, with no driver-capability question attached.
+
+- `GraphClient` trait + `AgeClient` over `tokio-postgres`; every call
+  inside a `READ ONLY` transaction (the backend-enforced boundary).
+- `GraphValue` → Arrow conversion for scalars, nodes, relationships,
+  paths, lists, maps (`agtype` decoding) — shared by every later backend.
+- `cypher_query` UDTF, declared-columns mode. The JSON-`record` fallback
+  is NOT in this milestone: AGE's `cypher()` call must declare its
+  result arity, so on AGE an omitted `columns` is a targeted error
+  (settled — previously an open question).
+- `graph_schema` from `ag_catalog` (names and types only, never values).
+- Keyword guard, query timeout, row cap, error taxonomy.
+- JSON getter: adopt `datafusion-functions-json`'s `json_get` family
+  (verify against the pinned DataFusion; a minimal same-named in-tree
+  getter only if the pin conflicts).
+- Integration tests against a Postgres+AGE testcontainer
+  (`#[ignore]`-gated).
+
+### Milestone 2 — Neo4j backend
+
+**Precondition, before this milestone starts: the `neo4rs` access-mode
+spike.** Read transactions are the security boundary; if the pinned
+driver cannot express Bolt's access mode, wiring or upstreaming it is
+part of this milestone's cost, and the milestone does not ship on the
+keyword guard alone.
+
+- `Neo4jClient` (Bolt): every query in a READ-access-mode transaction;
+  registration performs the read-mode proof (attempt a trivial `CREATE`
+  inside a read transaction, require the SERVER to refuse it, roll back
+  regardless) so a misconfigured driver/server pair fails closed at
+  registration.
+- JSON-`record` fallback mode (Bolt needs no declared arity).
+- `graph_schema` via `db.schema.nodeTypeProperties()` /
+  `db.schema.relTypeProperties()`.
+- Reuses milestone 1's conversion, guards, bounds, and error taxonomy.
 - Integration tests against testcontainer Neo4j (`#[ignore]`-gated).
 
-### Milestone 2 — Kuzu backend
+### Milestone 3 — Kuzu backend
 
-- Kuzu driver (using `kuzu` Rust crate in embedded or HTTP mode).
-- Same `GraphValue` conversion reused.
+- Kuzu driver (using `kuzu` Rust crate in embedded or HTTP mode);
+  database opened `read_only`.
+- Same `GraphValue` conversion reused; `graph_schema` from Kuzu's typed
+  catalog (exact, schema-full).
 - Prove federated `JOIN` between Kuzu and a CSV source.
 
-### Milestone 3 — YAML catalog views
+### Milestone 4 — YAML catalog views
 
-- `type: graph` data source registration.
+- `type: graph` data source registration (degraded-on-unreachable,
+  refuse-on-mismatch — see Schema handling).
 - Declared-schema views.
 - Live schema validation at registration.
 - Docs: per-backend guides, examples, and spec entry.
 
-### Milestone 3+ — Apache AGE backend (candidate)
-
-- `GraphClient` over `tokio-postgres` calling AGE's `cypher()` function;
-  `READ ONLY` transactions as the backend-enforced read guarantee.
-- Settle the `record`-fallback arity question (wrap `RETURN` in a map vs
-  require declared columns for AGE).
-- `graph_schema` from `ag_catalog`.
-- Promoted to a numbered milestone if GraphRAG-in-Postgres is the
-  dominant deployment; otherwise stays behind Neo4j/Kuzu.
-
-### Milestone 4+ — Write path (future)
+### Milestone 5+ — Write path (future)
 
 - Design mutation guard, idempotency keys, and transaction semantics.
 - Expose `cypher_mutate` only through explicit opt-in, never the read UDTF.
@@ -478,9 +563,9 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 ## Risks and Open Questions
 
 1. **Declared-type drift on dynamically-typed properties.** Neo4j property types vary per node: a view declaring `n.value AS Int64` meets a `string` value mid-scan and fails with a typed error (column, row, expected, found-kind). Conversion is page-atomic, but batches already emitted stay emitted — the same mid-scan failure trade-off the Open Connector adapters accept. Views over heterogeneous properties should declare `Utf8` (JSON text) instead of a scalar type, or normalize with Cypher `toInteger()`/`toString()` before `RETURN`.
-2. **Cypher injection.** Parameter binding prevents interpolation attacks. The keyword guard is string-based and bypassable by construction — which is why it is *not* the security boundary: the backend's read-transaction mode (Neo4j) / read-only database open (Kuzu) is what guarantees no write executes. Open question: confirm the pinned `neo4rs` version exposes transaction access mode; if not, wiring or upstreaming it is a milestone-1 prerequisite, with a read-only database user as the documented interim requirement.
+2. **Cypher injection.** Parameter binding prevents interpolation attacks. The keyword guard is string-based and bypassable by construction — which is why it is *not* the security boundary: the backend's `READ ONLY` transaction (AGE), read-access-mode transaction (Neo4j), or read-only database open (Kuzu) is what guarantees no write executes. Milestone 1 (AGE) carries no driver risk here — Postgres `READ ONLY` is native to `tokio-postgres`. The `neo4rs` access-mode question is scoped to the Neo4j milestone as a hard precondition (see Milestones), with the registration-time read-mode proof failing closed if the deployed pair cannot enforce it.
 3. **Path representation.** The parallel-lists struct (`nodes` + `relationships`) is lossless and type-homogeneous but positional — consumers must know relationship *i* joins node *i* to node *i+1*. Row-per-hop consumers flatten with Cypher `UNWIND` in the query or view instead of asking Skardi to restructure paths.
-4. **Backend divergence.** Kuzu Cypher — and Apache AGE's openCypher, if that candidate backend lands — are subsets of Neo4j's dialect. The design must avoid features that work on Neo4j but fail on the others unless the view/backend is explicit; backend errors surface the dialect gap through `GraphError::Backend { code, … }` so an agent can adapt.
+4. **Backend divergence.** Apache AGE's openCypher and Kuzu's Cypher are subsets of Neo4j's dialect — and AGE ships FIRST, so milestone-1 users meet the narrowest dialect before the richest. The design must avoid features that work on Neo4j but fail on the others unless the view/backend is explicit; backend errors surface the dialect gap through `GraphError::Backend { code, … }` so an agent can adapt.
 
 ## References
 
@@ -488,4 +573,4 @@ This separation keeps the engine deterministic and the prompt/LLM layer replacea
 - [DataFusion](https://arrow.apache.org/datafusion/) — the SQL engine Skardi builds on.
 - [Neo4j Cypher Manual](https://neo4j.com/docs/cypher-manual/current/)
 - [Kuzu Documentation](https://docs.kuzudb.com/)
-- [Apache AGE](https://age.apache.org/) — openCypher inside PostgreSQL; the candidate backend for GraphRAG data already living in Postgres.
+- [Apache AGE](https://age.apache.org/) — openCypher inside PostgreSQL; the milestone-1 backend, chosen because GraphRAG data already lives in Postgres.
