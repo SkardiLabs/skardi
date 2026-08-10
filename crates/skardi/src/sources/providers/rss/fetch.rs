@@ -352,14 +352,23 @@ impl FeedFetcher {
             // Canonicalize before checking: a dual-stack OS connect to an
             // IPv4-mapped v6 literal (`::ffff:10.0.0.1`) reaches the unmapped
             // V4 (10.0.0.1), so the policy must judge that same V4 — otherwise
-            // a V4-private rule is bypassed by the mapped form. Report the
-            // canonical address too, so the error names the rule that matched.
-            let ip = ip.to_canonical();
-            self.policy.check_ip(ip).map_err(|reason| EgressDenied {
-                host: ip.to_string(),
-                ip,
-                reason,
-            })?;
+            // a V4-private rule is bypassed by the mapped form.
+            let canonical = ip.to_canonical();
+            // Report the host as it appears in the URL (as `check_addrs` does
+            // with the DNS name), not the canonical IP. Filling `host` with the
+            // canonical IP too makes `feeds.last_error` read "host '10.0.0.1'
+            // resolves to ... 10.0.0.1" — a tautology that names neither the
+            // configured literal (a mapped `::ffff:10.0.0.1` vanishes into its
+            // V4) nor anything an operator can grep for. `ip` still carries the
+            // canonical address the rule actually matched.
+            let host = url.host_str().unwrap_or_default().to_string();
+            self.policy
+                .check_ip(canonical)
+                .map_err(|reason| EgressDenied {
+                    host,
+                    ip: canonical,
+                    reason,
+                })?;
         }
         Ok(())
     }
@@ -1109,12 +1118,25 @@ mod tests {
         // port 9 — so this pins the canonicalization.
         let policy = Arc::new(DenyList(vec!["10.0.0.1".parse().unwrap()]));
         let f = fetcher_with_policy(policy);
-        let err = f
-            .fetch("http://[::ffff:10.0.0.1]:9/f", None)
-            .await
-            .unwrap_err();
+        let url = "http://[::ffff:10.0.0.1]:9/f";
+        let err = f.fetch(url, None).await.unwrap_err();
         match err {
-            FetchError::Egress(e) => assert_eq!(e.reason, "test-denied", "got {e}"),
+            FetchError::Egress(e) => {
+                assert_eq!(e.reason, "test-denied", "got {e}");
+                // `ip` is the canonical address the rule matched...
+                assert_eq!(e.ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+                // ...but `host` is the literal as written in the URL, not the
+                // canonical IP — so the message names what was configured and
+                // is not the tautological "host '10.0.0.1' resolves to
+                // ... 10.0.0.1".
+                let written_host = Url::parse(url).unwrap().host_str().unwrap().to_string();
+                assert_eq!(e.host, written_host);
+                assert_ne!(
+                    e.host,
+                    e.ip.to_string(),
+                    "host must not collapse to the canonical ip"
+                );
+            }
             other => panic!("expected Egress, got {other:?}"),
         }
     }
