@@ -341,6 +341,38 @@ pub trait FeedCache: Send + Sync {
         last_fetch_ms: i64,
         armed_until: Instant,
     );
+
+    /// Record an egress-policy refusal: like [`FeedCache::record_failure`],
+    /// except the cached window — validators included — is dropped rather
+    /// than kept for stale serving, so the status is always
+    /// [`FeedStatus::Error`].
+    ///
+    /// A refusal is a policy verdict, not a transient fault, and
+    /// `StaleError`'s contract — "temporarily unreachable, serve the last
+    /// good read" — is wrong for a destination the *active* policy forbids:
+    /// the policy may have changed since the window was fetched, or the host
+    /// may now resolve somewhere denied (DNS rebinding), and the design
+    /// requires a refused subscription to contribute zero item rows while
+    /// `feeds` records the refusal (the design doc's failure-mode table and
+    /// acceptance criterion 15). Dropping the window is what makes that
+    /// stick: the denial's own serve has nothing to emit, and every
+    /// within-fuse scan after it takes the cache-hit path into the same zero
+    /// rows — `Error` claims no window, so `window_lost` does not force a
+    /// refetch — instead of resurrecting the stale window. The observation
+    /// survives, as everywhere else; once the fuse expires, a re-allowed
+    /// fetch rebuilds the window with an unconditional `GET` (its validators
+    /// went with it).
+    ///
+    /// No `http_status` and no `dialect_declared`: a refusal happens before
+    /// any connection, so there is no response to describe.
+    fn record_egress_denial(
+        &self,
+        feed: &str,
+        expected_generation: u64,
+        error: String,
+        last_fetch_ms: i64,
+        armed_until: Instant,
+    );
 }
 
 /// `feeds.last_error` for a `304` whose window was evicted while the request
@@ -865,6 +897,54 @@ impl FeedCache for MemoryFeedCache {
         // is, through the same entry point. Both fields it just wrote are capped
         // by their own writers too; going through `capped()` here is what keeps
         // that a redundancy rather than the only thing holding the invariant up.
+        let observation = std::mem::take(&mut entry.observation);
+        entry.observation = observation.capped();
+
+        inner.touch_entry(feed);
+        inner.evict_observations(self.max_observations);
+    }
+
+    fn record_egress_denial(
+        &self,
+        feed: &str,
+        expected_generation: u64,
+        error: String,
+        last_fetch_ms: i64,
+        armed_until: Instant,
+    ) {
+        let mut inner = self.lock();
+        // Generation gate — see the trait doc. Same drop-always rule as
+        // `record_failure`: a stale denial must not purge a window a fetch
+        // that outran this one just committed under an allowing verdict.
+        let current = inner.map.get(feed).map_or(0, |e| e.generation);
+        if current != expected_generation {
+            tracing::debug!(
+                feed,
+                commit = "egress-denial",
+                expected_generation,
+                current_generation = current,
+                "rss stale cache commit dropped"
+            );
+            return;
+        }
+        let generation = inner.next_generation();
+        // The one difference from `record_failure`: the window goes — see
+        // the trait method's doc for why a policy refusal must not leave
+        // content behind to serve stale.
+        inner.drop_window(feed);
+        let entry = inner
+            .map
+            .entry(feed.to_string())
+            .or_insert_with(|| Entry::new(armed_until));
+        entry.generation = generation;
+        entry.observation.last_status = FeedStatus::Error;
+        entry.observation.http_status = None;
+        entry.observation.last_error = Some(error);
+        entry.observation.last_fetch_ms = Some(last_fetch_ms);
+        entry.armed_until = armed_until;
+        // Same cap discipline as the other write paths: the denial string is
+        // built from policy-side facts, but the bound belongs to the store,
+        // not to trust in any particular writer.
         let observation = std::mem::take(&mut entry.observation);
         entry.observation = observation.capped();
 
@@ -1670,5 +1750,72 @@ mod tests {
         assert!(matches!(snap.observation.last_status, FeedStatus::Fresh));
         assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
         assert_eq!(snap.observation.last_error, None);
+    }
+
+    /// An egress refusal purges the window instead of keeping it for stale
+    /// serving — a policy verdict must not leave forbidden content behind —
+    /// while the observation records the refusal and the fuse still arms.
+    #[test]
+    fn an_egress_denial_drops_the_window_and_negative_caches() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), t0); // expired at once
+        cache.record_egress_denial(
+            "a",
+            1,
+            "egress blocked: host 'feed.example' resolves to private address 10.0.0.1".into(),
+            7,
+            t0 + Duration::from_secs(30),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(
+            snap.window.is_none(),
+            "the refused feed's window (and validators) must be purged"
+        );
+        assert!(
+            matches!(snap.observation.last_status, FeedStatus::Error),
+            "`error`, not `stale-error`: there is deliberately nothing to serve stale"
+        );
+        assert!(
+            snap.observation
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("egress blocked")
+        );
+        assert!(
+            snap.within_ttl,
+            "a refusal negative-caches exactly like any other failure"
+        );
+    }
+
+    /// A stale denial obeys the same generation rule as a stale failure: it
+    /// must not purge a window a fetch that outran it just committed under
+    /// an allowing verdict.
+    #[test]
+    fn a_stale_egress_denial_does_not_purge_a_fresher_success() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), t0);
+        // Both racing scans snapshot generation 1; the success commits first.
+        cache.record_success(
+            "a",
+            1,
+            window_with_rows(2),
+            obs_fresh(2),
+            t0 + Duration::from_secs(900),
+        );
+        cache.record_egress_denial(
+            "a",
+            1,
+            "egress blocked: host 'feed.example' resolves to private address 10.0.0.1".into(),
+            7,
+            t0 + Duration::from_secs(30),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(matches!(snap.observation.last_status, FeedStatus::Fresh));
+        assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
     }
 }

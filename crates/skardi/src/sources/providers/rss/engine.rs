@@ -549,6 +549,15 @@ impl RssEngine {
                     ),
                 }
             }
+            // An egress refusal is a policy verdict, not a transient fault:
+            // it purges the cached window instead of serving it stale, so
+            // the refused subscription contributes zero item rows from this
+            // serve on — see `deny` and `record_egress_denial`.
+            Err(FetchError::Egress(denied)) => self.deny(
+                sub,
+                snapshot.generation,
+                truncate(&denied.to_string(), MAX_ERROR_CHARS),
+            ),
             Err(error) => {
                 let http_status = match &error {
                     FetchError::Status { status } => Some(*status),
@@ -640,6 +649,42 @@ impl RssEngine {
             now_ms(),
             arm(Instant::now(), failure_fuse(self.ttl)),
         );
+        self.degraded_serve(sub, http_status, error, bytes)
+    }
+
+    /// Record an egress refusal and serve the aftermath. Unlike [`degrade`],
+    /// the refusal purges the cached window ([`FeedCache::record_egress_denial`]
+    /// has the full argument), so the read-back in [`degraded_serve`] finds
+    /// `Error` and no window — zero rows, whatever the cache held before,
+    /// which is what the design requires of a policy refusal (its
+    /// failure-mode table and acceptance criterion 15). The fuse still arms:
+    /// a refusal is negative-cached exactly like any other failure.
+    fn deny(
+        &self,
+        sub: &ResolvedSubscription,
+        expected_generation: u64,
+        error: String,
+    ) -> (Option<RecordBatch>, ServeLog) {
+        self.cache.record_egress_denial(
+            &sub.name,
+            expected_generation,
+            error.clone(),
+            now_ms(),
+            arm(Instant::now(), failure_fuse(self.ttl)),
+        );
+        self.degraded_serve(sub, None, error, 0)
+    }
+
+    /// The shared tail of [`degrade`] and [`deny`]: the warning, then the
+    /// post-commit read-back that decides what — if anything — is still
+    /// serveable.
+    fn degraded_serve(
+        &self,
+        sub: &ResolvedSubscription,
+        http_status: Option<u16>,
+        error: String,
+        bytes: usize,
+    ) -> (Option<RecordBatch>, ServeLog) {
         // No `url` field: a subscription URL can carry a private query
         // token, and this event fires at `warn` — a level ordinary
         // deployments export. `source` + `feed` locate the subscription;
@@ -651,10 +696,11 @@ impl RssEngine {
             "rss feed degraded"
         );
 
-        // Read back after recording: `record_failure` is what decides
-        // between `StaleError` (a window survived to serve) and `Error` (none
-        // did), so the status stamped on the rows comes from the cache rather
-        // than from a second guess here. If the commit was dropped as stale
+        // Read back after recording: the cache commit is what decides
+        // between `StaleError` (a window survived to serve) and `Error`
+        // (none did — either none existed, or an egress denial purged it),
+        // so the status stamped on the rows comes from the cache rather than
+        // from a second guess here. If the commit was dropped as stale
         // (the cache trait's commit-generation doc), the read-back returns
         // whatever the intervening commit left — e.g. a concurrent fetch's
         // fresh window — and serving that freshest known state is exactly
@@ -912,6 +958,21 @@ mod tests {
         }
     }
 
+    /// Flips from allow-everything to deny-everything on demand — the
+    /// "verdict changed after the cache was warmed" scenario, whether by a
+    /// dynamic policy or a new DNS answer.
+    #[derive(Debug)]
+    struct TogglePolicy(AtomicBool);
+    impl EgressPolicy for TogglePolicy {
+        fn check_ip(&self, _ip: IpAddr) -> Result<(), EgressReason> {
+            if self.0.load(Ordering::SeqCst) {
+                Err("test-denied".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     /// An engine over `feeds` (`(name, path)` pairs) pointed at `server`,
     /// with `ttl_seconds` and a default politeness bound.
     fn test_engine(server: &MockFeedServer, feeds: &[(&str, &str)], ttl_seconds: u64) -> RssEngine {
@@ -1001,6 +1062,23 @@ mod tests {
                 armed_until,
             );
         }
+
+        fn record_egress_denial(
+            &self,
+            feed: &str,
+            expected_generation: u64,
+            error: String,
+            last_fetch_ms: i64,
+            armed_until: Instant,
+        ) {
+            self.0.record_egress_denial(
+                feed,
+                expected_generation,
+                error,
+                last_fetch_ms,
+                armed_until,
+            );
+        }
     }
 
     /// A cache that remembers every `armed_until` the engine hands
@@ -1082,6 +1160,23 @@ mod tests {
                 http_status,
                 error,
                 dialect_declared,
+                last_fetch_ms,
+                armed_until,
+            );
+        }
+
+        fn record_egress_denial(
+            &self,
+            feed: &str,
+            expected_generation: u64,
+            error: String,
+            last_fetch_ms: i64,
+            armed_until: Instant,
+        ) {
+            self.inner.record_egress_denial(
+                feed,
+                expected_generation,
+                error,
                 last_fetch_ms,
                 armed_until,
             );
@@ -1887,6 +1982,67 @@ mod tests {
             server.requests().len(),
             0,
             "nothing was connected to at all"
+        );
+    }
+
+    /// The review-requested scenario: a feed cached under an allowing
+    /// verdict, then refused — a changed policy or a new DNS answer. The
+    /// refusal must produce zero item rows *despite* the warm cache (a
+    /// policy verdict is not a transient fault to serve stale through), the
+    /// refusal must land in `feeds`, and the fuse must keep serving zero
+    /// rows without re-poking the destination.
+    #[tokio::test]
+    async fn a_denial_after_a_warm_cache_serves_zero_rows_not_stale() {
+        let (_interest_guard, _) = capture_events();
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        // The mock's URL has an IP-literal host (127.0.0.1), so
+        // `check_hop_target` consults the policy directly on every fetch.
+        let feeds = vec![("a".to_string(), format!("{}/f.xml", server.url()))];
+        let cache = Arc::new(MemoryFeedCache::new(CACHE_MAX_BYTES, 64));
+        let policy = Arc::new(TogglePolicy(AtomicBool::new(false)));
+        // `ttl_seconds: 0`: every serve refetches, so the second serve below
+        // actually consults the flipped policy instead of the cache.
+        let engine = engine_with_cache_and_policy(
+            &feeds,
+            0,
+            4,
+            cache,
+            Arc::clone(&policy) as Arc<dyn EgressPolicy>,
+        );
+
+        // Warm the cache under the allowing verdict.
+        assert_eq!(
+            engine
+                .serve_feed("a", || true)
+                .await
+                .expect("the allowed fetch warms the cache")
+                .num_rows(),
+            1
+        );
+
+        // The verdict changes.
+        policy.0.store(true, Ordering::SeqCst);
+
+        // The denial serve: zero rows despite the warm cache.
+        assert!(
+            engine.serve_feed("a", || true).await.is_none(),
+            "no stale rows from a refused destination"
+        );
+        let row = engine.feeds_row("a");
+        assert_eq!(str_col(&row, "last_status"), vec!["error"]);
+        let error = str_opt_col(&row, "last_error")[0]
+            .clone()
+            .expect("last_error records the refusal");
+        assert!(error.contains("egress blocked"), "{error}");
+
+        // Within the fuse: still zero rows, and no new connection attempts —
+        // the denial negative-caches instead of re-poking every scan.
+        let requests_after_denial = server.requests().len();
+        assert!(engine.serve_feed("a", || true).await.is_none());
+        assert_eq!(
+            server.requests().len(),
+            requests_after_denial,
+            "the fuse holds: a denied feed is not re-poked within it"
         );
     }
 
