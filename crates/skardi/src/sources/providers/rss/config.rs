@@ -138,6 +138,11 @@ pub struct RssConfig {
     /// hostname-vs-resolved-IP-vs-CDN question has to be settled first);
     /// meanwhile host-level politeness rests on honoring `Retry-After` and TTL
     /// pacing, not on this bound.
+    ///
+    /// Stored raw — validation rejects only `0`. The engine clamps the
+    /// effective value to tokio's `Semaphore::MAX_PERMITS` at construction
+    /// (with a warning), because `Semaphore::new` panics above it and a
+    /// config typo must not abort registration.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 

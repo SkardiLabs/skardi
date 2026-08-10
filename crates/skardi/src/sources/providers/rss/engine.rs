@@ -327,16 +327,34 @@ impl RssEngine {
                 "rss ttl_seconds clamped to the engine's ceiling"
             );
         }
+        // `RssConfig::validate` rejects `max_concurrent: 0`; the floor keeps
+        // a directly constructed config from producing a semaphore that
+        // parks every fetch forever. The ceiling is tokio's own:
+        // `Semaphore::new` panics above `Semaphore::MAX_PERMITS`
+        // (tokio-1.52.3 `src/sync/batch_semaphore.rs:130`, the assert at
+        // `:142-144`), and validation deliberately puts no upper bound on
+        // the field — so without this clamp a large-but-valid YAML integer
+        // would abort registration with a panic instead of degrading to a
+        // value beyond any real fleet's needs. Same clamp-and-warn
+        // treatment as `ttl_seconds` above; the ceiling is deliberately
+        // *not* the subscription count, because permits are shared across
+        // concurrent scans, so feed count does not bound useful concurrency.
+        let max_concurrent = config.max_concurrent.clamp(1, Semaphore::MAX_PERMITS);
+        if config.max_concurrent > Semaphore::MAX_PERMITS {
+            tracing::warn!(
+                source = %source_name,
+                configured_max_concurrent = config.max_concurrent,
+                effective_max_concurrent = max_concurrent,
+                "rss max_concurrent clamped to the semaphore's ceiling"
+            );
+        }
         Self {
             source_name,
             subscriptions,
             by_name,
             fetcher,
             cache,
-            // `RssConfig::validate` rejects `max_concurrent: 0`; the floor
-            // keeps a directly constructed config from producing a
-            // semaphore that parks every fetch forever.
-            semaphore: Arc::new(Semaphore::new(config.max_concurrent.max(1))),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
             ttl,
             scan_timeout: Duration::from_secs(config.scan_timeout_seconds),
         }
@@ -2514,6 +2532,43 @@ mod tests {
         assert_eq!(
             clamped[0].field("effective_ttl_seconds"),
             Some(MAX_TTL.as_secs().to_string().as_str())
+        );
+    }
+
+    /// `max_concurrent` is stored raw by `RssConfig` — validation rejects
+    /// only zero — and `Semaphore::new` panics above
+    /// `Semaphore::MAX_PERMITS`, so an absurd-but-valid YAML integer would
+    /// otherwise abort registration with a panic instead of a clamp. The
+    /// sibling of the ttl and scan-timeout clamp tests, to the same shape:
+    /// the clamp *and* the warning.
+    #[tokio::test]
+    async fn an_absurd_max_concurrent_is_clamped_rather_than_panicking() {
+        let server = MockFeedServer::start(|_| MockResponse::xml(RSS2_MINIMAL)).await;
+        // Set before the engine is built: `with_parts` is where the clamp and
+        // its warning happen — and where the unclamped value would panic.
+        let (_guard, events) = capture_events();
+        let feeds = vec![("a".to_string(), format!("{}/f.xml", server.url()))];
+        let cache = Arc::new(MemoryFeedCache::new(CACHE_MAX_BYTES, 64));
+        let engine = engine_with_cache(&feeds, 900, usize::MAX, cache);
+
+        // Construction survived, and the semaphore actually hands out
+        // permits: a serve completes.
+        let batch = engine.serve_feed("a", || true).await.expect("rows served");
+        assert_eq!(str_col(&batch, "window_status"), vec!["fresh"]);
+
+        let clamped = events_with_message(
+            &events,
+            "rss max_concurrent clamped to the semaphore's ceiling",
+        );
+        assert_eq!(clamped.len(), 1, "one warning per engine built");
+        assert_eq!(clamped[0].level, tracing::Level::WARN);
+        assert_eq!(
+            clamped[0].field("configured_max_concurrent"),
+            Some(usize::MAX.to_string().as_str())
+        );
+        assert_eq!(
+            clamped[0].field("effective_max_concurrent"),
+            Some(Semaphore::MAX_PERMITS.to_string().as_str())
         );
     }
 
