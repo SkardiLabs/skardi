@@ -62,8 +62,9 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
 
     /// Label roster for `graph_schema`: one `(label, kind)` row per
     /// label, kinds `vertex` / `edge`. Names only — never property
-    /// values (design §Agent and LLM interaction).
-    async fn labels(&self) -> Result<Vec<(String, String)>, GraphError>;
+    /// values (design §Agent and LLM interaction). Bounded like every
+    /// other query — "every query is bounded" has no catalog exemption.
+    async fn labels(&self, bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError>;
 }
 
 /// Apache AGE over the workspace's sqlx-postgres stack.
@@ -310,37 +311,70 @@ impl GraphClient for AgeClient {
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
 
-    async fn labels(&self) -> Result<Vec<(String, String)>, GraphError> {
-        // ag_catalog is the exact source for labels; AGE's own catch-all
-        // labels (`_ag_label_vertex` / `_ag_label_edge`) are implementation
-        // noise for an agent and are filtered.
-        let rows = sqlx::query(
-            "SELECT l.name, l.kind::text \
-             FROM ag_catalog.ag_label l \
-             JOIN ag_catalog.ag_graph g ON g.graphid = l.graph \
-             WHERE g.name = $1 AND l.name NOT LIKE '\\_ag\\_label\\_%' \
-             ORDER BY l.name",
-        )
-        .bind(&self.graph_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| backend_error(&self.source_name, &e))?;
-        rows.into_iter()
-            .map(|row| {
-                let name: String = row
-                    .try_get(0)
-                    .map_err(|e| backend_error(&self.source_name, &e))?;
-                let kind: String = row
-                    .try_get(1)
-                    .map_err(|e| backend_error(&self.source_name, &e))?;
-                let kind = match kind.as_str() {
-                    "v" => "vertex".to_string(),
-                    "e" => "edge".to_string(),
-                    other => other.to_string(),
-                };
-                Ok((name, kind))
-            })
-            .collect()
+    async fn labels(&self, bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError> {
+        // Same bounds discipline as execute — a catalog read against a
+        // wedged backend must not hang forever, and the design's "every
+        // query is bounded" makes no catalog exemption: READ ONLY
+        // transaction, server-side statement_timeout, row cap, and the
+        // client-side wrap.
+        let source = self.source_name.clone();
+        let run = async {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| backend_error(&source, &e))?;
+            sqlx::query("SET TRANSACTION READ ONLY")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend_error(&source, &e))?;
+            sqlx::query(&format!(
+                "SET LOCAL statement_timeout = '{}ms'",
+                bounds.timeout.as_millis()
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend_error(&source, &e))?;
+            // ag_catalog is the exact source for labels; AGE's own
+            // catch-all labels (`_ag_label_vertex` / `_ag_label_edge`)
+            // are implementation noise for an agent and are filtered.
+            let rows = sqlx::query(
+                "SELECT l.name, l.kind::text \
+                 FROM ag_catalog.ag_label l \
+                 JOIN ag_catalog.ag_graph g ON g.graphid = l.graph \
+                 WHERE g.name = $1 AND l.name NOT LIKE '\\_ag\\_label\\_%' \
+                 ORDER BY l.name",
+            )
+            .bind(&self.graph_name)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| map_query_error(&source, bounds, &e))?;
+            if rows.len() > bounds.max_rows {
+                return Err(GraphError::RowCapExceeded {
+                    max_rows: bounds.max_rows,
+                });
+            }
+            tx.rollback()
+                .await
+                .map_err(|e| backend_error(&source, &e))?;
+            rows.into_iter()
+                .map(|row| {
+                    let name: String = row.try_get(0).map_err(|e| backend_error(&source, &e))?;
+                    let kind: String = row.try_get(1).map_err(|e| backend_error(&source, &e))?;
+                    let kind = match kind.as_str() {
+                        "v" => "vertex".to_string(),
+                        "e" => "edge".to_string(),
+                        other => other.to_string(),
+                    };
+                    Ok((name, kind))
+                })
+                .collect()
+        };
+        tokio::time::timeout(bounds.timeout + Duration::from_secs(5), run)
+            .await
+            .map_err(|_| GraphError::Timeout {
+                seconds: bounds.timeout.as_secs(),
+            })?
     }
 }
 

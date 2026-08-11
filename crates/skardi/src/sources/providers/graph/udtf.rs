@@ -505,7 +505,11 @@ fn labels_batch(
     handle: Arc<GraphSourceHandle>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
-        let labels = handle.client.labels().await.map_err(execution_error)?;
+        let labels = handle
+            .client
+            .labels(handle.bounds)
+            .await
+            .map_err(execution_error)?;
         let mut names = arrow::array::StringBuilder::new();
         let mut kinds = arrow::array::StringBuilder::new();
         for (name, kind) in &labels {
@@ -549,7 +553,7 @@ mod tests {
             Ok(stream::iter(self.rows.clone().into_iter().map(Ok)).boxed())
         }
 
-        async fn labels(&self) -> Result<Vec<(String, String)>, GraphError> {
+        async fn labels(&self, _bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError> {
             Ok(self.labels.clone())
         }
     }
