@@ -73,11 +73,15 @@
 //! oversized new window does not leave a stale one behind under the new
 //! observation's identity.
 //!
-//! ## No in-flight coalescing
+//! ## No in-flight coalescing, generation-checked commits
 //!
 //! Two scans that both find the same feed's TTL expired can both fetch it —
-//! there is no request coalescing here, matching `open_connector`'s cache.
-//! That is a documented future extension, not this module's job.
+//! there is no request coalescing here, matching `open_connector`'s cache;
+//! singleflight stays a documented future extension (the engine's module
+//! doc records its trade-offs). What this module does own is keeping those
+//! racing commits from corrupting the store: the [`FeedCache`] trait's
+//! commit-generation contract drops a commit whose snapshot the world has
+//! moved past, so completion order cannot regress a window or mislabel one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -212,15 +216,43 @@ impl FeedObservation {
     }
 }
 
-/// A feed's cached window: the parsed `items` batch plus the conditional-GET
-/// validators that produced it. The two travel together — a batch is never
-/// kept without the validators that would let a future fetch revalidate it,
-/// and eviction drops both at once by dropping this whole struct.
+/// A feed's cached window: the parsed `items` batch, the conditional-GET
+/// validators that produced it, and where they came from. They all travel
+/// together — a batch is never kept without the validators that would let a
+/// future fetch revalidate it, nor without the address those validators are
+/// good against — and eviction drops the lot at once by dropping this whole
+/// struct.
 #[derive(Debug, Clone)]
 pub struct CachedWindow {
     pub batch: RecordBatch,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// The URL that produced this batch and issued these validators — the
+    /// subscription's own URL when nothing redirected, the landing URL
+    /// otherwise.
+    ///
+    /// Stored because validators are only meaningful against the resource
+    /// that issued them: a redirected feed's `etag` comes from the final
+    /// hop, and a conditional request carrying it must go *there*. Sending
+    /// it to the subscription's URL instead reaches a redirector, which
+    /// answers with another redirect rather than a `304` — so the feed can
+    /// never revalidate and re-downloads in full on every scan. The engine
+    /// aims its next conditional request here for that reason.
+    pub fetched_from: String,
+    /// When a fetch last started from the *subscription's configured* URL —
+    /// the clock behind the engine's redirect re-probe.
+    ///
+    /// Fetching `fetched_from` directly is what buys the `304`, but it also
+    /// stops observing the configured URL, so a redirect that later moves
+    /// somewhere else would go unnoticed (`301` is nominally permanent and
+    /// drifts in practice). The engine periodically starts from the
+    /// configured URL again to catch that, and this is what tells it when.
+    ///
+    /// Living on the window rather than the observation is deliberate:
+    /// losing it to eviction is harmless, because a feed with no window
+    /// refetches from its configured URL unconditionally anyway — which is
+    /// itself a probe.
+    pub probed_at: Instant,
 }
 
 /// A point-in-time read of one feed's cached state.
@@ -229,12 +261,32 @@ pub struct FeedSnapshot {
     pub observation: FeedObservation,
     pub window: Option<CachedWindow>,
     pub within_ttl: bool,
+    /// Commit generation this snapshot was read at — the ticket the three
+    /// `record_*` methods check before committing (see the trait doc). `0`
+    /// for a feed with no entry; the counter hands out values from `1`, so
+    /// `0` never collides with a live entry's generation.
+    pub generation: u64,
 }
 
 /// Per-feed TTL cache. A sync trait with a `Mutex` behind each implementation
 /// (see [`MemoryFeedCache`]) rather than an async one, so a later persistent
 /// implementation can swap in without touching callers — every observation of
 /// this cache's state flows through these four methods.
+///
+/// ## Commit generations
+///
+/// With no in-flight coalescing (see the module doc), two scans can fetch
+/// the same feed concurrently and their commits arrive in completion order.
+/// Each `record_*` therefore carries `expected_generation` — the
+/// [`FeedSnapshot::generation`] its fetch was decided from — and a commit
+/// whose generation no longer matches the entry's is *stale*: something
+/// else committed while this response was in flight. A stale commit is
+/// dropped, with one exception: a stale *success* still supersedes a
+/// failure-labelled state (each impl documents its rule inline). The gate
+/// is what keeps completion-order commits from regressing the window to an
+/// older response, stamping `revalidated` on a window the `304`'s
+/// validators never came from, or arming the failure fuse against a window
+/// a faster fetch just refreshed.
 pub trait FeedCache: Send + Sync {
     /// Read `feed`'s current state as of `now`. Unknown feeds report
     /// [`FeedStatus::Never`], no window, and `within_ttl: false`.
@@ -246,6 +298,7 @@ pub trait FeedCache: Send + Sync {
     fn record_success(
         &self,
         feed: &str,
+        expected_generation: u64,
         window: CachedWindow,
         observation: FeedObservation,
         armed_until: Instant,
@@ -288,6 +341,7 @@ pub trait FeedCache: Send + Sync {
     fn record_not_modified(
         &self,
         feed: &str,
+        expected_generation: u64,
         http_status: u16,
         last_fetch_ms: i64,
         armed_until: Instant,
@@ -308,9 +362,42 @@ pub trait FeedCache: Send + Sync {
     fn record_failure(
         &self,
         feed: &str,
+        expected_generation: u64,
         http_status: Option<u16>,
         error: String,
         dialect_declared: Option<String>,
+        last_fetch_ms: i64,
+        armed_until: Instant,
+    );
+
+    /// Record an egress-policy refusal: like [`FeedCache::record_failure`],
+    /// except the cached window — validators included — is dropped rather
+    /// than kept for stale serving, so the status is always
+    /// [`FeedStatus::Error`].
+    ///
+    /// A refusal is a policy verdict, not a transient fault, and
+    /// `StaleError`'s contract — "temporarily unreachable, serve the last
+    /// good read" — is wrong for a destination the *active* policy forbids:
+    /// the policy may have changed since the window was fetched, or the host
+    /// may now resolve somewhere denied (DNS rebinding), and the design
+    /// requires a refused subscription to contribute zero item rows while
+    /// `feeds` records the refusal (the design doc's failure-mode table and
+    /// acceptance criterion 15). Dropping the window is what makes that
+    /// stick: the denial's own serve has nothing to emit, and every
+    /// within-fuse scan after it takes the cache-hit path into the same zero
+    /// rows — `Error` claims no window, so `window_lost` does not force a
+    /// refetch — instead of resurrecting the stale window. The observation
+    /// survives, as everywhere else; once the fuse expires, a re-allowed
+    /// fetch rebuilds the window with an unconditional `GET` (its validators
+    /// went with it).
+    ///
+    /// No `http_status` and no `dialect_declared`: a refusal happens before
+    /// any connection, so there is no response to describe.
+    fn record_egress_denial(
+        &self,
+        feed: &str,
+        expected_generation: u64,
+        error: String,
         last_fetch_ms: i64,
         armed_until: Instant,
     );
@@ -380,6 +467,11 @@ struct Entry {
     observation: FeedObservation,
     window: Option<WindowEntry>,
     armed_until: Instant,
+    /// Value of [`Inner::commit_counter`] at this entry's last accepted
+    /// commit — what `expected_generation` is checked against. `0` only
+    /// before the first commit, matching the `0` a snapshot reports for an
+    /// absent entry (the counter hands out values from `1`).
+    generation: u64,
     /// Tick of the last access of any kind — the order `max_observations`
     /// evicts by. Set by every one of the four [`FeedCache`] methods, so an
     /// observation-only entry that keeps getting queried or refreshed is
@@ -397,6 +489,7 @@ impl Entry {
             observation: FeedObservation::default(),
             window: None,
             armed_until,
+            generation: 0,
             last_used: 0,
             window_last_used: 0,
         }
@@ -417,6 +510,14 @@ struct Inner {
     /// one tick per nanosecond a `u64` lasts ~584 years, so wrap-around is not
     /// a case this reasons about.
     clock: u64,
+    /// Hands out commit generations, cache-wide rather than per-entry: an
+    /// entry evicted by the observation backstop and later recreated starts
+    /// over at `generation: 0`, and a per-entry counter restarting with it
+    /// would let a snapshot taken of the *old* entry's `0` falsely match the
+    /// new entry's `0`. A cache-wide monotonic counter never re-issues a
+    /// value, so a stale ticket can never match by accident. Same
+    /// wrap-around argument as `clock`.
+    commit_counter: u64,
 }
 
 impl Inner {
@@ -427,6 +528,14 @@ impl Inner {
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
+    }
+
+    /// The generation an accepted commit stamps on its entry. First value is
+    /// `1`, so an absent entry's `0` (see [`FeedSnapshot::generation`]) is
+    /// never re-issued.
+    fn next_generation(&mut self) -> u64 {
+        self.commit_counter += 1;
+        self.commit_counter
     }
 
     /// Store `feed`'s window, charging its bytes and marking it used now.
@@ -573,6 +682,7 @@ impl MemoryFeedCache {
                 window_bytes: 0,
                 windowed: 0,
                 clock: 0,
+                commit_counter: 0,
             }),
             max_bytes,
             max_entries,
@@ -597,11 +707,13 @@ impl FeedCache for MemoryFeedCache {
                 observation: FeedObservation::default(),
                 window: None,
                 within_ttl: false,
+                generation: 0,
             };
         };
         let within_ttl = now < entry.armed_until;
         let observation = entry.observation.clone();
         let window = entry.window.as_ref().map(|w| w.window.clone());
+        let generation = entry.generation;
         let has_window = window.is_some();
 
         if has_window {
@@ -614,12 +726,14 @@ impl FeedCache for MemoryFeedCache {
             observation,
             window,
             within_ttl,
+            generation,
         }
     }
 
     fn record_success(
         &self,
         feed: &str,
+        expected_generation: u64,
         window: CachedWindow,
         observation: FeedObservation,
         armed_until: Instant,
@@ -630,6 +744,31 @@ impl FeedCache for MemoryFeedCache {
         let bytes = window.batch.get_array_memory_size();
         let mut inner = self.lock();
 
+        // Generation gate — see the trait doc. The one stale commit that is
+        // *accepted* is a success superseding a failure-labelled (or absent)
+        // state: dropping it would leave the feed negatively cached for up
+        // to the failure fuse despite a successful response in hand, which
+        // is worse than either racing response winning.
+        let (current, status) = inner.map.get(feed).map_or((0, None), |e| {
+            (e.generation, Some(e.observation.last_status))
+        });
+        if current != expected_generation
+            && !matches!(
+                status,
+                None | Some(FeedStatus::Error | FeedStatus::StaleError)
+            )
+        {
+            tracing::debug!(
+                feed,
+                commit = "success",
+                expected_generation,
+                current_generation = current,
+                "rss stale cache commit dropped"
+            );
+            return;
+        }
+        let generation = inner.next_generation();
+
         // `record_success` always replaces wholesale: whatever window this
         // feed held before is gone now, whether or not the new one below
         // ends up fitting.
@@ -639,6 +778,7 @@ impl FeedCache for MemoryFeedCache {
             .map
             .entry(feed.to_string())
             .or_insert_with(|| Entry::new(armed_until));
+        entry.generation = generation;
         // The one place a whole observation enters the store, and so where its
         // strings are bounded — see [`FeedObservation::capped`]. Applied here
         // rather than at the caller so no future construction site can omit it.
@@ -661,15 +801,33 @@ impl FeedCache for MemoryFeedCache {
     fn record_not_modified(
         &self,
         feed: &str,
+        expected_generation: u64,
         http_status: u16,
         last_fetch_ms: i64,
         armed_until: Instant,
     ) {
         let mut inner = self.lock();
+        // Generation gate — see the trait doc. A stale `304` has nothing to
+        // salvage: its status stamp would label a window its validators
+        // never came from, and the re-arm it would perform was already done
+        // by whatever committed in between.
+        let current = inner.map.get(feed).map_or(0, |e| e.generation);
+        if current != expected_generation {
+            tracing::debug!(
+                feed,
+                commit = "not-modified",
+                expected_generation,
+                current_generation = current,
+                "rss stale cache commit dropped"
+            );
+            return;
+        }
+        let generation = inner.next_generation();
         let entry = inner
             .map
             .entry(feed.to_string())
             .or_insert_with(|| Entry::new(armed_until));
+        entry.generation = generation;
 
         // An attempt happened and it is the caller's `armed_until` that
         // decides when the next one may, so the fetch metadata and the re-arm
@@ -715,6 +873,7 @@ impl FeedCache for MemoryFeedCache {
     fn record_failure(
         &self,
         feed: &str,
+        expected_generation: u64,
         http_status: Option<u16>,
         error: String,
         dialect_declared: Option<String>,
@@ -722,10 +881,28 @@ impl FeedCache for MemoryFeedCache {
         armed_until: Instant,
     ) {
         let mut inner = self.lock();
+        // Generation gate — see the trait doc. A stale failure must not
+        // stamp `stale-error` over — nor arm the failure fuse against —
+        // state committed by a fetch that outran this one; if the
+        // intervening commit was itself a failure, the only loss is the
+        // newer error string.
+        let current = inner.map.get(feed).map_or(0, |e| e.generation);
+        if current != expected_generation {
+            tracing::debug!(
+                feed,
+                commit = "failure",
+                expected_generation,
+                current_generation = current,
+                "rss stale cache commit dropped"
+            );
+            return;
+        }
+        let generation = inner.next_generation();
         let entry = inner
             .map
             .entry(feed.to_string())
             .or_insert_with(|| Entry::new(armed_until));
+        entry.generation = generation;
         // A failed refresh does not invalidate a previously cached window —
         // it is left exactly as it was, available to serve stale, and
         // determines which of the two failure statuses applies.
@@ -754,6 +931,54 @@ impl FeedCache for MemoryFeedCache {
         inner.touch_entry(feed);
         inner.evict_observations(self.max_observations);
     }
+
+    fn record_egress_denial(
+        &self,
+        feed: &str,
+        expected_generation: u64,
+        error: String,
+        last_fetch_ms: i64,
+        armed_until: Instant,
+    ) {
+        let mut inner = self.lock();
+        // Generation gate — see the trait doc. Same drop-always rule as
+        // `record_failure`: a stale denial must not purge a window a fetch
+        // that outran this one just committed under an allowing verdict.
+        let current = inner.map.get(feed).map_or(0, |e| e.generation);
+        if current != expected_generation {
+            tracing::debug!(
+                feed,
+                commit = "egress-denial",
+                expected_generation,
+                current_generation = current,
+                "rss stale cache commit dropped"
+            );
+            return;
+        }
+        let generation = inner.next_generation();
+        // The one difference from `record_failure`: the window goes — see
+        // the trait method's doc for why a policy refusal must not leave
+        // content behind to serve stale.
+        inner.drop_window(feed);
+        let entry = inner
+            .map
+            .entry(feed.to_string())
+            .or_insert_with(|| Entry::new(armed_until));
+        entry.generation = generation;
+        entry.observation.last_status = FeedStatus::Error;
+        entry.observation.http_status = None;
+        entry.observation.last_error = Some(error);
+        entry.observation.last_fetch_ms = Some(last_fetch_ms);
+        entry.armed_until = armed_until;
+        // Same cap discipline as the other write paths: the denial string is
+        // built from policy-side facts, but the bound belongs to the store,
+        // not to trust in any particular writer.
+        let observation = std::mem::take(&mut entry.observation);
+        entry.observation = observation.capped();
+
+        inner.touch_entry(feed);
+        inner.evict_observations(self.max_observations);
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +999,8 @@ mod tests {
             batch,
             etag: Some("\"etag\"".into()),
             last_modified: Some("Mon, 20 Jul 2026 10:00:00 GMT".into()),
+            fetched_from: "https://feed.example/f.xml".into(),
+            probed_at: Instant::now(),
         }
     }
 
@@ -932,6 +1159,7 @@ mod tests {
         let t0 = Instant::now();
         cache.record_success(
             "a",
+            0,
             window_with_rows(3),
             obs_all_strings_long(10_000),
             t0 + Duration::from_secs(900),
@@ -958,6 +1186,7 @@ mod tests {
         let t0 = Instant::now();
         cache.record_failure(
             "a",
+            0,
             Some(500),
             "x".repeat(10_000),
             Some(format!("unknown:{}", "y".repeat(10_000))),
@@ -992,6 +1221,7 @@ mod tests {
         let t0 = Instant::now();
         cache.record_success(
             "a",
+            0,
             window_with_rows(2),
             obs_fresh(2),
             t0 + Duration::from_secs(900),
@@ -1011,9 +1241,10 @@ mod tests {
     fn failure_is_negative_cached_with_window_kept() {
         let cache = MemoryFeedCache::new(1 << 20, 64);
         let t0 = Instant::now();
-        cache.record_success("a", window_with_rows(2), obs_fresh(2), t0); // expired immediately
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), t0); // expired immediately
         cache.record_failure(
             "a",
+            1,
             Some(503),
             "http status 503".into(),
             None,
@@ -1045,6 +1276,7 @@ mod tests {
         let t0 = Instant::now();
         cache.record_failure(
             "a",
+            0,
             Some(500),
             "http status 500".into(),
             None,
@@ -1072,8 +1304,8 @@ mod tests {
         let cache = MemoryFeedCache::new(bytes + 8, 64);
         let t0 = Instant::now();
         let armed = t0 + Duration::from_secs(900);
-        cache.record_success("a", window_with_rows(2), obs_fresh(2), armed);
-        cache.record_success("b", window_with_rows(2), obs_fresh(3), armed);
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), armed);
+        cache.record_success("b", 0, window_with_rows(2), obs_fresh(3), armed);
 
         let snap_a = cache.snapshot("a", t0 + Duration::from_secs(1));
         assert!(
@@ -1119,8 +1351,8 @@ mod tests {
     fn not_modified_rearms_and_flips_to_revalidated() {
         let cache = MemoryFeedCache::new(1 << 20, 64);
         let t0 = Instant::now();
-        cache.record_success("a", window_with_rows(2), obs_fresh(2), t0); // expired immediately
-        cache.record_not_modified("a", 304, 1, t0 + Duration::from_secs(900));
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), t0); // expired immediately
+        cache.record_not_modified("a", 1, 304, 1, t0 + Duration::from_secs(900));
         let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
         assert!(
             snap.within_ttl,
@@ -1158,7 +1390,7 @@ mod tests {
         // that makes a caller send validators in the first place, and what
         // makes the re-arm below the *only* thing that can put the feed back
         // within its TTL.
-        cache.record_success("a", window_with_rows(1), obs_fresh(1), t0);
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), t0);
         // "a" holds a window and its validators; a scan would send them now.
         assert!(cache.snapshot("a", t0).window.is_some());
         assert!(!cache.snapshot("a", t0 + Duration::from_secs(1)).within_ttl);
@@ -1167,6 +1399,7 @@ mod tests {
         // that conditional request is in flight.
         cache.record_success(
             "b",
+            0,
             window_with_rows(1),
             obs_fresh(1),
             t0 + Duration::from_secs(900),
@@ -1178,7 +1411,7 @@ mod tests {
 
         // No panic in either profile: run it directly rather than through
         // `catch_unwind`, so a reintroduced assertion fails this test.
-        cache.record_not_modified("a", 304, 42, t0 + Duration::from_secs(600));
+        cache.record_not_modified("a", 1, 304, 42, t0 + Duration::from_secs(600));
 
         let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
         assert!(
@@ -1212,8 +1445,8 @@ mod tests {
         let cache = MemoryFeedCache::new(bytes * 2 + 8, 64);
         let t0 = Instant::now();
         let armed = t0 + Duration::from_secs(900);
-        cache.record_success("a", window_with_rows(1), obs_fresh(1), armed);
-        cache.record_success("b", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("b", 0, window_with_rows(1), obs_fresh(1), armed);
         // Touch "a" so "b" becomes the least-recently-used entry.
         assert!(
             cache
@@ -1221,7 +1454,7 @@ mod tests {
                 .window
                 .is_some()
         );
-        cache.record_success("c", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("c", 0, window_with_rows(1), obs_fresh(1), armed);
 
         assert!(
             cache
@@ -1251,9 +1484,9 @@ mod tests {
         let cache = MemoryFeedCache::new(1 << 20, 2);
         let t0 = Instant::now();
         let armed = t0 + Duration::from_secs(900);
-        cache.record_success("a", window_with_rows(1), obs_fresh(1), armed);
-        cache.record_success("b", window_with_rows(1), obs_fresh(1), armed);
-        cache.record_success("c", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("b", 0, window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("c", 0, window_with_rows(1), obs_fresh(1), armed);
 
         let snap_a = cache.snapshot("a", t0 + Duration::from_secs(1));
         assert!(
@@ -1287,6 +1520,7 @@ mod tests {
         for i in 0..8 {
             cache.record_failure(
                 &format!("feed-{i}"),
+                0,
                 Some(500),
                 "http status 500".into(),
                 None,
@@ -1306,6 +1540,7 @@ mod tests {
         // must be the one dropped, whole entry and all.
         cache.record_failure(
             "feed-8",
+            0,
             Some(500),
             "http status 500".into(),
             None,
@@ -1340,17 +1575,27 @@ mod tests {
         let t0 = Instant::now();
         let armed = t0 + Duration::from_secs(900);
 
-        cache.record_success("a", window_with_rows(1), obs_fresh(1), armed);
-        cache.record_success("b", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("b", 0, window_with_rows(1), obs_fresh(1), armed);
         // Replacing an existing window must credit the old bytes back.
-        cache.record_success("a", window_with_rows(1), obs_fresh(1), armed);
-        // A failure leaves "a"'s window in place to serve stale.
-        cache.record_failure("a", Some(500), "boom".into(), None, 1, armed);
+        // ("a"'s entry holds generation 1 from its first commit above.)
+        cache.record_success("a", 1, window_with_rows(1), obs_fresh(1), armed);
+        // A failure leaves "a"'s window in place to serve stale. ("a" now
+        // holds generation 3: commits are numbered cache-wide in call order.)
+        cache.record_failure("a", 3, Some(500), "boom".into(), None, 1, armed);
         // Over the byte budget: one window is evicted, its observation kept.
-        cache.record_success("c", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("c", 0, window_with_rows(1), obs_fresh(1), armed);
         // Windowless keys, driving the whole-entry backstop at 8 * 8 = 64.
         for i in 0..70 {
-            cache.record_failure(&format!("f{i}"), Some(500), "boom".into(), None, 1, armed);
+            cache.record_failure(
+                &format!("f{i}"),
+                0,
+                Some(500),
+                "boom".into(),
+                None,
+                1,
+                armed,
+            );
         }
 
         let inner = cache.lock();
@@ -1382,7 +1627,7 @@ mod tests {
         let t0 = Instant::now();
         let armed = t0 + Duration::from_secs(900);
 
-        cache.record_success("a", window_with_rows(2), obs_fresh(2), armed);
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), armed);
         let snap_a = cache.snapshot("a", t0 + Duration::from_secs(1));
         assert!(
             snap_a.window.is_none(),
@@ -1393,7 +1638,7 @@ mod tests {
         // Insert a second, different feed — with no floor, `max_observations`
         // would be 0 and this insert's `evict_observations` call would have
         // already discarded "a"'s observation before this snapshot ever runs.
-        cache.record_success("b", window_with_rows(1), obs_fresh(1), armed);
+        cache.record_success("b", 0, window_with_rows(1), obs_fresh(1), armed);
         let snap_a_after = cache.snapshot("a", t0 + Duration::from_secs(1));
         assert!(
             matches!(snap_a_after.observation.last_status, FeedStatus::Fresh),
@@ -1401,5 +1646,206 @@ mod tests {
         );
         let snap_b = cache.snapshot("b", t0 + Duration::from_secs(1));
         assert!(matches!(snap_b.observation.last_status, FeedStatus::Fresh));
+    }
+
+    /// The 200/200 commit race: two scans snapshot the same generation, both
+    /// fetch, and the slower response commits second. Without the generation
+    /// gate the second commit would replace the first wholesale — the window
+    /// regressing to the older response while labelled `fresh`.
+    #[test]
+    fn a_second_success_from_the_same_snapshot_is_dropped() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        let armed = t0 + Duration::from_secs(900);
+
+        // Both scans read generation 0 (no entry yet). The fast fetch
+        // commits first; the slow one still carries the shared ticket.
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), armed);
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), armed);
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert_eq!(
+            snap.window.as_ref().unwrap().batch.num_rows(),
+            2,
+            "the first-committed window stays; the stale commit is dropped"
+        );
+        assert_eq!(snap.observation.item_count, Some(2));
+    }
+
+    /// The 200/304 commit race: a `304` whose validators came from the
+    /// pre-race window must not stamp `revalidated` on — nor re-arm — the
+    /// window a concurrent `200` committed in between.
+    #[test]
+    fn a_stale_304_does_not_label_a_window_it_never_validated() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+
+        // The primed window both racing scans snapshot: generation 1,
+        // already expired so both fetch.
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), t0);
+        // The concurrent full `200` wins the race.
+        cache.record_success(
+            "a",
+            1,
+            window_with_rows(2),
+            obs_fresh(2),
+            t0 + Duration::from_secs(900),
+        );
+        // The `304` arrives late, its validators minted from generation 1.
+        cache.record_not_modified("a", 1, 304, 99, t0 + Duration::from_secs(600));
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(
+            matches!(snap.observation.last_status, FeedStatus::Fresh),
+            "not `revalidated`: the 304 never saw the two-row window"
+        );
+        assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
+        assert_ne!(
+            snap.observation.last_fetch_ms,
+            Some(99),
+            "the dropped 304 must not update fetch metadata either"
+        );
+    }
+
+    /// A slow failure must not stamp `stale-error` over — nor arm the
+    /// failure fuse against — a window a faster concurrent fetch just
+    /// refreshed.
+    #[test]
+    fn a_stale_failure_does_not_degrade_a_fresher_success() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), t0);
+        // Both racing scans snapshot generation 1; the success commits first,
+        // armed 900s out.
+        cache.record_success(
+            "a",
+            1,
+            window_with_rows(2),
+            obs_fresh(2),
+            t0 + Duration::from_secs(900),
+        );
+        // The slow failure would have armed the 30s fuse.
+        cache.record_failure(
+            "a",
+            1,
+            Some(500),
+            "http status 500".into(),
+            None,
+            7,
+            t0 + Duration::from_secs(30),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(matches!(snap.observation.last_status, FeedStatus::Fresh));
+        assert_eq!(snap.observation.last_error, None);
+        assert!(
+            cache
+                .snapshot("a", t0 + Duration::from_secs(600))
+                .within_ttl,
+            "the success's 900s arm stands; the dropped failure's 30s fuse does not"
+        );
+    }
+
+    /// The one stale commit that is accepted: a success superseding a
+    /// failure-labelled state. Dropping it would leave the feed negatively
+    /// cached for up to the failure fuse despite a successful response in
+    /// hand.
+    #[test]
+    fn a_stale_success_supersedes_a_failure_commit() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+
+        // Concurrent first fetches: both snapshot generation 0. The failure
+        // commits first...
+        cache.record_failure(
+            "a",
+            0,
+            None,
+            "transport error: connection refused".into(),
+            None,
+            1,
+            t0 + Duration::from_secs(30),
+        );
+        // ...and the slower success still lands.
+        cache.record_success(
+            "a",
+            0,
+            window_with_rows(2),
+            obs_fresh(2),
+            t0 + Duration::from_secs(900),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(matches!(snap.observation.last_status, FeedStatus::Fresh));
+        assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
+        assert_eq!(snap.observation.last_error, None);
+    }
+
+    /// An egress refusal purges the window instead of keeping it for stale
+    /// serving — a policy verdict must not leave forbidden content behind —
+    /// while the observation records the refusal and the fuse still arms.
+    #[test]
+    fn an_egress_denial_drops_the_window_and_negative_caches() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        cache.record_success("a", 0, window_with_rows(2), obs_fresh(2), t0); // expired at once
+        cache.record_egress_denial(
+            "a",
+            1,
+            "egress blocked: host 'feed.example' resolves to private address 10.0.0.1".into(),
+            7,
+            t0 + Duration::from_secs(30),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(
+            snap.window.is_none(),
+            "the refused feed's window (and validators) must be purged"
+        );
+        assert!(
+            matches!(snap.observation.last_status, FeedStatus::Error),
+            "`error`, not `stale-error`: there is deliberately nothing to serve stale"
+        );
+        assert!(
+            snap.observation
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("egress blocked")
+        );
+        assert!(
+            snap.within_ttl,
+            "a refusal negative-caches exactly like any other failure"
+        );
+    }
+
+    /// A stale denial obeys the same generation rule as a stale failure: it
+    /// must not purge a window a fetch that outran it just committed under
+    /// an allowing verdict.
+    #[test]
+    fn a_stale_egress_denial_does_not_purge_a_fresher_success() {
+        let cache = MemoryFeedCache::new(1 << 20, 64);
+        let t0 = Instant::now();
+        cache.record_success("a", 0, window_with_rows(1), obs_fresh(1), t0);
+        // Both racing scans snapshot generation 1; the success commits first.
+        cache.record_success(
+            "a",
+            1,
+            window_with_rows(2),
+            obs_fresh(2),
+            t0 + Duration::from_secs(900),
+        );
+        cache.record_egress_denial(
+            "a",
+            1,
+            "egress blocked: host 'feed.example' resolves to private address 10.0.0.1".into(),
+            7,
+            t0 + Duration::from_secs(30),
+        );
+
+        let snap = cache.snapshot("a", t0 + Duration::from_secs(1));
+        assert!(matches!(snap.observation.last_status, FeedStatus::Fresh));
+        assert_eq!(snap.window.as_ref().unwrap().batch.num_rows(), 2);
     }
 }

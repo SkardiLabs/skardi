@@ -222,9 +222,9 @@ fn read_opml(name: &str, path: &Path) -> Result<Vec<(String, Option<String>)>, R
             }
         }
 
-        // name = `text`, else `title`, else (left as `None` here) the URL —
-        // `finalize` applies that last fallback uniformly for both input
-        // forms.
+        // name = `text`, else `title`, else (left as `None` here) the URL
+        // stripped of credentials/query/fragment — `finalize` applies that
+        // last fallback uniformly for both input forms.
         if let Some(url) = xml_url {
             subs.push((url, text_attr.or(title_attr)));
         }
@@ -331,7 +331,7 @@ mod tests {
             }
         );
         assert_eq!(subs[1].name, "TWiR"); // title attr fallback
-        assert_eq!(subs[2].name, "https://example.com/no-name.xml"); // name defaults to URL
+        assert_eq!(subs[2].name, "https://example.com/no-name.xml"); // name defaults to the stripped URL
     }
 
     #[test]

@@ -27,7 +27,10 @@ use super::sanitize::{
 /// Why a document could not be turned into a feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseFailure {
-    /// `"refused-internal-dtd"` or `"strict-parse"` (the ladder was exhausted).
+    /// `"refused-internal-dtd"` or `"strict-parse"` (the ladder was
+    /// exhausted). The engine synthesizes two more around its call to
+    /// [`parse_feed_document`]: `"timeout"` and `"panic"` (see
+    /// `engine::parse_off_worker`).
     pub stage: &'static str,
     pub reason: String,
     pub dialect_declared: Option<String>,

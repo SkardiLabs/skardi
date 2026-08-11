@@ -56,6 +56,14 @@
 //! resent past the first hop, even though each hop still gets its own fresh
 //! retry budget (see below).
 //!
+//! This is why [`FetchOutcome::Fetched`] reports a `final_url`. A redirected
+//! feed's validators are issued by the *last* hop, so a caller that keeps
+//! them under the URL it originally asked for will send them somewhere that
+//! never issued them — to a redirector, which answers with another redirect
+//! rather than a `304`, forever. Reporting the landing URL lets the caller
+//! store the two together and aim the next conditional request where the
+//! validators actually mean something.
+//!
 //! ## The size cap is measured on the decoded stream
 //!
 //! [`FeedFetcher::new`] enables gzip decoding on the client, and
@@ -116,15 +124,8 @@
 //! per-feed degrade, re-fetched on the next scan — rather than a cached
 //! window.
 
-// `FeedFetcher` has no production caller yet — the engine (a later PR in
-// this stack) is the first one, and hasn't landed. Until then, everything
-// here outside of this module's own tests is unreferenced from a build that
-// excludes test code (and, transitively, so is `egress.rs`, whose only
-// consumer is this module), and `cargo check`/`cargo build` would otherwise
-// flag both files. Remove this once the engine wires `FeedFetcher` in.
-#![allow(dead_code)]
-
 use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -139,6 +140,7 @@ use reqwest::{Response, StatusCode};
 use thiserror::Error;
 use url::{Host, Url};
 
+use super::config::redact_url;
 use super::egress::{AllowAll, EgressDenied, EgressPolicy, PolicyDns};
 use super::error::RssError;
 use crate::util::http::parse_retry_after;
@@ -184,6 +186,12 @@ pub struct Validators {
 #[derive(Debug)]
 pub enum FetchOutcome {
     /// The server confirmed the cached copy is still current (`304`).
+    ///
+    /// Carries no landing URL, and needs none: a `304` can only answer a hop
+    /// that actually sent validators, validators go out on the first hop
+    /// only, and [`FeedFetcher::attempt_hop`] maps an unconditional `304` to
+    /// [`FetchError::Status`] rather than this variant. So the URL that
+    /// produced a `NotModified` is always the one the caller asked for.
     NotModified { http_status: u16 },
     /// A fresh body, bounded by the fetcher's configured byte cap.
     Fetched {
@@ -192,6 +200,16 @@ pub enum FetchOutcome {
         etag: Option<String>,
         last_modified: Option<String>,
         content_type: Option<String>,
+        /// The URL of the hop that produced this body — the caller's URL
+        /// when nothing redirected, the final target otherwise.
+        ///
+        /// Reported because `etag`/`last_modified` above belong to *this*
+        /// URL, not to the one the caller passed: a conditional request
+        /// carrying them has to go here, or the validators are presented to
+        /// an address that never issued them. That is exactly what a
+        /// redirected feed used to do — see the engine's landing-URL
+        /// handling.
+        final_url: String,
     },
 }
 
@@ -349,8 +367,13 @@ impl FeedFetcher {
     /// Parse the feed URL and apply [`FeedFetcher::check_hop_target`] to it
     /// — the same checks every redirect target gets.
     fn parse_and_check(&self, url: &str) -> Result<Url, FetchError> {
+        // The unparsed URL is not quoted: it can carry a private query token,
+        // and this string reaches `feeds.last_error` and the degraded-feed
+        // `warn` (whose `feed` field already locates the subscription).
+        // Config validation runs the same parse at load, so this arm is
+        // defence in depth, not the primary report.
         let parsed = Url::parse(url).map_err(|e| FetchError::InvalidUrl {
-            reason: format!("'{url}' is not a valid URL: {e}"),
+            reason: e.to_string(),
         })?;
         self.check_hop_target(&parsed)?;
         Ok(parsed)
@@ -362,9 +385,14 @@ impl FeedFetcher {
     /// IP-literal target on its own, on any hop, so every resolved redirect
     /// target is re-checked here before the next request is built.
     fn resolve_redirect_target(&self, current: &Url, location: &str) -> Result<Url, FetchError> {
+        // `current` is quoted redacted: a hop URL can carry a private query
+        // token, and this string reaches `feeds.last_error` and `warn` logs.
+        // The location is the server's own header, kept verbatim — it is the
+        // datum being diagnosed.
         let target = current.join(location).map_err(|e| FetchError::InvalidUrl {
             reason: format!(
-                "redirect location '{location}' does not resolve against '{current}': {e}"
+                "redirect location '{location}' does not resolve against '{}': {e}",
+                redact_url(current)
             ),
         })?;
         self.check_hop_target(&target)?;
@@ -504,7 +532,7 @@ impl FeedFetcher {
                         // the full GET, discarding the partial body.
                         // `TooLarge` (and anything else) stays terminal —
                         // see the module doc's Retries section.
-                        match self.read_body(resp).await {
+                        match self.read_body(resp, url).await {
                             Ok(outcome) => return Ok(HopOutcome::Done(outcome)),
                             Err(
                                 err @ (FetchError::Timeout { .. } | FetchError::Transport { .. }),
@@ -533,7 +561,7 @@ impl FeedFetcher {
                         }
                     } else {
                         FetchError::Transport {
-                            reason: e.to_string(),
+                            reason: transport_reason(e),
                         }
                     };
                     if attempt + 1 >= MAX_ATTEMPTS {
@@ -557,7 +585,7 @@ impl FeedFetcher {
 
     /// Capture the validator/content-type headers, then stream the body,
     /// enforcing the byte cap on the *decoded* stream — see the module doc.
-    async fn read_body(&self, resp: Response) -> Result<FetchOutcome, FetchError> {
+    async fn read_body(&self, resp: Response, url: &Url) -> Result<FetchOutcome, FetchError> {
         let http_status = resp.status().as_u16();
         let etag = header_string(&resp, ETAG);
         let last_modified = header_string(&resp, LAST_MODIFIED);
@@ -574,7 +602,7 @@ impl FeedFetcher {
                     }
                 } else {
                     FetchError::Transport {
-                        reason: format!("failed to read response body: {e}"),
+                        reason: format!("failed to read response body: {}", transport_reason(e)),
                     }
                 }
             })?;
@@ -590,6 +618,9 @@ impl FeedFetcher {
             etag,
             last_modified,
             content_type,
+            // The hop this body came off, not the URL `fetch` was called
+            // with — see the variant's doc.
+            final_url: url.to_string(),
         })
     }
 }
@@ -641,6 +672,31 @@ fn header_string(resp: &Response, name: HeaderName) -> Option<String> {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+/// `reason` for a [`FetchError::Transport`]: the reqwest error with its URL
+/// dropped and its `source()` chain folded in.
+///
+/// Both halves matter, for the same destination: this string is stored
+/// verbatim as `feeds.last_error` and logged at `warn` when a feed
+/// degrades. reqwest's `Display` appends the request URL (`" for url (…)"`
+/// — reqwest-0.12.28 `src/error.rs`, the `Display` impl), and on a
+/// redirected fetch that URL is the *hop's*, i.e. wherever the server's
+/// `Location` pointed; either way it can carry a private query token, so it
+/// must not ride along. And reqwest's `Display` names only the error's kind
+/// — the cause ("Connection refused", a DNS failure) lives in the
+/// `source()` chain — so dropping the URL without folding the chain in
+/// would leave nothing to diagnose with. What the chain contributes is at
+/// most a host or an ip:port, never a query string or userinfo.
+fn transport_reason(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut reason = e.to_string();
+    let mut source = StdError::source(&e);
+    while let Some(cause) = source {
+        let _ = write!(reason, ": {cause}");
+        source = cause.source();
+    }
+    reason
 }
 
 /// Walk a failed request's source chain for an [`EgressDenied`] that
@@ -737,6 +793,7 @@ mod tests {
                 etag,
                 last_modified,
                 content_type,
+                ..
             } => {
                 assert_eq!(body, b"<rss/>");
                 assert_eq!(http_status, 200);
@@ -973,6 +1030,78 @@ mod tests {
         );
     }
 
+    /// A transport error's string reaches `feeds.last_error` and the
+    /// degraded-feed `warn`, so it must carry the cause but never the URL —
+    /// a feed URL's query can be a private token. Without stripping,
+    /// reqwest's `Display` appends ` for url (…)` with the query intact.
+    #[tokio::test]
+    async fn a_transport_error_names_the_cause_but_never_the_url() {
+        // Bind-then-drop yields a port that refuses connections.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let f = test_fetcher();
+        let err = f
+            .fetch(
+                &format!("http://127.0.0.1:{port}/feed.xml?token=secret"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Transport { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("token=secret") && !msg.contains("for url"),
+            "reqwest's URL clause must be stripped: {msg}"
+        );
+        assert!(
+            msg.contains("refused") || msg.contains("connect"),
+            "the folded source chain carries the actual cause: {msg}"
+        );
+    }
+
+    /// A `Location` that cannot be resolved is quoted verbatim — it is the
+    /// server's own header and the datum being diagnosed — but the current
+    /// hop's URL is quoted with its query stripped: that query can be a
+    /// private token, and the string reaches `feeds.last_error` and `warn`.
+    #[tokio::test]
+    async fn an_unresolvable_location_redacts_the_current_url() {
+        let server = MockFeedServer::start(|_req| {
+            // `http://` alone cannot parse (a special scheme requires a
+            // host), so joining it against any base fails.
+            MockResponse::status(302).with_header("location", "http://")
+        })
+        .await;
+        let f = test_fetcher();
+        let url = format!("{}/feed.xml?token=secret", server.url());
+        let err = f.fetch(&url, None).await.unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(!msg.contains("token=secret"), "{msg}");
+        assert!(
+            msg.contains("redirect location 'http://'"),
+            "the offending location itself is the diagnostic: {msg}"
+        );
+        assert!(
+            msg.contains("/feed.xml'"),
+            "the redacted current URL still locates the hop: {msg}"
+        );
+    }
+
+    /// An unparseable feed URL is not echoed into the error: even a string
+    /// that fails `Url::parse` can carry a readable `?token=…`, and config
+    /// validation already reports parse failures at load with the URL in
+    /// hand — this arm only feeds `last_error` and logs.
+    #[tokio::test]
+    async fn an_unparseable_url_is_not_echoed_into_the_error() {
+        let f = test_fetcher();
+        let err = f.fetch("not a url?token=secret", None).await.unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(!msg.contains("token=secret"), "{msg}");
+    }
+
     #[tokio::test]
     async fn redirect_is_followed_and_validated() {
         let server = MockFeedServer::start(|req| {
@@ -992,6 +1121,52 @@ mod tests {
         let requests = server.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].path, "/moved");
+    }
+
+    /// `final_url` names the hop the body came off, not the URL `fetch` was
+    /// called with. The caller needs it because the validators reported
+    /// beside it were issued by *that* hop — see the module doc's
+    /// first-hop section.
+    #[tokio::test]
+    async fn a_redirected_fetch_reports_its_landing_url() {
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                MockResponse::xml("<rss/>").with_header("etag", "\"landing\"")
+            } else {
+                MockResponse::status(301).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let requested = format!("{}/feed.xml", server.url());
+        let out = f.fetch(&requested, None).await.unwrap();
+        match out {
+            FetchOutcome::Fetched {
+                final_url, etag, ..
+            } => {
+                assert_eq!(final_url, format!("{}/moved", server.url()));
+                assert_ne!(final_url, requested, "the landing URL, not the request");
+                assert_eq!(
+                    etag.as_deref(),
+                    Some("\"landing\""),
+                    "and the validators beside it are the landing hop's"
+                );
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+    }
+
+    /// An un-redirected fetch lands where it was aimed, so caller logic that
+    /// compares the two needs no special case.
+    #[tokio::test]
+    async fn an_undirected_fetch_reports_the_requested_url() {
+        let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
+        let f = test_fetcher();
+        let requested = format!("{}/feed.xml", server.url());
+        match f.fetch(&requested, None).await.unwrap() {
+            FetchOutcome::Fetched { final_url, .. } => assert_eq!(final_url, requested),
+            other => panic!("expected Fetched, got {other:?}"),
+        }
     }
 
     #[tokio::test]
