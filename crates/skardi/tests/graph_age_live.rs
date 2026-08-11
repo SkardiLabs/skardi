@@ -60,8 +60,10 @@ async fn seed_graph(url: &str, graph: &str) -> sqlx::PgPool {
             CREATE (a:Person {{name: 'ada', age: 36}}),
                    (b:Person {{name: 'bob', age: 41}}),
                    (c:Person {{name: 'cyd'}}),
+                   (d:Person {{name: '颱風', note: 'café ☔'}}),
                    (a)-[:KNOWS {{since: 2019}}]->(b),
-                   (b)-[:KNOWS {{since: 2021}}]->(c)
+                   (b)-[:KNOWS {{since: 2021}}]->(c),
+                   (a)-[:KNOWS {{since: 2024}}]->(d)
         $$) AS (v agtype)"
     );
     pool.execute(seed.as_str()).await.expect("seed cypher");
@@ -149,7 +151,10 @@ async fn scalars_params_and_ordering_round_trip() {
         .unwrap();
     assert_eq!(ages.value(0), 41);
 
-    // A NULL property lands as SQL NULL (cyd has no age).
+    // A NULL property lands as SQL NULL (cyd has no age), and the CJK
+    // name round-trips byte-faithfully (the P1 mojibake regression:
+    // Latin-1 per-byte push would deliver a corrupted-but-parseable
+    // string, so this MUST assert the exact value end to end).
     let batches = collect(
         &ctx,
         "SELECT name, age FROM cypher_query('kg', '\
@@ -158,7 +163,20 @@ async fn scalars_params_and_ordering_round_trip() {
     )
     .await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 3);
+    assert_eq!(total, 4);
+    let all_names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        all_names.contains(&"颱風".to_string()),
+        "CJK survives byte-faithfully: {all_names:?}"
+    );
 
     drop_graph(&pool, &graph).await;
 }
@@ -186,13 +204,29 @@ async fn nodes_relationships_and_paths_take_the_canonical_shapes() {
     )
     .await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 3);
+    assert_eq!(total, 4);
     let names = batches[0]
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(names.value(0), "ada");
+
+    // json_get through a node's properties keeps non-ASCII intact —
+    // the whole agtype → JSON-text → json_get chain, live.
+    let batches = collect(
+        &ctx,
+        "SELECT json_get_str(v.properties, 'note') AS note \
+         FROM cypher_query('kg', 'MATCH (v:Person {name: \"颱風\"}) RETURN v', \
+         '{}', '{\"v\": \"node\"}')",
+    )
+    .await;
+    let notes = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(notes.value(0), "café ☔");
 
     // Relationship STRUCT: type and endpoint ids are strings.
     let batches = collect(
@@ -206,7 +240,7 @@ async fn nodes_relationships_and_paths_take_the_canonical_shapes() {
         .as_any()
         .downcast_ref::<StructArray>()
         .unwrap();
-    assert_eq!(rels.len(), 2);
+    assert_eq!(rels.len(), 3);
     let types = rels
         .column_by_name("type")
         .unwrap()
@@ -375,7 +409,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         .expect("plans")
         .collect()
         .await
-        .expect_err("3 people, cap 1");
+        .expect_err("4 people, cap 1");
     let msg = err.to_string();
     assert!(msg.contains("max_rows = 1"), "{msg}");
     assert!(msg.contains("LIMIT"), "the fix is named: {msg}");

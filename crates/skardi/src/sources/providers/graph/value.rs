@@ -189,7 +189,15 @@ pub fn declared_schema(columns: &[DeclaredColumn]) -> Arc<Schema> {
 /// which always follow a value (`}`, `]`, digit, or scalar keyword) — are
 /// removed.
 pub fn parse_agtype(text: &str) -> Result<Value, String> {
-    let mut cleaned = String::with_capacity(text.len());
+    // BYTES in, BYTES out, one UTF-8 decode at the end. `u8 as char` is
+    // Latin-1 semantics and would shred every multi-byte UTF-8 character
+    // into mojibake that still parses as JSON — a SILENT corruption
+    // (CJK entity names are the common case in knowledge graphs, not an
+    // edge case). Byte-level scanning is sound because everything the
+    // scanner matches ('"', '\\', ':', the annotation identifiers) is
+    // ASCII, and UTF-8 continuation bytes are all >= 0x80 — a multi-byte
+    // character can never alias a structural byte.
+    let mut cleaned: Vec<u8> = Vec::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut in_string = false;
@@ -197,7 +205,7 @@ pub fn parse_agtype(text: &str) -> Result<Value, String> {
     while i < bytes.len() {
         let b = bytes[i];
         if in_string {
-            cleaned.push(b as char);
+            cleaned.push(b);
             if escaped {
                 escaped = false;
             } else if b == b'\\' {
@@ -211,7 +219,7 @@ pub fn parse_agtype(text: &str) -> Result<Value, String> {
         match b {
             b'"' => {
                 in_string = true;
-                cleaned.push('"');
+                cleaned.push(b'"');
                 i += 1;
             }
             b':' if i + 1 < bytes.len() && bytes[i + 1] == b':' => {
@@ -222,13 +230,13 @@ pub fn parse_agtype(text: &str) -> Result<Value, String> {
                 }
             }
             _ => {
-                // Non-ASCII bytes only occur inside strings in agtype's
-                // structural layer, but push byte-faithfully regardless.
-                cleaned.push(b as char);
+                cleaned.push(b);
                 i += 1;
             }
         }
     }
+    let cleaned = String::from_utf8(cleaned)
+        .map_err(|e| format!("agtype text is not valid UTF-8 after annotation strip: {e}"))?;
     serde_json::from_str(&cleaned).map_err(|e| e.to_string())
 }
 
@@ -622,6 +630,23 @@ mod tests {
         let v = parse_agtype(r#"[1.5::numeric, "a", {"x": 2}::vertex]"#).expect("parses");
         assert_eq!(v[0], 1.5);
         assert_eq!(v[2]["x"], 2);
+    }
+
+    #[test]
+    fn non_ascii_string_values_survive_byte_faithfully() {
+        // Latin-1 `u8 as char` shredding would turn 颱風 into mojibake
+        // that STILL parses as JSON — this pins the byte-faithful path
+        // (CJK, emoji, and a combining accent, inside and outside
+        // annotated objects).
+        let text = r#"{"id": 1, "label": "城市", "properties": {"name": "颱風", "note": "café ☔"}}::vertex"#;
+        let v = parse_agtype(text).expect("parses");
+        assert_eq!(v["label"], "城市");
+        assert_eq!(v["properties"]["name"], "颱風");
+        assert_eq!(v["properties"]["note"], "café ☔");
+
+        let v = parse_agtype(r#"["中文", 1.5::numeric, "🎈"]"#).expect("parses");
+        assert_eq!(v[0], "中文");
+        assert_eq!(v[2], "🎈");
     }
 
     #[test]
