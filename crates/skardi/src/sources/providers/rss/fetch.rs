@@ -1066,6 +1066,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retryable_statuses_retry_with_http_date_retry_after() {
+        // The header's other legal form: `Retry-After: <http-date>`, which
+        // CDN-fronted origins emit routinely. Before parse_retry_after
+        // learned it, this fell to backoff (250-750ms) and the elapsed
+        // assertion below failed — the host asked for seconds and got
+        // sub-second re-hits. The date is minted per-request at now+2s;
+        // http-dates have whole-second resolution, so the effective wait is
+        // truncation-reduced to somewhere in (1s, 2s] and the assertion
+        // checks >= 1s.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let server = MockFeedServer::start(move |_req| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(2));
+                MockResponse::status(429).with_header("retry-after", &date)
+            } else {
+                MockResponse::xml("<rss/>")
+            }
+        })
+        .await;
+        let f = test_fetcher();
+        let start = Instant::now();
+        let out = f.fetch(&format!("{}/f", server.url()), None).await.unwrap();
+        assert!(matches!(out, FetchOutcome::Fetched { .. }));
+        assert_eq!(server.requests().len(), 2);
+        assert!(
+            start.elapsed() >= Duration::from_secs(1),
+            "elapsed {:?}, expected the http-date retry-after to be honored",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn retry_after_is_capped_at_max_retry_wait() {
         // A `Retry-After` naming ~11.5 days is a one-header denial of
         // service if honored literally; the fetch must still complete in

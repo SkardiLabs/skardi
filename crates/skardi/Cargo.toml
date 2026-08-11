@@ -101,6 +101,9 @@ datafusion-table-providers = { workspace = true }
 derivative = "2.2.0"
 futures = { workspace = true }
 hex = "0.4"
+# Already in the tree transitively (reqwest → hyper), promoted to a direct
+# dependency for `util::http::parse_retry_after`'s HTTP-date form.
+httpdate = "1.0"
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true }

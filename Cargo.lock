@@ -9375,6 +9375,7 @@ dependencies = [
  "gguf-rs-lib",
  "glob",
  "hex",
+ "httpdate",
  "iceberg",
  "iceberg-datafusion",
  "iceberg-storage-opendal",
