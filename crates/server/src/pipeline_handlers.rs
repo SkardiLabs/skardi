@@ -174,7 +174,7 @@ pub(crate) async fn get_table_schema(
 /// same policy as `get_table_schema`'s empty-schema fallback in
 /// [`get_data_sources`] — so one unregistered source cannot fail the whole
 /// listing.
-async fn enumerate_catalog_tables(
+pub(crate) async fn enumerate_catalog_tables(
     ctx: &SessionContext,
     source_name: &str,
     semantics: &SemanticsRegistry,
