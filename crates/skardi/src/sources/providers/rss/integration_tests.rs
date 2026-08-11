@@ -951,8 +951,17 @@ async fn limit_stops_launching_fetches() {
 /// Three slow feeds and one permit: the first is in flight when the query is
 /// aborted and the other two are still queued on the semaphore. Dropping the
 /// stream drops their futures before they are ever handed the permit, so the
-/// request count stays at one — checked after a wait long enough for both
-/// delayed responses to have completed had the fetches been launched.
+/// request count stays at one.
+///
+/// The scripted delay is pulled two ways. The mock records a request on
+/// arrival and only then sleeps, so the delay is the entire margin between
+/// `await_requests` returning and the abort landing — a scheduler stall
+/// longer than it lets feed `a` complete, release the permit, and launch
+/// `/b.xml` before the abort runs, failing the test spuriously. But the
+/// delay must also stay shorter than the post-abort observation window: a
+/// cancellation leak only becomes visible once `a`'s response arrives and
+/// the freed permit could travel to `/b.xml`, and that has to happen while
+/// the test is still watching.
 #[tokio::test]
 async fn cancellation_stops_further_fetches() {
     let news = TestNews::start(
@@ -963,9 +972,7 @@ async fn cancellation_stops_further_fetches() {
     for path in ["/a.xml", "/b.xml", "/c.xml"] {
         news.script(
             path,
-            FeedScript::always(
-                Canned::xml(&default_body(path)).with_delay(Duration::from_millis(500)),
-            ),
+            FeedScript::always(Canned::xml(&default_body(path)).with_delay(Duration::from_secs(5))),
         );
     }
 
@@ -988,7 +995,10 @@ async fn cancellation_stops_further_fetches() {
         "the task ended for some reason other than the abort"
     );
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Outlives the 5s delay: feed `a`'s response has landed by now, so had
+    // the abort leaked the queued fetches, the freed permit would already
+    // have launched `/b.xml` — and the mock records requests on arrival.
+    tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(
         news.paths().len(),
         1,
