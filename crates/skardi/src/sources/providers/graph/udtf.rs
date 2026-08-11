@@ -69,6 +69,20 @@ pub type GraphSources = Arc<RwLock<HashMap<String, Arc<GraphSourceHandle>>>>;
 /// (`datafusion-functions-json`: `json_get`, `json_get_str`, …) on a
 /// session. The getters are what make node/relationship `properties`
 /// columns queryable without leaving SQL.
+///
+/// # Example
+/// ```
+/// use std::collections::HashMap;
+/// use std::sync::{Arc, RwLock};
+/// use datafusion::prelude::SessionContext;
+/// use skardi::sources::providers::graph::udtf::{GraphSources, register_graph_udtfs};
+///
+/// let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+/// let ctx = SessionContext::new();
+/// register_graph_udtfs(&ctx, sources).unwrap();
+/// // cypher_query('kg', …) now plans; with no source registered it
+/// // fails at planning naming the (empty) roster.
+/// ```
 pub fn register_graph_udtfs(ctx: &SessionContext, sources: GraphSources) -> DFResult<()> {
     datafusion_functions_json::register_all(&mut ctx.clone())?;
     ctx.register_udtf(
@@ -82,9 +96,10 @@ pub fn register_graph_udtfs(ctx: &SessionContext, sources: GraphSources) -> DFRe
 }
 
 fn lookup(sources: &GraphSources, name: &str) -> DFResult<Arc<GraphSourceHandle>> {
-    let map = sources
-        .read()
-        .map_err(|_| DataFusionError::Internal("graph sources lock poisoned".into()))?;
+    // Poisoning degrades gracefully (AGENTS.md: the optimizer-registry /
+    // model-cache pattern) — the map holds only Arc'd handles, so a
+    // panicked writer cannot leave it half-updated in a harmful way.
+    let map = sources.read().unwrap_or_else(|p| p.into_inner());
     map.get(name).cloned().ok_or_else(|| {
         let mut known: Vec<&str> = map.keys().map(String::as_str).collect();
         known.sort_unstable();
@@ -239,7 +254,7 @@ impl TableProvider for CypherQueryProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(GraphScanExec::new(
             GraphScanKind::Cypher {
@@ -247,6 +262,10 @@ impl TableProvider for CypherQueryProvider {
                 cypher: self.cypher.clone(),
                 params: self.params.clone(),
                 columns: Arc::clone(&self.columns),
+                // LIMIT pushes to the CONSUMPTION side: the client stops
+                // reading the backend stream after this many rows instead
+                // of pulling max_rows and letting DataFusion truncate.
+                limit,
             },
             self.schema(),
             projection.cloned(),
@@ -326,6 +345,7 @@ enum GraphScanKind {
         cypher: String,
         params: Value,
         columns: Arc<Vec<DeclaredColumn>>,
+        limit: Option<usize>,
     },
     Labels {
         handle: Arc<GraphSourceHandle>,
@@ -366,7 +386,12 @@ impl GraphScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected)),
             Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
+            // Final, honestly: the milestone-1 client buffers the whole
+            // result before the first batch is emitted (the repo's
+            // buffering scans — postgres/mysql/mongo/sqlite — all declare
+            // Final; Incremental is for genuinely streaming plans, and
+            // the optimizer takes the declaration at its word).
+            EmissionType::Final,
             Boundedness::Bounded,
         );
         // `schema` itself is not stored: the projected schema lives in
@@ -442,11 +467,13 @@ impl ExecutionPlan for GraphScanExec {
                 cypher,
                 params,
                 columns,
+                limit,
             } => cypher_batches(
                 Arc::clone(handle),
                 cypher.clone(),
                 params.clone(),
                 Arc::clone(columns),
+                *limit,
             ),
             GraphScanKind::Labels { handle } => labels_batch(Arc::clone(handle)),
         };
@@ -473,11 +500,12 @@ fn cypher_batches(
     cypher: String,
     params: Value,
     columns: Arc<Vec<DeclaredColumn>>,
+    limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
         let rows = handle
             .client
-            .execute(&cypher, &params, columns.len(), handle.bounds)
+            .execute(&cypher, &params, columns.len(), handle.bounds, limit)
             .await
             .map_err(execution_error)?
             .try_collect::<Vec<_>>()
@@ -549,8 +577,13 @@ mod tests {
             _params: &Value,
             _arity: usize,
             _bounds: QueryBounds,
+            limit: Option<usize>,
         ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
-            Ok(stream::iter(self.rows.clone().into_iter().map(Ok)).boxed())
+            let mut rows = self.rows.clone();
+            if let Some(l) = limit {
+                rows.truncate(l);
+            }
+            Ok(stream::iter(rows.into_iter().map(Ok)).boxed())
         }
 
         async fn labels(&self, _bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError> {
@@ -663,6 +696,26 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unknown type 'Utf8'"), "{msg}");
         assert!(msg.contains("node, relationship, path"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn sql_limit_pushes_to_the_consumption_side() {
+        // LIMIT reaches the client as a consumption bound (the mock
+        // truncates, standing in for the AGE client's early stop) — the
+        // scan does not pull max_rows and let DataFusion discard.
+        let ctx = ctx_with(vec![
+            vec![serde_json::json!("a")],
+            vec![serde_json::json!("b")],
+            vec![serde_json::json!("c")],
+        ])
+        .await;
+        let batches = collect(
+            &ctx,
+            "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', '{}', \
+             '{\"name\": \"string\"}') LIMIT 1",
+        )
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
     #[tokio::test]

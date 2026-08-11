@@ -321,6 +321,7 @@ async fn the_backend_read_only_transaction_is_the_boundary() {
             &serde_json::json!({}),
             1,
             handle.bounds,
+            None,
         )
         .await;
     let err = match result {
@@ -417,6 +418,17 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     assert!(msg.contains("max_rows = 1"), "{msg}");
     assert!(msg.contains("LIMIT"), "the fix is named: {msg}");
 
+    // …and taking the error message's own advice works: a SQL LIMIT at
+    // the cap consumes exactly that many rows and stops CLEANLY — the
+    // limit is pushed to the consumption side, it never trips the cap.
+    let batches = collect(
+        &capped,
+        "SELECT name FROM cypher_query('capped', \
+         'MATCH (p:Person) RETURN p.name', '{}', '{\"name\": \"string\"}') LIMIT 1",
+    )
+    .await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
     // Leak regression: hammer the capped (error) path well past the
     // pool size — parameterized, so each call PREPAREs — then sweep the
     // SAME pool's sessions for leftover skq_p_* statements
@@ -424,7 +436,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // the very sessions execute used; hence the direct AgeClient and its
     // test-only pool hook). Before the fix each error path left one
     // behind, monotonically.
-    let client = AgeClient::connect("leakcheck", &url, &graph, None, None)
+    let client = AgeClient::connect("leakcheck", &url, &graph, None, None, 4)
         .await
         .expect("connects");
     let tight = QueryBounds {
@@ -438,6 +450,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
                 &serde_json::json!({"x": "nobody"}),
                 1,
                 tight,
+                None,
             )
             .await
             .err()

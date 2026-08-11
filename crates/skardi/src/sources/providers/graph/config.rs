@@ -10,6 +10,8 @@ use super::error::GraphError;
 pub const DEFAULT_QUERY_TIMEOUT_SECONDS: u64 = 30;
 /// Default per-query row cap.
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
+/// Default connection-pool size.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 4;
 
 /// The `graph:` block of a `type: graph` data source.
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +36,9 @@ pub struct GraphConfig {
     /// never a silent truncation.
     #[serde(default = "default_max_rows")]
     pub max_rows: usize,
+    /// Connection-pool size against the backend.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
 }
 
 fn default_timeout() -> u64 {
@@ -42,6 +47,10 @@ fn default_timeout() -> u64 {
 
 fn default_max_rows() -> usize {
     DEFAULT_MAX_ROWS
+}
+
+fn default_max_connections() -> u32 {
+    DEFAULT_MAX_CONNECTIONS
 }
 
 impl GraphConfig {
@@ -114,6 +123,12 @@ impl GraphConfig {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
                 reason: "query_timeout_seconds must be positive".to_string(),
+            });
+        }
+        if self.max_connections == 0 {
+            return Err(GraphError::InvalidConfig {
+                name: name.to_string(),
+                reason: "max_connections must be positive".to_string(),
             });
         }
         Ok(())

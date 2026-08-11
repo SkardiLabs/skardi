@@ -51,6 +51,30 @@ pub use udtf::register_graph_udtfs;
 /// # Errors
 /// [`GraphError::InvalidConfig`] for validation failures;
 /// [`GraphError::Backend`] when the backend refuses the connection.
+///
+/// # Example
+/// ```no_run
+/// use std::collections::HashMap;
+/// use std::sync::{Arc, RwLock};
+/// use skardi::sources::providers::graph::config::GraphConfig;
+/// use skardi::sources::providers::graph::udtf::GraphSources;
+/// use skardi::sources::providers::graph::register_graph_source;
+///
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+/// let config: GraphConfig =
+///     serde_yaml::from_str("backend: age\ngraph_name: knowledge\n")?;
+/// register_graph_source(
+///     &sources,
+///     "kg",
+///     "postgres://localhost:5432/graphrag",
+///     &config,
+/// )
+/// .await?;
+/// // cypher_query('kg', …) and graph_schema('kg') now resolve.
+/// # Ok(())
+/// # }
+/// ```
 pub async fn register_graph_source(
     sources: &GraphSources,
     name: &str,
@@ -64,6 +88,7 @@ pub async fn register_graph_source(
         &config.graph_name,
         config.username_env.as_deref(),
         config.password_env.as_deref(),
+        config.max_connections,
     )
     .await?;
     let handle = Arc::new(GraphSourceHandle {
@@ -73,10 +98,10 @@ pub async fn register_graph_source(
             max_rows: config.max_rows,
         },
     });
-    let mut map = sources.write().map_err(|_| GraphError::InvalidConfig {
-        name: name.to_string(),
-        reason: "graph sources lock poisoned".to_string(),
-    })?;
+    // Poisoning degrades gracefully (AGENTS.md convention) — and it also
+    // keeps InvalidConfig meaning what it says instead of moonlighting as
+    // a lock error.
+    let mut map = sources.write().unwrap_or_else(|p| p.into_inner());
     if map.insert(name.to_string(), handle).is_some() {
         return Err(GraphError::InvalidConfig {
             name: name.to_string(),

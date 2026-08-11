@@ -46,18 +46,62 @@ pub type GraphRowStream = BoxStream<'static, Result<GraphRow, GraphError>>;
 
 /// What a backend must provide. Hides AGE (Postgres wire) vs Neo4j Bolt
 /// vs Kuzu details behind one seam.
+///
+/// # Example
+/// ```
+/// use async_trait::async_trait;
+/// use futures::StreamExt;
+/// use serde_json::Value;
+/// use skardi::sources::providers::graph::client::{
+///     GraphClient, GraphRowStream, QueryBounds,
+/// };
+/// use skardi::sources::providers::graph::error::GraphError;
+///
+/// /// A canned backend, the shape tests use.
+/// #[derive(Debug)]
+/// struct Fixed(Vec<Vec<Value>>);
+///
+/// #[async_trait]
+/// impl GraphClient for Fixed {
+///     async fn execute(
+///         &self,
+///         _cypher: &str,
+///         _params: &Value,
+///         _arity: usize,
+///         _bounds: QueryBounds,
+///         limit: Option<usize>,
+///     ) -> Result<GraphRowStream, GraphError> {
+///         let mut rows = self.0.clone();
+///         if let Some(l) = limit {
+///             rows.truncate(l);
+///         }
+///         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
+///     }
+///
+///     async fn labels(
+///         &self,
+///         _bounds: QueryBounds,
+///     ) -> Result<Vec<(String, String)>, GraphError> {
+///         Ok(vec![("Person".into(), "vertex".into())])
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait GraphClient: Send + Sync + std::fmt::Debug {
     /// Run read-only Cypher inside a backend-enforced read transaction,
     /// bounded by `bounds`. `arity` is the declared column count — AGE's
     /// `cypher()` call must declare its result arity, which is why the
-    /// declared-columns mode is required on this backend.
+    /// declared-columns mode is required on this backend. `limit` is a
+    /// SQL LIMIT pushed to the CONSUMPTION side: the client stops reading
+    /// after that many rows (a clean early stop, not an error — the row
+    /// cap stays the loud overflow signal for uncapped scans).
     async fn execute(
         &self,
         cypher: &str,
         params: &Value,
         arity: usize,
         bounds: QueryBounds,
+        limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError>;
 
     /// Label roster for `graph_schema`: one `(label, kind)` row per
@@ -89,6 +133,7 @@ impl AgeClient {
         graph_name: &str,
         username_env: Option<&str>,
         password_env: Option<&str>,
+        max_connections: u32,
     ) -> Result<Self, GraphError> {
         let mut options: PgConnectOptions =
             connection_string
@@ -106,7 +151,7 @@ impl AgeClient {
             options = options.password(&pass);
         }
         let pool = PgPoolOptions::new()
-            .max_connections(4)
+            .max_connections(max_connections)
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // Per-connection, not per-query: LOAD is connection
@@ -205,6 +250,7 @@ impl GraphClient for AgeClient {
         params: &Value,
         arity: usize,
         bounds: QueryBounds,
+        limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError> {
         let (sql, prepared) = self.build_sql(cypher, params, arity);
         let source = self.source_name.clone();
@@ -242,6 +288,11 @@ impl GraphClient for AgeClient {
                     let step = step.map_err(|e| map_query_error(&source, bounds, &e))?;
                     // PREPARE contributes a rowless result; only rows count.
                     let Either::Right(row) = step else { continue };
+                    // A SQL LIMIT is a clean early stop — enough rows is
+                    // success, unlike the cap below.
+                    if limit.is_some_and(|l| rows.len() >= l) {
+                        break;
+                    }
                     if rows.len() >= bounds.max_rows {
                         return Err(GraphError::RowCapExceeded {
                             max_rows: bounds.max_rows,
