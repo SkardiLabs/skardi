@@ -379,6 +379,30 @@ fn read_scalar_usize(udf: &str, arg: &ColumnarValue, name: &str) -> DfResult<usi
     Ok(n as usize)
 }
 
+/// Pre-flight for LargeUtf8 COLUMNS: chunk output flows through
+/// i32-offset builders (`StringBuilder`), whose offset overflow is a
+/// PANIC in arrow, not an error — and LargeUtf8 is the one layout whose
+/// contract makes >2 GiB legal input. Chunk output ≈ input bytes (more
+/// with overlap), so reject early with a real error instead of
+/// unwinding mid-batch. (A near-2 GiB Utf8 column plus overlap can
+/// still overflow — that exposure predates LargeUtf8 support and is
+/// shared with every i32-offset producer.) Offsets first-to-last, so a
+/// SLICED array counts its own bytes, not the whole buffer's. A free
+/// function over raw offsets so the boundary is unit-testable without a
+/// 2 GiB allocation.
+fn ensure_large_text_fits_i32(udf: &str, name: &str, offsets: &[i64]) -> DfResult<()> {
+    let total_bytes =
+        offsets.last().copied().unwrap_or_default() - offsets.first().copied().unwrap_or_default();
+    if total_bytes > i64::from(i32::MAX) {
+        return Err(DataFusionError::Execution(format!(
+            "{udf}: '{name}' carries more than 2 GiB of text in one batch; \
+             chunk output is built as 32-bit-offset Utf8 and cannot hold it — \
+             split the input into smaller batches"
+        )));
+    }
+    Ok(())
+}
+
 fn read_text_column<'a>(
     udf: &str,
     arg: &'a ColumnarValue,
@@ -399,32 +423,7 @@ fn read_text_column<'a>(
                 return Ok(view_arr.iter().collect());
             }
             if let Some(large_arr) = arr.as_any().downcast_ref::<LargeStringArray>() {
-                // Pre-flight: chunk output flows through i32-offset
-                // builders (`StringBuilder`), whose offset overflow is a
-                // PANIC in arrow, not an error — and LargeUtf8 is the one
-                // layout whose contract makes >2 GiB legal input. Chunk
-                // output ≈ input bytes (more with overlap), so reject
-                // early with a real error instead of unwinding mid-batch.
-                // (A near-2 GiB Utf8 column plus overlap can still
-                // overflow — that exposure predates LargeUtf8 support and
-                // is shared with every i32-offset producer.)
-                let total_bytes = large_arr
-                    .value_offsets()
-                    .last()
-                    .copied()
-                    .unwrap_or_default()
-                    - large_arr
-                        .value_offsets()
-                        .first()
-                        .copied()
-                        .unwrap_or_default();
-                if total_bytes > i64::from(i32::MAX) {
-                    return Err(DataFusionError::Execution(format!(
-                        "{udf}: '{name}' carries more than 2 GiB of text in one batch; \
-                         chunk output is built as 32-bit-offset Utf8 and cannot hold it — \
-                         split the input into smaller batches"
-                    )));
-                }
+                ensure_large_text_fits_i32(udf, name, large_arr.value_offsets())?;
                 return Ok(large_arr.iter().collect());
             }
             let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
@@ -664,6 +663,119 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(list_at(list, 0).len() >= 3);
         assert!(list.is_null(1), "null in → null out");
+    }
+
+    #[test]
+    fn utf8view_text_columns_and_scalars_chunk_like_utf8() {
+        // The view arm (DataFusion 52 carries computed string expressions
+        // as view arrays/scalars) — column with a null, then the scalar.
+        let texts = StringViewArray::from(vec![Some("a".repeat(250)), None]);
+        let result = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(texts)),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap();
+        let arr = match result {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(list_at(list, 0).len() >= 3);
+        assert!(list.is_null(1), "null in → null out");
+
+        // LargeUtf8 and Utf8View SCALARS: a literal must never be
+        // stricter than a column.
+        for scalar in [
+            ScalarValue::LargeUtf8(Some("b".repeat(150))),
+            ScalarValue::Utf8View(Some("b".repeat(150))),
+        ] {
+            let result = udf()
+                .invoke_with_args(make_args(vec![
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                    ColumnarValue::Scalar(scalar),
+                    ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+                ]))
+                .unwrap();
+            let arr = match result {
+                ColumnarValue::Array(a) => a,
+                _ => panic!("expected array"),
+            };
+            let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(list_at(list, 0).len(), 2);
+        }
+
+        // Typed NULL scalars of every string layout → a NULL list row.
+        for scalar in [
+            ScalarValue::Utf8(None),
+            ScalarValue::LargeUtf8(None),
+            ScalarValue::Utf8View(None),
+        ] {
+            let result = udf()
+                .invoke_with_args(make_args(vec![
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                    ColumnarValue::Scalar(scalar),
+                    ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+                ]))
+                .unwrap();
+            let arr = match result {
+                ColumnarValue::Array(a) => a,
+                _ => panic!("expected array"),
+            };
+            let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+            assert!(list.is_null(0), "typed NULL text → NULL list");
+        }
+    }
+
+    #[test]
+    fn non_string_text_arguments_name_the_accepted_layouts() {
+        // Column of the wrong type → the array-arm diagnostic.
+        let err = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(arrow::array::Int64Array::from(vec![1, 2]))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be a string column (Utf8, LargeUtf8, or Utf8View)"),
+            "{err}"
+        );
+
+        // Scalar of the wrong type → the scalar-arm diagnostic.
+        let err = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(7))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be a string (Utf8, LargeUtf8, or Utf8View)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_two_gib_preflight_boundary_is_exact() {
+        // Raw offsets, so the boundary is pinned without a 2 GiB
+        // allocation: exactly i32::MAX passes, one past fails, and a
+        // SLICED array (non-zero first offset) counts its own bytes.
+        let max = i64::from(i32::MAX);
+        assert!(ensure_large_text_fits_i32("chunk", "text", &[0, max]).is_ok());
+        let err = ensure_large_text_fits_i32("chunk", "text", &[0, max + 1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 2 GiB"), "{err}");
+        assert!(err.contains("split the input"), "the fix is named: {err}");
+        // Slice: 10 bytes into a huge buffer — the slice's own span is
+        // what counts.
+        assert!(ensure_large_text_fits_i32("chunk", "text", &[max, max + 10]).is_ok());
+        // Empty offsets: nothing to overflow.
+        assert!(ensure_large_text_fits_i32("chunk", "text", &[]).is_ok());
     }
 
     #[test]
