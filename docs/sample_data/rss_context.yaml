@@ -1,16 +1,19 @@
 # Example context for the RSS/Atom data source (`type: rss`).
 # Reference: docs/rss.md
 #
-# Try it — registration performs no network I/O and `feeds` is a pure state
-# read, so this works offline and fetches nothing:
+# Try it — only the server needs the feature; the CLI is a thin HTTP client:
 #
-#   cargo run -p skardi-cli --features rss -- \
-#     query --ctx docs/sample_data/rss_context.yaml \
-#     --sql "SELECT name, last_status FROM news.main.feeds"
+#   cargo run -p skardi-server --features rss -- --ctx docs/sample_data/rss_context.yaml
 #
-# Every row comes back `never`: no `items` scan has run, so no feed has been
-# attempted. The hosts below are under the reserved `.invalid` TLD and are
-# deliberately unresolvable — swap in real feed URLs before scanning `items`.
+# then, in another terminal:
+#
+#   cargo run -p skardi-cli -- query -e "SELECT name, last_status FROM news.main.feeds"
+#
+# Registration performs no network I/O and `feeds` is a pure state read, so
+# the query fetches nothing. Every row comes back `never`: no `items` scan has
+# run, so no feed has been attempted. The hosts below are under the reserved
+# `.invalid` TLD and are deliberately unresolvable — swap in real feed URLs
+# before scanning `items`.
 
 kind: context
 
