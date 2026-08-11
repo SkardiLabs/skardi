@@ -53,7 +53,8 @@ use url::Url;
 
 use super::config::{OpenConnectorConfig, validate_action_id};
 use super::error::OpenConnectorError;
-use crate::util::http::parse_retry_after;
+use crate::util::http::{clock_jitter_nanos, parse_retry_after};
+use crate::util::text::truncate_chars;
 
 /// Health endpoint path (relative to the gateway base URL).
 const HEALTH_PATH: &str = "v1/health";
@@ -691,22 +692,20 @@ fn terminal_reason(status: StatusCode, body: &str) -> String {
     {
         return format!("HTTP {}: {}", status.as_u16(), envelope.failure_reason());
     }
-    let trimmed: String = body.chars().take(MAX_BODY).collect();
+    let trimmed = truncate_chars(body, MAX_BODY);
     format!("HTTP {}: {}", status.as_u16(), trimmed)
 }
 
 /// Exponential backoff with time-derived jitter: `200ms * 2^(attempt-1)`
 /// plus up to 100ms of jitter, capped at [`MAX_RETRY_WAIT`]. Jitter comes
-/// from the system clock's sub-second nanoseconds — good enough for retry
-/// decorrelation without a randomness dependency.
+/// from the crate's shared [`clock_jitter_nanos`] — good enough for retry
+/// decorrelation without a randomness dependency. The flat 0-100ms addition
+/// is this client's own shape; the rss fetcher spreads the same source
+/// ±50%, per its spec.
 fn backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(5);
     let base = BACKOFF_BASE.saturating_mul(1 << shift);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let jitter = Duration::from_millis(u64::from(nanos % 100));
+    let jitter = Duration::from_millis(clock_jitter_nanos() % 100);
     base.saturating_add(jitter).min(MAX_RETRY_WAIT)
 }
 
@@ -1027,7 +1026,7 @@ mod tests {
         // An 8 KiB error page must not be buffered whole for a 512-char
         // message; the reason stays tightly bounded.
         let big = "e".repeat(8 * 1024);
-        let gateway = MockGateway::start(move |_| MockResponse::new(400, &big)).await;
+        let gateway = MockGateway::start(move |_| MockResponse::new(400, big.clone())).await;
         let err = test_client(&gateway, 3)
             .execute("github.x", &serde_json::json!({}), None)
             .await
@@ -1241,7 +1240,7 @@ mod tests {
         let gateway = MockGateway::start(|_| {
             MockResponse::new(
                 400,
-                &envelope_err(
+                envelope_err(
                     "invalid_input",
                     "Action input does not match the action schema.",
                 ),

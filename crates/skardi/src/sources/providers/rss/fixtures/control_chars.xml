@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- XML 1.0 forbids these C0 control characters outright: the item title
+     carries a 0x08 (backspace) and the channel description a 0x1F. -->
+<rss version="2.0">
+  <channel>
+    <title>Control Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>A channel description.</description>
+    <item>
+      <guid>tag:corpus.example,2026:ctrl-1</guid>
+      <title>Interrupted title</title>
+      <link>https://corpus.example/ctrl/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+      <description>Bodywith a vertical tab.</description>
+    </item>
+  </channel>
+</rss>

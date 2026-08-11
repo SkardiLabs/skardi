@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Truncated mid-tag: the document ends inside the second item's start tag,
+     so the XML reader hits EOF with a tag still open. -->
+<rss version="2.0">
+  <channel>
+    <title>Truncated Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>A document cut off mid-tag.</description>
+    <item>
+      <guid>tag:corpus.example,2026:trunc-1</guid>
+      <title>Complete item</title>
+      <link>https://corpus.example/trunc/1</link>
+    </item>
+    <item>
+      <guid>tag:corpus.example,2026:trunc-2</guid>
+      <title>Cut off here</tit

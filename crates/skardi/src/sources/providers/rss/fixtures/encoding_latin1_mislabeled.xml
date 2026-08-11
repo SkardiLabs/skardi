@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The declaration claims UTF-8, but the bytes are Latin-1: the title's
+     "e-acute" is the single byte 0xE9, which is not valid UTF-8. -->
+<rss version="2.0">
+  <channel>
+    <title>Café Corpus</title>
+    <link>https://corpus.example/</link>
+    <description>Une lettre accentuée mal étiquetée.</description>
+    <item>
+      <guid>tag:corpus.example,2026:latin1-1</guid>
+      <title>Café au lait</title>
+      <link>https://corpus.example/latin1/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+      <description>Résumé en latin-1.</description>
+    </item>
+  </channel>
+</rss>

@@ -17,8 +17,8 @@ use serde_json::Value;
 use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 
-use crate::config::{DataSource, DataSourceType};
-use crate::pipeline_handlers::get_table_schema;
+use crate::config::{DataSource, DataSourceType, HierarchyLevel};
+use crate::pipeline_handlers::{FieldInfo, enumerate_catalog_tables, get_table_schema};
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
 
@@ -158,12 +158,7 @@ const SEMANTICS_CARD_TEMPLATE: &str = r#"<article class="semantics-card">
         <span class="source-type">{{TYPE}}</span>
     </header>
     {{DESCRIPTION_BLOCK}}
-    <div class="columns-section">
-        <h3>Columns</h3>
-        <div class="columns-table">
-            {{COLUMNS}}
-        </div>
-    </div>
+    {{TABLES}}
 </article>"#;
 
 const JOBS_DISABLED_EMPTY: &str = r#"<div class="empty-state">
@@ -310,12 +305,64 @@ fn data_source_type_str(t: &DataSourceType) -> &'static str {
     t.as_str()
 }
 
+/// Render the rows of one `columns-table`. An empty field list renders the
+/// same "Schema not available." row the failed-lookup path shows.
+fn render_col_rows(fields: &[FieldInfo]) -> String {
+    if fields.is_empty() {
+        return r#"<div class="col-row"><span class="col-name no-desc">Schema not available.</span></div>"#.to_string();
+    }
+    fields
+        .iter()
+        .map(|f| {
+            let desc_html = match f.description.as_deref() {
+                Some(d) => format!(r#"<div class="col-description">{}</div>"#, escape_html(d)),
+                None => {
+                    r#"<div class="col-description no-desc">No description.</div>"#.to_string()
+                }
+            };
+            format!(
+                r#"<div class="col-row"><span class="col-name">{}</span><span class="col-type">{}</span>{}</div>"#,
+                escape_html(&f.name),
+                escape_html(&f.r#type),
+                desc_html
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render one `columns-section`: a heading, an optional description block,
+/// and the pre-rendered column rows.
+fn render_columns_section(title: &str, description: Option<&str>, rows: &str) -> String {
+    let desc_html = description
+        .map(|d| {
+            format!(
+                r#"<div class="source-description">{}</div>"#,
+                escape_html(d)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<div class="columns-section">
+        <h3>{}</h3>
+        {}
+        <div class="columns-table">
+            {}
+        </div>
+    </div>"#,
+        escape_html(title),
+        desc_html,
+        rows
+    )
+}
+
 async fn render_semantics_card(
     ds: &DataSource,
     semantics: &SemanticsRegistry,
     session_ctx: &datafusion::prelude::SessionContext,
 ) -> String {
-    let description_block = match semantics.table_description(&ds.name) {
+    let source_description = semantics.table_description(&ds.name);
+    let description_block = match source_description {
         Some(desc) => format!(
             r#"<div class="source-description">{}</div>"#,
             escape_html(desc)
@@ -325,36 +372,43 @@ async fn render_semantics_card(
         }
     };
 
-    let columns_html = match get_table_schema(session_ctx, &ds.name, semantics).await {
-        Ok(fields) if !fields.is_empty() => fields
-            .iter()
-            .map(|f| {
-                let desc_html = match f.description.as_deref() {
-                    Some(d) => format!(
-                        r#"<div class="col-description">{}</div>"#,
-                        escape_html(d)
-                    ),
-                    None => r#"<div class="col-description no-desc">No description.</div>"#
-                        .to_string(),
-                };
-                format!(
-                    r#"<div class="col-row"><span class="col-name">{}</span><span class="col-type">{}</span>{}</div>"#,
-                    escape_html(&f.name),
-                    escape_html(&f.r#type),
-                    desc_html
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Ok(_) => r#"<div class="col-row"><span class="col-name no-desc">Schema not available.</span></div>"#.to_string(),
-        Err(_) => r#"<div class="col-row"><span class="col-name no-desc">Schema not available.</span></div>"#.to_string(),
+    // Catalog-mode sources render one section per inner table — heading is
+    // the fully-qualified `FROM`-usable name, with the table's own overlay
+    // description — mirroring what `GET /data_source` reports. Table-mode
+    // sources keep the single "Columns" section.
+    let tables_html = if ds.hierarchy_level == HierarchyLevel::Catalog {
+        let tables = enumerate_catalog_tables(session_ctx, &ds.name, semantics).await;
+        if tables.is_empty() {
+            render_columns_section("Tables", None, &render_col_rows(&[]))
+        } else {
+            tables
+                .iter()
+                .map(|t| {
+                    // The registry falls back to the source-level entry for
+                    // tables without a qualified overlay; skip repeating the
+                    // paragraph the card already shows at the top.
+                    let table_description = t
+                        .description
+                        .as_deref()
+                        .filter(|d| Some(*d) != source_description);
+                    render_columns_section(&t.name, table_description, &render_col_rows(&t.schema))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    } else {
+        let rows = match get_table_schema(session_ctx, &ds.name, semantics).await {
+            Ok(fields) => render_col_rows(&fields),
+            Err(_) => render_col_rows(&[]),
+        };
+        render_columns_section("Columns", None, &rows)
     };
 
     SEMANTICS_CARD_TEMPLATE
         .replace("{{NAME}}", &escape_html(&ds.name))
         .replace("{{TYPE}}", data_source_type_str(&ds.source_type))
         .replace("{{DESCRIPTION_BLOCK}}", &description_block)
-        .replace("{{COLUMNS}}", &columns_html)
+        .replace("{{TABLES}}", &tables_html)
 }
 
 /// Serve the dashboard UI - GET /
@@ -459,5 +513,77 @@ mod tests {
             data_source_type_str(&DataSourceType::OpenConnector),
             "open_connector"
         );
+    }
+
+    /// A catalog-mode source's card must render one section per inner
+    /// table with the qualified overlay merged — not the pre-fix "Schema
+    /// not available." that came from looking the source name up under
+    /// `datafusion.public`. Uses a hand-built in-memory catalog so the
+    /// test stays independent of any provider feature flag.
+    #[tokio::test]
+    async fn semantics_card_enumerates_catalog_source_tables() {
+        use datafusion::catalog::{
+            CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+        };
+        use datafusion::datasource::MemTable;
+        use std::sync::Arc;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
+        let schema_provider = Arc::new(MemorySchemaProvider::new());
+        schema_provider
+            .register_table("orders".to_string(), Arc::new(table))
+            .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog.register_schema("main", schema_provider).unwrap();
+        let session_ctx = datafusion::prelude::SessionContext::new();
+        let _ = session_ctx.register_catalog("shop", catalog);
+
+        let overlay_dir = tempfile::TempDir::new().unwrap();
+        let overlay_path = overlay_dir.path().join("semantics.yaml");
+        std::fs::write(
+            &overlay_path,
+            r#"kind: semantics
+metadata:
+  name: shop-semantics
+  version: 1.0.0
+spec:
+  sources:
+    - name: shop.main.orders
+      description: "One row per order."
+      columns:
+        - name: id
+          description: "Order id."
+"#,
+        )
+        .unwrap();
+        let semantics = crate::semantics::SemanticsRegistry::build(
+            Some(&overlay_path),
+            &[("shop".to_string(), None)],
+        )
+        .unwrap();
+
+        let ds = DataSource {
+            name: "shop".to_string(),
+            source_type: DataSourceType::OpenConnector,
+            path: std::path::PathBuf::new(),
+            connection_string: None,
+            schema: None,
+            options: None,
+            hierarchy_level: HierarchyLevel::Catalog,
+            access_mode: skardi::sources::AccessMode::ReadOnly,
+            enable_cache: false,
+            description: None,
+            open_connector: None,
+            rss: None,
+        };
+
+        let html = render_semantics_card(&ds, &semantics, &session_ctx).await;
+        assert!(html.contains("<h3>shop.main.orders</h3>"), "got {html}");
+        assert!(html.contains("One row per order."), "got {html}");
+        assert!(html.contains("Order id."), "got {html}");
+        assert!(!html.contains("Schema not available."), "got {html}");
     }
 }

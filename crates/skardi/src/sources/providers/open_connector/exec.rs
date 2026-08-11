@@ -494,7 +494,7 @@ impl ScanState {
             && !code.is_null()
         {
             let code = match code.as_str() {
-                Some(text) => text.chars().take(128).collect(),
+                Some(text) => crate::util::text::truncate_chars(text, 128),
                 None => format!(
                     "<{}>",
                     crate::sources::providers::open_connector::row_path::json_kind(code)

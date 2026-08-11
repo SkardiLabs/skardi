@@ -771,7 +771,7 @@ bindings:
             if req.method == "POST" && req.path == "/v1/actions/slack.list_conversations" {
                 return MockResponse::new(
                     502,
-                    &envelope_err("provider_error", "slack error: missing_scope"),
+                    envelope_err("provider_error", "slack error: missing_scope"),
                 );
             }
             MockResponse::new(404, "{}")
@@ -1087,7 +1087,7 @@ bindings:
                         {"userId": "U0003", "username": "grace", "isBot": false}
                     ], "nextCursor": null}),
                     Some(other) => {
-                        return MockResponse::new(400, &format!("unexpected cursor {other}"));
+                        return MockResponse::new(400, format!("unexpected cursor {other}"));
                     }
                 };
                 return MockResponse::ok(&envelope_ok(&page.to_string()));
