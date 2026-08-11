@@ -714,7 +714,8 @@ impl ScalarUDFImpl for LlmExtractUDF {
     }
 
     /// The real return-type hook. `json_schema` (arg 2) is already required to
-    /// be a string literal (see [`extract_string_literal`]), so its *value* is
+    /// be a string literal (see `extract_string_literal` — private, hence
+    /// named but not linked), so its *value* is
     /// available here via `scalar_arguments` — mirroring how DataFusion's own
     /// `arrow_cast(x, 'Int16')` picks a return type from a literal argument's
     /// value rather than its type. We parse the schema's `properties` into
