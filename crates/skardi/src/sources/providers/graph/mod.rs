@@ -103,13 +103,21 @@ pub async fn register_graph_source(
     });
     // Poisoning degrades gracefully (AGENTS.md convention) — and it also
     // keeps InvalidConfig meaning what it says instead of moonlighting as
-    // a lock error.
+    // a lock error. Entry-based: a duplicate name must leave the ORIGINAL
+    // handle untouched — insert-then-check would replace the live
+    // connection and then report failure, leaving queries silently
+    // routed to the new one.
     let mut map = sources.write().unwrap_or_else(|p| p.into_inner());
-    if map.insert(name.to_string(), handle).is_some() {
-        return Err(GraphError::InvalidConfig {
+    match map.entry(name.to_string()) {
+        std::collections::hash_map::Entry::Occupied(_) => Err(GraphError::InvalidConfig {
             name: name.to_string(),
-            reason: "a graph source with this name is already registered".to_string(),
-        });
+            reason: "a graph source with this name is already registered \
+                     (the existing connection is unchanged)"
+                .to_string(),
+        }),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(handle);
+            Ok(())
+        }
     }
-    Ok(())
 }

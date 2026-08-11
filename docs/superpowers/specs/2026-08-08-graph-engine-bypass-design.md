@@ -262,8 +262,20 @@ There is no schema probe anywhere in the design: planning performs no network I/
   fixed, engine-authored introspection queries (`db.schema.*`,
   `ag_catalog` reads) that never pass through it, so rejecting `CALL`
   does not self-block discovery.
-- **Parameterized queries only:** parameters are bound by the driver,
-  never interpolated into the string.
+- **Parameterized queries, with the AGE exception recorded.** On Neo4j
+  and Kuzu, parameters are bound by the driver and never interpolated.
+  AGE cannot take that road: its `cypher()` function needs its arguments
+  resolvable at parse analysis, so the milestone-1 client renders the
+  params object as ONE serde_json-encoded SQL string literal cast to
+  `agtype` inside a `PREPARE ...; EXECUTE ...;` batch. The invariant
+  that replaces driver binding: values are encoded by serde_json (so
+  quotes, backslashes, and control characters cannot break out of the
+  JSON string), and the resulting literal is single-quote-doubled as a
+  whole — the same injection boundary the etl generator's `json_pack`
+  leans on. The caller's Cypher itself rides a dollar-quoted string
+  whose tag is chosen to not occur in the text. Hostile-looking
+  parameter values (apostrophes, backslashes, SQL fragments) are pinned
+  by live tests.
 - **Connection URLs are operator trust, not query trust.** The URL comes
   from context YAML — the same trust tier as a Postgres connection string
   in the same file — and the UDTF only ever accepts a registered

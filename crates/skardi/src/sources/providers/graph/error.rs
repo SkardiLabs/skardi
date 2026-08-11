@@ -94,6 +94,19 @@ pub enum GraphError {
         message: String,
     },
 
+    /// A backend row carried a different column count than the declared
+    /// schema — driver drift, surfaced as a typed error instead of an
+    /// index panic.
+    #[error(
+        "graph result row {row} carries {found} columns but {expected} were declared — \
+         the backend and the declared schema disagree"
+    )]
+    RowArityMismatch {
+        row: usize,
+        expected: usize,
+        found: usize,
+    },
+
     /// A response cell was not parseable agtype/JSON. Carries position
     /// only.
     #[error(

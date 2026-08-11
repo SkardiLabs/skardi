@@ -8,6 +8,10 @@ use super::error::GraphError;
 
 /// Default per-query timeout (design §Security and operational bounds).
 pub const DEFAULT_QUERY_TIMEOUT_SECONDS: u64 = 30;
+/// Upper bound on the configurable timeout: one day. Keeps the value
+/// well inside Postgres's statement_timeout range (int4 milliseconds)
+/// and makes the client-side `+5s` wrap arithmetic trivially safe.
+pub const MAX_QUERY_TIMEOUT_SECONDS: u64 = 86_400;
 /// Default per-query row cap.
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
 /// Default connection-pool size.
@@ -80,6 +84,34 @@ impl GraphConfig {
                     .to_string(),
             });
         }
+        // Credentials travel as env-var NAMES only (username_env /
+        // password_env) — a password embedded in the URL would sit in
+        // config repos, deploy logs, and diagnostics. Parsed, not
+        // substring-matched, so `:` in a database name cannot
+        // false-positive. The error never echoes the URL (it may carry
+        // the very secret being rejected).
+        if let Ok(parsed) = url::Url::parse(connection_string) {
+            if parsed.password().is_some() {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: "connection_string must not embed a password — set \
+                             password_env to the NAME of an environment variable \
+                             instead"
+                        .to_string(),
+                });
+            }
+            if parsed
+                .query_pairs()
+                .any(|(k, _)| k.eq_ignore_ascii_case("password"))
+            {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: "connection_string must not carry a password= query \
+                             parameter — set password_env instead"
+                        .to_string(),
+                });
+            }
+        }
         // The graph name is spliced into `cypher('<name>', …)` as a SQL
         // literal — identifier shape keeps it inert belt-and-braces (the
         // literal is also quote-escaped at the call site).
@@ -119,10 +151,16 @@ impl GraphConfig {
                 reason: "max_rows must be positive".to_string(),
             });
         }
-        if self.query_timeout_seconds == 0 {
+        if self.query_timeout_seconds == 0 || self.query_timeout_seconds > MAX_QUERY_TIMEOUT_SECONDS
+        {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
-                reason: "query_timeout_seconds must be positive".to_string(),
+                reason: format!(
+                    "query_timeout_seconds must be in 1..={MAX_QUERY_TIMEOUT_SECONDS} \
+                     (got {}) — the value feeds Postgres's statement_timeout and the \
+                     client-side wrap",
+                    self.query_timeout_seconds
+                ),
             });
         }
         if self.max_connections == 0 {
@@ -191,6 +229,37 @@ password_env: AGE_PG_PASS
         c.username_env = Some("BAD NAME".into());
         let err = c.validate("kg", "postgres://h/db").unwrap_err();
         assert!(err.to_string().contains("environment variable NAME"));
+    }
+
+    #[test]
+    fn url_embedded_passwords_are_rejected_without_echoing_the_url() {
+        let c = base();
+        for url in [
+            "postgres://user:s3cret@localhost:5432/db",
+            "postgresql://h/db?password=s3cret",
+            "postgres://h/db?PASSWORD=s3cret",
+        ] {
+            let err = c.validate("kg", url).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("password_env"), "{msg}");
+            assert!(!msg.contains("s3cret"), "the secret never echoes: {msg}");
+        }
+        // A bare username is identity, not a secret — allowed.
+        c.validate("kg", "postgres://postgres@localhost:5432/db")
+            .expect("username-only URL is fine");
+    }
+
+    #[test]
+    fn timeout_has_a_hard_ceiling() {
+        let mut c = base();
+        c.query_timeout_seconds = MAX_QUERY_TIMEOUT_SECONDS + 1;
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("1..=86400"), "{err}");
+        c.query_timeout_seconds = u64::MAX; // would overflow the +5s wrap
+        assert!(c.validate("kg", "postgres://h/db").is_err());
+        c.query_timeout_seconds = MAX_QUERY_TIMEOUT_SECONDS;
+        c.validate("kg", "postgres://h/db")
+            .expect("the ceiling itself is legal");
     }
 
     #[test]

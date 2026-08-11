@@ -250,6 +250,18 @@ pub fn build_batch(
     rows: &[Vec<Value>],
     row_base: usize,
 ) -> Result<RecordBatch, GraphError> {
+    // Arity first: a backend row shorter than the declared schema must
+    // be a typed error, not an index panic (future Neo4j/Kuzu drivers
+    // make this reachable even if the AGE client can't produce it).
+    for (i, row) in rows.iter().enumerate() {
+        if row.len() != columns.len() {
+            return Err(GraphError::RowArityMismatch {
+                row: row_base + i,
+                expected: columns.len(),
+                found: row.len(),
+            });
+        }
+    }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for (col_idx, col) in columns.iter().enumerate() {
         let cells = rows.iter().map(|r| &r[col_idx]);
@@ -270,7 +282,10 @@ pub fn build_batch(
                 for (i, v) in cells.enumerate() {
                     match v {
                         Value::Null => b.append_null(),
-                        Value::Number(n) if n.is_i64() => b.append_value(n.as_i64().unwrap()),
+                        Value::Number(n) => match n.as_i64() {
+                            Some(i) => b.append_value(i),
+                            None => return Err(mismatch(col, row_base + i, "int", v)),
+                        },
                         other => return Err(mismatch(col, row_base + i, "int", other)),
                     }
                 }
@@ -602,12 +617,15 @@ fn path_struct_array(items: &[Option<PathParts>]) -> StructArray {
         )),
         OffsetBuffer::from_lengths(rel_lengths),
         Arc::new(relationship_struct_array(&flat_rels)),
-        Some(NullBuffer::from(validity)),
+        Some(NullBuffer::from(validity.clone())),
     );
+    // The parent STRUCT carries the SAME validity as its child lists —
+    // with None here, a NULL path row would read as a valid struct whose
+    // lists happen to be null, and `path IS NULL` would answer false.
     StructArray::new(
         path_fields(),
         vec![Arc::new(nodes_list), Arc::new(rels_list)],
-        None,
+        Some(NullBuffer::from(validity)),
     )
 }
 
@@ -799,6 +817,44 @@ mod tests {
             .unwrap();
         assert_eq!(nodes.value(0).len(), 2, "nodes is one longer");
         assert_eq!(rels.value(0).len(), 1);
+    }
+
+    #[test]
+    fn a_null_path_row_is_a_null_struct() {
+        // With a None parent validity the null row would read as a VALID
+        // struct whose child lists are null — and SQL `path IS NULL`
+        // would answer false. The parent must carry the row validity.
+        let columns = vec![col("p", GraphType::Path)];
+        let rows = vec![
+            vec![serde_json::json!([{"id":1,"label":"A","properties":{}}])],
+            vec![Value::Null],
+        ];
+        let batch = build_batch(&columns, &rows, 0).expect("converts");
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!paths.is_null(0));
+        assert!(paths.is_null(1), "NULL path row must be a NULL struct");
+    }
+
+    #[test]
+    fn a_short_row_is_a_typed_arity_error_not_a_panic() {
+        // A backend row narrower than the declared schema (reachable via
+        // future drivers) must surface as a typed error with identity.
+        let columns = vec![col("a", GraphType::Int), col("b", GraphType::Int)];
+        let rows = vec![
+            vec![serde_json::json!(1), serde_json::json!(2)],
+            vec![serde_json::json!(3)], // one column short
+        ];
+        let err = build_batch(&columns, &rows, 5).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("row 6"), "{msg}");
+        assert!(
+            msg.contains("carries 1 columns but 2 were declared"),
+            "{msg}"
+        );
     }
 
     #[test]

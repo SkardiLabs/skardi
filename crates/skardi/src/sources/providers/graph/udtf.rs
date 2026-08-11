@@ -334,11 +334,13 @@ impl TableProvider for GraphSchemaProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(GraphScanExec::new(
             GraphScanKind::Labels {
                 handle: Arc::clone(&self.handle),
+                // The SQL LIMIT rides into the catalog fetch itself.
+                limit,
             },
             self.schema(),
             projection.cloned(),
@@ -357,6 +359,7 @@ enum GraphScanKind {
     },
     Labels {
         handle: Arc<GraphSourceHandle>,
+        limit: Option<usize>,
     },
 }
 
@@ -483,7 +486,7 @@ impl ExecutionPlan for GraphScanExec {
                 Arc::clone(columns),
                 *limit,
             ),
-            GraphScanKind::Labels { handle } => labels_batch(Arc::clone(handle)),
+            GraphScanKind::Labels { handle, limit } => labels_batch(Arc::clone(handle), *limit),
         };
         let stream = batches
             .map(move |batch| {
@@ -539,11 +542,12 @@ fn cypher_batches(
 
 fn labels_batch(
     handle: Arc<GraphSourceHandle>,
+    limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
         let labels = handle
             .client
-            .labels(handle.bounds)
+            .labels(handle.bounds, limit)
             .await
             .map_err(execution_error)?;
         let mut names = arrow::array::StringBuilder::new();
@@ -594,8 +598,16 @@ mod tests {
             Ok(stream::iter(rows.into_iter().map(Ok)).boxed())
         }
 
-        async fn labels(&self, _bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError> {
-            Ok(self.labels.clone())
+        async fn labels(
+            &self,
+            _bounds: QueryBounds,
+            limit: Option<usize>,
+        ) -> Result<Vec<(String, String)>, GraphError> {
+            let mut labels = self.labels.clone();
+            if let Some(l) = limit {
+                labels.truncate(l);
+            }
+            Ok(labels)
         }
     }
 

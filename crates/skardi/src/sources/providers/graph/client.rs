@@ -81,6 +81,7 @@ pub type GraphRowStream = BoxStream<'static, Result<GraphRow, GraphError>>;
 ///     async fn labels(
 ///         &self,
 ///         _bounds: QueryBounds,
+///         _limit: Option<usize>,
 ///     ) -> Result<Vec<(String, String)>, GraphError> {
 ///         Ok(vec![("Person".into(), "vertex".into())])
 ///     }
@@ -107,8 +108,14 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
     /// Label roster for `graph_schema`: one `(label, kind)` row per
     /// label, kinds `vertex` / `edge`. Names only — never property
     /// values (design §Agent and LLM interaction). Bounded like every
-    /// other query — "every query is bounded" has no catalog exemption.
-    async fn labels(&self, bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError>;
+    /// other query — "every query is bounded" has no catalog exemption —
+    /// and `limit` is the SQL LIMIT, pushed into the catalog fetch as a
+    /// clean early stop.
+    async fn labels(
+        &self,
+        bounds: QueryBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String)>, GraphError>;
 }
 
 /// Apache AGE over the workspace's sqlx-postgres stack.
@@ -255,35 +262,43 @@ impl GraphClient for AgeClient {
         let (sql, prepared) = self.build_sql(cypher, params, arity);
         let source = self.source_name.clone();
         let run = async {
-            let mut tx = self
+            // A MANUAL transaction on an explicitly acquired connection,
+            // not sqlx's Transaction guard: cleanup must be able to
+            // ROLLBACK FIRST and then DEALLOCATE on the SAME session — a
+            // backend error (invalid Cypher, runtime error,
+            // statement_timeout) puts the transaction in aborted state,
+            // where DEALLOCATE itself is refused, while rollback does NOT
+            // clear session-level prepared statements. Rollback-then-
+            // deallocate is the only order that cleans up after backend
+            // errors.
+            let mut conn = self
                 .pool
-                .begin()
+                .acquire()
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
             // The security boundary: the SERVER refuses writes in a read
             // transaction, whatever slipped past the keyword guard.
-            sqlx::query("SET TRANSACTION READ ONLY")
-                .execute(&mut *tx)
+            conn.execute("BEGIN TRANSACTION READ ONLY")
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
-            // Server-side: runaway traversals die in the backend, not in
-            // a client that gave up waiting.
-            sqlx::query(&format!(
-                "SET LOCAL statement_timeout = '{}ms'",
-                bounds.timeout.as_millis()
-            ))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| backend_error(&source, &e))?;
-
-            // Stream (simple protocol — see build_sql) and cap:
-            // max_rows + 1 proves the overflow without buffering past it.
-            // The collection runs as an INNER block so every early exit
-            // (row cap, malformed cell, wire error) still reaches the
-            // DEALLOCATE below.
             let collected: Result<Vec<GraphRow>, GraphError> = async {
+                // Server-side: runaway traversals die in the backend, not
+                // in a client that gave up waiting.
+                conn.execute(
+                    format!(
+                        "SET LOCAL statement_timeout = '{}ms'",
+                        bounds.timeout.as_millis()
+                    )
+                    .as_str(),
+                )
+                .await
+                .map_err(|e| backend_error(&source, &e))?;
+
+                // Stream (simple protocol — see build_sql) and cap:
+                // max_rows + 1 proves the overflow without buffering past
+                // it.
                 let mut rows: Vec<GraphRow> = Vec::new();
-                let mut stream = tx.fetch_many(sqlx::raw_sql(&sql));
+                let mut stream = conn.fetch_many(sqlx::raw_sql(&sql));
                 while let Some(step) = stream.next().await {
                     let step = step.map_err(|e| map_query_error(&source, bounds, &e))?;
                     // PREPARE contributes a rowless result; only rows count.
@@ -323,28 +338,29 @@ impl GraphClient for AgeClient {
                 Ok(rows)
             }
             .await;
+            // ROLLBACK unconditionally and FIRST: it clears an aborted
+            // transaction (making the DEALLOCATE below executable) and a
+            // read-only transaction had nothing to undo anyway.
+            let rollback = conn.execute("ROLLBACK").await;
+            if collected.is_ok() {
+                rollback.map_err(|e| backend_error(&source, &e))?;
+            }
             if let Some(name) = &prepared {
-                // On EVERY exit, success or error: prepared statements are
-                // SESSION-level — rollback does not clear them, the
-                // pid+seq names never reuse, and skipping this on an
+                // On EVERY exit: prepared statements are SESSION-level,
+                // the pid+seq names never reuse, and skipping this on an
                 // error path would monotonically accumulate statements on
                 // the pooled connection. Best-effort on the error path
-                // (the original error stays the one reported); a failed
-                // DEALLOCATE on the success path is itself an error.
-                // Targeted, never ALL — sqlx's own statement cache lives
-                // on the same connection.
-                let dealloc = tx.execute(format!("DEALLOCATE {name}").as_str()).await;
+                // (the original error stays the one reported — and when
+                // the PREPARE itself failed there is nothing to drop); a
+                // failed DEALLOCATE on the success path is itself an
+                // error. Targeted, never ALL — sqlx's own statement cache
+                // lives on the same connection.
+                let dealloc = conn.execute(format!("DEALLOCATE {name}").as_str()).await;
                 if collected.is_ok() {
                     dealloc.map_err(|e| backend_error(&source, &e))?;
                 }
             }
-            let rows = collected?;
-            // Read-only: rollback returns the connection with nothing to
-            // undo either way.
-            tx.rollback()
-                .await
-                .map_err(|e| backend_error(&source, &e))?;
-            Ok(rows)
+            collected
         };
         // Residual, stated: the client-side timeout below ABANDONS the
         // future mid-flight — no DEALLOCATE can run on that path. It only
@@ -353,8 +369,10 @@ impl GraphClient for AgeClient {
         // dropped mid-query rather than pooling it, so nothing
         // accumulates there either.
         // Client-side wrap: the server timeout is authoritative, this one
-        // covers a backend that stops answering entirely.
-        let rows = tokio::time::timeout(bounds.timeout + Duration::from_secs(5), run)
+        // covers a backend that stops answering entirely. saturating_add:
+        // the config caps the timeout, but arithmetic here must not be
+        // the thing that panics if that invariant ever moves.
+        let rows = tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
             .map_err(|_| GraphError::Timeout {
                 seconds: bounds.timeout.as_secs(),
@@ -362,12 +380,24 @@ impl GraphClient for AgeClient {
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
 
-    async fn labels(&self, bounds: QueryBounds) -> Result<Vec<(String, String)>, GraphError> {
+    async fn labels(
+        &self,
+        bounds: QueryBounds,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String)>, GraphError> {
         // Same bounds discipline as execute — a catalog read against a
         // wedged backend must not hang forever, and the design's "every
         // query is bounded" makes no catalog exemption: READ ONLY
         // transaction, server-side statement_timeout, row cap, and the
-        // client-side wrap.
+        // client-side wrap. The cap and the SQL LIMIT both ride the
+        // query's own LIMIT clause, so at most max_rows + 1 label rows
+        // ever cross the wire — never the whole catalog first.
+        let fetch = match limit {
+            // A SQL LIMIT at or under the cap is a clean early stop.
+            Some(l) if l <= bounds.max_rows => l,
+            // Otherwise fetch one past the cap to PROVE an overflow.
+            _ => bounds.max_rows.saturating_add(1),
+        };
         let source = self.source_name.clone();
         let run = async {
             let mut tx = self
@@ -394,13 +424,14 @@ impl GraphClient for AgeClient {
                  FROM ag_catalog.ag_label l \
                  JOIN ag_catalog.ag_graph g ON g.graphid = l.graph \
                  WHERE g.name = $1 AND l.name NOT LIKE '\\_ag\\_label\\_%' \
-                 ORDER BY l.name",
+                 ORDER BY l.name LIMIT $2",
             )
             .bind(&self.graph_name)
+            .bind(i64::try_from(fetch).unwrap_or(i64::MAX))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| map_query_error(&source, bounds, &e))?;
-            if rows.len() > bounds.max_rows {
+            if limit.is_none_or(|l| l > bounds.max_rows) && rows.len() > bounds.max_rows {
                 return Err(GraphError::RowCapExceeded {
                     max_rows: bounds.max_rows,
                 });
@@ -421,7 +452,7 @@ impl GraphClient for AgeClient {
                 })
                 .collect()
         };
-        tokio::time::timeout(bounds.timeout + Duration::from_secs(5), run)
+        tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
             .map_err(|_| GraphError::Timeout {
                 seconds: bounds.timeout.as_secs(),

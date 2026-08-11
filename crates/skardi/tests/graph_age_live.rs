@@ -78,14 +78,61 @@ async fn drop_graph(pool: &sqlx::PgPool, graph: &str) {
         .await;
 }
 
-/// A registered source + session, against the live database.
+/// Split a maybe-credentialed URL into (cred-free URL, user, pass):
+/// config validation rejects URL-embedded passwords, so the registered
+/// source takes credentials the designed way — env-var NAMES.
+fn split_creds(url: &str) -> (String, Option<String>, Option<String>) {
+    let mut parsed = url::Url::parse(url).expect("live URL parses");
+    let user = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
+    let pass = parsed.password().map(str::to_string);
+    parsed
+        .set_username("")
+        .expect("postgres URLs take userinfo");
+    parsed
+        .set_password(None)
+        .expect("postgres URLs take userinfo");
+    (parsed.to_string(), user, pass)
+}
+
+/// YAML `username_env`/`password_env` lines for a URL's credentials,
+/// with the values exported under `prefix`-derived env names.
+fn cred_lines(url: &str, prefix: &str) -> String {
+    let (_, user, pass) = split_creds(url);
+    let mut lines = String::new();
+    if let Some(u) = &user {
+        let env = format!("{prefix}_USER");
+        unsafe { std::env::set_var(&env, u) };
+        lines.push_str(&format!("username_env: {env}\n"));
+    }
+    if let Some(p) = &pass {
+        let env = format!("{prefix}_PASS");
+        unsafe { std::env::set_var(&env, p) };
+        lines.push_str(&format!("password_env: {env}\n"));
+    }
+    lines
+}
+
+/// A registered source + session, against the live database. Credentials
+/// ride env vars (unique per graph name, so parallel tests never race).
 async fn live_ctx(url: &str, graph: &str) -> (SessionContext, GraphSources) {
     let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let (clean_url, user, pass) = split_creds(url);
+    let user_env = format!("SKARDI_AGE_LIVE_USER_{}", graph.to_uppercase());
+    let pass_env = format!("SKARDI_AGE_LIVE_PASS_{}", graph.to_uppercase());
+    let mut cred_lines = String::new();
+    if let Some(u) = &user {
+        unsafe { std::env::set_var(&user_env, u) };
+        cred_lines.push_str(&format!("username_env: {user_env}\n"));
+    }
+    if let Some(p) = &pass {
+        unsafe { std::env::set_var(&pass_env, p) };
+        cred_lines.push_str(&format!("password_env: {pass_env}\n"));
+    }
     let config: GraphConfig = serde_yaml::from_str(&format!(
-        "backend: age\ngraph_name: {graph}\nquery_timeout_seconds: 10\nmax_rows: 100\n"
+        "backend: age\ngraph_name: {graph}\nquery_timeout_seconds: 10\nmax_rows: 100\n{cred_lines}"
     ))
     .expect("config parses");
-    register_graph_source(&sources, "kg", url, &config)
+    register_graph_source(&sources, "kg", &clean_url, &config)
         .await
         .expect("registration connects eagerly");
     let ctx = SessionContext::new();
@@ -396,10 +443,13 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // PREPARE onto the pooled connection (prepared statements are
     // session-level; rollback does not clear them).
     let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
-    let config: GraphConfig =
-        serde_yaml::from_str(&format!("backend: age\ngraph_name: {graph}\nmax_rows: 1\n"))
-            .expect("config parses");
-    register_graph_source(&sources, "capped", &url, &config)
+    let (clean_url, _, _) = split_creds(&url);
+    let creds = cred_lines(&url, "SKARDI_AGE_CAPPED");
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}\nmax_rows: 1\n{creds}"
+    ))
+    .expect("config parses");
+    register_graph_source(&sources, "capped", &clean_url, &config)
         .await
         .expect("registers");
     let capped = SessionContext::new();
@@ -436,9 +486,25 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // the very sessions execute used; hence the direct AgeClient and its
     // test-only pool hook). Before the fix each error path left one
     // behind, monotonically.
-    let client = AgeClient::connect("leakcheck", &url, &graph, None, None, 4)
-        .await
-        .expect("connects");
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        if let Some(u) = &user {
+            std::env::set_var("SKARDI_AGE_LEAK_USER", u);
+        }
+        if let Some(p) = &pass {
+            std::env::set_var("SKARDI_AGE_LEAK_PASS", p);
+        }
+    }
+    let client = AgeClient::connect(
+        "leakcheck",
+        &clean_url,
+        &graph,
+        user.as_ref().map(|_| "SKARDI_AGE_LEAK_USER"),
+        pass.as_ref().map(|_| "SKARDI_AGE_LEAK_PASS"),
+        4,
+    )
+    .await
+    .expect("connects");
     let tight = QueryBounds {
         timeout: std::time::Duration::from_secs(10),
         max_rows: 1,
@@ -457,6 +523,25 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
             .expect("4 people, cap 1: the capped error path");
         assert!(err.to_string().contains("max_rows = 1"), "{err}");
     }
+    // BACKEND error paths leak differently from client-local ones: a
+    // runtime error aborts the transaction, where DEALLOCATE itself is
+    // refused until ROLLBACK — the round-3 P1. Parameterized (so the
+    // PREPARE exists and the EXECUTE fails at runtime), 8× past the pool.
+    for _ in 0..8 {
+        let err = client
+            .execute(
+                "MATCH (p:Person) RETURN $x / 0",
+                &serde_json::json!({"x": 1}),
+                1,
+                tight,
+                None,
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "stream deferred".to_string());
+        assert!(!err.is_empty());
+    }
     for _ in 0..8 {
         let leaked: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_prepared_statements WHERE name LIKE 'skq_p_%'",
@@ -464,8 +549,69 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         .fetch_one(client.pool_for_tests())
         .await
         .expect("pg_prepared_statements readable");
-        assert_eq!(leaked, 0, "no skq_p_* statement survives an error path");
+        assert_eq!(
+            leaked, 0,
+            "no skq_p_* statement survives client-local OR backend error paths"
+        );
     }
+
+    // Hostile-looking parameter VALUES round-trip inertly through the
+    // serde_json + quote-doubling boundary (the design's recorded AGE
+    // exception): apostrophes, backslashes, SQL fragments.
+    let hostile = r#"O'Brien \ '; DROP TABLE documents; --"#;
+    let stream = client
+        .execute(
+            "RETURN $s",
+            &serde_json::json!({"s": hostile}),
+            1,
+            tight,
+            None,
+        )
+        .await
+        .expect("hostile param is inert data");
+    use futures::TryStreamExt;
+    let rows: Vec<_> = stream.try_collect().await.expect("collects");
+    assert_eq!(
+        rows[0][0],
+        serde_json::json!(hostile),
+        "byte-faithful round trip"
+    );
+
+    drop_graph(&pool, &graph).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn duplicate_registration_keeps_the_original_connection() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("dup");
+    let pool = seed_graph(&url, &graph).await;
+    let (ctx, sources) = live_ctx(&url, &graph).await;
+
+    // Second registration under the SAME name (pointing at a different
+    // graph) must fail AND leave the original routing untouched.
+    let (clean_url, _, _) = split_creds(&url);
+    let creds = cred_lines(&url, "SKARDI_AGE_DUP");
+    let config: GraphConfig =
+        serde_yaml::from_str(&format!("backend: age\ngraph_name: {graph}_other\n{creds}"))
+            .expect("config parses");
+    let err = register_graph_source(&sources, "kg", &clean_url, &config)
+        .await
+        .expect_err("duplicate name refuses");
+    assert!(err.to_string().contains("already registered"), "{err}");
+
+    // The original connection still serves — 4 people, not an error and
+    // not the empty _other graph.
+    let batches = collect(
+        &ctx,
+        "SELECT name FROM cypher_query('kg', 'MATCH (p:Person) RETURN p.name', '{}', \
+         '{\"name\": \"string\"}')",
+    )
+    .await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
 
     drop_graph(&pool, &graph).await;
 }
