@@ -242,6 +242,25 @@ curl http://localhost:8080/data_source
 `description` is omitted from the JSON when no overlay or fallback is
 present, so the wire shape stays clean for sources that opt out.
 
+A catalog-mode source keeps its single `data[]` entry, but `tables[]`
+enumerates every inner table the source registered. Each table's `name`
+is the fully-qualified `catalog.schema.table` path — the exact string
+you'd put in a `FROM` clause — and descriptions resolve
+most-specific-first: a qualified overlay entry wins, the bare
+source-name entry (or the ctx-inline `description`) applies as the
+broad fallback:
+
+```json
+{
+  "name": "news",
+  "type": "rss",
+  "tables": [
+    { "name": "news.main.feeds", "description": "Fetch health, one row per configured subscription…", "schema": [ "…" ] },
+    { "name": "news.main.items", "description": "The live window of every subscription…", "schema": [ "…" ] }
+  ]
+}
+```
+
 ### `skardi schema`
 
 The CLI has no local catalog of its own — `skardi schema` is a thin
@@ -261,13 +280,6 @@ The output is always pretty-printed JSON — `skardi schema` takes no flags.
 
 ## Limitations
 
-- `GET /data_source` still emits **one table per data source** (the
-  source name *is* the table name in the JSON response). Catalog-mode
-  sources expose many inner tables, but the HTTP endpoint doesn't
-  enumerate them yet — so qualified `catalog.schema.table` overlays
-  defined for inner tables won't surface on the endpoint (or on
-  `skardi schema`, which only renders that endpoint's response) until
-  the endpoint is extended.
 - There is no agent-callable `describe` verb yet. Agents reach the
   semantics through the HTTP endpoint above; a pipeline form is a
   separate task on the roadmap.
