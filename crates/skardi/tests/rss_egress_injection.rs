@@ -49,7 +49,7 @@ const QUERY_CEILING: Duration = Duration::from_secs(60);
 struct DenyLoopback;
 
 impl EgressPolicy for DenyLoopback {
-    fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+    fn check(&self, _host: &str, ip: IpAddr) -> Result<(), EgressReason> {
         if ip.is_loopback() {
             Err("test-loopback".into())
         } else {

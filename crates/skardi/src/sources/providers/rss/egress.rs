@@ -13,10 +13,10 @@
 //!
 //! The seam is enforced at the DNS-resolver layer ([`PolicyDns`]) so an
 //! injected policy holds against DNS rebinding: reqwest only ever connects to
-//! addresses that already passed [`EgressPolicy::check_ip`], and a lookup that
+//! addresses that already passed [`EgressPolicy::check`], and a lookup that
 //! returns any refused address fails whole (see [`check_addrs`]). A feed URL
 //! whose host is already an IP literal never reaches the resolver, so
-//! [`super::fetch::FeedFetcher`] additionally calls [`EgressPolicy::check_ip`]
+//! [`super::fetch::FeedFetcher`] additionally calls [`EgressPolicy::check`]
 //! on every hop whose host parses as an `IpAddr`. Under the `AllowAll` default
 //! both paths are no-ops.
 
@@ -42,6 +42,12 @@ pub type EgressReason = Cow<'static, str>;
 pub trait EgressPolicy: Send + Sync + fmt::Debug {
     /// `Ok(())` to allow the connection to `ip`, `Err(reason)` to refuse it.
     ///
+    /// `host` is the hostname that resolved to `ip` — for an IP-literal URL,
+    /// the literal itself — passed per hop so a host-based policy (e.g. a
+    /// per-tenant feed-host allowlist) holds on redirect targets too, not just
+    /// on the URL that was vetted at subscription time. [`AllowAll`] ignores
+    /// it.
+    ///
     /// `ip` is always canonical: every call site unmaps IPv4-mapped IPv6
     /// (`::ffff:a.b.c.d`) to the plain V4 with [`IpAddr::to_canonical`] before
     /// calling this, so an implementation judges only the address a connect
@@ -49,7 +55,7 @@ pub trait EgressPolicy: Send + Sync + fmt::Debug {
     /// written against `10.0.0.1` therefore also refuses `::ffff:10.0.0.1`. The
     /// two call sites are `check_addrs` (the resolver path; unlinked, it is
     /// crate-private) and the fetcher's IP-literal hop check.
-    fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason>;
+    fn check(&self, host: &str, ip: IpAddr) -> Result<(), EgressReason>;
 }
 
 /// The OSS default: every address is allowed. Skardi OSS does not sandbox
@@ -58,7 +64,7 @@ pub trait EgressPolicy: Send + Sync + fmt::Debug {
 pub struct AllowAll;
 
 impl EgressPolicy for AllowAll {
-    fn check_ip(&self, _ip: IpAddr) -> Result<(), EgressReason> {
+    fn check(&self, _host: &str, _ip: IpAddr) -> Result<(), EgressReason> {
         Ok(())
     }
 }
@@ -102,7 +108,7 @@ pub(crate) fn check_addrs(
         // bypasses a V4-private rule. `to_canonical` unmaps mapped-v6 to V4 and
         // leaves everything else unchanged.
         let ip = addr.ip().to_canonical();
-        if let Err(reason) = policy.check_ip(ip) {
+        if let Err(reason) = policy.check(host, ip) {
             return Err(EgressDenied {
                 host: host.to_string(),
                 ip,
@@ -154,7 +160,7 @@ mod tests {
     #[derive(Debug)]
     struct DenyAll;
     impl EgressPolicy for DenyAll {
-        fn check_ip(&self, _ip: IpAddr) -> Result<(), EgressReason> {
+        fn check(&self, _host: &str, _ip: IpAddr) -> Result<(), EgressReason> {
             Err("test-denied".into())
         }
     }
@@ -166,7 +172,7 @@ mod tests {
     #[derive(Debug)]
     struct DenyV4(Ipv4Addr);
     impl EgressPolicy for DenyV4 {
-        fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+        fn check(&self, _host: &str, ip: IpAddr) -> Result<(), EgressReason> {
             if ip == IpAddr::V4(self.0) {
                 Err("test-denied".into())
             } else {
@@ -182,7 +188,7 @@ mod tests {
         let policy = AllowAll;
         for ip in ["127.0.0.1", "169.254.169.254", "10.0.0.1", "1.1.1.1"] {
             policy
-                .check_ip(ip.parse().unwrap())
+                .check(ip, ip.parse().unwrap())
                 .unwrap_or_else(|_| panic!("AllowAll must permit {ip}"));
         }
     }

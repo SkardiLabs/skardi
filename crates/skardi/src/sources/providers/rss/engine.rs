@@ -1209,7 +1209,7 @@ mod tests {
     #[derive(Debug)]
     struct DenyList(Vec<IpAddr>);
     impl EgressPolicy for DenyList {
-        fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+        fn check(&self, _host: &str, ip: IpAddr) -> Result<(), EgressReason> {
             if self.0.contains(&ip) {
                 Err("test-denied".into())
             } else {
@@ -1224,7 +1224,7 @@ mod tests {
     #[derive(Debug)]
     struct TogglePolicy(AtomicBool);
     impl EgressPolicy for TogglePolicy {
-        fn check_ip(&self, _ip: IpAddr) -> Result<(), EgressReason> {
+        fn check(&self, _host: &str, _ip: IpAddr) -> Result<(), EgressReason> {
             if self.0.load(Ordering::SeqCst) {
                 Err("test-denied".into())
             } else {

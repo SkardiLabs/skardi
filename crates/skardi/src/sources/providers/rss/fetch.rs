@@ -16,7 +16,7 @@
 //! hostnames by construction; it structurally cannot see an IP-literal
 //! target, on the initial URL or on any hop. So every redirect target this
 //! module resolves is re-run through [`FeedFetcher::check_hop_target`] — the
-//! same scheme allowlist and [`EgressPolicy::check_ip`] check the initial URL
+//! same scheme allowlist and [`EgressPolicy::check`] check the initial URL
 //! gets, where the injected `EgressPolicy` (default [`AllowAll`]) is
 //! consulted on every hop — before the next request is ever built. A hostname
 //! target needs no extra help: it re-enters `PolicyDns` like any other name
@@ -286,7 +286,7 @@ impl FeedFetcher {
     ///
     /// The resolver check gates connection *establishment*, not every request:
     /// a warm pooled connection is reused without re-resolving, so
-    /// [`EgressPolicy::check_ip`] is not re-consulted while it lives. This is
+    /// [`EgressPolicy::check`] is not re-consulted while it lives. This is
     /// not a bypass — a reused connection only ever talks to the address that
     /// was approved when it was opened — but the guarantee is temporal: a
     /// policy that begins refusing a host does not sever connections already
@@ -399,7 +399,7 @@ impl FeedFetcher {
         Ok(target)
     }
 
-    /// Scheme allowlist plus, for an IP-literal host, [`EgressPolicy::check_ip`].
+    /// Scheme allowlist plus, for an IP-literal host, [`EgressPolicy::check`].
     /// A hostname host needs no check here: [`PolicyDns`] (the client's DNS
     /// resolver) validates it structurally when reqwest actually connects.
     fn check_hop_target(&self, url: &Url) -> Result<(), FetchError> {
@@ -428,7 +428,7 @@ impl FeedFetcher {
             // canonical address the rule actually matched.
             let host = url.host_str().unwrap_or_default().to_string();
             self.policy
-                .check_ip(canonical)
+                .check(&host, canonical)
                 .map_err(|reason| EgressDenied {
                     host,
                     ip: canonical,
@@ -736,7 +736,7 @@ mod tests {
     #[derive(Debug)]
     struct DenyList(Vec<IpAddr>);
     impl EgressPolicy for DenyList {
-        fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+        fn check(&self, _host: &str, ip: IpAddr) -> Result<(), EgressReason> {
             if self.0.contains(&ip) {
                 Err("test-denied".into())
             } else {
