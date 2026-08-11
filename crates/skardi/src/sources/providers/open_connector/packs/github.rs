@@ -1413,7 +1413,7 @@ bindings:
                 if input.get("owner").is_some() || input.get("repo").is_some() {
                     return MockResponse::new(
                         400,
-                        &crate::sources::providers::open_connector::testutil::envelope_err(
+                        crate::sources::providers::open_connector::testutil::envelope_err(
                             "invalid_input",
                             "Action input does not match the action schema.",
                         ),

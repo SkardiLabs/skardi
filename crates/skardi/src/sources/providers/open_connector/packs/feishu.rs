@@ -621,7 +621,7 @@ bindings:
                                     "pageToken": "tok-2", "hasMore": true}),
                     Some("tok-2") => json!({"items": [chat_row("oc-3")],
                                              "pageToken": null, "hasMore": false}),
-                    Some(other) => return MockResponse::new(400, &format!("bad token {other}")),
+                    Some(other) => return MockResponse::new(400, format!("bad token {other}")),
                 };
                 return MockResponse::ok(&envelope_ok(&page.to_string()));
             }

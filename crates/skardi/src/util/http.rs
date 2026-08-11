@@ -50,3 +50,18 @@ pub fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
             .unwrap_or(Duration::ZERO),
     )
 }
+
+/// The system clock's sub-second nanoseconds, as a jitter source for retry
+/// backoff: good enough to decorrelate concurrent retries without a
+/// randomness dependency.
+///
+/// A source only, deliberately shapeless: each retry loop turns it into its
+/// own spread (the Open Connector client adds a flat 0–100ms; the rss
+/// fetcher spreads ±50% of the base, per its spec), the same way the loops
+/// themselves stay with their callers per this module's doc.
+pub(crate) fn clock_jitter_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+}

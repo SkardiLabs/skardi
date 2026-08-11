@@ -496,7 +496,7 @@ bindings:
                                     "next_cursor": "cur-2", "has_more": true}),
                     Some("cur-2") => json!({"results": [user_row("u-3")],
                                              "next_cursor": null, "has_more": false}),
-                    Some(other) => return MockResponse::new(400, &format!("bad cursor {other}")),
+                    Some(other) => return MockResponse::new(400, format!("bad cursor {other}")),
                 };
                 return MockResponse::ok(&envelope_ok(&page.to_string()));
             }
@@ -553,7 +553,7 @@ bindings:
                 let rows = match kind {
                     "page" => json!([{"object": "page", "id": "p-1"}]),
                     "data_source" => json!([{"object": "data_source", "id": "ds-1"}]),
-                    other => return MockResponse::new(400, &format!("bad filter {other}")),
+                    other => return MockResponse::new(400, format!("bad filter {other}")),
                 };
                 return MockResponse::ok(&envelope_ok(
                     &json!({"results": rows, "next_cursor": null, "has_more": false}).to_string(),

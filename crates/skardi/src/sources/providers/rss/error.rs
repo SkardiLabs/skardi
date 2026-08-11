@@ -57,17 +57,12 @@ pub const MAX_ERROR_CHARS: usize = 512;
 /// outlive the window it described.
 pub const MAX_FEED_TEXT_CHARS: usize = 4096;
 
-/// Bound `text` to `max_chars` *characters*, cutting on a char boundary so a
-/// multi-byte sequence is never split.
-///
-/// A length bound only: nothing here removes content, so what may appear in a
-/// string this bounds is decided by which strings are passed in, not by this.
-pub fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((byte_index, _)) => text[..byte_index].to_string(),
-        None => text.to_string(),
-    }
-}
+/// Bound a string to a character count, cutting on a char boundary — the
+/// crate-shared [`truncate_chars`](crate::util::text::truncate_chars),
+/// re-exported under this provider's historical name so its call sites (and
+/// their pairing with [`MAX_ERROR_CHARS`] / [`MAX_FEED_TEXT_CHARS`] above)
+/// read as before.
+pub use crate::util::text::truncate_chars as truncate;
 
 /// Errors surfaced while validating or registering an RSS/Atom data source.
 ///

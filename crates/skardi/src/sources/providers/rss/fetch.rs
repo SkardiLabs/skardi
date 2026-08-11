@@ -128,7 +128,7 @@ use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
 use percent_encoding::{CONTROLS, percent_encode};
@@ -143,7 +143,7 @@ use url::{Host, Url};
 use super::config::redact_url;
 use super::egress::{AllowAll, EgressDenied, EgressPolicy, PolicyDns};
 use super::error::RssError;
-use crate::util::http::parse_retry_after;
+use crate::util::http::{clock_jitter_nanos, parse_retry_after};
 
 /// Maximum redirect hops [`FeedFetcher::fetch`] follows before returning
 /// [`FetchError::TooManyRedirects`]. Each hop gets its own fresh
@@ -641,26 +641,21 @@ fn retry_wait(resp: &Response, attempt: u32) -> Duration {
 }
 
 /// Exponential backoff — `RETRY_BASE_BACKOFF_MS * 2^attempt` — randomized
-/// within +/-50% of that value using the system clock's sub-second
-/// nanoseconds as the source of variation, capped at [`MAX_RETRY_WAIT`]. The
-/// jitter source is the same one `open_connector/client.rs`'s own backoff
-/// helper uses (chosen there, and reused here, to decorrelate concurrent
-/// retries without an added randomness dependency); the +/-50% spread itself
-/// is wider than that helper's flat 0-100ms addition, per this fetcher's own
-/// spec. The cap matters here independent of [`retry_wait`]'s own: `shift`
-/// only clamps at 6 (`RETRY_BASE_BACKOFF_MS * 2^6` = 16s), so a future
-/// increase to [`MAX_ATTEMPTS`] alone would otherwise be enough to exceed
+/// within +/-50% of that value using [`clock_jitter_nanos`] as the source of
+/// variation, capped at [`MAX_RETRY_WAIT`]. The jitter source is the crate's
+/// shared one; the +/-50% spread itself is wider than the flat 0-100ms
+/// addition `open_connector/client.rs`'s backoff shapes from the same
+/// source, per this fetcher's own spec. The cap matters here independent of
+/// [`retry_wait`]'s own: `shift` only clamps at 6
+/// (`RETRY_BASE_BACKOFF_MS * 2^6` = 16s), so a future increase to
+/// [`MAX_ATTEMPTS`] alone would otherwise be enough to exceed
 /// [`MAX_RETRY_WAIT`] without ever touching a `Retry-After` header.
 fn backoff(attempt: u32) -> Duration {
     let shift = attempt.min(6);
     let base_ms = RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << shift);
     let half = base_ms / 2;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos()))
-        .unwrap_or(0);
     let span = half.saturating_mul(2).saturating_add(1);
-    let jitter = (nanos % span) as i64 - half as i64;
+    let jitter = (clock_jitter_nanos() % span) as i64 - half as i64;
     let wait_ms = (base_ms as i64 + jitter).max(0) as u64;
     Duration::from_millis(wait_ms).min(MAX_RETRY_WAIT)
 }
