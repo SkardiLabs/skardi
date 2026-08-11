@@ -616,6 +616,18 @@ fn fetch_image_with_policy(
             handle.block_on(async {
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
+                    // This fetch wants raw image bytes and no content
+                    // negotiation. Without this, any build that compiles
+                    // reqwest's `gzip` feature in (the `rss` feature does —
+                    // Cargo unifies features workspace-wide) silently flips
+                    // this client to send `accept-encoding: gzip` and
+                    // auto-decompress, and the unbounded `resp.bytes()`
+                    // below becomes a decompression amplifier (~1000:1) on
+                    // an attacker-influenceable `image_ref`. `no_gzip()` is
+                    // available regardless of the Cargo feature, so this
+                    // holds in every build. Same defensive pattern as
+                    // `object_store`.
+                    .no_gzip()
                     .build()?;
                 let resp = client.get(image_ref).send().await?.error_for_status()?;
                 let mime = resp

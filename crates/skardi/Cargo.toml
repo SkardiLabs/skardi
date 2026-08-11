@@ -52,6 +52,14 @@ documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
 # the header set when it installs a gzip decoder, and `content_length()`
 # itself reads the body's size hint rather than the header, so it returns
 # `None` — not an under-reported wire size — the moment decoding is applied.
+# The third in-crate client, llm_extract's opt-in image fetch
+# (`model/llm_extract/mod.rs`, the `LLM_EXTRACT_IMAGE_FETCH=1` path), reads
+# with an unbounded `resp.bytes()` and so — unlike OC — has no streaming
+# bound to fall back on; auto-gzip would have handed an
+# attacker-influenceable `image_ref` a ~1000:1 decompression amplifier. It
+# pins `no_gzip()` on its builder (raw image bytes want no content
+# negotiation), which holds in every build because reqwest provides
+# `no_gzip()` independent of the Cargo feature.
 rss = [
     "dep:quick-xml",
     "reqwest/gzip",
