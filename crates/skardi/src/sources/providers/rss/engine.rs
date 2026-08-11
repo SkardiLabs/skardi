@@ -52,8 +52,8 @@
 //! ## Parsing runs off the worker threads
 //!
 //! `parse_feed_document` is synchronous CPU over attacker-authored bytes.
-//! [`parse_off_worker`] moves it to the blocking pool and fuses it with a
-//! budget scaled from `max_response_bytes` ([`parse_fuse`]) — their docs
+//! `parse_off_worker` moves it to the blocking pool and fuses it with a
+//! budget scaled from `max_response_bytes` (`parse_fuse`) — their docs
 //! have the full account. The politeness permit, held across that await, is
 //! what bounds how many parses run at once.
 //!
@@ -221,10 +221,10 @@
 //! stops being observed, so a `301` that later moves somewhere else would go
 //! unnoticed (permanent redirects drift in practice, and get used as
 //! temporary ones). Hence a third expiry clock alongside the TTL and
-//! [`failure_fuse`]: every [`reprobe_interval`], one fetch starts from the
+//! [`failure_fuse`]: every `reprobe_interval`, one fetch starts from the
 //! configured URL again and re-derives the landing URL, unconditionally —
 //! carrying the landing URL's validators *to* the configured URL would be
-//! the same mistake in reverse. [`RssEngine::reprobe_due`] is the check, and
+//! the same mistake in reverse. `RssEngine::reprobe_due` is the check, and
 //! the drift clock rides on the window (see `CachedWindow::probed_at` for
 //! why losing it to eviction is harmless).
 //!
@@ -415,11 +415,17 @@ pub struct RssEngine {
 impl RssEngine {
     /// Build an engine over `subscriptions`, with its own fetcher and
     /// in-memory window cache sized from the subscription count.
+    ///
+    /// `policy` passes through to `FeedFetcher::new` untouched: `None` is
+    /// the OSS default (no destination filtering, system proxies honored),
+    /// `Some` injects filtering and disables proxies. Materializing a
+    /// default here would erase the fact-of-injection switch the fetcher
+    /// keys its proxy behavior on — see `fetch.rs`'s module doc.
     pub fn new(
         source_name: String,
         subscriptions: Vec<ResolvedSubscription>,
         config: &RssConfig,
-        policy: Arc<dyn EgressPolicy>,
+        policy: Option<Arc<dyn EgressPolicy>>,
     ) -> Result<Self, RssError> {
         let fetcher = FeedFetcher::new(
             policy,
@@ -1485,7 +1491,7 @@ mod tests {
         config.max_concurrent = max_concurrent;
         config.request_timeout_seconds = 5;
         let fetcher = FeedFetcher::new(
-            policy,
+            Some(policy),
             Duration::from_secs(config.request_timeout_seconds),
             config.max_response_bytes,
             config.user_agent.clone(),
@@ -2913,7 +2919,7 @@ mod tests {
         // 7 units × 10s = 70s ≥ the 60s default scan timeout.
         config.max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES * 7;
         let fetcher = FeedFetcher::new(
-            Arc::new(AllowAll),
+            None,
             Duration::from_secs(5),
             config.max_response_bytes,
             config.user_agent.clone(),

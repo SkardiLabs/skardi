@@ -163,13 +163,16 @@ const ITEMS_TABLE: &str = "items";
 ///
 /// # Egress
 ///
-/// The engine's fetcher is given `AllowAll` (unlinked: the `egress` module is
-/// private, so a doc link to it would not resolve) — Skardi OSS does not
-/// filter fetch destinations, so a feed subscription reaches any address its
-/// host can route to. This is the only place production code constructs a
-/// policy at all. A caller may inject a different `EgressPolicy` through the
-/// test seam below (or, in Skardi Cloud, at registration) to restrict egress;
-/// see `docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`.
+/// The engine's fetcher is built with no injected policy (`None`) — the OSS
+/// default: no destination filtering (the fetcher falls back to its internal
+/// `AllowAll`), with system proxy variables honored. `FeedFetcher::new`
+/// disables proxies exactly when a policy is injected — the switch is the
+/// fact of injection — so the `None` must survive to it rather than being
+/// materialized as an `AllowAll` here (names unlinked: the `fetch` module is
+/// private, so a doc link to it would not resolve). A caller may inject an
+/// `EgressPolicy` through [`register_rss_tables_with_policy`] (an operator's
+/// own, or Skardi Cloud's at registration) to restrict egress; see
+/// `docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`.
 #[cfg(feature = "rss")]
 pub async fn register_rss_tables(
     session_ctx: &mut SessionContext,
@@ -178,15 +181,7 @@ pub async fn register_rss_tables(
     read_write: bool,
     hierarchy_level: HierarchyLevel,
 ) -> Result<()> {
-    register_with_policy(
-        session_ctx,
-        name,
-        config,
-        read_write,
-        hierarchy_level,
-        Arc::new(AllowAll),
-    )
-    .await
+    register_with_policy(session_ctx, name, config, read_write, hierarchy_level, None).await
 }
 
 /// [`register_rss_tables`] with a caller-supplied egress policy — the public
@@ -210,12 +205,15 @@ pub async fn register_rss_tables_with_policy(
         config,
         read_write,
         hierarchy_level,
-        policy,
+        Some(policy),
     )
     .await
 }
 
-/// The shared body of [`register_rss_tables`] and its test seam.
+/// The shared body of [`register_rss_tables`] and its test seam. `policy`
+/// carries the fact of injection through to `FeedFetcher::new`, which is why
+/// it is an `Option` and not a defaulted `AllowAll` — see the `# Egress`
+/// section on [`register_rss_tables`].
 #[cfg(feature = "rss")]
 async fn register_with_policy(
     session_ctx: &mut SessionContext,
@@ -223,7 +221,7 @@ async fn register_with_policy(
     config: Option<&RssConfig>,
     read_write: bool,
     hierarchy_level: HierarchyLevel,
-    policy: Arc<dyn EgressPolicy>,
+    policy: Option<Arc<dyn EgressPolicy>>,
 ) -> Result<()> {
     // All invariant checks live here so both front-ends (server and CLI) get
     // identical behavior; a front-end may add an earlier typed error, but
@@ -373,8 +371,8 @@ mod tests {
         let mut ctx = SessionContext::new();
         let config = config_pointing_at(&server, &[("a", "/f.xml")]);
 
-        // Through the test seam: production's `AllowAll` would work here too,
-        // but the seam exists so a test can inject a different policy.
+        // Through the test seam: production injects no policy at all, but
+        // the seam exists so a test can supply one.
         register_rss_tables_with_policy(
             &mut ctx,
             "news",

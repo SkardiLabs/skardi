@@ -29,10 +29,9 @@ use std::sync::Arc;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 /// Why a target was refused. A policy names the reason (e.g. `"link-local"`);
-/// [`FeedFetcher`] pairs it with the host and ip into an [`EgressDenied`]. The
-/// string is contractual: it is stored verbatim as `feeds.last_error`.
-///
-/// [`FeedFetcher`]: super::fetch::FeedFetcher
+/// `FeedFetcher` (unlinked: the `fetch` module is private) pairs it with the
+/// host and ip into an [`EgressDenied`]. The string is contractual: it is
+/// stored verbatim as `feeds.last_error`.
 pub type EgressReason = Cow<'static, str>;
 
 /// Decides whether the fetcher may connect to a resolved address.
@@ -48,8 +47,8 @@ pub trait EgressPolicy: Send + Sync + fmt::Debug {
     /// calling this, so an implementation judges only the address a connect
     /// actually reaches and never has to unmap the mapped form itself. A rule
     /// written against `10.0.0.1` therefore also refuses `::ffff:10.0.0.1`. The
-    /// two call sites are [`check_addrs`] (the resolver path) and the fetcher's
-    /// IP-literal hop check.
+    /// two call sites are `check_addrs` (the resolver path; unlinked, it is
+    /// crate-private) and the fetcher's IP-literal hop check.
     fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason>;
 }
 

@@ -26,7 +26,6 @@ use tokio::task::JoinHandle;
 use super::ResolvedSubscription;
 use super::cache::MemoryFeedCache;
 use super::config::{FeedSubscription, RssConfig, inline_config};
-use super::egress::AllowAll;
 use super::engine::{CACHE_MAX_BYTES, RssEngine};
 use super::fetch::FeedFetcher;
 
@@ -106,8 +105,9 @@ pub(crate) fn feed_urls(server: &MockFeedServer, feeds: &[(&str, &str)]) -> Vec<
 /// engine is assembled — the seam for `ttl_seconds`, `max_concurrent`, and
 /// `scan_timeout_seconds`.
 ///
-/// The fetcher is pointed at [`AllowAll`], the OSS default with no
-/// destination filtering, so the subscriptions can name [`MockFeedServer`].
+/// The fetcher is built with no injected policy (`None`) — the OSS default,
+/// no destination filtering — so the subscriptions can name
+/// [`MockFeedServer`].
 /// `request_timeout_seconds` is pulled down from the spec default (30) to 5
 /// so a test that means to hit a *different* bound does not first have to
 /// wait out a request timeout.
@@ -139,7 +139,7 @@ pub(crate) fn test_engine(
     config.request_timeout_seconds = 5;
     tune(&mut config);
     let fetcher = FeedFetcher::new(
-        Arc::new(AllowAll),
+        None,
         Duration::from_secs(config.request_timeout_seconds),
         config.max_response_bytes,
         config.user_agent.clone(),
