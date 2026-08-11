@@ -444,7 +444,12 @@ fn path_parts(
     match v {
         Value::Null => Ok(None),
         Value::Array(elements) => {
-            if elements.len().is_multiple_of(2) && !elements.is_empty() {
+            // A path is ODD-length by construction: n nodes alternate
+            // with n-1 edges, and the minimum is one node (the design's
+            // zero-hop path). Even lengths AND the empty array are both
+            // malformed — an empty array must not be silently accepted
+            // as a "0-node path".
+            if elements.len().is_multiple_of(2) {
                 return Err(mismatch(col, row, "path", v));
             }
             let mut nodes = Vec::with_capacity(elements.len() / 2 + 1);
@@ -797,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn an_even_length_path_is_a_typed_mismatch() {
+    fn even_length_and_empty_paths_are_typed_mismatches() {
         let columns = vec![col("p", GraphType::Path)];
         let rows = vec![vec![
             serde_json::json!([{"id":1,"label":"A","properties":{}},
@@ -805,5 +810,18 @@ mod tests {
         ]];
         let err = build_batch(&columns, &rows, 0).unwrap_err();
         assert!(err.to_string().contains("declared 'path'"), "{err}");
+
+        // The empty array is malformed too — an AGE path always carries
+        // at least one node, and silently accepting [] as a "0-node
+        // path" would hide upstream corruption.
+        let rows = vec![vec![serde_json::json!([])]];
+        let err = build_batch(&columns, &rows, 0).unwrap_err();
+        assert!(err.to_string().contains("declared 'path'"), "{err}");
+
+        // The zero-hop minimum stays legal: one node, no edges.
+        let rows = vec![vec![
+            serde_json::json!([{"id":1,"label":"A","properties":{}}]),
+        ]];
+        build_batch(&columns, &rows, 0).expect("a single-node path is the legal minimum");
     }
 }
