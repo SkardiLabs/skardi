@@ -71,8 +71,11 @@ pub(crate) const OPML_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// returns and never looks at `RssConfig`'s input shape again.
 ///
 /// Blocking, but boundedly so: the `opml:` form refuses non-regular files,
-/// then performs synchronous file I/O capped at [`MAX_OPML_BYTES`] and
-/// [`OPML_READ_TIMEOUT`] — never a read to EOF, never an unbounded wait.
+/// then performs synchronous file I/O capped at `MAX_OPML_BYTES` and
+/// `OPML_READ_TIMEOUT` (both `pub(crate)`, hence named but not linked here —
+/// this item is public and rustdoc's `private_intra_doc_links` rightly
+/// refuses a public doc that links somewhere the reader cannot follow) —
+/// never a read to EOF, never an unbounded wait.
 /// Callers on an async runtime (registration, when a later task adds it)
 /// should still wrap the call in `spawn_blocking`, as with any filesystem
 /// touch.
