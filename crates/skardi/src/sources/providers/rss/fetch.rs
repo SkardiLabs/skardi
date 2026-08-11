@@ -101,6 +101,20 @@
 //! carried `If-None-Match`/`If-Modified-Since` and maps an unconditional
 //! `304` to [`FetchError::Status`] instead of silently handing the engine an
 //! outcome it cannot honor.
+//!
+//! ## Only `200` is a success
+//!
+//! For the same reason, the success check is `status == 200`, not
+//! `is_success()`: every request here is a bare `GET` — no `Range`, no
+//! `A-IM` — so `200` is the only 2xx a conformant server can answer with.
+//! Accepting the rest of the range is not lenience but data corruption
+//! with a long tail: a spurious `206 Partial Content` streams a truncated
+//! body cleanly and pairs it with the response's validator, and once the
+//! engine caches that pair, every later conditional GET gets `304` and
+//! pins the truncated view until the origin's content really changes.
+//! A non-`200` 2xx therefore maps to [`FetchError::Status`] — a visible
+//! per-feed degrade, re-fetched on the next scan — rather than a cached
+//! window.
 
 // `FeedFetcher` has no production caller yet — the engine (a later PR in
 // this stack) is the first one, and hasn't landed. Until then, everything
@@ -468,7 +482,21 @@ impl FeedFetcher {
                         last_err = Some(err);
                         continue;
                     }
-                    if status.is_success() {
+                    // Exactly `200`, not `is_success()`: this hop sent a bare
+                    // GET (no `Range`, no `A-IM`), and the only conformant
+                    // success answer to that is `200`. Every other 2xx is a
+                    // protocol mismatch that must not become a cached window —
+                    // a spurious `206` streams a truncated body through
+                    // `read_body` cleanly and hands the engine a "complete"
+                    // document with the response's validator, which the next
+                    // scan's conditional GET then pins in place with `304`s
+                    // until the origin's content actually changes; `204`/`205`
+                    // similarly yield an empty "success". Falling through to
+                    // `FetchError::Status` instead degrades visibly
+                    // (`feeds.last_error`) and re-fetches next scan, and is
+                    // correctly non-retried within the hop (a 2xx mismatch is
+                    // the server's answer, not a transient fault).
+                    if status == StatusCode::OK {
                         // Body-phase failures spend the same attempt budget
                         // as send() failures: a connection that dies
                         // mid-body is no less transient than one that dies
@@ -1136,6 +1164,51 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, FetchError::Status { status: 404 }),
+            "got {err}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spurious_206_is_a_status_error_not_a_cached_window() {
+        // A bare GET (no Range) answered with `206 Partial Content` — a CDN
+        // or misconfigured origin serving a possibly-truncated body. Were
+        // this admitted as success, the body would stream through read_body
+        // cleanly and carry the etag into the engine's cache, where the next
+        // scan's conditional GET pins the truncated view with `304`s. It must
+        // be a Status error instead: a visible degrade, re-fetched next scan,
+        // and not retried within the hop (one request only — the 206 is the
+        // server's answer, not a transient fault).
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::new(206, "<rss/>".as_bytes().to_vec())
+                .with_header("content-type", "application/xml")
+                .with_header("etag", "\"v1\"")
+        })
+        .await;
+        let f = test_fetcher();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Status { status: 206 }),
+            "got {err}"
+        );
+        assert_eq!(server.requests().len(), 1, "a 2xx mismatch is not retried");
+    }
+
+    #[tokio::test]
+    async fn spurious_204_is_a_status_error_not_an_empty_success() {
+        // 204 No Content to a resource GET: an empty body must not become a
+        // "successful" empty document.
+        let server = MockFeedServer::start(|_req| MockResponse::status(204)).await;
+        let f = test_fetcher();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Status { status: 204 }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1);
