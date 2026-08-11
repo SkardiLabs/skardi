@@ -132,8 +132,9 @@ pub const RSS_SURFACE_VERSION: u32 = 1;
 /// again. It is a plain data struct with no parsing logic of its own, so
 /// unlike the `opml` module (which requires the `rss` feature for
 /// `quick-xml`, so a doc link to it would dangle in featureless builds) it
-/// stays nameable in featureless builds — the server and CLI can hold it
-/// in a typed field regardless of which features a given build enables.
+/// stays nameable in featureless builds — the server (or any embedder) can
+/// hold it in a typed field regardless of which features a given build
+/// enables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSubscription {
     /// Effective subscription name: an explicit `name`/`text`/`title`, or
@@ -246,10 +247,11 @@ async fn register_with_policy(
     hierarchy_level: HierarchyLevel,
     policy: Option<Arc<dyn EgressPolicy>>,
 ) -> Result<()> {
-    // All invariant checks live here so both front-ends (server and CLI) get
-    // identical behavior; a front-end may add an earlier typed error, but
-    // this is the single enforcement point — the same arrangement
-    // `register_open_connector_tables` uses
+    // All invariant checks live here so every entry point — the server's
+    // registration arm and the public `register_rss_tables_with_policy`
+    // embedder seam — gets identical behavior; a caller may add an earlier
+    // typed error, but this is the single enforcement point — the same
+    // arrangement `register_open_connector_tables` uses
     // (`sources/providers/open_connector/mod.rs:144-168`).
     if hierarchy_level != HierarchyLevel::Catalog {
         return Err(RssError::CatalogHierarchyRequired {

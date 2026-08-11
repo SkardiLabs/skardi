@@ -16,6 +16,8 @@ use skardi::sources::providers::open_connector::{
     OpenConnectorConfig, register_open_connector_tables,
 };
 use skardi::sources::providers::redis::datasource::register_redis_tables;
+#[cfg(feature = "rss")]
+use skardi::sources::providers::rss::register_rss_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
@@ -1782,9 +1784,11 @@ async fn register_data_source(
                 );
 
                 // Config presence, catalog-only, and read-only are re-checked
-                // inside the provider — the single enforcement point shared
-                // with the CLI (`sources/providers/rss/mod.rs:226-258`).
-                skardi::sources::providers::rss::register_rss_tables(
+                // inside the provider: `register_with_policy` in
+                // `sources/providers/rss/mod.rs` is the single enforcement
+                // point that this arm and the public embedder seam
+                // (`register_rss_tables_with_policy`) both feed into.
+                register_rss_tables(
                     session_ctx,
                     &source.name,
                     source.rss.as_ref(),
