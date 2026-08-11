@@ -31,7 +31,7 @@ spec:
       rss:
         feeds:
           - url: https://blog.example.invalid/feed.xml
-            name: example-blog          # optional; defaults to the URL
+            name: example-blog          # optional; defaults to the URL minus credentials/query
           - url: https://weekly.example.invalid/rss.xml
             name: example-weekly
           - url: https://notes.example.invalid/atom.xml

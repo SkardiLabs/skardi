@@ -74,7 +74,11 @@ never quoted. A degraded feed additionally emits a `warn` with its `last_error`.
 The feed URL in those `debug` lines is the thing to know before turning `debug` on
 in an environment where logs go somewhere less trusted than the config does: a
 subscription URL can carry a private token in its query string, and at `debug` it
-is in the log. At `info` and above, no feed URL is emitted.
+is in the log. At `info` and above, no feed URL is emitted. One URL-*shaped*
+string can still appear there: a feed's **name**, which for an unnamed
+subscription defaults to its URL stripped of credentials, query, and fragment —
+the parts that can carry a secret — and names are exactly what `info`+ events
+carry.
 
 ---
 
@@ -95,7 +99,7 @@ spec:
       rss:
         feeds:
           - url: https://blog.rust-lang.org/feed.xml
-            name: rust-blog            # optional; defaults to the URL
+            name: rust-blog            # optional; defaults to the URL minus credentials/query
           - url: https://this-week-in-rust.org/rss.xml
         # or: opml: subscriptions.opml # mutually exclusive with feeds:
         ttl_seconds: 900               # 0 = always live
@@ -166,7 +170,7 @@ requests at any moment, including immediately after a failure.
 
 | Column | Arrow type | Null | Notes |
 |---|---|---|---|
-| `name` | `Utf8` | no | Configured name; defaults to the URL; unique. |
+| `name` | `Utf8` | no | Configured name; defaults to the URL stripped of credentials, query, and fragment; unique. |
 | `url` | `Utf8` | no | Subscription URL. |
 | `title` | `Utf8` | yes | Wire title, once fetched. |
 | `site_url` | `Utf8` | yes | The feed's HTML alternate. |
@@ -1001,6 +1005,12 @@ report](#the-closing-health-report) `SELECT`s this column straight into a readin
 agent's context, treat its contents as **feed-authored text**, on the same footing
 as `content` and `summary` — see [Feeding it to an LLM](#feeding-it-to-an-llm).
 
+It also never contains the request URL. A transport error folds in reqwest's
+underlying cause chain — "Connection refused", a DNS failure, at most a host or
+an `ip:port` — with the URL clause reqwest would normally append dropped: on a
+redirected fetch that URL is whatever the last `Location` pointed at, and either
+way it can carry a private query token.
+
 The boundary above is measured at the pinned dependency versions and enforced by
 `parse_failure_last_error_quotes_structure_not_prose`, which runs a table of
 document shapes and asserts, shape by shape, which ones' text reaches the column
@@ -1019,7 +1029,7 @@ By the shape of the message:
 | `response exceeded <n> bytes` | Fetch | The **decoded** body passed `max_response_bytes`. Terminal, not retried. |
 | `too many redirects (limit 5)` | Fetch | The redirect chain was longer than the hop budget. |
 | `invalid feed url: …` | Fetch | The URL — or a redirect `Location` — is not a usable `http(s)` URL. |
-| `transport error: …` | Fetch | A connection or I/O failure, after retries were exhausted. |
+| `transport error: …` | Fetch | A connection or I/O failure, after retries were exhausted. Carries the underlying cause chain (at most a host or `ip:port`); never the request URL. |
 | `revalidated (304) but the cached window had already been evicted …` | Cache | A `304` came back for a window the [bounded cache](#the-cache-is-bounded-and-windows-can-be-evicted) had already evicted. Self-correcting on the next scan — the next attempt refetches unconditionally. This is the one shape that pairs `last_status = 'error'` with a non-NULL `item_count`. |
 
 ### A feed serves rows but they are missing fields

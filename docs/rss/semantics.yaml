@@ -48,9 +48,10 @@ spec:
       columns:
         - name: name
           description: >-
-            Subscription name from configuration, defaulting to the URL when
-            none was given. Unique across the source, and the value that appears
-            as `items.feed`.
+            Subscription name from configuration, defaulting to the URL
+            stripped of credentials, query, and fragment when none was given.
+            Unique across the source, and the value that appears as
+            `items.feed`.
         - name: url
           description: "The subscribed feed URL, exactly as configured."
         - name: title
