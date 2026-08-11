@@ -820,6 +820,99 @@ mod tests {
     }
 
     #[test]
+    fn relationships_convert_to_the_canonical_struct_with_null_rows() {
+        let columns = vec![col("r", GraphType::Relationship)];
+        let edge = parse_agtype(
+            r#"{"id": 9, "label": "KNOWS", "start_id": 1, "end_id": 2, "properties": {"since": 2019}}::edge"#,
+        )
+        .unwrap();
+        let rows = vec![vec![edge], vec![Value::Null]];
+        let batch = build_batch(&columns, &rows, 0).expect("converts");
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(s.is_null(1), "null relationship row is a null struct");
+        let types = s
+            .column_by_name("type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(types.value(0), "KNOWS");
+        let starts = s
+            .column_by_name("start_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(starts.value(0), "1", "endpoint ids stringify");
+    }
+
+    #[test]
+    fn every_wrong_kind_is_a_typed_mismatch_per_declared_type() {
+        // One wrong-kind row per scalar declared type, plus the malformed
+        // struct shapes — each must name the declared type, never a value.
+        let cases: Vec<(GraphType, Value, &str)> = vec![
+            (GraphType::String, serde_json::json!(7), "string"),
+            (GraphType::Bool, serde_json::json!("yes"), "bool"),
+            (GraphType::Float, serde_json::json!("1.5"), "float"),
+            (GraphType::Node, serde_json::json!({"id": 1}), "node"), // no label
+            (
+                GraphType::Relationship,
+                serde_json::json!({"id": 1, "label": "K"}), // no endpoints
+                "relationship",
+            ),
+            (GraphType::Path, serde_json::json!("not-a-list"), "path"),
+        ];
+        for (ty, bad, name) in cases {
+            let columns = vec![col("c", ty)];
+            let err = build_batch(&columns, &[vec![bad]], 0).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("declared '{name}'")),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_names_and_arrow_types_cover_every_variant() {
+        for (ty, canonical) in [
+            (GraphType::String, "string"),
+            (GraphType::Int, "int"),
+            (GraphType::Float, "float"),
+            (GraphType::Bool, "bool"),
+            (GraphType::Json, "json"),
+            (GraphType::Node, "node"),
+            (GraphType::Relationship, "relationship"),
+            (GraphType::Path, "path"),
+        ] {
+            assert_eq!(ty.canonical(), canonical);
+            // Round-trip: the canonical name parses back to the same type.
+            assert_eq!(GraphType::parse(canonical), Some(ty));
+            // And every variant plans a concrete Arrow type.
+            let _ = ty.arrow_type();
+        }
+    }
+
+    #[test]
+    fn a_path_with_a_malformed_element_is_a_typed_mismatch() {
+        // An edge slot holding a non-edge object fails as 'relationship'
+        // (the element conversion), with the path row named.
+        let columns = vec![col("p", GraphType::Path)];
+        let rows = vec![vec![serde_json::json!([
+            {"id": 1, "label": "A", "properties": {}},
+            {"id": 9}, // not an edge
+            {"id": 2, "label": "B", "properties": {}}
+        ])]];
+        let err = build_batch(&columns, &rows, 3).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("declared 'relationship'"), "{msg}");
+        assert!(msg.contains("row 3"), "{msg}");
+    }
+
+    #[test]
     fn a_null_path_row_is_a_null_struct() {
         // With a None parent validity the null row would read as a VALID
         // struct whose child lists are null — and SQL `path IS NULL`

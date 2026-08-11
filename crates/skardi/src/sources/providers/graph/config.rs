@@ -263,6 +263,37 @@ password_env: AGE_PG_PASS
     }
 
     #[test]
+    fn remaining_bounds_are_validated() {
+        let mut c = base();
+        c.max_rows = 0;
+        assert!(
+            c.validate("kg", "postgres://h/db")
+                .unwrap_err()
+                .to_string()
+                .contains("max_rows")
+        );
+        let mut c = base();
+        c.max_connections = 0;
+        assert!(
+            c.validate("kg", "postgres://h/db")
+                .unwrap_err()
+                .to_string()
+                .contains("max_connections")
+        );
+        let mut c = base();
+        c.graph_name = String::new();
+        assert!(
+            c.validate("kg", "postgres://h/db")
+                .unwrap_err()
+                .to_string()
+                .contains("bare identifier")
+        );
+        let mut c = base();
+        c.password_env = Some("2BAD".into());
+        assert!(c.validate("kg", "postgres://h/db").is_err());
+    }
+
+    #[test]
     fn unknown_fields_are_rejected_at_parse() {
         let err = serde_yaml::from_str::<GraphConfig>("backend: age\ngraph_name: g\nviews: []\n")
             .unwrap_err();

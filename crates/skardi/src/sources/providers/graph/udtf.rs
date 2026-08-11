@@ -774,6 +774,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_arg_counts_fail_with_the_signature_named() {
+        let ctx = ctx_with(vec![]).await;
+        for sql in [
+            "SELECT * FROM cypher_query('kg')",
+            "SELECT * FROM cypher_query('kg', 'RETURN 1', '{}', '{\"a\":\"int\"}', 'extra')",
+            "SELECT * FROM graph_schema()",
+            "SELECT * FROM graph_schema('kg', 'extra')",
+        ] {
+            let err = ctx.sql(sql).await.expect_err(sql);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("expects") || msg.contains("exactly"),
+                "{sql}: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_params_and_columns_fail_at_planning() {
+        let ctx = ctx_with(vec![]).await;
+        // params: unparseable JSON, then a non-object.
+        for (params, needle) in [("{not json", "unparseable JSON"), ("[1]", "an array")] {
+            let err = ctx
+                .sql(&format!(
+                    "SELECT * FROM cypher_query('kg', 'MATCH (n) RETURN n', '{params}', \
+                     '{{\"n\": \"node\"}}')"
+                ))
+                .await
+                .expect_err(params);
+            assert!(err.to_string().contains(needle), "{params}: {err}");
+        }
+        // columns: unparseable, non-object, empty, non-string type.
+        for (columns, needle) in [
+            ("{not json", "unparseable JSON"),
+            ("[1]", "expected a JSON object"),
+            ("{}", "at least one column"),
+            ("{\"n\": 7}", "type must be a string"),
+        ] {
+            let err = ctx
+                .sql(&format!(
+                    "SELECT * FROM cypher_query('kg', 'MATCH (n) RETURN n', '{{}}', '{columns}')"
+                ))
+                .await
+                .expect_err(columns);
+            assert!(err.to_string().contains(needle), "{columns}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_prunes_columns_and_explain_renders_the_plan() {
+        let ctx = ctx_with(vec![vec![serde_json::json!("ada"), serde_json::json!(1)]]).await;
+        // Projection: only the second declared column is scanned out.
+        let batches = collect(
+            &ctx,
+            "SELECT n FROM cypher_query('kg', 'MATCH (p) RETURN p.name, p.n', '{}', \
+             '{\"name\": \"string\", \"n\": \"int\"}')",
+        )
+        .await;
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "n");
+        // EXPLAIN drives DisplayAs for both scan kinds.
+        let plan = collect(
+            &ctx,
+            "EXPLAIN SELECT n FROM cypher_query('kg', 'MATCH (p) RETURN p.n', '{}', \
+             '{\"n\": \"int\"}')",
+        )
+        .await;
+        assert!(!plan.is_empty());
+        let plan = collect(&ctx, "EXPLAIN SELECT * FROM graph_schema('kg')").await;
+        assert!(!plan.is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_schema_respects_a_sql_limit() {
+        let ctx = ctx_with(vec![]).await;
+        let batches = collect(&ctx, "SELECT label FROM graph_schema('kg') LIMIT 1").await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    #[tokio::test]
     async fn graph_schema_lists_labels_and_kinds() {
         let ctx = ctx_with(vec![]).await;
         let batches = collect(

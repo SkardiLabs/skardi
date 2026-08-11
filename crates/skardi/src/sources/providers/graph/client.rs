@@ -212,40 +212,13 @@ impl AgeClient {
     /// Returns the statement batch and the prepared name to DEALLOCATE
     /// (when params were bound).
     fn build_sql(&self, cypher: &str, params: &Value, arity: usize) -> (String, Option<String>) {
-        let tag = dollar_tag(cypher);
-        let graph = self.graph_name.replace('\'', "''");
-        let cols: Vec<String> = (0..arity)
-            .map(|i| format!("c{i} ag_catalog.agtype"))
-            .collect();
-        let outs: Vec<String> = (0..arity).map(|i| format!("c{i}")).collect();
-        let has_params = params.as_object().is_some_and(|m| !m.is_empty());
-        if has_params {
-            let name = format!(
-                "skq_p_{}_{}",
-                std::process::id(),
-                self.prepare_seq.fetch_add(1, Ordering::Relaxed)
-            );
-            let literal = params.to_string().replace('\'', "''");
-            let batch = format!(
-                "PREPARE {name}(ag_catalog.agtype) AS \
-                 SELECT {} FROM ag_catalog.cypher('{graph}', {tag}{cypher}{tag}, $1) \
-                 AS t({}); \
-                 EXECUTE {name}('{literal}');",
-                outs.join(", "),
-                cols.join(", ")
-            );
-            (batch, Some(name))
-        } else {
-            (
-                format!(
-                    "SELECT {} FROM ag_catalog.cypher('{graph}', {tag}{cypher}{tag}) \
-                     AS t({})",
-                    outs.join(", "),
-                    cols.join(", ")
-                ),
-                None,
-            )
-        }
+        build_cypher_sql(
+            &self.graph_name,
+            self.prepare_seq.fetch_add(1, Ordering::Relaxed),
+            cypher,
+            params,
+            arity,
+        )
     }
 }
 
@@ -460,6 +433,49 @@ impl GraphClient for AgeClient {
     }
 }
 
+/// Render the `cypher()` invocation batch (see [`AgeClient::build_sql`]
+/// for the protocol constraints that shape it). A free function so the
+/// exact SQL text — quote doubling, dollar tags, arity columns, the
+/// PREPARE/EXECUTE split — is pinned by unit tests without a pool.
+fn build_cypher_sql(
+    graph_name: &str,
+    seq: u64,
+    cypher: &str,
+    params: &Value,
+    arity: usize,
+) -> (String, Option<String>) {
+    let tag = dollar_tag(cypher);
+    let graph = graph_name.replace('\'', "''");
+    let cols: Vec<String> = (0..arity)
+        .map(|i| format!("c{i} ag_catalog.agtype"))
+        .collect();
+    let outs: Vec<String> = (0..arity).map(|i| format!("c{i}")).collect();
+    let has_params = params.as_object().is_some_and(|m| !m.is_empty());
+    if has_params {
+        let name = format!("skq_p_{}_{seq}", std::process::id());
+        let literal = params.to_string().replace('\'', "''");
+        let batch = format!(
+            "PREPARE {name}(ag_catalog.agtype) AS \
+             SELECT {} FROM ag_catalog.cypher('{graph}', {tag}{cypher}{tag}, $1) \
+             AS t({}); \
+             EXECUTE {name}('{literal}');",
+            outs.join(", "),
+            cols.join(", ")
+        );
+        (batch, Some(name))
+    } else {
+        (
+            format!(
+                "SELECT {} FROM ag_catalog.cypher('{graph}', {tag}{cypher}{tag}) \
+                 AS t({})",
+                outs.join(", "),
+                cols.join(", ")
+            ),
+            None,
+        )
+    }
+}
+
 /// A dollar-quote tag that provably does not occur in `text`: extend a
 /// base tag with a counter until absent — no escape rules to get wrong.
 fn dollar_tag(text: &str) -> String {
@@ -523,6 +539,67 @@ mod tests {
         let hostile = "RETURN '$skq$ $skq1$'";
         let tag = dollar_tag(hostile);
         assert!(!hostile.contains(&tag), "{tag}");
+    }
+
+    #[test]
+    fn parameterless_sql_is_a_single_select_with_no_prepare() {
+        let (sql, prepared) = build_cypher_sql(
+            "kg",
+            0,
+            "MATCH (n) RETURN n.a, n.b",
+            &serde_json::json!({}),
+            2,
+        );
+        assert!(prepared.is_none(), "no params → nothing to DEALLOCATE");
+        assert!(
+            sql.starts_with("SELECT c0, c1 FROM ag_catalog.cypher('kg', $skq$"),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("AS t(c0 ag_catalog.agtype, c1 ag_catalog.agtype)"),
+            "{sql}"
+        );
+        assert!(!sql.contains("PREPARE"), "{sql}");
+    }
+
+    #[test]
+    fn parameterized_sql_prepares_executes_and_names_the_statement() {
+        let (sql, prepared) = build_cypher_sql(
+            "kg",
+            7,
+            "MATCH (n) WHERE n.x = $x RETURN n",
+            &serde_json::json!({"x": 1}),
+            1,
+        );
+        let name = prepared.expect("params → PREPARE name to DEALLOCATE");
+        assert!(name.starts_with("skq_p_"), "{name}");
+        assert!(name.ends_with("_7"), "the seq uniquifies: {name}");
+        assert!(
+            sql.contains(&format!("PREPARE {name}(ag_catalog.agtype)")),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(&format!("EXECUTE {name}('{{\"x\":1}}');")),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn hostile_values_stay_inside_their_literals() {
+        // Graph names double their quotes; param values ride serde_json
+        // encoding plus WHOLE-literal quote doubling — the SQL text can
+        // never fall out of its string literal.
+        let (sql, _) = build_cypher_sql(
+            "kg",
+            0,
+            "RETURN $s",
+            &serde_json::json!({"s": "O'Brien '; DROP TABLE x; --"}),
+            1,
+        );
+        assert!(sql.contains("O''Brien ''; DROP TABLE x; --"), "{sql}");
+
+        let (sql, _) = build_cypher_sql("g'name", 0, "RETURN 1", &serde_json::json!({}), 1);
+        assert!(sql.contains("cypher('g''name'"), "{sql}");
     }
 
     #[test]

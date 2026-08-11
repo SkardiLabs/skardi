@@ -173,6 +173,23 @@ mod tests {
     }
 
     #[test]
+    fn short_backend_messages_pass_untruncated_and_kinds_cover_json() {
+        let err = GraphError::backend("kg", "42601", "syntax error");
+        assert!(err.to_string().contains("syntax error"), "{err}");
+        assert!(!err.to_string().contains('…'), "no ellipsis when unclipped");
+        for (v, kind) in [
+            (serde_json::json!(null), "null"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(1), "a number"),
+            (serde_json::json!("s"), "a string"),
+            (serde_json::json!([1]), "an array"),
+            (serde_json::json!({}), "an object"),
+        ] {
+            assert_eq!(json_kind(&v), kind);
+        }
+    }
+
+    #[test]
     fn mutation_rejected_never_carries_query_text() {
         let err = GraphError::MutationRejected {
             keyword: "CREATE",

@@ -657,6 +657,44 @@ jobs:
         if: always()
         run: docker rm -f skardi-minio || true
 
+      # Apache AGE gives the graph provider's Postgres path real coverage —
+      # the AgeClient/register_graph_source code is exercised ONLY by the
+      # graph_age_live suite, which self-skips without this backend (the
+      # PR #203 codecov report showed client.rs at 11% for exactly that
+      # reason). Same docker-run pattern as MinIO above.
+      - name: Start Apache AGE for graph live tests
+        run: |
+          docker run -d --name skardi-age \
+            -p 127.0.0.1:15432:5432 \
+            -e POSTGRES_PASSWORD=skardiage \
+            apache/age
+          for i in $(seq 1 30); do
+            if docker exec skardi-age pg_isready -U postgres >/dev/null 2>&1; then
+              echo "age ready after ${i}s"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "apache/age failed to become ready"
+              docker logs skardi-age
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Execute graph AGE live tests
+        env:
+          SKARDI_AGE_LIVE_URL: postgres://postgres:skardiage@127.0.0.1:15432/postgres
+        # `--no-tests=fail`: if the suite is ever renamed out of the
+        # filter's reach, fail loudly instead of reporting success having
+        # run nothing (the documents S3 step's discipline).
+        run: |
+          cargo llvm-cov --no-report nextest --all-features \
+            -E 'binary(graph_age_live)' --no-tests=fail -- --ignored
+
+      - name: Stop Apache AGE
+        if: always()
+        run: docker rm -f skardi-age || true
+
       - name: Generate coverage report (lcov)
         run: cargo llvm-cov report --lcov --output-path lcov.info
 
