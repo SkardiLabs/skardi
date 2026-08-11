@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     /// [`engine_with_cache`] with a caller-supplied egress policy — the seam
-    /// [`egress_blocked_feed_degrades_like_unreachable`] uses to inject a
+    /// [`a_cold_cache_denial_yields_error_and_zero_rows`] uses to inject a
     /// [`DenyList`] instead of the OSS `AllowAll` default.
     fn engine_with_cache_and_policy(
         feeds: &[(String, String)],
@@ -2212,7 +2212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_blocked_feed_degrades_like_unreachable() {
+    async fn a_cold_cache_denial_yields_error_and_zero_rows() {
         // Guard, not an assertion target: this test reaches the `rss feed
         // degraded` warn callsite, and `tracing` caches a callsite's `Interest`
         // globally on first use — a guardless test reaching it first would cache
