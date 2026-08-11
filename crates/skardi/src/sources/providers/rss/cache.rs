@@ -529,8 +529,8 @@ impl Inner {
 /// (as a last resort) total observation count, behind a `Mutex`
 /// (hand-rolled LRU, following `open_connector/cache.rs`'s precedent rather
 /// than adding the `lru` crate). Recency is a tick recorded on each entry
-/// rather than a list of keys kept beside the map — see [`Entry`] for why
-/// that shape and not the other.
+/// rather than a list of keys kept beside the map — see `Entry` (private,
+/// so named in code font, not linked) for why that shape and not the other.
 ///
 /// `max_entries` bounds how many feeds may hold a cached window at once —
 /// it does not bound the map itself, since a feed that is only failing or
