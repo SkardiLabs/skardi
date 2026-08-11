@@ -24,6 +24,7 @@ use datafusion::prelude::SessionContext;
 use sqlx::Executor;
 use sqlx::postgres::PgPoolOptions;
 
+use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBounds};
 use skardi::sources::providers::graph::config::GraphConfig;
 use skardi::sources::providers::graph::udtf::GraphSources;
 use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
@@ -389,8 +390,10 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         ]
     );
 
-    // The row cap: a 2-row source with max_rows 2 passes; max_rows 1
-    // fails LOUDLY (typed, names the cap), never a silent truncation.
+    // The row cap: max_rows 1 fails LOUDLY (typed, names the cap),
+    // never a silent truncation — and the ERROR path must not leak its
+    // PREPARE onto the pooled connection (prepared statements are
+    // session-level; rollback does not clear them).
     let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
     let config: GraphConfig =
         serde_yaml::from_str(&format!("backend: age\ngraph_name: {graph}\nmax_rows: 1\n"))
@@ -413,6 +416,43 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     let msg = err.to_string();
     assert!(msg.contains("max_rows = 1"), "{msg}");
     assert!(msg.contains("LIMIT"), "the fix is named: {msg}");
+
+    // Leak regression: hammer the capped (error) path well past the
+    // pool size — parameterized, so each call PREPAREs — then sweep the
+    // SAME pool's sessions for leftover skq_p_* statements
+    // (pg_prepared_statements is session-local, so the sweep must run on
+    // the very sessions execute used; hence the direct AgeClient and its
+    // test-only pool hook). Before the fix each error path left one
+    // behind, monotonically.
+    let client = AgeClient::connect("leakcheck", &url, &graph, None, None)
+        .await
+        .expect("connects");
+    let tight = QueryBounds {
+        timeout: std::time::Duration::from_secs(10),
+        max_rows: 1,
+    };
+    for _ in 0..8 {
+        let err = client
+            .execute(
+                "MATCH (p:Person) WHERE p.name <> $x RETURN p.name",
+                &serde_json::json!({"x": "nobody"}),
+                1,
+                tight,
+            )
+            .await
+            .err()
+            .expect("4 people, cap 1: the capped error path");
+        assert!(err.to_string().contains("max_rows = 1"), "{err}");
+    }
+    for _ in 0..8 {
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_prepared_statements WHERE name LIKE 'skq_p_%'",
+        )
+        .fetch_one(client.pool_for_tests())
+        .await
+        .expect("pg_prepared_statements readable");
+        assert_eq!(leaked, 0, "no skq_p_* statement survives an error path");
+    }
 
     drop_graph(&pool, &graph).await;
 }

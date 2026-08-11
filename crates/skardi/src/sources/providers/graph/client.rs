@@ -127,6 +127,14 @@ impl AgeClient {
         })
     }
 
+    /// The pool, for the live leak-regression test ONLY (the
+    /// `pg_prepared_statements` sweep is session-local, so it must run
+    /// on the very sessions `execute` used). Not API.
+    #[doc(hidden)]
+    pub fn pool_for_tests(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// The `cypher()` invocation, spoken over the SIMPLE query protocol —
     /// three AGE realities verified live make this the one sound
     /// spelling:
@@ -223,8 +231,11 @@ impl GraphClient for AgeClient {
 
             // Stream (simple protocol — see build_sql) and cap:
             // max_rows + 1 proves the overflow without buffering past it.
-            let mut rows: Vec<GraphRow> = Vec::new();
-            {
+            // The collection runs as an INNER block so every early exit
+            // (row cap, malformed cell, wire error) still reaches the
+            // DEALLOCATE below.
+            let collected: Result<Vec<GraphRow>, GraphError> = async {
+                let mut rows: Vec<GraphRow> = Vec::new();
                 let mut stream = tx.fetch_many(sqlx::raw_sql(&sql));
                 while let Some(step) = stream.next().await {
                     let step = step.map_err(|e| map_query_error(&source, bounds, &e))?;
@@ -257,14 +268,25 @@ impl GraphClient for AgeClient {
                     }
                     rows.push(values);
                 }
+                Ok(rows)
             }
+            .await;
             if let Some(name) = &prepared {
-                // Targeted DEALLOCATE (never ALL — sqlx's own statement
-                // cache lives on the same connection).
-                tx.execute(format!("DEALLOCATE {name}").as_str())
-                    .await
-                    .map_err(|e| backend_error(&source, &e))?;
+                // On EVERY exit, success or error: prepared statements are
+                // SESSION-level — rollback does not clear them, the
+                // pid+seq names never reuse, and skipping this on an
+                // error path would monotonically accumulate statements on
+                // the pooled connection. Best-effort on the error path
+                // (the original error stays the one reported); a failed
+                // DEALLOCATE on the success path is itself an error.
+                // Targeted, never ALL — sqlx's own statement cache lives
+                // on the same connection.
+                let dealloc = tx.execute(format!("DEALLOCATE {name}").as_str()).await;
+                if collected.is_ok() {
+                    dealloc.map_err(|e| backend_error(&source, &e))?;
+                }
             }
+            let rows = collected?;
             // Read-only: rollback returns the connection with nothing to
             // undo either way.
             tx.rollback()
@@ -272,6 +294,12 @@ impl GraphClient for AgeClient {
                 .map_err(|e| backend_error(&source, &e))?;
             Ok(rows)
         };
+        // Residual, stated: the client-side timeout below ABANDONS the
+        // future mid-flight — no DEALLOCATE can run on that path. It only
+        // fires when the backend outlived its own statement_timeout by 5s
+        // (i.e. stopped answering), and sqlx tears down a connection
+        // dropped mid-query rather than pooling it, so nothing
+        // accumulates there either.
         // Client-side wrap: the server timeout is authoritative, this one
         // covers a backend that stops answering entirely.
         let rows = tokio::time::timeout(bounds.timeout + Duration::from_secs(5), run)
