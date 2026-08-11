@@ -116,7 +116,11 @@ fn unique_graph(tag: &str) -> String {
 #[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
 async fn scalars_params_and_ordering_round_trip() {
     let Some(url) = live_url() else {
-        panic!("SKARDI_AGE_LIVE_URL must be set for --ignored live tests");
+        // CI's coverage job runs `-- --ignored` across the board (the
+        // documents_s3_live convention): absent gating env means SKIP,
+        // loudly on stderr — never a panic.
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
     };
     let graph = unique_graph("scalar");
     let pool = seed_graph(&url, &graph).await;
@@ -163,7 +167,11 @@ async fn scalars_params_and_ordering_round_trip() {
 #[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
 async fn nodes_relationships_and_paths_take_the_canonical_shapes() {
     let Some(url) = live_url() else {
-        panic!("SKARDI_AGE_LIVE_URL must be set for --ignored live tests");
+        // CI's coverage job runs `-- --ignored` across the board (the
+        // documents_s3_live convention): absent gating env means SKIP,
+        // loudly on stderr — never a panic.
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
     };
     let graph = unique_graph("shape");
     let pool = seed_graph(&url, &graph).await;
@@ -243,7 +251,11 @@ async fn nodes_relationships_and_paths_take_the_canonical_shapes() {
 #[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
 async fn the_backend_read_only_transaction_is_the_boundary() {
     let Some(url) = live_url() else {
-        panic!("SKARDI_AGE_LIVE_URL must be set for --ignored live tests");
+        // CI's coverage job runs `-- --ignored` across the board (the
+        // documents_s3_live convention): absent gating env means SKIP,
+        // loudly on stderr — never a panic.
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
     };
     let graph = unique_graph("ro");
     let pool = seed_graph(&url, &graph).await;
@@ -308,7 +320,11 @@ async fn the_backend_read_only_transaction_is_the_boundary() {
 #[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
 async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     let Some(url) = live_url() else {
-        panic!("SKARDI_AGE_LIVE_URL must be set for --ignored live tests");
+        // CI's coverage job runs `-- --ignored` across the board (the
+        // documents_s3_live convention): absent gating env means SKIP,
+        // loudly on stderr — never a panic.
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
     };
     let graph = unique_graph("schema");
     let pool = seed_graph(&url, &graph).await;
