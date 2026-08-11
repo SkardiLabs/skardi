@@ -63,6 +63,9 @@ documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
 rss = [
     "dep:quick-xml",
     "reqwest/gzip",
+    "dep:encoding_rs",
+    "dep:htmd",
+    "dep:feed-rs",
 ]
 
 [dependencies]
@@ -143,6 +146,12 @@ liteparse = { version = "2.4.0", default-features = false, optional = true }
 blake3 = "1"
 # include_globs matching for the documents connector.
 glob = { version = "0.3", optional = true }
+# Label lookup + transcoding for the rss sanitation ladder's re-encode rung.
+encoding_rs = { version = "0.8", optional = true }
+# Deterministic HTML→Markdown for rss item content.
+htmd = { version = "0.5.5", optional = true }
+# RSS 0.9x/1.0/2.0, Atom, and JSON Feed parsing into one model.
+feed-rs = { version = "2.4", optional = true }
 # object-store (S3/GCS/Azure) backend for the documents connector's source `path`
 # and `image_store`. Only the `aws` scheme is wired in v1 (see blob.rs).
 object_store = { workspace = true, optional = true }
