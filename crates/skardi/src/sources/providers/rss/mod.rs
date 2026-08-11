@@ -72,9 +72,10 @@ pub mod table;
 
 // The acceptance-criteria crosswalk: full SQL against a registered catalog
 // whose feeds live on `testutil::MockFeedServer`. In-crate rather than in
-// `crates/skardi/tests/` because it drives `register_rss_tables_with_policy`
-// below, which is `#[cfg(test)] pub(crate)` and unreachable from an external
-// test crate — see that function's doc, and this module's own.
+// `crates/skardi/tests/` because that mock server is what binds it here:
+// `testutil` is test-only `pub(crate)` and unreachable from an external
+// test crate. (`register_rss_tables_with_policy` itself is `pub` — the
+// egress seam an embedder calls — so it is not the constraint.)
 #[cfg(all(test, feature = "rss"))]
 mod integration_tests;
 
