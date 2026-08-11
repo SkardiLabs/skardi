@@ -170,8 +170,13 @@ pub struct FeedSubscription {
     pub url: String,
 
     /// Human-readable subscription name, surfaced as the `feed` column in
-    /// `main.items`/`main.feeds`. Defaults to `url` when omitted — including
-    /// for duplicate-name detection, which compares this *effective* name.
+    /// `main.items`/`main.feeds`. Defaults to `url` when omitted, empty, or
+    /// whitespace-only — the same "blank is absent" normalization the
+    /// `user_agent` check applies, and what a title-less OPML outline needs:
+    /// OPML 2.0 requires the `text` attribute, so exporters emit `text=""`
+    /// rather than omitting it. Duplicate-name detection compares this
+    /// *effective* name. A non-blank name is used exactly as written (no
+    /// trimming): `"a "` and `"a"` stay two distinct names.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -247,7 +252,8 @@ fn invalid_config(reason: impl Into<String>) -> RssError {
 
 /// Check and resolve a flat `(url, name)` subscription list — the single
 /// implementation of the per-subscription rules both input forms share: a
-/// non-empty list, name defaulting (an omitted name falls back to the URL),
+/// non-empty list, name defaulting (an omitted, empty, or whitespace-only
+/// name falls back to the URL — see [`FeedSubscription::name`]),
 /// http/https scheme validation, and effective-name uniqueness.
 ///
 /// Run twice by design, against the same rules both times:
@@ -277,7 +283,16 @@ pub(crate) fn finalize(
             )));
         }
 
-        let effective_name = sub_name.unwrap_or_else(|| url.clone());
+        // Blank is absent: only `None` falling back would let a title-less
+        // OPML outline (`text=""` — OPML 2.0 requires the attribute, so
+        // exporters emit it empty rather than omit it) or a `name: " "` be
+        // the effective name, yielding an unqueryable `feed` value and, with
+        // two such outlines, a `duplicate subscription name ''` the operator
+        // cannot grep their OPML for. Same normalization as the
+        // `user_agent` check. Non-blank names stay exactly as written.
+        let effective_name = sub_name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| url.clone());
         if !seen_names.insert(effective_name.clone()) {
             return Err(invalid_config(format!(
                 "duplicate subscription name '{effective_name}'"
@@ -411,6 +426,45 @@ feeds:
             err.to_string().contains("duplicate subscription name"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn blank_names_fall_back_to_the_url() {
+        // Two entries with empty names — the shape a title-less OPML export
+        // produces (OPML 2.0 requires `text`, so exporters emit `text=""`).
+        // Before blank-is-absent, both effective names were `""` and the
+        // whole source was rejected with `duplicate subscription name ''`,
+        // which no operator can grep an OPML file for. Now each falls back
+        // to its (distinct) URL and the pair resolves.
+        let resolved = finalize(vec![
+            ("https://a.example/f.xml".to_string(), Some(String::new())),
+            ("https://b.example/f.xml".to_string(), Some(String::new())),
+        ])
+        .expect("blank names must fall back to distinct URLs");
+        assert_eq!(resolved[0].name, "https://a.example/f.xml");
+        assert_eq!(resolved[1].name, "https://b.example/f.xml");
+
+        // Whitespace-only is as absent as empty — same normalization the
+        // user_agent check applies.
+        let resolved = finalize(vec![(
+            "https://a.example/f.xml".to_string(),
+            Some("   ".to_string()),
+        )])
+        .expect("a whitespace-only name must fall back to the URL");
+        assert_eq!(resolved[0].name, "https://a.example/f.xml");
+
+        // A non-blank name is used exactly as written — no trimming, so
+        // `"a "` and `"a"` remain two distinct names.
+        let resolved = finalize(vec![
+            (
+                "https://a.example/f.xml".to_string(),
+                Some("a ".to_string()),
+            ),
+            ("https://b.example/f.xml".to_string(), Some("a".to_string())),
+        ])
+        .expect("non-blank names are not trimmed into collision");
+        assert_eq!(resolved[0].name, "a ");
+        assert_eq!(resolved[1].name, "a");
     }
 
     #[test]
