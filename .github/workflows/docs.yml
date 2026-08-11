@@ -41,6 +41,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cache/pdfium-rs
             target
           key: ${{ runner.os }}-docs-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-docs-
@@ -51,7 +52,12 @@ jobs:
       - name: Build documentation
         # --no-deps keeps the output focused on skardi's own APIs.
         # sources is excluded from the facade crate until the lance git dep is resolved.
-        run: cargo doc --no-deps -p skardi
+        # `--all-features` matches what docs.rs builds (package.metadata.docs.rs
+        # sets all-features = true), so feature-gated modules get their rustdoc
+        # warnings caught here instead of surfacing as broken links there.
+        # (~/.cache/pdfium-rs is cached above because the documents feature's
+        # build.rs downloads PDFium outside the cargo paths.)
+        run: cargo doc --no-deps -p skardi --all-features
 
       - name: Add redirect from root to skardi
         run: |
