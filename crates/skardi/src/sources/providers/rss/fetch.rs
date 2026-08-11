@@ -24,17 +24,28 @@
 //!
 //! [`AllowAll`]: super::egress::AllowAll
 //!
-//! ## Proxies are disabled
+//! ## Proxies are disabled exactly when a policy is injected
 //!
-//! [`FeedFetcher::new`] builds its client with `no_proxy()`. reqwest
-//! otherwise honors system proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`,
-//! read fresh from the environment at every `ClientBuilder::build`), and in
-//! proxy mode the *proxy's* address is what gets connected to — the target
-//! hostname travels inside the request for the proxy to resolve, so
-//! [`PolicyDns`] never sees the destination and the injected `EgressPolicy`
-//! is silently bypassed for every hostname URL. Feed fetches therefore
-//! always connect directly; an operator who must route egress through a
-//! proxy is choosing to enforce destination policy at that proxy instead.
+//! [`FeedFetcher::new`] builds its client with `no_proxy()` **iff** an
+//! [`EgressPolicy`] was injected. reqwest otherwise honors system proxy
+//! variables (`HTTP_PROXY`/`HTTPS_PROXY`, read fresh from the environment at
+//! every `ClientBuilder::build`), and in proxy mode the *proxy's* address is
+//! what gets connected to — the target hostname travels inside the request
+//! for the proxy to resolve, so [`PolicyDns`] never sees the destination and
+//! an injected `EgressPolicy` would be silently bypassed for every hostname
+//! URL. The switch is the *fact of injection*, never the policy's runtime
+//! behavior:
+//!
+//! - **No policy injected** (the OSS default): there is no destination
+//!   filtering to bypass, so honoring a mandated proxy costs nothing and
+//!   keeps feeds working on networks where direct egress is firewalled.
+//! - **A policy injected** (an operator, or Skardi Cloud): fetches connect
+//!   directly so the policy always sees the real destination. **Operational
+//!   consequence, loudly:** on a network that *mandates* a proxy, feed
+//!   fetches from a policy-bearing fetcher will not traverse it — every feed
+//!   fails with connect timeouts while other providers work. That is this
+//!   trade, made deliberately: an operator who must route egress through a
+//!   proxy enforces destination policy at that proxy and injects none here.
 //!
 //! ## Validators only cover the first hop
 //!
@@ -114,7 +125,7 @@ use reqwest::{Response, StatusCode};
 use thiserror::Error;
 use url::{Host, Url};
 
-use super::egress::{EgressDenied, EgressPolicy, PolicyDns};
+use super::egress::{AllowAll, EgressDenied, EgressPolicy, PolicyDns};
 use super::error::RssError;
 use crate::util::http::parse_retry_after;
 
@@ -250,27 +261,38 @@ impl FeedFetcher {
     /// warm to it, which linger up to reqwest's pool idle timeout (~90s by
     /// default). An [`EgressPolicy`] must therefore treat an approval as valid
     /// for the life of a connection.
+    ///
+    /// `policy: None` is the OSS default — no destination filtering, and
+    /// system proxy variables are honored. `Some(policy)` disables proxies so
+    /// the policy always sees the real destination; the switch is the fact of
+    /// injection, never the policy's runtime behavior — see the module doc's
+    /// "Proxies are disabled exactly when a policy is injected" section.
     pub fn new(
-        policy: Arc<dyn EgressPolicy>,
+        policy: Option<Arc<dyn EgressPolicy>>,
         request_timeout: Duration,
         max_response_bytes: u64,
         user_agent: String,
     ) -> Result<Self, RssError> {
+        let policy_injected = policy.is_some();
+        let policy: Arc<dyn EgressPolicy> = policy.unwrap_or_else(|| Arc::new(AllowAll));
         let resolver = Arc::new(PolicyDns::new(Arc::clone(&policy)));
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .dns_resolver(resolver)
             .redirect(Policy::none())
-            // Without this, system proxy variables would hand every hostname
-            // to the proxy and PolicyDns would never see the destination —
-            // see the module doc's "Proxies are disabled" section.
-            .no_proxy()
             .gzip(true)
             .timeout(request_timeout)
-            .user_agent(user_agent)
-            .build()
-            .map_err(|e| RssError::HttpClientBuild {
-                reason: e.to_string(),
-            })?;
+            .user_agent(user_agent);
+        if policy_injected {
+            // Without this, system proxy variables would hand every hostname
+            // to the proxy and PolicyDns would never see the destination —
+            // see the module doc's "Proxies are disabled exactly when a
+            // policy is injected" section. Under the no-policy default there
+            // is nothing to bypass, so proxies stay honored there.
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().map_err(|e| RssError::HttpClientBuild {
+            reason: e.to_string(),
+        })?;
         Ok(Self {
             http,
             policy,
@@ -623,7 +645,7 @@ fn find_egress_denied(err: &reqwest::Error) -> Option<EgressDenied> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::rss::egress::{AllowAll, EgressPolicy, EgressReason};
+    use crate::sources::providers::rss::egress::{EgressPolicy, EgressReason};
     use crate::sources::providers::rss::testutil::{MockFeedServer, MockResponse};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -646,7 +668,7 @@ mod tests {
 
     fn fetcher_with_policy(policy: Arc<dyn EgressPolicy>) -> FeedFetcher {
         FeedFetcher::new(
-            policy,
+            Some(policy),
             Duration::from_secs(2),
             1024 * 1024,
             "skardi-test".to_string(),
@@ -654,9 +676,17 @@ mod tests {
         .expect("build test fetcher")
     }
 
-    /// The OSS default fetcher: no destination filtering.
+    /// The OSS default fetcher: no policy injected, no destination filtering
+    /// (and, per the module doc, system proxies honored — irrelevant here,
+    /// since the test environment sets no proxy variables).
     fn test_fetcher() -> FeedFetcher {
-        fetcher_with_policy(Arc::new(AllowAll))
+        FeedFetcher::new(
+            None,
+            Duration::from_secs(2),
+            1024 * 1024,
+            "skardi-test".to_string(),
+        )
+        .expect("build test fetcher")
     }
 
     #[tokio::test]
@@ -1118,7 +1148,7 @@ mod tests {
         })
         .await;
         let f = FeedFetcher::new(
-            Arc::new(AllowAll),
+            None,
             Duration::from_secs(1),
             1024 * 1024,
             "skardi-test".to_string(),
@@ -1404,6 +1434,82 @@ mod tests {
         );
     }
 
+    /// The child half of `no_policy_fetcher_honors_proxy_env_vars`: the
+    /// mirror of `proxy_env_check_in_child_process` for the no-policy
+    /// default. With no [`EgressPolicy`] injected there is nothing a proxy
+    /// could bypass, so `FeedFetcher::new(None, ..)` must honor the proxy
+    /// variables the parent set — the request goes to the (unreachable)
+    /// proxy and fails Transport, and the mock server is never contacted
+    /// directly. If `no_proxy()` were applied on this path too, the fetch
+    /// would connect straight to the mock and succeed, failing both
+    /// assertions.
+    #[tokio::test]
+    #[ignore = "subprocess half of no_policy_fetcher_honors_proxy_env_vars"]
+    async fn no_policy_proxy_check_in_child_process() {
+        // Same wholesale `--ignored` CI caveat as
+        // `proxy_env_check_in_child_process`: without proxy variables there
+        // is nothing to check — skip rather than fail.
+        if std::env::var("HTTP_PROXY").is_err() {
+            eprintln!(
+                "skipping: no proxy variables in the environment — run via \
+                 no_policy_fetcher_honors_proxy_env_vars"
+            );
+            return;
+        }
+        let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
+        let f = test_fetcher();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Transport { .. } | FetchError::Timeout { .. }
+            ),
+            "expected the fetch to fail against the unreachable proxy, got {err}"
+        );
+        assert_eq!(
+            server.requests().len(),
+            0,
+            "with no policy injected the request must go to the proxy, \
+             never directly to the target"
+        );
+    }
+
+    #[test]
+    fn no_policy_fetcher_honors_proxy_env_vars() {
+        // The counterpart of `proxy_env_vars_do_not_bypass_the_egress_policy`,
+        // pinning the other half of the conditional: `no_proxy()` is applied
+        // exactly when a policy is injected, so the no-policy OSS default
+        // honors a mandated proxy instead of silently bypassing it (the
+        // corporate-network case: direct egress firewalled, proxy required).
+        // Same subprocess arrangement, for the same set_var/data-race reason.
+        let exe = std::env::current_exe().expect("locate the running test binary");
+        let output = Command::new(exe)
+            .args([
+                "--exact",
+                "sources::providers::rss::fetch::tests::no_policy_proxy_check_in_child_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("http_proxy", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn the child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child process failed — the no-policy fetcher did not honor \
+             proxy variables\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran zero tests — filter out of date?\nstdout:\n{stdout}"
+        );
+    }
+
     #[tokio::test]
     async fn https_and_http_only() {
         let f = test_fetcher();
@@ -1422,7 +1528,7 @@ mod tests {
         // by constructing the fetcher directly from typed parameters, bypassing
         // validate() — the residual path this test pins.
         let err = FeedFetcher::new(
-            Arc::new(AllowAll),
+            None,
             Duration::from_secs(2),
             1024 * 1024,
             "bad\nua".to_string(),
