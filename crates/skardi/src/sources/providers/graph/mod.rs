@@ -12,7 +12,10 @@
 //! - `cypher_query(connection, cypher, params, columns)` — declared
 //!   columns required on AGE (its `cypher()` call must declare arity);
 //! - `graph_schema(connection)` — the agent-discovery surface, one
-//!   `(label, kind)` row per label off `ag_catalog`, names only;
+//!   `(label, kind)` row per label off `ag_catalog`, names only (all
+//!   the AGE catalog knows: it is schema-optional and declares no
+//!   properties — property names/types come with the Neo4j/Kuzu
+//!   milestones, whose catalogs carry them);
 //! - read-only enforced by the BACKEND (`READ ONLY` transactions), with
 //!   the keyword guard as fast-path UX;
 //! - every query bounded (`query_timeout_seconds`, `max_rows`) with

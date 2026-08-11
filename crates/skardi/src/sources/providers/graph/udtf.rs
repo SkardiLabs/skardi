@@ -276,6 +276,14 @@ impl TableProvider for CypherQueryProvider {
 /// `graph_schema('connection')` — the agent-discovery surface: one row
 /// per label, `(label, kind)`, straight off the backend catalog. Names
 /// only, never property values.
+///
+/// No property columns on AGE, structurally: `ag_catalog` records label
+/// names and kinds ONLY (AGE is schema-optional — properties are
+/// untyped agtype maps with no catalog declaration), and property
+/// discovery would mean scanning data, unbounded on the agent's FIRST
+/// call. Property names/types arrive with the Neo4j
+/// (`db.schema.nodeTypeProperties()`) and Kuzu (typed catalog)
+/// milestones, whose catalogs actually carry them.
 #[derive(Debug)]
 pub struct GraphSchemaFunction {
     sources: GraphSources,

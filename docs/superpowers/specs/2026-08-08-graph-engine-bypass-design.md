@@ -459,7 +459,7 @@ An agent cannot write Cypher blindly. It needs machine-readable answers to:
 
 - *What graph backends are configured?* → the existing data-source metadata endpoint (`GET /data_source`) already lists registered sources; `type: graph` sources should appear with their declared views.
 - *What labels, relationship types, and properties exist?* → a lightweight **graph introspection surface** is required. Two options:
-  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type with its property **names and types** (AGE: `ag_catalog`; Neo4j: `db.schema.nodeTypeProperties()` / `db.schema.relTypeProperties()`; Kuzu: its typed catalog, which is exact because Kuzu is schema-full). Deliberately **names and types only, never property values** — sampled values would flow straight into agent prompts, the exact leak the error-handling rules exist to prevent;
+  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type. What it can carry is **per-backend, set by what each backend's catalog actually knows** (an earlier revision over-promised here): AGE's `ag_catalog` records label names and kinds ONLY — AGE is schema-optional, properties live as untyped agtype maps with no catalog declaration, so property discovery on AGE would mean scanning data (unbounded on the agent's FIRST call; deliberately not done in milestone 1 — an explicitly-sampled property-names option is a possible follow-up). Neo4j serves property **names and types** via `db.schema.nodeTypeProperties()` / `db.schema.relTypeProperties()` (its milestone delivers them); Kuzu's typed catalog is exact because Kuzu is schema-full. Everywhere: **names and types only, never property values** — sampled values would flow straight into agent prompts, the exact leak the error-handling rules exist to prevent;
   - a YAML view author who declares `nodes` / `edges` metadata tables alongside the Cypher views.
   The design chooses the first option as an engine-provided helper in milestone 1, because requiring every YAML view to also declare metadata duplicates effort.
 - *What shape does a `cypher_query` result have?* → the schema is fixed at planning time and stated in the function's documentation: either the caller-declared columns, or one `record: Utf8` JSON column. Agents can rely on stable `STRUCT` shapes for nodes and relationships inside those columns.
@@ -512,7 +512,11 @@ read-only guarantee is a Postgres `READ ONLY` transaction, native to
   is NOT in this milestone: AGE's `cypher()` call must declare its
   result arity, so on AGE an omitted `columns` is a targeted error
   (settled — previously an open question).
-- `graph_schema` from `ag_catalog` (names and types only, never values).
+- `graph_schema` from `ag_catalog`: one `(label, kind)` row per label —
+  labels and kinds are ALL the AGE catalog knows (schema-optional store;
+  see the introspection note in §Agent and LLM interaction). Property
+  names/types arrive with the Neo4j and Kuzu milestones, whose catalogs
+  carry them.
 - Keyword guard, query timeout, row cap, error taxonomy.
 - JSON getter: adopt `datafusion-functions-json`'s `json_get` family
   (verify against the pinned DataFusion; a minimal same-named in-tree
