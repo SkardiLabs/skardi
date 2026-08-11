@@ -162,6 +162,7 @@ thiserror = "2.0"
 tokio-rusqlite = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+datafusion-functions-json = "0.52"
 
 [dev-dependencies]
 tokio-test = "0.4"
