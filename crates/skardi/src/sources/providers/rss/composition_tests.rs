@@ -11,12 +11,12 @@
 //!
 //! ## Why this suite is in-crate rather than in `crates/skardi/tests/`
 //!
-//! Same reason as [`super::integration_tests`]: registration's test seam,
-//! [`super::register_rss_tables_with_policy`], is `#[cfg(test)] pub(crate)`,
+//! Same reason as [`super::integration_tests`]: [`MockFeedServer`] lives in
+//! the test-only `pub(crate)` `testutil`, unreachable from an external test
+//! crate. [`super::register_rss_tables_with_policy`] itself is `pub` — its
+//! external-crate proof is `crates/skardi/tests/rss_egress_injection.rs` —
 //! though every test here registers with the same `AllowAll` production
-//! ships. An external test crate cannot reach a `pub(crate)` item, and
-//! widening the seam to a public entry point would put policy selection on
-//! this provider's public surface for no OSS need.
+//! ships.
 //!
 //! ## Why this module has its own mock harness
 //!

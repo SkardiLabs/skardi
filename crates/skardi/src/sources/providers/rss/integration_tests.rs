@@ -3,12 +3,12 @@
 //!
 //! ## Why this suite is in-crate rather than in `crates/skardi/tests/`
 //!
-//! Registration's test seam, [`register_rss_tables_with_policy`], is
-//! `#[cfg(test)] pub(crate)`: it lets this suite inject an `EgressPolicy`,
-//! though every test here uses the same `AllowAll` production ships. An
-//! external test crate cannot reach a `pub(crate)` item, and widening the
-//! seam to a public entry point would put policy selection on this
-//! provider's public surface for no OSS need. `open_connector`'s own
+//! [`MockFeedServer`] is what binds it here: `testutil` is test-only
+//! `pub(crate)`, unreachable from an external test crate.
+//! [`register_rss_tables_with_policy`] itself is `pub` — the egress seam an
+//! embedder calls, proven from an external crate's position in
+//! `crates/skardi/tests/rss_egress_injection.rs` — though every test here
+//! uses the same `AllowAll` production ships. `open_connector`'s own
 //! mock-HTTP suite is in-crate for the same reason.
 //!
 //! ## What each test owns
