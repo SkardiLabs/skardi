@@ -254,7 +254,10 @@ mod tests {
         // …and completeness as an explicit roster, the one line a new pack
         // must extend (a stale list here means the generator's coverage
         // listing silently omits the newcomer).
-        assert_eq!(names, vec!["feishu", "github", "mock", "notion", "slack"]);
+        assert_eq!(
+            names,
+            vec!["feishu", "github", "gmail", "mock", "notion", "slack"]
+        );
     }
 
     #[test]
