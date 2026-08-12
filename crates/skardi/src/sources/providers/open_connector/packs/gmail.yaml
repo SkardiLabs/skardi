@@ -68,6 +68,10 @@ tables:
       # Wire key `to`; renamed because TO is a reserved SQL keyword and a
       # column requiring quotes on every reference is hostile to use.
       - { name: to_addresses, path: to, type: utf8, nullable: true }
+      # The wire value is an RFC 3339 string (the executor re-emits
+      # Gmail's epoch-millis `internalDate`); `timestamp_ms_utc` names the
+      # Arrow storage — Timestamp(ms, UTC) — and its converter accepts
+      # RFC 3339 or epoch-millis wires alike, same as github's *_at columns.
       - { name: message_timestamp, path: messageTimestamp, type: timestamp_ms_utc, nullable: true }
 
   drafts:
