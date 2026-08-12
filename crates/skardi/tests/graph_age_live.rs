@@ -798,3 +798,132 @@ async fn agtype_float_specials_are_pinned() {
 
     drop_graph(&pool, &graph).await;
 }
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn round4_fixes_hold_end_to_end() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("r4");
+    let pool = seed_graph(&url, &graph).await;
+    let (ctx, sources) = live_ctx(&url, &graph).await;
+
+    // ── #9: a BACKEND error must not echo the caller's Cypher. The
+    // query carries a recognizable marker; the rendered error must name
+    // the backend failure without the statement context Postgres
+    // attaches (db.message(), never sqlx Display or `position` lines).
+    let err = ctx
+        .sql(
+            "SELECT x FROM cypher_query('kg', \
+             'MATCH (marker_needle_xyz) RETURN nonexistent_fn(marker_needle_xyz)', \
+             '{}', '{\"x\": \"json\"}')",
+        )
+        .await
+        .expect("plans")
+        .collect()
+        .await
+        .expect_err("unknown function is a backend error");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("marker_needle_xyz"),
+        "backend errors never echo query text: {msg}"
+    );
+
+    // ── #8: pool saturation is bounded and TYPED. max_connections
+    // defaults to 4; hold all four sessions, then a query's acquire
+    // must time out as GraphError::Timeout — not a generic Backend
+    // error after sqlx's unrelated 30s default.
+    let handle = {
+        let map = sources.read().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(map.get("kg").unwrap())
+    };
+    // Reach the concrete client for its pool (test-only hook).
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        if let Some(u) = &user {
+            std::env::set_var("SKARDI_AGE_R4_USER", u);
+        }
+        if let Some(p) = &pass {
+            std::env::set_var("SKARDI_AGE_R4_PASS", p);
+        }
+    }
+    let client = AgeClient::connect(
+        "saturated",
+        &clean_url,
+        &graph,
+        user.as_ref().map(|_| "SKARDI_AGE_R4_USER"),
+        pass.as_ref().map(|_| "SKARDI_AGE_R4_PASS"),
+        1, // one connection: held below, so acquire must queue
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .expect("connects");
+    let _held = client
+        .pool_for_tests()
+        .acquire()
+        .await
+        .expect("hold the only connection");
+    let err = client
+        .execute(
+            "MATCH (p:Person) RETURN p.name",
+            &serde_json::json!({}),
+            1,
+            QueryBounds {
+                timeout: std::time::Duration::from_secs(1),
+                max_rows: 10,
+            },
+            None,
+        )
+        .await
+        .err()
+        .expect("no connection can be acquired");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out after 1s"),
+        "saturation surfaces as the typed Timeout: {msg}"
+    );
+    drop(_held);
+
+    // ── #2 (demonstration): declared-column order IS the binding — two
+    // same-typed columns declared out of RETURN order swap silently.
+    // This pins that the documented hazard is real, so the docs can
+    // never drift into describing a check that does not exist.
+    let batches = collect(
+        &ctx,
+        "SELECT * FROM cypher_query('kg', \
+         'MATCH (p:Person {name: \"ada\"}) RETURN p.name, p.age', '{}', \
+         '{\"age\": \"json\", \"name\": \"json\"}')",
+    )
+    .await;
+    let mis_age = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        mis_age.value(0),
+        "\"ada\"",
+        "out-of-order declaration binds positionally: the column NAMED age \
+         carries the name value — the silent swap the docs warn about"
+    );
+
+    // ── #4 (rewriter scope): register_all installs the ->/->> operator
+    // rewrite session-wide; pin that it works over a node's properties
+    // JSON, since that is the documented reason it is registered.
+    let batches = collect(
+        &ctx,
+        "SELECT v.properties->>'name' AS n FROM cypher_query('kg', \
+         'MATCH (v:Person {name: \"bob\"}) RETURN v', '{}', '{\"v\": \"node\"}')",
+    )
+    .await;
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(n.value(0), "bob", "the ->> rewrite reaches graph queries");
+
+    drop_graph(&pool, &graph).await;
+}
