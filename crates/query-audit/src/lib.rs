@@ -46,7 +46,12 @@ const INIT_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS query_audit (
     statement_kind TEXT NOT NULL,
     status         TEXT NOT NULL,
     row_count      INTEGER,
-    error          TEXT
+    error          TEXT,
+    request_id     TEXT,
+    org_id         TEXT,
+    workspace_id   TEXT,
+    user_id        TEXT,
+    run_id         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_audit_session_created
     ON query_audit (session_id, created_at DESC);
@@ -54,6 +59,42 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_created
     ON query_audit (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_query_audit_status
     ON query_audit (status);";
+
+/// The five identity columns, in order. `CREATE TABLE IF NOT EXISTS` cannot
+/// retrofit an existing table, so [`ensure_identity_columns`] reconciles the
+/// live schema on every open — additive, idempotent, and a no-op on fresh
+/// databases.
+const IDENTITY_COLUMNS: [&str; 5] = ["request_id", "org_id", "workspace_id", "user_id", "run_id"];
+
+fn ensure_identity_columns(conn: &rusqlite::Connection) -> SqlResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(query_audit)")?;
+    let existing: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for col in IDENTITY_COLUMNS {
+        if !existing.contains(col) {
+            conn.execute(
+                &format!("ALTER TABLE query_audit ADD COLUMN {col} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Who ran the statement, when the distribution knows. Every field optional:
+/// the OSS single-user server records none of them; an authenticated
+/// distribution (e.g. an engine fronted by an identity-minting gateway)
+/// fills what its envelope carries. Nullable columns, never a fork — the
+/// same table remains readable by the same tooling either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryIdentity {
+    pub request_id: Option<String>,
+    pub org_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub user_id: Option<String>,
+    pub run_id: Option<String>,
+}
 
 /// Outcome of an audited statement.
 ///
@@ -125,6 +166,7 @@ impl QueryAuditStore {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "FULL")?;
             conn.execute_batch(INIT_SCHEMA_SQL)?;
+            ensure_identity_columns(conn)?;
             Ok(())
         })
         .await
@@ -152,6 +194,7 @@ impl QueryAuditStore {
             .context("Failed to open in-memory query-audit db")?;
         conn.call(|conn| -> SqlResult<()> {
             conn.execute_batch(INIT_SCHEMA_SQL)?;
+            ensure_identity_columns(conn)?;
             Ok(())
         })
         .await
@@ -184,6 +227,21 @@ impl QueryAuditStore {
         max_rows: usize,
         statement_kind: &str,
     ) -> Result<String> {
+        self.record_started_for(sql, ai_context, max_rows, statement_kind, None)
+            .await
+    }
+
+    /// [`record_started`], carrying the caller's identity when the
+    /// distribution has one. `None` fields land as NULL — the OSS server
+    /// always passes `None` for the whole thing.
+    pub async fn record_started_for(
+        &self,
+        sql: &str,
+        ai_context: Option<&Value>,
+        max_rows: usize,
+        statement_kind: &str,
+        identity: Option<&QueryIdentity>,
+    ) -> Result<String> {
         let id = new_id();
         let created_at = chrono::Utc::now().to_rfc3339();
         // `session_id` is denormalised out of the context object so the index
@@ -196,14 +254,16 @@ impl QueryAuditStore {
         let sql = sql.to_string();
         let statement_kind = statement_kind.to_string();
         let row_id = id.clone();
+        let identity = identity.cloned().unwrap_or_default();
 
         self.conn
             .call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
-                         statement_kind, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                         statement_kind, status,
+                         request_id, org_id, workspace_id, user_id, run_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         row_id,
                         created_at,
@@ -213,6 +273,11 @@ impl QueryAuditStore {
                         max_rows as i64,
                         statement_kind,
                         QueryAuditStatus::Started.as_str(),
+                        identity.request_id,
+                        identity.org_id,
+                        identity.workspace_id,
+                        identity.user_id,
+                        identity.run_id,
                     ],
                 )?;
                 Ok(())
@@ -303,7 +368,8 @@ impl QueryAuditStore {
             .call(move |conn| -> SqlResult<Option<Value>> {
                 let mut stmt = conn.prepare(
                     "SELECT id, created_at, finished_at, sql, ai_context, session_id,
-                            max_rows, statement_kind, status, row_count, error
+                            max_rows, statement_kind, status, row_count, error,
+                            request_id, org_id, workspace_id, user_id, run_id
                        FROM query_audit WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -321,6 +387,11 @@ impl QueryAuditStore {
                             "status": row.get::<_, String>(8)?,
                             "row_count": row.get::<_, Option<i64>>(9)?,
                             "error": row.get::<_, Option<String>>(10)?,
+                            "request_id": row.get::<_, Option<String>>(11)?,
+                            "org_id": row.get::<_, Option<String>>(12)?,
+                            "workspace_id": row.get::<_, Option<String>>(13)?,
+                            "user_id": row.get::<_, Option<String>>(14)?,
+                            "run_id": row.get::<_, Option<String>>(15)?,
                         }))
                     })
                     .ok();
@@ -432,6 +503,81 @@ fn new_id() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The identity columns exist for downstream distributions whose caller
+    /// is authenticated (the cloud engine's envelope): five nullable columns,
+    /// written when the caller supplies them, NULL otherwise. OSS rows leave
+    /// them empty — same table, same file, same tooling.
+    #[tokio::test]
+    async fn identity_travels_when_supplied_and_is_null_otherwise() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let identity = QueryIdentity {
+            request_id: Some("req-9c41".into()),
+            org_id: Some("acme".into()),
+            workspace_id: Some("ws-core".into()),
+            user_id: Some("user:acme/alice".into()),
+            run_id: None,
+        };
+        let with_id = store
+            .record_started_for("SELECT 1", None, 10, "Query", Some(&identity))
+            .await
+            .unwrap();
+        let record = store.get(&with_id).await.unwrap().unwrap();
+        assert_eq!(record["request_id"], json!("req-9c41"));
+        assert_eq!(record["org_id"], json!("acme"));
+        assert_eq!(record["workspace_id"], json!("ws-core"));
+        assert_eq!(record["user_id"], json!("user:acme/alice"));
+        assert!(record["run_id"].is_null());
+
+        let anon = store
+            .record_started("SELECT 2", None, 10, "Query")
+            .await
+            .unwrap();
+        let record = store.get(&anon).await.unwrap().unwrap();
+        for col in ["request_id", "org_id", "workspace_id", "user_id", "run_id"] {
+            assert!(record[col].is_null(), "OSS rows leave {col} NULL");
+        }
+    }
+
+    /// A database created by a pre-identity binary gains the columns on open,
+    /// idempotently — `CREATE TABLE IF NOT EXISTS` alone cannot retrofit an
+    /// existing table, so open() must reconcile the live schema.
+    #[tokio::test]
+    async fn an_old_database_gains_the_identity_columns_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        {
+            // Simulate the pre-identity schema exactly.
+            let conn = Connection::open(&path).await.unwrap();
+            conn.call(|conn| -> SqlResult<()> {
+                conn.execute_batch(
+                    "CREATE TABLE query_audit (
+                        id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                        finished_at TEXT, sql TEXT NOT NULL, ai_context TEXT,
+                        session_id TEXT, max_rows INTEGER NOT NULL,
+                        statement_kind TEXT NOT NULL, status TEXT NOT NULL,
+                        row_count INTEGER, error TEXT);",
+                )?;
+                conn.execute(
+                    "INSERT INTO query_audit (id, created_at, sql, max_rows, statement_kind, status)
+                     VALUES ('old-row', '2026-01-01T00:00:00Z', 'SELECT 0', 1, 'Query', 'succeeded')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+        }
+
+        // Open twice: the migration must be idempotent.
+        for _ in 0..2 {
+            let store = QueryAuditStore::open(&path).await.unwrap();
+            let record = store.get("old-row").await.unwrap().unwrap();
+            assert_eq!(record["sql"], json!("SELECT 0"), "old rows survive");
+            assert!(record["user_id"].is_null(), "old rows read NULL identity");
+        }
+    }
 
     #[tokio::test]
     async fn records_sql_ai_context_and_outcome() {
