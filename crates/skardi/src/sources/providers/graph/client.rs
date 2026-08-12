@@ -92,10 +92,13 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
     /// Run read-only Cypher inside a backend-enforced read transaction,
     /// bounded by `bounds`. `arity` is the declared column count — AGE's
     /// `cypher()` call must declare its result arity, which is why the
-    /// declared-columns mode is required on this backend. `limit` is a
-    /// SQL LIMIT pushed to the CONSUMPTION side: the client stops reading
-    /// after that many rows (a clean early stop, not an error — the row
-    /// cap stays the loud overflow signal for uncapped scans).
+    /// declared-columns mode is required on this backend. `limit` is
+    /// pushed BOTH ways: into the statement as a real SQL LIMIT
+    /// (min(limit, max_rows + 1), so the backend and the wire are
+    /// bounded even when the caller passes none — an overflow costs
+    /// max_rows + 1 rows, not a full scan plus a drain) AND enforced at
+    /// consumption as defense in depth. Hitting `limit` is a clean early
+    /// stop; the row cap stays the loud overflow signal.
     async fn execute(
         &self,
         cypher: &str,
@@ -211,13 +214,20 @@ impl AgeClient {
     ///
     /// Returns the statement batch and the prepared name to DEALLOCATE
     /// (when params were bound).
-    fn build_sql(&self, cypher: &str, params: &Value, arity: usize) -> (String, Option<String>) {
+    fn build_sql(
+        &self,
+        cypher: &str,
+        params: &Value,
+        arity: usize,
+        fetch: usize,
+    ) -> (String, Option<String>) {
         build_cypher_sql(
             &self.graph_name,
             self.prepare_seq.fetch_add(1, Ordering::Relaxed),
             cypher,
             params,
             arity,
+            fetch,
         )
     }
 }
@@ -232,7 +242,19 @@ impl GraphClient for AgeClient {
         bounds: QueryBounds,
         limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError> {
-        let (sql, prepared) = self.build_sql(cypher, params, arity);
+        // The fetch bound rides the OUTER statement as a real SQL LIMIT
+        // (never inside the Cypher text): the backend and the wire are
+        // bounded even when the caller passes no limit, a RowCapExceeded
+        // costs max_rows + 1 rows instead of a full scan plus a full
+        // drain before ROLLBACK, and the consumption-side checks below
+        // stay as defense in depth. Same formula as labels(): a SQL
+        // LIMIT at or under the cap is a clean stop; otherwise fetch one
+        // past the cap to PROVE an overflow.
+        let fetch = match limit {
+            Some(l) if l <= bounds.max_rows => l,
+            _ => bounds.max_rows.saturating_add(1),
+        };
+        let (sql, prepared) = self.build_sql(cypher, params, arity, fetch);
         let source = self.source_name.clone();
         let run = async {
             // A MANUAL transaction on an explicitly acquired connection,
@@ -446,6 +468,7 @@ fn build_cypher_sql(
     cypher: &str,
     params: &Value,
     arity: usize,
+    fetch: usize,
 ) -> (String, Option<String>) {
     let tag = dollar_tag(cypher);
     let graph = graph_name.replace('\'', "''");
@@ -460,7 +483,7 @@ fn build_cypher_sql(
         let batch = format!(
             "PREPARE {name}(ag_catalog.agtype) AS \
              SELECT {} FROM ag_catalog.cypher('{graph}', {tag}{cypher}{tag}, $1) \
-             AS t({}); \
+             AS t({}) LIMIT {fetch}; \
              EXECUTE {name}('{literal}');",
             outs.join(", "),
             cols.join(", ")
@@ -470,7 +493,7 @@ fn build_cypher_sql(
         (
             format!(
                 "SELECT {} FROM ag_catalog.cypher('{graph}', {tag}{cypher}{tag}) \
-                 AS t({})",
+                 AS t({}) LIMIT {fetch}",
                 outs.join(", "),
                 cols.join(", ")
             ),
@@ -482,9 +505,16 @@ fn build_cypher_sql(
 /// A dollar-quote tag that provably does not occur in `text`: extend a
 /// base tag with a counter until absent — no escape rules to get wrong.
 fn dollar_tag(text: &str) -> String {
+    // The collision test runs against `text + "$"`, not `text`: the
+    // closing delimiter starts with `$`, so a query ENDING in the tag's
+    // interior (e.g. `RETURN $skq` with a parameter named `skq`) forms
+    // the full tag at the text/closing-tag boundary and would close the
+    // literal early. Appending the `$` makes the check cover exactly the
+    // stream Postgres scans.
+    let probe = format!("{text}$");
     let mut tag = "$skq$".to_string();
     let mut n = 0u32;
-    while text.contains(&tag) {
+    while probe.contains(&tag) {
         n += 1;
         tag = format!("$skq{n}$");
     }
@@ -542,6 +572,25 @@ mod tests {
         let hostile = "RETURN '$skq$ $skq1$'";
         let tag = dollar_tag(hostile);
         assert!(!hostile.contains(&tag), "{tag}");
+
+        // The BOUNDARY case: a query ending in the tag's interior forms
+        // the full tag against the closing delimiter's leading `$` —
+        // `RETURN $skq` + `$…` would close `$skq$…$skq$` early. The probe
+        // must scan text+"$", exactly the stream Postgres sees.
+        let boundary = "RETURN $skq";
+        let tag = dollar_tag(boundary);
+        assert_ne!(tag, "$skq$", "boundary composition must bump the tag");
+        assert!(!format!("{boundary}$").contains(&tag), "{tag}");
+        let (sql, _) = build_cypher_sql("kg", 0, boundary, &serde_json::json!({}), 1, 11);
+        // The emitted literal parses as ONE dollar-quoted string: the
+        // closing tag is found exactly once past the opening.
+        let open = sql.find(&tag).expect("opening tag");
+        let close = sql[open + tag.len()..].find(&tag).expect("closing tag");
+        assert_eq!(
+            &sql[open + tag.len()..open + tag.len() + close],
+            boundary,
+            "the whole query is the literal body: {sql}"
+        );
     }
 
     #[test]
@@ -552,14 +601,17 @@ mod tests {
             "MATCH (n) RETURN n.a, n.b",
             &serde_json::json!({}),
             2,
+            101,
         );
         assert!(prepared.is_none(), "no params → nothing to DEALLOCATE");
         assert!(
             sql.starts_with("SELECT c0, c1 FROM ag_catalog.cypher('kg', $skq$"),
             "{sql}"
         );
+        // The fetch bound is a REAL SQL LIMIT on the outer statement —
+        // the backend and the wire are bounded even with no caller LIMIT.
         assert!(
-            sql.ends_with("AS t(c0 ag_catalog.agtype, c1 ag_catalog.agtype)"),
+            sql.ends_with("AS t(c0 ag_catalog.agtype, c1 ag_catalog.agtype) LIMIT 101"),
             "{sql}"
         );
         assert!(!sql.contains("PREPARE"), "{sql}");
@@ -573,6 +625,11 @@ mod tests {
             "MATCH (n) WHERE n.x = $x RETURN n",
             &serde_json::json!({"x": 1}),
             1,
+            5,
+        );
+        assert!(
+            sql.contains("ag_catalog.agtype) LIMIT 5;"),
+            "the PREPARE body carries the fetch LIMIT: {sql}"
         );
         let name = prepared.expect("params → PREPARE name to DEALLOCATE");
         assert!(name.starts_with("skq_p_"), "{name}");
@@ -598,10 +655,11 @@ mod tests {
             "RETURN $s",
             &serde_json::json!({"s": "O'Brien '; DROP TABLE x; --"}),
             1,
+            10,
         );
         assert!(sql.contains("O''Brien ''; DROP TABLE x; --"), "{sql}");
 
-        let (sql, _) = build_cypher_sql("g'name", 0, "RETURN 1", &serde_json::json!({}), 1);
+        let (sql, _) = build_cypher_sql("g'name", 0, "RETURN 1", &serde_json::json!({}), 1, 10);
         assert!(sql.contains("cypher('g''name'"), "{sql}");
     }
 
