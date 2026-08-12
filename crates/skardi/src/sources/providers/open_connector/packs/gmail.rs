@@ -1032,7 +1032,7 @@ bindings:
             if req.method == "POST" && req.path == "/v1/actions/gmail.list_filters" {
                 return MockResponse::new(
                     403,
-                    &envelope_err(
+                    envelope_err(
                         "authorization_failed",
                         "Request had insufficient authentication scopes.",
                     ),
