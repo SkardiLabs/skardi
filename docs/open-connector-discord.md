@@ -92,10 +92,14 @@ Design notes:
   string; the legacy number is deliberately unmapped; decoding bits is
   query-side work. **Version-coupled risk**: if the gateway ever pins
   `/api/v10` — where `permissions` *is* the string and
-  `permissions_new` does not exist — this column goes always-NULL, and
-  the loose item schemas mean no fingerprint pin can catch the move.
-  Upstream issue pending (the gateway should pin an API version); this
-  doc links it once filed.
+  `permissions_new` does not exist — this mapping breaks, and the loose
+  item schemas mean no fingerprint pin can catch the move. The column
+  is therefore declared **non-nullable** (the legacy API attaches
+  `permissions_new` to every guild object; 6/6 live rows carried it):
+  the drift surfaces as a hard `ConversionFailed: missing key` with
+  full column/page/row identity instead of a silently always-NULL
+  column. Upstream issue pending (the gateway should pin an API
+  version); this doc links it once filed.
 - **Rate limits are tight**: rapid successive calls to
   `/users/@me/guilds` return HTTP 429, which the gateway surfaces as a
   loud scan failure (not a silent stop). A full scan of *n* guilds

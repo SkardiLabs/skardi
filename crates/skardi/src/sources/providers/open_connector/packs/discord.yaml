@@ -60,7 +60,13 @@ tables:
       # `permissions` as utf8, which fails conversion on every real row.
       # The column maps the authoritative string; the legacy number is
       # deliberately unmapped. Decoding bits stays query-side work.
-      - { name: permissions, path: permissions_new, type: utf8, nullable: true }
+      # NON-nullable on purpose: the legacy API attaches permissions_new
+      # to every guild object (6/6 live rows), and this mapping is the
+      # pack's one version-coupled drift — if the gateway ever pins
+      # /api/v10 (no permissions_new), the loose item schemas mean no
+      # fingerprint can see the move, so the converter's missing-key
+      # failure (with column/page/row identity) is the ONLY tripwire.
+      - { name: permissions, path: permissions_new, type: utf8, nullable: false }
       - { name: features, path: features, type: utf8_list, nullable: true }
       - { name: approximate_member_count, path: approximate_member_count, type: uint64, nullable: true }
       - { name: approximate_presence_count, path: approximate_presence_count, type: uint64, nullable: true }

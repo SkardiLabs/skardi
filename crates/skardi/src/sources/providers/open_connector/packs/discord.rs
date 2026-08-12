@@ -60,8 +60,11 @@
 //!   `permissions` as utf8 and failed conversion on every real row.
 //!   Version-coupled risk, documented in the pack doc: if the gateway
 //!   ever pins `/api/v10` (where `permissions` IS the string and
-//!   `permissions_new` is gone), this column goes always-NULL — the
-//!   loose item schemas mean no fingerprint can catch that move.
+//!   `permissions_new` is gone), this mapping breaks — the loose item
+//!   schemas mean no fingerprint can catch that move, so the column is
+//!   declared NON-nullable (the legacy API attaches `permissions_new`
+//!   to every guild object; 6/6 live rows) and the converter's
+//!   missing-key failure, with full row identity, is the tripwire.
 //!
 //! ## Column status (live pass, 2026-08-07)
 //!
@@ -301,33 +304,52 @@ mod tests {
 
     #[test]
     fn person_linked_fixtures_stay_redacted() {
-        // guilds is the one person-linked fixture (the authorizing user's
-        // guild MEMBERSHIP list); connections will be too once captured.
-        // Mechanical audit: every string leaf must match the redaction
-        // allowlist — synthetic snowflake prefix, placeholder names, the
-        // two synthetic asset hashes, ALL_CAPS feature enums (public
-        // platform constants), digit-only permission bitfields. A real
-        // guild name or id has no way to satisfy any arm. sticker_packs
-        // is deliberately NOT here: it is a public catalog kept verbatim.
-        fn audit(name: &str, value: &Value) {
+        // guilds and connections are the person-linked fixtures (the
+        // authorizing user's guild MEMBERSHIP and linked-account lists).
+        // Mechanical audit: every string leaf must satisfy the redaction
+        // allowlist FOR ITS KEY, default-deny. Key scoping is what makes
+        // the tripwire enforce anything: a real snowflake is digit-only
+        // and a real guild name can be ALL_CAPS, so shape arms alone
+        // would wave both through — ids MUST carry the synthetic prefix,
+        // names MUST carry the placeholder marker, and a key this list
+        // has never seen fails loudly instead of coasting on a shape
+        // coincidence. sticker_packs is deliberately NOT here: it is a
+        // public catalog kept verbatim.
+        fn audit(name: &str, key: &str, value: &Value) {
             match value {
                 Value::String(s) => {
-                    let allowed = s.starts_with("10000000000000000")
-                        || s.starts_with("Redacted ")
-                        || s == "0123456789abcdef0123456789abcdef"
-                        || s == "fedcba9876543210fedcba9876543210"
-                        || s.bytes().all(|b| b.is_ascii_digit())
-                        || (!s.is_empty()
-                            && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+                    let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+                    let allowed = match key {
+                        // Snowflakes must be synthetic — a real id is
+                        // digit-only too, so digit shape proves nothing.
+                        "id" => s.starts_with("10000000000000000"),
+                        // The only keys where a bare digit string is a
+                        // public platform value, not an identifier
+                        // (permissions_new on real rows; permissions in
+                        // the type-mismatch fixture's string-where-number
+                        // probe).
+                        "permissions" | "permissions_new" => digits,
+                        "name" => s.starts_with("Redacted "),
+                        "icon" | "banner" => {
+                            s == "0123456789abcdef0123456789abcdef"
+                                || s == "fedcba9876543210fedcba9876543210"
+                        }
+                        // Feature flags are public platform constants;
+                        // array items arrive under the parent key.
+                        "features" => {
+                            !s.is_empty() && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+                        }
                         // Public platform enums a connection's `type` takes.
-                        || ["github", "steam"].contains(&s.as_str());
+                        "type" => ["github", "steam"].contains(&s.as_str()),
+                        _ => false,
+                    };
                     assert!(
                         allowed,
-                        "{name}: string {s:?} is not on the redaction allowlist"
+                        "{name}: {key} = {s:?} is not on the redaction allowlist"
                     );
                 }
-                Value::Array(items) => items.iter().for_each(|v| audit(name, v)),
-                Value::Object(map) => map.values().for_each(|v| audit(name, v)),
+                Value::Array(items) => items.iter().for_each(|v| audit(name, key, v)),
+                Value::Object(map) => map.iter().for_each(|(k, v)| audit(name, k, v)),
                 _ => {}
             }
         }
@@ -343,7 +365,22 @@ mod tests {
             ),
         ] {
             let root: Value = serde_json::from_str(text).expect("fixture parses");
-            audit(name, &root);
+            audit(name, "$", &root);
+        }
+
+        // The tripwire must TRIP — each probe is a leak class a fixture
+        // re-capture could plausibly reintroduce, and each must panic.
+        for (key, leak) in [
+            ("id", "81384788765712384"),   // real snowflake, no prefix
+            ("id", ""),                    // vacuous all-digits
+            ("name", "MY_REAL_GUILD"),     // ALL_CAPS real name
+            ("owner_tag", "someone#1234"), // key the allowlist never saw
+        ] {
+            let probe = serde_json::json!({ key: leak });
+            assert!(
+                std::panic::catch_unwind(|| audit("probe", "$", &probe)).is_err(),
+                "audit must reject {key} = {leak:?}"
+            );
         }
     }
 
@@ -488,11 +525,15 @@ bindings:
     }
 
     fn guild_row(id: &str) -> Value {
+        // Wire-faithful shape: legacy `permissions` is a NUMBER and
+        // `permissions_new` carries the bitfield string the (now
+        // non-nullable) `permissions` column maps.
         json!({
             "id": id,
             "name": format!("guild {id}"),
             "owner": false,
-            "permissions": "0",
+            "permissions": 0,
+            "permissions_new": "0",
             "features": [],
             "approximate_member_count": 1,
             "approximate_presence_count": 0

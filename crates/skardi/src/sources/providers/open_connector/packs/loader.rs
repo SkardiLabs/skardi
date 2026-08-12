@@ -249,6 +249,15 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         } => vec![cursor_param, page_size_param],
         PaginationStrategy::SinglePage => Vec::new(),
     };
+    // An empty param name — under ANY strategy — would survive to scan
+    // time as a literal `""` input key: a strict gateway's 400 blamed on
+    // the request, or a lax gateway's page-1 refetch misdiagnosed as a
+    // provider loop. The loader's promise is one complete diagnostic
+    // pass at load, so the check covers every strategy here rather than
+    // living in one arm below.
+    if pagination_params.iter().any(|p| p.is_empty()) {
+        return Err(format!("{id}: pagination input names must be non-empty"));
+    }
     match table.pagination {
         PaginationStrategy::PageNumber {
             page_param,
@@ -286,17 +295,9 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
             page_size,
             ..
         } => {
-            // An empty param name would survive to scan time as a literal
-            // `""` input key — a strict gateway's 400 blamed on the
-            // request, or a lax gateway's page-1 refetch misdiagnosed as a
-            // provider loop. The loader's promise is one complete
-            // diagnostic pass at load. (row_cursor_field is validated by
-            // the strategy itself at construction.)
-            if cursor_param.is_empty() || page_size_param.is_empty() {
-                return Err(format!(
-                    "{id}: keyset pagination input names must be non-empty"
-                ));
-            }
+            // (row_cursor_field is validated by the strategy itself at
+            // construction; empty input names are rejected above, for
+            // every strategy.)
             if page_size_param == cursor_param {
                 return Err(format!(
                     "{id}: pagination declares '{cursor_param}' as both the cursor and page-size input"
@@ -923,10 +924,15 @@ tables:
         .unwrap_err();
         assert!(err.contains("relative to the row"), "{err}");
         // An empty input name would reach the wire as a literal "" key —
-        // rejected at load, not misdiagnosed at scan time.
+        // rejected at load, not misdiagnosed at scan time. The check is
+        // strategy-agnostic: every arm that names inputs is covered.
         for pagination in [
             "{ strategy: keyset, cursor_input: \"\", row_cursor_field: id, page_size_input: limit, page_size: 200 }",
             "{ strategy: keyset, cursor_input: after, row_cursor_field: id, page_size_input: \"\", page_size: 200 }",
+            "{ strategy: cursor, cursor_input: \"\", next_cursor_path: \"$.next\", page_size: 100 }",
+            "{ strategy: cursor, cursor_input: cursor, next_cursor_path: \"$.next\", page_size_input: \"\", page_size: 100 }",
+            "{ strategy: page_number, page_input: \"\", page_size_input: perPage, page_size: 100 }",
+            "{ strategy: page_number, page_input: page, page_size_input: \"\", page_size: 100 }",
         ] {
             let err = parse_pack(&base(pagination)).unwrap_err();
             assert!(err.contains("must be non-empty"), "{err}");
