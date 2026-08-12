@@ -14,7 +14,10 @@
 //!   against the declared columns. Every declared column is nullable
 //!   (Cypher can produce null in any position); a non-null value of the
 //!   wrong JSON kind is [`GraphError::TypeMismatch`] carrying kinds, never
-//!   values.
+//!   values. The JSON row is the CONTRACT between every backend client
+//!   and this converter: the Neo4j client decodes Bolt values into the
+//!   same shapes (its nodes spell multi-label as a `labels` array where
+//!   AGE spells its single label as `label` — both accepted below).
 //!
 //! The canonical STRUCT shapes (design §Result flattening):
 //! - node: `STRUCT<id Utf8, labels List<Utf8>, properties Utf8>` —
@@ -396,13 +399,15 @@ fn mismatch(col: &DeclaredColumn, row: usize, expected: &'static str, v: &Value)
     }
 }
 
-/// One vertex, decomposed: (id, label, properties-json). AGE vertex
-/// objects carry `id` (number), `label` (string), `properties` (object).
-/// Ids are stringified: opaque tokens, stable for the entity's life
-/// within one database (design §Backend abstraction).
+/// One vertex, decomposed: (id, labels, properties-json). AGE vertex
+/// objects carry `id` (number), `label` (ONE string — AGE vertices are
+/// single-label), `properties` (object); Neo4j nodes carry `labels` (an
+/// array — multi-label is native there), and [`node_parts`] accepts
+/// both spellings. Ids are stringified: opaque tokens, stable for the
+/// entity's life within one database (design §Backend abstraction).
 struct NodeParts {
     id: String,
-    label: String,
+    labels: Vec<String>,
     properties: String,
 }
 
@@ -423,13 +428,31 @@ fn node_parts(
     match v {
         Value::Null => Ok(None),
         Value::Object(map) => {
-            let (Some(id), Some(label)) = (map.get("id"), map.get("label").and_then(Value::as_str))
-            else {
+            let Some(id) = map.get("id") else {
                 return Err(mismatch(col, row, "node", v));
+            };
+            // Two accepted spellings, per backend reality: AGE emits ONE
+            // `label` string (its vertices are single-label); Neo4j emits
+            // a `labels` array (multi-label is native, and an empty array
+            // is a legal label-less node there). Exactly one must be
+            // present and well-formed.
+            let labels = match (map.get("labels"), map.get("label")) {
+                (Some(Value::Array(items)), None) => {
+                    let mut labels = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Value::String(s) = item else {
+                            return Err(mismatch(col, row, "node", v));
+                        };
+                        labels.push(s.clone());
+                    }
+                    labels
+                }
+                (None, Some(Value::String(label))) => vec![label.clone()],
+                _ => return Err(mismatch(col, row, "node", v)),
             };
             Ok(Some(NodeParts {
                 id: scalar_to_string(id),
-                label: label.to_string(),
+                labels,
                 properties: map
                     .get("properties")
                     .cloned()
@@ -527,7 +550,9 @@ fn node_struct_array(items: &[Option<NodeParts>]) -> StructArray {
         match item {
             Some(n) => {
                 ids.append_value(&n.id);
-                labels.values().append_value(&n.label);
+                for label in &n.labels {
+                    labels.values().append_value(label);
+                }
                 labels.append(true);
                 props.append_value(&n.properties);
                 validity.push(true);
@@ -609,7 +634,7 @@ fn path_struct_array(items: &[Option<PathParts>]) -> StructArray {
                 flat_nodes.extend(nodes.iter().map(|n| {
                     Some(NodeParts {
                         id: n.id.clone(),
-                        label: n.label.clone(),
+                        labels: n.labels.clone(),
                         properties: n.properties.clone(),
                     })
                 }));
@@ -1018,5 +1043,42 @@ mod tests {
             serde_json::json!([{"id":1,"label":"A","properties":{}}]),
         ]];
         build_batch(&columns, &rows, 0).expect("a single-node path is the legal minimum");
+    }
+
+    #[test]
+    fn nodes_accept_both_label_spellings_and_reject_mixtures() {
+        let columns = vec![col("n", GraphType::Node)];
+        // Neo4j's multi-label array — every label lands in the list.
+        let rows = vec![vec![
+            serde_json::json!({"id": "7", "labels": ["Person", "Admin"], "properties": {}}),
+        ]];
+        let batch = build_batch(&columns, &rows, 0).expect("labels array converts");
+        let node = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        let labels = node
+            .column_by_name("labels")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(labels.value(0).len(), 2, "both labels survive");
+        // An EMPTY labels array is a legal Neo4j node (label-less).
+        let rows = vec![vec![
+            serde_json::json!({"id": "8", "labels": [], "properties": {}}),
+        ]];
+        build_batch(&columns, &rows, 0).expect("label-less node is legal on neo4j");
+        // Both spellings at once, a non-string label, and neither
+        // spelling are all shape errors — kinds only, never values.
+        for bad in [
+            serde_json::json!({"id": 1, "label": "A", "labels": ["A"], "properties": {}}),
+            serde_json::json!({"id": 1, "labels": [7], "properties": {}}),
+            serde_json::json!({"id": 1, "properties": {}}),
+        ] {
+            let err = build_batch(&columns, &[vec![bad]], 0).unwrap_err();
+            assert!(err.to_string().contains("declared 'node'"), "{err}");
+        }
     }
 }

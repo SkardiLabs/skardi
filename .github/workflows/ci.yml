@@ -695,6 +695,42 @@ jobs:
         if: always()
         run: docker rm -f skardi-age || true
 
+      # Neo4j gives the graph provider's Bolt path the same real
+      # coverage — the milestone-2 backend, incl. the registration
+      # read-mode proof, which only a real server can answer.
+      - name: Start Neo4j for graph live tests
+        run: |
+          docker run -d --name skardi-neo4j \
+            -p 127.0.0.1:17687:7687 -p 127.0.0.1:17474:7474 \
+            -e NEO4J_AUTH=neo4j/skardineo4j \
+            neo4j:5
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:17474 >/dev/null 2>&1; then
+              echo "neo4j ready after ${i}s"
+              break
+            fi
+            if [ "$i" = "90" ]; then
+              echo "neo4j failed to become ready"
+              docker logs skardi-neo4j
+              exit 1
+            fi
+            sleep 1
+          done
+          # The HTTP port answers before Bolt finishes auth setup; give
+          # the server a moment to open Bolt too.
+          sleep 5
+
+      - name: Execute graph Neo4j live tests
+        env:
+          SKARDI_NEO4J_LIVE_URL: bolt://neo4j:skardineo4j@127.0.0.1:17687
+        run: |
+          cargo llvm-cov --no-report nextest --all-features \
+            -E 'binary(graph_neo4j_live)' --no-tests=fail -- --ignored
+
+      - name: Stop Neo4j
+        if: always()
+        run: docker rm -f skardi-neo4j || true
+
       - name: Generate coverage report (lcov)
         run: cargo llvm-cov report --lcov --output-path lcov.info
 

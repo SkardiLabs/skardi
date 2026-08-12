@@ -169,6 +169,14 @@ uuid = { workspace = true }
 # instead of a homegrown twin. Registered via graph::register_graph_udtfs
 # — note it also installs ->/->>/? operator rewrites session-wide.
 datafusion-functions-json = "0.52"
+# Graph milestone 2: the Neo4j Bolt driver. Pinned to the 0.9 RC because
+# the access-mode spike (graph-engine-bypass §Milestone 2) found 0.8.0
+# has NO read-mode channel at all, while the RC's `execute_read` sends
+# Bolt `mode: "r"` on auto-commit RUN — the enforcement channel this
+# milestone rides. Default features only: `unstable-bolt-protocol-impl-v2`
+# stays OFF (its explicit-transaction BEGIN never carries the mode, so it
+# would ADD surface without adding enforcement).
+neo4rs = "0.9.0-rc.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -27,7 +27,7 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{Either, Executor, Row};
 
 use super::error::{GraphError, json_kind};
-use super::value::parse_agtype;
+use super::value::{DeclaredColumn, parse_agtype};
 
 /// Per-query operational bounds (design §Security and operational
 /// bounds), carried per source.
@@ -37,12 +37,28 @@ pub struct QueryBounds {
     pub max_rows: usize,
 }
 
-/// One result row: one JSON value per declared column.
+/// One result row: one JSON value per declared column (or a single
+/// whole-record JSON object in the fallback mode).
 pub type GraphRow = Vec<Value>;
 /// The stream `execute` returns. Milestone 1 implementations may buffer
 /// internally up to `max_rows` — the trait shape is what must not change
 /// (design §Backend abstraction).
 pub type GraphRowStream = BoxStream<'static, Result<GraphRow, GraphError>>;
+
+/// One `graph_schema` row: a label or relationship type, and — where the
+/// backend's catalog carries them (Neo4j, Kuzu; never AGE, which is
+/// schema-optional) — one property name and its type(s) per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaRow {
+    pub label: String,
+    /// `vertex` or `edge`.
+    pub kind: String,
+    /// Property NAME — never a value (design §Agent and LLM interaction).
+    pub property: Option<String>,
+    /// The backend's type name(s) for the property, `|`-joined when the
+    /// catalog reports several.
+    pub property_type: Option<String>,
+}
 
 /// What a backend must provide. Hides AGE (Postgres wire) vs Neo4j Bolt
 /// vs Kuzu details behind one seam.
@@ -53,9 +69,10 @@ pub type GraphRowStream = BoxStream<'static, Result<GraphRow, GraphError>>;
 /// use futures::StreamExt;
 /// use serde_json::Value;
 /// use skardi::sources::providers::graph::client::{
-///     GraphClient, GraphRowStream, QueryBounds,
+///     GraphClient, GraphRowStream, QueryBounds, SchemaRow,
 /// };
 /// use skardi::sources::providers::graph::error::GraphError;
+/// use skardi::sources::providers::graph::value::DeclaredColumn;
 ///
 /// /// A canned backend, the shape tests use.
 /// #[derive(Debug)]
@@ -67,7 +84,7 @@ pub type GraphRowStream = BoxStream<'static, Result<GraphRow, GraphError>>;
 ///         &self,
 ///         _cypher: &str,
 ///         _params: &Value,
-///         _arity: usize,
+///         _columns: Option<&[DeclaredColumn]>,
 ///         _bounds: QueryBounds,
 ///         limit: Option<usize>,
 ///     ) -> Result<GraphRowStream, GraphError> {
@@ -78,47 +95,68 @@ pub type GraphRowStream = BoxStream<'static, Result<GraphRow, GraphError>>;
 ///         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
 ///     }
 ///
-///     async fn labels(
+///     fn requires_declared_columns(&self) -> bool {
+///         false
+///     }
+///
+///     async fn schema(
 ///         &self,
 ///         _bounds: QueryBounds,
 ///         _limit: Option<usize>,
-///     ) -> Result<Vec<(String, String)>, GraphError> {
-///         Ok(vec![("Person".into(), "vertex".into())])
+///     ) -> Result<Vec<SchemaRow>, GraphError> {
+///         Ok(vec![SchemaRow {
+///             label: "Person".into(),
+///             kind: "vertex".into(),
+///             property: None,
+///             property_type: None,
+///         }])
 ///     }
 /// }
 /// ```
 #[async_trait]
 pub trait GraphClient: Send + Sync + std::fmt::Debug {
     /// Run read-only Cypher inside a backend-enforced read transaction,
-    /// bounded by `bounds`. `arity` is the declared column count — AGE's
-    /// `cypher()` call must declare its result arity, which is why the
-    /// declared-columns mode is required on this backend. `limit` is
-    /// pushed BOTH ways: into the statement as a real SQL LIMIT
-    /// (min(limit, max_rows + 1), so the backend and the wire are
-    /// bounded even when the caller passes none — an overflow costs
-    /// max_rows + 1 rows, not a full scan plus a drain) AND enforced at
+    /// bounded by `bounds`.
+    ///
+    /// `columns` carries the caller's declared columns — how they BIND is
+    /// per backend: AGE binds positionally (its `cypher()` call declares
+    /// arity, all it gives us), Neo4j binds BY NAME to the Bolt record's
+    /// field names. `None` is the JSON-`record` fallback (whole record as
+    /// one JSON object per row) — backends whose wire needs a declared
+    /// arity refuse it (see [`Self::requires_declared_columns`]).
+    ///
+    /// `limit` is pushed as far down as the backend allows (AGE: a real
+    /// SQL LIMIT of min(limit, max_rows + 1); Neo4j: bounded stream
+    /// consumption over Bolt's incremental PULL) AND enforced at
     /// consumption as defense in depth. Hitting `limit` is a clean early
     /// stop; the row cap stays the loud overflow signal.
     async fn execute(
         &self,
         cypher: &str,
         params: &Value,
-        arity: usize,
+        columns: Option<&[DeclaredColumn]>,
         bounds: QueryBounds,
         limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError>;
 
-    /// Label roster for `graph_schema`: one `(label, kind)` row per
-    /// label, kinds `vertex` / `edge`. Names only — never property
-    /// values (design §Agent and LLM interaction). Bounded like every
-    /// other query — "every query is bounded" has no catalog exemption —
-    /// and `limit` is the SQL LIMIT, pushed into the catalog fetch as a
-    /// clean early stop.
-    async fn labels(
+    /// Whether `execute` refuses `columns: None`. True exactly when the
+    /// backend's wire call must declare its result arity up front (AGE's
+    /// `cypher()`); the UDTF turns this into a targeted plan-time error
+    /// instead of a late execution failure.
+    fn requires_declared_columns(&self) -> bool;
+
+    /// Catalog roster for `graph_schema`: one row per label (kinds
+    /// `vertex` / `edge`), and — where the backend's catalog knows them —
+    /// one row per (label, property) with the property's name and
+    /// type(s). Names and types only, never property values (design
+    /// §Agent and LLM interaction). Bounded like every other query —
+    /// "every query is bounded" has no catalog exemption — and `limit`
+    /// is pushed into the catalog fetch as a clean early stop.
+    async fn schema(
         &self,
         bounds: QueryBounds,
         limit: Option<usize>,
-    ) -> Result<Vec<(String, String)>, GraphError>;
+    ) -> Result<Vec<SchemaRow>, GraphError>;
 }
 
 /// Apache AGE over the workspace's sqlx-postgres stack.
@@ -268,10 +306,23 @@ impl GraphClient for AgeClient {
         &self,
         cypher: &str,
         params: &Value,
-        arity: usize,
+        columns: Option<&[DeclaredColumn]>,
         bounds: QueryBounds,
         limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError> {
+        // Positional binding: AGE's `cypher()` declares arity and nothing
+        // else, so only the COUNT of declared columns reaches the SQL.
+        // The UDTF already refuses the fallback on this backend
+        // (`requires_declared_columns`); this is the defense in depth.
+        let Some(declared) = columns else {
+            return Err(GraphError::InvalidColumns {
+                reason: "the age backend requires declared columns (its cypher() call \
+                         must declare its result arity)"
+                    .to_string(),
+                accepted: super::value::ACCEPTED_TYPES,
+            });
+        };
+        let arity = declared.len();
         // The fetch bound rides the OUTER statement as a real SQL LIMIT
         // (never inside the Cypher text): the backend and the wire are
         // bounded even when the caller passes no limit, a RowCapExceeded
@@ -408,11 +459,17 @@ impl GraphClient for AgeClient {
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
 
-    async fn labels(
+    fn requires_declared_columns(&self) -> bool {
+        // AGE's `cypher()` call must declare its result arity — the
+        // JSON-record fallback cannot exist on this backend.
+        true
+    }
+
+    async fn schema(
         &self,
         bounds: QueryBounds,
         limit: Option<usize>,
-    ) -> Result<Vec<(String, String)>, GraphError> {
+    ) -> Result<Vec<SchemaRow>, GraphError> {
         // Same bounds discipline as execute — a catalog read against a
         // wedged backend must not hang forever, and the design's "every
         // query is bounded" makes no catalog exemption: READ ONLY
@@ -476,7 +533,17 @@ impl GraphClient for AgeClient {
                         "e" => "edge".to_string(),
                         other => other.to_string(),
                     };
-                    Ok((name, kind))
+                    // Names only, structurally: `ag_catalog` records label
+                    // names and kinds and nothing else (AGE is
+                    // schema-optional) — property discovery would mean
+                    // scanning data, deliberately not done (design §Agent
+                    // and LLM interaction).
+                    Ok(SchemaRow {
+                        label: name,
+                        kind,
+                        property: None,
+                        property_type: None,
+                    })
                 })
                 .collect()
         };

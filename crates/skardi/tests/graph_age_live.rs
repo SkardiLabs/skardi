@@ -27,7 +27,17 @@ use sqlx::postgres::PgPoolOptions;
 use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBounds};
 use skardi::sources::providers::graph::config::GraphConfig;
 use skardi::sources::providers::graph::udtf::GraphSources;
+use skardi::sources::providers::graph::value::{DeclaredColumn, GraphType};
 use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
+
+/// One declared column for direct `GraphClient::execute` calls — AGE
+/// binds positionally, so only the COUNT matters to these tests.
+fn one_col() -> Vec<DeclaredColumn> {
+    vec![DeclaredColumn {
+        name: "c0".to_string(),
+        ty: GraphType::Json,
+    }]
+}
 
 fn live_url() -> Option<String> {
     std::env::var("SKARDI_AGE_LIVE_URL")
@@ -366,7 +376,7 @@ async fn the_backend_read_only_transaction_is_the_boundary() {
         .execute(
             "CREATE (n:Sneaky) RETURN n",
             &serde_json::json!({}),
-            1,
+            Some(&one_col()),
             handle.bounds,
             None,
         )
@@ -515,11 +525,12 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // (min_connections defaults to 0) and a "sweep" would only ever see
     // a single session (round-4 review).
     let hammer_params = serde_json::json!({"x": "nobody"});
+    let hammer_cols = one_col();
     let results = futures::future::join_all((0..8).map(|_| {
         client.execute(
             "MATCH (p:Person) WHERE p.name <> $x RETURN p.name",
             &hammer_params,
-            1,
+            Some(&hammer_cols),
             tight,
             None,
         )
@@ -537,11 +548,12 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // PREPARE exists and the EXECUTE fails at runtime), concurrent for
     // the same session-fan-out reason as above.
     let div_params = serde_json::json!({"x": 1});
+    let div_cols = one_col();
     let results = futures::future::join_all((0..8).map(|_| {
         client.execute(
             "MATCH (p:Person) RETURN $x / 0",
             &div_params,
-            1,
+            Some(&div_cols),
             tight,
             None,
         )
@@ -577,7 +589,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         .execute(
             "RETURN $s",
             &serde_json::json!({"s": hostile}),
-            1,
+            Some(&one_col()),
             tight,
             None,
         )
@@ -704,7 +716,7 @@ async fn the_timeout_bound_is_typed_and_credentials_never_reach_errors() {
             // for the full count either.
             "MATCH (a),(b),(c),(d),(e),(f),(g),(h),(i),(j),(k),(l),(m),(n) RETURN count(*)",
             &serde_json::json!({}),
-            1,
+            Some(&one_col()),
             QueryBounds {
                 timeout: std::time::Duration::from_secs(1),
                 max_rows: 10,
@@ -717,9 +729,9 @@ async fn the_timeout_bound_is_typed_and_credentials_never_reach_errors() {
     let msg = err.to_string();
     assert!(msg.contains("timed out after 1s"), "typed, named: {msg}");
 
-    // 2) graph_schema's own row cap (the labels() branch).
+    // 2) graph_schema's own row cap (the catalog branch).
     let err = client
-        .labels(
+        .schema(
             QueryBounds {
                 timeout: std::time::Duration::from_secs(10),
                 max_rows: 1,
@@ -866,7 +878,7 @@ async fn round4_fixes_hold_end_to_end() {
         .execute(
             "MATCH (p:Person) RETURN p.name",
             &serde_json::json!({}),
-            1,
+            Some(&one_col()),
             QueryBounds {
                 timeout: std::time::Duration::from_secs(1),
                 max_rows: 10,

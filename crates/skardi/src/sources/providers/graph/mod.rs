@@ -7,30 +7,37 @@
 //! **planning-time-stable schema** (caller-declared columns; no probes,
 //! no network I/O at planning). Milestone 1 ships the Apache AGE backend
 //! (openCypher inside Postgres — the GraphRAG-in-Postgres deployment,
-//! zero new infrastructure) with:
+//! zero new infrastructure); milestone 2 adds Neo4j over Bolt behind the
+//! same [`client::GraphClient`] trait:
 //!
 //! - `cypher_query(connection, cypher, params, columns)` — declared
-//!   columns required on AGE (its `cypher()` call must declare arity);
+//!   columns required on AGE (its `cypher()` call must declare arity;
+//!   binding is positional there) and optional on Neo4j (Bolt carries
+//!   field names: binding is BY NAME, and omission is the JSON-`record`
+//!   fallback);
 //! - `graph_schema(connection)` — the agent-discovery surface, one
-//!   `(label, kind)` row per label off `ag_catalog`, names only (all
-//!   the AGE catalog knows: it is schema-optional and declares no
-//!   properties — property names/types come with the Neo4j/Kuzu
-//!   milestones, whose catalogs carry them);
-//! - read-only enforced by the BACKEND (`READ ONLY` transactions), with
-//!   the keyword guard as fast-path UX;
+//!   `(label, kind, property, property_type)` row per label off the
+//!   backend catalog. Names and types only, per what each catalog knows:
+//!   AGE serves label names and kinds (schema-optional store, property
+//!   columns always null); Neo4j adds property names/types via
+//!   `db.schema.nodeTypeProperties()` / `relTypeProperties()`;
+//! - read-only enforced by the BACKEND (AGE: `READ ONLY` transactions;
+//!   Neo4j: auto-commit READ-access-mode transactions, proven at
+//!   registration — see `neo4j.rs`), with the keyword guard as
+//!   fast-path UX;
 //! - every query bounded (`query_timeout_seconds`, `max_rows`) with
 //!   typed errors, never silent truncation;
 //! - the `datafusion-functions-json` getter family registered alongside,
 //!   so `properties` JSON columns are queryable without leaving SQL.
 //!
-//! Neo4j (Bolt, gated on the access-mode spike) and Kuzu are later
-//! milestones behind the same [`client::GraphClient`] trait; YAML
-//! catalog views and `type: graph` server registration are milestone 4.
+//! Kuzu is a later milestone behind the same trait; YAML catalog views
+//! and `type: graph` server registration are milestone 4.
 
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod guard;
+pub mod neo4j;
 pub mod udtf;
 pub mod value;
 
@@ -40,6 +47,7 @@ use std::time::Duration;
 use client::{AgeClient, QueryBounds};
 use config::GraphConfig;
 use error::GraphError;
+use neo4j::Neo4jClient;
 use udtf::{GraphSourceHandle, GraphSources};
 
 pub use udtf::register_graph_udtfs;
@@ -100,20 +108,41 @@ pub async fn register_graph_source(
             });
         }
     }
-    let client = AgeClient::connect(
-        name,
-        connection_string,
-        &config.graph_name,
-        config.username_env.as_deref(),
-        config.password_env.as_deref(),
-        config.max_connections,
-        Duration::from_secs(config.query_timeout_seconds),
-    )
-    .await?;
+    let timeout = Duration::from_secs(config.query_timeout_seconds);
+    let client: Arc<dyn client::GraphClient> = match config.backend.as_str() {
+        "age" => Arc::new(
+            AgeClient::connect(
+                name,
+                connection_string,
+                config
+                    .graph_name
+                    .as_deref()
+                    .expect("validate() requires graph_name on age"),
+                config.username_env.as_deref(),
+                config.password_env.as_deref(),
+                config.max_connections,
+                timeout,
+            )
+            .await?,
+        ),
+        // validate() has already rejected everything else.
+        _ => Arc::new(
+            Neo4jClient::connect(
+                name,
+                connection_string,
+                config.graph_name.as_deref(),
+                config.username_env.as_deref(),
+                config.password_env.as_deref(),
+                config.max_connections,
+                timeout,
+            )
+            .await?,
+        ),
+    };
     let handle = Arc::new(GraphSourceHandle {
-        client: Arc::new(client),
+        client,
         bounds: QueryBounds {
-            timeout: Duration::from_secs(config.query_timeout_seconds),
+            timeout,
             max_rows: config.max_rows,
         },
     });
