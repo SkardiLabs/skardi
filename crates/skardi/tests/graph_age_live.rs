@@ -808,7 +808,7 @@ async fn round4_fixes_hold_end_to_end() {
     };
     let graph = unique_graph("r4");
     let pool = seed_graph(&url, &graph).await;
-    let (ctx, sources) = live_ctx(&url, &graph).await;
+    let (ctx, _sources) = live_ctx(&url, &graph).await;
 
     // ── #9: a BACKEND error must not echo the caller's Cypher. The
     // query carries a recognizable marker; the rendered error must name
