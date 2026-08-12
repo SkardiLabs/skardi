@@ -109,6 +109,10 @@ pub async fn register_graph_source(
         }
     }
     let timeout = Duration::from_secs(config.query_timeout_seconds);
+    // Explicit per-backend arms, no wildcard: when milestone 3 adds
+    // `kuzu` to validate()'s allowlist, forgetting this match must be a
+    // loud unreachable here — never a Kuzu URL silently dialed with the
+    // Bolt client.
     let client: Arc<dyn client::GraphClient> = match config.backend.as_str() {
         "age" => Arc::new(
             AgeClient::connect(
@@ -125,8 +129,7 @@ pub async fn register_graph_source(
             )
             .await?,
         ),
-        // validate() has already rejected everything else.
-        _ => Arc::new(
+        "neo4j" => Arc::new(
             Neo4jClient::connect(
                 name,
                 connection_string,
@@ -138,6 +141,7 @@ pub async fn register_graph_source(
             )
             .await?,
         ),
+        other => unreachable!("validate() rejected backend '{other}' before dispatch"),
     };
     let handle = Arc::new(GraphSourceHandle {
         client,

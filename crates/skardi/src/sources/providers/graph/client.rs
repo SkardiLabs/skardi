@@ -95,8 +95,8 @@ pub struct SchemaRow {
 ///         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
 ///     }
 ///
-///     fn requires_declared_columns(&self) -> bool {
-///         false
+///     fn declared_columns_requirement(&self) -> Option<&'static str> {
+///         None
 ///     }
 ///
 ///     async fn schema(
@@ -139,11 +139,13 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
         limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError>;
 
-    /// Whether `execute` refuses `columns: None`. True exactly when the
-    /// backend's wire call must declare its result arity up front (AGE's
-    /// `cypher()`); the UDTF turns this into a targeted plan-time error
-    /// instead of a late execution failure.
-    fn requires_declared_columns(&self) -> bool;
+    /// Why `execute` would refuse `columns: None`, if it would: `Some`
+    /// carries the backend's own explanation (AGE: its `cypher()` must
+    /// declare arity, and binding is positional), which the UDTF renders
+    /// into the targeted plan-time error — so shared code never
+    /// hardcodes one backend's contract. `None` means the JSON-`record`
+    /// fallback is available.
+    fn declared_columns_requirement(&self) -> Option<&'static str>;
 
     /// Catalog roster for `graph_schema`: one row per label (kinds
     /// `vertex` / `edge`), and — where the backend's catalog knows them —
@@ -151,7 +153,9 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
     /// type(s). Names and types only, never property values (design
     /// §Agent and LLM interaction). Bounded like every other query —
     /// "every query is bounded" has no catalog exemption — and `limit`
-    /// is pushed into the catalog fetch as a clean early stop.
+    /// is honored as a clean early stop, pushed as deep as the backend
+    /// allows (AGE: into the catalog SQL; Neo4j: applied after the
+    /// bounded procedure fetch, since procedure rows flatten 1-to-many).
     async fn schema(
         &self,
         bounds: QueryBounds,
@@ -447,22 +451,22 @@ impl GraphClient for AgeClient {
         // (i.e. stopped answering), and sqlx tears down a connection
         // dropped mid-query rather than pooling it, so nothing
         // accumulates there either.
-        // Client-side wrap: the server timeout is authoritative, this one
-        // covers a backend that stops answering entirely. saturating_add:
-        // the config caps the timeout, but arithmetic here must not be
-        // the thing that panics if that invariant ever moves.
-        let rows = tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
-            .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: bounds.timeout.as_secs(),
-            })??;
+        let rows = bounded(bounds.timeout, run).await?;
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
 
-    fn requires_declared_columns(&self) -> bool {
+    fn declared_columns_requirement(&self) -> Option<&'static str> {
         // AGE's `cypher()` call must declare its result arity — the
-        // JSON-record fallback cannot exist on this backend.
-        true
+        // JSON-record fallback cannot exist on this backend. The text
+        // also carries the positional-binding warning, because omitting
+        // columns and mis-ordering them are the same caller mistake
+        // family on this backend.
+        Some(
+            "'columns' is required on the age backend — declare the output columns \
+             IN THE SAME ORDER AS YOUR RETURN CLAUSE (the binding is positional; \
+             two same-typed columns declared out of order swap silently), \
+             e.g. '{\"name\": \"string\", \"n\": \"node\"}'",
+        )
     }
 
     async fn schema(
@@ -547,11 +551,7 @@ impl GraphClient for AgeClient {
                 })
                 .collect()
         };
-        tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
-            .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: bounds.timeout.as_secs(),
-            })?
+        bounded(bounds.timeout, run).await
     }
 }
 
@@ -618,11 +618,30 @@ fn dollar_tag(text: &str) -> String {
     tag
 }
 
-fn read_env(source: &str, field: &str, env: &str) -> Result<String, GraphError> {
+/// Env-var credential lookup, shared by every backend client so the
+/// error wording (env-var NAME only, never a value) cannot drift per
+/// backend.
+pub(super) fn read_env(source: &str, field: &str, env: &str) -> Result<String, GraphError> {
     std::env::var(env).map_err(|_| GraphError::InvalidConfig {
         name: source.to_string(),
         reason: format!("{field}: ${env} is not set in this environment"),
     })
+}
+
+/// The client-side timeout wrap, shared by every backend client: the
+/// SERVER-side timeout (statement_timeout / tx_timeout) is
+/// authoritative; this covers a backend that stops answering entirely.
+/// saturating_add: the config caps the timeout, but arithmetic here must
+/// not be the thing that panics if that invariant ever moves.
+pub(super) async fn bounded<T>(
+    timeout: Duration,
+    fut: impl Future<Output = Result<T, GraphError>>,
+) -> Result<T, GraphError> {
+    tokio::time::timeout(timeout.saturating_add(Duration::from_secs(5)), fut)
+        .await
+        .map_err(|_| GraphError::Timeout {
+            seconds: timeout.as_secs(),
+        })?
 }
 
 fn backend_error(source: &str, e: &sqlx::Error) -> GraphError {

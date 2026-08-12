@@ -26,10 +26,12 @@
 //! registration's **read-mode proof** probes that exact unit: it sends a
 //! trivial write (`CREATE (n:…) DELETE n` — self-erasing even if it were
 //! to execute, since auto-commit has no rollback to fall back on) through
-//! `execute_read` and requires the SERVER to refuse it. A driver/server
-//! pair that does not enforce read mode fails registration closed
-//! (design §Security: "the milestone does not ship on the keyword guard
-//! alone").
+//! `execute_read` and requires the server's ACCESS-MODE refusal
+//! (`Neo.ClientError.Statement.AccessMode`, pinned live) — nothing else
+//! passes: a write that executes fails registration, and so does any
+//! OTHER error (a transient failure proves nothing about enforcement, so
+//! it fails closed too; design §Security: "the milestone does not ship
+//! on the keyword guard alone").
 //!
 //! ## Result decoding
 //!
@@ -42,7 +44,9 @@
 //! Bolt path's index list. Ids are Bolt's numeric ids stringified (the
 //! default protocol negotiates Bolt 4.4, which predates `elementId()`;
 //! design §Backend abstraction covers exactly this normalization).
-//! Temporal values render as ISO-8601 text, spatial points as small JSON
+//! Temporal values render as ISO-8601 text (durations through the
+//! driver's signed (seconds, nanos) view — its `std::time::Duration`
+//! conversion would wrap negatives), spatial points as small JSON
 //! objects, byte arrays as lowercase hex — all JSON-representable, so a
 //! `datetime()` property cannot fail a whole scan. Non-finite floats
 //! decode to null (the same decision the AGE decoder made for agtype's
@@ -63,10 +67,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use futures::StreamExt;
-use neo4rs::{BoltType, ConfigBuilder, Graph, Query};
+use neo4rs::{BoltNode, BoltType, ConfigBuilder, Graph, Query};
+use serde::Deserialize;
+use serde::de::IntoDeserializer;
 use serde_json::Value;
 
-use super::client::{GraphClient, GraphRow, GraphRowStream, QueryBounds, SchemaRow};
+use super::client::{
+    GraphClient, GraphRow, GraphRowStream, QueryBounds, SchemaRow, bounded, read_env,
+};
 use super::error::GraphError;
 use super::value::DeclaredColumn;
 
@@ -147,40 +155,51 @@ impl Neo4jClient {
             graph,
             source_name: source_name.to_string(),
         };
-        client
-            .bounded(timeout, async {
-                let mut rows = client
-                    .graph
-                    .execute_read(Query::new("RETURN 1".to_string()))
-                    .await
-                    .map_err(|e| map_driver_error(&client.source_name, &e))?;
-                rows.next()
-                    .await
-                    .map_err(|e| map_driver_error(&client.source_name, &e))?;
-                Ok(())
-            })
-            .await?;
+        bounded(timeout, async {
+            let mut rows = client
+                .graph
+                .execute_read(Query::new("RETURN 1".to_string()))
+                .await
+                .map_err(|e| map_driver_error(&client.source_name, &e))?;
+            rows.next()
+                .await
+                .map_err(|e| map_driver_error(&client.source_name, &e))?;
+            Ok(())
+        })
+        .await?;
         client.read_mode_proof(timeout).await?;
         Ok(client)
     }
 
     /// The registration read-mode proof (design §Milestone 2): send a
     /// trivial, self-erasing write through the SAME auto-commit read
-    /// channel every later query uses, and require the server to refuse
-    /// it. Success means read mode is not enforced by this driver/server
-    /// pair — fail closed, never register.
+    /// channel every later query uses, and require the server's
+    /// ACCESS-MODE refusal. Fail-closed in every other outcome: a write
+    /// that EXECUTES means read mode is not enforced, and any OTHER
+    /// error (transient network failure, auth hiccup, a server that
+    /// rejects the statement for unrelated reasons) proves nothing about
+    /// enforcement — registration surfaces it instead of vacuously
+    /// passing the security gate on it.
     async fn read_mode_proof(&self, timeout: Duration) -> Result<(), GraphError> {
         let probe = format!("CREATE (n:{READ_PROOF_LABEL}) DELETE n");
-        let outcome = self
-            .bounded(timeout, async {
-                Ok(self.graph.execute_read(Query::new(probe)).await)
-            })
-            .await?;
+        let outcome = bounded(timeout, async {
+            Ok(self.graph.execute_read(Query::new(probe)).await)
+        })
+        .await?;
         match outcome {
-            // The server refused a write inside the read-mode
-            // transaction — the boundary the whole milestone rests on
-            // demonstrably holds for this exact pair.
-            Err(_) => Ok(()),
+            // The one passing outcome, pinned live against Neo4j 5:
+            // Neo.ClientError.Statement.AccessMode, "Writing in read
+            // access mode not allowed".
+            Err(neo4rs::Error::Neo4j(err)) if err.code().contains("AccessMode") => Ok(()),
+            Err(other) => Err(GraphError::InvalidConfig {
+                name: self.source_name.to_string(),
+                reason: format!(
+                    "the read-mode proof failed for a reason OTHER than the server's \
+                     access-mode refusal — enforcement is unproven, so the source is \
+                     not registered; underlying error: {}",
+                    map_driver_error(&self.source_name, &other)
+                ),
+            }),
             Ok(_) => Err(GraphError::InvalidConfig {
                 name: self.source_name.to_string(),
                 reason: "the server EXECUTED a write inside a read-access-mode \
@@ -192,36 +211,21 @@ impl Neo4jClient {
         }
     }
 
-    /// Client-side timeout wrap, same shape as the AGE client's: the
-    /// server-side `tx_timeout` is authoritative; this covers a backend
-    /// that stops answering entirely.
-    async fn bounded<T>(
-        &self,
-        timeout: Duration,
-        fut: impl Future<Output = Result<T, GraphError>>,
-    ) -> Result<T, GraphError> {
-        tokio::time::timeout(timeout.saturating_add(Duration::from_secs(5)), fut)
-            .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: timeout.as_secs(),
-            })?
-    }
-
     /// Build the driver query: params driver-bound (never interpolated —
     /// the design's normal road, which AGE alone cannot take), and the
     /// transaction timeout in the RUN extra so runaway traversals die
     /// server-side.
-    fn build_query(cypher: &str, params: &Value, bounds: QueryBounds) -> Query {
+    fn build_query(cypher: &str, params: &Value, bounds: QueryBounds) -> Result<Query, GraphError> {
         let mut query = Query::new(cypher.to_string()).extra(
             "tx_timeout",
             i64::try_from(bounds.timeout.as_millis()).unwrap_or(i64::MAX),
         );
         if let Some(map) = params.as_object() {
             for (key, value) in map {
-                query = query.param(key, json_to_bolt(value));
+                query = query.param(key, json_to_bolt(value)?);
             }
         }
-        query
+        Ok(query)
     }
 
     /// Consume up to `fetch` rows. Shared row-loop semantics with the AGE
@@ -271,6 +275,69 @@ impl Neo4jClient {
         }
         Ok(rows)
     }
+
+    /// One `db.schema.*` catalog query, flattened to [`SchemaRow`]s.
+    async fn schema_rows(
+        &self,
+        query: String,
+        kind: &'static str,
+        bounds: QueryBounds,
+    ) -> Result<Vec<SchemaRow>, GraphError> {
+        let source = &self.source_name;
+        let mut stream = self
+            .graph
+            .execute_read(Self::build_query(&query, &Value::Null, bounds)?)
+            .await
+            .map_err(|e| map_query_error(source, bounds, &e))?;
+        let mut out = Vec::new();
+        while let Some(row) = stream
+            .next()
+            .await
+            .map_err(|e| map_query_error(source, bounds, &e))?
+        {
+            let labels: Vec<String> = match kind {
+                "vertex" => {
+                    let labels = row
+                        .get::<Vec<String>>("nodeLabels")
+                        .map_err(|e| schema_shape_error(source, &e))?;
+                    if labels.is_empty() {
+                        // Label-less nodes are legal on Neo4j and their
+                        // node type still carries properties — one row
+                        // with an empty label keeps them discoverable
+                        // instead of silently vanishing from the roster.
+                        vec![String::new()]
+                    } else {
+                        labels
+                    }
+                }
+                // relType arrives as ":`KNOWS`" — strip to the name.
+                _ => vec![strip_rel_type(
+                    &row.get::<String>("relType")
+                        .map_err(|e| schema_shape_error(source, &e))?,
+                )],
+            };
+            // A label with no properties yields one row with a null
+            // propertyName — keep it: the label's existence IS the
+            // information. Decode ERRORS are not null: a YIELD-shape
+            // drift must surface, exactly like nodeLabels above.
+            let property: Option<String> = row
+                .get("propertyName")
+                .map_err(|e| schema_shape_error(source, &e))?;
+            let property_type: Option<String> = row
+                .get::<Option<Vec<String>>>("propertyTypes")
+                .map_err(|e| schema_shape_error(source, &e))?
+                .map(|types| types.join("|"));
+            for label in labels {
+                out.push(SchemaRow {
+                    label,
+                    kind: kind.to_string(),
+                    property: property.clone(),
+                    property_type: property_type.clone(),
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -283,20 +350,19 @@ impl GraphClient for Neo4jClient {
         bounds: QueryBounds,
         limit: Option<usize>,
     ) -> Result<GraphRowStream, GraphError> {
-        let query = Self::build_query(cypher, params, bounds);
-        let rows = self
-            .bounded(
-                bounds.timeout,
-                self.collect_rows(query, columns, bounds, limit),
-            )
-            .await?;
+        let query = Self::build_query(cypher, params, bounds)?;
+        let rows = bounded(
+            bounds.timeout,
+            self.collect_rows(query, columns, bounds, limit),
+        )
+        .await?;
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
 
-    fn requires_declared_columns(&self) -> bool {
+    fn declared_columns_requirement(&self) -> Option<&'static str> {
         // Bolt records carry field names and need no declared arity —
         // the JSON-record fallback is native here.
-        false
+        None
     }
 
     async fn schema(
@@ -321,53 +387,26 @@ impl GraphClient for Neo4jClient {
              RETURN relType, propertyName, propertyTypes LIMIT {fetch}"
         );
         let run = async {
-            let mut out: Vec<SchemaRow> = Vec::new();
-            for (query, kind) in [(node_q, "vertex"), (rel_q, "edge")] {
-                let mut stream = self
-                    .graph
-                    .execute_read(Self::build_query(&query, &Value::Null, bounds))
-                    .await
-                    .map_err(|e| map_driver_error(&self.source_name, &e))?;
-                while let Some(row) = stream
-                    .next()
-                    .await
-                    .map_err(|e| map_driver_error(&self.source_name, &e))?
-                {
-                    let labels: Vec<String> = match kind {
-                        "vertex" => row
-                            .get::<Vec<String>>("nodeLabels")
-                            .map_err(|e| schema_shape_error(&self.source_name, &e))?,
-                        // relType arrives as ":`KNOWS`" — strip to the name.
-                        _ => vec![strip_rel_type(
-                            &row.get::<String>("relType")
-                                .map_err(|e| schema_shape_error(&self.source_name, &e))?,
-                        )],
-                    };
-                    // A label with no properties yields one row with a
-                    // null propertyName — keep it: the label's existence
-                    // IS the information.
-                    let property: Option<String> = row.get("propertyName").unwrap_or(None);
-                    let property_type: Option<String> = row
-                        .get::<Option<Vec<String>>>("propertyTypes")
-                        .unwrap_or(None)
-                        .map(|types| types.join("|"));
-                    for label in labels {
-                        if out.len() > bounds.max_rows {
-                            return Err(GraphError::RowCapExceeded {
-                                max_rows: bounds.max_rows,
-                            });
-                        }
-                        out.push(SchemaRow {
-                            label,
-                            kind: kind.to_string(),
-                            property: property.clone(),
-                            property_type: property_type.clone(),
-                        });
-                    }
-                }
+            // The two catalog queries share no state — concurrent, on
+            // two pooled connections.
+            let (nodes, rels) = futures::try_join!(
+                self.schema_rows(node_q, "vertex", bounds),
+                self.schema_rows(rel_q, "edge", bounds),
+            )?;
+            let mut out = nodes;
+            out.extend(rels);
+            // The cap rule is the AGE client's, verbatim: a caller LIMIT
+            // at or under the cap is a clean early stop (never a cap
+            // error), and only an uncapped/over-cap read that actually
+            // exceeds max_rows is the loud overflow.
+            if limit.is_none_or(|l| l > bounds.max_rows) && out.len() > bounds.max_rows {
+                return Err(GraphError::RowCapExceeded {
+                    max_rows: bounds.max_rows,
+                });
             }
             // The procedures publish no order; sort for a deterministic
-            // agent-facing roster (AGE orders by name in SQL).
+            // agent-facing roster (AGE orders by name in SQL — and like
+            // SQL, the sort runs before the LIMIT truncation).
             out.sort_by(|a, b| {
                 (&a.kind, &a.label, &a.property).cmp(&(&b.kind, &b.label, &b.property))
             });
@@ -376,22 +415,13 @@ impl GraphClient for Neo4jClient {
             }
             Ok(out)
         };
-        self.bounded(bounds.timeout, run).await
+        bounded(bounds.timeout, run).await
     }
-}
-
-fn read_env(source: &str, field: &str, env: &str) -> Result<String, GraphError> {
-    std::env::var(env).map_err(|_| GraphError::InvalidConfig {
-        name: source.to_string(),
-        reason: format!("{field} names environment variable '{env}', which is not set"),
-    })
 }
 
 /// Map a driver error to the taxonomy. Neo4j server errors carry their
 /// code verbatim and a bounded message via [`GraphError::backend`]
-/// (never `Display` of the whole error — messages can embed query text);
-/// the server-side transaction timeout becomes the typed
-/// [`GraphError::Timeout`].
+/// (never `Display` of the whole error — messages can embed query text).
 fn map_driver_error(source: &str, e: &neo4rs::Error) -> GraphError {
     match e {
         neo4rs::Error::Neo4j(err) => GraphError::backend(source, err.code(), err.message()),
@@ -455,44 +485,66 @@ fn decode_declared(
 }
 
 /// Decode one Bolt record as the whole-record JSON object (the fallback
-/// mode). Keys are sorted — the driver's row is a hash map, so RETURN
-/// order is not recoverable; sorted beats nondeterministic.
+/// mode) — ONE deserialization pass over the row, then keys sorted (the
+/// driver's row is a hash map, so RETURN order is not recoverable;
+/// sorted beats nondeterministic).
 fn decode_record(row: &neo4rs::Row, row_idx: usize) -> Result<Value, GraphError> {
-    let mut keys: Vec<String> = row.keys().iter().map(|k| k.value.clone()).collect();
-    keys.sort_unstable();
-    let mut record = serde_json::Map::with_capacity(keys.len());
-    for (col_idx, key) in keys.iter().enumerate() {
-        let bolt: BoltType = row.get(key).map_err(|e| GraphError::MalformedCell {
-            row: row_idx,
-            column: col_idx,
-            reason: format!("record field failed to decode: {e}"),
-        })?;
-        record.insert(key.clone(), bolt_to_json(&bolt));
+    let map: neo4rs::BoltMap = row.to_strict().map_err(|e| GraphError::MalformedCell {
+        row: row_idx,
+        column: 0,
+        reason: format!("record failed to decode: {e}"),
+    })?;
+    let mut entries: Vec<(&str, &BoltType)> = map
+        .value
+        .iter()
+        .map(|(k, v)| (k.value.as_str(), v))
+        .collect();
+    entries.sort_unstable_by_key(|(k, _)| *k);
+    let mut record = serde_json::Map::with_capacity(entries.len());
+    for (key, bolt) in entries {
+        record.insert(key.to_string(), bolt_to_json(bolt));
     }
     Ok(Value::Object(record))
 }
 
 /// One JSON parameter value → the driver's Bolt value. Recursion mirrors
-/// JSON's own shape; numbers prefer i64 and fall back to f64 (JSON's own
-/// widening).
-fn json_to_bolt(v: &Value) -> BoltType {
-    match v {
+/// JSON's own shape. Numbers must fit Bolt's 64-bit signed integers or
+/// arrive as floats — a u64 beyond i64::MAX is a typed error, never a
+/// silent narrowing to f64 (an equality filter on a narrowed id would
+/// silently match nothing; AGE passes the exact literal through, and
+/// divergence here must be loud).
+fn json_to_bolt(v: &Value) -> Result<BoltType, GraphError> {
+    Ok(match v {
         Value::Null => BoltType::Null(neo4rs::BoltNull),
         Value::Bool(b) => BoltType::Boolean(neo4rs::BoltBoolean::new(*b)),
-        Value::Number(n) => match n.as_i64() {
-            Some(i) => BoltType::Integer(neo4rs::BoltInteger::new(i)),
-            None => BoltType::Float(neo4rs::BoltFloat::new(n.as_f64().unwrap_or(f64::NAN))),
-        },
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                BoltType::Integer(neo4rs::BoltInteger::new(i))
+            } else if n.is_u64() {
+                return Err(GraphError::InvalidParams {
+                    found: "an integer beyond the neo4j backend's signed 64-bit range \
+                            (pass it as a string instead)"
+                        .to_string(),
+                });
+            } else {
+                BoltType::Float(neo4rs::BoltFloat::new(n.as_f64().unwrap_or(f64::NAN)))
+            }
+        }
         Value::String(s) => BoltType::String(neo4rs::BoltString::new(s)),
-        Value::Array(items) => items.iter().map(json_to_bolt).collect(),
+        Value::Array(items) => items
+            .iter()
+            .map(json_to_bolt)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect(),
         Value::Object(map) => {
             let mut bolt = neo4rs::BoltMap::with_capacity(map.len());
             for (k, val) in map {
-                bolt.put(neo4rs::BoltString::new(k), json_to_bolt(val));
+                bolt.put(neo4rs::BoltString::new(k), json_to_bolt(val)?);
             }
             BoltType::Map(bolt)
         }
-    }
+    })
 }
 
 /// One Bolt value → the canonical JSON shape `value.rs` converts
@@ -510,24 +562,18 @@ fn bolt_to_json(v: &BoltType) -> Value {
             .unwrap_or(Value::Null),
         BoltType::String(s) => Value::from(s.value.clone()),
         BoltType::List(items) => Value::Array(items.iter().map(bolt_to_json).collect()),
-        BoltType::Map(map) => {
-            let mut out = serde_json::Map::with_capacity(map.value.len());
-            for (k, val) in &map.value {
-                out.insert(k.value.clone(), bolt_to_json(val));
-            }
-            Value::Object(out)
-        }
+        BoltType::Map(map) => bolt_map_json(map),
         BoltType::Node(n) => node_json(n),
-        BoltType::Relation(r) => serde_json::json!({
-            "id": r.id.value.to_string(),
-            "start_id": r.start_node_id.value.to_string(),
-            "end_id": r.end_node_id.value.to_string(),
-            "label": r.typ.value,
-            "properties": bolt_map_json(&r.properties),
-        }),
+        BoltType::Relation(r) => rel_json(
+            r.id.value,
+            r.start_node_id.value,
+            r.end_node_id.value,
+            &r.typ.value,
+            &r.properties,
+        ),
         // Outside a path a relationship always arrives bounded; an
         // unbounded one at the top level would be driver drift. Decoded
-        // with empty endpoints rather than failing the scan — the shape
+        // with no endpoints rather than failing the scan — the shape
         // check in value.rs will name it if a declared column meets it.
         BoltType::UnboundedRelation(r) => serde_json::json!({
             "id": r.id.value.to_string(),
@@ -565,12 +611,26 @@ fn bolt_to_json(v: &BoltType) -> Value {
             )),
             Err(_) => Value::Null,
         },
-        BoltType::Duration(d) => {
-            // ISO-8601 duration via the driver's std conversion (which
-            // flattens the months/days components — its documented
-            // approximation; sub-second precision survives).
-            let std: std::time::Duration = d.clone().into();
-            Value::from(format!("PT{}.{:09}S", std.as_secs(), std.subsec_nanos()))
+        BoltType::Duration(_) => {
+            // Through the driver's EXTERNAL serde view — a signed
+            // (seconds, nanos) pair (months/days collapsed, saturating).
+            // Its `From<BoltDuration> for std::time::Duration` is NOT
+            // usable here: it casts `seconds as u64`, so a negative
+            // Cypher duration (legal: duration({seconds: -30})) would
+            // wrap to ~1.8e19 and render as garbage.
+            match <(i64, i64)>::deserialize(v.into_deserializer()) {
+                Ok((secs, nanos)) => {
+                    let total = i128::from(secs) * 1_000_000_000 + i128::from(nanos);
+                    let sign = if total < 0 { "-" } else { "" };
+                    let abs = total.unsigned_abs();
+                    Value::from(format!(
+                        "{sign}PT{}.{:09}S",
+                        abs / 1_000_000_000,
+                        abs % 1_000_000_000
+                    ))
+                }
+                Err(_) => Value::Null,
+            }
         }
         BoltType::Point2D(p) => serde_json::json!({
             "srid": p.sr_id.value, "x": p.x.value, "y": p.y.value,
@@ -589,19 +649,24 @@ fn bolt_to_json(v: &BoltType) -> Value {
 /// A Bolt node → the canonical vertex object. `labels` is an ARRAY (the
 /// multi-label spelling `value.rs` accepts alongside AGE's single
 /// `label`).
-fn node_json(n: &neo4rs::BoltNode) -> Value {
-    let labels: Vec<Value> = n
-        .labels
-        .iter()
-        .map(|l| match l {
-            BoltType::String(s) => Value::from(s.value.clone()),
-            other => bolt_to_json(other),
-        })
-        .collect();
+fn node_json(n: &BoltNode) -> Value {
     serde_json::json!({
         "id": n.id.value.to_string(),
-        "labels": labels,
+        "labels": n.labels.iter().map(bolt_to_json).collect::<Vec<_>>(),
         "properties": bolt_map_json(&n.properties),
+    })
+}
+
+/// The canonical bounded-relationship object — ONE spelling, shared by
+/// the top-level Relation arm and path hops, so the contract `value.rs`
+/// consumes cannot fork.
+fn rel_json(id: i64, start_id: i64, end_id: i64, typ: &str, properties: &neo4rs::BoltMap) -> Value {
+    serde_json::json!({
+        "id": id.to_string(),
+        "start_id": start_id.to_string(),
+        "end_id": end_id.to_string(),
+        "label": typ,
+        "properties": bolt_map_json(properties),
     })
 }
 
@@ -621,14 +686,34 @@ fn bolt_map_json(map: &neo4rs::BoltMap) -> Value {
 /// relationship index (sign = direction) followed by a 0-based node
 /// index. The canonical shape wants bounded relationships (`start_id` /
 /// `end_id`), so each hop resolves its endpoints from the nodes it
-/// connects; a malformed index is decoded as null (which `value.rs`
-/// rejects with the path's identity) rather than panicking on driver
-/// drift.
+/// connects; a malformed element or index is decoded as null (which
+/// `value.rs` rejects with the path's identity) rather than panicking on
+/// driver drift. Everything is borrowed from the BoltPath's own lists —
+/// the driver's accessor methods deep-clone every element and are
+/// deliberately not used.
 fn path_json(p: &neo4rs::BoltPath) -> Value {
-    let nodes = p.nodes();
-    let rels = p.rels();
-    let indices = p.indices();
-    let Some(start) = nodes.first() else {
+    let mut nodes: Vec<&BoltNode> = Vec::with_capacity(p.nodes.len());
+    for element in p.nodes.iter() {
+        let BoltType::Node(n) = element else {
+            return Value::Null; // non-node in the node list: drift
+        };
+        nodes.push(n);
+    }
+    let mut rels: Vec<&neo4rs::BoltUnboundedRelation> = Vec::with_capacity(p.rels.len());
+    for element in p.rels.iter() {
+        let BoltType::UnboundedRelation(r) = element else {
+            return Value::Null;
+        };
+        rels.push(r);
+    }
+    let mut indices: Vec<i64> = Vec::with_capacity(p.indices.len());
+    for element in p.indices.iter() {
+        let BoltType::Integer(i) = element else {
+            return Value::Null;
+        };
+        indices.push(i.value);
+    }
+    let Some(&start) = nodes.first() else {
         return Value::Null; // no start node: not a path
     };
     let mut elements: Vec<Value> = Vec::with_capacity(indices.len() + 1);
@@ -638,30 +723,30 @@ fn path_json(p: &neo4rs::BoltPath) -> Value {
         let [rel_idx, node_idx] = hop else {
             return Value::Null; // odd index list: not a path
         };
-        let rel_pos = rel_idx.value.unsigned_abs() as usize;
+        let rel_pos = rel_idx.unsigned_abs() as usize;
         let (Some(rel), Ok(node_pos)) = (
-            rel_pos.checked_sub(1).and_then(|i| rels.get(i)),
-            usize::try_from(node_idx.value),
+            rel_pos.checked_sub(1).and_then(|i| rels.get(i).copied()),
+            usize::try_from(*node_idx),
         ) else {
             return Value::Null;
         };
-        let Some(next) = nodes.get(node_pos) else {
+        let Some(&next) = nodes.get(node_pos) else {
             return Value::Null;
         };
         // Positive index: traversed with the relationship (current →
         // next); negative: against it.
-        let (start_id, end_id) = if rel_idx.value >= 0 {
+        let (start_id, end_id) = if *rel_idx >= 0 {
             (current.id.value, next.id.value)
         } else {
             (next.id.value, current.id.value)
         };
-        elements.push(serde_json::json!({
-            "id": rel.id.value.to_string(),
-            "start_id": start_id.to_string(),
-            "end_id": end_id.to_string(),
-            "label": rel.typ.value,
-            "properties": bolt_map_json(&rel.properties),
-        }));
+        elements.push(rel_json(
+            rel.id.value,
+            start_id,
+            end_id,
+            &rel.typ.value,
+            &rel.properties,
+        ));
         elements.push(node_json(next));
         current = next;
     }
@@ -671,7 +756,7 @@ fn path_json(p: &neo4rs::BoltPath) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neo4rs::{BoltBoolean, BoltInteger, BoltList, BoltMap, BoltNode, BoltPath, BoltString};
+    use neo4rs::{BoltBoolean, BoltInteger, BoltList, BoltMap, BoltPath, BoltString};
 
     fn bolt_node(id: i64, labels: &[&str], props: &[(&str, &str)]) -> BoltNode {
         let mut label_list = BoltList::new();
@@ -817,25 +902,66 @@ mod tests {
     }
 
     #[test]
-    fn params_convert_shape_faithfully() {
+    fn negative_durations_render_signed_never_wrapped() {
+        // duration({seconds: -30}) is legal Cypher; the driver's own
+        // std::time::Duration conversion would wrap it to ~1.8e19.
+        let neg = neo4rs::BoltDuration::new(0.into(), 0.into(), (-30i64).into(), 0.into());
+        assert_eq!(
+            bolt_to_json(&BoltType::Duration(neg)),
+            serde_json::json!("-PT30.000000000S")
+        );
+        // Mixed sign resolves through total nanoseconds: -1s + 0.25s.
+        let mixed =
+            neo4rs::BoltDuration::new(0.into(), 0.into(), (-1i64).into(), 250_000_000i64.into());
+        assert_eq!(
+            bolt_to_json(&BoltType::Duration(mixed)),
+            serde_json::json!("-PT0.750000000S")
+        );
+    }
+
+    #[test]
+    fn params_convert_shape_faithfully_and_overflow_is_typed() {
         let params = serde_json::json!({
             "s": "it's", "i": 3, "f": 2.5, "b": true, "nul": null,
             "list": [1, 2], "map": {"k": "v"},
         });
         let map = params.as_object().unwrap();
-        assert!(matches!(json_to_bolt(&map["s"]), BoltType::String(_)));
-        assert!(matches!(json_to_bolt(&map["i"]), BoltType::Integer(_)));
-        assert!(matches!(json_to_bolt(&map["f"]), BoltType::Float(_)));
-        assert!(matches!(json_to_bolt(&map["b"]), BoltType::Boolean(_)));
-        assert!(matches!(json_to_bolt(&map["nul"]), BoltType::Null(_)));
-        let BoltType::List(l) = json_to_bolt(&map["list"]) else {
+        assert!(matches!(
+            json_to_bolt(&map["s"]).unwrap(),
+            BoltType::String(_)
+        ));
+        assert!(matches!(
+            json_to_bolt(&map["i"]).unwrap(),
+            BoltType::Integer(_)
+        ));
+        assert!(matches!(
+            json_to_bolt(&map["f"]).unwrap(),
+            BoltType::Float(_)
+        ));
+        assert!(matches!(
+            json_to_bolt(&map["b"]).unwrap(),
+            BoltType::Boolean(_)
+        ));
+        assert!(matches!(
+            json_to_bolt(&map["nul"]).unwrap(),
+            BoltType::Null(_)
+        ));
+        let BoltType::List(l) = json_to_bolt(&map["list"]).unwrap() else {
             panic!("list");
         };
         assert_eq!(l.len(), 2);
-        let BoltType::Map(m) = json_to_bolt(&map["map"]) else {
+        let BoltType::Map(m) = json_to_bolt(&map["map"]).unwrap() else {
             panic!("map");
         };
         assert_eq!(m.len(), 1);
+        // A u64 beyond i64::MAX must be a typed refusal, never a silent
+        // narrowing to f64 (an equality filter would then silently miss).
+        let big = serde_json::json!(u64::MAX);
+        let err = json_to_bolt(&big).unwrap_err();
+        assert!(err.to_string().contains("64-bit"), "{err}");
+        // Nested overflows are caught too.
+        let nested = serde_json::json!({"ids": [1, u64::MAX]});
+        assert!(json_to_bolt(&nested).is_err());
     }
 
     #[test]

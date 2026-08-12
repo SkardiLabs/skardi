@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{Array, ListArray, StringArray, StructArray};
-use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 
 use skardi::sources::providers::graph::client::{GraphClient, QueryBounds};
@@ -30,10 +29,11 @@ use skardi::sources::providers::graph::udtf::GraphSources;
 use skardi::sources::providers::graph::value::{DeclaredColumn, GraphType};
 use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
 
+mod graph_live_support;
+use graph_live_support::{collect, split_creds};
+
 fn live_url() -> Option<String> {
-    std::env::var("SKARDI_NEO4J_LIVE_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty())
+    graph_live_support::live_url("SKARDI_NEO4J_LIVE_URL")
 }
 
 /// One declared column for direct `GraphClient::execute` calls. On this
@@ -46,18 +46,6 @@ fn cols(names: &[(&str, GraphType)]) -> Vec<DeclaredColumn> {
             ty: *ty,
         })
         .collect()
-}
-
-/// Split a maybe-credentialed URL into (cred-free URL, user, pass):
-/// config validation rejects URL-embedded passwords, so the registered
-/// source takes credentials the designed way — env-var NAMES.
-fn split_creds(url: &str) -> (String, Option<String>, Option<String>) {
-    let mut parsed = url::Url::parse(url).expect("live URL parses");
-    let user = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
-    let pass = parsed.password().map(str::to_string);
-    parsed.set_username("").expect("bolt URLs take userinfo");
-    parsed.set_password(None).expect("bolt URLs take userinfo");
-    (parsed.to_string(), user, pass)
 }
 
 /// A run-unique label suffix: Community Neo4j has one database, so the
@@ -155,15 +143,6 @@ async fn live_client(url: &str, timeout_secs: u64) -> Neo4jClient {
     )
     .await
     .expect("connects")
-}
-
-async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-    ctx.sql(sql)
-        .await
-        .expect("plans")
-        .collect()
-        .await
-        .expect("executes")
 }
 
 fn skip() -> bool {
@@ -638,6 +617,24 @@ async fn bounds_hold_row_cap_limit_and_typed_timeout() {
         .await
         .expect("collects");
     assert_eq!(rows.len(), 1);
+
+    // graph_schema shares the bounds discipline, AGE-parity: a LIMIT at
+    // or under the cap is a CLEAN stop even when the flattened catalog
+    // exceeds the cap, and only an uncapped read overflows loudly.
+    let schema_bounds = QueryBounds {
+        timeout: std::time::Duration::from_secs(10),
+        max_rows: 1,
+    };
+    let rows = client
+        .schema(schema_bounds, Some(1))
+        .await
+        .expect("limit at the cap is a clean stop, never a cap error");
+    assert_eq!(rows.len(), 1);
+    let err = client
+        .schema(schema_bounds, None)
+        .await
+        .expect_err("the seeded catalog flattens past a cap of 1");
+    assert!(err.to_string().contains("max_rows = 1"), "{err}");
 
     // Server-side tx_timeout: a summation the server cannot finish in 1s
     // dies THERE and surfaces as the typed Timeout naming the bound —

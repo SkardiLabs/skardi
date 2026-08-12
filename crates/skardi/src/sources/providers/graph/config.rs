@@ -69,17 +69,30 @@ impl GraphConfig {
     /// as a Postgres connection string in the same file) — no SSRF guard,
     /// only a scheme allowlist (design §Security).
     pub fn validate(&self, name: &str, connection_string: &str) -> Result<(), GraphError> {
-        // Scheme allowlists are per backend (design §Security): the URL
-        // is operator trust, but a bolt:// URL on the age backend (or
-        // vice versa) is a misconfiguration worth naming at load.
-        let scheme_ok = match self.backend.as_str() {
-            "age" => {
-                connection_string.starts_with("postgres://")
-                    || connection_string.starts_with("postgresql://")
-            }
-            "neo4j" => ["bolt://", "bolt+s://", "neo4j://", "neo4j+s://"]
-                .iter()
-                .any(|scheme| connection_string.starts_with(scheme)),
+        // ONE rules row per backend — the scheme list drives both the
+        // check and the error text, and the graph_name rule rides along,
+        // so milestone 3's kuzu is one new row here instead of parallel
+        // matches that can drift.
+        let rules = match self.backend.as_str() {
+            "age" => BackendRules {
+                schemes: &["postgres://", "postgresql://"],
+                // Spliced into `cypher('<name>', …)` as a SQL literal —
+                // identifier shape keeps it inert belt-and-braces (the
+                // literal is also quote-escaped at the call site).
+                name_required: true,
+                name_extra_chars: &[],
+                name_shape: "a bare identifier ([A-Za-z0-9_]+)",
+            },
+            "neo4j" => BackendRules {
+                schemes: &["bolt://", "bolt+s://", "neo4j://", "neo4j+s://"],
+                // Optional (the server default database); travels as
+                // driver-bound Bolt metadata, never query text — the
+                // shape check (Neo4j's own name alphabet) keeps typos
+                // loud, nothing more.
+                name_required: false,
+                name_extra_chars: &['.', '-'],
+                name_shape: "a database name ([A-Za-z0-9_.-]+)",
+            },
             other => {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
@@ -90,16 +103,17 @@ impl GraphConfig {
                 });
             }
         };
-        if !scheme_ok {
-            let allowed = match self.backend.as_str() {
-                "age" => "postgres:// or postgresql://",
-                _ => "bolt://, bolt+s://, neo4j://, or neo4j+s://",
-            };
+        if !rules
+            .schemes
+            .iter()
+            .any(|scheme| connection_string.starts_with(scheme))
+        {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
                 reason: format!(
-                    "the {} backend requires a {allowed} connection_string",
-                    self.backend
+                    "the {} backend requires a {} connection_string",
+                    self.backend,
+                    rules.schemes.join(" / ")
                 ),
             });
         }
@@ -131,15 +145,8 @@ impl GraphConfig {
                 });
             }
         }
-        // Per backend: on AGE the graph name is REQUIRED and spliced into
-        // `cypher('<name>', …)` as a SQL literal — identifier shape keeps
-        // it inert belt-and-braces (the literal is also quote-escaped at
-        // the call site). On neo4j it is optional (the server default
-        // database) and travels as driver-bound Bolt metadata, never
-        // query text — but the same identifier shape (plus `.` and `-`,
-        // legal in Neo4j database names) keeps typos loud.
-        match (self.backend.as_str(), self.graph_name.as_deref()) {
-            ("age", None) => {
+        match self.graph_name.as_deref() {
+            None if rules.name_required => {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
                     reason: "the age backend requires graph_name (AGE graphs are named \
@@ -147,30 +154,17 @@ impl GraphConfig {
                         .to_string(),
                 });
             }
-            ("age", Some(graph_name))
+            Some(graph_name)
                 if graph_name.is_empty()
-                    || !graph_name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                    || !graph_name.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '_' || rules.name_extra_chars.contains(&c)
+                    }) =>
             {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
                     reason: format!(
-                        "graph_name '{graph_name}' must be a bare identifier ([A-Za-z0-9_]+)"
-                    ),
-                });
-            }
-            ("neo4j", Some(db))
-                if db.is_empty()
-                    || !db
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-') =>
-            {
-                return Err(GraphError::InvalidConfig {
-                    name: name.to_string(),
-                    reason: format!(
-                        "graph_name '{db}' must be a database name ([A-Za-z0-9_.-]+) \
-                         on the neo4j backend"
+                        "graph_name '{graph_name}' must be {} on the {} backend",
+                        rules.name_shape, self.backend
                     ),
                 });
             }
@@ -218,6 +212,16 @@ impl GraphConfig {
         }
         Ok(())
     }
+}
+
+/// Per-backend validation rules — one row per backend in `validate`, so
+/// the scheme allowlist, its error text, and the graph_name contract
+/// cannot drift apart across parallel matches.
+struct BackendRules {
+    schemes: &'static [&'static str],
+    name_required: bool,
+    name_extra_chars: &'static [char],
+    name_shape: &'static str,
 }
 
 fn is_env_var_name(s: &str) -> bool {

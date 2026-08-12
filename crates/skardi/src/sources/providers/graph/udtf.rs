@@ -194,24 +194,18 @@ impl TableFunctionImpl for CypherQueryFunction {
         };
 
         // Whether `columns` may be omitted is the BACKEND's contract
-        // (resolved through the handle, still at plan time): AGE's
-        // cypher() must declare its arity, so omission there is a
-        // targeted error; on backends whose wire carries field names
-        // (Neo4j) the omission is the JSON-`record` fallback.
+        // (resolved through the handle, still at plan time): the
+        // requirement REASON comes from the backend itself, so this
+        // shared code never hardcodes one backend's binding rules.
         let handle = lookup(&self.sources, &connection)?;
         let columns = match columns_json {
             Some(text) => Some(Arc::new(parse_columns(&text).map_err(plan_error)?)),
-            None if handle.client.requires_declared_columns() => {
-                return plan_err!(
-                    "cypher_query: 'columns' is required on the age backend — declare the \
-                     output columns IN THE SAME ORDER AS YOUR RETURN CLAUSE (the binding \
-                     is positional; two same-typed columns declared out of order swap \
-                     silently), e.g. '{{\"name\": \"string\", \"n\": \"node\"}}' \
-                     (accepted types: {})",
-                    ACCEPTED_TYPES
-                );
-            }
-            None => None,
+            None => match handle.client.declared_columns_requirement() {
+                Some(reason) => {
+                    return plan_err!("cypher_query: {reason} (accepted types: {ACCEPTED_TYPES})");
+                }
+                None => None,
+            },
         };
         Ok(Arc::new(CypherQueryProvider {
             handle,
@@ -225,11 +219,17 @@ impl TableFunctionImpl for CypherQueryFunction {
 /// The JSON-`record` fallback's one-column schema: each row is the whole
 /// Cypher record as canonical JSON text (keys sorted — the Bolt driver
 /// hands records over as hash maps, so RETURN order is not recoverable).
-fn record_fallback_columns() -> Vec<DeclaredColumn> {
-    vec![DeclaredColumn {
-        name: "record".to_string(),
-        ty: GraphType::Json,
-    }]
+/// Static: it is consulted on every planning pass and every fallback
+/// scan and never changes.
+fn record_fallback_columns() -> Arc<Vec<DeclaredColumn>> {
+    static COLUMNS: std::sync::LazyLock<Arc<Vec<DeclaredColumn>>> =
+        std::sync::LazyLock::new(|| {
+            Arc::new(vec![DeclaredColumn {
+                name: "record".to_string(),
+                ty: GraphType::Json,
+            }])
+        });
+    Arc::clone(&COLUMNS)
 }
 
 /// Parse the declared-columns JSON object. Declaration order is object
@@ -597,7 +597,7 @@ fn cypher_batches(
             .map_err(execution_error)?;
         // Conversion always runs against concrete columns: the declared
         // ones, or the fallback's single `record: json`.
-        let columns = columns.unwrap_or_else(|| Arc::new(record_fallback_columns()));
+        let columns = columns.unwrap_or_else(record_fallback_columns);
         let mut batches = Vec::with_capacity(rows.len() / CONVERSION_BATCH_ROWS + 1);
         for (chunk_idx, chunk) in rows.chunks(CONVERSION_BATCH_ROWS).enumerate() {
             batches.push(
@@ -691,8 +691,11 @@ mod tests {
             Ok(stream::iter(rows.into_iter().map(Ok)).boxed())
         }
 
-        fn requires_declared_columns(&self) -> bool {
-            self.declared_required
+        fn declared_columns_requirement(&self) -> Option<&'static str> {
+            self.declared_required.then_some(
+                "'columns' is required on the age backend — declare the output \
+                 columns IN THE SAME ORDER AS YOUR RETURN CLAUSE",
+            )
         }
 
         async fn schema(

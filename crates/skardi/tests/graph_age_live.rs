@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{Array, Int64Array, ListArray, StringArray, StructArray};
-use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use sqlx::Executor;
 use sqlx::postgres::PgPoolOptions;
@@ -29,6 +28,9 @@ use skardi::sources::providers::graph::config::GraphConfig;
 use skardi::sources::providers::graph::udtf::GraphSources;
 use skardi::sources::providers::graph::value::{DeclaredColumn, GraphType};
 use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
+
+mod graph_live_support;
+use graph_live_support::{collect, split_creds};
 
 /// One declared column for direct `GraphClient::execute` calls — AGE
 /// binds positionally, so only the COUNT matters to these tests.
@@ -40,9 +42,7 @@ fn one_col() -> Vec<DeclaredColumn> {
 }
 
 fn live_url() -> Option<String> {
-    std::env::var("SKARDI_AGE_LIVE_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty())
+    graph_live_support::live_url("SKARDI_AGE_LIVE_URL")
 }
 
 /// Seed a fresh, uniquely named graph through AGE's own APIs (writes go
@@ -86,22 +86,6 @@ async fn drop_graph(pool: &sqlx::PgPool, graph: &str) {
         .bind(graph)
         .execute(pool)
         .await;
-}
-
-/// Split a maybe-credentialed URL into (cred-free URL, user, pass):
-/// config validation rejects URL-embedded passwords, so the registered
-/// source takes credentials the designed way — env-var NAMES.
-fn split_creds(url: &str) -> (String, Option<String>, Option<String>) {
-    let mut parsed = url::Url::parse(url).expect("live URL parses");
-    let user = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
-    let pass = parsed.password().map(str::to_string);
-    parsed
-        .set_username("")
-        .expect("postgres URLs take userinfo");
-    parsed
-        .set_password(None)
-        .expect("postgres URLs take userinfo");
-    (parsed.to_string(), user, pass)
 }
 
 /// YAML `username_env`/`password_env` lines for a URL's credentials,
@@ -148,15 +132,6 @@ async fn live_ctx(url: &str, graph: &str) -> (SessionContext, GraphSources) {
     let ctx = SessionContext::new();
     register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("udtfs register");
     (ctx, sources)
-}
-
-async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-    ctx.sql(sql)
-        .await
-        .expect("plans")
-        .collect()
-        .await
-        .expect("executes")
 }
 
 fn unique_graph(tag: &str) -> String {
