@@ -16,6 +16,15 @@
 //! so `columns` is REQUIRED here: omitting it is a targeted error, and
 //! the JSON-`record` fallback ships with the Neo4j milestone, where Bolt
 //! needs no declared arity.
+//!
+//! **Declared-column ORDER is load-bearing**: the binding to the Cypher
+//! `RETURN` clause is positional (all AGE's `cypher()` gives us), so
+//! `columns` must list them in RETURN order. Two same-typed columns
+//! declared out of order swap SILENTLY — same JSON kind, no
+//! `TypeMismatch`, nothing downstream can tell — which is also the
+//! mis-declaration an LLM is most likely to produce. The error message,
+//! this doc, and the design's §Schema handling all state it because no
+//! structural check is possible.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -69,6 +78,19 @@ pub type GraphSources = Arc<RwLock<HashMap<String, Arc<GraphSourceHandle>>>>;
 /// (`datafusion-functions-json`: `json_get`, `json_get_str`, …) on a
 /// session. The getters are what make node/relationship `properties`
 /// columns queryable without leaving SQL.
+///
+/// **Scope, stated plainly**: `register_all` registers 12 UDFs *and* a
+/// function rewriter *and* an expr planner that remap the SQL operators
+/// `->`, `->>` and `?` to `json_get`/`json_as_text`/`json_contains` for
+/// EVERY query in the session, not just graph ones — and it overwrites
+/// same-named UDFs (debug-level log only). Additive today (DF 52 parses
+/// `->` but ships no implementation; `json_pack` does not collide).
+/// Before M4 wires this into the server session: re-home the JSON family
+/// next to skardi's other UDF registrations, and check the
+/// datafusion-federation interaction — the rewrite runs at analysis,
+/// ahead of federation planning, so a remote `data->'k'` that used to
+/// push down could become a local `json_get` and a full scan (recorded
+/// in the design's M4 milestone).
 ///
 /// # Example
 /// ```
@@ -167,8 +189,10 @@ impl TableFunctionImpl for CypherQueryFunction {
         let Some(columns_json) = columns_json else {
             return plan_err!(
                 "cypher_query: 'columns' is required on the age backend — declare the \
-                 output columns as the 4th argument, e.g. \
-                 '{{\"name\": \"string\", \"n\": \"node\"}}' (accepted types: {})",
+                 output columns IN THE SAME ORDER AS YOUR RETURN CLAUSE (the binding \
+                 is positional; two same-typed columns declared out of order swap \
+                 silently), e.g. '{{\"name\": \"string\", \"n\": \"node\"}}' \
+                 (accepted types: {})",
                 ACCEPTED_TYPES
             );
         };

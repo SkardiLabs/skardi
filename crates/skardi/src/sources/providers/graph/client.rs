@@ -144,6 +144,7 @@ impl AgeClient {
         username_env: Option<&str>,
         password_env: Option<&str>,
         max_connections: u32,
+        acquire_timeout: Duration,
     ) -> Result<Self, GraphError> {
         let mut options: PgConnectOptions =
             connection_string
@@ -162,6 +163,12 @@ impl AgeClient {
         }
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            // Queueing on a saturated pool is bounded by the SAME knob
+            // as the query itself — sqlx's 30s default is unrelated to
+            // query_timeout_seconds and would surface as a generic
+            // driver failure after possibly LONGER than the configured
+            // bound ("every query is bounded" covers the queue too).
+            .acquire_timeout(acquire_timeout)
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // Per-connection, not per-query: LOAD is connection
@@ -175,6 +182,29 @@ impl AgeClient {
             .connect_with(options)
             .await
             .map_err(|e| backend_error(source_name, &e))?;
+        // The graph name gets the same eager treatment as the URL and
+        // the credential: a typo would otherwise fail LATE and split —
+        // per-query raw backend errors on cypher_query, and zero rows
+        // WITHOUT error on graph_schema (the catalog join just misses),
+        // which an agent reads as "this graph is empty". The connect
+        // already paid the round-trip; this check makes the eager-fail
+        // docstring true as written.
+        let exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1")
+                .bind(graph_name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| backend_error(source_name, &e))?;
+        if exists.is_none() {
+            return Err(GraphError::InvalidConfig {
+                name: source_name.to_string(),
+                reason: format!(
+                    "graph '{graph_name}' does not exist in this database \
+                     (ag_catalog.ag_graph has no such entry; create it with \
+                     SELECT create_graph(...) or fix graph_name)"
+                ),
+            });
+        }
         Ok(Self {
             pool,
             graph_name: graph_name.to_string(),
@@ -270,7 +300,7 @@ impl GraphClient for AgeClient {
                 .pool
                 .acquire()
                 .await
-                .map_err(|e| backend_error(&source, &e))?;
+                .map_err(|e| map_query_error(&source, bounds, &e))?;
             // The security boundary: the SERVER refuses writes in a read
             // transaction, whatever slipped past the keyword guard.
             conn.execute("BEGIN TRANSACTION READ ONLY")
@@ -529,11 +559,17 @@ fn read_env(source: &str, field: &str, env: &str) -> Result<String, GraphError> 
 }
 
 fn backend_error(source: &str, e: &sqlx::Error) -> GraphError {
-    let code = match e {
-        sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
-        _ => None,
+    // db.message(), never e.to_string(), for database errors: Postgres
+    // errors carry `position` and statement context — the caller's
+    // Cypher, i.e. values — and sqlx's Display dropping them today is
+    // an implementation detail of sqlx, not a guarantee of ours. Taking
+    // message() makes the "query text never flows into errors" rule
+    // THIS module's own (the 300-byte cap remains as backstop only).
+    let (code, message) = match e {
+        sqlx::Error::Database(db) => (db.code().map(|c| c.to_string()), db.message().to_string()),
+        _ => (None, e.to_string()),
     };
-    GraphError::backend(source, code.as_deref().unwrap_or("io"), &e.to_string())
+    GraphError::backend(source, code.as_deref().unwrap_or("io"), &message)
 }
 
 /// Postgres cancels a statement-timeout overrun with SQLSTATE 57014 —
@@ -542,6 +578,12 @@ fn map_query_error(source: &str, bounds: QueryBounds, e: &sqlx::Error) -> GraphE
     if let sqlx::Error::Database(db) = e
         && db.code().as_deref() == Some("57014")
     {
+        return GraphError::Timeout {
+            seconds: bounds.timeout.as_secs(),
+        };
+    }
+    // A pool-acquire timeout is the queueing flavor of the same bound.
+    if matches!(e, sqlx::Error::PoolTimedOut) {
         return GraphError::Timeout {
             seconds: bounds.timeout.as_secs(),
         };

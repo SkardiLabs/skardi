@@ -229,6 +229,33 @@ pub fn parse_agtype(text: &str) -> Result<Value, String> {
                     i += 1;
                 }
             }
+            b if b.is_ascii_alphabetic() => {
+                // agtype's float specials are bare non-JSON tokens —
+                // VERIFIED live: `RETURN 1.0e308 * 10` emits `Infinity`
+                // through agtype_out (and `-Infinity`/`NaN` are its
+                // siblings). JSON has no spelling for them, so they
+                // decode to null — the proportionate outcome for a
+                // declared float (AGE's own sqrt(-1.0) already answers
+                // SQL NULL), instead of a whole-scan MalformedCell for a
+                // legitimate value. Other bare words (true/false/null)
+                // pass through untouched; strings are untouched by
+                // construction (this arm is outside-string only).
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                if word == "NaN" || word == "Infinity" {
+                    // A leading sign belongs to the token (`-Infinity`),
+                    // not to the null replacing it.
+                    if cleaned.last() == Some(&b'-') {
+                        cleaned.pop();
+                    }
+                    cleaned.extend_from_slice(b"null");
+                } else {
+                    cleaned.extend_from_slice(word.as_bytes());
+                }
+            }
             _ => {
                 cleaned.push(b);
                 i += 1;
@@ -670,6 +697,25 @@ mod tests {
         let v = parse_agtype(r#"["中文", 1.5::numeric, "🎈"]"#).expect("parses");
         assert_eq!(v[0], "中文");
         assert_eq!(v[2], "🎈");
+    }
+
+    #[test]
+    fn agtype_float_specials_decode_to_null_outside_strings_only() {
+        // Verified live: AGE emits bare `Infinity` for float overflow
+        // (1.0e308 * 10). JSON has no spelling for the specials, so they
+        // decode to null — proportionate for a declared float — while
+        // string CONTENT is untouched and ordinary words pass through.
+        let v = parse_agtype(r#"[Infinity, -Infinity, NaN, 1.5, true]"#).expect("parses");
+        assert_eq!(v[0], Value::Null);
+        assert_eq!(v[1], Value::Null, "the sign is consumed with the token");
+        assert_eq!(v[2], Value::Null);
+        assert_eq!(v[3], 1.5);
+        assert_eq!(v[4], true);
+
+        let v =
+            parse_agtype(r#"{"note": "to Infinity and beyond", "x": Infinity}"#).expect("parses");
+        assert_eq!(v["note"], "to Infinity and beyond", "strings untouched");
+        assert_eq!(v["x"], Value::Null);
     }
 
     #[test]

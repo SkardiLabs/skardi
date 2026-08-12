@@ -85,6 +85,21 @@ pub async fn register_graph_source(
     config: &GraphConfig,
 ) -> Result<(), GraphError> {
     config.validate(name, connection_string)?;
+    // Check-early AND check-again: this peek spares a doomed registration
+    // the full eager connect (pool + graph probe, possibly a slow
+    // backend); the entry-based check after connect is what actually
+    // closes the race between two concurrent registrations.
+    {
+        let map = sources.read().unwrap_or_else(|p| p.into_inner());
+        if map.contains_key(name) {
+            return Err(GraphError::InvalidConfig {
+                name: name.to_string(),
+                reason: "a graph source with this name is already registered \
+                         (the existing connection is unchanged)"
+                    .to_string(),
+            });
+        }
+    }
     let client = AgeClient::connect(
         name,
         connection_string,
@@ -92,6 +107,7 @@ pub async fn register_graph_source(
         config.username_env.as_deref(),
         config.password_env.as_deref(),
         config.max_connections,
+        Duration::from_secs(config.query_timeout_seconds),
     )
     .await?;
     let handle = Arc::new(GraphSourceHandle {

@@ -502,6 +502,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         user.as_ref().map(|_| "SKARDI_AGE_LEAK_USER"),
         pass.as_ref().map(|_| "SKARDI_AGE_LEAK_PASS"),
         4,
+        std::time::Duration::from_secs(10),
     )
     .await
     .expect("connects");
@@ -509,16 +510,23 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         timeout: std::time::Duration::from_secs(10),
         max_rows: 1,
     };
-    for _ in 0..8 {
-        let err = client
-            .execute(
-                "MATCH (p:Person) WHERE p.name <> $x RETURN p.name",
-                &serde_json::json!({"x": "nobody"}),
-                1,
-                tight,
-                None,
-            )
-            .await
+    // CONCURRENT, so the pool genuinely opens max_connections sessions —
+    // sequential execute() reuses the one idle connection
+    // (min_connections defaults to 0) and a "sweep" would only ever see
+    // a single session (round-4 review).
+    let hammer_params = serde_json::json!({"x": "nobody"});
+    let results = futures::future::join_all((0..8).map(|_| {
+        client.execute(
+            "MATCH (p:Person) WHERE p.name <> $x RETURN p.name",
+            &hammer_params,
+            1,
+            tight,
+            None,
+        )
+    }))
+    .await;
+    for result in results {
+        let err = result
             .err()
             .expect("4 people, cap 1: the capped error path");
         assert!(err.to_string().contains("max_rows = 1"), "{err}");
@@ -526,32 +534,38 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // BACKEND error paths leak differently from client-local ones: a
     // runtime error aborts the transaction, where DEALLOCATE itself is
     // refused until ROLLBACK — the round-3 P1. Parameterized (so the
-    // PREPARE exists and the EXECUTE fails at runtime), 8× past the pool.
-    for _ in 0..8 {
-        let err = client
-            .execute(
-                "MATCH (p:Person) RETURN $x / 0",
-                &serde_json::json!({"x": 1}),
-                1,
-                tight,
-                None,
-            )
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "stream deferred".to_string());
-        assert!(!err.is_empty());
+    // PREPARE exists and the EXECUTE fails at runtime), concurrent for
+    // the same session-fan-out reason as above.
+    let div_params = serde_json::json!({"x": 1});
+    let results = futures::future::join_all((0..8).map(|_| {
+        client.execute(
+            "MATCH (p:Person) RETURN $x / 0",
+            &div_params,
+            1,
+            tight,
+            None,
+        )
+    }))
+    .await;
+    for result in results {
+        assert!(result.is_err(), "division by zero is a backend error");
     }
-    for _ in 0..8 {
+    // Sweep EVERY pooled session, not whichever one a lone query lands
+    // on: acquire all max_connections connections and hold them while
+    // checking each — that is what makes "no session carries a leak"
+    // true rather than assumed (round-4 review).
+    let conns = futures::future::join_all((0..4).map(|_| client.pool_for_tests().acquire())).await;
+    for conn in conns {
+        let mut conn = conn.expect("acquire pooled session");
         let leaked: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_prepared_statements WHERE name LIKE 'skq_p_%'",
         )
-        .fetch_one(client.pool_for_tests())
+        .fetch_one(&mut *conn)
         .await
         .expect("pg_prepared_statements readable");
         assert_eq!(
             leaked, 0,
-            "no skq_p_* statement survives client-local OR backend error paths"
+            "no skq_p_* statement survives on ANY pooled session"
         );
     }
 
@@ -595,8 +609,11 @@ async fn duplicate_registration_keeps_the_original_connection() {
     // graph) must fail AND leave the original routing untouched.
     let (clean_url, _, _) = split_creds(&url);
     let creds = cred_lines(&url, "SKARDI_AGE_DUP");
+    // Same (existing) graph, duplicate connection NAME — the name is
+    // what's under test; a nonexistent graph would now trip the
+    // registration-time existence probe first.
     let config: GraphConfig =
-        serde_yaml::from_str(&format!("backend: age\ngraph_name: {graph}_other\n{creds}"))
+        serde_yaml::from_str(&format!("backend: age\ngraph_name: {graph}\n{creds}"))
             .expect("config parses");
     let err = register_graph_source(&sources, "kg", &clean_url, &config)
         .await
@@ -612,6 +629,172 @@ async fn duplicate_registration_keeps_the_original_connection() {
     )
     .await;
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+
+    drop_graph(&pool, &graph).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn a_typoed_graph_name_fails_registration_not_discovery() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    // Without the existence probe this split: graph_schema returned ZERO
+    // ROWS with no error (an agent reads "empty graph") while
+    // cypher_query failed per-query — a typo must fail at registration,
+    // named (round-4 review, reproduced live there).
+    let graph = unique_graph("typo");
+    let pool = seed_graph(&url, &graph).await;
+    let (clean_url, _, _) = split_creds(&url);
+    let creds = cred_lines(&url, "SKARDI_AGE_TYPO");
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}_misspelled\n{creds}"
+    ))
+    .expect("config parses");
+    let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let err = register_graph_source(&sources, "kg", &clean_url, &config)
+        .await
+        .expect_err("nonexistent graph refuses at registration");
+    let msg = err.to_string();
+    assert!(msg.contains("does not exist"), "{msg}");
+    assert!(msg.contains("create_graph"), "the fix is named: {msg}");
+
+    drop_graph(&pool, &graph).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn the_timeout_bound_is_typed_and_credentials_never_reach_errors() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("bounds");
+    let pool = seed_graph(&url, &graph).await;
+
+    // 1) The timeout — the row cap's equal-billing sibling — end to end:
+    // statement_timeout fires server-side (57014) and surfaces as the
+    // TYPED Timeout naming the seconds, not a generic Backend error.
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        if let Some(u) = &user {
+            std::env::set_var("SKARDI_AGE_BOUNDS_USER", u);
+        }
+        if let Some(p) = &pass {
+            std::env::set_var("SKARDI_AGE_BOUNDS_PASS", p);
+        }
+    }
+    let client = AgeClient::connect(
+        "bounds",
+        &clean_url,
+        &graph,
+        user.as_ref().map(|_| "SKARDI_AGE_BOUNDS_USER"),
+        pass.as_ref().map(|_| "SKARDI_AGE_BOUNDS_PASS"),
+        4,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .expect("connects");
+    let err = client
+        .execute(
+            // Unbounded cartesian blowup over the seeded graph: 4^14 ≈
+            // 268M pattern combinations cannot be counted in 1s — and
+            // statement_timeout kills it AT 1s, so the test never waits
+            // for the full count either.
+            "MATCH (a),(b),(c),(d),(e),(f),(g),(h),(i),(j),(k),(l),(m),(n) RETURN count(*)",
+            &serde_json::json!({}),
+            1,
+            QueryBounds {
+                timeout: std::time::Duration::from_secs(1),
+                max_rows: 10,
+            },
+            None,
+        )
+        .await
+        .err()
+        .expect("the cartesian traversal cannot finish in 1s");
+    let msg = err.to_string();
+    assert!(msg.contains("timed out after 1s"), "typed, named: {msg}");
+
+    // 2) graph_schema's own row cap (the labels() branch).
+    let err = client
+        .labels(
+            QueryBounds {
+                timeout: std::time::Duration::from_secs(10),
+                max_rows: 1,
+            },
+            None,
+        )
+        .await
+        .expect_err("2 labels, cap 1");
+    assert!(err.to_string().contains("max_rows = 1"), "{err}");
+
+    // 3) Credentials never reach error text: force an auth failure and
+    // assert neither the wrong nor the real password appears.
+    if pass.is_some() {
+        unsafe { std::env::set_var("SKARDI_AGE_BADPASS", "wrong-password-on-purpose") };
+        let err = AgeClient::connect(
+            "badcreds",
+            &clean_url,
+            &graph,
+            user.as_ref().map(|_| "SKARDI_AGE_BOUNDS_USER"),
+            Some("SKARDI_AGE_BADPASS"),
+            4,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("wrong password refuses");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("wrong-password-on-purpose"),
+            "the credential value never appears in errors: {msg}"
+        );
+        if let Some(real) = &pass {
+            assert!(!msg.contains(real.as_str()), "nor the real one: {msg}");
+        }
+    }
+
+    drop_graph(&pool, &graph).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn agtype_float_specials_are_pinned() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    // Pins whether AGE emits non-JSON float spellings (NaN/Infinity)
+    // through agtype_out, and what our decode does with them — the
+    // round-4 review question. Whatever the outcome, it must be a
+    // PROPORTIONATE per-cell/typed result, not an opaque whole-scan
+    // failure with no identity.
+    let graph = unique_graph("nan");
+    let pool = seed_graph(&url, &graph).await;
+    let (ctx, _sources) = live_ctx(&url, &graph).await;
+
+    // Pinned live: sqrt(-1.0) is SQL NULL from AGE itself, while float
+    // OVERFLOW emits the bare token `Infinity` through agtype_out — the
+    // reachable case the review asked about. Both decode to NULL floats
+    // (proportionate; a whole-scan MalformedCell for a legitimate value
+    // would be the wrong severity).
+    for cypher in ["RETURN sqrt(-1.0)", "RETURN 1.0e308 * 10"] {
+        let batches = collect(
+            &ctx,
+            &format!(
+                "SELECT f FROM cypher_query('kg', '{cypher}', '{{}}', \
+                 '{{\"f\": \"float\"}}')"
+            ),
+        )
+        .await;
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!(col.is_null(0), "{cypher}: a float special is a NULL float");
+    }
 
     drop_graph(&pool, &graph).await;
 }
