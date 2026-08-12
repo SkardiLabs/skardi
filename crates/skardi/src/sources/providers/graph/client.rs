@@ -313,11 +313,12 @@ impl GraphClient for AgeClient {
             .await;
             // ROLLBACK unconditionally and FIRST: it clears an aborted
             // transaction (making the DEALLOCATE below executable) and a
-            // read-only transaction had nothing to undo anyway.
+            // read-only transaction had nothing to undo anyway. Its
+            // RESULT is checked LAST — an early `?` here would skip the
+            // DEALLOCATE below and leak the statement on the very success
+            // path this cleanup exists for (round-4 follow-up finding).
             let rollback = conn.execute("ROLLBACK").await;
-            if collected.is_ok() {
-                rollback.map_err(|e| backend_error(&source, &e))?;
-            }
+            let mut dealloc = Ok(Default::default());
             if let Some(name) = &prepared {
                 // On EVERY exit: prepared statements are SESSION-level,
                 // the pid+seq names never reuse, and skipping this on an
@@ -328,12 +329,14 @@ impl GraphClient for AgeClient {
                 // failed DEALLOCATE on the success path is itself an
                 // error. Targeted, never ALL — sqlx's own statement cache
                 // lives on the same connection.
-                let dealloc = conn.execute(format!("DEALLOCATE {name}").as_str()).await;
-                if collected.is_ok() {
-                    dealloc.map_err(|e| backend_error(&source, &e))?;
-                }
+                dealloc = conn.execute(format!("DEALLOCATE {name}").as_str()).await;
             }
-            collected
+            let rows = collected?;
+            // Success path only, and only AFTER both cleanups ran:
+            // rollback failure first (it happened first), then dealloc.
+            rollback.map_err(|e| backend_error(&source, &e))?;
+            dealloc.map_err(|e| backend_error(&source, &e))?;
+            Ok(rows)
         };
         // Residual, stated: the client-side timeout below ABANDONS the
         // future mid-flight — no DEALLOCATE can run on that path. It only
