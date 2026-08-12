@@ -835,11 +835,8 @@ async fn round4_fixes_hold_end_to_end() {
     // defaults to 4; hold all four sessions, then a query's acquire
     // must time out as GraphError::Timeout — not a generic Backend
     // error after sqlx's unrelated 30s default.
-    let handle = {
-        let map = sources.read().unwrap_or_else(|p| p.into_inner());
-        Arc::clone(map.get("kg").unwrap())
-    };
-    // Reach the concrete client for its pool (test-only hook).
+    // A dedicated 1-connection client (the registered source's handle
+    // hides the concrete type behind dyn GraphClient).
     let (clean_url, user, pass) = split_creds(&url);
     unsafe {
         if let Some(u) = &user {
