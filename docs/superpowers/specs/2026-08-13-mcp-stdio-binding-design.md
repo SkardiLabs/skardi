@@ -4,16 +4,29 @@
 **Date:** 2026-08-13
 **Branch:** `mcp-stdio-binding-design`
 
+**Scope — touches two crates, not one.** This is not a CLI-only feature.
+Most of the work lives in `crates/cli` (the new `skardi mcp` subcommand),
+but shipping it also requires a small, additive, **decided** change in
+`crates/server`: `GET /pipelines` gains `description` and `parameters`
+fields it does not return today (Option A — see "Server-side change" for
+the full rationale and the rejected zero-server-change alternative). A
+server-side PR is a prerequisite for this design, not an optional
+enhancement layered on top of it.
+
 ## Summary
 
 Skardi gains its third agent-facing binding: an MCP (Model Context Protocol)
 server. v1 ships as a new CLI subcommand — `skardi mcp` — that speaks MCP over
 **stdio** to a local host (Claude Desktop, Cursor, any MCP client) and proxies
-every operation to a running `skardi-server` over the existing REST API, using
-the CLI's existing `ApiClient`. The server's execution path is untouched — the
-subcommand is a protocol translator; the only proposed server edit is a small
-additive enrichment of the pipeline inventory endpoint (see "Server-side
-change").
+every operation to a running `skardi-server` over REST, using the CLI's
+existing `ApiClient`. The server's *execution* path is untouched — no
+pipeline runs, no query executes, any differently than it does today. But
+this design does require one small, additive, **decided** server-side
+change: `GET /pipelines` gains `description` and `parameters` fields it
+doesn't return today (Option A — see "Server-side change"). That change is
+a prerequisite for the bridge, not an optional enhancement — without it,
+pipeline tools would ship with no LLM-facing description and parameter
+types rendered as raw Rust Debug strings.
 
 The tool surface mirrors what REST and shell already expose:
 
@@ -40,11 +53,13 @@ roadmap has promised this binding ("MCP-soon" in the README banner; unchecked
 item under `5` Agent-facing bindings).
 
 stdio ships first because it is the cheap half: the CLI is already a thin
-HTTP client for skardi-server, so the MCP subcommand is a translator between
-two existing, stable interfaces. The streamable HTTP transport (an `/mcp`
-route inside skardi-server, for remote/hosted agents) is deferred; the tool
-projection logic designed here is transport-independent and will be shared
-when that lands.
+HTTP client for skardi-server, so most of the MCP subcommand is a translator
+between two existing, stable interfaces — plus one small, decided,
+additive server change (below) so descriptions and clean parameter types
+survive that translation instead of getting lost in it. The streamable HTTP
+transport (an `/mcp` route inside skardi-server, for remote/hosted agents)
+is deferred; the tool projection logic designed here is transport-independent
+and will be shared when that lands.
 
 ## Repo facts the design builds on
 
@@ -255,15 +270,20 @@ call** — no cache. Hosts call it rarely (connect time), the hop is
 typically localhost, and this transparently reflects a restarted or
 re-configured server without bridge restart logic.
 
-## Server-side change (small, additive — needs sign-off)
+## Server-side change (required — decided: Option A)
 
+**This section is not a menu of options — it documents one required change
+to `crates/server` and the rejected alternative that would have avoided it.**
 The REST surface does not currently expose what the projection needs in one
 round trip: `GET /pipelines` lacks parameters *and* descriptions, and
 `GET /pipeline/:name` lacks the description and renders types as Rust Debug
-strings.
+strings. Implementing pipeline tools without this change means shipping
+`skardi mcp` with tool descriptions the LLM never sees and parameter types
+rendered as opaque Debug strings — so this is scoped as part of the v1
+binding, not a "nice to have" deferred to later.
 
-**Option A (recommended): enrich `GET /pipelines`.** Each list item gains
-two fields (existing fields unchanged — additive, backward compatible):
+**Decided: enrich `GET /pipelines`.** Each list item gains two fields
+(existing fields unchanged — additive, backward compatible):
 
 ```json
 {
@@ -280,18 +300,20 @@ two fields (existing fields unchanged — additive, backward compatible):
 `json_type` is emitted server-side from the same mapping table above, so the
 bridge (and any future binding — the skills generator needs exactly the same
 data) never parses Debug strings. `GET /pipeline/:name` gains the same
-`description` and `json_type` fields for consistency.
+`description` and `json_type` fields for consistency. This is a ~20-line
+change in `pipeline_handlers.rs` plus tests — the only server-side edit in
+this design, and it lands in `crates/server` alongside (or ahead of) the
+`crates/cli` work, not after it: the bridge's tool-description and type-
+mapping tests depend on these fields existing.
 
-**Option B (zero server change).** The bridge calls `GET /pipeline/:name`
-per pipeline (N+1, acceptable for realistic N), parses the Debug `type`
-string, and falls back to a generic description ("Execute pipeline
-<name>"). Rejected as the default because tool descriptions are the single
-highest-leverage input to LLM tool-selection quality, and the YAML authors
-already wrote them — hiding them from the binding wastes exactly the
-metadata this feature exists to project.
-
-Option A is a ~20-line change in `pipeline_handlers.rs` plus tests, and is
-the only server-side edit in this design.
+**Rejected: zero-server-change alternative (Option B).** The bridge would
+instead call `GET /pipeline/:name` per pipeline (N+1, acceptable for
+realistic N), parse the Debug `type` string itself, and fall back to a
+generic description ("Execute pipeline `<name>`") when none is available.
+Rejected because tool descriptions are the single highest-leverage input to
+LLM tool-selection quality, and the YAML authors already wrote them — hiding
+them from the binding behind a generic fallback wastes exactly the metadata
+this feature exists to project.
 
 ## Execution flow and error mapping
 
@@ -367,13 +389,19 @@ here needs `#[ignore]`, as all tests are self-contained.
   schemas further, but it is a new YAML surface; propose separately if tool
   ergonomics prove insufficient.
 
+## Decided
+
+- **Server-side inventory enrichment: Option A** (2026-08-13) — `GET
+  /pipelines` gains `description` and `parameters` fields; see "Server-side
+  change". This is a required change to `crates/server`, not deferred —
+  the zero-server-change alternative (Option B) is rejected and kept in
+  that section only for the record.
+
 ## Open decisions
 
-1. **Option A vs B** for the server-side inventory enrichment
-   (recommendation: A).
-2. **`purpose` parameter on `query`** — include as optional (recommended,
+1. **`purpose` parameter on `query`** — include as optional (recommended,
    as specced) or omit entirely from v1.
-3. **Built-in tool naming** — `query` / `list_data_sources` as specced, or
+2. **Built-in tool naming** — `query` / `list_data_sources` as specced, or
    e.g. `skardi_query` prefixing to reduce collision odds with user
    pipeline names (recommendation: unprefixed; MCP hosts already namespace
    tools per server, and reserved-name suffixing covers the edge).
