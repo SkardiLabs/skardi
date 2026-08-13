@@ -57,6 +57,16 @@ use super::guard::reject_mutations;
 use super::value::{ACCEPTED_TYPES, DeclaredColumn, GraphType, build_batch, declared_schema};
 use crate::sources::providers::udtf_args::strict_string_arg;
 
+/// Projection prunes AFTER conversion, deliberately: the declared
+/// schema is the CALLER'S CONTRACT, so a violated declaration fails
+/// loudly whether or not this query selected the column — otherwise the
+/// error surfaces only when someone finally selects it, far from the
+/// query that established the bad declaration. A reader making
+/// projection pushdown actually prune work would change observable
+/// behaviour;
+/// `an_unprojected_declared_column_still_fails_its_type_contract` pins
+/// it.
+///
 /// Conversion batch size (design §Schema handling): the atomic unit —
 /// each batch converts as a whole before it is emitted, so a mid-scan
 /// type mismatch never emits a partially converted batch.

@@ -166,6 +166,18 @@ impl Drop for OpenTxnGuard {
             // harnesses.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
+                    // NOTE: this ROLLBACK queues BEHIND the statement
+                    // still running on this session, so the connection
+                    // does not return to the pool until the server-side
+                    // statement_timeout expires (up to
+                    // query_timeout_seconds — measured ~23s in review).
+                    // A burst of cancellations can therefore pin every
+                    // pooled session for that long, with new queries
+                    // queueing on acquire_timeout — bounded, but not
+                    // prompt. Cancelling the running query first
+                    // (pg_cancel_backend from a second connection) is
+                    // the fix if that ever bites.
+                    //
                     // ROLLBACK first (clears an aborted transaction, where
                     // DEALLOCATE is refused), then drop the statement —
                     // the same order the clean path uses.
