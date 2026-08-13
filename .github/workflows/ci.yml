@@ -661,7 +661,13 @@ jobs:
       # the AgeClient/register_graph_source code is exercised ONLY by the
       # graph_age_live suite, which self-skips without this backend (the
       # PR #203 codecov report showed client.rs at 11% for exactly that
-      # reason). Same docker-run pattern as MinIO above.
+      # reason). Docker-run like MinIO above, but the readiness poll must
+      # go over TCP: the postgres entrypoint runs a TEMPORARY
+      # unix-socket-only server for initdb, so a socket-side pg_isready
+      # can answer "ready" during bootstrap while the real server is
+      # still seconds away — an intermittent red on the whole coverage
+      # job. The bootstrap server never listens on TCP, so -h 127.0.0.1
+      # can only succeed against the real one.
       - name: Start Apache AGE for graph live tests
         run: |
           docker run -d --name skardi-age \
@@ -669,7 +675,7 @@ jobs:
             -e POSTGRES_PASSWORD=skardiage \
             apache/age
           for i in $(seq 1 30); do
-            if docker exec skardi-age pg_isready -U postgres >/dev/null 2>&1; then
+            if docker exec skardi-age pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then
               echo "age ready after ${i}s"
               break
             fi

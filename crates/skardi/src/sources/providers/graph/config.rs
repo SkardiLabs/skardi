@@ -14,8 +14,21 @@ pub const DEFAULT_QUERY_TIMEOUT_SECONDS: u64 = 30;
 pub const MAX_QUERY_TIMEOUT_SECONDS: u64 = 86_400;
 /// Default per-query row cap.
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
+/// Upper bound on the configurable row cap: one million rows. The knob
+/// maps to MEMORY, not just wire traffic — the milestone-1 client
+/// buffers the whole result (JSON rows, then the collected stream, then
+/// every RecordBatch) before the first batch is emitted, so peak
+/// resident memory is a small multiple of the result set and scales
+/// linearly with this value. Bounded by construction beats bounded by
+/// review: an accidental `max_rows: 50000000` must be a config error,
+/// not an in-process OOM.
+pub const MAX_MAX_ROWS: usize = 1_000_000;
 /// Default connection-pool size.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 4;
+/// Upper bound on the pool size — same bounded-by-construction
+/// principle; anything past this is far beyond a Postgres default
+/// (`max_connections = 100`) and reads like a typo'd row cap.
+pub const MAX_MAX_CONNECTIONS: u32 = 64;
 
 /// The `graph:` block of a `type: graph` data source.
 #[derive(Debug, Clone, Deserialize)]
@@ -37,12 +50,21 @@ pub struct GraphConfig {
     #[serde(default = "default_timeout")]
     pub query_timeout_seconds: u64,
     /// Rows Skardi will consume per query; exceeding it is a typed error,
-    /// never a silent truncation.
+    /// never a silent truncation. This is a MEMORY knob: the client
+    /// buffers the whole result before emitting (see [`MAX_MAX_ROWS`]).
     #[serde(default = "default_max_rows")]
     pub max_rows: usize,
     /// Connection-pool size against the backend.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// PARSED but not yet supported: YAML catalog views are milestone 4.
+    /// The field exists so an operator copying the design doc's example
+    /// gets "views arrive with milestone 4" from validation — not
+    /// serde's "unknown field `views`", which reads as "skardi doesn't
+    /// support views". Accepted-and-ignored would be worse: a declared
+    /// view that silently does nothing.
+    #[serde(default)]
+    pub views: Option<serde_yaml::Value>,
 }
 
 fn default_timeout() -> u64 {
@@ -145,10 +167,15 @@ impl GraphConfig {
                 });
             }
         }
-        if self.max_rows == 0 {
+        if self.max_rows == 0 || self.max_rows > MAX_MAX_ROWS {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
-                reason: "max_rows must be positive".to_string(),
+                reason: format!(
+                    "max_rows must be in 1..={MAX_MAX_ROWS} (got {}) — the milestone-1 \
+                     client buffers the whole result, so this knob is peak memory, and \
+                     it gets the same hard ceiling the timeout got",
+                    self.max_rows
+                ),
             });
         }
         if self.query_timeout_seconds == 0 || self.query_timeout_seconds > MAX_QUERY_TIMEOUT_SECONDS
@@ -163,10 +190,22 @@ impl GraphConfig {
                 ),
             });
         }
-        if self.max_connections == 0 {
+        if self.max_connections == 0 || self.max_connections > MAX_MAX_CONNECTIONS {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
-                reason: "max_connections must be positive".to_string(),
+                reason: format!(
+                    "max_connections must be in 1..={MAX_MAX_CONNECTIONS} (got {})",
+                    self.max_connections
+                ),
+            });
+        }
+        if self.views.is_some() {
+            return Err(GraphError::InvalidConfig {
+                name: name.to_string(),
+                reason: "`views` arrive with milestone 4 (YAML catalog views); the \
+                         ad-hoc surface today is cypher_query(...) — remove the views \
+                         block until then"
+                    .to_string(),
             });
         }
         Ok(())
@@ -295,8 +334,39 @@ password_env: AGE_PG_PASS
 
     #[test]
     fn unknown_fields_are_rejected_at_parse() {
-        let err = serde_yaml::from_str::<GraphConfig>("backend: age\ngraph_name: g\nviews: []\n")
+        let err = serde_yaml::from_str::<GraphConfig>("backend: age\ngraph_name: g\nviewz: []\n")
             .unwrap_err();
-        assert!(err.to_string().contains("views"), "{err}");
+        assert!(err.to_string().contains("viewz"), "{err}");
+    }
+
+    #[test]
+    fn views_parse_but_are_named_as_milestone_4_work() {
+        // The design doc's own example carries `views:` — an operator
+        // copying it must get "milestone 4", not serde's unknown-field
+        // error (which reads as "skardi doesn't support views").
+        let c: GraphConfig = serde_yaml::from_str(
+            "backend: age\ngraph_name: g\nviews:\n  - name: user_posts\n    cypher: MATCH (n) RETURN n\n",
+        )
+        .expect("the field parses");
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("milestone 4"), "{err}");
+    }
+
+    #[test]
+    fn max_rows_and_max_connections_have_hard_ceilings() {
+        // The row cap is a MEMORY knob under the fully-buffering client
+        // — an accidental 50M must be a config error, not an OOM.
+        let mut c = base();
+        c.max_rows = MAX_MAX_ROWS + 1;
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("1..=1000000"), "{err}");
+        c.max_rows = MAX_MAX_ROWS;
+        c.validate("kg", "postgres://h/db")
+            .expect("the ceiling itself is legal");
+
+        let mut c = base();
+        c.max_connections = MAX_MAX_CONNECTIONS + 1;
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("1..=64"), "{err}");
     }
 }

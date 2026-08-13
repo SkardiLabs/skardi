@@ -200,7 +200,7 @@ async fn scalars_params_and_ordering_round_trip() {
     assert_eq!(ages.value(0), 41);
 
     // A NULL property lands as SQL NULL (cyd has no age), and the CJK
-    // name round-trips byte-faithfully (the P1 mojibake regression:
+    // name round-trips byte-faithfully (the mojibake failure mode:
     // Latin-1 per-byte push would deliver a corrupted-but-parseable
     // string, so this MUST assert the exact value end to end).
     let batches = collect(
@@ -513,7 +513,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // CONCURRENT, so the pool genuinely opens max_connections sessions —
     // sequential execute() reuses the one idle connection
     // (min_connections defaults to 0) and a "sweep" would only ever see
-    // a single session (round-4 review).
+    // a single session.
     let hammer_params = serde_json::json!({"x": "nobody"});
     let results = futures::future::join_all((0..8).map(|_| {
         client.execute(
@@ -533,7 +533,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     }
     // BACKEND error paths leak differently from client-local ones: a
     // runtime error aborts the transaction, where DEALLOCATE itself is
-    // refused until ROLLBACK — the round-3 P1. Parameterized (so the
+    // refused until ROLLBACK. Parameterized (so the
     // PREPARE exists and the EXECUTE fails at runtime), concurrent for
     // the same session-fan-out reason as above.
     let div_params = serde_json::json!({"x": 1});
@@ -553,7 +553,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // Sweep EVERY pooled session, not whichever one a lone query lands
     // on: acquire all max_connections connections and hold them while
     // checking each — that is what makes "no session carries a leak"
-    // true rather than assumed (round-4 review).
+    // true rather than assumed.
     let conns = futures::future::join_all((0..4).map(|_| client.pool_for_tests().acquire())).await;
     for conn in conns {
         let mut conn = conn.expect("acquire pooled session");
@@ -643,7 +643,7 @@ async fn a_typoed_graph_name_fails_registration_not_discovery() {
     // Without the existence probe this split: graph_schema returned ZERO
     // ROWS with no error (an agent reads "empty graph") while
     // cypher_query failed per-query — a typo must fail at registration,
-    // named (round-4 review, reproduced live there).
+    // named (reproduced live before the probe existed).
     let graph = unique_graph("typo");
     let pool = seed_graph(&url, &graph).await;
     let (clean_url, _, _) = split_creds(&url);
@@ -766,8 +766,9 @@ async fn agtype_float_specials_are_pinned() {
         return;
     };
     // Pins whether AGE emits non-JSON float spellings (NaN/Infinity)
-    // through agtype_out, and what our decode does with them — the
-    // round-4 review question. Whatever the outcome, it must be a
+    // through agtype_out, and what our decode does with them (the
+    // overflow spelling is real: 1.0e308 * 10 emits a bare Infinity
+    // token). Whatever the outcome, it must be a
     // PROPORTIONATE per-cell/typed result, not an opaque whole-scan
     // failure with no identity.
     let graph = unique_graph("nan");
@@ -801,7 +802,7 @@ async fn agtype_float_specials_are_pinned() {
 
 #[tokio::test]
 #[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
-async fn round4_fixes_hold_end_to_end() {
+async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
     let Some(url) = live_url() else {
         eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
         return;

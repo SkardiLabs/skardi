@@ -21,10 +21,15 @@ const BLOCKED: &[&str] = &[
 ];
 
 /// Reject Cypher containing a blocked keyword. The error names the
-/// keyword and its byte offset — never the query text.
+/// keyword and its byte offset — never the query text. The FIRST match
+/// in the query wins, not the first keyword in [`BLOCKED`]: the error
+/// exists to hand an LLM the place to start rewriting, and
+/// `DETACH DELETE` must point at `DETACH`, not at the later `DELETE`
+/// that happens to sort earlier in the list.
 pub fn reject_mutations(cypher: &str) -> Result<(), GraphError> {
     let upper = cypher.to_ascii_uppercase();
     let bytes = upper.as_bytes();
+    let mut earliest: Option<(&'static str, usize)> = None;
     for keyword in BLOCKED {
         let mut from = 0;
         while let Some(pos) = upper[from..].find(keyword) {
@@ -33,15 +38,18 @@ pub fn reject_mutations(cypher: &str) -> Result<(), GraphError> {
             let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
             let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
             if boundary_before && boundary_after {
-                return Err(GraphError::MutationRejected {
-                    keyword,
-                    offset: start,
-                });
+                if earliest.is_none_or(|(_, best)| start < best) {
+                    earliest = Some((keyword, start));
+                }
+                break; // later occurrences of this keyword can't be earlier
             }
             from = end;
         }
     }
-    Ok(())
+    match earliest {
+        Some((keyword, offset)) => Err(GraphError::MutationRejected { keyword, offset }),
+        None => Ok(()),
+    }
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -96,5 +104,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("'SET'"), "{msg}");
         assert!(!msg.contains("secret"), "query text never leaks: {msg}");
+    }
+
+    #[test]
+    fn the_first_keyword_in_the_query_wins_not_the_first_in_the_list() {
+        // DETACH sits earlier in the text, DELETE earlier in BLOCKED —
+        // the LLM's rewrite anchor is the text position.
+        let err = reject_mutations("MATCH (n) DETACH DELETE n").unwrap_err();
+        let GraphError::MutationRejected { keyword, offset } = err else {
+            panic!("mutation");
+        };
+        assert_eq!(keyword, "DETACH");
+        assert_eq!(offset, 10);
     }
 }
