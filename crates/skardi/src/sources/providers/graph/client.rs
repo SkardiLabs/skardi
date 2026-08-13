@@ -24,7 +24,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::{Either, Executor, Row};
+use sqlx::{Connection, Either, Executor, Row};
 
 use super::error::{GraphError, json_kind};
 use super::value::parse_agtype;
@@ -131,11 +131,18 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
 /// returned `idle in transaction` mostly self-heals on reuse, but it
 /// holds a snapshot while idle and a cancellation burst can pin every
 /// pooled session. This guard closes it: if dropped while ARMED, the
-/// connection is moved into a spawned task that rolls back and only then
-/// returns it to the pool; the clean path defuses and runs its ordered
-/// cleanup inline.
+/// connection is moved into a spawned task that rolls back AND
+/// deallocates the call's prepared statement, and only then returns it
+/// to the pool; the clean path defuses and runs its ordered cleanup
+/// inline. The DEALLOCATE matters as much as the rollback: the guard is
+/// what RESCUES the connection back into the pool, so without it every
+/// cancelled parameterized query would strand one session-level
+/// `skq_p_*` statement permanently — monotonic growth on long-lived
+/// sessions, the exact failure the live leak sweep exists to prevent.
 struct OpenTxnGuard {
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    /// The per-call PREPARE name, armed as soon as it is known.
+    prepared: Option<String>,
 }
 
 impl OpenTxnGuard {
@@ -151,14 +158,21 @@ impl OpenTxnGuard {
 impl Drop for OpenTxnGuard {
     fn drop(&mut self) {
         if let Some(mut conn) = self.conn.take() {
-            // Drop is sync; the rollback needs the runtime. Execution
+            let prepared = self.prepared.take();
+            // Drop is sync; the cleanup needs the runtime. Execution
             // always runs inside tokio here — the fallback (no runtime:
             // plain drop, sqlx pings a possibly-in-transaction session
             // back into the pool) is only reachable from exotic test
             // harnesses.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
+                    // ROLLBACK first (clears an aborted transaction, where
+                    // DEALLOCATE is refused), then drop the statement —
+                    // the same order the clean path uses.
                     let _ = conn.execute("ROLLBACK").await;
+                    if let Some(name) = prepared {
+                        let _ = conn.execute(format!("DEALLOCATE {name}").as_str()).await;
+                    }
                 });
             }
         }
@@ -205,6 +219,47 @@ impl AgeClient {
             let pass = read_env(source_name, "password_env", env)?;
             options = options.password(&pass);
         }
+        // PREFLIGHT on a single direct connection, before any pool
+        // exists: sqlx treats an `after_connect` error as a failed
+        // attempt and RETRIES until acquire_timeout, discarding the
+        // underlying cause — a bad search_path or a missing AGE would
+        // surface as a 30-second "pool timed out" pointing at pool
+        // sizing. Running the same per-connection setup here first means
+        // auth failures, setup failures, and the graph probe all fail
+        // FAST with their real, named error (the eager-fail contract in
+        // mod.rs's docstring).
+        {
+            let mut conn = sqlx::postgres::PgConnection::connect_with(&options)
+                .await
+                .map_err(|e| backend_error(source_name, &e))?;
+            per_connection_setup(&mut conn)
+                .await
+                .map_err(|e| backend_error(source_name, &e))?;
+            // The graph name gets the same eager treatment as the URL
+            // and the credential: a typo would otherwise fail LATE and
+            // split — per-query raw backend errors on cypher_query, and
+            // zero rows WITHOUT error on graph_schema (the catalog join
+            // just misses), which an agent reads as "this graph is
+            // empty".
+            let exists: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1")
+                    .bind(graph_name)
+                    .fetch_optional(&mut conn)
+                    .await
+                    .map_err(|e| backend_error(source_name, &e))?;
+            if exists.is_none() {
+                return Err(GraphError::InvalidConfig {
+                    name: source_name.to_string(),
+                    reason: format!(
+                        "graph '{graph_name}' does not exist in this database \
+                         (ag_catalog.ag_graph has no such entry; create it with \
+                         SELECT create_graph(...) or fix graph_name)"
+                    ),
+                });
+            }
+        }
+        // Lazy pool: the preflight above already proved the environment,
+        // so the pool's own connections dial on demand.
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             // Queueing on a saturated pool is bounded by the SAME knob
@@ -213,42 +268,13 @@ impl AgeClient {
             // driver failure after possibly LONGER than the configured
             // bound ("every query is bounded" covers the queue too).
             .acquire_timeout(acquire_timeout)
-            .after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    // Per-connection, not per-query: LOAD is connection
-                    // state, and ag_catalog on the search path is what
-                    // makes `agtype` and `cypher()` resolvable.
-                    conn.execute("LOAD 'age'; SET search_path = ag_catalog, \"$user\", public;")
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect_with(options)
-            .await
-            .map_err(|e| backend_error(source_name, &e))?;
-        // The graph name gets the same eager treatment as the URL and
-        // the credential: a typo would otherwise fail LATE and split —
-        // per-query raw backend errors on cypher_query, and zero rows
-        // WITHOUT error on graph_schema (the catalog join just misses),
-        // which an agent reads as "this graph is empty". The connect
-        // already paid the round-trip; this check makes the eager-fail
-        // docstring true as written.
-        let exists: Option<i32> =
-            sqlx::query_scalar("SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1")
-                .bind(graph_name)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| backend_error(source_name, &e))?;
-        if exists.is_none() {
-            return Err(GraphError::InvalidConfig {
-                name: source_name.to_string(),
-                reason: format!(
-                    "graph '{graph_name}' does not exist in this database \
-                     (ag_catalog.ag_graph has no such entry; create it with \
-                     SELECT create_graph(...) or fix graph_name)"
-                ),
-            });
-        }
+            .after_connect(|conn, _meta| Box::pin(per_connection_setup(conn)))
+            .connect_lazy_with(options);
+        tracing::debug!(
+            source = source_name,
+            graph = graph_name,
+            "graph source connected"
+        );
         Ok(Self {
             pool,
             graph_name: graph_name.to_string(),
@@ -264,7 +290,30 @@ impl AgeClient {
     pub fn pool_for_tests(&self) -> &PgPool {
         &self.pool
     }
+}
 
+/// Per-connection session state, shared by the registration preflight
+/// and the pool's `after_connect` hook so the two can never drift.
+///
+/// `LOAD 'age'` is BEST-EFFORT, deliberately: Postgres restricts LOAD
+/// of a library outside `$libdir/plugins` to superusers (AGE installs
+/// to `$libdir/age.so`), so requiring it would force every graph source
+/// onto a superuser credential — the exact opposite of the design's
+/// least-privilege recommendation, and it would put the module's ONLY
+/// enforcing layer (the backend READ ONLY transaction) behind maximum
+/// privilege. The supported deployment (the official apache/age image)
+/// ships `shared_preload_libraries = age`, where the LOAD is a no-op;
+/// where AGE is genuinely absent, the registration preflight's
+/// `ag_catalog.ag_graph` probe is what fails, with a named error. The
+/// search_path, by contrast, is required state — its failure is real.
+async fn per_connection_setup(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    let _ = conn.execute("LOAD 'age'").await;
+    conn.execute("SET search_path = ag_catalog, \"$user\", public")
+        .await?;
+    Ok(())
+}
+
+impl AgeClient {
     /// The `cypher()` invocation, spoken over the SIMPLE query protocol —
     /// three AGE realities verified live make this the one sound
     /// spelling:
@@ -330,6 +379,19 @@ impl GraphClient for AgeClient {
         };
         let (sql, prepared) = self.build_sql(cypher, params, arity, fetch);
         let source = self.source_name.clone();
+        let started = std::time::Instant::now();
+        // Acquire OUTSIDE the client-side timeout window: acquire and
+        // execution are sequential costs, and acquire_timeout already
+        // bounds the queue with its own typed PoolTimedOut mapping.
+        // Sharing one window would let 25s of pool contention leave a
+        // 30s statement 10s of budget — reported as the query's timeout
+        // with the server-side bound (the authoritative one) mostly
+        // unspent.
+        let acquired = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| map_query_error(&source, bounds, &e))?;
         let run = async {
             // A MANUAL transaction on an explicitly acquired connection,
             // not sqlx's Transaction guard: cleanup must be able to
@@ -340,15 +402,11 @@ impl GraphClient for AgeClient {
             // clear session-level prepared statements. Rollback-then-
             // deallocate is the only order that cleans up after backend
             // errors. The [`OpenTxnGuard`] covers what MANUAL cannot: a
-            // scan future dropped mid-transaction still rolls back before
-            // the connection re-enters the pool.
+            // scan future dropped mid-transaction still rolls back AND
+            // deallocates before the connection re-enters the pool.
             let mut guard = OpenTxnGuard {
-                conn: Some(
-                    self.pool
-                        .acquire()
-                        .await
-                        .map_err(|e| map_query_error(&source, bounds, &e))?,
-                ),
+                conn: Some(acquired),
+                prepared: prepared.clone(),
             };
             // The security boundary: the SERVER refuses writes in a read
             // transaction, whatever slipped past the keyword guard.
@@ -446,23 +504,29 @@ impl GraphClient for AgeClient {
             dealloc.map_err(|e| backend_error(&source, &e))?;
             Ok(rows)
         };
-        // Residual, stated: the client-side timeout below (and any drop
-        // of the scan future) ABANDONS the run mid-flight. The OPEN
-        // TRANSACTION is covered — [`OpenTxnGuard`] rolls it back before
-        // the connection re-enters the pool — but no DEALLOCATE runs on
-        // that path. Acceptable: the prepared names are per-call unique
-        // (never reused), the timeout arm only fires when the backend
-        // outlived its own statement_timeout by 5s, and sqlx tears down
-        // a connection dropped mid-query rather than pooling it.
-        // Client-side wrap: the server timeout is authoritative, this one
-        // covers a backend that stops answering entirely. saturating_add:
-        // the config caps the timeout, but arithmetic here must not be
-        // the thing that panics if that invariant ever moves.
+        // The client-side timeout (and any drop of the scan future)
+        // ABANDONS the run mid-flight; [`OpenTxnGuard`] then rolls the
+        // open transaction back AND deallocates this call's prepared
+        // statement before the connection re-enters the pool — the
+        // guard is what RESCUES the session, so it must also be what
+        // cleans it. The wrap covers only the transaction body (acquire
+        // happened above, bounded by its own acquire_timeout), so the
+        // server-side statement_timeout keeps its full budget and stays
+        // the authoritative bound; this one covers a backend that stops
+        // answering entirely. saturating_add: the config caps the
+        // timeout, but arithmetic here must not be the thing that panics
+        // if that invariant ever moves.
         let rows = tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
             .map_err(|_| GraphError::Timeout {
                 seconds: bounds.timeout.as_secs(),
             })??;
+        tracing::debug!(
+            source = %self.source_name,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            rows = rows.len(),
+            "cypher_query executed"
+        );
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
 
@@ -491,17 +555,26 @@ impl GraphClient for AgeClient {
                 .begin()
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
-            sqlx::query("SET TRANSACTION READ ONLY")
-                .execute(&mut *tx)
+            // Same protocol discipline as execute(): the SETs ride the
+            // SIMPLE protocol as constant text. `sqlx::query` would take
+            // the extended protocol and plant a server-side prepared
+            // statement in the per-connection cache — keyed on the
+            // interpolated text, so each distinct timeout value would
+            // cache another copy on every pooled session.
+            (&mut *tx)
+                .execute("SET TRANSACTION READ ONLY")
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
-            sqlx::query(&format!(
-                "SET LOCAL statement_timeout = '{}ms'",
-                bounds.timeout.as_millis()
-            ))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| backend_error(&source, &e))?;
+            (&mut *tx)
+                .execute(
+                    format!(
+                        "SET LOCAL statement_timeout = '{}ms'",
+                        bounds.timeout.as_millis()
+                    )
+                    .as_str(),
+                )
+                .await
+                .map_err(|e| backend_error(&source, &e))?;
             // ag_catalog is the exact source for labels; AGE's own
             // catch-all labels (`_ag_label_vertex` / `_ag_label_edge`)
             // are implementation noise for an agent and are filtered.
@@ -525,6 +598,7 @@ impl GraphClient for AgeClient {
             tx.rollback()
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
+            tracing::debug!(source = %source, labels = rows.len(), "graph_schema catalog read");
             rows.into_iter()
                 .map(|row| {
                     let name: String = row.try_get(0).map_err(|e| backend_error(&source, &e))?;

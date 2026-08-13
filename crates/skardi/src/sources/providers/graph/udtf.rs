@@ -880,6 +880,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unprojected_declared_column_still_fails_its_type_contract() {
+        // The projection contract (see CONVERSION_BATCH_ROWS' doc): the
+        // declared schema is the contract, projection prunes AFTER
+        // conversion — `b` mis-declared fails even though only `a` was
+        // selected.
+        let ctx = ctx_with(vec![vec![
+            serde_json::json!("ada"),
+            serde_json::json!("not-an-int"),
+        ]])
+        .await;
+        let err = ctx
+            .sql(
+                "SELECT a FROM cypher_query('kg', 'MATCH (x) RETURN x.a, x.b', '{}', \
+                 '{\"a\": \"string\", \"b\": \"int\"}')",
+            )
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("the unprojected column's violated declaration is still loud");
+        let msg = err.to_string();
+        assert!(msg.contains("'b'"), "{msg}");
+        assert!(msg.contains("declared 'int'"), "{msg}");
+    }
+
+    #[tokio::test]
     async fn graph_schema_respects_a_sql_limit() {
         let ctx = ctx_with(vec![]).await;
         let batches = collect(&ctx, "SELECT label FROM graph_schema('kg') LIMIT 1").await;
