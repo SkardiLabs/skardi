@@ -25,8 +25,9 @@ this design does require one small, additive, **decided** server-side
 change: `GET /pipelines` gains `description` and `parameters` fields it
 doesn't return today (Option A — see "Server-side change"). That change is
 a prerequisite for the bridge, not an optional enhancement — without it,
-pipeline tools would ship with no LLM-facing description and parameter
-types rendered as raw Rust Debug strings.
+pipeline tools would ship with generic placeholder descriptions instead of
+the author-written ones, and the bridge would be left parsing Rust Debug
+struct dumps to recover parameter types.
 
 The tool surface mirrors what REST and shell already expose:
 
@@ -68,15 +69,17 @@ Verified against the current tree:
 - `GET /pipelines` returns only `name`, `version`, `endpoint` per pipeline —
   **no parameters, no description** (`pipeline_handlers.rs::list_pipelines`).
 - `GET /pipeline/:name` returns parameters as
-  `{name, type: format!("{:?}", InferredFieldType.field_type)}` — a Debug
-  string of a DataFusion `DataType` — and **does not return
+  `{name, type: format!("{:?}", field_type)}` where `field_type` is the
+  whole `InferredFieldType` struct — a Debug dump including `nullable` and
+  `source_location`, not just the `DataType` name — and **does not return
   `metadata.description`** even though `ComponentMetadata.description:
   Option<String>` exists and the pipeline YAML documents it.
 - `POST /:name/execute` takes a **flat** JSON object (`ExecuteRequest` is
   `#[serde(flatten)] parameters: HashMap<String, Value>`); missing
   placeholders are a `parameter_validation_error` listing
-  `missing_parameters` — i.e. every placeholder is a required key, and
-  nullable use-sites take an explicit JSON `null`.
+  `missing_parameters` — i.e. every placeholder is a required key, and any
+  parameter accepts an explicit JSON `null` (rendered as SQL `NULL`; the
+  server never validates nullability).
 - `POST /query` takes `{sql, max_rows?, ai_context?}`; `ai_context`, when
   present, must be an object with non-empty `purpose` and `session_id`
   (recorded for observability, never executed).
@@ -87,7 +90,7 @@ Verified against the current tree:
   auth (`SKARDI_API_TOKEN` / config `token`), with uniform `ApiError`
   mapping. `wiremock 0.6` is already a dev-dependency of the CLI crate.
 - The CLI binary is named `skardi`; subcommands are `query`, `run`,
-  `pipeline`, `schema`, `jobs`, `health`.
+  `pipeline`, `schema`, `job`, `health`.
 
 ## Architecture
 
@@ -120,8 +123,13 @@ making the subcommand a local MCP gateway to a remote deployment.
 ### SDK
 
 Use **`rmcp`** (the official Rust MCP SDK, `modelcontextprotocol/rust-sdk`)
-with only the `server` + stdio transport features enabled, keeping its HTTP
-stack (and any axum version skew) out of the dependency graph. Tools here are
+as `rmcp = { version = "<pinned>", default-features = false, features =
+["server", "transport-io"] }`. `transport-io` is the stdio transport's
+actual feature name (there is no feature literally called "stdio"), and
+`default-features = false` matters because `server` already ships in the
+crate's defaults alongside `macros` and `base64` — add those back only if
+actually used. This keeps rmcp's HTTP stack (and any axum version skew)
+out of the dependency graph. Tools here are
 **dynamic** — they come from YAML loaded by a remote server — so the `#[tool]`
 macro path does not apply; the bridge implements `ServerHandler` manually:
 
@@ -129,8 +137,10 @@ macro path does not apply; the bridge implements `ServerHandler` manually:
   definitions, append the two built-in tools.
 - `call_tool` → route by tool name: pipeline tool → `POST /:name/execute`;
   `query` → `POST /query`; `list_data_sources` → `GET /data_source`.
-- Capabilities: tools only. No resources, no prompts, no `listChanged`
-  (pipelines are static per server process).
+- Capabilities: tools only. No resources, no prompts, no `listChanged` in
+  v1 — the bridge cannot detect server-side pipeline changes without
+  polling; hosts that re-issue `tools/list` (or reconnect) see the fresh
+  inventory, others keep their connect-time snapshot.
 - `ServerInfo.instructions`: one short paragraph telling the model what
   Skardi is and the intended pattern (prefer pipeline tools; use
   `list_data_sources` to discover tables before writing ad-hoc `query` SQL).
@@ -145,33 +155,39 @@ host closes stdin.
 
 ### Pipeline tools
 
-One MCP tool per pipeline. Sources, in order of preference:
+One MCP tool per pipeline. Field sources:
 
 | Tool field | Source |
 |---|---|
 | `name` | pipeline name, sanitized (below) |
-| `description` | `metadata.description` from the pipeline YAML (see server-side change) |
-| `inputSchema` | inferred parameter set → JSON Schema object |
+| `description` | `metadata.description` via the enriched inventory (see server-side change); when `null` (the field is `Option<String>` in the YAML), the bridge substitutes ``Execute pipeline `<name>` `` so no tool ships description-less |
+| `inputSchema` | assembled from the server-emitted per-parameter `json_schema` fragments (see server-side change) |
 
 **Name sanitization.** MCP clients commonly enforce `^[a-zA-Z0-9_-]{1,64}$`
 for tool names. Pipeline names are URL-path segments today and may contain
-other characters. Rule: replace every character outside `[a-zA-Z0-9_-]` with
-`_`, truncate to 64; on collision after sanitization, append `_2`, `_3`, … in
-deterministic (sorted) order. The bridge keeps a tool-name → pipeline-name
-map for dispatch; the original pipeline name is echoed in the tool
-description so the model can correlate with server-side errors.
+other characters. The algorithm, in order: (1) replace every character
+outside `[a-zA-Z0-9_-]` with `_` and truncate to 64; (2) rename a candidate
+that equals a reserved built-in name (`query`, `list_data_sources`) by
+appending `_pipeline`, with a stderr warning; (3) run one collision pass
+over the full candidate set in sorted order of *original pipeline name* —
+the first claims the contested name, each later duplicate appends `_2`,
+`_3`, …, **re-truncating the base first so base + suffix never exceeds
+64**, and iterating the counter until the candidate is unique against
+every name already assigned (including the reserved names and previously
+suffixed ones — a user pipeline literally named `query_pipeline` or
+`foo_2` must not silently collide). The bridge keeps the resulting
+tool-name → pipeline-name map for dispatch; the original pipeline name is
+echoed in the tool description so the model can correlate with server-side
+errors.
 
-**Reserved names.** `query` and `list_data_sources` are reserved for the
-built-in tools. A pipeline with a colliding sanitized name keeps its function
-but its tool is renamed with a `_pipeline` suffix, and a warning is logged to
-stderr.
-
-**Input schema mapping.** All placeholders become **required** properties
-(matching the server's `missing_parameters` behavior) — required governs
-whether the key must appear; nullability (below) governs whether its value
-can be `null`; the two are independent axes in the server's own validation
-(`InferredFieldType.nullable` vs. key presence in `substitute_sql_params`).
-DataFusion type → JSON Schema:
+**Input schema mapping.** This table specifies the **server-side**
+`json_schema` computation — it lives in `crates/server` with the Option A
+enrichment, next to the SQL templates and inferred types it needs (see
+Server-side change); the bridge only assembles the emitted fragments into
+each tool's `inputSchema`. All placeholders become **required** properties,
+matching the server's `missing_parameters` behavior — key presence is the
+only thing `substitute_sql_params` validates. DataFusion type → JSON Schema
+fragment:
 
 | Inferred `DataType` | JSON Schema |
 |---|---|
@@ -179,14 +195,20 @@ DataFusion type → JSON Schema:
 | integer family (`Int*`, `UInt*`) | `{"type": "integer"}` |
 | float/decimal family (incl. `Decimal128`/`Decimal256`) | `{"type": "number"}` |
 | `Boolean` | `{"type": "boolean"}` |
-| `Date32`/`Date64`/`Timestamp*` | `{"type": "string", "format": "date-time"}` |
+| `Date32`/`Date64` (date-only types) | `{"type": "string", "format": "date"}` |
+| `Timestamp*` | `{"type": "string", "format": "date-time"}` |
 | `List(inner)` | `{"type": "array", "items": <map(inner)>}` |
 | anything else / unknown | `{}` (any) |
 
-A parameter whose use-site is nullable maps to a type union with `"null"`
-(e.g. `{"type": ["string", "null"]}`) — callers must still pass the key, as
-the server requires. `additionalProperties: false` on the object, since the
-server rejects `unsupported_parameters`.
+Every fragment is emitted as a union with `"null"` (e.g. `{"type":
+["string", "null"]}`) — unconditionally, not per-use-site: the server never
+validates nullability (any parameter accepts an explicit JSON `null`,
+rendered as SQL `NULL`), and the inferrer hardcodes `nullable: true` for
+every request parameter (inferencer.rs: "Named parameters are typically
+nullable"), so there is no per-use-site signal to condition on. Callers
+must still pass every key, as the server requires. The bridge adds
+`additionalProperties: false` on the enclosing object, since the server
+rejects `unsupported_parameters`.
 
 **Special case: `VALUES {name}` (multi-row tuple-list parameters, e.g.
 `{rows}` in a batch `INSERT`).** The DataFusion-type table above does not
@@ -205,15 +227,21 @@ the real accepted shape is a JSON array of row-tuples
 `VALUES` shape). A host that validates tool arguments against the declared
 schema would reject a legitimate array argument outright.
 
-The bridge must detect this shape independently of the inferred type,
-reusing the loader's own detection regex (`\bVALUES\s*\{name\}\b` against
-the pipeline's SQL template — the same pattern `convert_named_to_placeholders`
-already matches) and override the projected schema to
-`{"type": "array", "items": {"type": "array"}}` — array-of-arrays, not
-attempting to model per-position tuple typing (JSON Schema's `prefixItems`
-could express fixed per-column types, but each pipeline's row shape varies
-and isn't otherwise tracked; the looser shape is honest about what the
-bridge actually knows).
+The override therefore happens **server-side, inside the Option A
+enrichment** — the server is the only party holding the SQL template (the
+enriched `GET /pipelines` response deliberately carries no SQL, so the
+bridge could not run this detection itself). When computing a parameter's
+`json_schema`, the server first checks the template against the loader's
+own detection pattern — `(?i)\bVALUES\s*\{name\}`, case-insensitive with
+**no** trailing boundary assertion, ideally sharing the exact compiled
+regex `convert_named_to_placeholders` uses rather than re-transcribing it
+(a hand-copied variant with a stray trailing `\b` would silently never
+match, since `}` is a non-word character) — and on a match emits
+`{"type": "array", "items": {"type": "array"}}` in place of the type-table
+result. Array-of-arrays, not per-position tuple typing: JSON Schema's
+`prefixItems` could express fixed per-column types, but each pipeline's
+row shape varies and isn't otherwise tracked; the looser shape is honest
+about what is actually known.
 
 ### Built-in tool: `query`
 
@@ -266,9 +294,14 @@ independently.
 ### Freshness
 
 `list_tools` fetches the pipeline inventory from the server **on every
-call** — no cache. Hosts call it rarely (connect time), the hop is
-typically localhost, and this transparently reflects a restarted or
-re-configured server without bridge restart logic.
+call** — no cache — and rebuilds the tool-name → pipeline-name dispatch map
+from what it fetched. Hosts call it rarely (typically connect time) and the
+hop is usually localhost, so the cost is negligible. The honest scope of
+this freshness: a host that re-issues `tools/list` (or reconnects) sees a
+restarted or re-configured server's new inventory with no bridge restart
+logic; a host that listed once and never again keeps its snapshot — without
+`listChanged` (a non-goal) the bridge has no way to push the update, and a
+`call_tool` naming a since-removed tool gets the unknown-tool error.
 
 ## Server-side change (required — decided: Option A)
 
@@ -277,10 +310,11 @@ to `crates/server` and the rejected alternative that would have avoided it.**
 The REST surface does not currently expose what the projection needs in one
 round trip: `GET /pipelines` lacks parameters *and* descriptions, and
 `GET /pipeline/:name` lacks the description and renders types as Rust Debug
-strings. Implementing pipeline tools without this change means shipping
-`skardi mcp` with tool descriptions the LLM never sees and parameter types
-rendered as opaque Debug strings — so this is scoped as part of the v1
-binding, not a "nice to have" deferred to later.
+strings. Implementing pipeline tools without this change means the
+author-written descriptions never reach the LLM (only a generic fallback
+would) and the bridge is left parsing Rust Debug struct dumps to recover
+parameter types — so this is scoped as part of the v1 binding, not a
+"nice to have" deferred to later.
 
 **Decided: enrich `GET /pipelines`.** Each list item gains two fields
 (existing fields unchanged — additive, backward compatible):
@@ -292,19 +326,34 @@ binding, not a "nice to have" deferred to later.
   "endpoint": "/product-search-demo/execute",
   "description": "Product search and filtering",
   "parameters": [
-    {"name": "brand", "type": "Utf8", "json_type": "string", "nullable": true}
+    {"name": "brand", "data_type": "Utf8",
+     "json_schema": {"type": ["string", "null"]}}
   ]
 }
 ```
 
-`json_type` is emitted server-side from the same mapping table above, so the
-bridge (and any future binding — the skills generator needs exactly the same
-data) never parses Debug strings. `GET /pipeline/:name` gains the same
-`description` and `json_type` fields for consistency. This is a ~20-line
-change in `pipeline_handlers.rs` plus tests — the only server-side edit in
-this design, and it lands in `crates/server` alongside (or ahead of) the
-`crates/cli` work, not after it: the bridge's tool-description and type-
-mapping tests depend on these fields existing.
+`description` mirrors `metadata.description` and is `null` when the YAML
+omits it (the bridge substitutes its fallback — see the field-source
+table). `json_schema` is a complete per-parameter **JSON Schema fragment**,
+not a scalar type name — it has to be: `List(inner)` needs a nested `items`
+schema, dates and timestamps carry a `format`, the null union is folded in,
+and the `VALUES {name}` override (above) replaces the fragment wholesale.
+It is computed server-side from the mapping table above, so the bridge (and
+any future binding — the skills generator needs exactly the same data)
+never parses Debug strings; `data_type` rides along for human/debug use.
+The mapping's unit tests live in `crates/server` next to the computation.
+`GET /pipeline/:name` gains the same fields for consistency. This is a
+small, contained change in `pipeline_handlers.rs` plus tests — the only
+server-side edit in this design, and it lands in `crates/server` alongside
+(or ahead of) the `crates/cli` work, not after it: the bridge's projection
+tests consume these fields as fixtures.
+
+One consequence worth stating plainly: `GET /pipelines` and
+`GET /pipeline/:name` never call `require_session` (only the two execute
+handlers do), so the enriched inventory — author-written descriptions and
+full parameter schemas included — is readable without a token, exactly like
+the `/data_source` gap flagged in the `list_data_sources` auth note.
+Deployments weighing that question should weigh both surfaces together.
 
 **Rejected: zero-server-change alternative (Option B).** The bridge would
 instead call `GET /pipeline/:name` per pipeline (N+1, acceptable for
@@ -319,8 +368,11 @@ this feature exists to project.
 
 `tools/call` on a pipeline tool:
 
-1. Look up the pipeline name from the tool-name map; unknown tool →
-   JSON-RPC "unknown tool" error (protocol-level, host bug).
+1. Look up the pipeline name in the tool-name map (the map is rebuilt on
+   every `list_tools`; `call_tool` resolves against the most recent build).
+   Unknown tool → JSON-RPC "unknown tool" error — protocol-level, covering
+   both host bugs and a server re-configured since the host last listed;
+   the error nudges the host to re-issue `tools/list`.
 2. Arguments are passed through as the flat execute body — the server is
    the validator (missing/unsupported/type errors come back structured).
 3. `POST /:name/execute` via `ApiClient` (reusing the same call path as
@@ -337,8 +389,12 @@ endpoints. `list_tools` with an unreachable server returns a JSON-RPC error
 whose message names the resolved server URL and the three ways to configure
 it (mirroring `ApiError::Connect`'s existing wording).
 
-Result size is bounded by the server's `max_rows` cap (default 1000) and the
-CLI's existing 256 MB response ceiling; v1 does no additional truncation.
+Result size: `query` results are bounded by the server's `max_rows` cap
+(default 1000; it applies to `SELECT`s on `POST /query` only). Pipeline
+executions have **no server-side row cap** — `execute_pipeline_by_name`
+pushes no limit into the plan — so a pipeline `SELECT` without a `LIMIT`
+(or a `{limit}` parameter) returns every row, bounded only by the CLI's
+existing 256 MB response ceiling. v1 adds no bridge-side truncation.
 
 ## Testing
 
@@ -347,17 +403,23 @@ CI), `cargo fmt` before push, and CI bare-runs `#[ignore]` tests — nothing
 here needs `#[ignore]`, as all tests are self-contained.
 
 - **Unit (cli crate):** projection is implemented as pure functions —
-  pipeline-inventory JSON → tool definitions — so sanitization, collision
-  suffixing, reserved-name handling, type mapping (incl. nullable unions,
-  date/timestamp types, and unknown types), the `VALUES {name}` array-of-
-  arrays override, and `ai_context` assembly are table-driven unit tests.
+  enriched-inventory JSON → tool definitions — so sanitization, collision
+  suffixing (length budget, uniqueness re-check), reserved-name handling,
+  `inputSchema` assembly from `json_schema` fragments (required keys,
+  `additionalProperties: false`, the missing-description fallback), and
+  `ai_context` assembly are table-driven unit tests. The DataFusion → JSON
+  Schema mapping itself (date vs. timestamp formats, `List(inner)`, null
+  unions, the `VALUES` regex override) is tested in `crates/server`, where
+  the computation now lives.
 - **Bridge-level (wiremock):** construct the bridge over an `ApiClient`
   pointed at a wiremock server (same pattern as existing CLI command tests);
   drive `list_tools`/`call_tool` directly and assert REST interactions
   (execute body is flat, `purpose` → `ai_context`, error → `isError`).
 - **End-to-end (spawned binary):** spawn `env!("CARGO_BIN_EXE_skardi") mcp
   --server <wiremock url>` as a child process and connect an rmcp *client*
-  over stdio (rmcp's client feature as a dev-dependency): initialize
+  over stdio (rmcp as a dev-dependency with `features = ["client",
+  "transport-child-process"]` — the child-process transport is what
+  connects a client to a spawned binary): initialize
   handshake, `tools/list` shows pipelines + built-ins, `tools/call` round
   trip, server-down behavior. This also permanently guards the "stdout is
   protocol-only" invariant — any stray print breaks the handshake test.
@@ -392,10 +454,11 @@ here needs `#[ignore]`, as all tests are self-contained.
 ## Decided
 
 - **Server-side inventory enrichment: Option A** (2026-08-13) — `GET
-  /pipelines` gains `description` and `parameters` fields; see "Server-side
-  change". This is a required change to `crates/server`, not deferred —
-  the zero-server-change alternative (Option B) is rejected and kept in
-  that section only for the record.
+  /pipelines` gains `description` and `parameters` (each parameter carrying
+  a complete `json_schema` fragment, `VALUES` detection included); see
+  "Server-side change". This is a required change to `crates/server`, not
+  deferred — the zero-server-change alternative (Option B) is rejected and
+  kept in that section only for the record.
 
 ## Open decisions
 
@@ -405,3 +468,12 @@ here needs `#[ignore]`, as all tests are self-contained.
    e.g. `skardi_query` prefixing to reduce collision odds with user
    pipeline names (recommendation: unprefixed; MCP hosts already namespace
    tools per server, and reserved-name suffixing covers the edge).
+3. **Bridge lifecycle knobs** — three currently-implicit choices to pin at
+   implementation time: whether concurrent `tools/call` requests are served
+   in parallel as rmcp dispatches them (recommendation: yes — a slow
+   `query` must not block `list_tools`); what happens on stdin close
+   (recommendation: abort in-flight REST calls, exit 0); and whether the
+   bridge sets a request timeout — `ApiClient` builds its reqwest client
+   with **no timeout today**, so a hung server hangs the tool call until
+   the host's own tool-call timeout fires (recommendation: rely on the
+   host's timeout in v1 and say so in docs/mcp.md).
