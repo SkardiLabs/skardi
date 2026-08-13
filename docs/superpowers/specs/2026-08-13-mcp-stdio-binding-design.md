@@ -152,15 +152,19 @@ but its tool is renamed with a `_pipeline` suffix, and a warning is logged to
 stderr.
 
 **Input schema mapping.** All placeholders become **required** properties
-(matching the server's `missing_parameters` behavior). DataFusion type →
-JSON Schema:
+(matching the server's `missing_parameters` behavior) — required governs
+whether the key must appear; nullability (below) governs whether its value
+can be `null`; the two are independent axes in the server's own validation
+(`InferredFieldType.nullable` vs. key presence in `substitute_sql_params`).
+DataFusion type → JSON Schema:
 
 | Inferred `DataType` | JSON Schema |
 |---|---|
 | `Utf8` / `LargeUtf8` | `{"type": "string"}` |
 | integer family (`Int*`, `UInt*`) | `{"type": "integer"}` |
-| float/decimal family | `{"type": "number"}` |
+| float/decimal family (incl. `Decimal128`/`Decimal256`) | `{"type": "number"}` |
 | `Boolean` | `{"type": "boolean"}` |
+| `Date32`/`Date64`/`Timestamp*` | `{"type": "string", "format": "date-time"}` |
 | `List(inner)` | `{"type": "array", "items": <map(inner)>}` |
 | anything else / unknown | `{}` (any) |
 
@@ -168,6 +172,33 @@ A parameter whose use-site is nullable maps to a type union with `"null"`
 (e.g. `{"type": ["string", "null"]}`) — callers must still pass the key, as
 the server requires. `additionalProperties: false` on the object, since the
 server rejects `unsupported_parameters`.
+
+**Special case: `VALUES {name}` (multi-row tuple-list parameters, e.g.
+`{rows}` in a batch `INSERT`).** The DataFusion-type table above does not
+apply to this shape. Tracing `SqlSchemaInferrer` confirms why: its AST-based
+placeholder→column mapping only walks `SetExpr::Select`
+(`extract_placeholder_columns`, inferencer.rs) — a `VALUES (?)` clause is
+`SetExpr::Values` and is skipped outright (`_ => continue`). With no AST
+mapping, the fallback (`infer_column_from_parameter_name`) echoes the
+parameter's own name back as a "column name" (no `_min`/`_max` suffix to
+strip), which matches no real column, so type inference bottoms out at its
+final default: **`DataType::Utf8`**. Projected naively through the table
+above, `{rows}` would get `{"type": "string"}` — not absent guidance
+(the "anything else" row's `{}`) but an *actively wrong* constraint, since
+the real accepted shape is a JSON array of row-tuples
+(`[["d1","doc-a",[1.0,0.0,0.0,0.0]], ...]`, per pipelines.md's multi-row
+`VALUES` shape). A host that validates tool arguments against the declared
+schema would reject a legitimate array argument outright.
+
+The bridge must detect this shape independently of the inferred type,
+reusing the loader's own detection regex (`\bVALUES\s*\{name\}\b` against
+the pipeline's SQL template — the same pattern `convert_named_to_placeholders`
+already matches) and override the projected schema to
+`{"type": "array", "items": {"type": "array"}}` — array-of-arrays, not
+attempting to model per-position tuple typing (JSON Schema's `prefixItems`
+could express fixed per-column types, but each pipeline's row shape varies
+and isn't otherwise tracked; the looser shape is honest about what the
+bridge actually knows).
 
 ### Built-in tool: `query`
 
@@ -199,6 +230,23 @@ versions can extend to full identity injection without touching call sites.
 
 No parameters. `GET /data_source`, returned verbatim (it already includes
 table schemas and semantic descriptions).
+
+**Auth note.** Unlike `query` and pipeline tools, this stays unauthenticated
+even when `AUTH_MODE=BETTER_AUTH_DIESEL_SQLITE` is set: `get_data_sources`
+(`pipeline_handlers.rs`) never calls `require_session`, unlike
+`execute_query` and `execute_pipeline_by_name`, which both do. This is
+existing REST behavior, not something this binding introduces or changes —
+the bridge proxies `/data_source` as-is, and the same gap is reachable today
+via a plain unauthenticated `curl`. Worth calling out here because this
+design's own `query` tool description tells every MCP client to call
+`list_data_sources` first, so it is the one built-in tool nearly every
+connection will hit regardless of whether it holds a valid token. What it
+returns is schema plus `kind: semantics` descriptions — operator-authored
+natural-language notes about what tables and columns *mean*, which can
+carry more business context than the raw schema alone. Whether `/data_source`
+should require auth is a server-level decision outside this design's
+scope; deployments with sensitive semantic descriptions should evaluate it
+independently.
 
 ### Freshness
 
@@ -278,8 +326,9 @@ here needs `#[ignore]`, as all tests are self-contained.
 
 - **Unit (cli crate):** projection is implemented as pure functions —
   pipeline-inventory JSON → tool definitions — so sanitization, collision
-  suffixing, reserved-name handling, type mapping (incl. nullable unions and
-  unknown types), and `ai_context` assembly are table-driven unit tests.
+  suffixing, reserved-name handling, type mapping (incl. nullable unions,
+  date/timestamp types, and unknown types), the `VALUES {name}` array-of-
+  arrays override, and `ai_context` assembly are table-driven unit tests.
 - **Bridge-level (wiremock):** construct the bridge over an `ApiClient`
   pointed at a wiremock server (same pattern as existing CLI command tests);
   drive `list_tools`/`call_tool` directly and assert REST interactions
