@@ -5,9 +5,9 @@
 
 **Skardi is an open-source self-improving context framework.**
 
-Point it at your data and your agent can ask anything of it in SQL — declaring *why* it asks. Skardi records every ask, finds the questions that keep coming back, and promotes them into named tools the agent calls next time. The agent you ship on Monday is better at your data by Friday, and you never wrote another integration.
+Point it at your data and your agent can ask anything of it in SQL — declaring *why* it asks. Skardi records every ask, finds the intentions that keep coming back, and turns them into named tools and standing routines. The thing that improves is the agent's **context** — what it can do on your data without rediscovering it — not model weights, serving latency, or your infra bill. The agent you ship on Monday is better at your data by Friday, and you never wrote another integration.
 
-**Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools, installed for you
+**Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines, installed for you
 
 <a href="#the-loop">How the loop works</a> •
 <a href="#install">Install</a> •
@@ -59,12 +59,12 @@ tools it ends up with are the ones it demonstrably reached for.
      ▼                                                          │
  ② LEARN                                                        │
    read the ledger, group by session and purpose,                │
-   find the questions that keep coming back                      │
+   find the intentions that keep coming back                     │
      │                                                          │
      ▼                                                          │
  ③ ACT                                                          │
-   promote a recurring query into a named pipeline —             │
-   a REST endpoint + shell verb the agent calls by name          │
+   recurring queries become named pipelines; recurring           │
+   intentions become routines that run before they're asked      │
      │                                                          │
      └──────────────────────────────────────────────────────────┘
                     the toolset grew itself
@@ -122,6 +122,18 @@ skardi run weekly-churn -p days=7
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"days": 7}'
 ```
+
+Promotion is the first rung of ③, not the whole of it. The same ledger supports
+acting on *intentions*: when every weekday morning ends with the same GitHub +
+Slack queries, each declaring `purpose: "daily standup"`, the pattern isn't a
+pipeline — it's a routine, and any harness that can run an agent on a schedule
+(Claude Code routines, a cron-driven CLI run) can have the standup drafted
+before anyone asks. And because the ledger is one SQLite file, you can hand a
+window of it to an LLM and ask what keeps being needed that nobody turned into a
+tool — recurring intentions the user hasn't noticed yet. Both land as skills on
+top of the ledger, like
+[`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) —
+no server changes required.
 
 Then back to ①, with one fewer thing your agent has to figure out from scratch.
 

@@ -99,6 +99,28 @@ material behind links or `<details>`.
 - No code changes. Every capability the README claims as shipped is verified
   against the tree at `0.5.0`; anything unverified is marked or omitted.
 
+## Follow-ups surfaced in review
+
+Feedback on the first draft: the headline did not say *what* self-improves, and
+promoting queries into pipelines is too small a ceiling for Act.
+
+- **Definition added to the header**: what improves is the agent's context —
+  what it can do on your data without rediscovering it — explicitly not model
+  weights, serving latency, or infra cost.
+- **Act extended from queries to intentions**: recurring intention → standing
+  routine (scheduled by the harness — Claude Code routines, cron-driven CLI
+  runs), and LLM analysis over the ledger to surface intentions the user never
+  noticed. Both verified feasible as skills with the shipped ledger: rows carry
+  `created_at`, `ai_context`, and denormalised `session_id`, indexed on
+  `(session_id, created_at)`, so cadence detection is a SQL read.
+- **Gap to file as a roadmap issue**: pipeline executions are not audited
+  (`pipeline_handlers.rs` never writes to the audit store), so once a query is
+  promoted its recurrence signal leaves the ledger. The enabling server change
+  is `ai_context` on `POST /:pipeline/execute` plus a unified execution ledger.
+- **Privacy note for the hidden-intent skill**: ledger rows store raw SQL
+  including literals (hence `0600`); feeding a window to a remote LLM must be
+  an explicit operator choice, or the skill should strip literals first.
+
 ## Verification
 
 - No occurrence of the retired phrase: `grep -ci "data plane" README.md` → 0.
