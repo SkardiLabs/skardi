@@ -89,9 +89,15 @@
 //!   in-band error envelope (`assertGmailResponse` throws on non-2xx),
 //!   so provider failures arrive as gateway failure envelopes, pinned by
 //!   an e2e test.
-//! - **Nullability is conservative**: identity fields non-null
-//!   (`thread_id`, `message_id` + its `thread_id`, the raw `id`s),
-//!   everything else nullable.
+//! - **Nullability follows the captured contract**: identity fields
+//!   non-null (`thread_id`, `message_id` + its `thread_id`, the raw
+//!   `id`s), and every `messages` column non-null — both non-ids
+//!   branches of the pinned `fetch_emails` contract `require` all seven
+//!   fields, and the executor's fallbacks keep the keys present (`""`
+//!   headers, `[]` labelIds). Since `messages` rides outside the
+//!   fingerprint gate (next bullet), non-null is what turns emitted-key
+//!   drift into a loud `missing key` failure instead of a silently
+//!   all-NULL column. Everything else stays nullable.
 //! - **Fingerprints are pinned** from a live gateway capture
 //!   (`fixtures/gmail/contracts/`, gateway v1.3.4). `fetch_emails`
 //!   declares its row items as an `anyOf` (ids | summary | full) the
@@ -192,11 +198,12 @@ mod tests {
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
     }
 
-    // ── Contract tests: provider-shaped fixture pages derived from the
-    // executor source and the captured contracts (synthetic until the
-    // phase-4 live pass re-derives them as redacted captures). They pin
-    // the conversion contract per the admission gate: null-bearing,
-    // null-parent, nested, extra-field, and schema-mismatch. ─
+    // ── Contract tests: fixture pages that are redacted live captures
+    // (2026-08-05 gateway pass), except messages_type_mismatch.json —
+    // deliberately synthetic (a live wire cannot be made to produce a
+    // schema mismatch) and saying so. They pin the conversion contract
+    // per the admission gate: null-bearing, null-parent, nested,
+    // extra-field, and schema-mismatch. ─
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -783,8 +790,10 @@ bindings:
     async fn single_page_tables_issue_exactly_one_request_with_no_inputs() {
         // labels and filters declare the single_page strategy: one POST
         // each, an EMPTY input object (no pagination keys — the strict
-        // schema would 400 them — and no userId), and no second request
-        // no matter what the response carries.
+        // schema would 400 them — and no userId), and no second request.
+        // The labels body carries a stray nextPageToken that MUST be
+        // ignored (SinglePage's advance() terminates unconditionally);
+        // the filters body carries none — one request either way.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -796,7 +805,8 @@ bindings:
                 return MockResponse::ok(&envelope_ok(
                     &json!({"labels": [
                         {"id": "INBOX", "name": "INBOX", "type": "system"},
-                        {"id": "Label_1", "name": "P/Redacted", "type": "user"}]})
+                        {"id": "Label_1", "name": "P/Redacted", "type": "user"}],
+                        "nextPageToken": "tok-2"})
                     .to_string(),
                 ));
             }
@@ -820,7 +830,10 @@ bindings:
 
         let batches = collect(&ctx, "SELECT id FROM saas.mail.labels ORDER BY id").await;
         assert_eq!(column_values(&batches, "id"), vec!["INBOX", "Label_1"]);
-        let batches = collect(&ctx, "SELECT id FROM saas.mail.filters").await;
+        // criteria/action ride along to pin that both parse as bare
+        // identifiers (ACTION is a sqlparser keyword) — the same hazard
+        // the to_addresses rename protects messages against.
+        let batches = collect(&ctx, "SELECT id, criteria, action FROM saas.mail.filters").await;
         assert_eq!(column_values(&batches, "id"), vec!["f-1"]);
 
         for action in ["gmail.list_labels", "gmail.list_filters"] {

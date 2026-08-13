@@ -34,7 +34,7 @@ spec:
           - name: mail                   # schema name in SQL
             source_pack: gmail
             resource:                    # all optional; omit for the default listing
-              query: "newer_than:90d"        # Gmail search syntax; threads + messages
+              query: "newer_than:90d"        # Gmail search syntax; threads + messages (drafts: not narrowed)
               labelIds: [INBOX]              # messages only
               includeSpamTrash: false        # messages only
             tables: [threads, messages, drafts, labels, filters]
@@ -85,10 +85,28 @@ highlights and caveats:
   `threads` offers no such input on the gateway's schema, which is also
   why the pack does not pin `includeSpamTrash: true` — the two tables
   would otherwise describe different mailboxes.
+- **Resources narrow only the tables that declare them** (the Resources
+  column above). A partially-applicable key passes registration and is
+  silently withheld from every non-declaring table's requests, so the
+  tables of one binding can describe *different mailbox slices*. The
+  example binding above does: `query: "newer_than:90d"` scopes `threads`
+  and `messages`, while `drafts` — whose gateway action accepts no
+  narrowing inputs at all — lists the mailbox's drafts in full. A join
+  across them is a join across two different slices.
 - **`messages` pins `detail: summary`** — the bounded row shape (no
   bodies, no attachment trees). The gateway hydrates each listed message
   with a metadata `messages.get`, so a scanned page of 100 rows costs 101
-  Gmail API calls; the reduced page size bounds that burst.
+  Gmail API calls; the reduced page size bounds that burst. It also
+  lowers the effective scan ceiling: at the default `max_pages: 100`,
+  `messages` hits `ScanBoundsExceeded` at 10,000 rows where
+  `threads`/`drafts` reach 50,000 — and on this table `max_pages` is the
+  knob that multiplies the hydration burst, so narrow with `query` or
+  `LIMIT` before reaching for it.
+- **`threads.snippet` is body content**: Gmail's own excerpt of the
+  latest message's text (roughly its first hundred characters), returned
+  under `gmail.readonly`. The "no bodies" shape above is `messages`'
+  posture, not the pack's — size content/PII exposure with this column
+  included.
 - **Header-derived fields spell "absent" as `''`**, never NULL
   (`subject`, `sender`, `to_addresses`) — filter with `<> ''`, not
   `IS NOT NULL`. `to_addresses` is the raw `To` header (display names
@@ -111,8 +129,8 @@ highlights and caveats:
   `list_threads`), `list_history` (an incremental-sync checkpoint API,
   not a collection), `list_forwarding_addresses` (no output schema to
   fingerprint; needs the `settings.sharing` scope), `get_profile` (a
-  scalar endpoint). Message bodies (`detail: full`) are deferred to a
-  future content-oriented surface.
+  scalar endpoint). Full message bodies (`detail: full`) are deferred to
+  a future content-oriented surface.
 - **Action-contract fingerprints are pinned** from a live capture
   (`packs/fixtures/gmail/contracts/`, gateway v1.3.4). The gateway
   declares `fetch_emails` row items as an `anyOf` (ids | summary |
@@ -135,6 +153,9 @@ envelope — the other tables are unaffected.
 Gmail's API enforces per-user quota units per second (list ≈ 5 units,
 metadata get ≈ 5 units — a hydrated `messages` page is by far the most
 expensive scan); `429` responses are retried with backoff inside the
-scan deadline. Reads are live by default; the gateway-level TTL cache
-applies as documented in the
+scan deadline. That covers Gmail-origin rate limits too: the gateway
+classifies a provider 429 as `rate_limited` and re-emits it as its own
+HTTP 429 (gateway source, verified at v1.3.4), which is the one status
+the execute retry policy retries. Reads are live by default; the
+gateway-level TTL cache applies as documented in the
 [general guide](open-connector.md#caching-and-freshness).

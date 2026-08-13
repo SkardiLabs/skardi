@@ -34,6 +34,9 @@ tables:
       optional: [query]
     columns:
       - { name: thread_id, path: threadId, type: utf8, nullable: false }
+      # Gmail's excerpt of the latest message's body text (~first 100
+      # chars): truncated message CONTENT under gmail.readonly, not
+      # metadata — the pack doc's caveats call it out for PII sizing.
       - { name: snippet, path: snippet, type: utf8, nullable: true }
       - { name: history_id, path: historyId, type: utf8, nullable: true }
 
@@ -60,19 +63,25 @@ tables:
     resources:
       optional: [query, labelIds, includeSpamTrash]
     columns:
+      # Non-null across the board: both non-ids branches of the captured
+      # contract `require` all seven fields, and the executor's fallbacks
+      # keep every key present ("" headers, [] labelIds). These columns
+      # ride outside the fingerprint gate (anyOf row items — see the
+      # coverage-gap pin), so non-null is the tripwire: emitted-key drift
+      # fails the scan loudly instead of silently going all-NULL.
       - { name: message_id, path: messageId, type: utf8, nullable: false }
       - { name: thread_id, path: threadId, type: utf8, nullable: false }
-      - { name: label_ids, path: labelIds, type: utf8_list, nullable: true }
-      - { name: subject, path: subject, type: utf8, nullable: true }
-      - { name: sender, path: sender, type: utf8, nullable: true }
+      - { name: label_ids, path: labelIds, type: utf8_list, nullable: false }
+      - { name: subject, path: subject, type: utf8, nullable: false }
+      - { name: sender, path: sender, type: utf8, nullable: false }
       # Wire key `to`; renamed because TO is a reserved SQL keyword and a
       # column requiring quotes on every reference is hostile to use.
-      - { name: to_addresses, path: to, type: utf8, nullable: true }
+      - { name: to_addresses, path: to, type: utf8, nullable: false }
       # The wire value is an RFC 3339 string (the executor re-emits
       # Gmail's epoch-millis `internalDate`); `timestamp_ms_utc` names the
       # Arrow storage — Timestamp(ms, UTC) — and its converter accepts
       # RFC 3339 or epoch-millis wires alike, same as github's *_at columns.
-      - { name: message_timestamp, path: messageTimestamp, type: timestamp_ms_utc, nullable: true }
+      - { name: message_timestamp, path: messageTimestamp, type: timestamp_ms_utc, nullable: false }
 
   drafts:
     action: gmail.list_drafts
