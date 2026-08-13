@@ -143,29 +143,40 @@ impl GraphConfig {
         // password_env) — a password embedded in the URL would sit in
         // config repos, deploy logs, and diagnostics. Parsed, not
         // substring-matched, so `:` in a database name cannot
-        // false-positive. The error never echoes the URL (it may carry
-        // the very secret being rejected).
-        if let Ok(parsed) = url::Url::parse(connection_string) {
-            if parsed.password().is_some() {
-                return Err(GraphError::InvalidConfig {
-                    name: name.to_string(),
-                    reason: "connection_string must not embed a password — set \
-                             password_env to the NAME of an environment variable \
-                             instead"
-                        .to_string(),
-                });
-            }
-            if parsed
-                .query_pairs()
-                .any(|(k, _)| k.eq_ignore_ascii_case("password"))
-            {
-                return Err(GraphError::InvalidConfig {
-                    name: name.to_string(),
-                    reason: "connection_string must not carry a password= query \
-                             parameter — set password_env instead"
-                        .to_string(),
-                });
-            }
+        // false-positive. FAIL-CLOSED: a string this parser cannot read
+        // is a config error, never a skipped check — the url crate and
+        // the driver's own parser are different implementations, and a
+        // value only the driver accepts would otherwise carry a secret
+        // past a validator that reported success. The scheme allowlist
+        // above already guarantees the string is URL-shaped, so nothing
+        // legitimate lands here. The error never echoes the URL (it may
+        // carry the very secret being rejected).
+        let parsed = url::Url::parse(connection_string).map_err(|_| GraphError::InvalidConfig {
+            name: name.to_string(),
+            reason: "connection_string is not a parseable URL (the embedded-credential \
+                     check could not run, so the value is rejected rather than passed \
+                     through unvetted)"
+                .to_string(),
+        })?;
+        if parsed.password().is_some() {
+            return Err(GraphError::InvalidConfig {
+                name: name.to_string(),
+                reason: "connection_string must not embed a password — set \
+                         password_env to the NAME of an environment variable \
+                         instead"
+                    .to_string(),
+            });
+        }
+        if parsed
+            .query_pairs()
+            .any(|(k, _)| k.eq_ignore_ascii_case("password"))
+        {
+            return Err(GraphError::InvalidConfig {
+                name: name.to_string(),
+                reason: "connection_string must not carry a password= query \
+                         parameter — set password_env instead"
+                    .to_string(),
+            });
         }
         match self.graph_name.as_deref() {
             None if rules.name_required => {
@@ -383,6 +394,16 @@ password_env: AGE_PG_PASS
         // A bare username is identity, not a secret — allowed.
         c.validate("kg", "postgres://postgres@localhost:5432/db")
             .expect("username-only URL is fine");
+        // FAIL-CLOSED: a URL the checker cannot parse is rejected, not
+        // waved past the credential checks (the url crate and the
+        // driver parse differently). Scheme-prefixed so it reaches the
+        // parse step, then malformed.
+        let err = c
+            .validate("kg", "postgres://[not-a-host/db?password=s3cret")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a parseable URL"), "{msg}");
+        assert!(!msg.contains("s3cret"), "never echoed: {msg}");
     }
 
     #[test]

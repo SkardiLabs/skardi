@@ -33,7 +33,7 @@ mod graph_live_support;
 use graph_live_support::{collect, split_creds};
 
 fn live_url() -> Option<String> {
-    graph_live_support::live_url("SKARDI_NEO4J_LIVE_URL")
+    graph_live_support::live_url("SKARDI_NEO4J_LIVE_URL", "SKARDI_NEO4J_LIVE_REQUIRED")
 }
 
 /// One declared column for direct `GraphClient::execute` calls. On this

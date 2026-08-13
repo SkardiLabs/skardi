@@ -42,7 +42,7 @@ fn one_col() -> Vec<DeclaredColumn> {
 }
 
 fn live_url() -> Option<String> {
-    graph_live_support::live_url("SKARDI_AGE_LIVE_URL")
+    graph_live_support::live_url("SKARDI_AGE_LIVE_URL", "SKARDI_AGE_LIVE_REQUIRED")
 }
 
 /// Seed a fresh, uniquely named graph through AGE's own APIs (writes go
@@ -910,5 +910,136 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
         .unwrap();
     assert_eq!(n.value(0), "bob", "the ->> rewrite reaches graph queries");
 
+    drop_graph(&pool, &graph).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn a_least_privilege_reader_role_registers_and_queries() {
+    // The design's least-privilege recommendation, executed: a plain
+    // reader role (no superuser) must register and query. This is what
+    // pins `LOAD 'age'` as BEST-EFFORT — a required LOAD is superuser-
+    // only for $libdir libraries and would fail this registration on
+    // the stock apache/age image (which preloads AGE instead).
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("reader");
+    let pool = seed_graph(&url, &graph).await;
+    let role = format!("skardi_reader_{graph}");
+    for grant in [
+        format!("CREATE ROLE {role} LOGIN PASSWORD 'readerpass'"),
+        format!("GRANT USAGE ON SCHEMA ag_catalog TO {role}"),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA ag_catalog TO {role}"),
+        format!("GRANT USAGE ON SCHEMA {graph} TO {role}"),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA {graph} TO {role}"),
+    ] {
+        pool.execute(grant.as_str()).await.expect("grant");
+    }
+
+    let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let (clean_url, _, _) = split_creds(&url);
+    let user_env = format!("SKARDI_AGE_READER_USER_{}", graph.to_uppercase());
+    let pass_env = format!("SKARDI_AGE_READER_PASS_{}", graph.to_uppercase());
+    unsafe {
+        std::env::set_var(&user_env, &role);
+        std::env::set_var(&pass_env, "readerpass");
+    }
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}\nquery_timeout_seconds: 10\nmax_rows: 100\n\
+         username_env: {user_env}\npassword_env: {pass_env}\n"
+    ))
+    .expect("config parses");
+    register_graph_source(&sources, "kg", &clean_url, &config)
+        .await
+        .expect("a NON-superuser reader registers (LOAD must be best-effort)");
+    let ctx = SessionContext::new();
+    register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("udtfs register");
+    let batches = collect(
+        &ctx,
+        "SELECT name FROM cypher_query('kg', 'MATCH (p:Person) RETURN p.name', '{}', \
+         '{\"name\": \"string\"}') ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        4,
+        "the reader role sees the seeded people"
+    );
+
+    drop(sources);
+    let _ = pool
+        .execute(format!("DROP OWNED BY {role}; DROP ROLE {role};").as_str())
+        .await;
+    drop_graph(&pool, &graph).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn cancelled_scans_leave_no_prepared_statements() {
+    // The OpenTxnGuard is what RESCUES a cancelled scan's connection
+    // back into the pool — so it must also DEALLOCATE the call's
+    // prepared statement, or every cancellation strands one `skq_p_*`
+    // on the session permanently (monotonic; reproduced in review).
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("cancel");
+    let pool = seed_graph(&url, &graph).await;
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        std::env::set_var("SKARDI_AGE_CANCEL_USER", user.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_CANCEL_PASS", pass.unwrap_or_default());
+    }
+    // max_connections = 1: every round and the sweep share ONE session.
+    let client = AgeClient::connect(
+        "kg",
+        &clean_url,
+        &graph,
+        Some("SKARDI_AGE_CANCEL_USER"),
+        Some("SKARDI_AGE_CANCEL_PASS"),
+        1,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("connects");
+    let bounds = QueryBounds {
+        timeout: std::time::Duration::from_secs(30),
+        max_rows: 1_000_000,
+    };
+    // Slow enough to still be mid-flight at 300ms: a wide cartesian
+    // whose predicate REJECTS NOTHING (an equality on a missing name
+    // would zero out `a` and finish instantly).
+    let slow = "MATCH (a),(b),(c),(d),(e),(f),(g),(h),(i),(j) \
+                WHERE a.name <> $x RETURN a";
+    let params = serde_json::json!({"x": "nobody"});
+    let cols = one_col();
+    for round in 0..3 {
+        let fut = client.execute(slow, &params, Some(&cols), bounds, None);
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), fut).await;
+        assert!(
+            outcome.is_err(),
+            "round {round}: the future must still be mid-flight when dropped"
+        );
+    }
+    // The guard's cleanup is a spawned task; give it a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let mut conn = client
+        .pool_for_tests()
+        .acquire()
+        .await
+        .expect("the one session");
+    let leaked: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pg_prepared_statements WHERE name LIKE 'skq_p_%'")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("sweep");
+    assert!(
+        leaked.is_empty(),
+        "cancelled scans must deallocate their prepared statements, found: {leaked:?}"
+    );
+    drop(conn);
     drop_graph(&pool, &graph).await;
 }
