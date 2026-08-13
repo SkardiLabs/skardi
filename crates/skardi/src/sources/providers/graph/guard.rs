@@ -22,7 +22,7 @@ const BLOCKED: &[&str] = &[
 
 /// Reject Cypher containing a blocked keyword. The error names the
 /// keyword and its byte offset — never the query text. The FIRST match
-/// in the query wins, not the first keyword in [`BLOCKED`]: the error
+/// in the query wins, not the first keyword in `BLOCKED`: the error
 /// exists to hand an LLM the place to start rewriting, and
 /// `DETACH DELETE` must point at `DETACH`, not at the later `DELETE`
 /// that happens to sort earlier in the list.
