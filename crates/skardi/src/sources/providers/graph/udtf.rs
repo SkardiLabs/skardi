@@ -69,8 +69,17 @@ use crate::sources::providers::udtf_args::strict_string_arg;
 
 /// Conversion batch size (design §Schema handling): the atomic unit —
 /// each batch converts as a whole before it is emitted, so a mid-scan
-/// type mismatch never emits a partially converted batch, and peak
-/// conversion memory is one batch, not one result.
+/// type mismatch never emits a partially converted batch.
+///
+/// Milestone-1 reality, stated so this comment cannot outlive the code
+/// it describes: BOTH layers fully buffer (the client collects every
+/// row, and `cypher_batches` materializes every RecordBatch before the
+/// first is emitted — which `EmissionType::Final` declares honestly).
+/// So today NOTHING is emitted before a mid-scan failure — the design's
+/// explicitly-permitted whole-result variant, strictly stronger than
+/// the batch-atomic contract. The chunking below is where the contract
+/// will start to bind if a later client genuinely streams; it is not
+/// buying partial emission now.
 const CONVERSION_BATCH_ROWS: usize = 1024;
 
 /// One registered `type: graph` source, resolvable by connection name.

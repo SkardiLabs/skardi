@@ -123,7 +123,7 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
     /// arity, all it gives us), Neo4j binds BY NAME to the Bolt record's
     /// field names. `None` is the JSON-`record` fallback (whole record as
     /// one JSON object per row) — backends whose wire needs a declared
-    /// arity refuse it (see [`Self::requires_declared_columns`]).
+    /// arity refuse it (see [`Self::declared_columns_requirement`]).
     ///
     /// `limit` is pushed as far down as the backend allows (AGE: a real
     /// SQL LIMIT of min(limit, max_rows + 1); Neo4j: bounded stream
@@ -161,6 +161,50 @@ pub trait GraphClient: Send + Sync + std::fmt::Debug {
         bounds: QueryBounds,
         limit: Option<usize>,
     ) -> Result<Vec<SchemaRow>, GraphError>;
+}
+
+/// Cancellation safety for the hand-rolled transaction: [`AgeClient::execute`]
+/// manages BEGIN/ROLLBACK manually (rollback must precede DEALLOCATE on
+/// the same session — sqlx's `Transaction` guard cannot order that), and
+/// the cost of going manual is that NOTHING rolls back if the scan
+/// future is dropped mid-transaction — DataFusion drops scan streams on
+/// client disconnect, plan short-circuits, and sibling-partition errors,
+/// and sqlx's pool return path never rolls back (it pings). A connection
+/// returned `idle in transaction` mostly self-heals on reuse, but it
+/// holds a snapshot while idle and a cancellation burst can pin every
+/// pooled session. This guard closes it: if dropped while ARMED, the
+/// connection is moved into a spawned task that rolls back and only then
+/// returns it to the pool; the clean path defuses and runs its ordered
+/// cleanup inline.
+struct OpenTxnGuard {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+}
+
+impl OpenTxnGuard {
+    fn conn(&mut self) -> &mut sqlx::PgConnection {
+        self.conn.as_mut().expect("armed until defused")
+    }
+
+    fn defuse(mut self) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+        self.conn.take().expect("defused exactly once")
+    }
+}
+
+impl Drop for OpenTxnGuard {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            // Drop is sync; the rollback needs the runtime. Execution
+            // always runs inside tokio here — the fallback (no runtime:
+            // plain drop, sqlx pings a possibly-in-transaction session
+            // back into the pool) is only reachable from exotic test
+            // harnesses.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = conn.execute("ROLLBACK").await;
+                });
+            }
+        }
+    }
 }
 
 /// Apache AGE over the workspace's sqlx-postgres stack.
@@ -350,18 +394,26 @@ impl GraphClient for AgeClient {
             // where DEALLOCATE itself is refused, while rollback does NOT
             // clear session-level prepared statements. Rollback-then-
             // deallocate is the only order that cleans up after backend
-            // errors.
-            let mut conn = self
-                .pool
-                .acquire()
-                .await
-                .map_err(|e| map_query_error(&source, bounds, &e))?;
+            // errors. The [`OpenTxnGuard`] covers what MANUAL cannot: a
+            // scan future dropped mid-transaction still rolls back before
+            // the connection re-enters the pool.
+            let mut guard = OpenTxnGuard {
+                conn: Some(
+                    self.pool
+                        .acquire()
+                        .await
+                        .map_err(|e| map_query_error(&source, bounds, &e))?,
+                ),
+            };
             // The security boundary: the SERVER refuses writes in a read
             // transaction, whatever slipped past the keyword guard.
-            conn.execute("BEGIN TRANSACTION READ ONLY")
+            guard
+                .conn()
+                .execute("BEGIN TRANSACTION READ ONLY")
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
             let collected: Result<Vec<GraphRow>, GraphError> = async {
+                let conn = guard.conn();
                 // Server-side: runaway traversals die in the backend, not
                 // in a client that gave up waiting.
                 conn.execute(
@@ -418,12 +470,16 @@ impl GraphClient for AgeClient {
                 Ok(rows)
             }
             .await;
+            // The clean path reclaims the connection — from here the
+            // guard's drop no longer fires and cleanup runs inline, in
+            // its required order.
+            let mut conn = guard.defuse();
             // ROLLBACK unconditionally and FIRST: it clears an aborted
             // transaction (making the DEALLOCATE below executable) and a
             // read-only transaction had nothing to undo anyway. Its
             // RESULT is checked LAST — an early `?` here would skip the
             // DEALLOCATE below and leak the statement on the very success
-            // path this cleanup exists for (round-4 follow-up finding).
+            // path this cleanup exists for.
             let rollback = conn.execute("ROLLBACK").await;
             let mut dealloc = Ok(Default::default());
             if let Some(name) = &prepared {
@@ -445,12 +501,14 @@ impl GraphClient for AgeClient {
             dealloc.map_err(|e| backend_error(&source, &e))?;
             Ok(rows)
         };
-        // Residual, stated: the client-side timeout below ABANDONS the
-        // future mid-flight — no DEALLOCATE can run on that path. It only
-        // fires when the backend outlived its own statement_timeout by 5s
-        // (i.e. stopped answering), and sqlx tears down a connection
-        // dropped mid-query rather than pooling it, so nothing
-        // accumulates there either.
+        // Residual, stated: the client-side timeout below (and any drop
+        // of the scan future) ABANDONS the run mid-flight. The OPEN
+        // TRANSACTION is covered — [`OpenTxnGuard`] rolls it back before
+        // the connection re-enters the pool — but no DEALLOCATE runs on
+        // that path. Acceptable: the prepared names are per-call unique
+        // (never reused), the timeout arm only fires when the backend
+        // outlived its own statement_timeout by 5s, and sqlx tears down
+        // a connection dropped mid-query rather than pooling it.
         let rows = bounded(bounds.timeout, run).await?;
         Ok(futures::stream::iter(rows.into_iter().map(Ok)).boxed())
     }
@@ -599,8 +657,9 @@ fn build_cypher_sql(
     }
 }
 
-/// A dollar-quote tag that provably does not occur in `text`: extend a
-/// base tag with a counter until absent — no escape rules to get wrong.
+/// A dollar-quote tag that provably does not occur in `text`: pick the
+/// first `$skqN$` suffix the text does not contain — no escape rules to
+/// get wrong.
 fn dollar_tag(text: &str) -> String {
     // The collision test runs against `text + "$"`, not `text`: the
     // closing delimiter starts with `$`, so a query ENDING in the tag's
@@ -608,14 +667,32 @@ fn dollar_tag(text: &str) -> String {
     // the full tag at the text/closing-tag boundary and would close the
     // literal early. Appending the `$` makes the check cover exactly the
     // stream Postgres scans.
+    //
+    // ONE pass: collect the tag-shaped substrings actually present, then
+    // take the first free suffix — a probe stuffed with `$skq$ $skq1$ …`
+    // costs one scan, not one scan per collision.
     let probe = format!("{text}$");
-    let mut tag = "$skq$".to_string();
-    let mut n = 0u32;
-    while probe.contains(&tag) {
-        n += 1;
-        tag = format!("$skq{n}$");
+    let mut base_used = false;
+    let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (i, _) in probe.match_indices("$skq") {
+        let rest = &probe[i + "$skq".len()..];
+        if let Some(end) = rest.find('$') {
+            let digits = &rest[..end];
+            if digits.is_empty() {
+                base_used = true;
+            } else if let Ok(n) = digits.parse::<u32>() {
+                used.insert(n);
+            }
+        }
     }
-    tag
+    if !base_used {
+        return "$skq$".to_string();
+    }
+    let mut n = 1u32;
+    while used.contains(&n) {
+        n += 1;
+    }
+    format!("$skq{n}$")
 }
 
 /// Env-var credential lookup, shared by every backend client so the

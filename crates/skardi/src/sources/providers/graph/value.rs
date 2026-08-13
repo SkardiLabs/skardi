@@ -428,6 +428,23 @@ fn node_parts(
     match v {
         Value::Null => Ok(None),
         Value::Object(map) => {
+            // Endpoint keys are the structural tell of an EDGE: an edge
+            // object ({id, label, start_id, end_id, properties}) would
+            // otherwise satisfy the node shape completely — id and label
+            // present — and a `RETURN r` declared as `node` would decode
+            // silently, dropping start_id/end_id on the floor. The
+            // reverse direction already fails naturally (a vertex lacks
+            // the endpoint keys a relationship column requires); this
+            // check closes the hole from the other side, turning a
+            // silent wrong answer into the typed error the design
+            // promises. Sound because both keys are structural fields,
+            // never property names: properties live under their own
+            // `properties` sub-object. Holds for BOTH backends' edge
+            // spellings (AGE and the Neo4j client emit the same
+            // endpoint keys).
+            if map.contains_key("start_id") || map.contains_key("end_id") {
+                return Err(mismatch(col, row, "node", v));
+            }
             let Some(id) = map.get("id") else {
                 return Err(mismatch(col, row, "node", v));
             };
@@ -930,6 +947,16 @@ mod tests {
             (GraphType::Bool, serde_json::json!("yes"), "bool"),
             (GraphType::Float, serde_json::json!("1.5"), "float"),
             (GraphType::Node, serde_json::json!({"id": 1}), "node"), // no label
+            (
+                // An EDGE object satisfies the node keys (id + label) —
+                // the endpoint keys are what must reject it, or a
+                // `RETURN r` declared `node` decodes silently with
+                // start_id/end_id dropped.
+                GraphType::Node,
+                serde_json::json!({"id": 9, "label": "KNOWS", "start_id": 1,
+                                   "end_id": 2, "properties": {}}),
+                "node",
+            ),
             (
                 GraphType::Relationship,
                 serde_json::json!({"id": 1, "label": "K"}), // no endpoints
