@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{Array, Int64Array, ListArray, StringArray, StructArray};
-use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use sqlx::Executor;
 use sqlx::postgres::PgPoolOptions;
@@ -27,22 +26,23 @@ use sqlx::postgres::PgPoolOptions;
 use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBounds};
 use skardi::sources::providers::graph::config::GraphConfig;
 use skardi::sources::providers::graph::udtf::GraphSources;
+use skardi::sources::providers::graph::value::{DeclaredColumn, GraphType};
 use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
 
+mod graph_live_support;
+use graph_live_support::{collect, split_creds};
+
+/// One declared column for direct `GraphClient::execute` calls — AGE
+/// binds positionally, so only the COUNT matters to these tests.
+fn one_col() -> Vec<DeclaredColumn> {
+    vec![DeclaredColumn {
+        name: "c0".to_string(),
+        ty: GraphType::Json,
+    }]
+}
+
 fn live_url() -> Option<String> {
-    let url = std::env::var("SKARDI_AGE_LIVE_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty());
-    // CI arms this: absent gating env is a SKIP for a developer's
-    // laptop but a hard failure where the suite is the AGE backend's
-    // ONLY coverage — a renamed or dropped URL var must not turn nine
-    // skips into a green step nobody reads.
-    assert!(
-        url.is_some() || std::env::var("SKARDI_AGE_LIVE_REQUIRED").is_err(),
-        "SKARDI_AGE_LIVE_REQUIRED is set but SKARDI_AGE_LIVE_URL is not — \
-         the AGE backend would have gone untested"
-    );
-    url
+    graph_live_support::live_url("SKARDI_AGE_LIVE_URL", "SKARDI_AGE_LIVE_REQUIRED")
 }
 
 /// Seed a fresh, uniquely named graph through AGE's own APIs (writes go
@@ -86,22 +86,6 @@ async fn drop_graph(pool: &sqlx::PgPool, graph: &str) {
         .bind(graph)
         .execute(pool)
         .await;
-}
-
-/// Split a maybe-credentialed URL into (cred-free URL, user, pass):
-/// config validation rejects URL-embedded passwords, so the registered
-/// source takes credentials the designed way — env-var NAMES.
-fn split_creds(url: &str) -> (String, Option<String>, Option<String>) {
-    let mut parsed = url::Url::parse(url).expect("live URL parses");
-    let user = (!parsed.username().is_empty()).then(|| parsed.username().to_string());
-    let pass = parsed.password().map(str::to_string);
-    parsed
-        .set_username("")
-        .expect("postgres URLs take userinfo");
-    parsed
-        .set_password(None)
-        .expect("postgres URLs take userinfo");
-    (parsed.to_string(), user, pass)
 }
 
 /// YAML `username_env`/`password_env` lines for a URL's credentials,
@@ -148,15 +132,6 @@ async fn live_ctx(url: &str, graph: &str) -> (SessionContext, GraphSources) {
     let ctx = SessionContext::new();
     register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("udtfs register");
     (ctx, sources)
-}
-
-async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-    ctx.sql(sql)
-        .await
-        .expect("plans")
-        .collect()
-        .await
-        .expect("executes")
 }
 
 fn unique_graph(tag: &str) -> String {
@@ -376,7 +351,7 @@ async fn the_backend_read_only_transaction_is_the_boundary() {
         .execute(
             "CREATE (n:Sneaky) RETURN n",
             &serde_json::json!({}),
-            1,
+            Some(&one_col()),
             handle.bounds,
             None,
         )
@@ -525,11 +500,12 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // (min_connections defaults to 0) and a "sweep" would only ever see
     // a single session.
     let hammer_params = serde_json::json!({"x": "nobody"});
+    let hammer_cols = one_col();
     let results = futures::future::join_all((0..8).map(|_| {
         client.execute(
             "MATCH (p:Person) WHERE p.name <> $x RETURN p.name",
             &hammer_params,
-            1,
+            Some(&hammer_cols),
             tight,
             None,
         )
@@ -547,11 +523,12 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
     // PREPARE exists and the EXECUTE fails at runtime), concurrent for
     // the same session-fan-out reason as above.
     let div_params = serde_json::json!({"x": 1});
+    let div_cols = one_col();
     let results = futures::future::join_all((0..8).map(|_| {
         client.execute(
             "MATCH (p:Person) RETURN $x / 0",
             &div_params,
-            1,
+            Some(&div_cols),
             tight,
             None,
         )
@@ -587,7 +564,7 @@ async fn graph_schema_lists_labels_and_the_row_cap_fires() {
         .execute(
             "RETURN $s",
             &serde_json::json!({"s": hostile}),
-            1,
+            Some(&one_col()),
             tight,
             None,
         )
@@ -714,7 +691,7 @@ async fn the_timeout_bound_is_typed_and_credentials_never_reach_errors() {
             // for the full count either.
             "MATCH (a),(b),(c),(d),(e),(f),(g),(h),(i),(j),(k),(l),(m),(n) RETURN count(*)",
             &serde_json::json!({}),
-            1,
+            Some(&one_col()),
             QueryBounds {
                 timeout: std::time::Duration::from_secs(1),
                 max_rows: 10,
@@ -727,9 +704,9 @@ async fn the_timeout_bound_is_typed_and_credentials_never_reach_errors() {
     let msg = err.to_string();
     assert!(msg.contains("timed out after 1s"), "typed, named: {msg}");
 
-    // 2) graph_schema's own row cap (the labels() branch).
+    // 2) graph_schema's own row cap (the catalog branch).
     let err = client
-        .labels(
+        .schema(
             QueryBounds {
                 timeout: std::time::Duration::from_secs(10),
                 max_rows: 1,
@@ -877,7 +854,7 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
         .execute(
             "MATCH (p:Person) RETURN p.name",
             &serde_json::json!({}),
-            1,
+            Some(&one_col()),
             QueryBounds {
                 timeout: std::time::Duration::from_secs(1),
                 max_rows: 10,
@@ -1038,8 +1015,9 @@ async fn cancelled_scans_leave_no_prepared_statements() {
     let slow = "MATCH (a),(b),(c),(d),(e),(f),(g),(h),(i),(j) \
                 WHERE a.name <> $x RETURN a";
     let params = serde_json::json!({"x": "nobody"});
+    let cols = one_col();
     for round in 0..3 {
-        let fut = client.execute(slow, &params, 1, bounds, None);
+        let fut = client.execute(slow, &params, Some(&cols), bounds, None);
         let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), fut).await;
         assert!(
             outcome.is_err(),

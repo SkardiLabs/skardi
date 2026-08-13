@@ -181,9 +181,15 @@ and 3 behind the same trait.
   simplicity — the trait shape is what must not change.
 - A `GraphRow` is a vector of `GraphValue` (scalar, node, relationship, path, list, map).
 - Conversion from `GraphValue` to Arrow arrays is centralized and backend-agnostic.
-- Node identity: the `id` field carries Neo4j 5's `elementId()` (a
-  string); Neo4j 4 numeric ids, AGE graphids, and Kuzu internal ids are
-  stringified into the same field. The stability contract, stated
+- Node identity: the `id` field carries the backend's node identity as
+  an opaque STRING — AGE graphids, Neo4j numeric ids, and Kuzu internal
+  ids are stringified into the same field. (Milestone-2 correction: an
+  earlier revision promised Neo4j 5's `elementId()` here, but the
+  pinned driver's stable protocol implementation negotiates Bolt 4.4,
+  which predates it — the numeric id is what the wire carries, and it
+  satisfies the same stability contract below. `elementId()` remains
+  available explicitly via `RETURN elementId(n)` when a caller wants
+  it.) The stability contract, stated
   precisely because federated `JOIN`s are a headline use case: an id is
   **stable for the life of the entity within one database instance**,
   which makes it join-safe across the scans of a single federated query
@@ -553,16 +559,53 @@ driver cannot express Bolt's access mode, wiring or upstreaming it is
 part of this milestone's cost, and the milestone does not ship on the
 keyword guard alone.
 
-- `Neo4jClient` (Bolt): every query in a READ-access-mode transaction;
-  registration performs the read-mode proof (attempt a trivial `CREATE`
-  inside a read transaction, require the SERVER to refuse it, roll back
-  regardless) so a misconfigured driver/server pair fails closed at
-  registration.
-- JSON-`record` fallback mode (Bolt needs no declared arity).
+**Spike outcome (recorded; details in `neo4j.rs`'s module doc):** the
+latest stable `neo4rs` (0.8.0) has no read-mode channel at all; the
+pinned **0.9.0-rc.10** sends Bolt's `mode: "r"` in the RUN extra via
+`Graph::execute_read` — the spelling the Bolt spec honors for
+**auto-commit transactions**, so every milestone-2 query runs as one
+auto-commit READ transaction. The driver's EXPLICIT transactions do not
+carry the mode (its `Begin` builder supports it; `Txn::new` never calls
+it — an upstream gap), so they are not used and the
+`unstable-bolt-protocol-impl-v2` feature stays off. Consequences,
+verified live against Neo4j 5:
+
+- the registration **read-mode proof** probes the exact enforcement
+  unit every query uses: a trivial `CREATE (n:…) DELETE n` through the
+  read channel, required to be REFUSED by the server (it answers
+  `Neo.ClientError.Statement.AccessMode`, "Writing in read access mode
+  not allowed"; the probe is self-erasing rather than rolled back —
+  auto-commit has no rollback — so even a non-enforcing server is left
+  unchanged, and registration then fails closed);
+- the transaction timeout rides the RUN extra (`tx_timeout`), and the
+  server kills at the bound with
+  `Transaction.TransactionTimedOutClientConfiguration` → the typed
+  `GraphError::Timeout`;
+- declared columns bind BY NAME (Bolt records carry field names —
+  AGE's positional-order footgun does not exist here), and a declared
+  name the query never returns is a typed error naming it.
+
+Shipped surface:
+
+- `Neo4jClient` (Bolt) behind the same `GraphClient` trait; every query
+  one auto-commit READ-access-mode transaction; registration runs the
+  reachability probe and the read-mode proof.
+- JSON-`record` fallback mode (Bolt needs no declared arity): one
+  `record: Utf8` column, the whole record as canonical JSON text, keys
+  sorted (the driver surfaces records as hash maps; RETURN order is not
+  recoverable through its public API).
 - `graph_schema` via `db.schema.nodeTypeProperties()` /
-  `db.schema.relTypeProperties()`.
-- Reuses milestone 1's conversion, guards, bounds, and error taxonomy.
-- Integration tests against testcontainer Neo4j (`#[ignore]`-gated).
+  `db.schema.relTypeProperties()`: the shared output grows nullable
+  `property` / `property_type` columns (one row per label × property;
+  AGE serves them as null, structurally).
+- Reuses milestone 1's conversion, guards, bounds, and error taxonomy;
+  the canonical node shape learns the `labels` ARRAY spelling
+  (multi-label is native on Neo4j; AGE's single `label` stays legal),
+  Bolt temporals render as ISO-8601 text, spatial points as small JSON
+  objects, byte arrays as hex, non-finite floats as null (the agtype
+  decoder's decision, honored across backends).
+- Integration tests against a dockerized Neo4j (`#[ignore]`-gated,
+  wired into the CI coverage job like AGE's).
 
 ### Milestone 3 — Kuzu backend
 

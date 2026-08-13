@@ -3332,6 +3332,9 @@ name = "deadpool-runtime"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "deadpool-runtime"
@@ -6922,6 +6925,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
+name = "mutants"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc0287524726960e07b119cebd01678f852f147742ae0d925e6a520dca956126"
+
+[[package]]
 name = "mysql-common-derive"
 version = "0.32.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7051,6 +7060,54 @@ name = "ndk-context"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
+
+[[package]]
+name = "neo4rs"
+version = "0.9.0-rc.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b433ba6b38f863f3f1db1cd2b99da742c5db961d7fec9553663331b5db3bc453"
+dependencies = [
+ "backon",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "deadpool 0.12.3",
+ "delegate",
+ "futures",
+ "log",
+ "neo4rs-macros",
+ "neo4rs_include_snippet",
+ "pastey",
+ "pin-project-lite",
+ "rustls 0.23.41",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde",
+ "socket2 0.5.10",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "url",
+]
+
+[[package]]
+name = "neo4rs-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53a0d57c55d2d1dc62a2b1d16a0a1079eb78d67c36bdf468d582ab4482ec7002"
+dependencies = [
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "neo4rs_include_snippet"
+version = "0.9.0-rc.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79f62dfc17e5e779bfed003d02e9ef4ecdb7b25fb9d37f7e60f3f730d9a62726"
+dependencies = [
+ "unsynn",
+]
 
 [[package]]
 name = "never-say-never"
@@ -7635,6 +7692,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "path_abs"
@@ -9499,6 +9562,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shadow_counted"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65da48d447333cebe1aadbdd3662f3ba56e76e67f53bc46f3dd5f67c74629d6b"
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9616,6 +9685,7 @@ dependencies = [
  "mongodb",
  "mysql_async",
  "ndarray 0.17.2",
+ "neo4rs",
  "num_cpus",
  "object_store",
  "ort",
@@ -11306,6 +11376,17 @@ name = "unsafe-libyaml"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
+name = "unsynn"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd574186a61b234717745ee569f9323def8ac863c2e4b512a25d3b0ec39322fc"
+dependencies = [
+ "mutants",
+ "proc-macro2",
+ "shadow_counted",
+]
 
 [[package]]
 name = "untrusted"

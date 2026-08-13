@@ -1,6 +1,6 @@
 //! Typed configuration for a `type: graph` data source (design
-//! §GraphConfig typed YAML). Milestone 1 supports the `age` backend;
-//! views land with milestone 4.
+//! §GraphConfig typed YAML). Milestones 1-2 support the `age` and
+//! `neo4j` backends; views land with milestone 4.
 
 use serde::Deserialize;
 
@@ -34,10 +34,15 @@ pub const MAX_MAX_CONNECTIONS: u32 = 64;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphConfig {
-    /// Backend engine. Milestone 1: `age` (openCypher inside Postgres).
+    /// Backend engine: `age` (openCypher inside Postgres) or `neo4j`
+    /// (Bolt).
     pub backend: String,
-    /// AGE graphs are named per database.
-    pub graph_name: String,
+    /// What it names is per backend: AGE graphs are named per database,
+    /// so `age` REQUIRES it; on `neo4j` it selects the database and may
+    /// be omitted for the server default (the design's neo4j example
+    /// carries no graph_name).
+    #[serde(default)]
+    pub graph_name: Option<String>,
     /// Environment variable NAMES holding credentials — values never
     /// appear in YAML (Open Connector's hygiene; the topology differs:
     /// there is no gateway, so Skardi holds the credential in memory).
@@ -86,24 +91,52 @@ impl GraphConfig {
     /// as a Postgres connection string in the same file) — no SSRF guard,
     /// only a scheme allowlist (design §Security).
     pub fn validate(&self, name: &str, connection_string: &str) -> Result<(), GraphError> {
-        if self.backend != "age" {
+        // ONE rules row per backend — the scheme list drives both the
+        // check and the error text, and the graph_name rule rides along,
+        // so milestone 3's kuzu is one new row here instead of parallel
+        // matches that can drift.
+        let rules = match self.backend.as_str() {
+            "age" => BackendRules {
+                schemes: &["postgres://", "postgresql://"],
+                // Spliced into `cypher('<name>', …)` as a SQL literal —
+                // identifier shape keeps it inert belt-and-braces (the
+                // literal is also quote-escaped at the call site).
+                name_required: true,
+                name_extra_chars: &[],
+                name_shape: "a bare identifier ([A-Za-z0-9_]+)",
+            },
+            "neo4j" => BackendRules {
+                schemes: &["bolt://", "bolt+s://", "neo4j://", "neo4j+s://"],
+                // Optional (the server default database); travels as
+                // driver-bound Bolt metadata, never query text — the
+                // shape check (Neo4j's own name alphabet) keeps typos
+                // loud, nothing more.
+                name_required: false,
+                name_extra_chars: &['.', '-'],
+                name_shape: "a database name ([A-Za-z0-9_.-]+)",
+            },
+            other => {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!(
+                        "backend '{other}' is not supported (milestones 1-2 support: \
+                         age, neo4j; kuzu is a later milestone)"
+                    ),
+                });
+            }
+        };
+        if !rules
+            .schemes
+            .iter()
+            .any(|scheme| connection_string.starts_with(scheme))
+        {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
                 reason: format!(
-                    "backend '{}' is not supported (milestone 1 supports: age; \
-                     neo4j and kuzu are later milestones)",
-                    self.backend
+                    "the {} backend requires a {} connection_string",
+                    self.backend,
+                    rules.schemes.join(" / ")
                 ),
-            });
-        }
-        let scheme_ok = connection_string.starts_with("postgres://")
-            || connection_string.starts_with("postgresql://");
-        if !scheme_ok {
-            return Err(GraphError::InvalidConfig {
-                name: name.to_string(),
-                reason: "the age backend requires a postgres:// or postgresql:// \
-                         connection_string"
-                    .to_string(),
             });
         }
         // Credentials travel as env-var NAMES only (username_env /
@@ -145,22 +178,30 @@ impl GraphConfig {
                     .to_string(),
             });
         }
-        // The graph name is spliced into `cypher('<name>', …)` as a SQL
-        // literal — identifier shape keeps it inert belt-and-braces (the
-        // literal is also quote-escaped at the call site).
-        if self.graph_name.is_empty()
-            || !self
-                .graph_name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(GraphError::InvalidConfig {
-                name: name.to_string(),
-                reason: format!(
-                    "graph_name '{}' must be a bare identifier ([A-Za-z0-9_]+)",
-                    self.graph_name
-                ),
-            });
+        match self.graph_name.as_deref() {
+            None if rules.name_required => {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: "the age backend requires graph_name (AGE graphs are named \
+                             per database)"
+                        .to_string(),
+                });
+            }
+            Some(graph_name)
+                if graph_name.is_empty()
+                    || !graph_name.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '_' || rules.name_extra_chars.contains(&c)
+                    }) =>
+            {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!(
+                        "graph_name '{graph_name}' must be {} on the {} backend",
+                        rules.name_shape, self.backend
+                    ),
+                });
+            }
+            _ => {}
         }
         for (field, value) in [
             ("username_env", &self.username_env),
@@ -195,8 +236,8 @@ impl GraphConfig {
                 name: name.to_string(),
                 reason: format!(
                     "query_timeout_seconds must be in 1..={MAX_QUERY_TIMEOUT_SECONDS} \
-                     (got {}) — the value feeds Postgres's statement_timeout and the \
-                     client-side wrap",
+                     (got {}) — the value feeds the backend's server-side timeout \
+                     (statement_timeout / tx_timeout) and the client-side wrap",
                     self.query_timeout_seconds
                 ),
             });
@@ -221,6 +262,16 @@ impl GraphConfig {
         }
         Ok(())
     }
+}
+
+/// Per-backend validation rules — one row per backend in `validate`, so
+/// the scheme allowlist, its error text, and the graph_name contract
+/// cannot drift apart across parallel matches.
+struct BackendRules {
+    schemes: &'static [&'static str],
+    name_required: bool,
+    name_extra_chars: &'static [char],
+    name_shape: &'static str,
 }
 
 fn is_env_var_name(s: &str) -> bool {
@@ -258,21 +309,67 @@ password_env: AGE_PG_PASS
     }
 
     #[test]
-    fn non_age_backends_and_wrong_schemes_are_named_errors() {
+    fn unknown_backends_and_wrong_schemes_are_named_errors() {
         let mut c = base();
-        c.backend = "neo4j".into();
+        c.backend = "kuzu".into();
         let err = c.validate("kg", "postgres://h/db").unwrap_err();
-        assert!(err.to_string().contains("later milestones"), "{err}");
+        assert!(err.to_string().contains("later milestone"), "{err}");
 
+        // Cross-backend URLs are misconfigurations, both directions.
         let c = base();
         let err = c.validate("kg", "bolt://localhost:7687").unwrap_err();
         assert!(err.to_string().contains("postgres://"), "{err}");
+        let mut c = base();
+        c.backend = "neo4j".into();
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("bolt://"), "{err}");
+    }
+
+    #[test]
+    fn neo4j_accepts_bolt_schemes_and_an_optional_database() {
+        let mut c = base();
+        c.backend = "neo4j".into();
+        for url in [
+            "bolt://localhost:7687",
+            "bolt+s://h:7687",
+            "neo4j://h:7687",
+            "neo4j+s://h:7687",
+        ] {
+            c.validate("kg", url).expect(url);
+        }
+        // graph_name is the database selector there — optional, and
+        // Neo4j's own name alphabet (dots, dashes) is legal.
+        c.graph_name = None;
+        c.validate("kg", "bolt://h:7687")
+            .expect("default database needs no graph_name");
+        c.graph_name = Some("my-db.prod".into());
+        c.validate("kg", "bolt://h:7687")
+            .expect("neo4j db alphabet");
+        c.graph_name = Some("bad name".into());
+        let err = c.validate("kg", "bolt://h:7687").unwrap_err();
+        assert!(err.to_string().contains("database name"), "{err}");
+        // The +ssc self-signed variants are deliberately NOT allowlisted.
+        c.graph_name = None;
+        let err = c.validate("kg", "bolt+ssc://h:7687").unwrap_err();
+        assert!(err.to_string().contains("bolt://"), "{err}");
+    }
+
+    #[test]
+    fn age_requires_a_graph_name_and_neo4j_dots_stay_illegal_there() {
+        let mut c = base();
+        c.graph_name = None;
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("requires graph_name"), "{err}");
+        let mut c = base();
+        c.graph_name = Some("my.graph".into());
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("bare identifier"), "{err}");
     }
 
     #[test]
     fn graph_name_and_env_names_are_shape_checked() {
         let mut c = base();
-        c.graph_name = "bad-name".into();
+        c.graph_name = Some("bad-name".into());
         assert!(c.validate("kg", "postgres://h/db").is_err());
 
         let mut c = base();
@@ -341,7 +438,7 @@ password_env: AGE_PG_PASS
                 .contains("max_connections")
         );
         let mut c = base();
-        c.graph_name = String::new();
+        c.graph_name = Some(String::new());
         assert!(
             c.validate("kg", "postgres://h/db")
                 .unwrap_err()

@@ -11,20 +11,30 @@
 //! Call-shape constraints (stated because agents generate these calls):
 //! arguments are positional, so declaring `columns` requires passing
 //! `params` — `'{}'` is the no-parameters spelling, and NULL is rejected
-//! (schema-shaping arguments are strict string literals). Milestone 1 is
-//! AGE-only, and AGE's `cypher()` call must declare its result arity —
-//! so `columns` is REQUIRED here: omitting it is a targeted error, and
-//! the JSON-`record` fallback ships with the Neo4j milestone, where Bolt
-//! needs no declared arity.
+//! (schema-shaping arguments are strict string literals). Whether
+//! `columns` may be OMITTED is per backend: AGE's `cypher()` call must
+//! declare its result arity, so omitting it there is a targeted error;
+//! on Neo4j (Bolt needs no declared arity) the omission is the
+//! JSON-`record` fallback — one `record: Utf8` column carrying each
+//! whole record as canonical JSON text, keys in sorted order.
 //!
-//! **Declared-column ORDER is load-bearing**: the binding to the Cypher
-//! `RETURN` clause is positional (all AGE's `cypher()` gives us), so
-//! `columns` must list them in RETURN order. Two same-typed columns
-//! declared out of order swap SILENTLY — same JSON kind, no
-//! `TypeMismatch`, nothing downstream can tell — which is also the
-//! mis-declaration an LLM is most likely to produce. The error message,
-//! this doc, and the design's §Schema handling all state it because no
-//! structural check is possible.
+//! **How declared columns BIND is per backend, and both contracts are
+//! stated here** (the schema itself is identical either way):
+//!
+//! - **AGE: positional.** The binding to the Cypher `RETURN` clause is
+//!   positional (all AGE's `cypher()` gives us), so `columns` must list
+//!   them in RETURN order. Two same-typed columns declared out of order
+//!   swap SILENTLY — same JSON kind, no `TypeMismatch`, nothing
+//!   downstream can tell — which is also the mis-declaration an LLM is
+//!   most likely to produce. The error message, this doc, and the
+//!   design's §Schema handling all state it because no structural check
+//!   is possible.
+//! - **Neo4j: by NAME.** Bolt records carry field names, so each
+//!   declared column binds to the RETURN entry of the same name —
+//!   declaration order only sets output column order, and a declared
+//!   name the query never returns is a typed error naming it (alias the
+//!   entry with `AS`). The positional footgun above does not exist on
+//!   this backend.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -202,29 +212,43 @@ impl TableFunctionImpl for CypherQueryFunction {
             }
         };
 
-        // Milestone 1 is AGE-only: `columns` is required (AGE's cypher()
-        // must declare its arity; the JSON-record fallback ships with the
-        // Neo4j milestone).
-        let Some(columns_json) = columns_json else {
-            return plan_err!(
-                "cypher_query: 'columns' is required on the age backend — declare the \
-                 output columns IN THE SAME ORDER AS YOUR RETURN CLAUSE (the binding \
-                 is positional; two same-typed columns declared out of order swap \
-                 silently), e.g. '{{\"name\": \"string\", \"n\": \"node\"}}' \
-                 (accepted types: {})",
-                ACCEPTED_TYPES
-            );
-        };
-        let columns = parse_columns(&columns_json).map_err(plan_error)?;
-
+        // Whether `columns` may be omitted is the BACKEND's contract
+        // (resolved through the handle, still at plan time): the
+        // requirement REASON comes from the backend itself, so this
+        // shared code never hardcodes one backend's binding rules.
         let handle = lookup(&self.sources, &connection)?;
+        let columns = match columns_json {
+            Some(text) => Some(Arc::new(parse_columns(&text).map_err(plan_error)?)),
+            None => match handle.client.declared_columns_requirement() {
+                Some(reason) => {
+                    return plan_err!("cypher_query: {reason} (accepted types: {ACCEPTED_TYPES})");
+                }
+                None => None,
+            },
+        };
         Ok(Arc::new(CypherQueryProvider {
             handle,
             cypher,
             params,
-            columns: Arc::new(columns),
+            columns,
         }))
     }
+}
+
+/// The JSON-`record` fallback's one-column schema: each row is the whole
+/// Cypher record as canonical JSON text (keys sorted — the Bolt driver
+/// hands records over as hash maps, so RETURN order is not recoverable).
+/// Static: it is consulted on every planning pass and every fallback
+/// scan and never changes.
+fn record_fallback_columns() -> Arc<Vec<DeclaredColumn>> {
+    static COLUMNS: std::sync::LazyLock<Arc<Vec<DeclaredColumn>>> =
+        std::sync::LazyLock::new(|| {
+            Arc::new(vec![DeclaredColumn {
+                name: "record".to_string(),
+                ty: GraphType::Json,
+            }])
+        });
+    Arc::clone(&COLUMNS)
 }
 
 /// Parse the declared-columns JSON object. Declaration order is object
@@ -269,13 +293,16 @@ fn parse_columns(text: &str) -> Result<Vec<DeclaredColumn>, GraphError> {
 }
 
 /// The provider behind one `cypher_query` call: planning-time-stable
-/// declared schema, backend touched only at execute.
+/// schema (declared columns, or the record fallback), backend touched
+/// only at execute.
 #[derive(Debug)]
 struct CypherQueryProvider {
     handle: Arc<GraphSourceHandle>,
     cypher: String,
     params: Value,
-    columns: Arc<Vec<DeclaredColumn>>,
+    /// `None` is the JSON-`record` fallback (never on AGE — the call
+    /// refuses it at plan time there).
+    columns: Option<Arc<Vec<DeclaredColumn>>>,
 }
 
 #[async_trait]
@@ -285,7 +312,10 @@ impl TableProvider for CypherQueryProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        declared_schema(&self.columns)
+        match &self.columns {
+            Some(columns) => declared_schema(columns),
+            None => declared_schema(&record_fallback_columns()),
+        }
     }
 
     fn table_type(&self) -> TableType {
@@ -304,7 +334,7 @@ impl TableProvider for CypherQueryProvider {
                 handle: Arc::clone(&self.handle),
                 cypher: self.cypher.clone(),
                 params: self.params.clone(),
-                columns: Arc::clone(&self.columns),
+                columns: self.columns.clone(),
                 // LIMIT pushes to the CONSUMPTION side: the client stops
                 // reading the backend stream after this many rows instead
                 // of pulling max_rows and letting DataFusion truncate.
@@ -317,16 +347,18 @@ impl TableProvider for CypherQueryProvider {
 }
 
 /// `graph_schema('connection')` — the agent-discovery surface: one row
-/// per label, `(label, kind)`, straight off the backend catalog. Names
-/// only, never property values.
+/// per label `(label, kind, property, property_type)`, straight off the
+/// backend catalog. Names and types only, never property values.
 ///
-/// No property columns on AGE, structurally: `ag_catalog` records label
-/// names and kinds ONLY (AGE is schema-optional — properties are
+/// The property columns are filled per backend, by what each catalog
+/// actually knows: Neo4j serves property names and types via
+/// `db.schema.nodeTypeProperties()` / `relTypeProperties()` (one row per
+/// label × property; a property-less label keeps one row with nulls);
+/// on AGE they are ALWAYS null, structurally — `ag_catalog` records
+/// label names and kinds only (AGE is schema-optional — properties are
 /// untyped agtype maps with no catalog declaration), and property
 /// discovery would mean scanning data, unbounded on the agent's FIRST
-/// call. Property names/types arrive with the Neo4j
-/// (`db.schema.nodeTypeProperties()`) and Kuzu (typed catalog)
-/// milestones, whose catalogs actually carry them.
+/// call. Kuzu's typed catalog arrives with its milestone.
 #[derive(Debug)]
 pub struct GraphSchemaFunction {
     sources: GraphSources,
@@ -350,6 +382,10 @@ fn graph_schema_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("label", DataType::Utf8, false),
         Field::new("kind", DataType::Utf8, false),
+        // Nullable BY MEANING: null is "this backend's catalog declares
+        // no properties" (all of AGE) or "this label has none" (Neo4j).
+        Field::new("property", DataType::Utf8, true),
+        Field::new("property_type", DataType::Utf8, true),
     ]))
 }
 
@@ -397,7 +433,8 @@ enum GraphScanKind {
         handle: Arc<GraphSourceHandle>,
         cypher: String,
         params: Value,
-        columns: Arc<Vec<DeclaredColumn>>,
+        /// `None` is the record fallback.
+        columns: Option<Arc<Vec<DeclaredColumn>>>,
         limit: Option<usize>,
     },
     Labels {
@@ -412,7 +449,7 @@ impl fmt::Debug for GraphScanKind {
         match self {
             Self::Cypher { columns, .. } => f
                 .debug_struct("Cypher")
-                .field("columns", &columns.len())
+                .field("columns", &columns.as_ref().map_or(1, |c| c.len()))
                 .finish_non_exhaustive(),
             Self::Labels { .. } => f.debug_struct("Labels").finish_non_exhaustive(),
         }
@@ -465,8 +502,14 @@ impl GraphScanExec {
 impl DisplayAs for GraphScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.kind {
-            GraphScanKind::Cypher { columns, .. } => {
+            GraphScanKind::Cypher {
+                columns: Some(columns),
+                ..
+            } => {
                 write!(f, "GraphScanExec: cypher_query columns={}", columns.len())
+            }
+            GraphScanKind::Cypher { columns: None, .. } => {
+                write!(f, "GraphScanExec: cypher_query record-fallback")
             }
             GraphScanKind::Labels { .. } => write!(f, "GraphScanExec: graph_schema"),
         }
@@ -526,7 +569,7 @@ impl ExecutionPlan for GraphScanExec {
                 Arc::clone(handle),
                 cypher.clone(),
                 params.clone(),
-                Arc::clone(columns),
+                columns.clone(),
                 *limit,
             ),
             GraphScanKind::Labels { handle, limit } => labels_batch(Arc::clone(handle), *limit),
@@ -553,18 +596,27 @@ fn cypher_batches(
     handle: Arc<GraphSourceHandle>,
     cypher: String,
     params: Value,
-    columns: Arc<Vec<DeclaredColumn>>,
+    columns: Option<Arc<Vec<DeclaredColumn>>>,
     limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
         let rows = handle
             .client
-            .execute(&cypher, &params, columns.len(), handle.bounds, limit)
+            .execute(
+                &cypher,
+                &params,
+                columns.as_ref().map(|c| c.as_slice()),
+                handle.bounds,
+                limit,
+            )
             .await
             .map_err(execution_error)?
             .try_collect::<Vec<_>>()
             .await
             .map_err(execution_error)?;
+        // Conversion always runs against concrete columns: the declared
+        // ones, or the fallback's single `record: json`.
+        let columns = columns.unwrap_or_else(record_fallback_columns);
         let mut batches = Vec::with_capacity(rows.len() / CONVERSION_BATCH_ROWS + 1);
         for (chunk_idx, chunk) in rows.chunks(CONVERSION_BATCH_ROWS).enumerate() {
             batches.push(
@@ -588,20 +640,29 @@ fn labels_batch(
     limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
-        let labels = handle
+        let rows = handle
             .client
-            .labels(handle.bounds, limit)
+            .schema(handle.bounds, limit)
             .await
             .map_err(execution_error)?;
         let mut names = arrow::array::StringBuilder::new();
         let mut kinds = arrow::array::StringBuilder::new();
-        for (name, kind) in &labels {
-            names.append_value(name);
-            kinds.append_value(kind);
+        let mut properties = arrow::array::StringBuilder::new();
+        let mut property_types = arrow::array::StringBuilder::new();
+        for row in &rows {
+            names.append_value(&row.label);
+            kinds.append_value(&row.kind);
+            properties.append_option(row.property.as_deref());
+            property_types.append_option(row.property_type.as_deref());
         }
         RecordBatch::try_new(
             graph_schema_schema(),
-            vec![Arc::new(names.finish()), Arc::new(kinds.finish())],
+            vec![
+                Arc::new(names.finish()),
+                Arc::new(kinds.finish()),
+                Arc::new(properties.finish()),
+                Arc::new(property_types.finish()),
+            ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     })
@@ -615,13 +676,17 @@ fn execution_error(e: GraphError) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use futures::stream::BoxStream;
 
     /// Canned-rows client: the UDTF/exec seam without a backend.
+    /// `declared_required` flips it between the two backend contracts
+    /// (true = AGE-shaped, false = Neo4j-shaped with record fallback).
     #[derive(Debug)]
     struct MockClient {
         rows: Vec<Vec<Value>>,
-        labels: Vec<(String, String)>,
+        schema_rows: Vec<super::super::client::SchemaRow>,
+        declared_required: bool,
     }
 
     #[async_trait]
@@ -630,10 +695,14 @@ mod tests {
             &self,
             _cypher: &str,
             _params: &Value,
-            _arity: usize,
+            columns: Option<&[DeclaredColumn]>,
             _bounds: QueryBounds,
             limit: Option<usize>,
         ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
+            assert!(
+                columns.is_some() || !self.declared_required,
+                "the UDTF must not reach a declared-required client without columns"
+            );
             let mut rows = self.rows.clone();
             if let Some(l) = limit {
                 rows.truncate(l);
@@ -641,27 +710,49 @@ mod tests {
             Ok(stream::iter(rows.into_iter().map(Ok)).boxed())
         }
 
-        async fn labels(
+        fn declared_columns_requirement(&self) -> Option<&'static str> {
+            self.declared_required.then_some(
+                "'columns' is required on the age backend — declare the output \
+                 columns IN THE SAME ORDER AS YOUR RETURN CLAUSE",
+            )
+        }
+
+        async fn schema(
             &self,
             _bounds: QueryBounds,
             limit: Option<usize>,
-        ) -> Result<Vec<(String, String)>, GraphError> {
-            let mut labels = self.labels.clone();
+        ) -> Result<Vec<super::super::client::SchemaRow>, GraphError> {
+            let mut rows = self.schema_rows.clone();
             if let Some(l) = limit {
-                labels.truncate(l);
+                rows.truncate(l);
             }
-            Ok(labels)
+            Ok(rows)
         }
     }
 
-    fn sources_with(rows: Vec<Vec<Value>>) -> GraphSources {
+    fn schema_row(
+        label: &str,
+        kind: &str,
+        property: Option<&str>,
+        property_type: Option<&str>,
+    ) -> super::super::client::SchemaRow {
+        super::super::client::SchemaRow {
+            label: label.to_string(),
+            kind: kind.to_string(),
+            property: property.map(str::to_string),
+            property_type: property_type.map(str::to_string),
+        }
+    }
+
+    fn sources_shaped(rows: Vec<Vec<Value>>, declared_required: bool) -> GraphSources {
         let handle = Arc::new(GraphSourceHandle {
             client: Arc::new(MockClient {
                 rows,
-                labels: vec![
-                    ("Person".to_string(), "vertex".to_string()),
-                    ("KNOWS".to_string(), "edge".to_string()),
+                schema_rows: vec![
+                    schema_row("Person", "vertex", Some("name"), Some("String")),
+                    schema_row("KNOWS", "edge", None, None),
                 ],
+                declared_required,
             }),
             bounds: QueryBounds {
                 timeout: std::time::Duration::from_secs(5),
@@ -671,9 +762,20 @@ mod tests {
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }
 
+    fn sources_with(rows: Vec<Vec<Value>>) -> GraphSources {
+        sources_shaped(rows, true)
+    }
+
     async fn ctx_with(rows: Vec<Vec<Value>>) -> SessionContext {
         let ctx = SessionContext::new();
         register_graph_udtfs(&ctx, sources_with(rows)).expect("registration");
+        ctx
+    }
+
+    /// A Neo4j-shaped session: declared columns optional.
+    async fn ctx_record_capable(rows: Vec<Vec<Value>>) -> SessionContext {
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, sources_shaped(rows, false)).expect("registration");
         ctx
     }
 
@@ -729,6 +831,57 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("'columns' is required"), "{msg}");
         assert!(msg.contains("age backend"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn omitted_columns_is_the_record_fallback_where_the_backend_allows() {
+        // A record-capable (Neo4j-shaped) client: each row is one whole
+        // record object, and the planned schema is the single `record`
+        // Utf8 column carrying it as JSON text.
+        let ctx = ctx_record_capable(vec![
+            vec![serde_json::json!({"name": "ada", "age": 36})],
+            vec![serde_json::json!({"name": "bob", "age": 41})],
+        ])
+        .await;
+        let batches = collect(
+            &ctx,
+            "SELECT record FROM cypher_query('kg', 'MATCH (p) RETURN p.name, p.age')",
+        )
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(batches[0].schema().field(0).name(), "record");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        // Verbatim JSON text — and queryable in place via the registered
+        // json getters.
+        assert!(col.value(0).contains("\"ada\""), "{}", col.value(0));
+        let extracted = collect(
+            &ctx,
+            "SELECT json_get_str(record, 'name') AS name FROM \
+             cypher_query('kg', 'MATCH (p) RETURN p.name, p.age') ORDER BY name",
+        )
+        .await;
+        let names = extracted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "ada");
+    }
+
+    #[tokio::test]
+    async fn record_fallback_keeps_its_schema_on_empty_results() {
+        let ctx = ctx_record_capable(vec![]).await;
+        let batches = collect(
+            &ctx,
+            "SELECT * FROM cypher_query('kg', 'MATCH (p) RETURN p')",
+        )
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+        assert_eq!(batches[0].schema().field(0).name(), "record");
     }
 
     #[tokio::test]
@@ -923,15 +1076,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_schema_lists_labels_and_kinds() {
+    async fn graph_schema_lists_labels_kinds_and_per_backend_properties() {
         let ctx = ctx_with(vec![]).await;
         let batches = collect(
             &ctx,
-            "SELECT label, kind FROM graph_schema('kg') ORDER BY label",
+            "SELECT label, kind, property, property_type FROM graph_schema('kg') \
+             ORDER BY label",
         )
         .await;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+        let batch = &batches[0];
+        let property = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        // KNOWS sorts first: a property-less label keeps its row, nulls
+        // in the property columns; Person carries (name, String).
+        assert!(property.is_null(0));
+        assert_eq!(property.value(1), "name");
     }
 
     #[tokio::test]
