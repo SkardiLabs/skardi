@@ -1,6 +1,7 @@
 # `auto_news_base` Skill Design (RSS M3)
 
-**Status:** Migration draft — carried out of the RSS design, not yet re-decided
+**Status:** Migration draft under review — Open Questions 1 (resolved by
+verification) and 3 (decided: source build primary) are settled; the rest remain open
 **Date:** 2026-08-14
 **Branch:** `rss-m3-skill-design`
 **Supersedes:** the M3 material in [2026-07-22-rss-feed-support-design.md](2026-07-22-rss-feed-support-design.md)
@@ -311,66 +312,120 @@ Ordered by how much they change the shape of the work.
 
 ### 1. Does the ingest pipeline still need a statement-sequence engine extension?
 
-The source spec records one: the ingest pipeline is two `INSERT`s plus a closing
-`SELECT` (the health report), requiring *"statement sequences that return the last
-statement's rows as the response — a small pipeline-engine extension recorded as an
-M3 dependency."*
+**Resolved by verification, 2026-08-14: no.** The skill renders **three independent
+single-statement pipelines** — archive-items (`INSERT … SELECT` anti-join),
+archive-chunks (`INSERT … SELECT` through `chunk_parts` + embedding), and the
+health-report `SELECT` — and a driver script POSTs them in order. The
+statement-sequence extension the source spec recorded as an M3 dependency is not
+needed.
 
-That requirement came from an assumption that no longer holds — that `sync` was one
-alias bound to one pipeline. With a driver script in the picture (`auto_context`'s
-established pattern), the skill can render **three independent pipelines** and POST
-them in order. Atomicity is not lost: ingest is idempotent by anti-join, so an
-interrupted run is re-run, not repaired.
+What the verification established:
 
-Weight of evidence that the extension is the more expensive path: the single-statement
-rule is not a pipeline-layer convenience but the execution contract. `POST /query`
-enforces it too — *"exactly one SQL statement. Multi-statement input is rejected at
-validation with a 400"* ([query-endpoint design](2026-07-17-query-endpoint-design.md)) —
-because DataFusion's `ctx.sql()` rejects it. The source spec's estimate of "a small
-pipeline-engine extension" looks low.
+- **The pipeline execute path has no statement-kind gate.** `execute_pipeline_by_name`
+  ([pipeline_handlers.rs:718](../../../crates/server/src/pipeline_handlers.rs))
+  substitutes parameters and calls `engine.execute(&sql)` directly — unlike
+  `POST /query`, which branches on `StatementKind`. INSERT pipelines are an
+  explicitly supported shape: the parameter substituter renders multi-row tuple
+  lists for `INSERT … VALUES {rows}` and is tested for it.
+- **Production precedent exists.** `auto_context`'s `ingest` / `ingest-chunked`
+  pipelines are INSERTs running against a released server (their SKILL.md records
+  runs verified 2026-08-04).
+- **The engine-level SQL is already proven.** `composition_tests.rs` runs the exact
+  cross-source `INSERT INTO archive… SELECT FROM news…` statements this skill will
+  render.
+- **One requirement carried into the render:** the archive source in `ctx.yaml` must
+  declare `access_mode: read_write`, or the INSERTs are refused.
 
-**If three pipelines suffice, M3 stops depending on an engine change at all.** This
-is the first thing to settle.
+Atomicity is not lost by splitting: ingest is idempotent by anti-join, so an
+interrupted run is re-run, not repaired. The original single-pipeline shape would
+have fought the execution contract anyway — the single-statement rule is not a
+pipeline-layer convenience (`POST /query` rejects multi-statement input with a 400
+because DataFusion's `ctx.sql()` does).
+
+**Consequence: M3 requires no engine change for ingest.**
 
 ### 2. Where does the version handshake live?
 
 Same shape of question. The source spec puts `requires: rss/<version>` in pipeline
 metadata and the check in the pipeline loader. But the skill's own `start_server`
 step already verifies pipeline registration on every start; comparing the recorded
-surface version against the server's would run at the same moment, in skill space,
-with no engine change.
+surface version against the server's would run at the same moment, in skill space.
 
-The counter-argument the source spec makes is worth preserving: rendered artifacts
-live in user space and version skew is *"this design's default failure mode, not an
-edge case"* — so wherever the check lives, it must be unskippable.
+**Verified 2026-08-14: the skill-space check is not free either.** The surface
+version is logged at registration and stamped into both tables' Arrow schema
+metadata (`skardi.rss.surface_version`), but **no HTTP endpoint exposes it**:
+`GET /data_source` serializes fields only — name, type, nullability, semantics
+description ([get_table_schema](../../../crates/server/src/pipeline_handlers.rs)) —
+and schema-level metadata never crosses the wire. So either placement needs an
+engine-side change:
+
+- **Skill-space check** → an additive exposure (e.g. table-level metadata in
+  `GET /data_source`), small and useful beyond RSS, then the check itself lives in
+  the skill's start step.
+- **Loader handshake** → the `requires` field on pipeline metadata plus the loader
+  check, as the source spec drew it.
+
+The first is the materially smaller engine change, but it is not zero. The
+counter-argument the source spec makes is worth preserving either way: rendered
+artifacts live in user space and version skew is *"this design's default failure
+mode, not an edge case"* — so wherever the check lives, it must be unskippable.
 
 ### 3. Which `skardi-server` build, and who produces it?
 
-The skill needs `rss` (to register the source at all) plus embedding (to build
-`news_chunks`). **No published artifact has both.** The release matrix
-([release.yml:144](../../../.github/workflows/release.yml)) publishes exactly two
-image variants — `skardi-server` (no features) and `skardi-server-rag`
-(`--features rag`) — and `rag = ["embedding", "chunking"]`
-([Cargo.toml:32](../../../crates/server/Cargo.toml)) does not include `rss`. There
-is no `skardi-server` release **binary** on any platform either.
+**Decided 2026-08-14: a source build is the primary path.** The skill's
+prerequisite is
 
-Three sub-questions:
+```bash
+cargo build --release -p skardi-server --features "rss candle"
+```
 
-- **Minimum feature set.** `--features "rag rss"` is the "everything" spelling.
-  Server `default = ["chunking"]`, so `chunk()` is in a stock build; only embedding
-  needs more. `rss candle` is materially cheaper to build than `rss rag` — `gguf`
-  pulls `llama-cpp-4` and needs cmake, `onnx` pulls `ort`. If the skill defaults to
-  candle, users need no C++ toolchain.
-- **Artifact strategy.** Add an image variant (cheap — the Dockerfile already takes
-  `ARG FEATURES`, so it is one matrix row), or require a source build. Folding `rss`
-  into the `rag` umbrella is **not** recommended: `rag` is a UDF umbrella and `rss`
-  is a source connector (`documents` is not in `rag` either), and `rss` turns on
-  reqwest's `gzip` feature whose reach is workspace-wide by Cargo's feature
-  unification ([Cargo.toml:38-46](../../../crates/skardi/Cargo.toml)).
-- **Archive backend follows from it.** The published image carries no Linux
-  sqlite-vec, which is why `auto_context` refuses `--backend sqlite --runtime
-  docker`. So "image" implies a Postgres archive — asking a user to run pgvector to
-  read a few blogs. "Source build" keeps the local SQLite path.
+run by the user, served as `--runtime local-process`. Publishing artifacts is
+recorded below as **alternatives for future consideration**, not commitments.
+
+The facts that forced the decision, strongest first:
+
+- **No release contains the RSS provider at all.** `v0.5.0` was tagged 2026-08-04;
+  RSS 4/4 (#183) merged after it, and no tag contains it. Until the next release,
+  a build from `main` is the only way to get `type: rss` — regardless of features,
+  images, or anything else. (Verified: `git show v0.5.0:crates/skardi/src/sources/providers/rss/mod.rs`
+  → path does not exist.)
+- **Even ignoring that, no published artifact combines `rss` with embedding.** The
+  release matrix ([release.yml:144](../../../.github/workflows/release.yml))
+  publishes exactly two image variants — `skardi-server` (no features) and
+  `skardi-server-rag` (`--features rag`) — and `rag = ["embedding", "chunking"]`
+  does not include `rss`. There is no `skardi-server` release **binary** on any
+  platform either.
+- **Minimum feature set is `rss candle`, not `rss rag`.** On `main`, server
+  `default = ["chunking"]`, so `chunk()` / `chunk_parts()` are in every build
+  (note: that default landed in #193, *after* v0.5.0, whose default was empty —
+  moot today given the first bullet, but it pins the minimum server version the
+  skill must declare). `candle` alone avoids `gguf` (pulls `llama-cpp-4`, needs
+  cmake + a C++ toolchain) and `onnx` (pulls `ort`): **no C++ toolchain needed for
+  the default path.**
+
+**Alternatives recorded for future consideration** (either would be triggered by a
+release decision in the skardi repo, not by this skill):
+
+- **An image variant** (`--features "rag rss"` or similar). Mechanically cheap —
+  the Dockerfile already takes `ARG FEATURES`; the release matrix needs two build
+  rows plus one manifest row. On its own it forces a Postgres archive, because the
+  runtime image carries no Linux sqlite-vec (`auto_context` refuses
+  `--backend sqlite --runtime docker` for exactly this reason) — an awkward trade
+  for the personal-subscriptions persona.
+- **An image variant plus sqlite-vec baked into the runtime image** (a per-arch
+  `.so` plus a default `SQLITE_VEC_PATH`). The only path that gets to
+  "docker-only, no toolchain, local sqlite archive" — and it would incidentally fix
+  `auto_context`'s docker+sqlite refusal. It is also a general-image decision
+  (version pinning, licensing, arch coverage) with reach beyond this skill, which
+  is why it is not assumed here.
+- Folding `rss` into the `rag` umbrella is **rejected** in any variant: `rag` is a
+  UDF umbrella and `rss` is a source connector (`documents` is not in `rag`
+  either), and `rss` turns on reqwest's `gzip` feature whose reach is
+  workspace-wide by Cargo's feature unification
+  ([Cargo.toml:38-46](../../../crates/skardi/Cargo.toml)).
+- A lighter unblock worth noting: `dev-docker.yml` builds an image from any branch
+  on demand but takes no features input; adding one would produce experimental
+  `rss`-bearing images for skill development without touching the release matrix.
 
 ### 4. Does search return whole articles or chunks?
 
