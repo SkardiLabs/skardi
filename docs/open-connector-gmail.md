@@ -146,10 +146,13 @@ highlights and caveats:
   schema; the `messages` columns are non-null so that drift fails the
   scan rather than yielding an all-NULL column.
   The gate covers **output** schemas only, so a gateway that renamed an
-  input key would register cleanly and then fail every scan. The pack
-  therefore pins the input schemas too (`contracts/inputs/`) and a test
-  checks every key, page size and fixed value it sends against them —
-  caught in CI rather than at registration.
+  input key would register cleanly and then fail every scan. This pack
+  also pins the input schemas (`contracts/inputs/`), and a test checks
+  every key, page size and fixed value it sends against them. Both sides
+  of that check are committed files, so it catches input drift when the
+  contracts are re-captured after a gateway upgrade — not while the
+  gateway is drifting underneath a deployed binary. Gating inputs at
+  registration, as output already is, remains engine work.
 
 ## Authorization and scopes
 

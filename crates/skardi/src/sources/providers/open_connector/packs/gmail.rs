@@ -114,12 +114,17 @@
 //!   declared. A tooling limit, pinned so it stays visible — not a hole
 //!   in the gate. The gate is OUTPUT-only, though: `fingerprint_schema`
 //!   hashes the output schema alone and nothing reads
-//!   `ActionMetadata::input_schema`, so a renamed input key would pass
-//!   registration and 400 every scan. This pack sends six input keys
-//!   into `additionalProperties: false` actions, so the input halves of
-//!   the same capture are pinned in `contracts/inputs/` and checked by
-//!   `generated_inputs_are_accepted_by_the_captured_input_contracts` —
-//!   CI, not registration, until the engine gates inputs too.
+//!   `ActionMetadata::input_schema`, so a renamed input key passes
+//!   registration and then 400s every scan. That blind spot is
+//!   engine-wide, not a gmail trait — every pack's actions are
+//!   `additionalProperties: false`, and this one sends the FEWEST input
+//!   keys of the five. What this pack adds is the missing half of its
+//!   own capture (`contracts/inputs/`) plus
+//!   `generated_inputs_are_accepted_by_the_captured_input_contracts`,
+//!   which locks the declarations against it. Both sides are committed
+//!   artifacts, so it catches drift on re-capture, not live; closing it
+//!   properly means an input fingerprint checked at registration, the
+//!   same way output is (tracked in the source-pack skill).
 //! - **Column sets are verified against REAL wire rows**, end to end
 //!   against a live mailbox through the gateway (2026-08-05, gateway
 //!   v1.3.4): registration passed the fingerprint gate against live
@@ -491,12 +496,18 @@ mod tests {
         // The fingerprint gate hashes OUTPUT schemas only, so registration
         // says nothing about the keys this pack SENDS — and these actions
         // are `additionalProperties: false` strict, where an undeclared
-        // key is a hard 400 on every scan rather than a quiet no-op. The
-        // input halves of the same live capture (gateway v1.3.4) are
-        // pinned here so a gateway that renames `pageToken`, narrows the
-        // `maxResults` bound or tightens the `detail` enum fails in CI
-        // instead of at scan time. Registration-time enforcement is
-        // engine work; this keeps the reconciliation honest meanwhile.
+        // key is a hard 400 on every scan rather than a quiet no-op.
+        //
+        // Scope, precisely: both sides here are committed artifacts, so
+        // this locks the pack's declarations against the captured input
+        // halves (gateway v1.3.4) — it does NOT observe the live gateway.
+        // A drift that nobody re-captures stays invisible to it. Its
+        // value is the upgrade path: re-capturing the contracts after an
+        // upstream bump makes a renamed `pageToken`, a narrowed
+        // `maxResults` bound or a tightened `detail` enum fail HERE,
+        // where before nothing looked at inputs at all. Catching drift
+        // without a re-capture needs an input fingerprint compared at
+        // registration — engine work, tracked in the source-pack skill.
         for (short, contract) in [
             (
                 "threads",
