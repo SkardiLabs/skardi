@@ -425,6 +425,21 @@ event carrying the scan identity and error.
       per-table wire-declaration e2e for all three tables, UDTF parity, and
       empty-page schema stability), 868 full library suite.
 - [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
+- [ ] 5.7 Microsoft 365 packs (OAuth user token, cursor pagination over Graph
+      `@odata.nextLink`, raw-passthrough rows): `outlook` — messages,
+      mail_folders; `one_drive` — drive_items, drive_item_search. Open Connector
+      has no `microsoft365` service; it splits Graph into `outlook` (mail only —
+      no calendar or contacts), `one_drive` and `excel`, with one OAuth
+      connection each, so the work ships as two packs 1:1 with their services.
+      The whole `excel` service is deferred at the gate — its list actions emit
+      `nextLink` but accept no `nextLink` input, so their pagination cannot be
+      completed. Phases 1–2 (live contract reconciliation against gateway
+      v1.3.4, table design) are recorded in
+      `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`;
+      phases 3–5 pending. Note `outlook.list_messages` declares no timestamp
+      field at all, so `receivedDateTime` and every other date ride
+      `additionalProperties` passthrough outside the fingerprint gate — live
+      real-row verification is a prerequisite here, not a final check.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
