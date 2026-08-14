@@ -43,12 +43,18 @@ const SESSION_ID_HEADER: &str = "x-skardi-session-id";
 /// when present but malformed — silently dropping a malformed value would
 /// corrupt session stitching, the one job this field has.
 fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, String> {
-    let Some(value) = headers.get(SESSION_ID_HEADER) else {
+    let mut values = headers.get_all(SESSION_ID_HEADER).iter();
+    let Some(value) = values.next() else {
         return Ok(None);
     };
+    if values.next().is_some() {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must not be sent more than once"
+        ));
+    }
     let s = value
         .to_str()
-        .map_err(|_| format!("{SESSION_ID_HEADER} must be valid UTF-8"))?;
+        .map_err(|_| format!("{SESSION_ID_HEADER} must contain only visible ASCII characters"))?;
     if s.is_empty() {
         return Err(format!("{SESSION_ID_HEADER} must not be empty"));
     }

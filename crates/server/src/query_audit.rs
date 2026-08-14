@@ -460,7 +460,7 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 }
 
 /// Statement-kind marker distinguishing pipeline rows from ad-hoc SQL rows.
-pub const PIPELINE_STATEMENT_KIND: &str = "pipeline";
+const PIPELINE_STATEMENT_KIND: &str = "pipeline";
 
 /// `max_rows` does not apply to pipeline executions, but the column is NOT
 /// NULL; pipeline rows store this sentinel.

@@ -303,6 +303,25 @@ async fn malformed_session_header_is_400_and_records_nothing() {
 }
 
 #[tokio::test]
+async fn duplicate_session_header_is_400_and_records_nothing() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let resp = execute_with_headers(
+        &state,
+        &[
+            ("x-skardi-session-id", "sess-1"),
+            ("x-skardi-session-id", "sess-2"),
+        ],
+        json!({"limit": 5}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+    assert_eq!(store.count().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn audit_write_failure_is_503_and_pipeline_does_not_run() {
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
