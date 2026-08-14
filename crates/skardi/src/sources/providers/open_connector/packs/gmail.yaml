@@ -63,27 +63,31 @@ tables:
     resources:
       optional: [query, labelIds, includeSpamTrash]
     columns:
-      # Non-null across the board, on the executor's guarantee rather
-      # than the schema's `require`: the pinned detail=summary shape is
-      # an unconditional object literal, so all seven keys are always
-      # emitted ("" headers, [] labelIds). Non-null makes emitted-key
-      # drift — a key silently dropped upstream without a schema change,
-      # which the fingerprint gate cannot see — fail the scan instead of
-      # producing an all-NULL column. See gmail.rs for why that drift is
-      # not hypothetical (list_drafts declares seven, emits two).
+      # Identity non-null, the rest nullable — the convention every pack
+      # follows, kept here as a deliberate trade rather than by default.
+      # Declared drift is caught at registration either way (the
+      # fingerprint hashes the whole schema, anyOf included). What
+      # nullability decides is the OTHER class: an upstream that stops
+      # emitting a key without changing its schema. Non-null would make
+      # that loud, but on a listing table with no filter pushdown it
+      # takes the whole table down with no WHERE to route around it —
+      # too blunt for descriptive columns. Accepted consequence: such
+      # drift shows up as a silently all-NULL column here, so treat a
+      # wholly-NULL subject/sender/labelIds as a contract alarm, not as
+      # mail without senders.
       - { name: message_id, path: messageId, type: utf8, nullable: false }
       - { name: thread_id, path: threadId, type: utf8, nullable: false }
-      - { name: label_ids, path: labelIds, type: utf8_list, nullable: false }
-      - { name: subject, path: subject, type: utf8, nullable: false }
-      - { name: sender, path: sender, type: utf8, nullable: false }
+      - { name: label_ids, path: labelIds, type: utf8_list, nullable: true }
+      - { name: subject, path: subject, type: utf8, nullable: true }
+      - { name: sender, path: sender, type: utf8, nullable: true }
       # Wire key `to`; renamed because TO is a reserved SQL keyword and a
       # column requiring quotes on every reference is hostile to use.
-      - { name: to_addresses, path: to, type: utf8, nullable: false }
+      - { name: to_addresses, path: to, type: utf8, nullable: true }
       # The wire value is an RFC 3339 string (the executor re-emits
       # Gmail's epoch-millis `internalDate`); `timestamp_ms_utc` names the
       # Arrow storage — Timestamp(ms, UTC) — and its converter accepts
       # RFC 3339 or epoch-millis wires alike, same as github's *_at columns.
-      - { name: message_timestamp, path: messageTimestamp, type: timestamp_ms_utc, nullable: false }
+      - { name: message_timestamp, path: messageTimestamp, type: timestamp_ms_utc, nullable: true }
 
   drafts:
     action: gmail.list_drafts

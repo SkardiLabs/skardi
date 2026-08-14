@@ -145,9 +145,12 @@ highlights and caveats:
   hashes the whole declared schema — `anyOf` branches included — so a
   renamed or retyped field in `fetch_emails`' row items fails
   registration before any scan runs. It compares *declarations*, so what
-  it cannot see is a key upstream stops emitting without changing the
-  schema; the `messages` columns are non-null so that drift fails the
-  scan rather than yielding an all-NULL column.
+  it cannot see is a key upstream stops emitting while still declaring
+  it. Outside the identity columns this pack takes that on the chin:
+  such drift surfaces as a wholly-NULL column rather than a failed scan,
+  which keeps one upstream change from taking a whole table offline.
+  **A column that is NULL for every row is a contract alarm** — read it
+  as drift to investigate, not as mail without senders or subjects.
   The gate covers **output** schemas only, so a gateway that renamed an
   input key would register cleanly and then fail every scan. This pack
   also pins the input schemas (`contracts/inputs/`), and a test checks

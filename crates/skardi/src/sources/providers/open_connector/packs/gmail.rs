@@ -95,19 +95,25 @@
 //!   so provider failures arrive as gateway failure envelopes, pinned by
 //!   an e2e test.
 //! - **Nullability**: identity fields non-null (`thread_id`,
-//!   `message_id` + its `thread_id`, the raw `id`s), and every
-//!   `messages` column non-null. The basis is the executor, not the
-//!   schema's `required`: under the pinned `detail: summary` the
-//!   summary shape is an unconditional object literal, so all seven
-//!   keys are always emitted (`""` headers, `[]` labelIds). What
-//!   non-null buys is a tripwire on *emitted-key* drift — an upstream
-//!   change that stops emitting a key without changing the declared
-//!   schema, which the fingerprint gate cannot see (it compares
-//!   declarations). Such drift is not hypothetical: `list_drafts`
-//!   declares its `message` object with all seven fields `require`d,
-//!   yet its non-verbose path emits only `messageId`/`threadId` — the
-//!   captured `drafts.json` shows exactly that, which is why the drafts
-//!   columns stay nullable. Everything else stays nullable.
+//!   `message_id` + its `thread_id`, the raw `id`s), everything else
+//!   nullable — the convention across packs, and here a weighed choice
+//!   rather than a default. Two drift classes need separating. DECLARED
+//!   drift (a field renamed in the action's schema) fails at
+//!   registration whatever the nullability, because the fingerprint
+//!   hashes the whole schema, `anyOf` branches included. EMITTED-KEY
+//!   drift — upstream stops sending a key while its schema still
+//!   declares it — is invisible to that gate, and it is not
+//!   hypothetical: `list_drafts` declares its `message` object with all
+//!   seven fields `require`d, yet its non-verbose path emits only
+//!   `messageId`/`threadId`, exactly as the captured `drafts.json`
+//!   shows. Non-null on the descriptive columns would turn that into a
+//!   loud scan failure — but `messages` has no filter pushdown, so a
+//!   single unconvertible row takes the entire table down with no
+//!   `WHERE` to route around it. Identity keeps the tripwire where a
+//!   row without it is meaningless anyway; the rest trade the alarm for
+//!   a table that still answers. Accepted consequence: emitted-key
+//!   drift surfaces as a wholly-NULL column, which is a contract alarm
+//!   to investigate, never mail that genuinely has no sender.
 //! - **Fingerprints are pinned** from a live gateway capture
 //!   (`fixtures/gmail/contracts/`, gateway v1.3.4) and cover the whole
 //!   declared schema, `anyOf` branches included — the hash is over
