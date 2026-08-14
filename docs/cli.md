@@ -146,6 +146,9 @@ sends an array. A value only falls back to a plain string when it isn't
 valid JSON on its own (e.g. `-p name=hello`). This matters because the
 server substitutes typed literals into the pipeline's SQL.
 
+`--session-id <ID>` — sent as `X-Skardi-Session-Id`; groups this
+execution with an agent session in the server's query audit ledger.
+
 Calling a pipeline that doesn't exist on the server returns a friendly
 error instead of a raw 404:
 

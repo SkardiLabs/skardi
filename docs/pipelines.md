@@ -227,6 +227,15 @@ verb. Define a [user alias](cli.md) and
 `data_source_error`, `query_execution_error`, …) suitable for agents to
 branch on without parsing human-readable text.
 
+### Session attribution
+
+Send `X-Skardi-Session-Id: <id>` (non-empty, ≤ 200 chars) with an execute
+request to group this run with the rest of an agent session in the query
+audit ledger (`--query-audit-db`). The header is optional and ignored when
+auditing is off. It is a header rather than a body field because the
+request body is the parameter map itself — a reserved key could collide
+with a SQL parameter of the same name.
+
 ---
 
 ## Pipelines vs. jobs — picking the right shape

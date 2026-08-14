@@ -203,6 +203,30 @@ The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
 including the WAL sidecars). It is a local database, never the OTLP/tracing
 pipeline, so enabling it does not push query text to external collectors.
 
+#### Pipeline executions in the ledger
+
+When `--query-audit-db` is configured, `POST /:pipeline/execute` is audited
+with the same record-before-execute and fail-closed semantics as `/query`
+(a failed pre-execution write returns 503 and the pipeline does not run).
+A pipeline row differs from an ad-hoc row in four ways:
+
+- `statement_kind` is `pipeline`, and the `sql` column holds the pipeline
+  *name*, not SQL — the template lives on disk, and the pipeline's
+  `description` carries its purpose.
+- Parameter values are never recorded: params are where PII lives.
+  `ai_context` is always NULL on pipeline rows.
+- `max_rows` is stored as `0` (not applicable to pipelines).
+- On failure, `error` holds a fixed kind (`query_execution_error` or
+  `result_conversion_error`), never engine error text — engine errors can
+  echo substituted parameter values back, and those must not reach the
+  ledger. The full error still goes to the HTTP caller.
+
+`session_id` comes from the optional `X-Skardi-Session-Id` request header
+(non-empty, ≤ 200 characters). A malformed header is rejected with `400
+parameter_validation_error` rather than silently dropped. With the header
+present, one agent session's ad-hoc queries and pipeline calls interleave
+under a single `session_id` in the ledger, ordered by `created_at`.
+
 ---
 
 ## Context files
