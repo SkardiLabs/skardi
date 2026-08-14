@@ -31,7 +31,12 @@
 //!   return the complete collection in one response. This pack adds the
 //!   loader's `single_page` strategy spelling for exactly this shape —
 //!   the engine's `SinglePage` strategy predates it but was unreachable
-//!   from YAML.
+//!   from YAML. Both tables also declare `next_cursor_path`, which the
+//!   strategy reads only to CHECK that premise: neither captured
+//!   contract has a token field and Gmail does not paginate either
+//!   endpoint, so it can only fire if upstream starts — and then it
+//!   fails the scan (`SinglePageIncomplete`) instead of handing back a
+//!   prefix of the collection as if it were all of it.
 //! - **`messages` pins `detail: summary` and a page size of 100.**
 //!   `summary` is the bounded row shape: `ids` carries no metadata worth
 //!   a table, and `full` hydrates entire decoded bodies plus attachment
@@ -568,7 +573,8 @@ mod tests {
                     generated.push(page_param);
                     generated.push(per_page_param);
                 }
-                PaginationStrategy::SinglePage => {}
+                // next_cursor_path is read from the RESPONSE, never sent.
+                PaginationStrategy::SinglePage { .. } => {}
             }
             for key in &generated {
                 assert!(
@@ -949,9 +955,10 @@ bindings:
         // labels and filters declare the single_page strategy: one POST
         // each, an EMPTY input object (no pagination keys — the strict
         // schema would 400 them — and no userId), and no second request.
-        // The labels body carries a stray nextPageToken that MUST be
-        // ignored (SinglePage's advance() terminates unconditionally);
-        // the filters body carries none — one request either way.
+        // The labels body spells end-of-collection as an explicit null
+        // token, filters omits the field entirely: both spellings satisfy
+        // the declared premise check. Its refusal side — a LIVE token —
+        // is pinned by the next test.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -964,7 +971,7 @@ bindings:
                     &json!({"labels": [
                         {"id": "INBOX", "name": "INBOX", "type": "system"},
                         {"id": "Label_1", "name": "P/Redacted", "type": "user"}],
-                        "nextPageToken": "tok-2"})
+                        "nextPageToken": null})
                     .to_string(),
                 ));
             }
@@ -1003,6 +1010,55 @@ bindings:
                 "{action}: empty input object"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_single_page_table_refuses_a_live_continuation_token() {
+        // The premise `single_page` rests on is "one request IS the whole
+        // collection". labels.list has no token field in its captured
+        // contract and Gmail's own API does not paginate it — but if that
+        // ever changes, the rows this scan could return are a PREFIX of
+        // the mailbox's labels. Returning them as a complete table would
+        // be this engine's only silent truncation, so the scan fails and
+        // says why. Pinned end to end, not just at the strategy.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return gmail_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/gmail.list_labels" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}],
+                            "nextPageToken": "tok-2"})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_GMAIL_SHORT", "labels", "").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.mail.labels")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a continuation token must fail the single-page scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("single-page") && message.contains("$.nextPageToken"),
+            "the broken premise and its path are named: {message}"
+        );
+        // Failing beats truncating — but it must not also start paging.
+        assert_eq!(
+            execute_inputs(&gateway, "gmail.list_labels").len(),
+            1,
+            "the refusal happens after one request, never by following the token"
+        );
     }
 
     #[tokio::test]

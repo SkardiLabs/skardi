@@ -242,7 +242,7 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         } => std::iter::once(cursor_param)
             .chain(page_size_param)
             .collect(),
-        PaginationStrategy::SinglePage => Vec::new(),
+        PaginationStrategy::SinglePage { .. } => Vec::new(),
     };
     match table.pagination {
         PaginationStrategy::PageNumber {
@@ -275,7 +275,7 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 return Err(format!("{id}: pagination page size must be positive"));
             }
         }
-        PaginationStrategy::SinglePage => {}
+        PaginationStrategy::SinglePage { .. } => {}
     }
     // NOT rejected on purpose: a filter input equal to a FIXED input is
     // the override mechanism itself (a pushed predicate replacing the
@@ -468,7 +468,17 @@ enum PaginationDoc {
     /// one) so `deny_unknown_fields` keeps rejecting stray keys — a
     /// misspelled pagination field must fail loudly, not ride along
     /// ignored.
-    SinglePage {},
+    SinglePage {
+        /// Optional: where this action would spell "there is more", if it
+        /// has such a field. Declaring it turns the strategy's premise
+        /// into a checked assertion — a live continuation fails the scan
+        /// instead of returning a short answer as a complete one. Declare
+        /// it whenever the action's envelope has such a field, even one
+        /// the provider never populates today: that is precisely the
+        /// tripwire for the day it starts.
+        #[serde(default)]
+        next_cursor_path: Option<String>,
+    },
 }
 
 impl PaginationDoc {
@@ -500,7 +510,9 @@ impl PaginationDoc {
                 page_size,
                 has_more_path: has_more_path.map(leak_str),
             },
-            Self::SinglePage {} => PaginationStrategy::SinglePage,
+            Self::SinglePage { next_cursor_path } => PaginationStrategy::SinglePage {
+                next_cursor_path: next_cursor_path.map(leak_str),
+            },
         }
     }
 }
@@ -770,11 +782,38 @@ tables:
         .expect("single_page is a valid strategy");
         assert!(matches!(
             pack.tables[0].pagination,
-            PaginationStrategy::SinglePage
+            PaginationStrategy::SinglePage {
+                next_cursor_path: None
+            }
         ));
 
-        // The refusal side: single_page takes no parameters, and a stray
-        // key (a page size someone expected to matter) fails loudly
+        // Its one optional parameter: the premise check. Declaring it does
+        // not make the strategy paginate — it makes a live continuation
+        // fail the scan instead of truncating it silently.
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page, next_cursor_path: "$.nextPageToken" }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("single_page accepts an optional next_cursor_path");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::SinglePage {
+                next_cursor_path: Some("$.nextPageToken")
+            }
+        ));
+
+        // The refusal side: single_page takes no OTHER parameters, and a
+        // stray key (a page size someone expected to matter) fails loudly
         // instead of riding along ignored.
         let err = parse_pack(
             r#"

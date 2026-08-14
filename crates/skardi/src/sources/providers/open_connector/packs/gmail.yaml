@@ -109,7 +109,11 @@ tables:
     fingerprint: a7b2930049e2c32201c72f0c2378fd0e097c957321befc58593c3e8f35464566
     # labels.list takes no pagination inputs (strict schema — injecting
     # one would 400) and returns the complete collection in one response.
-    pagination: { strategy: single_page }
+    # next_cursor_path checks that premise rather than trusting it: the
+    # captured contract declares no token field at all, so this only ever
+    # fires if upstream starts paginating — loudly, instead of handing
+    # back a silently short label set.
+    pagination: { strategy: single_page, next_cursor_path: "$.nextPageToken" }
     columns:
       - { name: id, path: id, type: utf8, nullable: false }
       - { name: name, path: name, type: utf8, nullable: true }
@@ -122,9 +126,10 @@ tables:
     action: gmail.list_filters
     row_path: "$.filters"
     fingerprint: 1ae3e5348bbef770d4a460d873847c49ca14227e0817b03782bf40a3ccdc7300
-    # Same single-response shape as labels; requires the
-    # gmail.settings.basic OAuth scope (documented in the pack doc).
-    pagination: { strategy: single_page }
+    # Same single-response shape as labels, with the same premise check;
+    # requires the gmail.settings.basic OAuth scope (documented in the
+    # pack doc).
+    pagination: { strategy: single_page, next_cursor_path: "$.nextPageToken" }
     columns:
       # criteria/action are Gmail's own sparse objects (from/to/subject/
       # query matchers; add/remove label mutations) — opaque JSON, the

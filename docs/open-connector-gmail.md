@@ -70,7 +70,10 @@ soon as enough rows have been emitted. Cursor scans terminate on the
 executor's explicit `nextPageToken: null` (absent and empty-string
 tokens also terminate); a non-advancing gateway fails as a pagination
 loop. `labels` and `filters` take no pagination inputs at all — each is
-one request returning the complete collection.
+one request returning the complete collection, and each checks that
+premise rather than trusting it: if such a response ever carries a
+continuation token, the scan **fails** instead of returning a silently
+short table.
 
 The default safety bounds cap an unfiltered scan at `max_pages` ×
 page-size rows before it **fails** with `ScanBoundsExceeded`

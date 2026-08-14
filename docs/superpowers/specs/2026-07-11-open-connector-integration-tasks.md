@@ -323,7 +323,13 @@ event carrying the scan identity and error.
       all, which required the one engine extension this milestone adds:
       the loader's **`single_page` strategy spelling** (the engine's
       `SinglePage` existed but was unreachable from YAML; braced variant so
-      `deny_unknown_fields` still rejects stray keys). **No filter pushdown
+      `deny_unknown_fields` still rejects stray keys) plus its optional
+      `next_cursor_path`, which turns the strategy's "one request is the
+      whole collection" premise into a checked assertion — a live
+      continuation fails as `SinglePageIncomplete` rather than returning a
+      prefix as a complete table, closing the engine's one silent
+      truncation. Raw scans (`open_connector_scan`) declare no path and
+      keep the historic one-request behaviour. **No filter pushdown
       anywhere** (Gmail's `q` is a free-text language, `labelIds` an
       AND-semantics array — neither maps to a scalar `column op literal`
       faithfully); `query`/`labelIds`/`includeSpamTrash` are optional

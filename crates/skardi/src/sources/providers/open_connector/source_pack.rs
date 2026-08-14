@@ -407,7 +407,9 @@ mod tests {
             action_id: "t.action",
             row_path: "$.items",
             fields: &[],
-            pagination: PaginationStrategy::SinglePage,
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
             required_resources: &[],
             optional_resources: &[],
             fixed_inputs: &[],
