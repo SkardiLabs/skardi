@@ -199,6 +199,14 @@ There is no schema probe anywhere in the design: planning performs no network I/
 
 - **YAML views:** the user declares the output schema explicitly. Skardi validates at registration that the Cypher query returns columns compatible with the declared schema (one live validation call at registration — registration is allowed to do network I/O; query planning is not). Availability and contract violations part ways here, deliberately diverging from Open Connector's hard-fail health check: OC probes a gateway Skardi deploys, while this backend is a shared external database whose transient blip must not hold every unrelated Postgres/CSV/Lance source hostage at server startup. An **unreachable backend registers the source DEGRADED** — views register with their declared (planning-sufficient) schemas, the source is marked unhealthy in `GET /data_source`, and the first scan retries the validation and fails loudly if the backend is still gone or the view no longer matches. A **reachable backend whose view fails validation refuses registration** — that is a contract violation, not an outage.
 - **Declared-type vocabulary — the repo's friendly lowercase names, not Arrow PascalCase** (every existing config-parsed type in the tree spells types this way — dynamodb, mongo, seekdb, llm_extract — and this surface will not introduce a second spelling). The accepted set, exactly: `string` (aliases `str`, `utf8`) → `Utf8`; `int` (aliases `integer`, `bigint`) → `Int64`; `float` (alias `double`) → `Float64`; `bool` (alias `boolean`) → `Boolean`; `json` → `Utf8` carrying JSON text verbatim; `node`, `relationship`, `path` → the canonical `STRUCT` shapes from Result flattening. Anything else fails planning with the accepted set listed. The same vocabulary is used by YAML views' `type:` fields — one spelling everywhere.
+- **Declared-column ORDER is the binding.** The mapping from declared
+  columns to the Cypher `RETURN` clause is positional — all AGE's
+  `cypher()` arity gives us — so the JSON object must list columns in
+  RETURN order. Two same-typed columns declared out of order swap
+  silently (same JSON kind, no TypeMismatch); no structural check is
+  possible, which is exactly why the contract is stated loudly in the
+  UDTF's error message and module doc, and why serde_json's
+  `preserve_order` feature is load-bearing here.
 - **Ad-hoc declared columns are always nullable.** Cypher can produce `null` in any position (`OPTIONAL MATCH`, missing properties), so the ad-hoc JSON object is name→type only and every field is `nullable: true` — there is no way to declare otherwise. YAML views default to `nullable: true` too and may declare `nullable: false` as an author'ed assertion about the view's Cypher; the two declaration paths cannot silently disagree because the stricter bit exists only where an author explicitly wrote it.
 - **Ad-hoc UDTF with declared columns:** an optional fourth argument declares the output columns and their Arrow types as a JSON object (`'{"user_name": "string", "post_title": "string"}'`). The declared object is the planning-time schema; each returned `GraphValue` is converted against its declared type, and a mismatch fails with a typed error carrying column name, row index, expected type, and found JSON kind. Conversion is **batch-atomic, and the batch is the unit this design defines** (a Cypher stream has no upstream "page" the way Open Connector does): the driver stream is consumed in conversion batches of a fixed implementation constant (order 1024 rows, never more than `max_rows`), each batch converts as a unit before it is emitted, and a type mismatch fails the CURRENT batch before emission — batches already emitted may have been consumed downstream, the same trade-off Open Connector's page-atomic conversion accepts. Peak conversion memory is one batch, not one result. Milestone 1 may implement the stream as a single batch of up to `max_rows`, in which case nothing at all is emitted before a mid-scan failure.
 - **Ad-hoc UDTF without declared columns:** every row is returned as one `record: Utf8` column containing the whole Cypher record as canonical JSON text (column names from `RETURN` become keys of the JSON object). Empty results are empty batches with the same one-column schema. **Backend note:** AGE's `cypher()` call must declare its result arity, which the fallback by definition does not know — on AGE, omitting `columns` is an error telling the caller to declare them; the fallback ships with the Neo4j milestone, where Bolt needs no declared arity.
@@ -262,8 +270,20 @@ There is no schema probe anywhere in the design: planning performs no network I/
   fixed, engine-authored introspection queries (`db.schema.*`,
   `ag_catalog` reads) that never pass through it, so rejecting `CALL`
   does not self-block discovery.
-- **Parameterized queries only:** parameters are bound by the driver,
-  never interpolated into the string.
+- **Parameterized queries, with the AGE exception recorded.** On Neo4j
+  and Kuzu, parameters are bound by the driver and never interpolated.
+  AGE cannot take that road: its `cypher()` function needs its arguments
+  resolvable at parse analysis, so the milestone-1 client renders the
+  params object as ONE serde_json-encoded SQL string literal cast to
+  `agtype` inside a `PREPARE ...; EXECUTE ...;` batch. The invariant
+  that replaces driver binding: values are encoded by serde_json (so
+  quotes, backslashes, and control characters cannot break out of the
+  JSON string), and the resulting literal is single-quote-doubled as a
+  whole — the same injection boundary the etl generator's `json_pack`
+  leans on. The caller's Cypher itself rides a dollar-quoted string
+  whose tag is chosen to not occur in the text. Hostile-looking
+  parameter values (apostrophes, backslashes, SQL fragments) are pinned
+  by live tests.
 - **Connection URLs are operator trust, not query trust.** The URL comes
   from context YAML — the same trust tier as a Postgres connection string
   in the same file — and the UDTF only ever accepts a registered
@@ -277,8 +297,9 @@ There is no schema probe anywhere in the design: planning performs no network I/
   `query_timeout_seconds` (default 30) is passed to the backend as the
   transaction timeout so runaway traversals die server-side, and
   `max_rows` (default 10 000) caps the rows Skardi will consume —
-  exceeding it fails with a typed error naming the cap and the row count
-  reached, never a silent truncation. Agents generate pathological Cypher
+  exceeding it fails with a typed error naming the cap, never a silent
+  truncation (the bounded fetch reads at most `max_rows + 1` rows, so
+  the true row count is deliberately never learned). Agents generate pathological Cypher
   (unbounded variable-length paths, whole-graph `RETURN`); bounded by
   construction beats bounded by review.
 
@@ -459,7 +480,7 @@ An agent cannot write Cypher blindly. It needs machine-readable answers to:
 
 - *What graph backends are configured?* → the existing data-source metadata endpoint (`GET /data_source`) already lists registered sources; `type: graph` sources should appear with their declared views.
 - *What labels, relationship types, and properties exist?* → a lightweight **graph introspection surface** is required. Two options:
-  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type with its property **names and types** (AGE: `ag_catalog`; Neo4j: `db.schema.nodeTypeProperties()` / `db.schema.relTypeProperties()`; Kuzu: its typed catalog, which is exact because Kuzu is schema-full). Deliberately **names and types only, never property values** — sampled values would flow straight into agent prompts, the exact leak the error-handling rules exist to prevent;
+  - a UDTF `graph_schema(connection)` that returns one row per label/relationship type. What it can carry is **per-backend, set by what each backend's catalog actually knows** (an earlier revision over-promised here): AGE's `ag_catalog` records label names and kinds ONLY — AGE is schema-optional, properties live as untyped agtype maps with no catalog declaration, so property discovery on AGE would mean scanning data (unbounded on the agent's FIRST call; deliberately not done in milestone 1 — an explicitly-sampled property-names option is a possible follow-up). Neo4j serves property **names and types** via `db.schema.nodeTypeProperties()` / `db.schema.relTypeProperties()` (its milestone delivers them); Kuzu's typed catalog is exact because Kuzu is schema-full. Everywhere: **names and types only, never property values** — sampled values would flow straight into agent prompts, the exact leak the error-handling rules exist to prevent;
   - a YAML view author who declares `nodes` / `edges` metadata tables alongside the Cypher views.
   The design chooses the first option as an engine-provided helper in milestone 1, because requiring every YAML view to also declare metadata duplicates effort.
 - *What shape does a `cypher_query` result have?* → the schema is fixed at planning time and stated in the function's documentation: either the caller-declared columns, or one `record: Utf8` JSON column. Agents can rely on stable `STRUCT` shapes for nodes and relationships inside those columns.
@@ -512,7 +533,11 @@ read-only guarantee is a Postgres `READ ONLY` transaction, native to
   is NOT in this milestone: AGE's `cypher()` call must declare its
   result arity, so on AGE an omitted `columns` is a targeted error
   (settled — previously an open question).
-- `graph_schema` from `ag_catalog` (names and types only, never values).
+- `graph_schema` from `ag_catalog`: one `(label, kind)` row per label —
+  labels and kinds are ALL the AGE catalog knows (schema-optional store;
+  see the introspection note in §Agent and LLM interaction). Property
+  names/types arrive with the Neo4j and Kuzu milestones, whose catalogs
+  carry them.
 - Keyword guard, query timeout, row cap, error taxonomy.
 - JSON getter: adopt `datafusion-functions-json`'s `json_get` family
   (verify against the pinned DataFusion; a minimal same-named in-tree
@@ -549,6 +574,16 @@ keyword guard alone.
 
 ### Milestone 4 — YAML catalog views
 
+Two carried-in obligations from milestone 1's review, settled here
+because they only bind once the server session is involved: (a) decide
+the pipeline-parameter substitution story for `params` (see Risks item
+0); (b) re-home the `datafusion-functions-json` registration next to
+skardi's other UDF registrations and CHECK the datafusion-federation
+interaction — its `->`/`->>`/`?` rewriter runs at analysis, ahead of
+federation planning, so a remote `data->'k'` that pushes down today
+could silently become a local `json_get` over a full scan.
+
+
 - `type: graph` data source registration (degraded-on-unreachable,
   refuse-on-mismatch — see Schema handling).
 - Declared-schema views.
@@ -562,6 +597,19 @@ keyword guard alone.
 
 ## Risks and Open Questions
 
+0. **Pipeline parameters cannot reach Cypher parameters yet (decide in
+   milestone 4).** skardi substitutes request parameters into SQL
+   TEXTUALLY, and its two passes disagree about nested-literal
+   positions: inference replaces `{p}` with the bare token `NULL`
+   (fine inside a JSON string), while execution substitutes a QUOTED
+   `'value'` — which terminates the enclosing SQL string literal when
+   `{p}` sits inside the `params` JSON. There is no spelling of
+   `'{"uid": …{user_id}…}'` that satisfies both passes. Nothing breaks
+   today (the server does not register these UDTFs until milestone 4),
+   but §Agent and LLM interaction describes exactly this workflow, so
+   milestone 4 must pick one: a raw/unquoted substitution mode for
+   nested-literal positions, or a params spelling that is not a nested
+   JSON-in-SQL literal.
 1. **Declared-type drift on dynamically-typed properties.** Neo4j property types vary per node: a view declaring `n.value AS Int64` meets a `string` value mid-scan and fails with a typed error (column, row, expected, found-kind). Conversion is page-atomic, but batches already emitted stay emitted — the same mid-scan failure trade-off the Open Connector adapters accept. Views over heterogeneous properties should declare `Utf8` (JSON text) instead of a scalar type, or normalize with Cypher `toInteger()`/`toString()` before `RETURN`.
 2. **Cypher injection.** Parameter binding prevents interpolation attacks. The keyword guard is string-based and bypassable by construction — which is why it is *not* the security boundary: the backend's `READ ONLY` transaction (AGE), read-access-mode transaction (Neo4j), or read-only database open (Kuzu) is what guarantees no write executes. Milestone 1 (AGE) carries no driver risk here — Postgres `READ ONLY` is native to `tokio-postgres`. The `neo4rs` access-mode question is scoped to the Neo4j milestone as a hard precondition (see Milestones), with the registration-time read-mode proof failing closed if the deployed pair cannot enforce it.
 3. **Path representation.** The parallel-lists struct (`nodes` + `relationships`) is lossless and type-homogeneous but positional — consumers must know relationship *i* joins node *i* to node *i+1*. Row-per-hop consumers flatten with Cypher `UNWIND` in the query or view instead of asking Skardi to restructure paths.
