@@ -171,9 +171,9 @@ pub(crate) async fn validate_view(
     cypher: &str,
     columns: &[DeclaredColumn],
 ) -> Result<(), GraphError> {
-    let fail = |e: GraphError| GraphError::InvalidConfig {
-        name: view_name.to_string(),
-        reason: format!("view validation failed: {e}"),
+    let fail = |e: GraphError| GraphError::ViewValidationFailed {
+        view: view_name.to_string(),
+        reason: e.to_string(),
     };
     let rows = handle
         .client

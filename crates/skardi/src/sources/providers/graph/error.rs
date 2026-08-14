@@ -29,6 +29,13 @@ pub enum GraphError {
     #[error("graph source '{name}': {reason}")]
     InvalidConfig { name: String, reason: String },
 
+    /// A YAML view failed its live validation — at registration, or at
+    /// the degraded recovery retry. The failing identity is a VIEW, not
+    /// a source, so it does not ride [`GraphError::InvalidConfig`]
+    /// (whose rendering would call it one).
+    #[error("graph view '{view}' failed validation: {reason}")]
+    ViewValidationFailed { view: String, reason: String },
+
     /// The fast-path keyword guard blocked caller-supplied Cypher. Names
     /// the blocked keyword and its byte offset — NEVER the query text
     /// (inline Cypher literals are values).

@@ -154,6 +154,20 @@ impl GraphConfig {
     /// live validation runs the view once — a genuinely mutating view is
     /// caught there, with the backend's own error.
     pub fn validate(&self, name: &str, connection_string: &str) -> Result<(), GraphError> {
+        // The source name becomes a CATALOG name; `datafusion` and
+        // `information_schema` are DataFusion's built-ins, and
+        // `register_catalog` replaces unconditionally — a source with
+        // either name would silently clobber the default catalog (and
+        // every table in it).
+        if matches!(name, "datafusion" | "information_schema") {
+            return Err(GraphError::InvalidConfig {
+                name: name.to_string(),
+                reason: "the source name is reserved: it would replace DataFusion's \
+                         built-in catalog of the same name (register_catalog replaces \
+                         unconditionally); choose another name"
+                    .to_string(),
+            });
+        }
         if self.backend != "age" {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
@@ -382,6 +396,18 @@ password_env: AGE_PG_PASS
         c.validate("kg", "postgres://localhost:5432/graphrag")
             .expect("valid");
         c.validate("kg", "postgresql://h/db").expect("valid");
+    }
+
+    #[test]
+    fn reserved_catalog_names_are_rejected() {
+        // The source name becomes a catalog name, and register_catalog
+        // replaces unconditionally — `datafusion` would clobber the
+        // built-in catalog with every table in it.
+        let c = base();
+        for reserved in ["datafusion", "information_schema"] {
+            let err = c.validate(reserved, "postgres://h/db").unwrap_err();
+            assert!(err.to_string().contains("reserved"), "{err}");
+        }
     }
 
     #[test]

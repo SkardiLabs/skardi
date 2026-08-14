@@ -206,3 +206,13 @@ server-side `statement_timeout` plus a client-side wrap;
 `RowCapExceeded`, and the fetch is a real SQL LIMIT of
 `min(limit, max_rows + 1)` so the wire is bounded too. `max_connections`
 (1..=64) sizes the pool; pool queueing is bounded by the same timeout.
+
+## Troubleshooting
+
+| Symptom | Cause → fix |
+|---|---|
+| `Operator ->> is not yet supported` (also `->`, `?`) | The `->`/`->>` operator rewrite is deliberately NOT installed on the server session (it would rewrite those operators session-wide, ahead of federated pushdown planning). Use the getter UDFs instead: `properties->>'name'` → `json_get_str(properties, 'name')`; `properties->'a'->>'b'` → `json_get_str(properties, 'a', 'b')`; `properties ? 'key'` → `json_contains(properties, 'key')`. |
+| `graph source is registered DEGRADED (registration error: ... Connection refused ...)` | The backend was unreachable at startup and the retried query still can't reach it. Check the host/port and credentials in the env vars; the source flips back to `healthy` on its own once a query succeeds. |
+| `graph view '<name>' failed validation: ...` (at startup) | A reachable backend rejected the view's contract — the `RETURN` clause's arity or types disagree with the declared `schema`. The error carries the backend's complaint; align the declaration with the Cypher and restart. |
+| `graph scan exceeded max_rows = …` on a view scan | The view returned more rows than the source allows. SQL-side `WHERE` over a view does not push into Cypher — bound the view's Cypher itself (`WHERE`/`LIMIT`), or raise `max_rows`. See "A view's Cypher must carry its own bound". |
+| `graph query timed out after Ns` | The statement ran past `query_timeout_seconds` server-side; narrow the traversal or raise the timeout. (If the backend was never reached, you'll see `could not acquire a connection …` instead — that one is connectivity, not query shape.) |

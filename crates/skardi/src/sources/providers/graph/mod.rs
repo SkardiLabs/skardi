@@ -284,17 +284,24 @@ pub async fn register_graph_tables(
             // Reachable backend: every view must prove itself NOW.
             // Any failure is a contract violation, not an outage —
             // refuse registration (nothing has been published yet).
+            // Validations are independent read-only probes fetching at
+            // most one row each — concurrent, so N views cost one
+            // round-trip's latency, not N serial ones at startup.
             let client: Arc<dyn GraphClient> = Arc::new(client);
-            for view in &config.views {
-                let columns = view.declared_columns()?;
-                let probe = GraphSourceHandle {
-                    client: Arc::clone(&client),
-                    bounds,
-                    health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-                    view_contracts: Arc::new(vec![]),
-                };
-                validate_view(&probe, &view.name, &view.cypher, &columns).await?;
-            }
+            let probe = Arc::new(GraphSourceHandle {
+                client: Arc::clone(&client),
+                bounds,
+                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+                view_contracts: Arc::new(vec![]),
+            });
+            futures::future::try_join_all(config.views.iter().map(|view| {
+                let probe = Arc::clone(&probe);
+                async move {
+                    let columns = view.declared_columns()?;
+                    validate_view(&probe, &view.name, &view.cypher, &columns).await
+                }
+            }))
+            .await?;
             (client, GraphSourceHealth::Healthy)
         }
         Err(e) => {
@@ -346,43 +353,72 @@ pub async fn register_graph_tables(
                 .collect::<Result<Vec<_>, GraphError>>()?,
         ),
     });
+    // Publish the handle BEFORE touching the catalog: register_catalog
+    // REPLACES a same-named catalog unconditionally, so with the reverse
+    // order a duplicate name would leave the catalog pointing at the new
+    // handle while the UDTF map keeps the old one — a split state. The
+    // entry check here is what makes the duplicate fail before any
+    // catalog is replaced (the peek above merely spared the connect).
+    {
+        let mut map = sources.write().unwrap_or_else(|p| p.into_inner());
+        match map.entry(name.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: "a graph source with this name is already registered \
+                             (the existing connection is unchanged)"
+                        .to_string(),
+                });
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&handle));
+            }
+        }
+    }
     if !config.views.is_empty() {
         let catalog = Arc::new(MemoryCatalogProvider::new());
         let schema_provider = Arc::new(MemorySchemaProvider::new());
-        for view in &config.views {
-            let provider = GraphViewProvider::new(
-                Arc::clone(&handle),
-                view.name.clone(),
-                view.cypher.clone(),
-                view.declared_columns()?,
-            );
-            schema_provider
-                .register_table(view.name.clone(), Arc::new(provider))
+        let build = (|| {
+            for view in &config.views {
+                let provider = GraphViewProvider::new(
+                    Arc::clone(&handle),
+                    view.name.clone(),
+                    view.cypher.clone(),
+                    view.declared_columns()?,
+                );
+                schema_provider
+                    .register_table(view.name.clone(), Arc::new(provider))
+                    .map_err(|e| GraphError::InvalidConfig {
+                        name: name.to_string(),
+                        reason: format!("failed to register view '{}': {e}", view.name),
+                    })?;
+            }
+            catalog
+                .register_schema("main", schema_provider)
                 .map_err(|e| GraphError::InvalidConfig {
                     name: name.to_string(),
-                    reason: format!("failed to register view '{}': {e}", view.name),
+                    reason: format!("failed to register the 'main' schema: {e}"),
                 })?;
+            Ok::<_, GraphError>(catalog)
+        })();
+        match build {
+            Ok(catalog) => {
+                session_ctx.register_catalog(name, catalog);
+                Ok(())
+            }
+            Err(e) => {
+                // The handle went in first, so a catalog-build failure
+                // must take it back out — no handle-without-catalog
+                // residue either.
+                sources
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(name);
+                Err(e)
+            }
         }
-        catalog
-            .register_schema("main", schema_provider)
-            .map_err(|e| GraphError::InvalidConfig {
-                name: name.to_string(),
-                reason: format!("failed to register the 'main' schema: {e}"),
-            })?;
-        session_ctx.register_catalog(name, catalog);
-    }
-    let mut map = sources.write().unwrap_or_else(|p| p.into_inner());
-    match map.entry(name.to_string()) {
-        std::collections::hash_map::Entry::Occupied(_) => Err(GraphError::InvalidConfig {
-            name: name.to_string(),
-            reason: "a graph source with this name is already registered \
-                     (the existing connection is unchanged)"
-                .to_string(),
-        }),
-        std::collections::hash_map::Entry::Vacant(slot) => {
-            slot.insert(handle);
-            Ok(())
-        }
+    } else {
+        Ok(())
     }
 }
 
@@ -589,6 +625,87 @@ views:
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_healthy()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reserved_catalog_name_is_rejected_before_any_network() {
+        // `register_catalog` replaces unconditionally, so a source named
+        // `datafusion` would clobber the built-in catalog (and every
+        // table in it) — caught in pure validation, before any dial.
+        let mut ctx = SessionContext::new();
+        let err = register_graph_tables(
+            &mut ctx,
+            &sources(),
+            "datafusion",
+            DEAD_URL,
+            Some(&config_with_views()),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("reserved"), "{msg}");
+        assert!(ctx.catalog("datafusion").is_some(), "built-in untouched");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_registration_leaves_catalog_and_handle_unsplit() {
+        // First: a full degraded registration — handle AND catalog
+        // published.
+        let sources = sources();
+        let mut ctx = SessionContext::new();
+        register_graph_tables(
+            &mut ctx,
+            &sources,
+            "kg",
+            DEAD_URL,
+            Some(&config_with_views()),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("degraded registration");
+        let original_handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("registered"),
+        );
+        let original_catalog = ctx.catalog("kg").expect("catalog registered");
+
+        // Second: a duplicate attempt must fail WITHOUT the catalog
+        // having been replaced underneath the surviving handle — the
+        // split state the entry-first order exists to prevent.
+        let err = register_graph_tables(
+            &mut ctx,
+            &sources,
+            "kg",
+            DEAD_URL,
+            Some(&config_with_views()),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already registered"), "{err}");
+        let handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("still registered"),
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &handle),
+            "the original handle survives"
+        );
+        let catalog = ctx.catalog("kg").expect("catalog still registered");
+        assert!(
+            Arc::ptr_eq(&original_catalog, &catalog),
+            "the original catalog was never replaced"
         );
     }
 }
