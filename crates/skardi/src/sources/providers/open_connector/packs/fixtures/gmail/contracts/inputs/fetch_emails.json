@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Gmail search query."
+    },
+    "labelIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Gmail label IDs."
+    },
+    "includeSpamTrash": {
+      "type": "boolean",
+      "description": "Whether to include Spam and Trash."
+    },
+    "detail": {
+      "type": "string",
+      "enum": [
+        "ids",
+        "summary",
+        "full"
+      ],
+      "description": "Message detail level.",
+      "default": "summary"
+    },
+    "maxResults": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500,
+      "description": "Maximum number of results to return."
+    },
+    "pageToken": {
+      "type": "string",
+      "description": "Opaque pagination token returned by Gmail."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The input payload for this action."
+}

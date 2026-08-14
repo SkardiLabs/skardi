@@ -145,6 +145,11 @@ highlights and caveats:
   it cannot see is a key upstream stops emitting without changing the
   schema; the `messages` columns are non-null so that drift fails the
   scan rather than yielding an all-NULL column.
+  The gate covers **output** schemas only, so a gateway that renamed an
+  input key would register cleanly and then fail every scan. The pack
+  therefore pins the input schemas too (`contracts/inputs/`) and a test
+  checks every key, page size and fixed value it sends against them —
+  caught in CI rather than at registration.
 
 ## Authorization and scopes
 

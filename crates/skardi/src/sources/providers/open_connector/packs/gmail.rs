@@ -112,7 +112,14 @@
 //!   (`fingerprint_uncovered_columns`) reads `properties` only and does
 //!   not descend `anyOf`, so it cannot confirm the `messages` paths are
 //!   declared. A tooling limit, pinned so it stays visible — not a hole
-//!   in the gate.
+//!   in the gate. The gate is OUTPUT-only, though: `fingerprint_schema`
+//!   hashes the output schema alone and nothing reads
+//!   `ActionMetadata::input_schema`, so a renamed input key would pass
+//!   registration and 400 every scan. This pack sends six input keys
+//!   into `additionalProperties: false` actions, so the input halves of
+//!   the same capture are pinned in `contracts/inputs/` and checked by
+//!   `generated_inputs_are_accepted_by_the_captured_input_contracts` —
+//!   CI, not registration, until the engine gates inputs too.
 //! - **Column sets are verified against REAL wire rows**, end to end
 //!   against a live mailbox through the gateway (2026-08-05, gateway
 //!   v1.3.4): registration passed the fingerprint gate against live
@@ -163,8 +170,9 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use crate::sources::providers::open_connector::row_path::RowPath;
-    use crate::sources::providers::open_connector::source_pack::SourcePackTable;
+    use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
         EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_err, envelope_ok,
         fingerprint_uncovered_columns,
@@ -476,6 +484,133 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn generated_inputs_are_accepted_by_the_captured_input_contracts() {
+        // The fingerprint gate hashes OUTPUT schemas only, so registration
+        // says nothing about the keys this pack SENDS — and these actions
+        // are `additionalProperties: false` strict, where an undeclared
+        // key is a hard 400 on every scan rather than a quiet no-op. The
+        // input halves of the same live capture (gateway v1.3.4) are
+        // pinned here so a gateway that renames `pageToken`, narrows the
+        // `maxResults` bound or tightens the `detail` enum fails in CI
+        // instead of at scan time. Registration-time enforcement is
+        // engine work; this keeps the reconciliation honest meanwhile.
+        for (short, contract) in [
+            (
+                "threads",
+                include_str!("fixtures/gmail/contracts/inputs/list_threads.json"),
+            ),
+            (
+                "messages",
+                include_str!("fixtures/gmail/contracts/inputs/fetch_emails.json"),
+            ),
+            (
+                "drafts",
+                include_str!("fixtures/gmail/contracts/inputs/list_drafts.json"),
+            ),
+            (
+                "labels",
+                include_str!("fixtures/gmail/contracts/inputs/list_labels.json"),
+            ),
+            (
+                "filters",
+                include_str!("fixtures/gmail/contracts/inputs/list_filters.json"),
+            ),
+        ] {
+            let schema: Value =
+                serde_json::from_str(contract).expect("input contract fixture parses");
+            let properties = &schema["properties"];
+            let t = table(short);
+
+            // Strictness is this test's premise: were the action lenient,
+            // an undeclared key would ride along ignored instead of 400ing.
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{short}: the action's input schema is strict"
+            );
+
+            // Every key this table can put on the wire must be declared.
+            let mut generated: Vec<&str> = t
+                .required_resources
+                .iter()
+                .chain(t.optional_resources)
+                .copied()
+                .collect();
+            generated.extend(t.fixed_inputs.iter().map(|(key, _)| *key));
+            match t.pagination {
+                PaginationStrategy::Cursor {
+                    cursor_param,
+                    page_size_param,
+                    ..
+                } => {
+                    generated.push(cursor_param);
+                    generated.extend(page_size_param);
+                }
+                PaginationStrategy::PageNumber {
+                    page_param,
+                    per_page_param,
+                    ..
+                } => {
+                    generated.push(page_param);
+                    generated.push(per_page_param);
+                }
+                PaginationStrategy::SinglePage => {}
+            }
+            for key in &generated {
+                assert!(
+                    !properties[*key].is_null(),
+                    "{short}: `{key}` is not declared by the action's input schema"
+                );
+            }
+
+            // ...and anything the action requires must be among them.
+            if let Some(required) = schema["required"].as_array() {
+                for entry in required {
+                    let entry = entry.as_str().expect("required entries are strings");
+                    assert!(
+                        generated.contains(&entry),
+                        "{short}: the action requires `{entry}`, which this table never sends"
+                    );
+                }
+            }
+
+            // The requested page size must sit inside the declared bounds.
+            if let PaginationStrategy::Cursor {
+                page_size_param: Some(param),
+                page_size,
+                ..
+            } = t.pagination
+            {
+                let declared = &properties[param];
+                if let Some(minimum) = declared["minimum"].as_u64() {
+                    assert!(
+                        u64::from(page_size) >= minimum,
+                        "{short}: page size {page_size} is below `{param}`'s minimum {minimum}"
+                    );
+                }
+                if let Some(maximum) = declared["maximum"].as_u64() {
+                    assert!(
+                        u64::from(page_size) <= maximum,
+                        "{short}: page size {page_size} exceeds `{param}`'s maximum {maximum}"
+                    );
+                }
+            }
+
+            // A fixed input must be one of the values the action accepts.
+            for (key, value) in t.fixed_inputs {
+                if let (FixedValue::Str(value), Some(variants)) =
+                    (value, properties[*key]["enum"].as_array())
+                {
+                    assert!(
+                        variants.iter().any(|v| v.as_str() == Some(*value)),
+                        "{short}: fixed input `{key}: {value}` is outside the declared enum"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
