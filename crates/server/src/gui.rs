@@ -578,6 +578,7 @@ spec:
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         };
 
         let html = render_semantics_card(&ds, &semantics, &session_ctx).await;

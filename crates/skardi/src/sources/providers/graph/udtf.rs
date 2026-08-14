@@ -10,12 +10,24 @@
 //!
 //! Call-shape constraints (stated because agents generate these calls):
 //! arguments are positional, so declaring `columns` requires passing
-//! `params` — `'{}'` is the no-parameters spelling, and NULL is rejected
-//! (schema-shaping arguments are strict string literals). Milestone 1 is
-//! AGE-only, and AGE's `cypher()` call must declare its result arity —
-//! so `columns` is REQUIRED here: omitting it is a targeted error, and
-//! the JSON-`record` fallback ships with the Neo4j milestone, where Bolt
-//! needs no declared arity.
+//! `params` — `'{}'` is the no-parameters spelling. `connection`,
+//! `cypher`, and `columns` are strict string literals (connection decides
+//! the plan-time source lookup, columns decide the plan-time schema, and
+//! cypher is what the plan-time guard screens); `params` alone accepts a
+//! bare NULL as the pipeline schema-inference placeholder, read as the
+//! empty object (design Risks #0).
+//!
+//! **Pipeline usage**: the params placeholder occupies the WHOLE argument
+//! position — `cypher_query('kg', 'MATCH (u:User) WHERE u.id = $uid
+//! RETURN u.name', {params}, '{"name": "string"}')`. At inference the
+//! placeholder becomes NULL (no params); at request time the substituted
+//! value is a string literal carrying JSON text, parsed as the params
+//! object.
+//!
+//! Milestone 1 is AGE-only, and AGE's `cypher()` call must declare its
+//! result arity — so `columns` is REQUIRED here: omitting it is a
+//! targeted error, and the JSON-`record` fallback ships with the Neo4j
+//! milestone, where Bolt needs no declared arity.
 //!
 //! **Declared-column ORDER is load-bearing**: the binding to the Cypher
 //! `RETURN` clause is positional (all AGE's `cypher()` gives us), so
@@ -55,7 +67,7 @@ use super::client::{GraphClient, QueryBounds, validate_params};
 use super::error::{GraphError, json_kind};
 use super::guard::reject_mutations;
 use super::value::{ACCEPTED_TYPES, DeclaredColumn, GraphType, build_batch, declared_schema};
-use crate::sources::providers::udtf_args::strict_string_arg;
+use crate::sources::providers::udtf_args::{strict_string_arg, string_arg};
 
 /// Projection prunes AFTER conversion, deliberately: the declared
 /// schema is the CALLER'S CONTRACT, so a violated declaration fails
@@ -87,29 +99,48 @@ const CONVERSION_BATCH_ROWS: usize = 1024;
 pub struct GraphSourceHandle {
     pub client: Arc<dyn GraphClient>,
     pub bounds: QueryBounds,
+    /// Registration-time health (design §Schema handling): a source whose
+    /// backend was unreachable at registration is Degraded with the
+    /// registration error's summary; the first view scan retries
+    /// validation and flips this back to Healthy on success.
+    pub health: Arc<RwLock<GraphSourceHealth>>,
+}
+
+/// Registration-time health of a graph source.
+#[derive(Debug, Clone)]
+pub enum GraphSourceHealth {
+    /// The backend answered at registration (and every view validated).
+    Healthy,
+    /// The backend was unreachable at registration; the payload is the
+    /// registration error's summary, for diagnostics.
+    Degraded(String),
+}
+
+impl GraphSourceHealth {
+    /// Whether the backend validated at registration.
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
 }
 
 /// Shared map of connection name → handle, owned by the front-end the
 /// way `OpenConnectorGateways` is.
 pub type GraphSources = Arc<RwLock<HashMap<String, Arc<GraphSourceHandle>>>>;
 
-/// Register `cypher_query`, `graph_schema`, and the JSON getter family
-/// (`datafusion-functions-json`: `json_get`, `json_get_str`, …) on a
-/// session. The getters are what make node/relationship `properties`
-/// columns queryable without leaving SQL.
+/// Register `cypher_query` and `graph_schema` on a session.
 ///
-/// **Scope, stated plainly**: `register_all` registers 12 UDFs *and* a
-/// function rewriter *and* an expr planner that remap the SQL operators
-/// `->`, `->>` and `?` to `json_get`/`json_as_text`/`json_contains` for
-/// EVERY query in the session, not just graph ones — and it overwrites
-/// same-named UDFs (debug-level log only). Additive today (DF 52 parses
-/// `->` but ships no implementation; `json_pack` does not collide).
-/// Before M4 wires this into the server session: re-home the JSON family
-/// next to skardi's other UDF registrations, and check the
-/// datafusion-federation interaction — the rewrite runs at analysis,
-/// ahead of federation planning, so a remote `data->'k'` that used to
-/// push down could become a local `json_get` and a full scan (recorded
-/// in the design's M4 milestone).
+/// The JSON getter family (`json_get`, `json_get_str`, …) is
+/// deliberately NOT registered here: `datafusion-functions-json`'s
+/// `register_all` also installs an expr planner rewriting the SQL
+/// operators `->`, `->>` and `?` session-wide — a side effect that must
+/// not hide behind a graph-only registration (a remote `data->'k'` that
+/// pushes down today could become a local `json_get` over a full scan —
+/// the datafusion-federation interaction recorded in the design's M4
+/// milestone). The server session registers the getters unconditionally
+/// (`util::json_getters::register_json_getter_udfs`, wired with the
+/// server task); engine-API users who need them register the individual
+/// UDFs themselves (`datafusion_functions_json::udfs::json_get_str_udf()`
+/// and siblings).
 ///
 /// # Example
 /// ```
@@ -125,7 +156,6 @@ pub type GraphSources = Arc<RwLock<HashMap<String, Arc<GraphSourceHandle>>>>;
 /// // fails at planning naming the (empty) roster.
 /// ```
 pub fn register_graph_udtfs(ctx: &SessionContext, sources: GraphSources) -> DFResult<()> {
-    datafusion_functions_json::register_all(&mut ctx.clone())?;
     ctx.register_udtf(
         "cypher_query",
         Arc::new(CypherQueryFunction {
@@ -176,9 +206,13 @@ impl TableFunctionImpl for CypherQueryFunction {
         }
         let connection = strict_string_arg(&exprs[0], "cypher_query", "connection")?;
         let cypher = strict_string_arg(&exprs[1], "cypher_query", "cypher")?;
+        // params accepts the pipeline-inference NULL placeholder (design
+        // Risks #0): NULL reads as the empty object below, exactly the
+        // `Some("")` case — inference plans with no params, execution
+        // gets the substituted JSON text.
         let params_json = exprs
             .get(2)
-            .map(|e| strict_string_arg(e, "cypher_query", "params_json"))
+            .map(|e| string_arg(e, "cypher_query", "params_json"))
             .transpose()?;
         let columns_json = exprs
             .get(3)
@@ -263,7 +297,13 @@ fn parse_columns(text: &str) -> Result<Vec<DeclaredColumn>, GraphError> {
                 reason: format!("column '{name}': unknown type '{ty_name}'"),
                 accepted: ACCEPTED_TYPES,
             })?;
-            Ok(DeclaredColumn { name, ty })
+            Ok(DeclaredColumn {
+                name,
+                ty,
+                // The ad-hoc surface cannot declare nullability (design
+                // §Schema handling) — every ad-hoc column is nullable.
+                nullable: true,
+            })
         })
         .collect()
 }
@@ -391,8 +431,9 @@ impl TableProvider for GraphSchemaProvider {
     }
 }
 
-/// What one graph scan executes.
-enum GraphScanKind {
+/// What one graph scan executes. `pub(crate)` for the YAML view
+/// provider (`view.rs`), which scans through the same leaf plan.
+pub(crate) enum GraphScanKind {
     Cypher {
         handle: Arc<GraphSourceHandle>,
         cypher: String,
@@ -420,15 +461,16 @@ impl fmt::Debug for GraphScanKind {
 }
 
 /// Leaf plan: one partition, executes the graph call on first poll.
+/// `pub(crate)` for the YAML view provider (`view.rs`).
 #[derive(Debug)]
-struct GraphScanExec {
+pub(crate) struct GraphScanExec {
     kind: GraphScanKind,
     projection: Option<Vec<usize>>,
     properties: PlanProperties,
 }
 
 impl GraphScanExec {
-    fn new(
+    pub(crate) fn new(
         kind: GraphScanKind,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
@@ -549,7 +591,7 @@ impl ExecutionPlan for GraphScanExec {
 /// The cypher scan: run on first poll, then convert in batch-atomic
 /// chunks (design §Schema handling — the conversion batch is the defined
 /// atomic unit; a type mismatch fails the CURRENT batch before emission).
-fn cypher_batches(
+pub(crate) fn cypher_batches(
     handle: Arc<GraphSourceHandle>,
     cypher: String,
     params: Value,
@@ -667,6 +709,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(5),
                 max_rows: 100,
             },
+            health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }
@@ -674,6 +717,12 @@ mod tests {
     async fn ctx_with(rows: Vec<Vec<Value>>) -> SessionContext {
         let ctx = SessionContext::new();
         register_graph_udtfs(&ctx, sources_with(rows)).expect("registration");
+        // The getter family is the SESSION's registration, not the graph
+        // UDTFs' (see register_graph_udtfs' doc) — the test session
+        // registers only what it uses, never register_all (its `->`
+        // expr-planner rewrite is the session-level side effect the
+        // re-home removed).
+        ctx.register_udf((*datafusion_functions_json::udfs::json_get_str_udf()).clone());
         ctx
     }
 
@@ -935,9 +984,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_getters_are_registered_for_properties_extraction() {
-        // A node's `properties` column is JSON text; the registered
-        // json_get family is what makes it queryable without leaving SQL.
+    async fn json_get_str_extracts_properties_when_the_session_registers_it() {
+        // A node's `properties` column is JSON text; the getter family
+        // (registered by the session, not by register_graph_udtfs) is
+        // what makes it queryable without leaving SQL.
         let node = serde_json::json!({
             "id": 1, "label": "Person", "properties": {"name": "ada"}
         });
@@ -954,5 +1004,30 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap();
         assert_eq!(col.value(0), "ada");
+    }
+
+    #[tokio::test]
+    async fn a_null_params_placeholder_plans_as_no_params() {
+        // Pipeline schema inference substitutes `{params}` with a bare
+        // NULL (design Risks #0): params — alone among the arguments —
+        // accepts it and plans as the empty object; the other arguments
+        // stay strict.
+        let ctx = ctx_with(vec![vec![serde_json::json!("ada")]]).await;
+        let batches = collect(
+            &ctx,
+            "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', NULL, \
+             '{\"name\": \"string\"}')",
+        )
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        // …while connection/cypher/columns still reject NULL outright.
+        for sql in [
+            "SELECT * FROM cypher_query(NULL, 'MATCH (n) RETURN n', '{}', '{\"n\": \"node\"}')",
+            "SELECT * FROM cypher_query('kg', NULL, '{}', '{\"n\": \"node\"}')",
+            "SELECT * FROM cypher_query('kg', 'MATCH (n) RETURN n', '{}', NULL)",
+        ] {
+            let err = ctx.sql(sql).await.expect_err(sql);
+            assert!(err.to_string().contains("not NULL"), "{sql}: {err}");
+        }
     }
 }

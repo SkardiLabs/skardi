@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::engine::Engine;
 use skardi::pipeline::pipeline::Pipeline;
+use skardi::sources::providers::graph::udtf::GraphSourceHealth;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -92,6 +93,14 @@ pub struct DataSourceResponse {
     pub path: Option<String>,
     /// Sanitized URL for database sources (PostgreSQL)
     pub url: Option<String>,
+    /// Registration health — currently only graph sources report one: a
+    /// graph source whose backend was unreachable at startup registers
+    /// DEGRADED (the degraded-registration semantics) instead of failing
+    /// boot, so its status is observable here. Every other source fails
+    /// startup when unreachable, hence is healthy by construction and
+    /// omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// Registered tables with their schemas
     pub tables: Vec<TableInfo>,
 }
@@ -481,8 +490,10 @@ pub async fn get_data_sources(
             | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb
             // RSS has no path: its feed URLs live in the typed `rss:` block,
-            // not in `path`.
-            | DataSourceType::Rss => None,
+            // not in `path`. Graph likewise: the connection lives in
+            // `connection_string`.
+            | DataSourceType::Rss
+            | DataSourceType::Graph => None,
         };
 
         let url = match data_source.source_type {
@@ -494,12 +505,34 @@ pub async fn get_data_sources(
             | DataSourceType::Influxdb
             | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
-            | DataSourceType::Dynamodb => {
+            | DataSourceType::Dynamodb
+            // Graph validation rejects credentials embedded in the URL, so
+            // the connection string is safe to report like any db source's.
+            | DataSourceType::Graph => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()
             }
             _ => None,
+        };
+
+        // Only graph sources report a status (see the field's doc): read the
+        // handle's registration health. A missing handle reports nothing —
+        // the same degrade-quietly policy as the table-listing fallbacks.
+        let status = if data_source.source_type == DataSourceType::Graph {
+            let sources = app_state
+                .graph_sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            sources.get(&data_source.name).map(|handle| {
+                let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+                match &*health {
+                    GraphSourceHealth::Healthy => "healthy".to_string(),
+                    GraphSourceHealth::Degraded(_) => "degraded".to_string(),
+                }
+            })
+        } else {
+            None
         };
 
         // Catalog-mode sources register a whole catalog named after the
@@ -544,6 +577,7 @@ pub async fn get_data_sources(
             r#type: source_type_str.to_string(),
             path,
             url,
+            status,
             tables,
         });
     }
@@ -968,6 +1002,7 @@ spec:
             crate::auth::layer::AuthLayer::None,
             None,
             None,
+            Default::default(),
         )
     }
 
@@ -1018,6 +1053,7 @@ spec:
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         };
 
         // Create pipeline that queries the registered data source
@@ -1061,6 +1097,7 @@ spec:
             crate::auth::layer::AuthLayer::None,
             None,
             None,
+            Default::default(),
         );
 
         let request = ExecuteRequest {
@@ -1650,6 +1687,7 @@ spec:
                 description: None,
                 open_connector: None,
                 rss: None,
+                graph: None,
             });
         }
 
@@ -1706,6 +1744,7 @@ spec:
                 )
                 .expect("parse rss config"),
             ),
+            graph: None,
         };
 
         let mut session_ctx = SessionContext::new();
@@ -1745,6 +1784,7 @@ spec:
             crate::auth::layer::AuthLayer::None,
             None,
             None,
+            Default::default(),
         );
 
         let Json(body) = get_data_sources(State(app_state)).await.unwrap();

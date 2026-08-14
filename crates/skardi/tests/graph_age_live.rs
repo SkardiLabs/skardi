@@ -28,6 +28,7 @@ use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBou
 use skardi::sources::providers::graph::config::GraphConfig;
 use skardi::sources::providers::graph::udtf::GraphSources;
 use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
+use skardi::util::json_getters::register_json_getter_udfs;
 
 fn live_url() -> Option<String> {
     let url = std::env::var("SKARDI_AGE_LIVE_URL")
@@ -147,6 +148,10 @@ async fn live_ctx(url: &str, graph: &str) -> (SessionContext, GraphSources) {
         .expect("registration connects eagerly");
     let ctx = SessionContext::new();
     register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("udtfs register");
+    // The getter family is the session's registration, not the graph
+    // UDTFs' (register_graph_udtfs' doc) — register_json_getter_udfs
+    // installs the UDFs without the `->` operator rewrite.
+    register_json_getter_udfs(&ctx).expect("json getters register");
     (ctx, sources)
 }
 
@@ -917,23 +922,30 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
          carries the name value — the silent swap the docs warn about"
     );
 
-    // ── #4 (rewriter scope): register_all installs the ->/->> operator
-    // rewrite session-wide; pin that it works over a node's properties
-    // JSON, since that is the documented reason it is registered.
-    let batches = collect(
-        &ctx,
-        "SELECT v.properties->>'name' AS n FROM cypher_query('kg', \
-         'MATCH (v:Person {name: \"bob\"}) RETURN v', '{}', '{\"v\": \"node\"}')",
-    )
-    .await;
-    let n = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(n.value(0), "bob", "the ->> rewrite reaches graph queries");
-
     drop_graph(&pool, &graph).await;
+}
+
+/// The federation-pushdown contract that replaced the old `register_all`
+/// pin (#4 in the live test above): with ONLY the getter UDFs registered —
+/// the session shape every front-end now uses — `->>` must NOT be silently
+/// rewritten to `json_get`. DataFusion 52 has no native Arrow-operator
+/// planner either, so the observable contract is a loud planning error
+/// naming the operator. Deliberate, not a regression: see
+/// `util::json_getters`' module doc. No backend needed — planning only.
+#[tokio::test]
+async fn arrow_operators_keep_native_planning() {
+    let ctx = SessionContext::new();
+    register_json_getter_udfs(&ctx).expect("json getters register");
+    let err = ctx
+        .sql("SELECT '{\"a\":1}'::text ->> 'a'")
+        .await
+        .expect_err("no rewrite means no plan");
+    let msg = err.to_string();
+    assert!(msg.contains("->>"), "the operator is named: {msg}");
+    assert!(
+        msg.contains("not yet supported"),
+        "native (unsupported), not rewritten: {msg}"
+    );
 }
 
 #[tokio::test]

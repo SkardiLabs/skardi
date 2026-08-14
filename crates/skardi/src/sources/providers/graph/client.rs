@@ -216,21 +216,7 @@ impl AgeClient {
         max_connections: u32,
         acquire_timeout: Duration,
     ) -> Result<Self, GraphError> {
-        let mut options: PgConnectOptions =
-            connection_string
-                .parse()
-                .map_err(|e: sqlx::Error| GraphError::InvalidConfig {
-                    name: source_name.to_string(),
-                    reason: format!("connection_string does not parse: {e}"),
-                })?;
-        if let Some(env) = username_env {
-            let user = read_env(source_name, "username_env", env)?;
-            options = options.username(&user);
-        }
-        if let Some(env) = password_env {
-            let pass = read_env(source_name, "password_env", env)?;
-            options = options.password(&pass);
-        }
+        let options = build_options(source_name, connection_string, username_env, password_env)?;
         // PREFLIGHT on a single direct connection, before any pool
         // exists: sqlx treats an `after_connect` error as a failed
         // attempt and RETRIES until acquire_timeout, discarding the
@@ -270,29 +256,49 @@ impl AgeClient {
                 });
             }
         }
-        // Lazy pool: the preflight above already proved the environment,
-        // so the pool's own connections dial on demand.
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            // Queueing on a saturated pool is bounded by the SAME knob
-            // as the query itself — sqlx's 30s default is unrelated to
-            // query_timeout_seconds and would surface as a generic
-            // driver failure after possibly LONGER than the configured
-            // bound ("every query is bounded" covers the queue too).
-            .acquire_timeout(acquire_timeout)
-            .after_connect(|conn, _meta| Box::pin(per_connection_setup(conn)))
-            .connect_lazy_with(options);
+        Ok(Self::from_pool(
+            build_pool(options, max_connections, acquire_timeout),
+            source_name,
+            graph_name,
+        ))
+    }
+
+    /// Connect WITHOUT the preflight probe: URL parsing and env-var
+    /// resolution still fail here (those are config errors, never
+    /// transient), but no network I/O happens — the lazy pool dials on
+    /// first acquire. Used by degraded registration
+    /// (`register_graph_tables`): an unreachable shared backend must not
+    /// take server startup — and every unrelated source — down with it;
+    /// the first scan surfaces the real backend error instead.
+    pub fn connect_degraded(
+        source_name: &str,
+        connection_string: &str,
+        graph_name: &str,
+        username_env: Option<&str>,
+        password_env: Option<&str>,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self, GraphError> {
+        let options = build_options(source_name, connection_string, username_env, password_env)?;
+        Ok(Self::from_pool(
+            build_pool(options, max_connections, acquire_timeout),
+            source_name,
+            graph_name,
+        ))
+    }
+
+    fn from_pool(pool: PgPool, source_name: &str, graph_name: &str) -> Self {
         tracing::debug!(
             source = source_name,
             graph = graph_name,
             "graph source connected"
         );
-        Ok(Self {
+        Self {
             pool,
             graph_name: graph_name.to_string(),
             source_name: source_name.to_string(),
             prepare_seq: AtomicU64::new(0),
-        })
+        }
     }
 
     /// The pool, for the live leak-regression test ONLY (the
@@ -302,6 +308,52 @@ impl AgeClient {
     pub fn pool_for_tests(&self) -> &PgPool {
         &self.pool
     }
+}
+
+/// URL parse + credential env resolution — PURE (no network I/O), so its
+/// errors are config errors and hard-fail in every connect path,
+/// degraded included.
+fn build_options(
+    source_name: &str,
+    connection_string: &str,
+    username_env: Option<&str>,
+    password_env: Option<&str>,
+) -> Result<PgConnectOptions, GraphError> {
+    let mut options: PgConnectOptions =
+        connection_string
+            .parse()
+            .map_err(|e: sqlx::Error| GraphError::InvalidConfig {
+                name: source_name.to_string(),
+                reason: format!("connection_string does not parse: {e}"),
+            })?;
+    if let Some(env) = username_env {
+        let user = read_env(source_name, "username_env", env)?;
+        options = options.username(&user);
+    }
+    if let Some(env) = password_env {
+        let pass = read_env(source_name, "password_env", env)?;
+        options = options.password(&pass);
+    }
+    Ok(options)
+}
+
+/// The lazy pool shared by both connect paths: connections dial on
+/// demand, each running [`per_connection_setup`] via `after_connect`.
+fn build_pool(
+    options: PgConnectOptions,
+    max_connections: u32,
+    acquire_timeout: Duration,
+) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        // Queueing on a saturated pool is bounded by the SAME knob
+        // as the query itself — sqlx's 30s default is unrelated to
+        // query_timeout_seconds and would surface as a generic
+        // driver failure after possibly LONGER than the configured
+        // bound ("every query is bounded" covers the queue too).
+        .acquire_timeout(acquire_timeout)
+        .after_connect(|conn, _meta| Box::pin(per_connection_setup(conn)))
+        .connect_lazy_with(options)
 }
 
 /// Per-connection session state, shared by the registration preflight
@@ -873,5 +925,47 @@ mod tests {
         assert!(validate_params(&serde_json::json!({"a": 1})).is_ok());
         let err = validate_params(&serde_json::json!([1])).unwrap_err();
         assert!(err.to_string().contains("an array"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_degraded_hard_fails_config_errors_but_never_dials() {
+        // Unparseable URL: a config error, hard-failed even on the
+        // degraded path.
+        let err = AgeClient::connect_degraded(
+            "kg",
+            "not a url",
+            "g",
+            None,
+            None,
+            4,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not parse"), "{err}");
+        // Unset credential env var: same — config, not transient.
+        let err = AgeClient::connect_degraded(
+            "kg",
+            "postgres://127.0.0.1:1/none",
+            "g",
+            Some("SKARDI_TEST_GRAPH_DEFINITELY_UNSET"),
+            None,
+            4,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not set"), "{err}");
+        // A closed port is NOT probed: the lazy pool builds fine and the
+        // backend is first touched on acquire (degraded registration's
+        // whole point).
+        AgeClient::connect_degraded(
+            "kg",
+            "postgres://127.0.0.1:1/none",
+            "g",
+            None,
+            None,
+            4,
+            Duration::from_secs(1),
+        )
+        .expect("no dial at connect_degraded");
     }
 }

@@ -339,6 +339,7 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), Slack pack (conversations, users, files — [guide](docs/open-connector-slack.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
 | Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories or S3 prefixes; `documents` feature) | [docs/documents.md](docs/documents.md) |
 | RSS / Atom | Read | Yes | RSS 0.9x/1.0/2.0, Atom, JSON Feed subscriptions as `feeds` (health) + `items` (live window); content stored as Markdown, per-feed TTL cache with conditional GETs, per-feed fault isolation, un-sandboxed fetch egress — operator/Cloud-owned SSRF control (`rss` feature) | [docs/rss.md](docs/rss.md) |
+| Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres as SQL tables: YAML-declared views as `kg.main.<view>` catalog tables, `cypher_query` / `graph_schema` UDTFs, backend-enforced read-only, degraded registration with first-scan revalidation (Neo4j / Kuzu next) | [docs/graph.md](docs/graph.md) |
 
 ---
 
@@ -434,7 +435,8 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 `1` Federated SQL engine
    - [x] One SQL engine ([DataFusion](https://datafusion.apache.org/), in-process) over CSV, Parquet, JSON, S3 / GCS / Azure, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, SeekDB — all joinable in one query
    - [x] Register either one specific table, or point Skardi at a database (Postgres / MySQL / SQLite) and let it auto-discover all tables — one config line either way
-   - [ ] Graph database sources (Neo4j / Kuzu) — to unlock graphRAG patterns alongside vector / full-text retrieval
+   - [x] Graph sources (Apache AGE — read-only Cypher over Postgres as SQL tables, YAML views + `cypher_query`; [docs](docs/graph.md))
+   - [ ] Graph sources beyond AGE (Neo4j / Kuzu) — to unlock graphRAG patterns alongside vector / full-text retrieval
 
 `2` Retrieval primitives
    - [x] Vector search (KNN) — `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), Lance KNN, SeekDB HNSW

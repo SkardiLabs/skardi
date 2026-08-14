@@ -69,6 +69,7 @@ fn products_data_source(description: Option<&str>) -> DataSource {
         description: description.map(str::to_string),
         open_connector: None,
         rss: None,
+        graph: None,
     }
 }
 
@@ -102,6 +103,7 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
         AuthLayer::None,
         None,
         None,
+        Default::default(),
     )
 }
 

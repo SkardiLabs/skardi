@@ -1,10 +1,13 @@
 //! Typed configuration for a `type: graph` data source (design
 //! §GraphConfig typed YAML). Milestone 1 supports the `age` backend;
-//! views land with milestone 4.
+//! milestone 4 adds YAML catalog views.
 
-use serde::Deserialize;
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
 
 use super::error::GraphError;
+use super::value::{ACCEPTED_TYPES, DeclaredColumn, GraphType};
 
 /// Default per-query timeout (design §Security and operational bounds).
 pub const DEFAULT_QUERY_TIMEOUT_SECONDS: u64 = 30;
@@ -31,7 +34,10 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 4;
 pub const MAX_MAX_CONNECTIONS: u32 = 64;
 
 /// The `graph:` block of a `type: graph` data source.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` because the server's `DataSource` struct serializes its
+/// typed blocks (the rss/open_connector precedent).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphConfig {
     /// Backend engine. Milestone 1: `age` (openCypher inside Postgres).
@@ -57,14 +63,68 @@ pub struct GraphConfig {
     /// Connection-pool size against the backend.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
-    /// PARSED but not yet supported: YAML catalog views are milestone 4.
-    /// The field exists so an operator copying the design doc's example
-    /// gets "views arrive with milestone 4" from validation — not
-    /// serde's "unknown field `views`", which reads as "skardi doesn't
-    /// support views". Accepted-and-ignored would be worse: a declared
-    /// view that silently does nothing.
+    /// YAML catalog views (milestone 4): each becomes the catalog table
+    /// `<source>.main.<name>` — fixed Cypher plus a declared schema.
     #[serde(default)]
-    pub views: Option<serde_yaml::Value>,
+    pub views: Vec<GraphView>,
+}
+
+/// One YAML-declared catalog view.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphView {
+    /// Table name inside the source's `main` schema.
+    pub name: String,
+    /// The Cypher executed at scan time. Deliberately NOT screened by the
+    /// keyword guard — see [`GraphConfig::validate`].
+    pub cypher: String,
+    /// Declared output columns, in RETURN order (the binding to the
+    /// Cypher RETURN clause is positional — same rule as the ad-hoc
+    /// `columns` argument).
+    pub schema: Vec<GraphViewColumn>,
+}
+
+/// One declared view column.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphViewColumn {
+    pub name: String,
+    /// The friendly lowercase type vocabulary (`string`, `int`, `node`,
+    /// …) — one spelling shared with the ad-hoc `columns` argument.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Defaults to true; `false` is the author's assertion that the
+    /// view's Cypher never yields null here, enforced at scan time.
+    #[serde(default = "default_nullable")]
+    pub nullable: bool,
+}
+
+fn default_nullable() -> bool {
+    true
+}
+
+impl GraphView {
+    /// The declared columns in conversion form. Type names re-parse here
+    /// (the error path is defensive: [`GraphConfig::validate`] runs
+    /// before registration and rejects unparseable types first).
+    pub fn declared_columns(&self) -> Result<Vec<DeclaredColumn>, GraphError> {
+        self.schema
+            .iter()
+            .map(|c| {
+                Ok(DeclaredColumn {
+                    name: c.name.clone(),
+                    ty: GraphType::parse(&c.r#type).ok_or_else(|| GraphError::InvalidConfig {
+                        name: self.name.clone(),
+                        reason: format!(
+                            "column '{}' declares unknown type '{}' (accepted types: {})",
+                            c.name, c.r#type, ACCEPTED_TYPES
+                        ),
+                    })?,
+                    nullable: c.nullable,
+                })
+            })
+            .collect()
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -82,9 +142,17 @@ fn default_max_connections() -> u32 {
 impl GraphConfig {
     /// Pure validation (no network I/O): backend and scheme allowlists,
     /// identifier shape for the graph name, env-var NAME shape for
-    /// credentials. `connection_string` is operator trust (the same tier
+    /// credentials, and structural checks for every declared view.
+    /// `connection_string` is operator trust (the same tier
     /// as a Postgres connection string in the same file) — no SSRF guard,
     /// only a scheme allowlist (design §Security).
+    ///
+    /// View Cypher is deliberately NOT screened by the keyword guard:
+    /// views are the operator trust tier (same level as pipeline SQL),
+    /// and the guard exists to screen CALLER-submitted Cypher. The real
+    /// boundary is the backend's READ ONLY transaction, and registration's
+    /// live validation runs the view once — a genuinely mutating view is
+    /// caught there, with the backend's own error.
     pub fn validate(&self, name: &str, connection_string: &str) -> Result<(), GraphError> {
         if self.backend != "age" {
             return Err(GraphError::InvalidConfig {
@@ -167,7 +235,7 @@ impl GraphConfig {
             ("password_env", &self.password_env),
         ] {
             if let Some(v) = value
-                && !is_env_var_name(v)
+                && !is_identifier(v)
             {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
@@ -210,20 +278,79 @@ impl GraphConfig {
                 ),
             });
         }
-        if self.views.is_some() {
-            return Err(GraphError::InvalidConfig {
-                name: name.to_string(),
-                reason: "`views` arrive with milestone 4 (YAML catalog views); the \
-                         ad-hoc surface today is cypher_query(...) — remove the views \
-                         block until then"
-                    .to_string(),
-            });
+        let mut view_names = HashSet::new();
+        for view in &self.views {
+            // The view name becomes the catalog table name
+            // `<source>.main.<name>` — bare identifier shape keeps it
+            // addressable without quoting everywhere downstream.
+            if !is_identifier(&view.name) {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!(
+                        "view name '{}' must be an identifier ([A-Za-z_][A-Za-z0-9_]*) — \
+                         it becomes the catalog table name {name}.main.{}",
+                        view.name, view.name
+                    ),
+                });
+            }
+            if !view_names.insert(&view.name) {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!("duplicate view name '{}'", view.name),
+                });
+            }
+            if view.cypher.trim().is_empty() {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!("view '{}' declares empty cypher", view.name),
+                });
+            }
+            if view.schema.is_empty() {
+                return Err(GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!(
+                        "view '{}' declares an empty schema — at least one column is \
+                         required (the declared schema is the planning-time contract)",
+                        view.name
+                    ),
+                });
+            }
+            let mut column_names = HashSet::new();
+            for column in &view.schema {
+                if column.name.trim().is_empty() {
+                    return Err(GraphError::InvalidConfig {
+                        name: name.to_string(),
+                        reason: format!(
+                            "view '{}' declares a column with an empty name",
+                            view.name
+                        ),
+                    });
+                }
+                if !column_names.insert(&column.name) {
+                    return Err(GraphError::InvalidConfig {
+                        name: name.to_string(),
+                        reason: format!(
+                            "view '{}' declares column '{}' twice",
+                            view.name, column.name
+                        ),
+                    });
+                }
+                if GraphType::parse(&column.r#type).is_none() {
+                    return Err(GraphError::InvalidConfig {
+                        name: name.to_string(),
+                        reason: format!(
+                            "view '{}' column '{}': unknown type '{}' (accepted types: {})",
+                            view.name, column.name, column.r#type, ACCEPTED_TYPES
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
 }
 
-fn is_env_var_name(s: &str) -> bool {
+fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     chars
         .next()
@@ -361,16 +488,113 @@ password_env: AGE_PG_PASS
     }
 
     #[test]
-    fn views_parse_but_are_named_as_milestone_4_work() {
-        // The design doc's own example carries `views:` — an operator
-        // copying it must get "milestone 4", not serde's unknown-field
-        // error (which reads as "skardi doesn't support views").
+    fn views_parse_validate_and_default_nullable_to_true() {
+        // The design doc's own example shape — parse, validate, and the
+        // nullable default all in one.
         let c: GraphConfig = serde_yaml::from_str(
-            "backend: age\ngraph_name: g\nviews:\n  - name: user_posts\n    cypher: MATCH (n) RETURN n\n",
+            r#"
+backend: age
+graph_name: g
+views:
+  - name: user_posts
+    cypher: MATCH (u:User)-[:POSTED]->(p:Post) RETURN u.name AS user_name, p.title AS post_title
+    schema:
+      - name: user_name
+        type: string
+      - name: post_title
+        type: string
+        nullable: false
+"#,
         )
-        .expect("the field parses");
+        .expect("views parse");
+        assert_eq!(c.views.len(), 1);
+        assert!(c.views[0].schema[0].nullable, "nullable defaults to true");
+        assert!(!c.views[0].schema[1].nullable);
+        c.validate("kg", "postgres://h/db").expect("valid");
+        let columns = c.views[0].declared_columns().expect("types parse");
+        assert_eq!(columns[1].name, "post_title");
+        assert!(!columns[1].nullable);
+    }
+
+    #[test]
+    fn view_names_must_be_unique_identifiers() {
+        for bad in ["user-posts", "1posts", "", "user posts"] {
+            let mut c = base();
+            c.views = vec![view(bad, "MATCH (n) RETURN n", vec![column("n", "int")])];
+            let err = c.validate("kg", "postgres://h/db").unwrap_err();
+            assert!(err.to_string().contains("identifier"), "{bad}: {err}");
+        }
+        let mut c = base();
+        c.views = vec![
+            view("v", "MATCH (n) RETURN n", vec![column("n", "int")]),
+            view("v", "MATCH (m) RETURN m", vec![column("m", "int")]),
+        ];
         let err = c.validate("kg", "postgres://h/db").unwrap_err();
-        assert!(err.to_string().contains("milestone 4"), "{err}");
+        assert!(err.to_string().contains("duplicate view name 'v'"), "{err}");
+    }
+
+    #[test]
+    fn view_cypher_and_schema_must_be_nonempty() {
+        let mut c = base();
+        c.views = vec![view("v", "   \n ", vec![column("n", "int")])];
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("empty cypher"), "{err}");
+
+        let mut c = base();
+        c.views = vec![view("v", "MATCH (n) RETURN n", vec![])];
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("empty schema"), "{err}");
+    }
+
+    #[test]
+    fn view_columns_must_be_named_unique_and_typed() {
+        let mut c = base();
+        c.views = vec![view("v", "MATCH (n) RETURN n", vec![column(" ", "int")])];
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("empty name"), "{err}");
+
+        let mut c = base();
+        c.views = vec![view(
+            "v",
+            "MATCH (n) RETURN n",
+            vec![column("n", "int"), column("n", "string")],
+        )];
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
+
+        let mut c = base();
+        c.views = vec![view("v", "MATCH (n) RETURN n", vec![column("n", "Utf8")])];
+        let err = c.validate("kg", "postgres://h/db").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown type 'Utf8'"), "{msg}");
+        assert!(msg.contains("node, relationship, path"), "{msg}");
+    }
+
+    #[test]
+    fn view_cypher_is_not_keyword_guarded() {
+        // Views are the operator trust tier (see validate's doc): a
+        // mutating-looking view passes PURE validation — the backend's
+        // READ ONLY transaction and registration's live validation are
+        // the boundary, not the caller-facing keyword guard.
+        let mut c = base();
+        c.views = vec![view("v", "CREATE (n) RETURN n", vec![column("n", "node")])];
+        c.validate("kg", "postgres://h/db").expect("no guard here");
+    }
+
+    fn view(name: &str, cypher: &str, schema: Vec<GraphViewColumn>) -> GraphView {
+        GraphView {
+            name: name.to_string(),
+            cypher: cypher.to_string(),
+            schema,
+        }
+    }
+
+    fn column(name: &str, ty: &str) -> GraphViewColumn {
+        GraphViewColumn {
+            name: name.to_string(),
+            r#type: ty.to_string(),
+            nullable: true,
+        }
     }
 
     #[test]

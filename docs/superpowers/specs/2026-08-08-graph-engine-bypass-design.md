@@ -583,12 +583,34 @@ interaction — its `->`/`->>`/`?` rewriter runs at analysis, ahead of
 federation planning, so a remote `data->'k'` that pushes down today
 could silently become a local `json_get` over a full scan.
 
+**Shipped.** `type: graph` data source registration with the
+degraded-on-unreachable / refuse-on-mismatch semantics of §Schema
+handling (the unreachable case registers views with their declared
+schemas, reports `status: "degraded"` on `GET /data_source`, and the
+first scan retries the validation; a reachable backend whose view fails
+validation refuses registration). Declared-schema views with the
+`nullable: false` author assertion enforced at conversion. Live schema
+validation at registration (one fetch-≤1-row call per view). Both
+carried-in obligations settled:
 
-- `type: graph` data source registration (degraded-on-unreachable,
-  refuse-on-mismatch — see Schema handling).
-- Declared-schema views.
-- Live schema validation at registration.
-- Docs: per-backend guides, examples, and spec entry.
+- **(a) Params substitution (Risks item 0): the placeholder occupies
+  the whole argument.** `cypher_query`'s `params` argument accepts the
+  inference pass's `NULL` placeholder as "no parameters" (the
+  `udtf_args::string_arg` convention the FTS/KNN functions already
+  use), so pipelines spell `{params}` as the ENTIRE third argument and
+  callers send the params JSON as a string in the request. Connection,
+  cypher, and columns stay strict literals — they shape the plan. No
+  change to the substitution machinery.
+- **(b) JSON getters re-homed, rewrite deliberately NOT installed.**
+  The server session (planning AND runtime) registers the twelve
+  getter UDFs unconditionally via
+  `util::json_getters::register_json_getter_udfs`, next to
+  `json_pack`. The federation check's outcome: DataFusion 52's native
+  planner rejects `->`/`->>` with `NotImplemented`, so no pushdown
+  exists to regress today — but the unparser maps the operators back
+  for federated Postgres, so installing the `JsonExprPlanner` would
+  foreclose that future pushdown session-wide. UDFs only;
+  `json_get_str(col, 'key')` is the documented extraction spelling.
 
 ### Milestone 5+ — Write path (future)
 
@@ -597,19 +619,20 @@ could silently become a local `json_get` over a full scan.
 
 ## Risks and Open Questions
 
-0. **Pipeline parameters cannot reach Cypher parameters yet (decide in
-   milestone 4).** skardi substitutes request parameters into SQL
+0. **Pipeline parameters reaching Cypher parameters — SETTLED in
+   milestone 4.** skardi substitutes request parameters into SQL
    TEXTUALLY, and its two passes disagree about nested-literal
    positions: inference replaces `{p}` with the bare token `NULL`
    (fine inside a JSON string), while execution substitutes a QUOTED
    `'value'` — which terminates the enclosing SQL string literal when
-   `{p}` sits inside the `params` JSON. There is no spelling of
-   `'{"uid": …{user_id}…}'` that satisfies both passes. Nothing breaks
-   today (the server does not register these UDTFs until milestone 4),
-   but §Agent and LLM interaction describes exactly this workflow, so
-   milestone 4 must pick one: a raw/unquoted substitution mode for
-   nested-literal positions, or a params spelling that is not a nested
-   JSON-in-SQL literal.
+   `{p}` sits inside the `params` JSON. The settled spelling keeps the
+   placeholder OUT of nested-literal position: `{params}` occupies the
+   whole third argument of `cypher_query`, the UDTF accepts the
+   inference pass's `NULL` as "no parameters" (the
+   `udtf_args::string_arg` convention), and the request carries the
+   params JSON as a string. The alternative (a raw/unquoted
+   substitution mode) was rejected: it would change the substitution
+   machinery every existing pipeline depends on, for one call site.
 1. **Declared-type drift on dynamically-typed properties.** Neo4j property types vary per node: a view declaring `n.value AS Int64` meets a `string` value mid-scan and fails with a typed error (column, row, expected, found-kind). Conversion is page-atomic, but batches already emitted stay emitted — the same mid-scan failure trade-off the Open Connector adapters accept. Views over heterogeneous properties should declare `Utf8` (JSON text) instead of a scalar type, or normalize with Cypher `toInteger()`/`toString()` before `RETURN`.
 2. **Cypher injection.** Parameter binding prevents interpolation attacks. The keyword guard is string-based and bypassable by construction — which is why it is *not* the security boundary: the backend's `READ ONLY` transaction (AGE), read-access-mode transaction (Neo4j), or read-only database open (Kuzu) is what guarantees no write executes. Milestone 1 (AGE) carries no driver risk here — Postgres `READ ONLY` is native to `tokio-postgres`. The `neo4rs` access-mode question is scoped to the Neo4j milestone as a hard precondition (see Milestones), with the registration-time read-mode proof failing closed if the deployed pair cannot enforce it.
 3. **Path representation.** The parallel-lists struct (`nodes` + `relationships`) is lossless and type-homogeneous but positional — consumers must know relationship *i* joins node *i* to node *i+1*. Row-per-hop consumers flatten with Cypher `UNWIND` in the query or view instead of asking Skardi to restructure paths.

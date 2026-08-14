@@ -68,6 +68,16 @@ pub enum GraphError {
         found: &'static str,
     },
 
+    /// A column declared `nullable: false` (YAML views only — the ad-hoc
+    /// surface cannot declare it) met a null from the backend. Identity
+    /// only, never the value.
+    #[error(
+        "graph column '{column}' at result row {row}: declared nullable: false but the \
+         backend returned null; relax the declaration to nullable: true or filter \
+         nulls in the view's Cypher (e.g. WHERE ... IS NOT NULL)"
+    )]
+    NotNullViolation { column: String, row: usize },
+
     /// The scan hit the per-source row cap. Loud and typed — never a
     /// silent truncation.
     #[error(
