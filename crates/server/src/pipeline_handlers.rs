@@ -14,7 +14,7 @@ use anyhow::Result;
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
@@ -26,11 +26,39 @@ use std::time::Instant;
 
 use crate::auth::routes::require_session;
 use crate::config::{DataSourceType, HierarchyLevel};
+use crate::query_audit::QueryAuditStatus;
+use crate::query_handlers::{MAX_SESSION_ID_CHARS, finish_audit};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
+
+/// Optional caller-supplied session header. A header (not a body field)
+/// because the execute body IS the flattened parameter map — a reserved key
+/// could collide with a legitimate SQL parameter of the same name.
+const SESSION_ID_HEADER: &str = "x-skardi-session-id";
+
+/// Extract and validate the session header. `Ok(None)` when absent; `Err`
+/// when present but malformed — silently dropping a malformed value would
+/// corrupt session stitching, the one job this field has.
+fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = headers.get(SESSION_ID_HEADER) else {
+        return Ok(None);
+    };
+    let s = value
+        .to_str()
+        .map_err(|_| format!("{SESSION_ID_HEADER} must be valid UTF-8"))?;
+    if s.is_empty() {
+        return Err(format!("{SESSION_ID_HEADER} must not be empty"));
+    }
+    if s.chars().count() > MAX_SESSION_ID_CHARS {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must be at most {MAX_SESSION_ID_CHARS} characters"
+        ));
+    }
+    Ok(Some(s.to_string()))
+}
 
 /// Request structure for pipeline execution
 #[derive(Debug, Deserialize)]
@@ -723,6 +751,13 @@ pub async fn execute_pipeline_by_name(
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     require_session(&app_state, &headers).await?;
 
+    let session_id = session_id_from_headers(&headers).map_err(|msg| {
+        (
+            StatusCode::BAD_REQUEST,
+            create_error_response(&msg, "parameter_validation_error", None),
+        )
+    })?;
+
     let start_time = Instant::now();
 
     tracing::info!(
@@ -813,12 +848,52 @@ pub async fn execute_pipeline_by_name(
         ));
     }
 
+    // Raw parameter values are never written to the ledger — only the
+    // pipeline name, which doubles as the join key back to the on-disk
+    // template. Committed *before* execution, so a write failure means the
+    // pipeline does not run at all: an audited server must not execute
+    // anything it cannot account for.
+    let audit_id = match &app_state.query_audit {
+        Some(store) => match store
+            .record_pipeline_started(&pipeline_name, session_id.as_deref())
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!("Pipeline audit write failed; refusing to execute: {e}");
+                let elapsed_ms = start_time.elapsed().as_millis() as f64;
+                app_state
+                    .metrics
+                    .record_error(&pipeline_name, elapsed_ms, "query_audit_error");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    create_error_response(
+                        "Query auditing is enabled but the audit record could not be \
+                         written; the pipeline was not executed",
+                        "query_audit_error",
+                        None,
+                    ),
+                ));
+            }
+        },
+        None => None,
+    };
+
     // Execute the query using the DataFusion engine
     let record_batch = match app_state.engine.execute(&sql).await {
         Ok(batch) => batch,
         Err(e) => {
             tracing::error!("Query execution failed: {}", e);
             tracing::debug!("Failed SQL query: {}", sql); // Log SQL for debugging but don't expose in response
+
+            finish_audit(
+                &app_state,
+                audit_id.as_deref(),
+                QueryAuditStatus::Failed,
+                None,
+                Some(&e.to_string()),
+            )
+            .await;
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state
@@ -840,11 +915,25 @@ pub async fn execute_pipeline_by_name(
         }
     };
 
-    // Convert RecordBatch to JSON
-    let data = match record_batch_to_json(&record_batch) {
+    // Convert RecordBatch to JSON.
+    //
+    // `record_batch_to_json` yields a `Box<dyn Error>`, which is not `Send`.
+    // Flatten it to a message up front: holding the box across the audit
+    // await below would make the whole handler future non-`Send` (see the
+    // identical note in `query_handlers::execute_query`).
+    let data = match record_batch_to_json(&record_batch).map_err(|e| e.to_string()) {
         Ok(json_data) => json_data,
         Err(e) => {
             tracing::error!("Failed to convert results to JSON: {}", e);
+
+            finish_audit(
+                &app_state,
+                audit_id.as_deref(),
+                QueryAuditStatus::Failed,
+                Some(record_batch.num_rows()),
+                Some(&e),
+            )
+            .await;
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state
@@ -852,7 +941,7 @@ pub async fn execute_pipeline_by_name(
                 .record_error(&pipeline_name, elapsed_ms, "result_conversion_error");
 
             let error_details = serde_json::json!({
-                "conversion_error": e.to_string(),
+                "conversion_error": e,
                 "record_batch_schema": format!("{:?}", record_batch.schema()),
                 "record_batch_rows": record_batch.num_rows()
             });
@@ -868,6 +957,15 @@ pub async fn execute_pipeline_by_name(
 
     let execution_time = start_time.elapsed().as_millis() as u64;
     let row_count = record_batch.num_rows();
+
+    finish_audit(
+        &app_state,
+        audit_id.as_deref(),
+        QueryAuditStatus::Succeeded,
+        Some(row_count),
+        None,
+    )
+    .await;
 
     app_state
         .metrics

@@ -34,7 +34,11 @@ const MAX_PURPOSE_CHARS: usize = 2000;
 
 /// Upper bound on the `session_id` field length (characters). It is an opaque
 /// grouping key, not a payload.
-const MAX_SESSION_ID_CHARS: usize = 200;
+///
+/// `pub(crate)`: also the cap for the pipeline execute endpoint's
+/// `x-skardi-session-id` header (see `pipeline_handlers::session_id_from_headers`)
+/// — one constant, so the two paths can't drift apart.
+pub(crate) const MAX_SESSION_ID_CHARS: usize = 200;
 
 /// Upper bound on the serialized size of the whole `ai_context` object (bytes).
 /// The object is free-form beyond its two required fields; the cap keeps a
@@ -126,7 +130,10 @@ fn validate_context_string(
 /// Unlike the pre-execution write, a failure here cannot un-run the query, so
 /// it is logged rather than surfaced: the row simply stays `started` and the
 /// next startup reconciles it to `unknown`. No-op when auditing is off.
-async fn finish_audit(
+///
+/// `pub(crate)`: also called from `pipeline_handlers::execute_pipeline_by_name`
+/// to stamp pipeline-execution outcomes onto the same ledger.
+pub(crate) async fn finish_audit(
     app_state: &AppState,
     audit_id: Option<&str>,
     status: QueryAuditStatus,
