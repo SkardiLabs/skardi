@@ -88,6 +88,26 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
     assert!(msg.contains("user_posts"), "the view is named: {msg}");
     assert!(msg.contains("DEGRADED"), "{msg}");
 
+    // The UDTF path reports the same degraded context — the registration
+    // error (Connection refused) must survive next to the fresh failure,
+    // never a bare timeout advising to "narrow the traversal".
+    let err = state
+        .session_ctx
+        .sql(
+            "SELECT user_name FROM cypher_query('kg', \
+             'MATCH (u:User) RETURN u.name AS user_name', '{}', \
+             '{\"user_name\": \"string\"}')",
+        )
+        .await
+        .expect("the UDTF plans against the declared columns")
+        .collect()
+        .await
+        .expect_err("the retried query fails");
+    let msg = err.to_string();
+    assert!(msg.contains("DEGRADED"), "{msg}");
+    assert!(msg.contains("Connection refused"), "{msg}");
+    assert!(!msg.contains("narrow the traversal"), "{msg}");
+
     // /data_source: the source reports its degraded status and enumerates
     // the view under its fully-qualified catalog name.
     let axum::Json(body) = get_data_sources(State(state))

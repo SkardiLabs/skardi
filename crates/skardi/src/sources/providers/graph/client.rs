@@ -797,9 +797,13 @@ fn map_query_error(source: &str, bounds: QueryBounds, e: &sqlx::Error) -> GraphE
             seconds: bounds.timeout.as_secs(),
         };
     }
-    // A pool-acquire timeout is the queueing flavor of the same bound.
+    // A pool-acquire timeout is NOT the statement timeout: sqlx retries
+    // a refused dial until the acquire deadline, so an unreachable
+    // backend surfaces as PoolTimedOut and the query never ran. The
+    // honest variant keeps "narrow the traversal" off an error it
+    // cannot help.
     if matches!(e, sqlx::Error::PoolTimedOut) {
-        return GraphError::Timeout {
+        return GraphError::ConnectionAcquireTimeout {
             seconds: bounds.timeout.as_secs(),
         };
     }
@@ -925,6 +929,26 @@ mod tests {
         assert!(validate_params(&serde_json::json!({"a": 1})).is_ok());
         let err = validate_params(&serde_json::json!([1])).unwrap_err();
         assert!(err.to_string().contains("an array"), "{err}");
+    }
+
+    #[test]
+    fn a_pool_acquire_timeout_is_not_misreported_as_a_statement_timeout() {
+        // sqlx retries a refused dial until the acquire deadline, so an
+        // UNREACHABLE backend surfaces as PoolTimedOut — the query never
+        // started. Mapping that to the statement Timeout would blame
+        // the query ("narrow the traversal") for a connection problem.
+        let bounds = QueryBounds {
+            timeout: std::time::Duration::from_secs(3),
+            max_rows: 10,
+        };
+        let err = map_query_error("kg", bounds, &sqlx::Error::PoolTimedOut);
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GraphError::ConnectionAcquireTimeout { seconds: 3 }),
+            "{msg}"
+        );
+        assert!(msg.contains("never started"), "{msg}");
+        assert!(!msg.contains("narrow the traversal"), "{msg}");
     }
 
     #[tokio::test]

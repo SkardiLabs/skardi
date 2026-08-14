@@ -75,7 +75,11 @@ hold every unrelated source hostage at startup):
   `GET /data_source` reports `status: "degraded"`, and the first scan
   retries the validation — failing loudly with the view name and the
   registration error if the backend is still gone, flipping the source
-  back to `healthy` once it answers.
+  back to `healthy` once it answers. The ad-hoc UDTF path behaves the
+  same way: a `cypher_query` / `graph_schema` call on a degraded source
+  IS the retry — a failure reports the registration error (the real
+  cause, e.g. connection refused) next to the fresh failure rather than
+  a bare timeout, and a success flips the source back to `healthy`.
 
 ## Ad-hoc queries
 

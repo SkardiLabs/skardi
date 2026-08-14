@@ -94,6 +94,19 @@ pub enum GraphError {
     )]
     Timeout { seconds: u64 },
 
+    /// No pooled connection became available within the bound. sqlx
+    /// retries a refused dial until the acquire deadline and then
+    /// surfaces `PoolTimedOut`, so an UNREACHABLE backend lands here —
+    /// not in a dial error. Distinct from [`GraphError::Timeout`]: the
+    /// query never started, so "narrow the traversal" would be
+    /// actively misleading advice.
+    #[error(
+        "could not acquire a connection to the graph backend within {seconds}s: the \
+         backend may be unreachable, or every pooled connection is checked out (the \
+         query never started)"
+    )]
+    ConnectionAcquireTimeout { seconds: u64 },
+
     /// A driver/backend failure. `code` is the backend's error code
     /// verbatim; `message` is a bounded snippet (see
     /// [`GraphError::backend`]).

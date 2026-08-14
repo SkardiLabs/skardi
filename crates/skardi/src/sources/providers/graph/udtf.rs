@@ -588,6 +588,43 @@ impl ExecutionPlan for GraphScanExec {
     }
 }
 
+/// The UDTF twin of the view path's degraded retry (view.rs's
+/// `ensure_healthy`): for a source registered DEGRADED, the caller's own
+/// query IS the re-validation — an ad-hoc call has no separate probe. A
+/// failure is wrapped with the registration error, so the real cause
+/// (the dial refused at startup) survives next to the fresh failure
+/// instead of surfacing as a bare acquire timeout; a success flips the
+/// source Healthy — the ONLY recovery route for a view-less or
+/// UDTF-only source, since view scans are what otherwise flip it.
+fn degraded_reason(handle: &GraphSourceHandle) -> Option<String> {
+    let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+    match &*health {
+        GraphSourceHealth::Healthy => None,
+        GraphSourceHealth::Degraded(reason) => Some(reason.clone()),
+    }
+}
+
+/// Flip a recovered source Healthy. Idempotent — racing scanners may
+/// both write; the transition is benign either way.
+fn mark_healthy(handle: &GraphSourceHandle) {
+    *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
+}
+
+/// Wrap an execution failure with the degraded registration context
+/// when the source is degraded; pass healthy sources' errors through
+/// untouched (they never carried a registration failure). The
+/// registration reason names the source (the clients build it from
+/// `backend_error`, whose text carries `on '{source}'`).
+fn degraded_execution_error(degraded: Option<String>, e: GraphError) -> DataFusionError {
+    match degraded {
+        Some(reason) => DataFusionError::Execution(format!(
+            "graph source is registered DEGRADED (registration error: {reason}); \
+             the query was retried against the backend and failed: {e}"
+        )),
+        None => execution_error(e),
+    }
+}
+
 /// The cypher scan: run on first poll, then convert in batch-atomic
 /// chunks (design §Schema handling — the conversion batch is the defined
 /// atomic unit; a type mismatch fails the CURRENT batch before emission).
@@ -599,14 +636,27 @@ pub(crate) fn cypher_batches(
     limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
-        let rows = handle
+        let degraded = degraded_reason(&handle);
+        let rows = match handle
             .client
             .execute(&cypher, &params, columns.len(), handle.bounds, limit)
             .await
-            .map_err(execution_error)?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(execution_error)?;
+        {
+            Ok(stream) => stream.try_collect::<Vec<_>>().await,
+            Err(e) => Err(e),
+        };
+        let rows = match (rows, degraded) {
+            (Ok(rows), degraded) => {
+                // The backend answered — the source has recovered even
+                // if the conversion below rejects the rows (a contract
+                // problem, not a reachability one).
+                if degraded.is_some() {
+                    mark_healthy(&handle);
+                }
+                rows
+            }
+            (Err(e), degraded) => return Err(degraded_execution_error(degraded, e)),
+        };
         let mut batches = Vec::with_capacity(rows.len() / CONVERSION_BATCH_ROWS + 1);
         for (chunk_idx, chunk) in rows.chunks(CONVERSION_BATCH_ROWS).enumerate() {
             batches.push(
@@ -630,11 +680,16 @@ fn labels_batch(
     limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
-        let labels = handle
-            .client
-            .labels(handle.bounds, limit)
-            .await
-            .map_err(execution_error)?;
+        let degraded = degraded_reason(&handle);
+        let labels = match handle.client.labels(handle.bounds, limit).await {
+            Ok(labels) => {
+                if degraded.is_some() {
+                    mark_healthy(&handle);
+                }
+                labels
+            }
+            Err(e) => return Err(degraded_execution_error(degraded, e)),
+        };
         let mut names = arrow::array::StringBuilder::new();
         let mut kinds = arrow::array::StringBuilder::new();
         for (name, kind) in &labels {
@@ -733,6 +788,172 @@ mod tests {
             .collect()
             .await
             .expect("collect")
+    }
+
+    /// A client whose every call fails with the given backend error —
+    /// the degraded-retry tests' still-down backend.
+    #[derive(Debug)]
+    struct FailingClient {
+        message: String,
+    }
+
+    #[async_trait]
+    impl GraphClient for FailingClient {
+        async fn execute(
+            &self,
+            _cypher: &str,
+            _params: &Value,
+            _arity: usize,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
+            Err(GraphError::backend("kg", "io", &self.message))
+        }
+
+        async fn labels(
+            &self,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<Vec<(String, String)>, GraphError> {
+            Err(GraphError::backend("kg", "io", &self.message))
+        }
+    }
+
+    fn sources_with_health(
+        health: GraphSourceHealth,
+        client: Arc<dyn GraphClient>,
+    ) -> GraphSources {
+        let handle = Arc::new(GraphSourceHandle {
+            client,
+            bounds: QueryBounds {
+                timeout: std::time::Duration::from_secs(5),
+                max_rows: 100,
+            },
+            health: Arc::new(RwLock::new(health)),
+        });
+        Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
+    }
+
+    fn health_of(sources: &GraphSources) -> GraphSourceHealth {
+        sources
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get("kg")
+            .expect("kg registered")
+            .health
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_degraded_source_reports_the_registration_reason_not_a_bare_timeout() {
+        // The P1 regression shape: a degraded source's UDTF failure used
+        // to surface as a bare acquire/statement timeout — the real
+        // cause (the dial refused at registration) was swallowed, and
+        // the timeout's "narrow the traversal" advice was actively
+        // misleading for a backend that was never reached.
+        let sources = sources_with_health(
+            GraphSourceHealth::Degraded(
+                "graph backend error on 'kg' [io]: Connection refused".to_string(),
+            ),
+            Arc::new(FailingClient {
+                message: "could not acquire a connection".to_string(),
+            }),
+        );
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("registration");
+        let err = ctx
+            .sql(
+                "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', '{}', \
+                 '{\"name\": \"string\"}')",
+            )
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("the retried query fails");
+        let msg = err.to_string();
+        assert!(msg.contains("DEGRADED"), "{msg}");
+        assert!(
+            msg.contains("Connection refused"),
+            "the registration error survives: {msg}"
+        );
+        assert!(
+            msg.contains("could not acquire a connection"),
+            "the fresh failure rides along: {msg}"
+        );
+        assert!(
+            !msg.contains("narrow the traversal"),
+            "no misleading advice: {msg}"
+        );
+        // A failed retry leaves the source degraded.
+        assert!(!health_of(&sources).is_healthy());
+
+        // graph_schema takes the same path.
+        let err = ctx
+            .sql("SELECT * FROM graph_schema('kg')")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("labels fail too");
+        assert!(err.to_string().contains("DEGRADED"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_successful_query_on_a_degraded_source_flips_it_healthy() {
+        // The UDTF path is the ONLY recovery route for a view-less (or
+        // UDTF-only) source: without the flip, /data_source would report
+        // degraded forever even after the backend recovered.
+        let sources = sources_with_health(
+            GraphSourceHealth::Degraded("connection refused at startup".to_string()),
+            Arc::new(MockClient {
+                rows: vec![vec![serde_json::json!("ada")]],
+                labels: vec![("Person".to_string(), "vertex".to_string())],
+            }),
+        );
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("registration");
+        let batches = collect(
+            &ctx,
+            "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', '{}', \
+             '{\"name\": \"string\"}')",
+        )
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert!(
+            health_of(&sources).is_healthy(),
+            "a successful retry flips the source healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_source_failure_is_not_wrapped_in_degraded_context() {
+        let sources = sources_with_health(
+            GraphSourceHealth::Healthy,
+            Arc::new(FailingClient {
+                message: "syntax error at or near".to_string(),
+            }),
+        );
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, sources).expect("registration");
+        let err = ctx
+            .sql(
+                "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', '{}', \
+                 '{\"name\": \"string\"}')",
+            )
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("the backend error passes through");
+        let msg = err.to_string();
+        assert!(msg.contains("syntax error at or near"), "{msg}");
+        assert!(
+            !msg.contains("DEGRADED"),
+            "a healthy source never had a registration error to cite: {msg}"
+        );
     }
 
     #[tokio::test]
