@@ -5,9 +5,15 @@
 //!
 //! The degraded state machine lives here: a source registered while its
 //! backend was unreachable carries [`GraphSourceHealth::Degraded`], and
-//! the FIRST scan of any of its views retries the live validation —
-//! success flips the source Healthy and the scan proceeds; failure is
-//! loud, naming the view and the underlying cause.
+//! the FIRST scan of any of its views retries the live validation of ALL
+//! the source's views — success flips the source Healthy and the scan
+//! proceeds; failure is loud, naming the failing view and the underlying
+//! cause. Re-proving every view keeps the recovery path at the same
+//! contract strength as the reachable-registration path (which refuses
+//! the source unless every view validates): without it, a
+//! contract-violating view would silently downgrade from
+//! "registration refused" to "scan-time conversion error" the moment any
+//! OTHER view's scan flipped the source healthy.
 
 use std::any::Any;
 use std::fmt;
@@ -26,6 +32,21 @@ use serde_json::Value;
 use super::error::GraphError;
 use super::udtf::{GraphScanExec, GraphScanKind, GraphSourceHandle, GraphSourceHealth};
 use super::value::{DeclaredColumn, build_batch, declared_schema};
+
+/// One view's validation contract — everything `validate_view` needs to
+/// re-prove the view against a recovered backend. Stored on the source
+/// handle at registration so the degraded retry can re-validate ALL of
+/// the source's views, not just the one being scanned (see the module
+/// doc for why recovery must match registration's contract strength).
+#[derive(Debug)]
+pub struct ViewContract {
+    /// The view (catalog table) name.
+    pub name: String,
+    /// The view's fixed Cypher text.
+    pub cypher: String,
+    /// The declared output columns, nullable bits included.
+    pub columns: Vec<DeclaredColumn>,
+}
 
 /// One YAML-declared view: fixed Cypher + declared schema, registered as
 /// a catalog table. The schema is precomputed at registration (the
@@ -56,11 +77,11 @@ impl GraphViewProvider {
         }
     }
 
-    /// The degraded retry: a Degraded source re-validates this view
-    /// against the backend on first scan and flips Healthy on success; a
-    /// failed retry is the loud error the design asks for ("the first
-    /// scan retries the validation and fails loudly"). The lock is
-    /// dropped BEFORE the await — never held across it.
+    /// The degraded retry: a Degraded source re-validates ALL of its
+    /// views against the backend on first scan and flips Healthy on
+    /// success; a failed retry is the loud error the design asks for
+    /// ("the first scan retries the validation and fails loudly"). The
+    /// lock is dropped BEFORE the await — never held across it.
     async fn ensure_healthy(&self) -> DFResult<()> {
         let registration_error = {
             let health = self.handle.health.read().unwrap_or_else(|p| p.into_inner());
@@ -72,15 +93,14 @@ impl GraphViewProvider {
         let Some(registration_error) = registration_error else {
             return Ok(());
         };
-        validate_view(&self.handle, &self.view_name, &self.cypher, &self.columns)
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "graph view '{}' is registered DEGRADED (registration error: \
-                     {registration_error}) and its first-scan re-validation failed: {e}",
-                    self.view_name
-                ))
-            })?;
+        revalidate_all_views(&self.handle).await.map_err(|e| {
+            DataFusionError::Execution(format!(
+                "graph source of view '{}' is registered DEGRADED (registration \
+                     error: {registration_error}) and its first-scan re-validation \
+                     failed: {e}",
+                self.view_name
+            ))
+        })?;
         // Two racing scans may both validate and both flip — benign: the
         // transition is idempotent and the validation is read-only.
         *self
@@ -173,6 +193,20 @@ pub(crate) async fn validate_view(
     Ok(())
 }
 
+/// Re-prove every view contract of a source against the (recovered)
+/// backend. This is what keeps the degraded-recovery path at the same
+/// contract strength as reachable registration: there, ANY view failing
+/// validation refuses the source; here, any view failing re-validation
+/// keeps the source degraded and names the failing view. A source with
+/// no views has nothing to re-prove — the caller's own successful query
+/// is the recovery evidence (the UDTF path in udtf.rs relies on that).
+pub(crate) async fn revalidate_all_views(handle: &GraphSourceHandle) -> Result<(), GraphError> {
+    for contract in handle.view_contracts.iter() {
+        validate_view(handle, &contract.name, &contract.cypher, &contract.columns).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +278,13 @@ mod tests {
                 max_rows: 100,
             },
             health: Arc::new(RwLock::new(health)),
+            // The provider under test is this source's only view, so its
+            // contract is the whole re-validation set.
+            view_contracts: Arc::new(vec![ViewContract {
+                name: "user_posts".to_string(),
+                cypher: "MATCH (u:User) RETURN u.name".to_string(),
+                columns: columns(),
+            }]),
         });
         (handle, calls)
     }
@@ -280,6 +321,92 @@ mod tests {
             .await?
             .collect()
             .await
+    }
+
+    /// Fails only when the Cypher carries the marker — the two-view
+    /// re-validation test's way to break one contract and not the other.
+    #[derive(Debug)]
+    struct PickyMock {
+        fail_marker: &'static str,
+    }
+
+    #[async_trait]
+    impl GraphClient for PickyMock {
+        async fn execute(
+            &self,
+            cypher: &str,
+            _params: &Value,
+            _arity: usize,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
+            if cypher.contains(self.fail_marker) {
+                return Err(GraphError::backend(
+                    "kg",
+                    "42804",
+                    "return row and column definition list do not match",
+                ));
+            }
+            Ok(stream::iter(vec![vec![serde_json::json!("ada")]].into_iter().map(Ok)).boxed())
+        }
+
+        async fn labels(
+            &self,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<Vec<(String, String)>, GraphError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_revalidates_every_view_not_just_the_scanned_one() {
+        // The contract-strength parity pin: the SCANNED view is fine, but
+        // a sibling view on the same source violates its contract — the
+        // source must stay degraded and the error must name the broken
+        // view. Reachable registration refuses the source unless every
+        // view validates; recovery holds the same line, or the broken
+        // view would silently downgrade to a scan-time conversion error.
+        let handle = Arc::new(GraphSourceHandle {
+            client: Arc::new(PickyMock {
+                fail_marker: "Broken",
+            }),
+            bounds: QueryBounds {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            health: Arc::new(RwLock::new(GraphSourceHealth::Degraded(
+                "connection refused".to_string(),
+            ))),
+            view_contracts: Arc::new(vec![
+                ViewContract {
+                    name: "good_view".to_string(),
+                    cypher: "MATCH (g:Good) RETURN g.name".to_string(),
+                    columns: columns(),
+                },
+                ViewContract {
+                    name: "broken_view".to_string(),
+                    cypher: "MATCH (b:Broken) RETURN b.name".to_string(),
+                    columns: columns(),
+                },
+            ]),
+        });
+        let provider = GraphViewProvider::new(
+            handle.clone(),
+            "good_view".to_string(),
+            "MATCH (g:Good) RETURN g.name".to_string(),
+            columns(),
+        );
+        let err = scan_rows(provider)
+            .await
+            .expect_err("a broken sibling view blocks the recovery flip");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("broken_view"),
+            "the failing view is named: {msg}"
+        );
+        assert!(msg.contains("DEGRADED"), "{msg}");
+        assert!(!is_healthy(&handle), "the source stays degraded");
     }
 
     #[tokio::test]

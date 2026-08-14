@@ -101,9 +101,16 @@ pub struct GraphSourceHandle {
     pub bounds: QueryBounds,
     /// Registration-time health (design §Schema handling): a source whose
     /// backend was unreachable at registration is Degraded with the
-    /// registration error's summary; the first view scan retries
-    /// validation and flips this back to Healthy on success.
+    /// registration error's summary; the first scan retries validation
+    /// and flips this back to Healthy on success.
     pub health: Arc<RwLock<GraphSourceHealth>>,
+    /// The validation contract of every YAML view on this source, kept so
+    /// the degraded recovery re-proves ALL of them before the source
+    /// flips Healthy — the same strength as reachable registration, which
+    /// refuses the source unless every view validates. Empty for
+    /// view-less sources (the engine API included), where a successful
+    /// query is itself the recovery evidence.
+    pub view_contracts: Arc<Vec<super::view::ViewContract>>,
 }
 
 /// Registration-time health of a graph source.
@@ -625,6 +632,30 @@ fn degraded_execution_error(degraded: Option<String>, e: GraphError) -> DataFusi
     }
 }
 
+/// Recovery after a successful backend answer on a degraded source:
+/// re-prove the source's view contracts, then flip Healthy. This holds
+/// the recovery path to the same contract strength as reachable
+/// registration (which refuses a source unless EVERY view validates) —
+/// otherwise a contract-violating view would silently downgrade from
+/// "registration refused" to "scan-time conversion error" the moment an
+/// ad-hoc query flipped the source. For a view-less source there is
+/// nothing to re-prove and the successful query is itself the evidence.
+async fn recover_if_degraded(handle: &GraphSourceHandle, degraded: bool) -> DFResult<()> {
+    if !degraded {
+        return Ok(());
+    }
+    super::view::revalidate_all_views(handle)
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "the query succeeded against the recovered backend, but the source's \
+                 view re-validation failed and it stays degraded: {e}"
+            ))
+        })?;
+    mark_healthy(handle);
+    Ok(())
+}
+
 /// The cypher scan: run on first poll, then convert in batch-atomic
 /// chunks (design §Schema handling — the conversion batch is the defined
 /// atomic unit; a type mismatch fails the CURRENT batch before emission).
@@ -647,12 +678,9 @@ pub(crate) fn cypher_batches(
         };
         let rows = match (rows, degraded) {
             (Ok(rows), degraded) => {
-                // The backend answered — the source has recovered even
-                // if the conversion below rejects the rows (a contract
-                // problem, not a reachability one).
-                if degraded.is_some() {
-                    mark_healthy(&handle);
-                }
+                // The backend answered — re-prove the view contracts and
+                // flip Healthy (a no-op for healthy sources).
+                recover_if_degraded(&handle, degraded.is_some()).await?;
                 rows
             }
             (Err(e), degraded) => return Err(degraded_execution_error(degraded, e)),
@@ -683,9 +711,7 @@ fn labels_batch(
         let degraded = degraded_reason(&handle);
         let labels = match handle.client.labels(handle.bounds, limit).await {
             Ok(labels) => {
-                if degraded.is_some() {
-                    mark_healthy(&handle);
-                }
+                recover_if_degraded(&handle, degraded.is_some()).await?;
                 labels
             }
             Err(e) => return Err(degraded_execution_error(degraded, e)),
@@ -765,6 +791,7 @@ mod tests {
                 max_rows: 100,
             },
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+            view_contracts: Arc::new(vec![]),
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }
@@ -830,6 +857,7 @@ mod tests {
                 max_rows: 100,
             },
             health: Arc::new(RwLock::new(health)),
+            view_contracts: Arc::new(vec![]),
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }

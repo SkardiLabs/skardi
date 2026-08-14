@@ -55,6 +55,18 @@ Every column defaults to `nullable: true`; a view may declare
 column is a typed error naming the column and row, not a silent
 corruption.
 
+## A view's Cypher must carry its own bound
+
+SQL-side predicates over a view do NOT push down into its Cypher:
+`SELECT * FROM kg.main.people WHERE name = 'ada'` fetches the view's
+rows (up to `max_rows`) and filters locally. A SQL `LIMIT` does push to
+the consumption side (the fetch stops early), but a bare `WHERE` over a
+view larger than `max_rows` fails with a typed `RowCapExceeded` — even
+when the query wants one row. So write selective reads INTO the view's
+Cypher (`WHERE` / `LIMIT` there), or use the ad-hoc `cypher_query`
+where the predicate is yours to place. Filter→Cypher parameterization
+is a possible future improvement; today the bound lives in the view.
+
 ## Registration semantics: healthy, degraded, refused
 
 Availability and contract violations part ways deliberately (this
@@ -73,13 +85,17 @@ hold every unrelated source hostage at startup):
 - **Unreachable backend** → the source registers DEGRADED: views still
   register with their declared (planning-sufficient) schemas,
   `GET /data_source` reports `status: "degraded"`, and the first scan
-  retries the validation — failing loudly with the view name and the
-  registration error if the backend is still gone, flipping the source
-  back to `healthy` once it answers. The ad-hoc UDTF path behaves the
-  same way: a `cypher_query` / `graph_schema` call on a degraded source
-  IS the retry — a failure reports the registration error (the real
-  cause, e.g. connection refused) next to the fresh failure rather than
-  a bare timeout, and a success flips the source back to `healthy`.
+  retries the validation of ALL the source's views — failing loudly
+  with the failing view's name and the registration error if the
+  backend is still gone or a view no longer matches, flipping the
+  source back to `healthy` only when every view re-validates (the same
+  all-or-nothing line reachable registration holds). The ad-hoc UDTF
+  path behaves the same way: a `cypher_query` / `graph_schema` call on
+  a degraded source IS the retry — a failure reports the registration
+  error (the real cause, e.g. connection refused) next to the fresh
+  failure rather than a bare timeout, and a success flips the source
+  back to `healthy` once the view contracts re-prove (immediately, for
+  a view-less source).
 
 ## Ad-hoc queries
 

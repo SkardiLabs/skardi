@@ -135,6 +135,9 @@ pub async fn register_graph_source(
         },
         // connect() preflighted successfully, or we would not be here.
         health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+        // The engine-level entry registers no views (no session context
+        // to put them in), so there are no contracts to re-prove.
+        view_contracts: Arc::new(vec![]),
     });
     // Poisoning degrades gracefully (AGENTS.md convention) — and it also
     // keeps InvalidConfig meaning what it says instead of moonlighting as
@@ -288,6 +291,7 @@ pub async fn register_graph_tables(
                     client: Arc::clone(&client),
                     bounds,
                     health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+                    view_contracts: Arc::new(vec![]),
                 };
                 validate_view(&probe, &view.name, &view.cypher, &columns).await?;
             }
@@ -325,6 +329,22 @@ pub async fn register_graph_tables(
         client,
         bounds,
         health: Arc::new(RwLock::new(health)),
+        // The recovery contract: a degraded source flips Healthy only
+        // after EVERY view re-validates — the same all-or-nothing line
+        // reachable registration holds.
+        view_contracts: Arc::new(
+            config
+                .views
+                .iter()
+                .map(|v| {
+                    Ok(view::ViewContract {
+                        name: v.name.clone(),
+                        cypher: v.cypher.clone(),
+                        columns: v.declared_columns()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, GraphError>>()?,
+        ),
     });
     if !config.views.is_empty() {
         let catalog = Arc::new(MemoryCatalogProvider::new());
@@ -502,6 +522,7 @@ views:
                     max_rows: 10,
                 },
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+                view_contracts: Arc::new(vec![]),
             }),
         );
         let mut ctx = SessionContext::new();
