@@ -886,12 +886,18 @@ pub async fn execute_pipeline_by_name(
             tracing::error!("Query execution failed: {}", e);
             tracing::debug!("Failed SQL query: {}", sql); // Log SQL for debugging but don't expose in response
 
+            // A fixed, value-free error kind — not `e.to_string()`. Parameter
+            // values are substituted directly into `sql` as literals, and a
+            // type-mismatch engine error can quote the offending literal back
+            // (e.g. `price <= 'not-a-number'`). Persisting the raw engine
+            // error would smuggle a caller-supplied parameter value into the
+            // ledger, which parameter values must never enter.
             finish_audit(
                 &app_state,
                 audit_id.as_deref(),
                 QueryAuditStatus::Failed,
                 None,
-                Some(&e.to_string()),
+                Some("query_execution_error"),
             )
             .await;
 
@@ -926,12 +932,16 @@ pub async fn execute_pipeline_by_name(
         Err(e) => {
             tracing::error!("Failed to convert results to JSON: {}", e);
 
+            // A fixed, value-free error kind, for the same reason as the
+            // engine-execution branch above: substituted parameter values can
+            // echo through error text derived from the query/result, and
+            // parameter values must never reach the ledger.
             finish_audit(
                 &app_state,
                 audit_id.as_deref(),
                 QueryAuditStatus::Failed,
                 Some(record_batch.num_rows()),
-                Some(&e),
+                Some("result_conversion_error"),
             )
             .await;
 
