@@ -114,6 +114,14 @@
 //!   a table that still answers. Accepted consequence: emitted-key
 //!   drift surfaces as a wholly-NULL column, which is a contract alarm
 //!   to investigate, never mail that genuinely has no sender.
+//!   The identity columns differ between the two tables for a
+//!   structural reason, not a change of mind: `messages` carries
+//!   `messageId`/`threadId` at the row's top level, while `drafts`
+//!   reaches them through a `message` parent, and a nullable column
+//!   behind a JSON-null parent must become SQL NULL rather than fail
+//!   (the admission gate's null-parent category, pinned by
+//!   `null_parent_on_a_nested_path_becomes_sql_null`). Non-null there
+//!   would convert a nulled-out parent into a dead scan.
 //! - **Fingerprints are pinned** from a live gateway capture
 //!   (`fixtures/gmail/contracts/`, gateway v1.3.4) and cover the whole
 //!   declared schema, `anyOf` branches included — the hash is over
