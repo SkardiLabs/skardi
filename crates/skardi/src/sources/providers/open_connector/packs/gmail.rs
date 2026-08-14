@@ -638,8 +638,8 @@ mod tests {
 
     #[test]
     fn columns_the_coverage_walker_cannot_resolve_are_pinned() {
-        // Named for what it pins, because gmail's case is NOT the other
-        // packs': theirs report columns that upstream leaves to
+        // Named for what it pins, because gmail's case is not github's,
+        // slack's or feishu's: theirs report columns upstream leaves to
         // `additionalProperties` passthrough — genuinely undeclared, so
         // genuinely outside the gate. Here the `messages` paths ARE
         // declared; `fingerprint_uncovered_columns` reads `properties`
@@ -649,6 +649,9 @@ mod tests {
         // schema, anyOf included, so declared drift still fails
         // registration. Pinned so the walker's blind spot stays visible
         // — teaching it to descend branch schemas would make this `&[]`.
+        // (notion's pin is a mix of both: most of its search-backed paths
+        // are declared inside the same kind of anyOf, a couple —
+        // `is_archived`, `public_url` — genuinely are not.)
         for (short, contract, expected) in [
             (
                 "threads",

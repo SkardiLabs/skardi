@@ -159,11 +159,31 @@ impl tracing::Subscriber for CaptureSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-/// Mapped columns whose dotted path is NOT declared in a captured
-/// contract's row-item schema — the subset the fingerprint gate cannot
-/// protect, because upstream leaves those fields to `additionalProperties`
-/// passthrough. Packs pin this set explicitly so the coverage gap is a
-/// conscious, reviewed fact rather than an implicit one.
+/// Mapped columns this walker cannot resolve under `properties` in a
+/// captured contract's row-item schema. Packs pin the set explicitly so it
+/// stays a conscious, reviewed fact.
+///
+/// **Read the result carefully — it conflates two different situations,
+/// and only one of them is a gap in the fingerprint gate.**
+///
+/// 1. *Genuinely undeclared*: upstream leaves the field to
+///    `additionalProperties` passthrough, so nothing about it is in the
+///    schema and the fingerprint cannot notice it changing. A real gap;
+///    only phase-4 real rows vouch for those columns. (github, slack, and
+///    every feishu table, whose item schemas are declared wholly loose.)
+/// 2. *Declared but unreachable by THIS walker*: the path is declared,
+///    just not under a plain `properties` chain — typically inside an
+///    `anyOf` branch, which this function does not descend. The
+///    fingerprint hashes the whole schema including those branches, so
+///    declared drift there still fails registration. Nothing is
+///    unprotected; the walker is simply blind. (Every gmail `messages`
+///    column; most of notion's search-backed ones.)
+///
+/// Teaching the walker to descend branch schemas would empty case 2 and
+/// leave case 1 — but registration cannot know which branch a runtime
+/// input selects, so the honest reduction is the intersection of the
+/// branches' declarations. Each pack's pin comment says which case it is
+/// in; do not read a non-empty list here as "outside the gate".
 pub(crate) fn fingerprint_uncovered_columns(
     contract: &str,
     row_path: &str,
