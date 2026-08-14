@@ -42,8 +42,7 @@
 
 **The most agent-friendly backend for builders shipping their first AI agent.** The painful part of agent-building isn't the prompt — it's the data plumbing: a vector DB to stand up, an embedding pipeline to maintain, a chunker to debug, a tool-call wrapper to write for every query. Skardi auto-bootstraps the primitives every agent needs so you ship in hours, not weeks:
 
-- **[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag) — Auto-RAG (Retrieval Augmented Generation).** Server-backed hybrid search (vector + full-text + RRF) via `skardi-server` over a datastore you already control (Postgres + pgvector, MongoDB, or Lance). The skill renders the config, starts the server, and drives ingestion and queries through REST. One command from a datastore to a working retrieval API your agent calls as a tool — no Python orchestration layer, no glue code.
-- **[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) — Auto agent knowledge base.** Point it at a directory of documents and you have a queryable, citable local KB one command later. Chunking, embedding, indexing, and hybrid search are exposed to your agent as a `skardi run` verb. Zero infra by default (SQLite + local embeddings), so any Claude Code / Cursor session gets a grounded knowledge base over your files.
+- **[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context) — governed, searchable context in one command.** Point it at a folder of documents and you have a queryable, citable knowledge base a command later — zero infra by default (SQLite + local embeddings). Point it at a datastore you already control (Postgres + pgvector, MongoDB, or Lance) and you get the same hybrid search (vector + full-text + RRF) served over REST by `skardi-server`. Chunking, embedding, indexing and query are rendered for you; your agent calls the result as a tool. No Python orchestration layer, no glue code.
 - **Zero bootstrap** — `ctx.yaml`, pipelines, schema, server, all rendered for you by **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Install once and your agent has a working data tool the same hour.
 
 You build the agent. Skardi handles the data plane.
@@ -56,9 +55,7 @@ Open any Claude Code session and run:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
-/plugin install skardi-deploy-and-patterns@skardi-skills
-/plugin install auto-knowledge-base@skardi-skills
-/plugin install auto-rag@skardi-skills
+/plugin install auto-context@skardi-skills
 ```
 
 That's it — the skills are now available across all your projects, and `/plugin marketplace update skardi-skills` pulls future versions. For Cursor and other [Agent Skills](https://agentskills.io/)-compatible tools, plus a manual-copy fallback, see the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
@@ -69,7 +66,7 @@ Curious why a uniform plane matters? Read on.
 
 ## ⭐️ Star the Repository
 
-If **skardi-skills** lands well in your agentic stack — auto-RAG up in a minute, a knowledge base your agent actually grounds in — drop a ⭐️ on this repo. It helps other agent builders discover Skardi, makes onboarding their first agent that much shorter, and signals which directions are worth pushing on.
+If **skardi-skills** lands well in your agentic stack — searchable context up in a minute, a knowledge base your agent actually grounds in — drop a ⭐️ on this repo. It helps other agent builders discover Skardi, makes onboarding their first agent that much shorter, and signals which directions are worth pushing on.
 
 <p align="center">
   <a href="https://github.com/SkardiLabs/skardi">
@@ -222,7 +219,7 @@ skardi query -e "SELECT * FROM products LIMIT 10" --table
 YAML from [`demo/llm_wiki/cli/`](demo/llm_wiki/cli/) — the actual file, not
 pseudo-code:
 
-> ⚠️ Unlike Steps 1–2 (zero-dependency), this hybrid-search pipeline also needs a local embedding model at `models/…` + the `sqlite-vec` extension (`SQLITE_VEC_PATH`) and a seeded DB — so it is **not runnable by copy-paste alone**. The [`auto_knowledge_base` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base) sets all of this up for you; use it if you just want the pipeline working.
+> ⚠️ Unlike Steps 1–2 (zero-dependency), this hybrid-search pipeline also needs a local embedding model at `models/…` + the `sqlite-vec` extension (`SQLITE_VEC_PATH`) and a seeded DB — so it is **not runnable by copy-paste alone**. The [`auto_context` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context) sets all of this up for you; use it if you just want the pipeline working.
 
 ```yaml
 # pipelines/search_hybrid.yaml — declares the SQL once; Skardi infers the params
