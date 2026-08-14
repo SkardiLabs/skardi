@@ -223,6 +223,50 @@ impl QueryAuditStore {
         Ok(id)
     }
 
+    /// Insert a `started` row for a pipeline execution.
+    ///
+    /// Stores the pipeline *name* in the `sql` column: the template lives on
+    /// disk with no secrets, and the name is the join key to it and to the
+    /// pipeline's `description` (which carries the purpose). Parameter values
+    /// are deliberately never recorded — they are where PII lives. `ai_context`
+    /// is left NULL rather than synthesized so the column always means
+    /// "caller-sent object".
+    pub async fn record_pipeline_started(
+        &self,
+        pipeline_name: &str,
+        session_id: Option<&str>,
+    ) -> Result<String> {
+        let id = new_id();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let name = pipeline_name.to_string();
+        let session_id = session_id.map(str::to_string);
+        let row_id = id.clone();
+
+        self.conn
+            .call(move |conn| -> SqlResult<()> {
+                conn.execute(
+                    "INSERT INTO query_audit
+                        (id, created_at, sql, ai_context, session_id, max_rows,
+                         statement_kind, status)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                    params![
+                        row_id,
+                        created_at,
+                        name,
+                        session_id,
+                        PIPELINE_MAX_ROWS_SENTINEL,
+                        PIPELINE_STATEMENT_KIND,
+                        QueryAuditStatus::Started.as_str(),
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .context("Failed to write pre-execution pipeline-audit record")?;
+
+        Ok(id)
+    }
+
     /// Update a record with its terminal outcome.
     pub async fn record_outcome(
         &self,
@@ -414,6 +458,13 @@ fn restrict_permissions(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
+
+/// Statement-kind marker distinguishing pipeline rows from ad-hoc SQL rows.
+pub const PIPELINE_STATEMENT_KIND: &str = "pipeline";
+
+/// `max_rows` does not apply to pipeline executions, but the column is NOT
+/// NULL; pipeline rows store this sentinel.
+const PIPELINE_MAX_ROWS_SENTINEL: i64 = 0;
 
 /// Random-ish unique row id. Avoids a `uuid` dependency: the timestamp keeps
 /// ids ordered and the counter disambiguates within the same nanosecond.
@@ -607,5 +658,65 @@ mod tests {
         let reopened = QueryAuditStore::open(&path).await.unwrap();
         let record = reopened.get(&id).await.unwrap().unwrap();
         assert_eq!(record["sql"], json!("SELECT 'durable'"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_row_round_trips() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_pipeline_started("weekly-churn", Some("sess-1"))
+            .await
+            .unwrap();
+        store
+            .record_outcome(&id, QueryAuditStatus::Succeeded, Some(42), None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["sql"], json!("weekly-churn"));
+        assert_eq!(row["statement_kind"], json!("pipeline"));
+        assert_eq!(row["session_id"], json!("sess-1"));
+        assert_eq!(row["max_rows"], json!(0));
+        assert_eq!(row["row_count"], json!(42));
+        assert!(row["ai_context"].is_null());
+    }
+
+    #[tokio::test]
+    async fn pipeline_row_without_session_has_null_session_id() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_pipeline_started("weekly-churn", None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert!(row["session_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_by_session_interleaves_queries_and_pipelines() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let ctx = serde_json::json!({"purpose": "p", "session_id": "sess-mix"});
+        store
+            .record_started("SELECT 1", Some(&ctx), 10, "Query")
+            .await
+            .unwrap();
+        store
+            .record_pipeline_started("weekly-churn", Some("sess-mix"))
+            .await
+            .unwrap();
+        let rows = store.list_by_session("sess-mix").await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn orphaned_pipeline_rows_reconcile_to_unknown() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_pipeline_started("weekly-churn", None)
+            .await
+            .unwrap();
+        let n = store.reconcile_orphaned("test restart").await.unwrap();
+        assert_eq!(n, 1);
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
     }
 }
