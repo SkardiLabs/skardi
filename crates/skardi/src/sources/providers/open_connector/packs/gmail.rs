@@ -89,21 +89,30 @@
 //!   in-band error envelope (`assertGmailResponse` throws on non-2xx),
 //!   so provider failures arrive as gateway failure envelopes, pinned by
 //!   an e2e test.
-//! - **Nullability follows the captured contract**: identity fields
-//!   non-null (`thread_id`, `message_id` + its `thread_id`, the raw
-//!   `id`s), and every `messages` column non-null — both non-ids
-//!   branches of the pinned `fetch_emails` contract `require` all seven
-//!   fields, and the executor's fallbacks keep the keys present (`""`
-//!   headers, `[]` labelIds). Since `messages` rides outside the
-//!   fingerprint gate (next bullet), non-null is what turns emitted-key
-//!   drift into a loud `missing key` failure instead of a silently
-//!   all-NULL column. Everything else stays nullable.
+//! - **Nullability**: identity fields non-null (`thread_id`,
+//!   `message_id` + its `thread_id`, the raw `id`s), and every
+//!   `messages` column non-null. The basis is the executor, not the
+//!   schema's `required`: under the pinned `detail: summary` the
+//!   summary shape is an unconditional object literal, so all seven
+//!   keys are always emitted (`""` headers, `[]` labelIds). What
+//!   non-null buys is a tripwire on *emitted-key* drift — an upstream
+//!   change that stops emitting a key without changing the declared
+//!   schema, which the fingerprint gate cannot see (it compares
+//!   declarations). Such drift is not hypothetical: `list_drafts`
+//!   declares its `message` object with all seven fields `require`d,
+//!   yet its non-verbose path emits only `messageId`/`threadId` — the
+//!   captured `drafts.json` shows exactly that, which is why the drafts
+//!   columns stay nullable. Everything else stays nullable.
 //! - **Fingerprints are pinned** from a live gateway capture
-//!   (`fixtures/gmail/contracts/`, gateway v1.3.4). `fetch_emails`
-//!   declares its row items as an `anyOf` (ids | summary | full) the
-//!   coverage walker does not descend, so every `messages` column rides
-//!   outside the fingerprint gate — the coverage-gap pin records that
-//!   honestly; drift there surfaces at scan time per conversion rules.
+//!   (`fixtures/gmail/contracts/`, gateway v1.3.4) and cover the whole
+//!   declared schema, `anyOf` branches included — the hash is over
+//!   canonical JSON, so a renamed field inside `fetch_emails`' row
+//!   items fails registration like anywhere else. What the coverage-gap
+//!   pin records is narrower: the test walker
+//!   (`fingerprint_uncovered_columns`) reads `properties` only and does
+//!   not descend `anyOf`, so it cannot confirm the `messages` paths are
+//!   declared. A tooling limit, pinned so it stays visible — not a hole
+//!   in the gate.
 //! - **Column sets are verified against REAL wire rows**, end to end
 //!   against a live mailbox through the gateway (2026-08-05, gateway
 //!   v1.3.4): registration passed the fingerprint gate against live
@@ -471,12 +480,15 @@ mod tests {
 
     #[test]
     fn fingerprint_coverage_gap_is_pinned() {
-        // fetch_emails declares its row items as an anyOf (ids | summary |
-        // full) the coverage walker does not descend, so every messages
-        // column rides additionalProperties passthrough — outside the
-        // fingerprint gate, drift surfacing at scan time. The other four
-        // tables' item schemas are plain objects and fully cover the
-        // mapped paths. Pinned so any change is a conscious decision.
+        // What this pins is a limit of the WALKER, not of the gate: this
+        // helper reads `properties` only, and fetch_emails declares its
+        // row items as an anyOf (ids | summary | full), so it reports
+        // every messages column as uncovered even though the summary and
+        // full branches declare all seven. The fingerprint itself hashes
+        // the whole schema, anyOf included, so declared drift still fails
+        // registration. The other four tables' item schemas are plain
+        // objects the walker can read. Pinned so the blind spot stays
+        // visible and any change to it is a conscious decision.
         for (short, contract, expected) in [
             (
                 "threads",
@@ -843,6 +855,56 @@ bindings:
                 input_keys(&inputs[0]),
                 Vec::<&str>::new(),
                 "{action}: empty input object"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_page_tables_scan_an_empty_collection_cleanly() {
+        // An empty single-page collection is an empty result set, not an
+        // error: the cursor tables pin this shape in the resources e2e,
+        // and labels/filters need their own because they take the
+        // single_page path. It also localizes the known filters defect:
+        // a zero-filter mailbox breaks in the gateway's executor (empty
+        // BODY, not an empty collection) — were the body well-formed,
+        // everything from the envelope down handles it.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return gmail_discovery(&req.path);
+            }
+            if req.method == "POST" {
+                let empty = match req.path.as_str() {
+                    "/v1/actions/gmail.list_labels" => json!({"labels": []}),
+                    "/v1/actions/gmail.list_filters" => json!({"filters": []}),
+                    _ => return MockResponse::new(404, "{}"),
+                };
+                return MockResponse::ok(&envelope_ok(&empty.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_GMAIL_EMPTY_SINGLE",
+            "labels, filters",
+            "",
+        )
+        .await;
+
+        for table in ["labels", "filters"] {
+            let batches = collect(&ctx, &format!("SELECT id FROM saas.mail.{table}")).await;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                0,
+                "{table}: an empty collection is an empty result set"
+            );
+            assert_eq!(
+                execute_inputs(&gateway, &format!("gmail.list_{table}")).len(),
+                1,
+                "{table}: an empty page still means exactly one request"
             );
         }
     }

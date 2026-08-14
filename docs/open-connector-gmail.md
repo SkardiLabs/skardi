@@ -37,7 +37,9 @@ spec:
               query: "newer_than:90d"        # Gmail search syntax; threads + messages (drafts: not narrowed)
               labelIds: [INBOX]              # messages only
               includeSpamTrash: false        # messages only
-            tables: [threads, messages, drafts, labels, filters]
+            tables: [threads, messages, drafts, labels]
+            # `filters` is bindable too, but omitted here: it fails on a
+            # mailbox with zero filters (see the caveat below).
 ```
 
 ```sql
@@ -93,6 +95,10 @@ highlights and caveats:
   and `messages`, while `drafts` — whose gateway action accepts no
   narrowing inputs at all — lists the mailbox's drafts in full. A join
   across them is a join across two different slices.
+  The silent withholding stops at *no* declaring table: a key no bound
+  table accepts fails registration outright, so binding `labelIds` while
+  `tables:` omits `messages` is an error, not a no-op — narrow the
+  binding's tables and its resources together.
 - **`messages` pins `detail: summary`** — the bounded row shape (no
   bodies, no attachment trees). The gateway hydrates each listed message
   with a metadata `messages.get`, so a scanned page of 100 rows costs 101
@@ -132,11 +138,13 @@ highlights and caveats:
   scalar endpoint). Full message bodies (`detail: full`) are deferred to
   a future content-oriented surface.
 - **Action-contract fingerprints are pinned** from a live capture
-  (`packs/fixtures/gmail/contracts/`, gateway v1.3.4). The gateway
-  declares `fetch_emails` row items as an `anyOf` (ids | summary |
-  full) the coverage walker does not descend, so the `messages` columns
-  sit outside the fingerprint gate (pinned as such by the coverage
-  test) — their drift surfaces at scan time under the conversion rules.
+  (`packs/fixtures/gmail/contracts/`, gateway v1.3.4). The fingerprint
+  hashes the whole declared schema — `anyOf` branches included — so a
+  renamed or retyped field in `fetch_emails`' row items fails
+  registration before any scan runs. It compares *declarations*, so what
+  it cannot see is a key upstream stops emitting without changing the
+  schema; the `messages` columns are non-null so that drift fails the
+  scan rather than yielding an all-NULL column.
 
 ## Authorization and scopes
 

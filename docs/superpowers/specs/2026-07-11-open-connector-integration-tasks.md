@@ -305,7 +305,7 @@ event carrying the scan identity and error.
       tests (`cargo test -p skardi --lib sources::providers::open_connector`,
       post-merge with 5.3), 17 pack-scoped (`… packs::feishu`), 842 full
       library suite.
-- [x] 5.4 Gmail pack (Google OAuth, page-token cursor pagination): `threads`,
+- [x] 5.5 Gmail pack (Google OAuth, page-token cursor pagination): `threads`,
       `messages`, `drafts`, `labels`, `filters` as stable tables
       (`packs/gmail.yaml`) — the first Google Workspace pack. The wire
       contract is Open Connector's normalized rebuild of the Gmail API
@@ -372,7 +372,7 @@ event carrying the scan identity and error.
       with type fidelity and per-table withholding, no-pushdown guard
       with row identity, LIMIT early-stop, pagination-loop refusal,
       gateway failure-envelope surfacing, UDTF parity).
-- [ ] 5.5 Later waves per the design rollout (Google Calendar, Google Drive, Discord, HubSpot, Jira, …) through the source-pack admission gate
+- [ ] 5.6 Later waves per the design rollout (Google Calendar, Google Drive, Discord, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -382,9 +382,9 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.4 (Gmail pack — threads, messages, drafts,
-  labels, filters). Milestones 1–4 and 5.1–5.3 (GitHub, Slack, Notion
-  packs) are merged; this PR adds the first Google Workspace pack against
+- **Current PR**: milestone 5.5 (Gmail pack — threads, messages, drafts,
+  labels, filters). Milestones 1–4 and 5.1–5.4 (GitHub, Slack, Notion,
+  Feishu packs) are merged; this PR adds the first Google Workspace pack against
   Open Connector's normalized Gmail contract (reconciled live and
   verified end to end against a real mailbox), plus the one engine
   extension it required (the loader's `single_page` strategy spelling
