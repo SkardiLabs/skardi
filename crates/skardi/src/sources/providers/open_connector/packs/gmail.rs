@@ -631,16 +631,18 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_coverage_gap_is_pinned() {
-        // What this pins is a limit of the WALKER, not of the gate: this
-        // helper reads `properties` only, and fetch_emails declares its
-        // row items as an anyOf (ids | summary | full), so it reports
-        // every messages column as uncovered even though the summary and
-        // full branches declare all seven. The fingerprint itself hashes
-        // the whole schema, anyOf included, so declared drift still fails
-        // registration. The other four tables' item schemas are plain
-        // objects the walker can read. Pinned so the blind spot stays
-        // visible and any change to it is a conscious decision.
+    fn columns_the_coverage_walker_cannot_resolve_are_pinned() {
+        // Named for what it pins, because gmail's case is NOT the other
+        // packs': theirs report columns that upstream leaves to
+        // `additionalProperties` passthrough — genuinely undeclared, so
+        // genuinely outside the gate. Here the `messages` paths ARE
+        // declared; `fingerprint_uncovered_columns` reads `properties`
+        // only and cannot follow fetch_emails' anyOf (ids | summary |
+        // full), so it reports all seven despite the summary and full
+        // branches declaring them. The fingerprint hashes the whole
+        // schema, anyOf included, so declared drift still fails
+        // registration. Pinned so the walker's blind spot stays visible
+        // — teaching it to descend branch schemas would make this `&[]`.
         for (short, contract, expected) in [
             (
                 "threads",

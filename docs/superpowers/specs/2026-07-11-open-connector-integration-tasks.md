@@ -345,9 +345,13 @@ event carrying the scan identity and error.
       content surface). `error_path: None` everywhere (executors consume
       provider errors; failure envelope pinned by e2e). Fingerprints
       pinned from live capture (`fixtures/gmail/contracts/`, gateway
-      v1.3.4); the coverage-gap pin records that `fetch_emails` declares
-      its items as an `anyOf` the walker does not descend, so all
-      `messages` columns ride passthrough. **Live-verified end to end
+      v1.3.4) over the whole declared schema, `anyOf` branches included —
+      a renamed field inside `fetch_emails`' items moves the hash and
+      fails registration. Unlike the other packs' pins, gmail's records a
+      limit of the static walker, not a gap in the gate: the `messages`
+      paths ARE declared, inside `anyOf` branches the helper cannot
+      follow. Input schemas are pinned too (`contracts/inputs/`), since
+      the gate is output-only. **Live-verified end to end
       against a real mailbox (2026-08-05, gateway v1.3.4 + Google OAuth
       through the gateway)**: registration passed the fingerprint gate
       against live discovery for all five actions; every mapped column
