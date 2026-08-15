@@ -24,10 +24,14 @@ use datafusion::prelude::SessionContext;
 use sqlx::Executor;
 use sqlx::postgres::PgPoolOptions;
 
+use skardi::sources::hierarchy::HierarchyLevel;
 use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBounds};
 use skardi::sources::providers::graph::config::GraphConfig;
+use skardi::sources::providers::graph::error::GraphError;
 use skardi::sources::providers::graph::udtf::GraphSources;
-use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
+use skardi::sources::providers::graph::{
+    register_graph_source, register_graph_tables, register_graph_udtfs,
+};
 use skardi::util::json_getters::register_json_getter_udfs;
 
 fn live_url() -> Option<String> {
@@ -644,6 +648,82 @@ async fn duplicate_registration_keeps_the_original_connection() {
     )
     .await;
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+
+    drop_graph(&pool, &graph).await;
+}
+
+/// The server entry (`register_graph_tables`) must hard-fail every
+/// registration error that is NOT a connectivity failure: a typo'd
+/// graph_name and a wrong password are server-answered contract/config
+/// problems — degrading them would let a misconfiguration sail through
+/// startup and sit degraded forever.
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn server_registration_hard_fails_non_availability_errors() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("hardfail");
+    let pool = seed_graph(&url, &graph).await;
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        std::env::set_var("SKARDI_AGE_HF_USER", user.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_HF_PASS", pass.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_HF_WRONG", "definitely_wrong_pw_9");
+    }
+
+    // A typo'd graph_name: the server answered (no such graph) — refused,
+    // not degraded.
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}_misspelled\nusername_env: SKARDI_AGE_HF_USER\npassword_env: SKARDI_AGE_HF_PASS\n"
+    ))
+    .expect("config parses");
+    let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let mut ctx = SessionContext::new();
+    let err = register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg",
+        &clean_url,
+        Some(&config),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect_err("a typo'd graph is a configuration error, not an outage");
+    let msg = err.to_string();
+    assert!(msg.contains("does not exist"), "{msg}");
+    assert!(!matches!(err, GraphError::Unavailable { .. }), "{msg}");
+    assert!(
+        sources.read().unwrap_or_else(|p| p.into_inner()).is_empty(),
+        "a refused registration publishes no handle"
+    );
+    assert!(ctx.catalog("kg").is_none(), "nor a catalog");
+
+    // A wrong password: the server answers 28P01 — also refused.
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}\nusername_env: SKARDI_AGE_HF_USER\npassword_env: SKARDI_AGE_HF_WRONG\n"
+    ))
+    .expect("config parses");
+    let err = register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg",
+        &clean_url,
+        Some(&config),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect_err("an auth failure must not degrade either");
+    let msg = err.to_string();
+    assert!(msg.contains("password authentication failed"), "{msg}");
+    assert!(!matches!(err, GraphError::Unavailable { .. }), "{msg}");
+    assert!(
+        !msg.contains("definitely_wrong_pw_9"),
+        "the credential never echoes: {msg}"
+    );
 
     drop_graph(&pool, &graph).await;
 }

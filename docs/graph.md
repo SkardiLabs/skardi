@@ -82,20 +82,24 @@ hold every unrelated source hostage at startup):
   REFUSED and the server does not start. A view whose `RETURN` arity or
   types disagree with its declared schema is a contract violation, not
   an outage; the error names the view and the backend's complaint.
-- **Unreachable backend** → the source registers DEGRADED: views still
-  register with their declared (planning-sufficient) schemas,
-  `GET /data_source` reports `status: "degraded"`, and the first scan
-  retries the validation of ALL the source's views — failing loudly
-  with the failing view's name and the registration error if the
-  backend is still gone or a view no longer matches, flipping the
-  source back to `healthy` only when every view re-validates (the same
-  all-or-nothing line reachable registration holds). The ad-hoc UDTF
-  path behaves the same way: a `cypher_query` / `graph_schema` call on
-  a degraded source IS the retry — a failure reports the registration
-  error (the real cause, e.g. connection refused) next to the fresh
-  failure rather than a bare timeout, and a success flips the source
-  back to `healthy` once the view contracts re-prove (immediately, for
-  a view-less source).
+- **Unreachable backend** → the source registers DEGRADED — but only
+  genuine connectivity failures qualify (DNS, refused dial, network
+  timeout: no server answered). A server that ANSWERED with an error —
+  wrong credentials, AGE not installed, the graph missing — fails
+  startup loudly, because that is a configuration problem, not an
+  outage. When degraded does apply: views still register with their
+  declared (planning-sufficient) schemas, `GET /data_source` reports
+  `status: "degraded"`, and the first scan retries the validation of
+  ALL the source's views — failing loudly with the failing view's name
+  and the registration error if the backend is still gone or a view no
+  longer matches, flipping the source back to `healthy` only when every
+  view re-validates (the same all-or-nothing line reachable
+  registration holds). The ad-hoc UDTF path behaves the same way: a
+  `cypher_query` / `graph_schema` call on a degraded source IS the
+  retry — a failure reports the registration error (the real cause,
+  e.g. connection refused) next to the fresh failure rather than a bare
+  timeout, and a success flips the source back to `healthy` once the
+  view contracts re-prove (immediately, for a view-less source).
 
 ## Ad-hoc queries
 

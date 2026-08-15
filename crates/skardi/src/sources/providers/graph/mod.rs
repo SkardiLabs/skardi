@@ -305,6 +305,16 @@ pub async fn register_graph_tables(
             (client, GraphSourceHealth::Healthy)
         }
         Err(e) => {
+            // Only a genuine AVAILABILITY failure may degrade: DNS, a
+            // refused dial, a network timeout — no server answered.
+            // Everything else (bad credentials, AGE absent, the graph
+            // missing) is a configuration problem the server ANSWERED;
+            // degrading those would let a typo'd graph_name sail through
+            // startup and sit degraded forever, the exact failure the
+            // eager preflight exists to prevent.
+            if !matches!(e, GraphError::Unavailable { .. }) {
+                return Err(e);
+            }
             // Unreachable backend: register DEGRADED. The design's
             // divergence from Open Connector's hard-fail health check —
             // this backend is a shared external database whose transient

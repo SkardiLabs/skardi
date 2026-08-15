@@ -229,7 +229,7 @@ impl AgeClient {
         {
             let mut conn = sqlx::postgres::PgConnection::connect_with(&options)
                 .await
-                .map_err(|e| backend_error(source_name, &e))?;
+                .map_err(|e| connect_error(source_name, &e))?;
             per_connection_setup(&mut conn)
                 .await
                 .map_err(|e| backend_error(source_name, &e))?;
@@ -787,6 +787,22 @@ fn backend_error(source: &str, e: &sqlx::Error) -> GraphError {
     GraphError::backend(source, code.as_deref().unwrap_or("io"), &message)
 }
 
+/// Map a DIAL failure (the registration preflight's `connect_with`).
+/// Only a transport-level `io` error means "no server answered" — the
+/// degraded-registration qualifier. A `Database` error here is the
+/// SERVER answering (bad credentials, `28P01`), and a TLS failure is a
+/// client configuration problem; both stay [`backend_error`] so they
+/// hard-fail registration instead of degrading.
+fn connect_error(source: &str, e: &sqlx::Error) -> GraphError {
+    match e {
+        sqlx::Error::Io(io) => GraphError::Unavailable {
+            source_name: source.to_string(),
+            reason: io.to_string(),
+        },
+        other => backend_error(source, other),
+    }
+}
+
 /// Postgres cancels a statement-timeout overrun with SQLSTATE 57014 —
 /// surface it as the typed timeout, not a generic backend error.
 fn map_query_error(source: &str, bounds: QueryBounds, e: &sqlx::Error) -> GraphError {
@@ -929,6 +945,20 @@ mod tests {
         assert!(validate_params(&serde_json::json!({"a": 1})).is_ok());
         let err = validate_params(&serde_json::json!([1])).unwrap_err();
         assert!(err.to_string().contains("an array"), "{err}");
+    }
+
+    #[test]
+    fn only_transport_failures_classify_as_unavailable() {
+        // A refused dial (no server answered) is the degraded qualifier.
+        let io: sqlx::Error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused").into();
+        let err = connect_error("kg", &io);
+        assert!(matches!(err, GraphError::Unavailable { .. }), "{err}");
+        assert!(err.to_string().contains("unreachable"), "{err}");
+        // Anything else — a server-answered error, pool semantics, TLS —
+        // is a configuration problem that must hard-fail registration.
+        let err = connect_error("kg", &sqlx::Error::PoolTimedOut);
+        assert!(matches!(err, GraphError::Backend { .. }), "{err}");
     }
 
     #[test]

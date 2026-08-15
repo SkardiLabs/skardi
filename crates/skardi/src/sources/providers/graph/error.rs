@@ -114,6 +114,15 @@ pub enum GraphError {
     )]
     ConnectionAcquireTimeout { seconds: u64 },
 
+    /// The backend could not be REACHED at registration — a connectivity
+    /// failure (DNS, refused dial, network timeout), meaning no server
+    /// answered at all. This is the ONLY variant that qualifies for
+    /// degraded registration: anything the server answered (bad
+    /// credentials, missing extension, missing graph) is a configuration
+    /// problem that must fail startup loudly, never degrade.
+    #[error("graph backend '{source_name}' is unreachable: {reason}")]
+    Unavailable { source_name: String, reason: String },
+
     /// A driver/backend failure. `code` is the backend's error code
     /// verbatim; `message` is a bounded snippet (see
     /// [`GraphError::backend`]).
