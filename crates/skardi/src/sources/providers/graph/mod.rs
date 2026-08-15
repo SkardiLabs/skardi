@@ -639,6 +639,50 @@ views:
     }
 
     #[tokio::test]
+    async fn a_blackholed_backend_registers_degraded_within_the_bound() {
+        // The registration-side pin for the preflight timeout: a
+        // blackholed address (unroutable, no RST) must degrade within
+        // the configured bound — never hang startup on the OS TCP
+        // timeout.
+        let config: GraphConfig =
+            serde_yaml::from_str("backend: age\ngraph_name: knowledge\nquery_timeout_seconds: 1\n")
+                .expect("parses");
+        let sources = sources();
+        let mut ctx = SessionContext::new();
+        let started = std::time::Instant::now();
+        register_graph_tables(
+            &mut ctx,
+            &sources,
+            "kg",
+            "postgres://10.255.255.1:5432/none",
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("a blackholed backend still registers (degraded)");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "startup is not held hostage"
+        );
+        let handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("registered"),
+        );
+        assert!(
+            !handle
+                .health
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_healthy(),
+            "the blackholed source is degraded"
+        );
+    }
+
+    #[tokio::test]
     async fn a_reserved_catalog_name_is_rejected_before_any_network() {
         // `register_catalog` replaces unconditionally, so a source named
         // `datafusion` would clobber the built-in catalog (and every

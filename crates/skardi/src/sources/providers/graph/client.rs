@@ -225,8 +225,11 @@ impl AgeClient {
         // sizing. Running the same per-connection setup here first means
         // auth failures, setup failures, and the graph probe all fail
         // FAST with their real, named error (the eager-fail contract in
-        // mod.rs's docstring).
-        {
+        // mod.rs's docstring). The whole preflight is bounded by the
+        // same acquire_timeout: a blackholed address or a stuck TLS/auth
+        // handshake must not hold startup hostage — it degrades like any
+        // other unreachable backend.
+        let preflight = async {
             let mut conn = sqlx::postgres::PgConnection::connect_with(&options)
                 .await
                 .map_err(|e| connect_error(source_name, &e))?;
@@ -255,7 +258,17 @@ impl AgeClient {
                     ),
                 });
             }
-        }
+            Ok::<_, GraphError>(())
+        };
+        tokio::time::timeout(acquire_timeout, preflight)
+            .await
+            .map_err(|_| GraphError::Unavailable {
+                source_name: source_name.to_string(),
+                reason: format!(
+                    "the registration preflight did not complete within {}s",
+                    acquire_timeout.as_secs()
+                ),
+            })??;
         Ok(Self::from_pool(
             build_pool(options, max_connections, acquire_timeout),
             source_name,
@@ -945,6 +958,38 @@ mod tests {
         assert!(validate_params(&serde_json::json!({"a": 1})).is_ok());
         let err = validate_params(&serde_json::json!([1])).unwrap_err();
         assert!(err.to_string().contains("an array"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_blackholed_backend_fails_the_preflight_as_unavailable_within_the_bound() {
+        // 10.255.255.1 is unroutable in practice: the dial neither
+        // connects nor is refused quickly, so without the preflight
+        // timeout this connect would hang for the OS TCP timeout
+        // (minutes) — holding startup hostage and never reaching the
+        // degraded branch. Bounded at 1s it must surface as Unavailable,
+        // the degraded qualifier. (Networks that RST unroutable
+        // addresses take the io-error path to the same variant, so the
+        // assertion holds either way.)
+        let started = std::time::Instant::now();
+        let err = AgeClient::connect(
+            "kg",
+            "postgres://10.255.255.1:5432/none",
+            "knowledge",
+            None,
+            None,
+            1,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a blackhole cannot be reached");
+        assert!(
+            matches!(err, GraphError::Unavailable { .. }),
+            "classified as an availability failure: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "bounded by the configured timeout, not the OS's"
+        );
     }
 
     #[test]
