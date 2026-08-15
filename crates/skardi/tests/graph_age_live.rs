@@ -849,8 +849,10 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
 
     // ── #8: pool saturation is bounded and TYPED. max_connections
     // defaults to 4; hold all four sessions, then a query's acquire
-    // must time out as GraphError::Timeout — not a generic Backend
-    // error after sqlx's unrelated 30s default.
+    // must time out as GraphError::ConnectionAcquireTimeout — not a
+    // generic Backend error after sqlx's unrelated 30s default, and not
+    // the statement Timeout either (the query never started, so
+    // "narrow the traversal" would mislead).
     // A dedicated 1-connection client (the registered source's handle
     // hides the concrete type behind dyn GraphClient).
     let (clean_url, user, pass) = split_creds(&url);
@@ -894,8 +896,12 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
         .expect("no connection can be acquired");
     let msg = err.to_string();
     assert!(
-        msg.contains("timed out after 1s"),
-        "saturation surfaces as the typed Timeout: {msg}"
+        msg.contains("could not acquire a connection"),
+        "saturation surfaces as the typed ConnectionAcquireTimeout: {msg}"
+    );
+    assert!(
+        msg.contains("within 1s"),
+        "bounded by the configured timeout, not sqlx's 30s default: {msg}"
     );
     drop(_held);
 
