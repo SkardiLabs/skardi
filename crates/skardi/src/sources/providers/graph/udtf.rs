@@ -448,6 +448,18 @@ pub(crate) enum GraphScanKind {
         columns: Arc<Vec<DeclaredColumn>>,
         limit: Option<usize>,
     },
+    /// A YAML view scan: fixed Cypher, no params, and the degraded
+    /// recovery (re-validating ALL the source's view contracts) runs
+    /// inside the lazy stream on first poll — never during plan
+    /// construction (`TableProvider::scan` is physical planning; the
+    /// design forbids network I/O there).
+    View {
+        handle: Arc<GraphSourceHandle>,
+        view_name: String,
+        cypher: String,
+        columns: Arc<Vec<DeclaredColumn>>,
+        limit: Option<usize>,
+    },
     Labels {
         handle: Arc<GraphSourceHandle>,
         limit: Option<usize>,
@@ -461,6 +473,10 @@ impl fmt::Debug for GraphScanKind {
             Self::Cypher { columns, .. } => f
                 .debug_struct("Cypher")
                 .field("columns", &columns.len())
+                .finish_non_exhaustive(),
+            Self::View { view_name, .. } => f
+                .debug_struct("View")
+                .field("view", view_name)
                 .finish_non_exhaustive(),
             Self::Labels { .. } => f.debug_struct("Labels").finish_non_exhaustive(),
         }
@@ -516,6 +532,9 @@ impl DisplayAs for GraphScanExec {
         match &self.kind {
             GraphScanKind::Cypher { columns, .. } => {
                 write!(f, "GraphScanExec: cypher_query columns={}", columns.len())
+            }
+            GraphScanKind::View { view_name, .. } => {
+                write!(f, "GraphScanExec: view {view_name}")
             }
             GraphScanKind::Labels { .. } => write!(f, "GraphScanExec: graph_schema"),
         }
@@ -575,6 +594,19 @@ impl ExecutionPlan for GraphScanExec {
                 Arc::clone(handle),
                 cypher.clone(),
                 params.clone(),
+                Arc::clone(columns),
+                *limit,
+            ),
+            GraphScanKind::View {
+                handle,
+                view_name,
+                cypher,
+                columns,
+                limit,
+            } => super::view::view_batches(
+                Arc::clone(handle),
+                view_name.clone(),
+                cypher.clone(),
                 Arc::clone(columns),
                 *limit,
             ),

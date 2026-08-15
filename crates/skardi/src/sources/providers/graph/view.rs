@@ -20,13 +20,15 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use futures::TryStreamExt;
+use futures::stream;
+use futures::{StreamExt, TryStreamExt};
 use serde_json::Value;
 
 use super::error::GraphError;
@@ -76,40 +78,6 @@ impl GraphViewProvider {
             schema,
         }
     }
-
-    /// The degraded retry: a Degraded source re-validates ALL of its
-    /// views against the backend on first scan and flips Healthy on
-    /// success; a failed retry is the loud error the design asks for
-    /// ("the first scan retries the validation and fails loudly"). The
-    /// lock is dropped BEFORE the await — never held across it.
-    async fn ensure_healthy(&self) -> DFResult<()> {
-        let registration_error = {
-            let health = self.handle.health.read().unwrap_or_else(|p| p.into_inner());
-            match &*health {
-                GraphSourceHealth::Healthy => None,
-                GraphSourceHealth::Degraded(reason) => Some(reason.clone()),
-            }
-        };
-        let Some(registration_error) = registration_error else {
-            return Ok(());
-        };
-        revalidate_all_views(&self.handle).await.map_err(|e| {
-            DataFusionError::Execution(format!(
-                "graph source of view '{}' is registered DEGRADED (registration \
-                     error: {registration_error}) and its first-scan re-validation \
-                     failed: {e}",
-                self.view_name
-            ))
-        })?;
-        // Two racing scans may both validate and both flip — benign: the
-        // transition is idempotent and the validation is read-only.
-        *self
-            .handle
-            .health
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
-        Ok(())
-    }
 }
 
 impl fmt::Debug for GraphViewProvider {
@@ -144,13 +112,16 @@ impl TableProvider for GraphViewProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.ensure_healthy().await?;
+        // NO backend contact in this function: TableProvider::scan runs
+        // during PHYSICAL PLAN construction (DataFrame::create_physical_plan),
+        // and the design's hard rule is that planning performs no network
+        // I/O. The degraded recovery lives in the lazy stream built by
+        // GraphScanKind::View — it runs on the first poll, not here.
         Ok(Arc::new(GraphScanExec::new(
-            GraphScanKind::Cypher {
+            GraphScanKind::View {
                 handle: Arc::clone(&self.handle),
+                view_name: self.view_name.clone(),
                 cypher: self.cypher.clone(),
-                // Views are fixed Cypher with no parameter surface.
-                params: Value::Object(serde_json::Map::new()),
                 columns: Arc::clone(&self.columns),
                 limit,
             },
@@ -158,6 +129,64 @@ impl TableProvider for GraphViewProvider {
             projection.cloned(),
         )?))
     }
+}
+
+/// The view scan's lazy stream: the degraded recovery runs HERE, on
+/// first poll — never during plan construction. A degraded source
+/// re-validates ALL of its view contracts and flips Healthy before the
+/// view's own Cypher runs; a healthy source pays nothing (the health
+/// check is a lock read). Everything past the recovery is the shared
+/// cypher_batches machinery.
+pub(crate) fn view_batches(
+    handle: Arc<GraphSourceHandle>,
+    view_name: String,
+    cypher: String,
+    columns: Arc<Vec<DeclaredColumn>>,
+    limit: Option<usize>,
+) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
+    stream::once(async move {
+        ensure_healthy(&handle, &view_name).await?;
+        Ok::<_, DataFusionError>(super::udtf::cypher_batches(
+            handle,
+            cypher,
+            // Views are fixed Cypher with no parameter surface.
+            Value::Object(serde_json::Map::new()),
+            columns,
+            limit,
+        ))
+    })
+    .map_ok(|inner| inner)
+    .try_flatten()
+    .boxed()
+}
+
+/// The degraded retry: a Degraded source re-validates ALL of its views
+/// against the backend and flips Healthy on success; a failed retry is
+/// the loud error the design asks for ("the first scan retries the
+/// validation and fails loudly"). Called from the lazy scan stream —
+/// the lock is dropped BEFORE any await, never held across it.
+pub(crate) async fn ensure_healthy(handle: &GraphSourceHandle, view_name: &str) -> DFResult<()> {
+    let registration_error = {
+        let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+        match &*health {
+            GraphSourceHealth::Healthy => None,
+            GraphSourceHealth::Degraded(reason) => Some(reason.clone()),
+        }
+    };
+    let Some(registration_error) = registration_error else {
+        return Ok(());
+    };
+    revalidate_all_views(handle).await.map_err(|e| {
+        DataFusionError::Execution(format!(
+            "graph source of view '{view_name}' is registered DEGRADED (registration \
+             error: {registration_error}) and its first-scan re-validation \
+             failed: {e}"
+        ))
+    })?;
+    // Two racing scans may both validate and both flip — benign: the
+    // transition is idempotent and the validation is read-only.
+    *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
+    Ok(())
 }
 
 /// Prove one view against the live backend: run its Cypher fetching at
@@ -216,8 +245,8 @@ mod tests {
 
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
-    use futures::StreamExt;
     use futures::stream::{self, BoxStream};
+    use futures::{StreamExt, TryStreamExt};
 
     use super::super::client::{GraphClient, QueryBounds};
     use super::super::value::GraphType;
@@ -357,6 +386,66 @@ mod tests {
         ) -> Result<Vec<(String, String)>, GraphError> {
             Ok(vec![])
         }
+    }
+
+    #[tokio::test]
+    async fn physical_planning_never_touches_the_backend() {
+        // The regression pin: TableProvider::scan runs during PHYSICAL
+        // PLAN construction, so the degraded recovery must live in the
+        // lazy stream. Building the physical plan for a DEGRADED
+        // source's view makes ZERO backend calls; executing the plan
+        // pays the re-validation plus the scan.
+        let (handle, calls) = handle_with(
+            GraphSourceHealth::Degraded("connection refused".to_string()),
+            vec![vec![serde_json::json!("ada")]],
+            None,
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("user_posts", Arc::new(provider(Arc::clone(&handle))))
+            .expect("register");
+        let df = ctx.sql("SELECT name FROM user_posts").await.expect("plans");
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("physical planning performs no network I/O");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "no backend call before execution"
+        );
+        // First poll: re-validation (1) + the view scan (1).
+        let stream = plan.execute(0, ctx.task_ctx()).expect("execute");
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("backend answers");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "validate + scan");
+        assert!(is_healthy(&handle), "recovered on execution");
+    }
+
+    #[tokio::test]
+    async fn a_degraded_backend_failure_surfaces_at_execution_not_planning() {
+        // Same rule from the failure side: a still-down backend must not
+        // make plan CONSTRUCTION fail — the loud degraded error belongs
+        // to the stream.
+        let (handle, _calls) = handle_with(
+            GraphSourceHealth::Degraded("connection refused".to_string()),
+            vec![],
+            Some("still refused".to_string()),
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("user_posts", Arc::new(provider(Arc::clone(&handle))))
+            .expect("register");
+        let df = ctx.sql("SELECT name FROM user_posts").await.expect("plans");
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("physical planning succeeds against a down backend");
+        let err = plan
+            .execute(0, ctx.task_ctx())
+            .expect("execute")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect_err("the failure arrives at execution");
+        assert!(err.to_string().contains("DEGRADED"), "{err}");
     }
 
     #[tokio::test]
