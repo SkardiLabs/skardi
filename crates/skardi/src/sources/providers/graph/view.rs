@@ -32,7 +32,9 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::Value;
 
 use super::error::GraphError;
-use super::udtf::{GraphScanExec, GraphScanKind, GraphSourceHandle, GraphSourceHealth};
+use super::udtf::{
+    GraphScanExec, GraphScanKind, GraphSourceHandle, GraphSourceHealth, degraded_reason,
+};
 use super::value::{DeclaredColumn, build_batch, declared_schema};
 
 /// One view's validation contract — everything `validate_view` needs to
@@ -40,7 +42,7 @@ use super::value::{DeclaredColumn, build_batch, declared_schema};
 /// handle at registration so the degraded retry can re-validate ALL of
 /// the source's views, not just the one being scanned (see the module
 /// doc for why recovery must match registration's contract strength).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ViewContract {
     /// The view (catalog table) name.
     pub name: String,
@@ -165,16 +167,23 @@ pub(crate) fn view_batches(
 /// the loud error the design asks for ("the first scan retries the
 /// validation and fails loudly"). Called from the lazy scan stream —
 /// the lock is dropped BEFORE any await, never held across it.
-pub(crate) async fn ensure_healthy(handle: &GraphSourceHandle, view_name: &str) -> DFResult<()> {
-    let registration_error = {
-        let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
-        match &*health {
-            GraphSourceHealth::Healthy => None,
-            GraphSourceHealth::Degraded(reason) => Some(reason.clone()),
-        }
-    };
-    let Some(registration_error) = registration_error else {
+pub(crate) async fn ensure_healthy(
+    handle: &Arc<GraphSourceHandle>,
+    view_name: &str,
+) -> DFResult<()> {
+    // Fast path: a healthy source pays one lock-free-ish read, never the
+    // gate.
+    if degraded_reason(handle).is_none() {
         return Ok(());
+    }
+    // SINGLE-FLIGHT: without the gate, N concurrent first scans each
+    // re-validate every view — requests × views backend probes, with the
+    // losers queueing on the saturated pool until acquire_timeout turns
+    // wait into spurious failures. One arrival pays; the rest wake up to
+    // a Healthy re-check and proceed.
+    let _gate = handle.recovery_gate.lock().await;
+    let Some(registration_error) = degraded_reason(handle) else {
+        return Ok(()); // the winner already recovered the source
     };
     revalidate_all_views(handle).await.map_err(|e| {
         DataFusionError::Execution(format!(
@@ -183,8 +192,6 @@ pub(crate) async fn ensure_healthy(handle: &GraphSourceHandle, view_name: &str) 
              failed: {e}"
         ))
     })?;
-    // Two racing scans may both validate and both flip — benign: the
-    // transition is idempotent and the validation is read-only.
     *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
     Ok(())
 }
@@ -229,11 +236,36 @@ pub(crate) async fn validate_view(
 /// keeps the source degraded and names the failing view. A source with
 /// no views has nothing to re-prove — the caller's own successful query
 /// is the recovery evidence (the UDTF path in udtf.rs relies on that).
-pub(crate) async fn revalidate_all_views(handle: &GraphSourceHandle) -> Result<(), GraphError> {
-    for contract in handle.view_contracts.iter() {
-        validate_view(handle, &contract.name, &contract.cypher, &contract.columns).await?;
+pub(crate) async fn revalidate_all_views(
+    handle: &Arc<GraphSourceHandle>,
+) -> Result<(), GraphError> {
+    let n = handle.view_contracts.len();
+    if n == 0 {
+        return Ok(());
     }
-    Ok(())
+    // Same bounded launch as reachable registration (see
+    // validate_views_concurrently): at most the pool's worth in flight,
+    // so no probe queues behind its siblings. The whole run gets a
+    // computed BACKSTOP deadline — waves × (per-probe budget + the
+    // client wrap's slack) — which per-probe bounds make all but
+    // unreachable; it exists so a pathological stall can never wedge
+    // the recovery gate forever.
+    let limit = handle.validation_limit.max(1);
+    let waves = n.div_ceil(limit) as u32;
+    let deadline = handle
+        .bounds
+        .timeout
+        .saturating_add(std::time::Duration::from_secs(5))
+        .saturating_mul(waves);
+    let contracts = handle.view_contracts.iter().cloned().collect();
+    tokio::time::timeout(
+        deadline,
+        validate_views_concurrently(handle, contracts, limit),
+    )
+    .await
+    .map_err(|_| GraphError::RecoveryDeadlineExceeded {
+        seconds: deadline.as_secs(),
+    })?
 }
 
 /// Validate every contract with AT MOST `limit` validations in flight —
@@ -341,6 +373,8 @@ mod tests {
                 cypher: "MATCH (u:User) RETURN u.name".to_string(),
                 columns: columns(),
             }]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
         });
         (handle, calls)
     }
@@ -506,6 +540,8 @@ mod tests {
                     columns: columns(),
                 },
             ]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
         });
         let provider = GraphViewProvider::new(
             handle.clone(),
@@ -621,6 +657,33 @@ mod tests {
             .expect("empty is valid");
     }
 
+    #[tokio::test]
+    async fn concurrent_first_scans_share_one_recovery_flight() {
+        // Without the gate, N concurrent first scans each re-validate
+        // every view: requests × views probes. With it, exactly ONE
+        // validation flight runs; the losers wake to a Healthy re-check.
+        // Expected calls: 1 validation (the single contract) + 4 scans.
+        let (handle, calls) = handle_with(
+            GraphSourceHealth::Degraded("connection refused".to_string()),
+            vec![vec![serde_json::json!("ada")]],
+            None,
+        );
+        let scans = (0..4).map(|_| {
+            let handle = Arc::clone(&handle);
+            async move { scan_rows(provider(Arc::clone(&handle))).await }
+        });
+        let results = futures::future::join_all(scans).await;
+        for result in results {
+            result.expect("every concurrent scan succeeds");
+        }
+        assert!(is_healthy(&handle), "the winner flipped the source");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            5,
+            "one shared validation flight + four scans — never 4 + 4"
+        );
+    }
+
     /// A slow, in-flight-counting client: pins that view validation
     /// launches AT MOST `limit` probes concurrently. Unbounded launch
     /// parks the excess in the pool's acquire queue, where a healthy
@@ -679,6 +742,8 @@ mod tests {
             },
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
             view_contracts: Arc::new(vec![]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
         });
         let contracts: Vec<ViewContract> = (0..8)
             .map(|i| ViewContract {

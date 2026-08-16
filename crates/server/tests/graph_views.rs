@@ -88,9 +88,9 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
     assert!(msg.contains("user_posts"), "the view is named: {msg}");
     assert!(msg.contains("DEGRADED"), "{msg}");
 
-    // The UDTF path reports the same degraded context — the registration
-    // error (Connection refused) must survive next to the fresh failure,
-    // never a bare timeout advising to "narrow the traversal".
+    // The UDTF path reports the same degraded context — the typed
+    // unreachable registration error must survive next to the fresh
+    // failure, never a bare timeout advising to "narrow the traversal".
     let err = state
         .session_ctx
         .sql(
@@ -105,7 +105,11 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
         .expect_err("the retried query fails");
     let msg = err.to_string();
     assert!(msg.contains("DEGRADED"), "{msg}");
-    assert!(msg.contains("Connection refused"), "{msg}");
+    // Assert the TYPED unreachable context, not the OS errno text —
+    // "Connection refused" is what a normal host says, but a sandboxed
+    // runner says "Operation not permitted" for the same unreachable
+    // semantics, and the contract under test is ours, not libc's.
+    assert!(msg.contains("is unreachable"), "{msg}");
     assert!(!msg.contains("narrow the traversal"), "{msg}");
 
     // /data_source: the source reports its degraded status and enumerates
@@ -205,4 +209,129 @@ async fn the_runtime_session_has_json_getters_without_the_operator_rewrite() {
         msg.contains("not yet supported"),
         "native (unsupported), not rewritten to json_get: {msg}"
     );
+}
+
+/// The `{params}` decision (design Risks #0), proven through the REAL
+/// machinery end to end: skardi's pipeline loader must surface `params`
+/// in the inferred request_schema (the NULL placeholder plans), and the
+/// SERVER'S OWN `substitute_sql_params` — not a hand-rolled replace —
+/// must turn a request's params JSON into SQL that re-plans and delivers
+/// the bound value to the graph client.
+mod params_through_real_substitution {
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use futures::stream::{self, BoxStream};
+    use serde_json::Value;
+    use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
+    use skardi::sources::providers::graph::client::{GraphClient, QueryBounds};
+    use skardi::sources::providers::graph::error::GraphError;
+    use skardi::sources::providers::graph::udtf::{
+        GraphSourceHandle, GraphSourceHealth, GraphSources, register_graph_udtfs,
+    };
+    use skardi_server::pipeline_handlers::substitute_sql_params;
+
+    /// Echoes the bound `min` param back as the row, so substitution is
+    /// observable end to end.
+    #[derive(Debug)]
+    struct EchoClient;
+
+    #[async_trait]
+    impl GraphClient for EchoClient {
+        async fn execute(
+            &self,
+            _cypher: &str,
+            params: &Value,
+            _arity: usize,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
+            let min = params.get("min").cloned().unwrap_or(Value::Null);
+            Ok(stream::iter(vec![Ok(vec![min])]).boxed())
+        }
+
+        async fn labels(
+            &self,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<Vec<(String, String)>, GraphError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn the_servers_substitution_binds_params_into_cypher_query() {
+        let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+        sources.write().unwrap().insert(
+            "kg".to_string(),
+            Arc::new(GraphSourceHandle {
+                client: Arc::new(EchoClient),
+                bounds: QueryBounds {
+                    timeout: std::time::Duration::from_secs(5),
+                    max_rows: 100,
+                },
+                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+                view_contracts: Arc::new(vec![]),
+                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                validation_limit: 4,
+            }),
+        );
+        let ctx = Arc::new(datafusion::prelude::SessionContext::new());
+        register_graph_udtfs(&ctx, Arc::clone(&sources)).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let spec = r#"
+kind: pipeline
+metadata:
+  name: probe
+  version: "1"
+spec:
+  query: |
+    SELECT min_age FROM cypher_query('kg', 'MATCH (p) WHERE p.age > $min RETURN p.age', {params}, '{"min_age": "int"}')
+"#;
+        let path = dir.path().join("probe.yaml");
+        std::fs::write(&path, spec).unwrap();
+
+        // Inference through the REAL loader: `{params}` becomes NULL,
+        // plans, and `params` lands in the request schema — the exact
+        // set the server substitutes on.
+        let pipeline = StandardPipeline::load_from_file(&path, Arc::clone(&ctx))
+            .await
+            .expect("inference plans with the NULL placeholder");
+        let expected: Vec<String> = pipeline.request_schema().fields.keys().cloned().collect();
+        assert!(
+            expected.contains(&"params".to_string()),
+            "inference must surface params: {expected:?}"
+        );
+
+        // Execution through the SERVER'S substitution — the request
+        // carries the params JSON as a string, exactly as documented.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+        let mut sql = yaml["spec"]["query"].as_str().unwrap().to_string();
+        let request: HashMap<String, Value> = HashMap::from([(
+            "params".to_string(),
+            Value::String("{\"min\": 40}".to_string()),
+        )]);
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected, &request);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(unsupported.is_empty(), "{unsupported:?}");
+        assert!(!sql.contains("{params}"), "placeholder fully substituted");
+
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("substituted SQL re-plans")
+            .collect()
+            .await
+            .expect("executes");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int column");
+        assert_eq!(col.value(0), 40, "the bound param reached the client");
+    }
 }

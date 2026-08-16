@@ -42,6 +42,7 @@ pub mod udtf;
 pub mod value;
 mod view;
 
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -138,6 +139,8 @@ pub async fn register_graph_source(
         // The engine-level entry registers no views (no session context
         // to put them in), so there are no contracts to re-prove.
         view_contracts: Arc::new(vec![]),
+        recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+        validation_limit: config.max_connections as usize,
     });
     // Poisoning degrades gracefully (AGENTS.md convention) — and it also
     // keeps InvalidConfig meaning what it says instead of moonlighting as
@@ -147,13 +150,13 @@ pub async fn register_graph_source(
     // routed to the new one.
     let mut map = sources.write().unwrap_or_else(|p| p.into_inner());
     match map.entry(name.to_string()) {
-        std::collections::hash_map::Entry::Occupied(_) => Err(GraphError::InvalidConfig {
+        Entry::Occupied(_) => Err(GraphError::InvalidConfig {
             name: name.to_string(),
             reason: "a graph source with this name is already registered \
                      (the existing connection is unchanged)"
                 .to_string(),
         }),
-        std::collections::hash_map::Entry::Vacant(slot) => {
+        Entry::Vacant(slot) => {
             slot.insert(handle);
             Ok(())
         }
@@ -264,6 +267,23 @@ pub async fn register_graph_tables(
             });
         }
     }
+    // Any EXISTING catalog under this name — an embedder's custom
+    // catalog, another provider's registration — must survive:
+    // `register_catalog` replaces unconditionally, so this refusal is
+    // the only thing standing between a name collision and silently
+    // swallowing someone else's tables. (The config-level reserved-name
+    // check covers only DataFusion's built-ins; this covers everything
+    // else.) Placed AFTER the map peek so a duplicate graph source
+    // keeps its more precise "already registered" error; still before
+    // any network I/O.
+    if !config.views.is_empty() && session_ctx.catalog(name).is_some() {
+        return Err(GraphError::InvalidConfig {
+            name: name.to_string(),
+            reason: format!(
+                "a catalog named '{name}' already exists in this session — the graph                  source's views would replace it (register_catalog replaces                  unconditionally); rename the source"
+            ),
+        });
+    }
     let timeout = Duration::from_secs(config.query_timeout_seconds);
     let bounds = QueryBounds {
         timeout,
@@ -296,6 +316,8 @@ pub async fn register_graph_tables(
                 bounds,
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
+                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                validation_limit: config.max_connections as usize,
             });
             let contracts = config
                 .views
@@ -370,6 +392,8 @@ pub async fn register_graph_tables(
                 })
                 .collect::<Result<Vec<_>, GraphError>>()?,
         ),
+        recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+        validation_limit: config.max_connections as usize,
     });
     // Publish the handle BEFORE touching the catalog: register_catalog
     // REPLACES a same-named catalog unconditionally, so with the reverse
@@ -380,7 +404,7 @@ pub async fn register_graph_tables(
     {
         let mut map = sources.write().unwrap_or_else(|p| p.into_inner());
         match map.entry(name.to_string()) {
-            std::collections::hash_map::Entry::Occupied(_) => {
+            Entry::Occupied(_) => {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
                     reason: "a graph source with this name is already registered \
@@ -388,7 +412,7 @@ pub async fn register_graph_tables(
                         .to_string(),
                 });
             }
-            std::collections::hash_map::Entry::Vacant(slot) => {
+            Entry::Vacant(slot) => {
                 slot.insert(Arc::clone(&handle));
             }
         }
@@ -577,6 +601,8 @@ views:
                 },
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
+                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                validation_limit: config.max_connections as usize,
             }),
         );
         let mut ctx = SessionContext::new();
@@ -687,6 +713,41 @@ views:
                 .unwrap_or_else(|p| p.into_inner())
                 .is_healthy(),
             "the blackholed source is degraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_custom_catalog_survives_a_name_collision() {
+        // Not just DataFusion's built-ins: ANY catalog already in the
+        // session — an embedder's own, another provider's — must survive
+        // a graph source claiming its name, because register_catalog
+        // replaces unconditionally. Refused before any network I/O.
+        let mut ctx = SessionContext::new();
+        let custom = Arc::new(MemoryCatalogProvider::new());
+        let custom_schema = Arc::new(MemorySchemaProvider::new());
+        custom
+            .register_schema("main", custom_schema)
+            .expect("schema registers");
+        ctx.register_catalog("kg", Arc::clone(&custom) as Arc<dyn CatalogProvider>);
+
+        let err = register_graph_tables(
+            &mut ctx,
+            &sources(),
+            "kg",
+            DEAD_URL,
+            Some(&config_with_views()),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect_err("a name collision with an existing catalog is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("already exists"), "{msg}");
+        // The pre-existing catalog is untouched (same Arc, same schema).
+        let survived = ctx.catalog("kg").expect("catalog still present");
+        assert!(
+            survived.schema("main").is_some(),
+            "the embedder's catalog kept its schema"
         );
     }
 

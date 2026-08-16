@@ -649,7 +649,11 @@ fn row_cell_to_sql(v: &Value) -> String {
 /// empty batches see a clear instruction to filter client-side.
 ///
 /// Returns `(missing_params, unsupported_params)` — both empty on full success.
-fn substitute_sql_params(
+/// `pub` for the integration suites: the graph `{params}` contract test
+/// (tests/graph_views.rs) must run THIS function — a hand-rolled
+/// `str::replace` in the test would keep passing after a substitution
+/// regression, which is the failure the test exists to catch.
+pub fn substitute_sql_params(
     sql: &mut String,
     expected_params: &[String],
     parameters: &HashMap<String, Value>,

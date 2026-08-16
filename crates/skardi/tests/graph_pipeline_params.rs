@@ -99,6 +99,8 @@ async fn pipeline_params_placeholder_reaches_cypher_params() {
             },
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
             view_contracts: Arc::new(vec![]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
         }),
     )])));
     let ctx = SessionContext::new();

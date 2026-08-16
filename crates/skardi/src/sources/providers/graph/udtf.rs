@@ -111,6 +111,20 @@ pub struct GraphSourceHandle {
     /// view-less sources (the engine API included), where a successful
     /// query is itself the recovery evidence.
     pub view_contracts: Arc<Vec<super::view::ViewContract>>,
+    /// SINGLE-FLIGHT gate for the degraded recovery: concurrent first
+    /// scans of a degraded source would each re-validate every view —
+    /// requests × views backend probes, and (with the pool saturated by
+    /// the winners) queued losers converting wait into spurious acquire
+    /// timeouts. Recovery acquires this, RE-CHECKS health (the winner
+    /// already flipped it), and only the first arrival pays the
+    /// validation; the rest see Healthy on wake-up. Never held across a
+    /// healthy fast path — that stays a lock-free read.
+    pub recovery_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The bounded-concurrency limit for view (re)validation — the
+    /// pool's own `max_connections`, so no probe ever queues behind its
+    /// siblings in the acquire queue (see
+    /// `view::validate_views_concurrently`).
+    pub validation_limit: usize,
 }
 
 /// Registration-time health of a graph source.
@@ -635,7 +649,7 @@ impl ExecutionPlan for GraphScanExec {
 /// instead of surfacing as a bare acquire timeout; a success flips the
 /// source Healthy — the ONLY recovery route for a view-less or
 /// UDTF-only source, since view scans are what otherwise flip it.
-fn degraded_reason(handle: &GraphSourceHandle) -> Option<String> {
+pub(crate) fn degraded_reason(handle: &GraphSourceHandle) -> Option<String> {
     let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
     match &*health {
         GraphSourceHealth::Healthy => None,
@@ -672,8 +686,16 @@ fn degraded_execution_error(degraded: Option<String>, e: GraphError) -> DataFusi
 /// "registration refused" to "scan-time conversion error" the moment an
 /// ad-hoc query flipped the source. For a view-less source there is
 /// nothing to re-prove and the successful query is itself the evidence.
-async fn recover_if_degraded(handle: &GraphSourceHandle, degraded: bool) -> DFResult<()> {
+async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) -> DFResult<()> {
     if !degraded {
+        return Ok(());
+    }
+    // SINGLE-FLIGHT with the view path's recovery (the same gate):
+    // concurrent recoveries would each re-prove every view. Re-check
+    // under the gate — a racing winner (view scan or sibling query)
+    // already flipped the source and there is nothing left to prove.
+    let _gate = handle.recovery_gate.lock().await;
+    if degraded_reason(handle).is_none() {
         return Ok(());
     }
     super::view::revalidate_all_views(handle)
@@ -824,6 +846,8 @@ mod tests {
             },
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
             view_contracts: Arc::new(vec![]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }
@@ -890,6 +914,8 @@ mod tests {
             },
             health: Arc::new(RwLock::new(health)),
             view_contracts: Arc::new(vec![]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }

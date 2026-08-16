@@ -75,8 +75,9 @@ pub struct GraphConfig {
 pub struct GraphView {
     /// Table name inside the source's `main` schema.
     pub name: String,
-    /// The Cypher executed at scan time. Deliberately NOT screened by the
-    /// keyword guard — see [`GraphConfig::validate`].
+    /// The Cypher executed at scan time. Screened by the keyword guard
+    /// at validation, like every caller-authored Cypher — see
+    /// [`GraphConfig::validate`].
     pub cypher: String,
     /// Declared output columns, in RETURN order (the binding to the
     /// Cypher RETURN clause is positional — same rule as the ad-hoc
@@ -147,12 +148,14 @@ impl GraphConfig {
     /// as a Postgres connection string in the same file) — no SSRF guard,
     /// only a scheme allowlist (design §Security).
     ///
-    /// View Cypher is deliberately NOT screened by the keyword guard:
-    /// views are the operator trust tier (same level as pipeline SQL),
-    /// and the guard exists to screen CALLER-submitted Cypher. The real
-    /// boundary is the backend's READ ONLY transaction, and registration's
-    /// live validation runs the view once — a genuinely mutating view is
-    /// caught there, with the backend's own error.
+    /// View Cypher IS screened by the keyword guard, per the design's
+    /// §Security scope ("the text passed to `cypher_query` or declared
+    /// in a view"): the backend's READ ONLY transaction stops writes,
+    /// but the guard's `CALL`/`LOAD` arms exist for what a read
+    /// transaction does NOT cover — procedure escape hatches and
+    /// backend-side URL fetches. The known tax carries over from the
+    /// ad-hoc surface: a keyword-shaped string literal in a view's
+    /// Cypher false-positives, and the author rephrases.
     pub fn validate(&self, name: &str, connection_string: &str) -> Result<(), GraphError> {
         // The source name becomes a CATALOG name; `datafusion` and
         // `information_schema` are DataFusion's built-ins, and
@@ -319,6 +322,16 @@ impl GraphConfig {
                     reason: format!("view '{}' declares empty cypher", view.name),
                 });
             }
+            // The keyword guard, same as the ad-hoc surface (design
+            // §Security names views explicitly). READ ONLY transactions
+            // stop writes; this stops what they don't — CALL procedure
+            // escapes and LOAD's server-side URL fetch.
+            super::guard::reject_mutations(&view.cypher).map_err(|e| {
+                GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!("view '{}': {e}", view.name),
+                }
+            })?;
             if view.schema.is_empty() {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
@@ -514,6 +527,35 @@ password_env: AGE_PG_PASS
     }
 
     #[test]
+    fn view_cypher_is_screened_by_the_keyword_guard() {
+        // Design §Security names view-declared Cypher as guard scope:
+        // READ ONLY transactions stop writes, the guard stops CALL/LOAD —
+        // the escape hatches a read transaction does not cover.
+        for (cypher, keyword) in [
+            ("CREATE (n:X) RETURN n", "'CREATE'"),
+            ("CALL db.labels()", "'CALL'"),
+            ("LOAD CSV FROM 'https://x' AS row RETURN row", "'LOAD'"),
+        ] {
+            let c: GraphConfig = serde_yaml::from_str(&format!(
+                "backend: age
+graph_name: g
+views:
+  - name: v
+    cypher: \"{cypher}\"
+    schema:
+      - name: x
+        type: string
+"
+            ))
+            .expect("parses");
+            let err = c.validate("kg", "postgres://h/db").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("view 'v'"), "{cypher}: {msg}");
+            assert!(msg.contains(keyword), "{cypher}: {msg}");
+        }
+    }
+
+    #[test]
     fn views_parse_validate_and_default_nullable_to_true() {
         // The design doc's own example shape — parse, validate, and the
         // nullable default all in one.
@@ -594,17 +636,6 @@ views:
         let msg = err.to_string();
         assert!(msg.contains("unknown type 'Utf8'"), "{msg}");
         assert!(msg.contains("node, relationship, path"), "{msg}");
-    }
-
-    #[test]
-    fn view_cypher_is_not_keyword_guarded() {
-        // Views are the operator trust tier (see validate's doc): a
-        // mutating-looking view passes PURE validation — the backend's
-        // READ ONLY transaction and registration's live validation are
-        // the boundary, not the caller-facing keyword guard.
-        let mut c = base();
-        c.views = vec![view("v", "CREATE (n) RETURN n", vec![column("n", "node")])];
-        c.validate("kg", "postgres://h/db").expect("no guard here");
     }
 
     fn view(name: &str, cypher: &str, schema: Vec<GraphViewColumn>) -> GraphView {
