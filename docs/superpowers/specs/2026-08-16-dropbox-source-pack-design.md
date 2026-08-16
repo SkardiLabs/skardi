@@ -356,3 +356,168 @@ the docs, and a `/code-review` pass on the diff.
 - `docs/open-connector-dropbox.md`, the 5.5 entry in
   `2026-07-11-open-connector-integration-tasks.md`, and the supported-pack
   list in `docs/open-connector.md`.
+
+## Execution plan
+
+### Standing assumptions (each overridable before its step lands)
+
+- **A1** — the `pagination.continuation` engine extension is approved
+  (open question 4). Fallback: ship `shared_links` only, steps 1 and the
+  affected step-3 tables drop out.
+- **A2** — `recursive: true` stays pinned on `dropbox.files` (open
+  question 3).
+- **A3** — the tasks-spec entry is numbered 5.5 with an explicit
+  *off-roadmap, user-requested* note (Dropbox is not in the design's
+  rollout plan; no storage provider is), and the catch-all "later waves"
+  bucket renumbers to 5.6 — the same move Feishu's PR made when it took
+  5.4.
+- Build constraints on this box: serial cargo only, verify with
+  `cargo test -p skardi --lib`.
+
+### Step 1 — Engine: cursor continuation (commit 1)
+
+The design's three touch points, resolved to concrete code after reading
+the registration path. The split of responsibilities: **the table owns
+the contract** (continuation action ID + fingerprint), **the strategy
+owns nothing new** — exec already holds both the table and the paginator,
+so the strategy stays `Copy` and untouched except for one method.
+
+1. `table.rs` — `SourcePackTable` gains
+   `continuation: Option<ContinuationDecl>` with
+   `{ action: &'static str, fingerprint: &'static str, cursor_only: bool }`.
+   Action and fingerprint are non-optional inside the decl: the
+   same-action-cursor-only case (`shared_links`, if Q1 answers badly)
+   spells its own action ID explicitly rather than leaving a hole the
+   gate could fall through.
+2. `pagination.rs` — one new method,
+   `Pagination::apply_cursor_only(&mut Map)`, inserting only
+   `{cursor_param: token}` (no page-size input). `apply` and all
+   termination/loop/has-more logic untouched. Unit tests: page 1 has no
+   token to apply; page 2+ body is exactly the one pair.
+3. `exec.rs` — `ScanTarget` carries the continuation decl (as
+   `Option<Arc<...>>` fields, populated in `ScanTarget::from` the table);
+   `next_page` branches when `pagination.page() > 1` and a decl exists:
+   action ID = continuation action; `cursor_only` → start from an empty
+   map + `apply_cursor_only` instead of the resource/fixed/filter
+   assembly.
+4. `packs/loader.rs` — parse `continuation:` under the cursor strategy
+   only (`deny_unknown_fields`; `inputs: cursor_only | full`), validate
+   fingerprint shape, emit `SourcePackAssetInvalid` diagnostics for each
+   malformed spelling.
+5. Registration gating, **both call sites**: `mod.rs` pushes the
+   continuation action into `action_ids` (the `ActionRegistry::load`
+   input, mod.rs:184) and extends the fingerprint gate (mod.rs:229) to
+   check it, with the mismatch reason naming *which* action drifted;
+   `table_functions.rs:216` (the UDTF path) gets the same second check —
+   missing it would let a drifted continue action through
+   `open_connector_query` while bindings refuse it.
+
+Engine-level tests: loader diagnostics per malformed spelling;
+`apply_cursor_only` unit tests; an exec e2e through `MockGateway`
+asserting page 2 hits `/v1/actions/<continue-action>` with a body that is
+**exactly** `{"cursor": …}` (parsed structurally, not substring-matched);
+drift-refusal e2e where only the continue action's schema drifts; the
+UDTF-path equivalent.
+
+**Gate:** full `cargo test -p skardi --lib` green before any pack work —
+this step touches the engine every pack rides on.
+
+### Step 2 — Contract capture (blocked: needs Node)
+
+Prerequisite: a Node runtime (none installed — `node`/`npm` absent).
+Then, from the open-connector v1.3.5 checkout: start the gateway, capture
+`data.outputSchema` for all five actions (`list_folder`,
+`list_folder_continue`, `list_shared_links`, `search_files`,
+`search_files_continue`) into `packs/fixtures/dropbox/contracts/`,
+calibrate the no-credential discrimination once (one known-bad key → 400
+`invalid_input`; one known-good input → 403 credential wall), then drive
+every table's exact generated input set to the credential wall. Record
+the gateway version in the module doc.
+
+Step 3 does not block on this: the fingerprint sync test prints actual
+hashes on mismatch — the documented way to obtain pins — so pack
+authoring proceeds with placeholder pins and this step turns them real.
+
+### Step 3 — Pack (commit 2)
+
+`packs/dropbox.yaml` per the Tables section above; `packs/dropbox.rs`
+(OnceLock accessor, module doc carrying every design decision and its
+why, test suite); `mod` line in `packs/mod.rs`; builtins entry in
+`source_pack.rs`. Fixtures: six admission-gate categories × 3 tables,
+authored from the executor-derived shapes now, re-derived as redacted
+live captures in step 5.
+
+Test inventory (calibrated to the Feishu pack's density):
+
+- fingerprint sync across all five contracts; coverage-gap pin asserting
+  the **empty** set per table (non-empty is a finding, per the design);
+- drift refusal per table plus the continuation-action drift case;
+- multi-page scan per table with per-table wire pins (row path + input
+  keys — shared strategy constants don't share coverage);
+- termination: `hasMore: false` with a **non-empty** cursor (the
+  `list_folder` reality this pack exists to handle), null/absent cursor
+  for the `?? null` tables; `PaginationHasMoreInvalid`,
+  `PaginationCursorInvalid`, `PaginationLoop` at pack level;
+- LIMIT early-stop; empty collection;
+- fixed-input pins asserted on every request body (`recursive`,
+  `includeMountedFolders`, `includeDeleted` on files; `fileStatus` on
+  search);
+- required-resource (`query`) failing before any HTTP; resource
+  forwarding for `path`/`directOnly`;
+- negative-space guards: no filter key ever on the wire (all three
+  tables), `includeHighlights` never sent, `url`/`expires_at`/
+  `link_permissions` absent from the `files` schema;
+- gateway-failure surfacing (a Dropbox error code through the failure
+  envelope, `error_path: None`);
+- schema-mismatch fixture per table asserting full error identity
+  (column, path, page, row, expected, found-kind);
+- UDTF parity for `files`.
+
+### Step 4 — Docs (commit 3)
+
+`docs/open-connector-dropbox.md` modeled on the Slack/Feishu docs
+(binding YAML, per-table reference, behavior bullets including the
+continuation mechanics, authz = two read scopes, rate limits); the 5.5
+tasks-spec entry per A3 — left unticked until step 5 passes, since the
+entry's verification blurb must state live status honestly; the
+supported-packs paragraph in `docs/open-connector.md`.
+
+### Step 5 — Live verification (blocked: needs Node + a Dropbox account)
+
+Needs from the user: the Node runtime (step 2's) and a free Dropbox
+account with an OAuth app carrying `files.metadata.read` +
+`sharing.read`, configured in the gateway (`PUT /api/connections/dropbox`
+— user-held; I never touch the credential). Then, per table: probe at the
+pack's exact inputs and declared bounds; diff real row keys against
+mapped columns both directions; force real multi-page pagination with a
+small `limit`; confirm every mapped column extracts a non-NULL value
+somewhere; confirm termination on the real final page; scan end to end
+through skardi-server against LIVE discovery. This step also answers Q1
+(`path` + `cursor` together on `list_shared_links`), Q2 (cursor
+lifetime), and the `orderBy` stability note; fixtures re-derived as
+redacted captures; any wire-vs-declared contradiction recorded with the
+pinned provider API version.
+
+### Step 6 — Self-review and submission
+
+Work through `references/review-checklist.md` against the actual diff;
+`cargo fmt` + `cargo clippy` clean; full `cargo test -p skardi --lib`;
+test counts via the documented commands
+(`cargo test -p skardi --lib sources::providers::open_connector` and the
+`packs::dropbox` filter) matched everywhere they're stated; `/code-review`
+on the diff with every finding fixed or rebutted with evidence. Then
+update PR #216's body with the verification section and per-table live
+evidence, and flip it from Draft — after step 5 has run, not before.
+
+### Sequencing
+
+Three commits on this branch, one PR (#216), per the 5.1/5.2 precedent of
+engine extensions shipping inside the pack PR that needs them:
+
+1. `feat(sources): cursor continuation pagination — split-action page 2+`
+2. `feat(sources): Dropbox source pack — files, shared_links, file_search`
+3. `docs(sources): Dropbox pack docs + milestone 5.5 entry`
+
+Steps 1, 3, 4 are executable now, in order, with placeholder pins.
+Steps 2 and 5 are blocked on the two user-provided prerequisites; the
+PR stays Draft until step 5 completes.
