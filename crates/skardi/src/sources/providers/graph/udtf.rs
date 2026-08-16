@@ -1481,4 +1481,125 @@ mod tests {
             assert!(err.to_string().contains("not NULL"), "{sql}: {err}");
         }
     }
+
+    #[tokio::test]
+    async fn an_unknown_source_on_an_empty_registry_says_none() {
+        // The empty-registry arm of the known-sources hint.
+        let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, sources).expect("registration");
+        let err = ctx
+            .sql(
+                "SELECT * FROM cypher_query('nope', 'RETURN 1', '{}', \
+                 '{\"n\": \"int\"}')",
+            )
+            .await
+            .expect_err("an unknown source fails at plan time");
+        let msg = err.to_string();
+        assert!(msg.contains("nope"), "{msg}");
+        assert!(msg.contains("none"), "the empty registry says so: {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_degraded_flag_rechecks_under_the_gate_and_returns() {
+        // The ad-hoc twin of the view path's gate-loser re-check: the
+        // caller captured `degraded = true` at stream construction, but
+        // a racing winner already recovered the source — the re-check
+        // under the gate must return without touching health.
+        let sources = sources_with(vec![]);
+        let handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("kg registered"),
+        );
+        recover_if_degraded(&handle, true).await;
+        assert!(
+            health_of(&sources).is_healthy(),
+            "a healthy source stays healthy through the stale-flag path"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_leaf_plan_pins_its_contract_and_redacts_cypher() {
+        // GraphScanExec's ExecutionPlan plumbing, pinned directly: Debug
+        // and Display carry identity only (the Cypher text is caller
+        // data — the module-wide redaction rule), the plan is a strict
+        // leaf, and only partition 0 exists.
+        let sources = sources_with(vec![vec![serde_json::json!("ada")]]);
+        let handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("kg registered"),
+        );
+        let columns = Arc::new(vec![DeclaredColumn {
+            name: "name".to_string(),
+            ty: GraphType::String,
+            nullable: true,
+        }]);
+        let secret = "MATCH (creds {token: 'hunter2'}) RETURN creds.name";
+        let kinds = [
+            GraphScanKind::Cypher {
+                handle: Arc::clone(&handle),
+                cypher: secret.to_string(),
+                params: serde_json::json!({}),
+                columns: Arc::clone(&columns),
+                limit: None,
+            },
+            GraphScanKind::View {
+                handle: Arc::clone(&handle),
+                view_name: "people".to_string(),
+                cypher: secret.to_string(),
+                columns: Arc::clone(&columns),
+                limit: None,
+            },
+            GraphScanKind::Labels {
+                handle: Arc::clone(&handle),
+                limit: None,
+            },
+        ];
+        for kind in &kinds {
+            let dbg = format!("{kind:?}");
+            assert!(
+                !dbg.contains("hunter2") && !dbg.contains("MATCH"),
+                "the Cypher text never appears in Debug: {dbg}"
+            );
+        }
+        let [_, view_kind, _] = kinds;
+        assert!(format!("{view_kind:?}").contains("people"));
+
+        // No projection: the full declared schema is the plan's schema.
+        let schema = declared_schema(&columns);
+        let exec = Arc::new(
+            GraphScanExec::new(view_kind, Arc::clone(&schema), None).expect("plan builds"),
+        );
+        assert_eq!(exec.schema(), schema);
+        let display = format!(
+            "{}",
+            datafusion::physical_plan::displayable(exec.as_ref()).one_line()
+        );
+        assert!(display.contains("view people"), "{display}");
+        assert!(!display.contains("hunter2"), "{display}");
+
+        // A leaf: no children accepted, only partition 0 served.
+        let err = Arc::clone(&exec)
+            .with_new_children(vec![Arc::clone(&exec) as Arc<dyn ExecutionPlan>])
+            .expect_err("a leaf takes no children");
+        assert!(err.to_string().contains("leaf"), "{err}");
+        let err = match exec.execute(1, Arc::new(TaskContext::default())) {
+            Ok(_) => panic!("only partition 0 exists"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("partition 1"), "{err}");
+
+        // Partition 0, no projection, no limit: the row comes through.
+        let stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("partition 0 executes");
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collects");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
 }

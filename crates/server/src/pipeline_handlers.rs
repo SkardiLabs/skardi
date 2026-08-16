@@ -970,6 +970,23 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    #[test]
+    fn json_kind_names_every_shape_and_never_the_value() {
+        // The kind vocabulary is the ONLY thing parameter errors may say
+        // about a value (values can carry user data).
+        for (v, kind) in [
+            (serde_json::Value::Null, "null"),
+            (serde_json::json!(true), "boolean"),
+            (serde_json::json!(42.5), "number"),
+            (serde_json::json!("s3cret"), "string"),
+            (serde_json::json!(["s3cret"]), "array"),
+            (serde_json::json!({"k": "s3cret"}), "object"),
+        ] {
+            assert_eq!(json_kind(&v), kind);
+            assert!(!kind.contains("s3cret"));
+        }
+    }
+
     async fn create_test_pipeline_with_params() -> StandardPipeline {
         let temp_dir = TempDir::new().unwrap();
         let pipeline_content = r#"

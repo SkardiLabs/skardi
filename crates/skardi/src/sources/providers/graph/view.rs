@@ -762,4 +762,111 @@ mod tests {
             peak.load(Ordering::SeqCst)
         );
     }
+
+    /// A client that never answers — the backstop-deadline test's wedge.
+    #[derive(Debug)]
+    struct WedgedClient;
+
+    #[async_trait]
+    impl GraphClient for WedgedClient {
+        async fn execute(
+            &self,
+            _cypher: &str,
+            _params: &Value,
+            _arity: usize,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
+            std::future::pending().await
+        }
+
+        async fn labels(
+            &self,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<Vec<(String, String)>, GraphError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_carry_the_view_identity_never_the_cypher() {
+        // The module-wide redaction rule: Cypher text is caller/config
+        // data and never reaches Debug output (it can embed literals the
+        // operator considers sensitive).
+        let (handle, _) = handle_with(GraphSourceHealth::Healthy, vec![], None);
+        let provider = provider(handle);
+        assert_eq!(provider.table_type(), TableType::Base);
+        let dbg = format!("{provider:?}");
+        assert!(dbg.contains("user_posts"), "{dbg}");
+        assert!(
+            !dbg.contains("MATCH"),
+            "the Cypher text never appears in diagnostics: {dbg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gate_loser_wakes_to_a_healthy_source_and_skips_revalidation() {
+        // The single-flight loser path, deterministically: the "winner"
+        // (this test) holds the gate, the loser passes the fast path
+        // while the source is still degraded and parks on the gate; the
+        // winner flips Healthy and releases — the loser's under-gate
+        // re-check must return without a single backend probe.
+        let (handle, calls) = handle_with(
+            GraphSourceHealth::Degraded("down at startup".to_string()),
+            vec![],
+            None,
+        );
+        let gate = handle.recovery_gate.lock().await;
+        let loser = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { ensure_healthy(&handle, "user_posts").await }
+        });
+        // Let the loser reach the gate before the flip (if it hasn't, it
+        // takes the fast path instead — same observable outcome).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
+        drop(gate);
+        loser
+            .await
+            .expect("no panic")
+            .expect("the loser proceeds without error");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the loser re-proved nothing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_revalidation_hits_the_backstop_deadline() {
+        // The backstop exists for the pathological case the per-probe
+        // bounds cannot reach: a client future that never resolves. One
+        // contract, timeout 5s → deadline 1 wave × (5s + 5s) = 10s; the
+        // paused clock makes the wait instant.
+        let handle = Arc::new(GraphSourceHandle {
+            client: Arc::new(WedgedClient),
+            bounds: QueryBounds {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            health: Arc::new(RwLock::new(GraphSourceHealth::Degraded(
+                "down at startup".to_string(),
+            ))),
+            view_contracts: Arc::new(vec![ViewContract {
+                name: "user_posts".to_string(),
+                cypher: "MATCH (u:User) RETURN u.name".to_string(),
+                columns: columns(),
+            }]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
+        });
+        let err = revalidate_all_views(&handle)
+            .await
+            .expect_err("the wedge cannot pass validation");
+        assert!(
+            matches!(err, GraphError::RecoveryDeadlineExceeded { seconds: 10 }),
+            "{err}"
+        );
+    }
 }

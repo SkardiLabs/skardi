@@ -10,6 +10,7 @@
 use std::fs;
 
 use axum::extract::State;
+use skardi::sources::providers::graph::udtf::GraphSourceHealth;
 use skardi_server::config::{CliArgs, load_server_config};
 use skardi_server::pipeline_handlers::get_data_sources;
 use skardi_server::server::setup_app_state;
@@ -114,7 +115,7 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
 
     // /data_source: the source reports its degraded status and enumerates
     // the view under its fully-qualified catalog name.
-    let axum::Json(body) = get_data_sources(State(state))
+    let axum::Json(body) = get_data_sources(State(state.clone()))
         .await
         .expect("data sources list");
     let data = body["data"].as_array().expect("data array");
@@ -134,6 +135,29 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
     assert_eq!(names, ["kg.main.user_posts"]);
     let columns = tables[0]["schema"].as_array().expect("schema array");
     assert_eq!(columns[0]["name"], "user_name");
+
+    // Once the source recovers (health is flipped by a successful
+    // re-validation), the SAME endpoint reports healthy — the status is
+    // the handle's live health, not a registration-time snapshot.
+    {
+        let sources = state
+            .graph_sources
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let handle = sources.get("kg").expect("handle registered");
+        *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
+    }
+    let axum::Json(body) = get_data_sources(State(state))
+        .await
+        .expect("data sources list");
+    let entry = body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .find(|d| d["name"] == "kg")
+        .cloned()
+        .expect("graph source still listed");
+    assert_eq!(entry["status"], "healthy");
 }
 
 /// `type: graph` without `hierarchy_level: catalog` is a config error, not

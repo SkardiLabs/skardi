@@ -671,4 +671,29 @@ views:
         let err = c.validate("kg", "postgres://h/db").unwrap_err();
         assert!(err.to_string().contains("1..=64"), "{err}");
     }
+
+    #[test]
+    fn declared_columns_is_typed_even_called_standalone() {
+        // The conversion re-parses type names defensively (validate runs
+        // first in the registration flow, but declared_columns is also
+        // called on its own by the view provider construction) — the
+        // standalone error must be as precise as validate's.
+        let view = GraphView {
+            name: "v".to_string(),
+            cypher: "MATCH (n) RETURN n.id".to_string(),
+            schema: vec![GraphViewColumn {
+                name: "id".to_string(),
+                r#type: "uuid".to_string(),
+                nullable: true,
+            }],
+        };
+        let err = view.declared_columns().expect_err("unknown type");
+        let msg = err.to_string();
+        assert!(msg.contains("column 'id'"), "{msg}");
+        assert!(msg.contains("unknown type 'uuid'"), "{msg}");
+        assert!(
+            msg.contains("string"),
+            "the accepted list rides along: {msg}"
+        );
+    }
 }
