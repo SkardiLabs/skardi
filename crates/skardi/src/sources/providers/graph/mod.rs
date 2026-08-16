@@ -55,7 +55,7 @@ use client::{AgeClient, GraphClient, QueryBounds};
 use config::GraphConfig;
 use error::GraphError;
 use udtf::{GraphSourceHandle, GraphSourceHealth, GraphSources};
-use view::{GraphViewProvider, validate_view};
+use view::GraphViewProvider;
 
 use crate::sources::hierarchy::HierarchyLevel;
 
@@ -285,8 +285,11 @@ pub async fn register_graph_tables(
             // Any failure is a contract violation, not an outage —
             // refuse registration (nothing has been published yet).
             // Validations are independent read-only probes fetching at
-            // most one row each — concurrent, so N views cost one
-            // round-trip's latency, not N serial ones at startup.
+            // most one row each — concurrent, BOUNDED at the pool's own
+            // max_connections: unbounded launch would park the excess in
+            // the pool's acquire queue, where acquire_timeout converts
+            // queue wait into a spurious refusal of a healthy backend
+            // (see validate_views_concurrently's doc).
             let client: Arc<dyn GraphClient> = Arc::new(client);
             let probe = Arc::new(GraphSourceHandle {
                 client: Arc::clone(&client),
@@ -294,14 +297,19 @@ pub async fn register_graph_tables(
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
             });
-            futures::future::try_join_all(config.views.iter().map(|view| {
-                let probe = Arc::clone(&probe);
-                async move {
-                    let columns = view.declared_columns()?;
-                    validate_view(&probe, &view.name, &view.cypher, &columns).await
-                }
-            }))
-            .await?;
+            let contracts = config
+                .views
+                .iter()
+                .map(|view| {
+                    Ok(view::ViewContract {
+                        name: view.name.clone(),
+                        cypher: view.cypher.clone(),
+                        columns: view.declared_columns()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, GraphError>>()?;
+            view::validate_views_concurrently(&probe, contracts, config.max_connections as usize)
+                .await?;
             (client, GraphSourceHealth::Healthy)
         }
         Err(e) => {

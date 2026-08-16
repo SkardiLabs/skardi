@@ -236,6 +236,33 @@ pub(crate) async fn revalidate_all_views(handle: &GraphSourceHandle) -> Result<(
     Ok(())
 }
 
+/// Validate every contract with AT MOST `limit` validations in flight —
+/// `limit` is the pool's own `max_connections`, so no validation ever
+/// waits in the pool's acquire queue behind its siblings. An unbounded
+/// `try_join_all` here parks the excess in that queue, where
+/// `acquire_timeout` (wired to `query_timeout_seconds`) keeps ticking:
+/// with more views than connections and validations that take a
+/// meaningful fraction of the timeout, queued waves overrun the deadline
+/// and a HEALTHY backend with a CORRECT contract is refused registration
+/// as `ConnectionAcquireTimeout` — an availability artifact of the
+/// launch shape, not a contract violation. The first failure aborts the
+/// remaining validations (they are independent probes; one refusal is
+/// enough to refuse registration).
+pub(crate) async fn validate_views_concurrently(
+    handle: &Arc<GraphSourceHandle>,
+    contracts: Vec<ViewContract>,
+    limit: usize,
+) -> Result<(), GraphError> {
+    stream::iter(contracts.into_iter().map(Ok))
+        .try_for_each_concurrent(limit.max(1), |contract| {
+            let handle = Arc::clone(handle);
+            async move {
+                validate_view(&handle, &contract.name, &contract.cypher, &contract.columns).await
+            }
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +619,82 @@ mod tests {
         validate_view(&handle, "user_posts", "MATCH (n) RETURN n", &columns())
             .await
             .expect("empty is valid");
+    }
+
+    /// A slow, in-flight-counting client: pins that view validation
+    /// launches AT MOST `limit` probes concurrently. Unbounded launch
+    /// parks the excess in the pool's acquire queue, where a healthy
+    /// backend's queue wait converts into a spurious
+    /// ConnectionAcquireTimeout refusal (the P2 this test guards).
+    #[derive(Debug)]
+    struct GaugeMock {
+        current: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl GraphClient for GaugeMock {
+        async fn execute(
+            &self,
+            _cypher: &str,
+            _params: &Value,
+            _arity: usize,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
+            let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Long enough that an unbounded launch would overlap all
+            // probes and drive the peak to the view count.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            Ok(stream::iter(vec![Ok(vec![serde_json::json!("x")])]).boxed())
+        }
+
+        async fn labels(
+            &self,
+            _bounds: QueryBounds,
+            _limit: Option<usize>,
+        ) -> Result<Vec<(String, String)>, GraphError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_validation_concurrency_is_bounded_by_the_limit() {
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = Arc::new(GraphSourceHandle {
+            client: Arc::new(GaugeMock {
+                current: Arc::clone(&current),
+                peak: Arc::clone(&peak),
+                calls: Arc::clone(&calls),
+            }),
+            bounds: QueryBounds {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+            view_contracts: Arc::new(vec![]),
+        });
+        let contracts: Vec<ViewContract> = (0..8)
+            .map(|i| ViewContract {
+                name: format!("v{i}"),
+                cypher: "MATCH (n) RETURN n.x".to_string(),
+                columns: columns(),
+            })
+            .collect();
+        validate_views_concurrently(&handle, contracts, 2)
+            .await
+            .expect("all views validate");
+        assert_eq!(calls.load(Ordering::SeqCst), 8, "every view was proven");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "at most `limit` probes in flight, got {}",
+            peak.load(Ordering::SeqCst)
+        );
     }
 }
