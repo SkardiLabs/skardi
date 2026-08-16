@@ -1,0 +1,243 @@
+{
+  "type": "object",
+  "properties": {
+    "matches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "matchType": {
+            "type": "string",
+            "description": "The Dropbox match type tag."
+          },
+          "metadata": {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "type": "string",
+                "description": "The Dropbox metadata tag such as file, folder, or deleted."
+              },
+              "name": {
+                "type": "string",
+                "description": "The Dropbox item name."
+              },
+              "id": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The Dropbox item ID when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "pathDisplay": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The user-facing cased path when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "pathLower": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The lower-cased full path when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "clientModified": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The client-provided modification timestamp in ISO 8601 format when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "serverModified": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The server-side modification timestamp in ISO 8601 format when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "rev": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The Dropbox file revision when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sizeBytes": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "description": "The file size in bytes when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "isDownloadable": {
+                "anyOf": [
+                  {
+                    "type": "boolean",
+                    "description": "Whether the file can be downloaded directly."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "contentHash": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The Dropbox content hash when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "url": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The shared link URL when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "expiresAt": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "The shared link expiration timestamp in ISO 8601 format when available."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sharingInfo": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true,
+                    "description": "A generic JSON object returned by Dropbox."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "linkPermissions": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true,
+                    "description": "Shared-link permission metadata when Dropbox includes it."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "tag",
+              "name",
+              "id",
+              "pathDisplay",
+              "pathLower",
+              "clientModified",
+              "serverModified",
+              "rev",
+              "sizeBytes",
+              "isDownloadable",
+              "contentHash",
+              "url",
+              "expiresAt",
+              "sharingInfo",
+              "linkPermissions"
+            ],
+            "description": "A normalized Dropbox metadata or shared-link record."
+          },
+          "highlightSpans": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "description": "A generic JSON object returned by Dropbox."
+                },
+                "description": "Dropbox highlight spans when requested and returned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "matchType",
+          "metadata",
+          "highlightSpans"
+        ],
+        "description": "A normalized Dropbox search match."
+      },
+      "description": "The Dropbox search matches."
+    },
+    "cursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The cursor for continuing the search when available."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "hasMore": {
+      "type": "boolean",
+      "description": "Whether more search matches are available."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "matches",
+    "cursor",
+    "hasMore"
+  ],
+  "description": "A Dropbox search result page."
+}

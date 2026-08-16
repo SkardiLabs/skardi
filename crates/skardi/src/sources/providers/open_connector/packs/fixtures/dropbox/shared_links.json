@@ -1,0 +1,47 @@
+{
+  "links": [
+    {
+      "tag": "file",
+      "name": "redacted-report.pdf",
+      "id": "id:bbbbbbbbbbbbbbbbbbbbbb",
+      "pathDisplay": "/Redacted Folder/redacted-report.pdf",
+      "pathLower": "/redacted folder/redacted-report.pdf",
+      "clientModified": "2026-08-01T09:15:00Z",
+      "serverModified": "2026-08-01T09:15:04Z",
+      "rev": "0165f0a1b2c3d4e5f60",
+      "sizeBytes": 284913,
+      "isDownloadable": true,
+      "contentHash": "3f1a0c9e4b7d2a5f8e0c1b3d6a9f2e4c7b0d3a6f9e2c5b8d1a4f7e0c3b6d9a2f",
+      "url": "https://www.dropbox.com/scl/fi/redacted0001/report.pdf?dl=0",
+      "expiresAt": "2026-12-31T23:59:59Z",
+      "sharingInfo": null,
+      "linkPermissions": {
+        "resolved_visibility": { ".tag": "public" },
+        "can_revoke": true,
+        "allow_download": true
+      }
+    },
+    {
+      "tag": "folder",
+      "name": "Redacted Folder",
+      "id": "id:aaaaaaaaaaaaaaaaaaaaaa",
+      "pathDisplay": "/Redacted Folder",
+      "pathLower": "/redacted folder",
+      "clientModified": null,
+      "serverModified": null,
+      "rev": null,
+      "sizeBytes": null,
+      "isDownloadable": null,
+      "contentHash": null,
+      "url": "https://www.dropbox.com/scl/fo/redacted0002/folder?dl=0",
+      "expiresAt": null,
+      "sharingInfo": null,
+      "linkPermissions": {
+        "resolved_visibility": { ".tag": "team_only" },
+        "can_revoke": false
+      }
+    }
+  ],
+  "cursor": null,
+  "hasMore": false
+}

@@ -190,6 +190,7 @@ impl SourcePackRegistry {
         let mut packs = HashMap::new();
         for pack in [
             super::packs::mock::pack()?,
+            super::packs::dropbox::pack()?,
             super::packs::github::pack()?,
             super::packs::gmail::pack()?,
             super::packs::notion::pack()?,
@@ -318,6 +319,7 @@ mod tests {
             names,
             vec![
                 "discord",
+                "dropbox",
                 "feishu",
                 "github",
                 "gmail",

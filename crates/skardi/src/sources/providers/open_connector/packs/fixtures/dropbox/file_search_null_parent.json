@@ -1,0 +1,32 @@
+{
+  "matches": [
+    {
+      "matchType": "filename",
+      "metadata": {
+        "tag": "file",
+        "name": "present.txt",
+        "id": "id:dddddddddddddddddddddd",
+        "pathDisplay": "/present.txt",
+        "pathLower": "/present.txt",
+        "clientModified": null,
+        "serverModified": null,
+        "rev": null,
+        "sizeBytes": null,
+        "isDownloadable": null,
+        "contentHash": null,
+        "url": null,
+        "expiresAt": null,
+        "sharingInfo": null,
+        "linkPermissions": null
+      },
+      "highlightSpans": []
+    },
+    {
+      "matchType": "filename",
+      "metadata": null,
+      "highlightSpans": []
+    }
+  ],
+  "cursor": null,
+  "hasMore": false
+}
