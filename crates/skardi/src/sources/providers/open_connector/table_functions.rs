@@ -206,21 +206,26 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
             }
         }
 
-        // Same discovery and compatibility gates as YAML registration: the
-        // action must have been discovered when the gateway registered, and
-        // must still match the pack's expected contract fingerprint.
-        let meta = discovered_action(&handle, &gateway, table.action_id)?;
-        if let Some(expected) = table.expected_fingerprint
-            && meta.fingerprint() != expected
-        {
-            return Err(plan_error(OpenConnectorError::ActionContractMismatch {
-                table: table.id.to_string(),
-                reason: format!(
-                    "action '{}' fingerprint mismatch (expected {expected}, discovered {})",
-                    table.action_id,
-                    meta.fingerprint()
-                ),
-            }));
+        // Same discovery and compatibility gates as YAML registration: every
+        // action the table executes must have been discovered when the
+        // gateway registered, and must still match the pack's expected
+        // contract fingerprint. Iterating `gated_actions()` — the same
+        // helper the YAML path uses — is what keeps a drifted continuation
+        // action from being refused by one path and admitted by the other.
+        for action_id in table.actions() {
+            discovered_action(&handle, &gateway, action_id)?;
+        }
+        for (action_id, expected) in table.gated_actions() {
+            let meta = discovered_action(&handle, &gateway, action_id)?;
+            if meta.fingerprint() != expected {
+                return Err(plan_error(OpenConnectorError::ActionContractMismatch {
+                    table: table.id.to_string(),
+                    reason: format!(
+                        "action '{action_id}' fingerprint mismatch (expected {expected}, discovered {})",
+                        meta.fingerprint()
+                    ),
+                }));
+            }
         }
 
         let provider = OpenConnectorTableProvider::new(
@@ -330,6 +335,9 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 error_path: None,
                 fixed_inputs: &[],
                 source_pack_version: 0,
+                // Raw scans declare no pagination contract at all, so
+                // there is no listing to continue.
+                continuation: None,
             },
             converter,
             row_path,

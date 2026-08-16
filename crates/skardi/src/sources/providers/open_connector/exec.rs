@@ -25,13 +25,13 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::stream;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::cache::{ScanCache, ScanKeyParts, scan_cache_key, schema_fingerprint};
 use super::client::OpenConnectorClient;
 use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
-use super::pagination::{Pagination, PaginationStrategy};
+use super::pagination::{CursorContinuation, Pagination, PaginationStrategy};
 use super::row_path::RowPath;
 use super::source_pack::{FixedValue, SourcePackTable};
 
@@ -57,6 +57,10 @@ pub struct ScanTarget {
     /// Source-pack version, part of the cache key (0 for raw scans, which
     /// have no pack and bypass the cache).
     pub source_pack_version: u32,
+    /// Split-action cursor continuation (see
+    /// [`super::pagination::CursorContinuation`]); `None` for raw scans and
+    /// for every table whose provider accepts the cursor on its own action.
+    pub continuation: Option<CursorContinuation>,
 }
 
 impl ScanTarget {
@@ -69,6 +73,7 @@ impl ScanTarget {
             error_path: table.error_path,
             fixed_inputs: table.fixed_inputs,
             source_pack_version,
+            continuation: table.continuation,
         }
     }
 }
@@ -444,20 +449,47 @@ impl ScanState {
             });
         }
 
+        // Some providers serve pages 2..N from a DIFFERENT action than the
+        // one that began the listing (Dropbox's `list_folder` →
+        // `list_folder_continue`), and that action's schema commonly
+        // accepts the cursor and nothing else. Page one always uses the
+        // table's own action with the full input.
+        let continuation = self
+            .target
+            .continuation
+            .filter(|_| self.pagination.page() > 1);
+        let action_id: &str = match &continuation {
+            Some(continuation) => continuation.action_id,
+            None => &self.target.action_id,
+        };
+
         // Assemble the action input: resource inputs, the pack's fixed
         // inputs, pushed-down filters (which may override a fixed input —
         // `state=all` yields to a pushed `state='open'`), then page
         // parameters.
-        let mut input = self.resource.as_object().cloned().expect(
-            "resource is a JSON object by construction (registration always builds Value::Object)",
-        );
-        for (field, value) in self.target.fixed_inputs {
-            input.insert((*field).to_string(), value.to_json());
-        }
-        for (field, value) in &self.filter_inputs {
-            input.insert(field.clone(), value.clone());
-        }
-        self.pagination.apply(&mut input);
+        let input = if continuation.is_some_and(|c| c.cursor_only) {
+            // Everything the non-continuation branch assembles is a hard
+            // 400 here: the continue action declares `cursor` as its only
+            // property under `additionalProperties: false`. The listing's
+            // resources, fixed inputs, filters and page size were all
+            // committed by the request that opened it, and the cursor
+            // carries that state forward on the provider's side.
+            let mut input = Map::new();
+            self.pagination.apply_cursor_only(&mut input);
+            input
+        } else {
+            let mut input = self.resource.as_object().cloned().expect(
+                "resource is a JSON object by construction (registration always builds Value::Object)",
+            );
+            for (field, value) in self.target.fixed_inputs {
+                input.insert((*field).to_string(), value.to_json());
+            }
+            for (field, value) in &self.filter_inputs {
+                input.insert(field.clone(), value.clone());
+            }
+            self.pagination.apply(&mut input);
+            input
+        };
 
         let page = self.pagination.page();
         // The scan deadline covers the whole gateway operation, including
@@ -466,7 +498,7 @@ impl ScanState {
         let envelope = tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
             self.client.execute(
-                &self.target.action_id,
+                action_id,
                 &Value::Object(input),
                 self.connection_alias.as_deref(),
             ),
@@ -501,7 +533,10 @@ impl ScanState {
                 ),
             };
             return Err(OpenConnectorError::ProviderReportedError {
-                action_id: self.target.action_id.to_string(),
+                // The action that actually answered — on a continuation
+                // page that is the continue action, and naming the table's
+                // opening action instead would misdirect the reader.
+                action_id: action_id.to_string(),
                 page,
                 code,
             });
@@ -599,6 +634,7 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::packs::mock;
     use crate::sources::providers::open_connector::testutil::{
         CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
@@ -667,6 +703,127 @@ mod tests {
             OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5))
                 .expect("build client"),
         )
+    }
+
+    /// A cursor-paginated table continuing through a SEPARATE action whose
+    /// schema accepts only the cursor — the Dropbox `list_folder` /
+    /// `list_folder_continue` shape.
+    fn split_action_table() -> &'static SourcePackTable {
+        Box::leak(Box::new(SourcePackTable {
+            id: "split.entries",
+            action_id: "split.list",
+            row_path: "$.entries",
+            fields: &[FieldMapping {
+                name: "id",
+                path: "id",
+                field_type: FieldType::UInt64,
+                nullable: false,
+            }],
+            pagination: PaginationStrategy::Cursor {
+                cursor_param: "cursor",
+                next_cursor_path: "$.cursor",
+                page_size_param: Some("limit"),
+                page_size: 2,
+                has_more_path: Some("$.hasMore"),
+            },
+            required_resources: &[],
+            optional_resources: &["path"],
+            exclusive_resources: &[],
+            fixed_inputs: &[("recursive", FixedValue::Bool(true))],
+            filters: &[],
+            error_path: None,
+            expected_fingerprint: None,
+            continuation: Some(CursorContinuation {
+                action_id: "split.list_continue",
+                expected_fingerprint: "unused-in-exec",
+                cursor_only: true,
+            }),
+        }))
+    }
+
+    #[tokio::test]
+    async fn continuation_pages_target_the_continue_action_with_only_a_cursor() {
+        // The regression this whole extension exists to prevent: page two
+        // sent to the opening action, or sent to the continue action
+        // carrying the resources/fixed inputs/page size it declares no
+        // properties for. Either is a hard 400 against the real gateway
+        // (additionalProperties: false), so both request bodies are pinned
+        // structurally here.
+        let requests: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&requests);
+        let gateway = MockGateway::start(move |req: &RecordedRequest| {
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            let input = body.get("input").cloned().unwrap_or(json!({}));
+            recorder
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((req.path.clone(), input));
+            match req.path.as_str() {
+                "/v1/actions/split.list" => MockResponse::ok(&envelope_ok(
+                    &json!({"entries": [{"id": 1}, {"id": 2}], "cursor": "c2", "hasMore": true})
+                        .to_string(),
+                )),
+                // The final page still carries a NON-empty cursor — the
+                // Dropbox reality that makes has_more_path load-bearing.
+                "/v1/actions/split.list_continue" => MockResponse::ok(&envelope_ok(
+                    &json!({"entries": [{"id": 3}], "cursor": "c3", "hasMore": false}).to_string(),
+                )),
+                _ => MockResponse::new(404, "{}"),
+            }
+        })
+        .await;
+
+        let table = split_action_table();
+        let exec = OpenConnectorExec::new(
+            online_client(&gateway).await,
+            None,
+            "saas".to_string(),
+            Some("ws".to_string()),
+            None,
+            ScanTarget::from_pack_table(table, 1),
+            Arc::new(RowConverter::new(table.fields).expect("converter")),
+            RowPath::parse(table.row_path).expect("row path"),
+            json!({"path": "/docs"}),
+            vec![],
+            None,
+            None,
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .expect("build exec");
+
+        let mut state = ScanState::new(&exec).expect("state");
+        let mut rows = 0;
+        while let Some(batch) = state.next_page().await.expect("page") {
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 3, "both pages are scanned");
+
+        let requests = requests.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(requests.len(), 2, "exactly two gateway calls");
+
+        let (path, input) = &requests[0];
+        assert_eq!(path, "/v1/actions/split.list", "page one opens the listing");
+        assert_eq!(input.get("path"), Some(&json!("/docs")), "resource");
+        assert_eq!(input.get("recursive"), Some(&json!(true)), "fixed input");
+        assert_eq!(input.get("limit"), Some(&json!(2)), "page size");
+        assert!(
+            input.get("cursor").is_none(),
+            "no cursor exists on the first page"
+        );
+
+        let (path, input) = &requests[1];
+        assert_eq!(
+            path, "/v1/actions/split.list_continue",
+            "page two targets the continue action, not the opening one"
+        );
+        assert_eq!(
+            input,
+            &json!({"cursor": "c2"}),
+            "the continue action's schema accepts the cursor and nothing else"
+        );
     }
 
     #[tokio::test]

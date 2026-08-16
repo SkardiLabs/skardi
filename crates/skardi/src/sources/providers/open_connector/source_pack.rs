@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use super::error::OpenConnectorError;
 use super::filters::FilterMapping;
 use super::json_to_arrow::FieldMapping;
-use super::pagination::PaginationStrategy;
+use super::pagination::{CursorContinuation, PaginationStrategy};
 
 /// A fixed action-input value a pack pins at compile time — a
 /// const-friendly stand-in for the JSON scalar set (`serde_json::Value`'s
@@ -105,6 +105,11 @@ pub struct SourcePackTable {
     /// Expected action-contract fingerprint. When set, registration compares
     /// it with the discovered action's fingerprint and fails on mismatch.
     pub expected_fingerprint: Option<&'static str>,
+    /// Split-action cursor continuation, for providers that serve pages
+    /// 2..N from a different action than the one that began the listing
+    /// (see [`CursorContinuation`]). `None` for every table whose provider
+    /// accepts the cursor on its own action.
+    pub continuation: Option<CursorContinuation>,
 }
 
 impl SourcePackTable {
@@ -130,6 +135,29 @@ impl SourcePackTable {
             }
         }
         None
+    }
+
+    /// Every action this table executes: its own, plus a split-action
+    /// continuation's. Registration discovers all of them, so a
+    /// continuation action missing from the gateway fails at startup rather
+    /// than on page two of the first scan.
+    pub fn actions(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.action_id).chain(self.continuation.map(|c| c.action_id))
+    }
+
+    /// Every `(action, expected fingerprint)` pair the compatibility gate
+    /// must verify. Both gate call sites — YAML binding registration and
+    /// the `open_connector_query` UDTF — iterate THIS, so a drifted
+    /// continuation action cannot be refused by one path and admitted by
+    /// the other.
+    pub fn gated_actions(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+        self.expected_fingerprint
+            .map(|fingerprint| (self.action_id, fingerprint))
+            .into_iter()
+            .chain(
+                self.continuation
+                    .map(|c| (c.action_id, c.expected_fingerprint)),
+            )
     }
 }
 
@@ -490,6 +518,7 @@ mod tests {
             filters: &[],
             error_path: None,
             expected_fingerprint: None,
+            continuation: None,
         }
     }
 

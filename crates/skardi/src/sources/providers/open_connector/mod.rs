@@ -181,7 +181,10 @@ pub async fn register_open_connector_tables(
         let mut tables = Vec::with_capacity(binding.tables.len());
         for table_name in &binding.tables {
             let table = pack_registry.table(pack, table_name)?;
-            action_ids.push(table.action_id.to_string());
+            // Every action the table executes, including a split-action
+            // continuation's: an undiscovered continue action must fail at
+            // startup, not on page two of the first scan.
+            action_ids.extend(table.actions().map(str::to_string));
             for key in table.required_resources {
                 if !binding.resource.contains_key(*key) {
                     return Err(OpenConnectorError::MissingResourceInput {
@@ -239,18 +242,17 @@ pub async fn register_open_connector_tables(
         for table_name in &binding.tables {
             let table = pack_registry.table(pack, table_name)?;
 
-            // Compatibility gate: the discovered action contract must match
-            // the fingerprint the pack was built against.
-            if let Some(expected) = table.expected_fingerprint {
-                let actual = registry
-                    .get(table.action_id)
-                    .map(ActionMetadata::fingerprint);
+            // Compatibility gate: every discovered action contract the
+            // table executes must match the fingerprint the pack was built
+            // against — the opening action AND, for split-action
+            // pagination, the one serving pages 2..N.
+            for (action_id, expected) in table.gated_actions() {
+                let actual = registry.get(action_id).map(ActionMetadata::fingerprint);
                 if actual != Some(expected) {
                     return Err(OpenConnectorError::ActionContractMismatch {
                         table: table.id.to_string(),
                         reason: format!(
-                            "action '{}' fingerprint mismatch (expected {expected}, discovered {})",
-                            table.action_id,
+                            "action '{action_id}' fingerprint mismatch (expected {expected}, discovered {})",
                             actual.unwrap_or("<none>")
                         ),
                     }
