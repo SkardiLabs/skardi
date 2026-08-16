@@ -519,6 +519,10 @@ pub async fn get_data_sources(
         // Only graph sources report a status (see the field's doc): read the
         // handle's registration health. A missing handle reports nothing —
         // the same degrade-quietly policy as the table-listing fallbacks.
+        // NOT a liveness probe: health only moves toward Healthy (see
+        // GraphSourceHandle::health) — "healthy" means "recovered since
+        // registration", and a backend that died afterwards still reads
+        // healthy until its queries fail.
         let status = if data_source.source_type == DataSourceType::Graph {
             let sources = app_state
                 .graph_sources
@@ -621,6 +625,20 @@ fn row_cell_to_sql(v: &Value) -> String {
     }
 }
 
+/// The JSON kind name for parameter error messages — parameter VALUES
+/// never appear in errors (they can carry user data; the 400 body and
+/// logs must not echo them), only their shape.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// Substitute `{param}` placeholders in `sql` with their SQL-safe values.
 ///
 /// `expected_params` must be sorted longest-first so that a shorter name (e.g. `user`) cannot
@@ -704,7 +722,10 @@ pub fn substitute_sql_params(
                                  non-zero number of cells.",
                                 param_name
                             );
-                            unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                            unsupported_params.push(format!(
+                                "{}: inconsistent or empty row widths in a tuple list",
+                                param_name
+                            ));
                             continue;
                         }
                         let rows: Vec<String> = row_arrays
@@ -724,7 +745,10 @@ pub fn substitute_sql_params(
                              list).",
                             param_name
                         );
-                        unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                        unsupported_params.push(format!(
+                            "{}: mixed-shape array (all scalars or all arrays)",
+                            param_name
+                        ));
                         continue;
                     } else {
                         // Flat scalar array — the original vector-literal form.
@@ -734,11 +758,15 @@ pub fn substitute_sql_params(
                 }
                 _ => {
                     tracing::error!(
-                        "Unsupported parameter type for {}: {:?}",
+                        "Unsupported parameter type for {}: {}",
                         param_name,
-                        param_value
+                        json_kind(param_value)
                     );
-                    unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                    unsupported_params.push(format!(
+                        "{}: unsupported JSON {}",
+                        param_name,
+                        json_kind(param_value)
+                    ));
                     continue;
                 }
             };

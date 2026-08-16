@@ -174,6 +174,12 @@ operators into `json_get(...)` calls at planning time, session-wide,
 which datafusion-table-providers' unparser cannot translate back for
 federated sources. Use `json_get_str(col, 'key')` explicitly.
 
+Pick the getter that matches the property's JSON type: `json_get_str`
+returns NULL (not a coercion) when the stored value is a number, so a
+numeric property like `age` or `since` needs `json_get_int` /
+`json_get_float` — a silently-NULL column is the usual symptom of the
+wrong getter.
+
 ## Least-privilege deployment recipe
 
 The read-only guarantee is backend-enforced, so run it with the least

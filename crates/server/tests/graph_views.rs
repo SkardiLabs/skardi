@@ -233,8 +233,8 @@ mod params_through_real_substitution {
     };
     use skardi_server::pipeline_handlers::substitute_sql_params;
 
-    /// Echoes the bound `min` param back as the row, so substitution is
-    /// observable end to end.
+    /// Echoes the bound `min` (or `name`) param back as the row, so
+    /// substitution is observable end to end.
     #[derive(Debug)]
     struct EchoClient;
 
@@ -248,8 +248,12 @@ mod params_through_real_substitution {
             _bounds: QueryBounds,
             _limit: Option<usize>,
         ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
-            let min = params.get("min").cloned().unwrap_or(Value::Null);
-            Ok(stream::iter(vec![Ok(vec![min])]).boxed())
+            let echoed = params
+                .get("min")
+                .or_else(|| params.get("name"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(stream::iter(vec![Ok(vec![echoed])]).boxed())
         }
 
         async fn labels(
@@ -333,5 +337,94 @@ spec:
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("int column");
         assert_eq!(col.value(0), 40, "the bound param reached the client");
+    }
+
+    fn ctx_with_echo() -> Arc<datafusion::prelude::SessionContext> {
+        let sources: GraphSources = Arc::new(RwLock::new(HashMap::from([(
+            "kg".to_string(),
+            Arc::new(GraphSourceHandle {
+                client: Arc::new(EchoClient) as Arc<dyn GraphClient>,
+                bounds: QueryBounds {
+                    timeout: std::time::Duration::from_secs(5),
+                    max_rows: 100,
+                },
+                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
+                view_contracts: Arc::new(vec![]),
+                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                validation_limit: 4,
+            }),
+        )])));
+        let ctx = Arc::new(datafusion::prelude::SessionContext::new());
+        register_graph_udtfs(&ctx, sources).unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_single_quote_in_a_param_survives_the_sql_escaping_round_trip() {
+        // The substitution quotes the params JSON as a SQL string literal
+        // with '' escaping — a value like O'Brien is exactly the input
+        // that breaks if that escaping (or the UDTF's re-parse of the
+        // literal) is wrong, so pin the full round trip: escape → plan →
+        // parse → the client sees the original apostrophe.
+        let ctx = ctx_with_echo();
+        let mut sql = "SELECT who FROM cypher_query('kg', \
+                       'MATCH (p) WHERE p.name = $name RETURN p.name', {params}, \
+                       '{\"who\": \"string\"}')"
+            .to_string();
+        let expected = vec!["params".to_string()];
+        let request: HashMap<String, Value> = HashMap::from([(
+            "params".to_string(),
+            Value::String("{\"name\": \"O'Brien\"}".to_string()),
+        )]);
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected, &request);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(unsupported.is_empty(), "{unsupported:?}");
+        assert!(
+            sql.contains("O''Brien"),
+            "the literal is SQL-escaped: {sql}"
+        );
+
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("the escaped literal plans")
+            .collect()
+            .await
+            .expect("executes");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("string column");
+        assert_eq!(
+            col.value(0),
+            "O'Brien",
+            "the apostrophe survives the round trip"
+        );
+    }
+
+    #[test]
+    fn a_json_object_param_is_rejected_as_unsupported_not_stringified() {
+        // The documented contract is a STRING carrying JSON — a request
+        // that sends `"params": {"min": 40}` as a real JSON object must
+        // land in `unsupported` (a typed 400), not be silently
+        // Display-formatted into the SQL.
+        let mut sql = "SELECT n FROM cypher_query('kg', 'RETURN 1', {params}, '{\"n\": \"int\"}')"
+            .to_string();
+        let expected = vec!["params".to_string()];
+        let request: HashMap<String, Value> =
+            HashMap::from([("params".to_string(), serde_json::json!({"min": 40}))]);
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected, &request);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(
+            unsupported,
+            vec!["params: unsupported JSON object".to_string()],
+            "an object-shaped param is refused by KIND — the value itself \
+             never appears in the 400"
+        );
+        assert!(
+            sql.contains("{params}"),
+            "the placeholder is left untouched on refusal: {sql}"
+        );
     }
 }

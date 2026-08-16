@@ -39,7 +39,7 @@
 //! structural check is possible.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -103,6 +103,14 @@ pub struct GraphSourceHandle {
     /// backend was unreachable at registration is Degraded with the
     /// registration error's summary; the first scan retries validation
     /// and flips this back to Healthy on success.
+    ///
+    /// The flip is ONE-WAY: nothing moves a Healthy source back to
+    /// Degraded, deliberately — a post-recovery failure can be the
+    /// CALLER's (bad Cypher, a mis-typed declaration) as easily as the
+    /// backend's, and flipping on any error would mark healthy sources
+    /// degraded over queries they never could have served. Read this as
+    /// "registered degraded and not yet recovered", never as a liveness
+    /// probe — /data_source's status field carries the same caveat.
     pub health: Arc<RwLock<GraphSourceHealth>>,
     /// The validation contract of every YAML view on this source, kept so
     /// the degraded recovery re-proves ALL of them before the source
@@ -303,6 +311,24 @@ fn parse_columns(text: &str) -> Result<Vec<DeclaredColumn>, GraphError> {
             accepted: ACCEPTED_TYPES,
         });
     }
+    // serde_json's object parse REPLACES duplicate keys silently, so a
+    // declaration like '{"n": "int", "n": "string"}' would otherwise
+    // slip through as one column — the last type wins and the author's
+    // first declaration is dropped without a word. Re-walk the raw text
+    // as key/value PAIRS to catch what the map has already collapsed.
+    let pairs = object_pairs(text).map_err(|e| GraphError::InvalidColumns {
+        reason: format!("unparseable JSON ({e})"),
+        accepted: ACCEPTED_TYPES,
+    })?;
+    let mut seen = HashSet::with_capacity(pairs.len());
+    for (name, _) in &pairs {
+        if !seen.insert(name.as_str()) {
+            return Err(GraphError::InvalidColumns {
+                reason: format!("column '{name}' is declared twice"),
+                accepted: ACCEPTED_TYPES,
+            });
+        }
+    }
     map.into_iter()
         .map(|(name, ty)| {
             let Value::String(ty_name) = &ty else {
@@ -327,6 +353,33 @@ fn parse_columns(text: &str) -> Result<Vec<DeclaredColumn>, GraphError> {
             })
         })
         .collect()
+}
+
+/// The declared-columns object as raw key/value PAIRS, duplicates
+/// preserved — the duplicate-detection walk [`parse_columns`] runs after
+/// serde_json's own object parse has already collapsed repeats.
+fn object_pairs(text: &str) -> Result<Vec<(String, Value)>, serde_json::Error> {
+    struct Pairs;
+    impl<'de> serde::de::Visitor<'de> for Pairs {
+        type Value = Vec<(String, Value)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut pairs = Vec::new();
+            while let Some(entry) = access.next_entry::<String, Value>()? {
+                pairs.push(entry);
+            }
+            Ok(pairs)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_str(text);
+    let pairs = serde::de::Deserializer::deserialize_map(&mut de, Pairs)?;
+    de.end()?;
+    Ok(pairs)
 }
 
 /// The provider behind one `cypher_query` call: planning-time-stable
@@ -686,9 +739,19 @@ fn degraded_execution_error(degraded: Option<String>, e: GraphError) -> DataFusi
 /// "registration refused" to "scan-time conversion error" the moment an
 /// ad-hoc query flipped the source. For a view-less source there is
 /// nothing to re-prove and the successful query is itself the evidence.
-async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) -> DFResult<()> {
+/// NEVER fails the caller: on this path the caller's own query has
+/// ALREADY SUCCEEDED, and whether an UNRELATED view honors its contract
+/// is a different question from whether these rows are good — failing
+/// here would discard a correct answer, permanently (a source with one
+/// mis-declared view would fail every ad-hoc query and graph_schema —
+/// the agent's discovery surface — forever, with a restart then refusing
+/// to start). Instead: flip Healthy only on a clean re-validation, stay
+/// Degraded otherwise with a warning naming the cause, and let the
+/// broken view's OWN scan be the loud failure (view.rs::ensure_healthy
+/// keeps that behaviour).
+async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) {
     if !degraded {
-        return Ok(());
+        return;
     }
     // SINGLE-FLIGHT with the view path's recovery (the same gate):
     // concurrent recoveries would each re-prove every view. Re-check
@@ -696,18 +759,19 @@ async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) ->
     // already flipped the source and there is nothing left to prove.
     let _gate = handle.recovery_gate.lock().await;
     if degraded_reason(handle).is_none() {
-        return Ok(());
+        return;
     }
-    super::view::revalidate_all_views(handle)
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!(
-                "the query succeeded against the recovered backend, but the source's \
-                 view re-validation failed and it stays degraded: {e}"
-            ))
-        })?;
-    mark_healthy(handle);
-    Ok(())
+    match super::view::revalidate_all_views(handle).await {
+        Ok(()) => mark_healthy(handle),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "an ad-hoc query succeeded against the recovered backend, but view \
+                 re-validation failed — the source stays degraded (the failing \
+                 view's own scan reports this loudly)"
+            );
+        }
+    }
 }
 
 /// The cypher scan: run on first poll, then convert in batch-atomic
@@ -734,7 +798,7 @@ pub(crate) fn cypher_batches(
             (Ok(rows), degraded) => {
                 // The backend answered — re-prove the view contracts and
                 // flip Healthy (a no-op for healthy sources).
-                recover_if_degraded(&handle, degraded.is_some()).await?;
+                recover_if_degraded(&handle, degraded.is_some()).await;
                 rows
             }
             (Err(e), degraded) => return Err(degraded_execution_error(degraded, e)),
@@ -765,7 +829,7 @@ fn labels_batch(
         let degraded = degraded_reason(&handle);
         let labels = match handle.client.labels(handle.bounds, limit).await {
             Ok(labels) => {
-                recover_if_degraded(&handle, degraded.is_some()).await?;
+                recover_if_degraded(&handle, degraded.is_some()).await;
                 labels
             }
             Err(e) => return Err(degraded_execution_error(degraded, e)),
@@ -1015,6 +1079,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recovered_query_keeps_its_rows_when_a_sibling_view_fails_revalidation() {
+        // The recovery pin: the caller's query ALREADY succeeded, so a
+        // sibling view breaking its contract must not discard those rows
+        // — that would fail every ad-hoc query (and graph_schema, the
+        // discovery surface) forever over one mis-declared view. The
+        // rows come back; the source merely stays degraded, and the
+        // broken view's own scan is where the failure surfaces loudly.
+        let contract = super::super::view::ViewContract {
+            name: "people".to_string(),
+            cypher: "MATCH (p:Person) RETURN p.name, p.age".to_string(),
+            columns: vec![
+                DeclaredColumn {
+                    name: "name".to_string(),
+                    ty: GraphType::String,
+                    nullable: true,
+                },
+                DeclaredColumn {
+                    name: "age".to_string(),
+                    ty: GraphType::Int,
+                    nullable: true,
+                },
+            ],
+        };
+        // One value per row: the ad-hoc single-column query succeeds,
+        // but the two-column view contract hits an arity mismatch.
+        let handle = Arc::new(GraphSourceHandle {
+            client: Arc::new(MockClient {
+                rows: vec![vec![serde_json::json!("ada")]],
+                labels: vec![("Person".to_string(), "vertex".to_string())],
+            }),
+            bounds: QueryBounds {
+                timeout: std::time::Duration::from_secs(5),
+                max_rows: 100,
+            },
+            health: Arc::new(RwLock::new(GraphSourceHealth::Degraded(
+                "connection refused at startup".to_string(),
+            ))),
+            view_contracts: Arc::new(vec![contract]),
+            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            validation_limit: 4,
+        });
+        let sources: GraphSources =
+            Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])));
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("registration");
+        let batches = collect(
+            &ctx,
+            "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', '{}', \
+             '{\"name\": \"string\"}')",
+        )
+        .await;
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "the successful query's rows are emitted, not discarded"
+        );
+        assert!(
+            !health_of(&sources).is_healthy(),
+            "the failed view re-validation keeps the source degraded"
+        );
+    }
+
+    #[tokio::test]
     async fn a_healthy_source_failure_is_not_wrapped_in_degraded_context() {
         let sources = sources_with_health(
             GraphSourceHealth::Healthy,
@@ -1058,6 +1185,23 @@ mod tests {
         .await;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_column_declaration_is_rejected_not_silently_collapsed() {
+        // serde_json keeps the LAST duplicate key, so without the pair
+        // walk '{"n": "int", "n": "string"}' would plan as a single
+        // string column — the author's first declaration silently gone.
+        let ctx = ctx_with(vec![]).await;
+        let err = ctx
+            .sql(
+                "SELECT * FROM cypher_query('kg', 'MATCH (p) RETURN p.n', '{}', \
+                 '{\"n\": \"int\", \"n\": \"string\"}')",
+            )
+            .await
+            .expect_err("duplicate columns fail at plan time");
+        let msg = err.to_string();
+        assert!(msg.contains("column 'n' is declared twice"), "{msg}");
     }
 
     #[tokio::test]

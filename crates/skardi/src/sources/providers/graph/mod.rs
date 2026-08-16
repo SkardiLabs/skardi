@@ -330,9 +330,35 @@ pub async fn register_graph_tables(
                     })
                 })
                 .collect::<Result<Vec<_>, GraphError>>()?;
-            view::validate_views_concurrently(&probe, contracts, config.max_connections as usize)
-                .await?;
-            (client, GraphSourceHealth::Healthy)
+            match view::validate_views_concurrently(
+                &probe,
+                contracts,
+                config.max_connections as usize,
+            )
+            .await
+            {
+                Ok(()) => (client, GraphSourceHealth::Healthy),
+                // The dial's classification applies to VALIDATION too: a
+                // view timing out (the shared backend momentarily loaded,
+                // or the view genuinely heavy) or the pool failing to
+                // hand out a connection are AVAILABILITY artifacts — the
+                // "transient blip" the design says must not hold every
+                // unrelated source hostage at startup — and a slow patch
+                // must not fail harder than an outright outage. Degrade;
+                // the first scan retries. Everything else (type
+                // mismatches, nullable violations, arity, backend 42804)
+                // is a genuine contract violation and keeps refusing.
+                Err(e) if is_availability_artifact(&e) => {
+                    tracing::warn!(
+                        source = name,
+                        error = %e,
+                        "graph view validation hit an availability artifact at \
+                         registration; registering degraded (first scan retries)"
+                    );
+                    (client, GraphSourceHealth::Degraded(e.to_string()))
+                }
+                Err(e) => return Err(e),
+            }
         }
         Err(e) => {
             // Only a genuine AVAILABILITY failure may degrade: DNS, a
@@ -462,6 +488,23 @@ pub async fn register_graph_tables(
     } else {
         Ok(())
     }
+}
+
+/// Whether a view-validation failure is an AVAILABILITY artifact (the
+/// backend or the pool did not answer in time) rather than a contract
+/// violation. Availability degrades — same classification as the dial;
+/// contract refuses.
+fn is_availability_artifact(e: &GraphError) -> bool {
+    let underlying = match e {
+        GraphError::ViewValidationFailed { source, .. } => source.as_ref(),
+        other => other,
+    };
+    matches!(
+        underlying,
+        GraphError::Unavailable { .. }
+            | GraphError::Timeout { .. }
+            | GraphError::ConnectionAcquireTimeout { .. }
+    )
 }
 
 #[cfg(test)]
@@ -714,6 +757,47 @@ views:
                 .is_healthy(),
             "the blackholed source is degraded"
         );
+    }
+
+    #[test]
+    fn availability_artifacts_degrade_and_contract_failures_refuse() {
+        // The registration classification pin (design §Failure handling):
+        // ONLY unreachable-shaped failures qualify for degraded
+        // registration — a reachable backend that answered with a
+        // contract violation (wrong type, wrong arity) is a broken view
+        // declaration, and registering it would hide the bug behind
+        // per-scan failures. Both bare and ViewValidationFailed-wrapped
+        // shapes are classified, because validation wraps the underlying
+        // error with the failing view's name.
+        let timeout = GraphError::Timeout { seconds: 30 };
+        let acquire = GraphError::ConnectionAcquireTimeout { seconds: 30 };
+        let unavailable = GraphError::Unavailable {
+            source_name: "kg".to_string(),
+            reason: "connection refused".to_string(),
+        };
+        let mismatch = GraphError::TypeMismatch {
+            column: "age".to_string(),
+            row: 0,
+            expected: "int",
+            found: "string",
+        };
+        let arity = GraphError::RowArityMismatch {
+            row: 0,
+            expected: 2,
+            found: 1,
+        };
+        let wrap = |e: GraphError| GraphError::ViewValidationFailed {
+            view: "people".to_string(),
+            source: Box::new(e),
+        };
+        for e in [timeout, acquire, unavailable] {
+            assert!(is_availability_artifact(&e), "{e}");
+            assert!(is_availability_artifact(&wrap(e)), "wrapped");
+        }
+        for e in [mismatch, arity] {
+            assert!(!is_availability_artifact(&e), "{e}");
+            assert!(!is_availability_artifact(&wrap(e)), "wrapped");
+        }
     }
 
     #[tokio::test]

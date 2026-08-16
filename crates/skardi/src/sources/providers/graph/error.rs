@@ -32,9 +32,15 @@ pub enum GraphError {
     /// A YAML view failed its live validation — at registration, or at
     /// the degraded recovery retry. The failing identity is a VIEW, not
     /// a source, so it does not ride [`GraphError::InvalidConfig`]
-    /// (whose rendering would call it one).
-    #[error("graph view '{view}' failed validation: {reason}")]
-    ViewValidationFailed { view: String, reason: String },
+    /// (whose rendering would call it one). Carries the TYPED underlying
+    /// error, not its rendering: registration classifies availability
+    /// artifacts (timeouts, unreachable) apart from genuine contract
+    /// violations, and a stringified reason would erase that boundary.
+    #[error("graph view '{view}' failed validation: {source}")]
+    ViewValidationFailed {
+        view: String,
+        source: Box<GraphError>,
+    },
 
     /// The fast-path keyword guard blocked caller-supplied Cypher. Names
     /// the blocked keyword and its byte offset — NEVER the query text

@@ -28,7 +28,7 @@ use skardi::sources::hierarchy::HierarchyLevel;
 use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBounds};
 use skardi::sources::providers::graph::config::GraphConfig;
 use skardi::sources::providers::graph::error::GraphError;
-use skardi::sources::providers::graph::udtf::GraphSources;
+use skardi::sources::providers::graph::udtf::{GraphSourceHealth, GraphSources};
 use skardi::sources::providers::graph::{
     register_graph_source, register_graph_tables, register_graph_udtfs,
 };
@@ -648,6 +648,160 @@ async fn duplicate_registration_keeps_the_original_connection() {
     )
     .await;
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+
+    drop_graph(&pool, &graph).await;
+}
+
+/// YAML views end to end against a REAL AGE backend: registration
+/// validates each view's Cypher and contract against the live graph
+/// (this suite is the only place that path meets real agtype), the
+/// catalog tables answer plain SQL — projection, WHERE, a
+/// `nullable: false` assertion, a relationship STRUCT — and a view
+/// whose declared arity contradicts its RETURN clause refuses the whole
+/// registration, publishing neither handle nor catalog.
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn yaml_views_register_and_scan_against_a_live_backend() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("views");
+    let pool = seed_graph(&url, &graph).await;
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        std::env::set_var("SKARDI_AGE_VW_USER", user.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_VW_PASS", pass.unwrap_or_default());
+    }
+
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        r#"
+backend: age
+graph_name: {graph}
+username_env: SKARDI_AGE_VW_USER
+password_env: SKARDI_AGE_VW_PASS
+views:
+  - name: people
+    cypher: MATCH (p:Person) RETURN p.name, p.age
+    schema:
+      - {{name: name, type: string, nullable: false}}
+      - {{name: age, type: int}}
+  - name: knows
+    cypher: MATCH (a:Person)-[k:KNOWS]->(b:Person) RETURN a.name, k, b.name
+    schema:
+      - {{name: src, type: string}}
+      - {{name: rel, type: relationship}}
+      - {{name: dst, type: string}}
+"#
+    ))
+    .expect("config parses");
+    let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let mut ctx = SessionContext::new();
+    register_json_getter_udfs(&ctx).expect("getters");
+    register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg",
+        &clean_url,
+        Some(&config),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect("both views validate against the live graph");
+    {
+        let sources = sources.read().unwrap_or_else(|p| p.into_inner());
+        let handle = sources.get("kg").expect("handle published");
+        let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            matches!(&*health, GraphSourceHealth::Healthy),
+            "a reachable, contract-honoring registration is healthy: {health:?}"
+        );
+    }
+
+    // Plain SQL over the node view: projection, WHERE, ordering. The
+    // nullable:false assertion on `name` held at validation (every
+    // seeded person has a name) — `age` is nullable and cyd/颱風 prove it.
+    let batches = collect(
+        &ctx,
+        "SELECT name, age FROM kg.main.people WHERE age IS NOT NULL ORDER BY name",
+    )
+    .await;
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string");
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["ada", "bob"],
+        "SQL WHERE filtered the null ages"
+    );
+
+    // The relationship view: the STRUCT columns carry the canonical
+    // shape, and its JSON properties answer the getter family.
+    let batches = collect(
+        &ctx,
+        "SELECT src, rel.\"type\" AS rel_type, json_get_int(rel.properties, 'since') AS since, dst \
+         FROM kg.main.knows ORDER BY since",
+    )
+    .await;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "the three seeded KNOWS edges");
+    let first = &batches[0];
+    let rel_type = first
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("type string");
+    assert_eq!(rel_type.value(0), "KNOWS");
+
+    // A view whose declared arity contradicts its RETURN clause: the
+    // live backend answers, the contract check refuses, the error names
+    // the view, and NOTHING is published under the new source name.
+    let bad: GraphConfig = serde_yaml::from_str(&format!(
+        r#"
+backend: age
+graph_name: {graph}
+username_env: SKARDI_AGE_VW_USER
+password_env: SKARDI_AGE_VW_PASS
+views:
+  - name: lopsided
+    cypher: MATCH (p:Person) RETURN p.name, p.age
+    schema:
+      - {{name: name, type: string}}
+"#
+    ))
+    .expect("config parses");
+    let err = register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg2",
+        &clean_url,
+        Some(&bad),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect_err("an arity mismatch is a contract violation, not an outage");
+    let msg = err.to_string();
+    assert!(msg.contains("lopsided"), "the error names the view: {msg}");
+    assert!(
+        !sources
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key("kg2"),
+        "a refused registration publishes no handle"
+    );
+    assert!(ctx.catalog("kg2").is_none(), "nor a catalog");
 
     drop_graph(&pool, &graph).await;
 }

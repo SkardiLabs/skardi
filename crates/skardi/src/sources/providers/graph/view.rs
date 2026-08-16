@@ -209,7 +209,7 @@ pub(crate) async fn validate_view(
 ) -> Result<(), GraphError> {
     let fail = |e: GraphError| GraphError::ViewValidationFailed {
         view: view_name.to_string(),
-        reason: e.to_string(),
+        source: Box::new(e),
     };
     let rows = handle
         .client
