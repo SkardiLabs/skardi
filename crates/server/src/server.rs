@@ -253,7 +253,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // record would be worse than none at all.
     let query_audit = match config.args.query_audit_db.as_ref() {
         Some(path) => {
-            tracing::info!("Opening /query audit ledger at {}", path.display());
+            tracing::info!(
+                "Opening query-audit ledger (ad-hoc + pipeline executions) at {}",
+                path.display()
+            );
             let store = Arc::new(QueryAuditStore::open(path).await.with_context(|| {
                 format!("Failed to open --query-audit-db at {}", path.display())
             })?);
@@ -262,7 +265,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
                 .await?;
             if orphaned > 0 {
                 tracing::warn!(
-                    "Reconciled {} /query audit record(s) left in flight by a previous run",
+                    "Reconciled {} query-audit record(s) left in flight by a previous run",
                     orphaned
                 );
             }

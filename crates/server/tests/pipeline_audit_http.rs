@@ -4,8 +4,9 @@
 //! the `x-skardi-session-id` header, and value-free recording (only the
 //! pipeline name is ever written, never parameter values).
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Float64Array, Int64Array, StringArray, UnionArray};
+use arrow::buffer::ScalarBuffer;
+use arrow::datatypes::{DataType, Field, Schema, UnionFields, UnionMode};
 use arrow::record_batch::RecordBatch;
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, StatusCode};
@@ -35,6 +36,15 @@ const TEST_PIPELINE_NAME: &str = "product-search";
 /// execution fails inside the engine (not at parameter validation),
 /// exercising the `query_execution_error` audit path.
 const BROKEN_PIPELINE_NAME: &str = "broken-pipeline";
+
+/// Version set in every fixture pipeline's `metadata.version`; ledger rows
+/// store `sql = "<name>@<version>"`.
+const TEST_PIPELINE_VERSION: &str = "1.0.0";
+
+/// Name of the third fixture pipeline, whose SQL executes fine but yields a
+/// column arrow-json cannot serialize (a sparse `Union`), forcing the
+/// `result_conversion_error` audit path: `Failed` *with* a row_count.
+const CONVERSION_POISON_PIPELINE_NAME: &str = "conversion-poison";
 
 fn write_yaml(path: &std::path::Path, content: &str) {
     let mut f = std::fs::File::create(path).unwrap();
@@ -128,6 +138,46 @@ spec:
         .unwrap();
     pipelines.insert(broken_pipeline.name().to_string(), broken_pipeline);
     ctx.deregister_table("vanishing_table").unwrap();
+
+    // A third pipeline whose SQL executes successfully but yields a Union
+    // column — the one Arrow type arrow-json's encoder rejects that a scan
+    // can actually produce (temporals, decimals, binary, nested types are
+    // all encodable) — the fixture for the `result_conversion_error` path.
+    let union_fields: UnionFields = [(0i8, Arc::new(Field::new("a", DataType::Int64, false)))]
+        .into_iter()
+        .collect();
+    let union_array = UnionArray::try_new(
+        union_fields.clone(),
+        ScalarBuffer::from(vec![0i8]),
+        None,
+        vec![Arc::new(Int64Array::from(vec![7i64]))],
+    )
+    .unwrap();
+    let union_schema = Arc::new(Schema::new(vec![Field::new(
+        "u",
+        DataType::Union(union_fields, UnionMode::Sparse),
+        false,
+    )]));
+    let union_batch = RecordBatch::try_new(union_schema, vec![Arc::new(union_array)]).unwrap();
+    ctx.register_batch("union_poison", union_batch).unwrap();
+    let poison_yaml_path = tmp.path().join("conversion-poison.yaml");
+    write_yaml(
+        &poison_yaml_path,
+        r#"
+kind: pipeline
+metadata:
+  name: "conversion-poison"
+  version: "1.0.0"
+  description: "Executes fine; result cannot be converted to JSON"
+spec:
+  query: |
+    SELECT u FROM union_poison
+"#,
+    );
+    let poison_pipeline = StandardPipeline::load_from_file(&poison_yaml_path, Arc::clone(&ctx))
+        .await
+        .unwrap();
+    pipelines.insert(poison_pipeline.name().to_string(), poison_pipeline);
 
     let engine = Arc::new(skardi::engine::datafusion::DataFusionEngine::new_with_arc(
         Arc::clone(&ctx),
@@ -225,7 +275,10 @@ async fn successful_execution_is_audited_with_session() {
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row["statement_kind"], "pipeline");
-    assert_eq!(row["sql"], TEST_PIPELINE_NAME);
+    assert_eq!(
+        row["sql"],
+        format!("{TEST_PIPELINE_NAME}@{TEST_PIPELINE_VERSION}")
+    );
     assert_eq!(row["status"], "succeeded");
     // Deterministic fixture: Apple rows at 1299.0 and 999.0 pass the 1500.0
     // cap; the 2499.0 one doesn't. An exact count catches a handler that
@@ -322,7 +375,11 @@ async fn execution_without_header_audits_null_session() {
 }
 
 #[tokio::test]
-async fn no_store_configured_executes_without_recording() {
+async fn no_store_configured_still_executes() {
+    // "Without recording" is unverifiable here — there is no store to
+    // inspect — so this pins only what it can: execution succeeds. The
+    // no-recording half is covered structurally by the handler's
+    // `Option<QueryAuditStore>` (`None => None`).
     let (state, _tmp) = make_app_state(None).await;
     let resp = execute_with_headers(&state, &[], valid_params()).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -367,7 +424,14 @@ async fn param_validation_failure_records_nothing() {
 async fn malformed_session_header_is_400_and_records_nothing() {
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
-    for bad in [String::new(), "x".repeat(201)] {
+    for bad in [
+        String::new(),
+        "x".repeat(201),
+        "tab\there".to_string(),
+        // The shape a proxy produces by merging two header lines (RFC 9110
+        // §5.3) — must be rejected like a direct duplicate.
+        "sess-1, sess-2".to_string(),
+    ] {
         // The body must be one that would otherwise succeed, so the header is
         // the only possible reject cause — an invalid body 400s with the same
         // error_type at parameter validation, which would make this test pass
@@ -425,13 +489,66 @@ async fn audit_write_failure_is_503_and_pipeline_does_not_run() {
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
     store.close_for_test().await;
-    // Must be a fully valid parameter set: parameter validation runs before
-    // the audit-started write, so an invalid body (like the brief's
-    // `{"limit": 5}`, which this fixture's pipeline doesn't accept) would
-    // 400 out at validation and never reach the audit write this test
-    // targets.
-    let resp = execute_with_headers(&state, &[], valid_params()).await;
+    // Targeting the BROKEN pipeline makes "does not run" observable: its
+    // engine execution can only fail, so if the handler ran the query first
+    // and audited after, this would be a 500 query_execution_error. Getting
+    // 503 query_audit_error proves the engine was never reached — i.e. the
+    // record-before-execute ordering, which is what fail-closed exists for.
+    // (The body must still be valid: the broken pipeline takes no params,
+    // and an invalid body would 400 out before the audit write.)
+    let resp = execute_broken_pipeline(&state, &[]).await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("query_audit_error"));
+}
+
+/// The conversion-failure audit path: SQL executes, arrow-json cannot
+/// serialize the result. Distinct row shape — `failed` *with* a row_count —
+/// and the fixed error kind is the security-relevant half of the branch.
+#[tokio::test]
+async fn conversion_failure_is_audited_as_failed_with_row_count() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let app = configure_routes(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/{CONVERSION_POISON_PIPELINE_NAME}/execute"))
+        .header("content-type", "application/json")
+        .header("x-skardi-session-id", "sess-conv")
+        .body(Body::from(json!({}).to_string()))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("result_conversion_error"));
+
+    let rows = store.list_by_session("sess-conv").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], json!("failed"));
+    assert_eq!(rows[0]["error"], json!("result_conversion_error"));
+    assert_eq!(rows[0]["row_count"], json!(1));
+}
+
+/// An unknown pipeline 404s regardless of header shape: the session header
+/// is validated only after the pipeline lookup, so the reject metric's
+/// `pipeline` label is bounded to configured names — before this ordering,
+/// an unauthenticated caller could mint unbounded metric cardinality from
+/// arbitrary URL segments.
+#[tokio::test]
+async fn unknown_pipeline_with_malformed_header_is_404() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let app = configure_routes(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/no-such-pipeline/execute")
+        .header("content-type", "application/json")
+        .header("x-skardi-session-id", "")
+        .body(Body::from(json!({}).to_string()))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("pipeline_not_found"));
+    assert_eq!(store.count().await.unwrap(), 0);
 }

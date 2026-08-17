@@ -8,8 +8,10 @@
 //! whose behalf, and did it succeed" rather than merely "what was attempted".
 //!
 //! The `sql` column is overloaded by row kind: raw SQL for ad-hoc rows,
-//! the pipeline *name* for `statement_kind = 'pipeline'` rows (the template
-//! lives on disk; parameter values are never recorded). Ad-hoc rows carry
+//! `name@version` for `statement_kind = 'pipeline'` rows (the versioned
+//! template lives on disk; parameter values are never recorded — the version
+//! is what keeps "what ran" answerable after the promotion loop edits a
+//! template, since rows are kept forever by default). Ad-hoc rows carry
 //! `statement_kind` values from `StatementKind`'s `Debug` form — `Query` /
 //! `Other` — not SQL verbs like `select`.
 //!
@@ -32,10 +34,65 @@
 //! pruned at startup and hourly thereafter. Without that flag rows are kept
 //! forever, and pruning/rotation is the operator's call.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio_rusqlite::{Connection, params, rusqlite};
+
+/// Upper bound on any single ledger write. Fail-closed only means "503, and
+/// the statement does not run" if a write that *hangs* (a stalled fsync on
+/// EBS/NFS, a full dm-thin pool) is also treated as failed — otherwise the
+/// request hangs with it, and because the store is one serialized writer
+/// thread, every subsequent audited request queues behind it. A timed-out
+/// write may still land later on the writer thread; that leaves an orphaned
+/// `started` row, which the next startup reconciles to `unknown` exactly
+/// like a crash mid-query.
+pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum length of a session id, in characters — shared by `/query`'s
+/// `ai_context.session_id` and the pipeline execute endpoint's
+/// `x-skardi-session-id` header (see `query_handlers::validate_ai_context`
+/// and `pipeline_handlers::session_id_from_headers`), so the two paths can't
+/// drift apart. It is an opaque grouping key, not a payload.
+///
+/// `skardi-cli` restates this cap under the same name (`run.rs`) because the
+/// CLI crate does not depend on this one; keep them in sync.
+pub(crate) const MAX_SESSION_ID_CHARS: usize = 200;
+
+/// Await a ledger write, bounding it with [`AUDIT_WRITE_TIMEOUT`]. Elapsed
+/// is an error like any other write failure — see the timeout const for why.
+async fn bounded<T>(
+    write: impl Future<Output = tokio_rusqlite::Result<T>>,
+    what: &'static str,
+) -> Result<T> {
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
+        Ok(result) => result.context(what),
+        Err(_) => bail!("{what}: timed out after {AUDIT_WRITE_TIMEOUT:?}"),
+    }
+}
+
+/// Stamp the terminal outcome onto an audit record.
+///
+/// Unlike the pre-execution write, a failure (or timeout) here cannot un-run
+/// the statement, so it is logged rather than surfaced: the row simply stays
+/// `started` and the next startup reconciles it to `unknown`. No-op when
+/// auditing is off. Callers pass `app_state.query_audit.as_deref()`.
+pub(crate) async fn finish_audit(
+    store: Option<&QueryAuditStore>,
+    audit_id: Option<&str>,
+    status: QueryAuditStatus,
+    row_count: Option<usize>,
+    error: Option<&str>,
+) {
+    let (Some(store), Some(id)) = (store, audit_id) else {
+        return;
+    };
+    if let Err(e) = store.record_outcome(id, status, row_count, error).await {
+        tracing::error!("Failed to record query-audit outcome for {id}: {e}");
+    }
+}
 
 /// Shorthand for the closure return type `tokio_rusqlite::Connection::call`
 /// expects; the crate cannot infer it from a bare `Ok(())`.
@@ -204,8 +261,8 @@ impl QueryAuditStore {
         let statement_kind = statement_kind.to_string();
         let row_id = id.clone();
 
-        self.conn
-            .call(move |conn| -> SqlResult<()> {
+        bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
@@ -223,34 +280,38 @@ impl QueryAuditStore {
                     ],
                 )?;
                 Ok(())
-            })
-            .await
-            .context("Failed to write pre-execution query-audit record")?;
+            }),
+            "Failed to write pre-execution query-audit record",
+        )
+        .await?;
 
         Ok(id)
     }
 
     /// Insert a `started` row for a pipeline execution.
     ///
-    /// Stores the pipeline *name* in the `sql` column: the template lives on
-    /// disk with no secrets, and the name is the join key to it and to the
-    /// pipeline's `description` (which carries the purpose). Parameter values
-    /// are deliberately never recorded — they are where PII lives. `ai_context`
-    /// is left NULL rather than synthesized so the column always means
-    /// "caller-sent object".
+    /// Stores `name@version` in the `sql` column: the template lives on disk
+    /// with no secrets, and pipelines are precisely the artifacts the
+    /// promotion loop edits — rows outlive template revisions (retention is
+    /// off by default), so the name alone stops answering *what SQL ran*.
+    /// `version` comes from the pipeline's `metadata.version`. Parameter
+    /// values are deliberately never recorded — they are where PII lives.
+    /// `ai_context` is left NULL rather than synthesized so the column always
+    /// means "caller-sent object".
     pub async fn record_pipeline_started(
         &self,
         pipeline_name: &str,
+        version: &str,
         session_id: Option<&str>,
     ) -> Result<String> {
         let id = new_id();
         let created_at = chrono::Utc::now().to_rfc3339();
-        let name = pipeline_name.to_string();
+        let name_at_version = format!("{pipeline_name}@{version}");
         let session_id = session_id.map(str::to_string);
         let row_id = id.clone();
 
-        self.conn
-            .call(move |conn| -> SqlResult<()> {
+        bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
@@ -259,7 +320,7 @@ impl QueryAuditStore {
                     params![
                         row_id,
                         created_at,
-                        name,
+                        name_at_version,
                         session_id,
                         PIPELINE_MAX_ROWS_SENTINEL,
                         PIPELINE_STATEMENT_KIND,
@@ -267,9 +328,10 @@ impl QueryAuditStore {
                     ],
                 )?;
                 Ok(())
-            })
-            .await
-            .context("Failed to write pre-execution pipeline-audit record")?;
+            }),
+            "Failed to write pre-execution pipeline-audit record",
+        )
+        .await?;
 
         Ok(id)
     }
@@ -288,8 +350,8 @@ impl QueryAuditStore {
         let row_count = row_count.map(|n| n as i64);
         let error = error.map(str::to_string);
 
-        self.conn
-            .call(move |conn| -> SqlResult<()> {
+        bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "UPDATE query_audit
                         SET status = ?2, finished_at = ?3, row_count = ?4, error = ?5
@@ -297,9 +359,10 @@ impl QueryAuditStore {
                     params![id, status, finished_at, row_count, error],
                 )?;
                 Ok(())
-            })
-            .await
-            .context("Failed to update query-audit record")?;
+            }),
+            "Failed to update query-audit record",
+        )
+        .await?;
         Ok(())
     }
 
@@ -390,7 +453,12 @@ impl QueryAuditStore {
             .conn
             .call(move |conn| -> SqlResult<Vec<String>> {
                 let mut stmt = conn.prepare(
-                    "SELECT id FROM query_audit WHERE session_id = ?1 ORDER BY created_at ASC",
+                    // `id` breaks created_at ties: `to_rfc3339` emits
+                    // variable-precision subseconds, so two same-instant rows
+                    // compare equal as strings, and `new_id()` is monotonic
+                    // within a process — making the order total.
+                    "SELECT id FROM query_audit WHERE session_id = ?1 \
+                     ORDER BY created_at ASC, id ASC",
                 )?;
                 let ids = stmt
                     .query_map(params![session_id], |row| row.get::<_, String>(0))?
@@ -471,6 +539,13 @@ const PIPELINE_STATEMENT_KIND: &str = "pipeline";
 
 /// `max_rows` does not apply to pipeline executions, but the column is NOT
 /// NULL; pipeline rows store this sentinel.
+///
+/// The sentinel is unambiguous only because `/query` rejects
+/// `max_rows: Some(0)` up front (the `Some(0)` arm in
+/// `query_handlers::execute_query`), so `0` can never appear on an ad-hoc
+/// row. That invariant lives in a
+/// different module — if `/query` ever starts allowing `max_rows: 0`, this
+/// sentinel needs a new value (or a dedicated column) first.
 const PIPELINE_MAX_ROWS_SENTINEL: i64 = 0;
 
 /// Random-ish unique row id. Avoids a `uuid` dependency: the timestamp keeps
@@ -671,7 +746,7 @@ mod tests {
     async fn pipeline_row_round_trips() {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         let id = store
-            .record_pipeline_started("weekly-churn", Some("sess-1"))
+            .record_pipeline_started("weekly-churn", "1.0.0", Some("sess-1"))
             .await
             .unwrap();
         store
@@ -679,7 +754,7 @@ mod tests {
             .await
             .unwrap();
         let row = store.get(&id).await.unwrap().unwrap();
-        assert_eq!(row["sql"], json!("weekly-churn"));
+        assert_eq!(row["sql"], json!("weekly-churn@1.0.0"));
         assert_eq!(row["statement_kind"], json!("pipeline"));
         assert_eq!(row["session_id"], json!("sess-1"));
         assert_eq!(row["max_rows"], json!(0));
@@ -691,7 +766,7 @@ mod tests {
     async fn pipeline_row_without_session_has_null_session_id() {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         let id = store
-            .record_pipeline_started("weekly-churn", None)
+            .record_pipeline_started("weekly-churn", "1.0.0", None)
             .await
             .unwrap();
         let row = store.get(&id).await.unwrap().unwrap();
@@ -707,18 +782,25 @@ mod tests {
             .await
             .unwrap();
         store
-            .record_pipeline_started("weekly-churn", Some("sess-mix"))
+            .record_pipeline_started("weekly-churn", "1.0.0", Some("sess-mix"))
             .await
             .unwrap();
         let rows = store.list_by_session("sess-mix").await.unwrap();
         assert_eq!(rows.len(), 2);
+        // The promised property is the *ordering* (insertion order via
+        // created_at with id as tie-break), plus the sql-column overload —
+        // a bare count passes with ORDER BY dropped or reversed.
+        assert_eq!(rows[0]["statement_kind"], json!("Query"));
+        assert_eq!(rows[0]["sql"], json!("SELECT 1"));
+        assert_eq!(rows[1]["statement_kind"], json!("pipeline"));
+        assert_eq!(rows[1]["sql"], json!("weekly-churn@1.0.0"));
     }
 
     #[tokio::test]
     async fn orphaned_pipeline_rows_reconcile_to_unknown() {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         let id = store
-            .record_pipeline_started("weekly-churn", None)
+            .record_pipeline_started("weekly-churn", "1.0.0", None)
             .await
             .unwrap();
         let n = store.reconcile_orphaned("test restart").await.unwrap();

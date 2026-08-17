@@ -26,8 +26,7 @@ use std::time::Instant;
 
 use crate::auth::routes::require_session;
 use crate::config::{DataSourceType, HierarchyLevel};
-use crate::query_audit::QueryAuditStatus;
-use crate::query_handlers::{MAX_SESSION_ID_CHARS, finish_audit};
+use crate::query_audit::{MAX_SESSION_ID_CHARS, QueryAuditStatus, finish_audit};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
@@ -60,6 +59,18 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, String
     let s = value
         .to_str()
         .map_err(|_| format!("{SESSION_ID_HEADER} must contain only visible ASCII characters"))?;
+    // `to_str` admits horizontal tab; reject it so "visible ASCII" is the
+    // whole truth. Commas are rejected because RFC 9110 §5.3 lets any
+    // intermediary merge repeated header lines into one comma-joined value —
+    // without this, a duplicate sent through such a proxy would slip past
+    // the duplicate check above as a single merged "id1, id2".
+    if s.contains([',', '\t']) {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must not contain commas or tabs \
+             (proxies may merge repeated header lines into one \
+             comma-separated value)"
+        ));
+    }
     if s.is_empty() {
         return Err(format!("{SESSION_ID_HEADER} must not be empty"));
     }
@@ -764,33 +775,9 @@ pub async fn execute_pipeline_by_name(
 
     let start_time = Instant::now();
 
-    let session_id = session_id_from_headers(&headers).map_err(|msg| {
-        // Recorded like every other early reject in this handler — a client
-        // looping on a malformed session id must be visible in metrics.
-        let elapsed_ms = start_time.elapsed().as_millis() as f64;
-        app_state
-            .metrics
-            .record_error(&pipeline_name, elapsed_ms, "parameter_validation_error");
-        (
-            StatusCode::BAD_REQUEST,
-            create_error_response(&msg, "parameter_validation_error", None),
-        )
-    })?;
-
-    // `session_id` rides in the INFO marker so operators who stitch sessions
-    // from traces (rather than the opt-in ledger) get attribution too. It is
-    // an opaque, caller-asserted grouping key — value-free by the same
-    // standard as `/query`'s `ai_context` marker field.
-    tracing::info!(
-        session_id = session_id.as_deref().unwrap_or_default(),
-        "Received execution request for pipeline '{}' with {} parameters",
-        pipeline_name,
-        request.parameters.len()
-    );
-
     // Acquire read lock and get the specified pipeline
     // Extract what we need and drop the lock immediately
-    let (sql_template, expected_params) = {
+    let (sql_template, pipeline_version, expected_params) = {
         let config = app_state.config.read().map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -823,8 +810,43 @@ pub async fn execute_pipeline_by_name(
         // Sort longest-first so a shorter name (e.g. `{user}`) cannot corrupt a longer one
         // (`{user_id}`) during str::replace when both appear in the same SQL template.
         expected_params.sort_by_key(|b| std::cmp::Reverse(b.len()));
-        (query_def.sql.clone(), expected_params)
+        (
+            query_def.sql.clone(),
+            pipeline.version().to_string(),
+            expected_params,
+        )
     };
+
+    // Validated only after the pipeline lookup, deliberately: the reject
+    // below records a metric labeled by `pipeline_name`, and before the
+    // lookup that label is an arbitrary caller-supplied URL segment — an
+    // unauthenticated caller could mint unbounded metric cardinality until
+    // real pipelines overflow the OTel stream cap. Post-lookup the label is
+    // bounded to configured names (and an unknown pipeline correctly 404s
+    // regardless of header shape).
+    let session_id = session_id_from_headers(&headers).map_err(|msg| {
+        // Recorded like every other early reject in this handler — a client
+        // looping on a malformed session id must be visible in metrics.
+        let elapsed_ms = start_time.elapsed().as_millis() as f64;
+        app_state
+            .metrics
+            .record_error(&pipeline_name, elapsed_ms, "parameter_validation_error");
+        (
+            StatusCode::BAD_REQUEST,
+            create_error_response(&msg, "parameter_validation_error", None),
+        )
+    })?;
+
+    // `session_id` rides in the INFO marker so operators who stitch sessions
+    // from traces (rather than the opt-in ledger) get attribution too. It is
+    // an opaque, caller-asserted grouping key — value-free by the same
+    // standard as `/query`'s `ai_context` marker field.
+    tracing::info!(
+        session_id = session_id.as_deref().unwrap_or_default(),
+        "Received execution request for pipeline '{}' with {} parameters",
+        pipeline_name,
+        request.parameters.len()
+    );
 
     let mut sql = sql_template;
 
@@ -877,7 +899,7 @@ pub async fn execute_pipeline_by_name(
     // anything it cannot account for.
     let audit_id = match &app_state.query_audit {
         Some(store) => match store
-            .record_pipeline_started(&pipeline_name, session_id.as_deref())
+            .record_pipeline_started(&pipeline_name, &pipeline_version, session_id.as_deref())
             .await
         {
             Ok(id) => Some(id),
@@ -915,7 +937,7 @@ pub async fn execute_pipeline_by_name(
             // error would smuggle a caller-supplied parameter value into the
             // ledger, which parameter values must never enter.
             finish_audit(
-                &app_state,
+                app_state.query_audit.as_deref(),
                 audit_id.as_deref(),
                 QueryAuditStatus::Failed,
                 None,
@@ -959,7 +981,7 @@ pub async fn execute_pipeline_by_name(
             // echo through error text derived from the query/result, and
             // parameter values must never reach the ledger.
             finish_audit(
-                &app_state,
+                app_state.query_audit.as_deref(),
                 audit_id.as_deref(),
                 QueryAuditStatus::Failed,
                 Some(record_batch.num_rows()),
@@ -987,17 +1009,22 @@ pub async fn execute_pipeline_by_name(
         }
     };
 
-    let execution_time = start_time.elapsed().as_millis() as u64;
     let row_count = record_batch.num_rows();
 
     finish_audit(
-        &app_state,
+        app_state.query_audit.as_deref(),
         audit_id.as_deref(),
         QueryAuditStatus::Succeeded,
         Some(row_count),
         None,
     )
     .await;
+
+    // Measured *after* the outcome write, so the reported latency includes
+    // the second fsync on the critical path — otherwise the exact cost the
+    // audit ledger adds (the thing docs/server.md tells operators to size
+    // for) is invisible in `pipeline_latency_ms` until requests time out.
+    let execution_time = start_time.elapsed().as_millis() as u64;
 
     app_state
         .metrics
