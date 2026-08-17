@@ -63,7 +63,7 @@ pub fn arrayref_slice_to_ndarray(args: &[ArrayRef]) -> Result<ArrayD<f32>> {
     Ok(tensor.into_dyn())
 }
 
-/// Convert a slice of DataFusion ColumnarValue into a Vec<ArrayRef>,
+/// Convert a slice of DataFusion ColumnarValue into a `Vec<ArrayRef>`,
 /// expanding scalars to full-length arrays of floats.
 ///
 /// This function supports two modes:
@@ -164,8 +164,9 @@ pub fn columnar_values_to_arrayrefs(args: &[ColumnarValue]) -> Result<Vec<ArrayR
 
 /// Convert a slice of ArrayRefs containing ListArrays into a 2D ndarray
 /// where each row is one embedding vector.
-/// Expected input: A single ArrayRef that is a ListArray with shape [num_rows][embedding_dim]
-/// Output: 2D ndarray with shape [num_rows, embedding_dim]
+/// Expected input: A single ArrayRef that is a ListArray with shape
+/// `[num_rows][embedding_dim]`.
+/// Output: 2D ndarray with shape `[num_rows, embedding_dim]`.
 pub fn list_arrayref_to_ndarray(args: &[ArrayRef]) -> Result<ArrayD<f32>> {
     if args.is_empty() {
         return Err(anyhow!("No input array provided for conversion"));

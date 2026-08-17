@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Atom 0.3: its own namespace, `<modified>` in place of `<updated>`, and
+     `<issued>` in place of `<published>`. -->
+<feed version="0.3" xmlns="http://purl.org/atom/ns#">
+  <title>Corpus Atom 0.3</title>
+  <tagline>A pre-1.0 Atom feed.</tagline>
+  <id>tag:corpus.example,2026:atom03</id>
+  <modified>2026-07-21T11:00:00Z</modified>
+  <link rel="alternate" type="text/html" href="https://corpus.example/"/>
+  <entry>
+    <id>tag:corpus.example,2026:atom03-1</id>
+    <title>Atom 0.3 post</title>
+    <link rel="alternate" type="text/html" href="https://corpus.example/atom03/1"/>
+    <author><name>Barbara Liskov</name></author>
+    <issued>2026-07-20T10:00:00Z</issued>
+    <modified>2026-07-21T11:00:00Z</modified>
+    <content type="text/html" mode="escaped">&lt;p&gt;Atom 0.3 body.&lt;/p&gt;</content>
+    <summary>Atom 0.3 summary.</summary>
+  </entry>
+</feed>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- RSS 2.0 requires channel/title, channel/link and channel/description;
+     this channel omits the description. The item is still served. -->
+<rss version="2.0">
+  <channel>
+    <title>Corpus Weekly (no description)</title>
+    <link>https://corpus.example/</link>
+    <item>
+      <guid>tag:corpus.example,2026:nodesc-1</guid>
+      <title>Served anyway</title>
+      <link>https://corpus.example/nodesc/1</link>
+      <pubDate>Mon, 20 Jul 2026 10:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

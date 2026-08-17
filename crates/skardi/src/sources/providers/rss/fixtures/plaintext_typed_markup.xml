@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The hostile shape the "no raw HTML" claim used to deny: an Atom entry that
+     declares its content and summary as `type="text"` while the escaped text
+     spells out HTML. Escaped `&lt;script&gt;` is XML transport encoding, so the
+     text feed-rs hands over is literally `<script>alert(1)</script>`; a
+     text-typed value is not run through the HTML→Markdown converter at all, so
+     it is stored byte-exact, tag-shaped content included.
+
+     This is the documented passthrough, not a conversion bug — declaring
+     `type="text"` is the feed asserting the value is not markup, and Skardi
+     stores what it was told. The fixture exists so that the behaviour is a
+     reviewed contract: `plaintext_typed_content_is_stored_byte_exact` pins the
+     exact stored strings, so a converter change that starts rewriting
+     text-typed values fails a test, and the docs' narrower claim ("no HTML tag
+     survives as markup") stays honest. -->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Plain-Text Typed Corpus</title>
+  <id>tag:corpus.example,2026:plaintext-typed</id>
+  <updated>2026-07-20T10:00:00Z</updated>
+  <link rel="alternate" href="https://corpus.example/"/>
+  <entry>
+    <id>tag:corpus.example,2026:plaintext-1</id>
+    <title>Text-typed markup</title>
+    <link rel="alternate" href="https://corpus.example/plaintext/1"/>
+    <updated>2026-07-20T10:00:00Z</updated>
+    <published>2026-07-20T10:00:00Z</published>
+    <summary type="text">&lt;b&gt;not bold&lt;/b&gt; &amp; not escaped further</summary>
+    <content type="text">&lt;script&gt;alert(1)&lt;/script&gt;</content>
+  </entry>
+</feed>

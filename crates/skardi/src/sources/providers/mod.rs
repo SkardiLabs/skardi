@@ -2,6 +2,7 @@ pub mod clickhouse;
 #[cfg(feature = "documents")]
 pub mod documents;
 pub mod dynamodb;
+pub mod graph;
 pub mod iceberg;
 pub mod influxdb;
 pub mod knn_utils;
@@ -11,6 +12,10 @@ pub mod mysql;
 pub mod mysql_wire;
 pub mod open_connector;
 pub mod redis;
+// Config/error types compile unconditionally (plain serde/thiserror, no
+// heavy deps) so the server and CLI can hold a typed `RssConfig` field even
+// in builds without the `rss` feature; feature-gated submodules land later.
+pub mod rss;
 pub mod seekdb;
 pub mod sqlite;
 pub mod sqlx;

@@ -16,10 +16,13 @@ use skardi::sources::providers::open_connector::{
     OpenConnectorConfig, register_open_connector_tables,
 };
 use skardi::sources::providers::redis::datasource::register_redis_tables;
+#[cfg(feature = "rss")]
+use skardi::sources::providers::rss::register_rss_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
 use skardi::sources::sql_validator::{AdhocSqlPolicy, SqlValidatorConfig, validate_sql};
+use skardi::util::json_pack::register_json_pack_udf;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -159,6 +162,16 @@ pub struct DataSource {
     /// resources do not fit the flat `options` map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_connector: Option<OpenConnectorConfig>,
+    /// Typed RSS/Atom subscription configuration. Required when `type` is
+    /// `rss`, rejected for every other type: a list of feed subscriptions
+    /// does not fit the flat `options` map.
+    ///
+    /// Not behind `#[cfg(feature = "rss")]`: `RssConfig` compiles without the
+    /// feature (`sources/providers/rss/config.rs:1-10`), so a featureless
+    /// build still parses the block and fails at registration with a message
+    /// naming the missing feature rather than an opaque serde error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss: Option<skardi::sources::providers::rss::RssConfig>,
 }
 
 /// Top-level envelope for context YAML files:
@@ -295,6 +308,27 @@ pub enum ConfigError {
         "Data source '{name}' has type 'open_connector' but does not set hierarchy_level to 'catalog'. Open Connector gateways are exposed as DataFusion catalogs; add `hierarchy_level: catalog`."
     )]
     OpenConnectorHierarchyRequired { name: String },
+
+    #[error(
+        "Data source '{name}' has type 'rss' but no 'rss' config block. The typed subscription configuration (a `feeds` list or an `opml` path) is required."
+    )]
+    MissingRssConfig { name: String },
+
+    #[error(
+        "Data source '{name}' sets an 'rss' config block but its type is '{source_type}'. The 'rss' field is only valid for type 'rss'."
+    )]
+    UnexpectedRssConfig {
+        name: String,
+        source_type: DataSourceType,
+    },
+
+    #[error("Data source '{name}' has an invalid 'rss' config: {reason}")]
+    InvalidRssConfig { name: String, reason: String },
+
+    #[error(
+        "Data source '{name}' has type 'rss' but does not set hierarchy_level to 'catalog'. RSS sources are exposed as DataFusion catalogs ('{name}.main.feeds' and '{name}.main.items'); add `hierarchy_level: catalog`."
+    )]
+    RssHierarchyRequired { name: String },
 
     #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
     NonUtf8Path { name: String, path: PathBuf },
@@ -443,6 +477,9 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register chunk UDF (text-splitter wrapper for inline ingestion)
     #[cfg(feature = "chunking")]
     register_chunk_udf(&mut session_ctx);
+    // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
+    // metadata/frontmatter serialization boundary)
+    register_json_pack_udf(&mut session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
@@ -772,6 +809,10 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     // OpenConnector is catalog-only; its tables come from typed bindings, so
     // the same catalog-mode guards (no per-table `options`) must apply.
     DataSourceType::OpenConnector,
+    // Rss is catalog-only too: one source is one catalog exposing the fixed
+    // pair `main.feeds`/`main.items`, so per-table `options` must be rejected
+    // by the same guard.
+    DataSourceType::Rss,
 ];
 
 /// Data source types that support read_write access mode
@@ -845,6 +886,47 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
             }
             (_, Some(_)) => {
                 return Err(ConfigError::UnexpectedOpenConnectorConfig {
+                    name: source.name.clone(),
+                    source_type: source.source_type,
+                }
+                .into());
+            }
+            (_, None) => {}
+        }
+
+        // The RSS typed config, on the same terms as `open_connector` above:
+        // required for `type: rss`, rejected for every other type. A parallel
+        // match rather than a merged one, so each block's "wrong type" case
+        // still names the block the operator has to remove.
+        // `RssConfig::validate()` is pure — no file reads, no network
+        // (`sources/providers/rss/config.rs:166-171`) — so it is safe on this
+        // path; an `opml:` path is read later, at registration.
+        match (&source.source_type, &source.rss) {
+            (DataSourceType::Rss, Some(config)) => {
+                // Hierarchy defaults to Table, so without this a minimal
+                // config would pass validation and fail at registration with
+                // the provider's wrapped CatalogHierarchyRequired.
+                if source.hierarchy_level != HierarchyLevel::Catalog {
+                    return Err(ConfigError::RssHierarchyRequired {
+                        name: source.name.clone(),
+                    }
+                    .into());
+                }
+                config
+                    .validate()
+                    .map_err(|e| ConfigError::InvalidRssConfig {
+                        name: source.name.clone(),
+                        reason: e.to_string(),
+                    })?;
+            }
+            (DataSourceType::Rss, None) => {
+                return Err(ConfigError::MissingRssConfig {
+                    name: source.name.clone(),
+                }
+                .into());
+            }
+            (_, Some(_)) => {
+                return Err(ConfigError::UnexpectedRssConfig {
                     name: source.name.clone(),
                     source_type: source.source_type,
                 }
@@ -1692,6 +1774,44 @@ async fn register_data_source(
                 .into());
             }
         }
+        DataSourceType::Rss => {
+            #[cfg(feature = "rss")]
+            {
+                tracing::info!(
+                    "Registering RSS source: {} (hierarchy_level: {:?})",
+                    source.name,
+                    source.hierarchy_level
+                );
+
+                // Config presence, catalog-only, and read-only are re-checked
+                // inside the provider: `register_with_policy` in
+                // `sources/providers/rss/mod.rs` is the single enforcement
+                // point that this arm and the public embedder seam
+                // (`register_rss_tables_with_policy`) both feed into.
+                register_rss_tables(
+                    session_ctx,
+                    &source.name,
+                    source.rss.as_ref(),
+                    source.access_mode.is_read_write(),
+                    source.hierarchy_level,
+                )
+                .await
+                .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: e.to_string(),
+                })?;
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                return Err(ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: "rss data source type requires the `rss` feature to be enabled at \
+                            build time"
+                        .to_string(),
+                }
+                .into());
+            }
+        }
     }
 
     // If enable_cache is set for Csv/Parquet/Iceberg, load the table into a MemTable
@@ -2467,6 +2587,7 @@ options:
             enable_cache: false,
             description: None,
             open_connector: None,
+            rss: None,
         }
     }
 
@@ -2552,6 +2673,7 @@ options:
             enable_cache: false,
             description: None,
             open_connector,
+            rss: None,
         }
     }
 
@@ -2740,6 +2862,234 @@ bindings:
         );
     }
 
+    /// A minimal valid `rss:` block. The host is `.invalid` (RFC 2606 §2
+    /// reserves it as never-resolvable) so any accidental fetch on a path
+    /// these tests exercise would fail loudly rather than reach a real feed.
+    const VALID_RSS_CONFIG: &str = r#"
+feeds:
+  - url: https://feeds.example.invalid/f.xml
+    name: example
+"#;
+
+    fn rss_source(name: &str, config_yaml: Option<&str>, access_mode: AccessMode) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::Rss,
+            path: PathBuf::new(),
+            // Deliberately absent: RSS has no connection string — feed URLs
+            // live in the typed block — so `Rss` must not be in the
+            // connection-string-required arm of `validate_data_sources`.
+            connection_string: None,
+            schema: None,
+            options: None,
+            hierarchy_level: HierarchyLevel::Catalog,
+            access_mode,
+            enable_cache: false,
+            description: None,
+            open_connector: None,
+            rss: config_yaml.map(|yaml| serde_yaml::from_str(yaml).expect("parse rss config")),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_rss_with_typed_config() {
+        // Also pins the omission above: this source has no
+        // `connection_string`, and validation must still accept it.
+        let source = rss_source("news", Some(VALID_RSS_CONFIG), AccessMode::ReadOnly);
+        validate_data_sources(&[source]).expect("valid rss source");
+    }
+
+    #[test]
+    fn validate_rejects_rss_config_on_wrong_type() {
+        let mut source = dynamodb_source(
+            "products",
+            Some("http://localhost:8000"),
+            None,
+            AccessMode::ReadOnly,
+        );
+        source.rss = Some(serde_yaml::from_str(VALID_RSS_CONFIG).expect("parse rss config"));
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnexpectedRssConfig { name, source_type }
+                    if name == "products" && *source_type == DataSourceType::Dynamodb
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rss_without_typed_config() {
+        let source = rss_source("news", None, AccessMode::ReadOnly);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingRssConfig { name } if name == "news"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rss_table_hierarchy() {
+        // hierarchy_level defaults to Table; a source that omits
+        // `hierarchy_level: catalog` must fail at validation rather than at
+        // registration with the provider's wrapped CatalogHierarchyRequired.
+        let mut source = rss_source("news", Some(VALID_RSS_CONFIG), AccessMode::ReadOnly);
+        source.hierarchy_level = HierarchyLevel::Table;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::RssHierarchyRequired { name } if name == "news"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rss_read_write() {
+        // The RSS provider is read-only, so `Rss` is absent from
+        // WRITABLE_SOURCE_TYPES and the generic access_mode gate rejects
+        // read_write — there is no RSS-specific check for it.
+        let source = rss_source("news", Some(VALID_RSS_CONFIG), AccessMode::ReadWrite);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnsupportedWriteMode { name, source_type }
+                    if name == "news" && *source_type == DataSourceType::Rss
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rss_invalid_config() {
+        // `feeds` and `opml` are mutually exclusive (RssConfig::validate);
+        // validation must surface that as a typed config error.
+        let source = rss_source(
+            "news",
+            Some("feeds:\n  - url: https://a.example.invalid/f.xml\nopml: subs.opml\n"),
+            AccessMode::ReadOnly,
+        );
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::InvalidRssConfig { name, reason }
+                    if name == "news" && reason.contains("mutually exclusive")
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rss_catalog_table_option() {
+        // `Rss` joins CATALOG_SUPPORTED_SOURCES, so the existing catalog-mode
+        // guard applies: its tables are fixed (`main.feeds`/`main.items`) and
+        // a flat `table` option must fail rather than be silently ignored.
+        let mut source = rss_source("news", Some(VALID_RSS_CONFIG), AccessMode::ReadOnly);
+        source.options = Some(HashMap::from([("table".to_string(), "items".to_string())]));
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "news" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    /// A `type: rss` source in a build without the `rss` feature must fail at
+    /// registration with a message naming the feature — the typed `rss:` block
+    /// still parses (RssConfig compiles featureless), so the failure is a
+    /// build-capability error, not a serde error.
+    #[cfg(not(feature = "rss"))]
+    #[tokio::test]
+    async fn test_register_rss_source_without_feature_names_the_feature() {
+        let source = rss_source("news", Some(VALID_RSS_CONFIG), AccessMode::ReadOnly);
+        let mut session_ctx = SessionContext::new();
+        let err = register_data_sources(&mut session_ctx, &[source])
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("`rss` feature"), "unexpected error: {msg}");
+    }
+
+    /// End-to-end through a real `kind: context` file: parse, validate,
+    /// register, query. Zero network — registration performs no I/O beyond an
+    /// `opml:` path (unused here), and a `feeds` scan serves a synchronous
+    /// state row with no request at all (`rss/exec.rs:322-327`), so the
+    /// unreachable `.invalid` host is never contacted.
+    #[cfg(feature = "rss")]
+    #[tokio::test]
+    async fn test_register_rss_source_via_context() {
+        let temp_dir = TempDir::new().unwrap();
+        let context_content = r#"
+kind: context
+metadata:
+  name: rss-context
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: "news"
+      type: "rss"
+      hierarchy_level: catalog
+      access_mode: read_only
+      rss:
+        feeds:
+          - url: "https://feeds.example.invalid/f.xml"
+"#;
+        let context_path = temp_dir.path().join("context.yaml");
+        fs::write(&context_path, context_content).unwrap();
+
+        let data_sources = load_context_config(&context_path).unwrap();
+        assert!(matches!(data_sources[0].source_type, DataSourceType::Rss));
+
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect("rss source should register");
+
+        let batches = session_ctx
+            .sql("SELECT name, url, last_status FROM news.main.feeds")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "one subscription → one feeds row");
+
+        let batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+        let col = |i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        };
+        // `name` defaults to the URL when the subscription omits it.
+        assert_eq!(col(0), "https://feeds.example.invalid/f.xml");
+        assert_eq!(col(1), "https://feeds.example.invalid/f.xml");
+        assert_eq!(col(2), "never");
+    }
+
     #[test]
     fn validate_rejects_dynamodb_catalog_table_option() {
         let mut options = HashMap::new();
@@ -2777,6 +3127,7 @@ bindings:
             schema: None,
             options,
             open_connector: None,
+            rss: None,
             hierarchy_level: HierarchyLevel::default(),
             access_mode,
             enable_cache: false,

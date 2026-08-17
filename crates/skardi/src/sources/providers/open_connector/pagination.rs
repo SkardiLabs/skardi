@@ -118,7 +118,20 @@ pub enum PaginationStrategy {
     /// completes after the first response. Used by `open_connector_scan`,
     /// whose raw actions declare no pagination contract — callers pass any
     /// paging inputs explicitly in the action input JSON.
-    SinglePage,
+    SinglePage {
+        /// Where the provider would spell "there is more", when the action
+        /// has such a field. Never used to fetch: this strategy issues one
+        /// request either way. It exists to CHECK the premise — a live
+        /// continuation there means one request is not the whole
+        /// collection, and quietly stopping would be this engine's only
+        /// silent truncation (`SinglePageIncomplete` instead).
+        ///
+        /// `None` keeps the historic behaviour, which is what
+        /// `open_connector_scan` needs: its raw actions declare no
+        /// pagination contract for the engine to check against, and their
+        /// callers drive paging through the action input themselves.
+        next_cursor_path: Option<&'static str>,
+    },
 }
 
 /// Mutable pagination state for one scan.
@@ -195,6 +208,14 @@ impl PaginationStrategy {
                         .to_string(),
                 });
             }
+            // The premise-check path is pack-authored too, so a typo in it
+            // must fail at registration like any other — never leave the
+            // check silently unarmed until a scan happens to run.
+            PaginationStrategy::SinglePage {
+                next_cursor_path: Some(path),
+            } => {
+                RowPath::parse(path)?;
+            }
             _ => {}
         }
         Ok(())
@@ -212,15 +233,20 @@ impl Pagination {
             PaginationStrategy::PageNumber { .. } => Some("1".to_string()),
             PaginationStrategy::Cursor { .. }
             | PaginationStrategy::Keyset { .. }
-            | PaginationStrategy::SinglePage => None,
+            | PaginationStrategy::SinglePage { .. } => None,
         };
         let cursor_path = match &strategy {
             PaginationStrategy::Cursor {
                 next_cursor_path, ..
             } => Some(RowPath::parse(next_cursor_path)?),
+            // Parsed the same way, read for a different purpose: the
+            // single-page premise check, never to fetch a next page.
+            PaginationStrategy::SinglePage {
+                next_cursor_path: Some(path),
+            } => Some(RowPath::parse(path)?),
             PaginationStrategy::PageNumber { .. }
             | PaginationStrategy::Keyset { .. }
-            | PaginationStrategy::SinglePage => None,
+            | PaginationStrategy::SinglePage { .. } => None,
         };
         let total_pages_path = match &strategy {
             PaginationStrategy::PageNumber {
@@ -302,7 +328,7 @@ impl Pagination {
                 }
                 input.insert((*page_size_param).to_string(), Value::from(*page_size));
             }
-            PaginationStrategy::SinglePage => {}
+            PaginationStrategy::SinglePage { .. } => {}
         }
     }
 
@@ -521,7 +547,37 @@ impl Pagination {
                 self.next_token = Some(next);
                 Ok(true)
             }
-            PaginationStrategy::SinglePage => Ok(false),
+            PaginationStrategy::SinglePage { .. } => {
+                // One request, one page — but when the pack declared where
+                // the provider spells "there is more", VERIFY that rather
+                // than assume it. Undeclared (raw scans) keeps the historic
+                // unconditional stop.
+                let Some(path) = &self.cursor_path else {
+                    return Ok(false);
+                };
+                match path.extract(envelope, self.page) {
+                    // The premise holds: the same three spellings the cursor
+                    // strategy reads as end-of-collection.
+                    Err(OpenConnectorError::RowPathNotFound { .. }) | Ok(Value::Null) => Ok(false),
+                    Ok(Value::String(token)) if token.is_empty() => Ok(false),
+                    // Anything else is the provider saying the collection
+                    // continues. This strategy cannot follow it — issuing a
+                    // second request would send pagination inputs the strict
+                    // schema rejects — so the scan fails rather than passing
+                    // off a partial answer as complete.
+                    Ok(other) => Err(OpenConnectorError::SinglePageIncomplete {
+                        path: path.as_str().to_string(),
+                        page: self.page,
+                        found: match other {
+                            Value::String(_) => "a continuation token".to_string(),
+                            other => format!("{} where a token would be", json_kind(other)),
+                        },
+                    }),
+                    // Structural failures — traversing through a non-object —
+                    // are drift and propagate as themselves.
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 }
@@ -1131,7 +1187,10 @@ mod tests {
 
     #[test]
     fn single_page_injects_nothing_and_never_advances() {
-        let mut pagination = Pagination::new(PaginationStrategy::SinglePage).unwrap();
+        let strategy = PaginationStrategy::SinglePage {
+            next_cursor_path: None,
+        };
+        let mut pagination = Pagination::new(strategy).unwrap();
         assert_eq!(pagination.page(), 1);
 
         let mut input = Map::new();
@@ -1139,15 +1198,53 @@ mod tests {
         assert!(input.is_empty(), "no pagination inputs for a raw scan");
 
         // Even a "full-looking" page ends the scan: raw actions declare no
-        // pagination contract, so there is nothing to advance.
+        // pagination contract, so there is nothing to advance — and nothing
+        // to check it against either.
         assert!(
             !pagination
                 .advance(&json!({"next_cursor": "c2"}), 100, None)
                 .unwrap()
         );
-        PaginationStrategy::SinglePage
-            .validate()
-            .expect("nothing to validate");
+        strategy.validate().expect("nothing to validate");
+    }
+
+    #[test]
+    fn a_declared_single_page_premise_is_checked_not_assumed() {
+        let single_page = |envelope: &Value| {
+            Pagination::new(PaginationStrategy::SinglePage {
+                next_cursor_path: Some("$.nextPageToken"),
+            })
+            .unwrap()
+            .advance(envelope, 10, None)
+        };
+
+        // The three end-of-collection spellings all mean "the premise
+        // held": absent, explicit null, empty string.
+        for complete in [
+            json!({"labels": []}),
+            json!({"labels": [], "nextPageToken": null}),
+            json!({"labels": [], "nextPageToken": ""}),
+        ] {
+            assert!(
+                !single_page(&complete).expect("a complete collection scans cleanly"),
+                "{complete}: no continuation means one request was the whole collection"
+            );
+        }
+
+        // A live token is the provider saying otherwise. Stopping here
+        // would be a silent truncation, so the scan fails instead.
+        let err = single_page(&json!({"labels": [], "nextPageToken": "tok-2"}))
+            .expect_err("a live continuation must fail the scan");
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::SinglePageIncomplete { ref path, page: 1, .. }
+                    if path == "$.nextPageToken"
+            ),
+            "the premise break is named: {err}"
+        );
+        // The value never rides along into the message.
+        assert!(!err.to_string().contains("tok-2"), "{err}");
     }
 
     #[test]

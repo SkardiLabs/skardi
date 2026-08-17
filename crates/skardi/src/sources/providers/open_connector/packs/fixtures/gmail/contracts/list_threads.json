@@ -1,0 +1,147 @@
+{
+  "type": "object",
+  "properties": {
+    "threads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail thread ID."
+          },
+          "historyId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "Mailbox history checkpoint ID."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "snippet": {
+            "type": "string",
+            "description": "Thread snippet."
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "messageId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Gmail message ID."
+                },
+                "threadId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Gmail thread ID."
+                },
+                "labelIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": "Gmail label IDs."
+                },
+                "subject": {
+                  "type": "string",
+                  "description": "Message subject."
+                },
+                "sender": {
+                  "type": "string",
+                  "description": "Message sender."
+                },
+                "to": {
+                  "type": "string",
+                  "description": "Message recipients."
+                },
+                "messageTimestamp": {
+                  "type": "string",
+                  "description": "Message timestamp."
+                },
+                "preview": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "Gmail API object."
+                },
+                "payload": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Gmail API object."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "messageText": {
+                  "type": "string",
+                  "description": "Extracted message body text."
+                },
+                "attachmentList": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Gmail API object."
+                  },
+                  "description": "Message attachments."
+                },
+                "raw": {
+                  "type": "string",
+                  "description": "Raw RFC 2822 message when requested."
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "messageId",
+                "threadId",
+                "labelIds",
+                "subject",
+                "sender",
+                "to",
+                "messageTimestamp"
+              ],
+              "description": "Normalized Gmail message."
+            },
+            "description": "Messages in the thread."
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "threadId"
+        ],
+        "description": "Gmail thread."
+      },
+      "description": "Returned threads."
+    },
+    "nextPageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Opaque pagination token returned by Gmail."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resultSizeEstimate": {
+      "type": "integer",
+      "description": "Approximate result count."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "threads"
+  ],
+  "description": "Thread list result."
+}

@@ -110,7 +110,7 @@ The merged view is what the agent actually consumes. It surfaces in two places:
 
 This is *the agent's prompt*. The catalog endpoint is the first thing a well-built reading agent calls in a session, and the descriptions there are what it reads before it decides which pipeline to invoke. The overlay is shipped today; an agent-callable `describe` verb (so the agent can pull a single table's overlay through a pipeline call rather than the catalog endpoint) is open on the roadmap (`6` — *agent-callable describe verb*).
 
-One known limitation: the HTTP `/data_source` endpoint emits one table per source today, so qualified `catalog.schema.table` overlays for inner tables of a catalog-mode source don't yet surface there — and since `skardi schema` only renders that endpoint's response, they don't surface on the CLI either. Tracked in the same doc.
+Catalog-mode sources surface on the same endpoint: their entry's `tables[]` enumerates every registered inner table under its fully-qualified `catalog.schema.table` name (the exact string a `FROM` clause takes), with descriptions resolved most-specific-first — a qualified `catalog.schema.table` overlay entry wins, the bare source-name entry applies as the broad fallback. `skardi schema` renders the same response, so inner tables surface on the CLI as well.
 
 ---
 

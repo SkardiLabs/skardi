@@ -336,8 +336,9 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
-| Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), Slack pack (conversations, users, files — [guide](docs/open-connector-slack.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
+| Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), Slack pack (conversations, users, files — [guide](docs/open-connector-slack.md)), Notion pack (users, pages, data sources, block children — [guide](docs/open-connector-notion.md)), Feishu pack (chats, messages, chat members, tasks, wiki spaces and nodes — [guide](docs/open-connector-feishu.md)), Gmail pack (threads, messages, drafts, labels, filters — [guide](docs/open-connector-gmail.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
 | Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories or S3 prefixes; `documents` feature) | [docs/documents.md](docs/documents.md) |
+| RSS / Atom | Read | Yes | RSS 0.9x/1.0/2.0, Atom, JSON Feed subscriptions as `feeds` (health) + `items` (live window); content stored as Markdown, per-feed TTL cache with conditional GETs, per-feed fault isolation, un-sandboxed fetch egress — operator/Cloud-owned SSRF control (`rss` feature) | [docs/rss.md](docs/rss.md) |
 
 ---
 
@@ -362,6 +363,8 @@ For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a si
 </p>
 
 </details>
+
+Most sources read a store that already holds rows. The **RSS/Atom** source is the one that reaches out over the open web at query time: it fetches each subscription through a per-feed TTL cache with conditional GETs, runs one DataFusion partition per feed so a dead feed degrades alone instead of failing the scan, and — because feed URLs are agent-authored input — the fetch is deliberately un-sandboxed in OSS: Skardi does not restrict where a feed may point, and operators impose egress control at the infrastructure layer (managed egress is a Skardi Cloud feature). See [docs/rss.md](docs/rss.md).
 
 ---
 
@@ -439,7 +442,8 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
    - [x] Hybrid search — combine keyword and semantic search results in one SQL query (RRF merge), no Python re-ranking layer
    - [x] Inline embeddings — `candle()` UDF (local GGUF / Candle models, or remote embedding APIs) called inside SQL, so content + vector stay on the same row atomically
    - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
-   - [x] Chunking UDF — `chunk()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
+   - [x] Chunking UDFs — `chunk()` and index-carrying `chunk_parts()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
+   - [x] JSON encoding UDF — `json_pack()` builds JSON objects in SQL through `serde_json` (deterministic key order, no injection path) ([docs](docs/json_pack.md))
    - [ ] Memory primitive — give your agent a memory store (keyword + semantic recall, TTL/expiration, per-session provenance) defined in one YAML block
 
 `3` Online serving (pipelines)

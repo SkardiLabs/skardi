@@ -23,10 +23,13 @@ gateway **runtime token**.
 > children — dynamic-schema rows are gated on binding-time schema
 > freeze), [Feishu](open-connector-feishu.md) (chats, messages,
 > chat members, tasks, wiki — live-verified against a real workspace),
-> and [Discord](open-connector-discord.md) (guilds, connections, sticker
+> [Discord](open-connector-discord.md) (guilds, connections, sticker
 > packs — live-verified against a real account; entitlements gated on
-> upstream pagination inputs).
-> Further provider packs (Jira, …) ship one pack per release per the
+> upstream pagination inputs),
+> and [Gmail](open-connector-gmail.md) (threads, messages,
+> drafts, labels, filters — message bodies are deferred to a
+> content-oriented surface). Further provider packs (Google Calendar,
+> Google Drive, Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.

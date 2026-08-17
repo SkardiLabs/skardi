@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::auth::routes::require_session;
-use crate::config::DataSourceType;
+use crate::config::{DataSourceType, HierarchyLevel};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
@@ -69,7 +69,9 @@ pub struct FieldInfo {
 /// Table information with schema
 #[derive(Debug, Clone, Serialize)]
 pub struct TableInfo {
-    /// Table name (same as data source name)
+    /// Table name, directly usable in a `FROM` clause: the data source name
+    /// for a table-mode source, the fully-qualified `catalog.schema.table`
+    /// path for an inner table of a catalog-mode source.
     pub name: String,
     /// Natural-language description for the table (semantics overlay first,
     /// ctx-inline `description` second). Omitted when neither supplies one.
@@ -148,6 +150,104 @@ pub(crate) async fn get_table_schema(
         .collect();
 
     Ok(fields)
+}
+
+/// Enumerate every inner table of a catalog-mode source.
+///
+/// A catalog-mode source (RSS, Open Connector) registers a whole DataFusion
+/// catalog named after the source, so its tables live at
+/// `<source>.<schema>.<table>` and nothing exists under
+/// `datafusion.public.<source>` for [`get_table_schema`] to find.
+///
+/// Names in the returned [`TableInfo`]s are fully qualified so that
+/// `tables[].name` keeps the contract table-mode entries already provide:
+/// the string is directly usable in a `FROM` clause. Both name levels are
+/// sorted — the underlying providers are hash maps, and a stable order
+/// keeps the payload deterministic.
+///
+/// Descriptions resolve most-specific-first through the semantics
+/// registry: a qualified `catalog.schema.table` overlay entry wins, then
+/// the bare source-name entry (which the ctx-inline `description` seeds)
+/// applies as the broad fallback to every inner table.
+///
+/// A missing catalog degrades to an empty table list with a warning — the
+/// same policy as `get_table_schema`'s empty-schema fallback in
+/// [`get_data_sources`] — so one unregistered source cannot fail the whole
+/// listing.
+pub(crate) async fn enumerate_catalog_tables(
+    ctx: &SessionContext,
+    source_name: &str,
+    semantics: &SemanticsRegistry,
+) -> Vec<TableInfo> {
+    let Some(catalog) = ctx.catalog(source_name) else {
+        tracing::warn!(
+            "Catalog-mode source '{}' has no registered catalog; listing no tables",
+            source_name
+        );
+        return Vec::new();
+    };
+
+    let mut tables = Vec::new();
+    let mut schema_names = catalog.schema_names();
+    schema_names.sort();
+    for schema_name in schema_names {
+        let Some(schema_provider) = catalog.schema(&schema_name) else {
+            continue;
+        };
+        let mut table_names = schema_provider.table_names();
+        table_names.sort();
+        for table_name in table_names {
+            let table = match schema_provider.table(&table_name).await {
+                Ok(Some(table)) => table,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get table '{}.{}.{}': {}",
+                        source_name,
+                        schema_name,
+                        table_name,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let fields: Vec<FieldInfo> = table
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| FieldInfo {
+                    name: field.name().clone(),
+                    r#type: format!("{:?}", field.data_type()),
+                    nullable: field.is_nullable(),
+                    description: semantics
+                        .resolve_column_description(
+                            source_name,
+                            &schema_name,
+                            &table_name,
+                            Some(source_name),
+                            field.name(),
+                        )
+                        .map(str::to_string),
+                })
+                .collect();
+
+            tables.push(TableInfo {
+                name: format!("{source_name}.{schema_name}.{table_name}"),
+                description: semantics
+                    .resolve_table_description(
+                        source_name,
+                        &schema_name,
+                        &table_name,
+                        Some(source_name),
+                    )
+                    .map(str::to_string),
+                schema: fields,
+            });
+        }
+    }
+
+    tables
 }
 
 /// Per-pipeline health check endpoint - GET /health/:name
@@ -379,7 +479,10 @@ pub async fn get_data_sources(
             | DataSourceType::Influxdb
             | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
-            | DataSourceType::Dynamodb => None,
+            | DataSourceType::Dynamodb
+            // RSS has no path: its feed URLs live in the typed `rss:` block,
+            // not in `path`.
+            | DataSourceType::Rss => None,
         };
 
         let url = match data_source.source_type {
@@ -399,34 +502,42 @@ pub async fn get_data_sources(
             _ => None,
         };
 
-        // Get table schema from SessionContext, with column descriptions
-        // merged in from the semantics registry.
-        let table_schema = match get_table_schema(session_ctx, &data_source.name, &semantics).await
-        {
-            Ok(fields) => fields,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get schema for table '{}': {}",
-                    data_source.name,
-                    e
-                );
-                // Continue with empty schema if table not found or schema retrieval fails
-                Vec::new()
-            }
-        };
+        // Catalog-mode sources register a whole catalog named after the
+        // source — their tables live at `<source>.<schema>.<table>`, not
+        // under `datafusion.public.<source>` — so they are enumerated
+        // rather than reported as a single source-named table.
+        let tables = if data_source.hierarchy_level == HierarchyLevel::Catalog {
+            enumerate_catalog_tables(session_ctx, &data_source.name, &semantics).await
+        } else {
+            // Get table schema from SessionContext, with column descriptions
+            // merged in from the semantics registry.
+            let table_schema =
+                match get_table_schema(session_ctx, &data_source.name, &semantics).await {
+                    Ok(fields) => fields,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to get schema for table '{}': {}",
+                            data_source.name,
+                            e
+                        );
+                        // Continue with empty schema if table not found or schema retrieval fails
+                        Vec::new()
+                    }
+                };
 
-        // Build table info (data source name is the table name). The table
-        // description is the merged view: a `kind: semantics` overlay wins
-        // when present, falling back to the ctx-inline `description` field
-        // (this fallback is seeded into the registry at boot, so the
-        // single lookup here covers both cases).
-        let tables = vec![TableInfo {
-            name: data_source.name.clone(),
-            description: semantics
-                .table_description(&data_source.name)
-                .map(str::to_string),
-            schema: table_schema,
-        }];
+            // Build table info (data source name is the table name). The table
+            // description is the merged view: a `kind: semantics` overlay wins
+            // when present, falling back to the ctx-inline `description` field
+            // (this fallback is seeded into the registry at boot, so the
+            // single lookup here covers both cases).
+            vec![TableInfo {
+                name: data_source.name.clone(),
+                description: semantics
+                    .table_description(&data_source.name)
+                    .map(str::to_string),
+                schema: table_schema,
+            }]
+        };
 
         data_source_responses.push(DataSourceResponse {
             name: data_source.name.clone(),
@@ -906,6 +1017,7 @@ spec:
             hierarchy_level: Default::default(),
             description: None,
             open_connector: None,
+            rss: None,
         };
 
         // Create pipeline that queries the registered data source
@@ -1537,6 +1649,7 @@ spec:
                 enable_cache: false,
                 description: None,
                 open_connector: None,
+                rss: None,
             });
         }
 
@@ -1549,5 +1662,165 @@ spec:
         assert_eq!(entry["type"], "dynamodb");
         assert!(entry["path"].is_null(), "db sources expose no path");
         assert_eq!(entry["url"], "http://localhost:8000");
+
+        // Table-mode regression pin: one entry, named after the source —
+        // the catalog-mode enumeration path must not leak into this arm.
+        let tables = entry["tables"].as_array().unwrap();
+        assert_eq!(tables.len(), 1, "table-mode keeps one source-named entry");
+        assert_eq!(tables[0]["name"], "products");
+    }
+
+    /// Catalog-mode sources must surface their real inner tables on
+    /// `GET /data_source` — fully-qualified `FROM`-usable names, real Arrow
+    /// schemas, and the qualified `catalog.schema.table` overlay merged —
+    /// instead of the pre-fix fabrication (one source-named table with an
+    /// empty schema).
+    ///
+    /// Zero network: RSS registration performs no I/O, reading nothing
+    /// triggers no `items` scan here, and the configured host sits under
+    /// the never-resolvable `.invalid` TLD (RFC 2606 §2), so an accidental
+    /// fetch would fail loudly rather than reach a real feed.
+    ///
+    /// The semantics come from the SHIPPED overlay
+    /// (`docs/rss/semantics.yaml`) rather than a synthetic fixture, so this
+    /// test doubles as a drift tripwire: an overlay column that stops
+    /// matching the registered Arrow schema fails here.
+    #[cfg(feature = "rss")]
+    #[tokio::test]
+    async fn get_data_sources_enumerates_rss_catalog_tables() {
+        let source = DataSource {
+            name: "news".to_string(),
+            source_type: DataSourceType::Rss,
+            path: PathBuf::new(),
+            connection_string: None,
+            schema: None,
+            options: None,
+            hierarchy_level: HierarchyLevel::Catalog,
+            access_mode: AccessMode::ReadOnly,
+            enable_cache: false,
+            description: None,
+            open_connector: None,
+            rss: Some(
+                serde_yaml::from_str(
+                    "feeds:\n  - url: https://feeds.example.invalid/f.xml\n    name: example\n",
+                )
+                .expect("parse rss config"),
+            ),
+        };
+
+        let mut session_ctx = SessionContext::new();
+        crate::config::register_data_sources(&mut session_ctx, std::slice::from_ref(&source))
+            .await
+            .expect("rss source should register");
+        let session_ctx = Arc::new(session_ctx);
+
+        let overlay_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/rss/semantics.yaml");
+        let semantics =
+            SemanticsRegistry::build(Some(&overlay_path), &[("news".to_string(), None)])
+                .expect("shipped overlay loads");
+
+        let args = CliArgs {
+            pipeline_path: None,
+            jobs_path: None,
+            jobs_db_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
+        };
+        let config = ServerConfig {
+            pipelines: HashMap::new(),
+            jobs: HashMap::new(),
+            data_sources: vec![source],
+            semantics,
+            args,
+        };
+        let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
+        let app_state = AppState::new(
+            config,
+            engine,
+            session_ctx,
+            crate::auth::layer::AuthLayer::None,
+            None,
+            None,
+        );
+
+        let Json(body) = get_data_sources(State(app_state)).await.unwrap();
+        let data = body["data"].as_array().unwrap();
+        let entry = data
+            .iter()
+            .find(|d| d["name"] == "news")
+            .expect("rss source should be listed");
+        assert_eq!(entry["type"], "rss");
+        assert!(entry["path"].is_null(), "rss exposes no path");
+        assert!(entry["url"].is_null(), "rss exposes no url");
+
+        let tables = entry["tables"].as_array().unwrap();
+        let names: Vec<&str> = tables.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["news.main.feeds", "news.main.items"],
+            "inner tables under fully-qualified FROM-usable names, sorted"
+        );
+
+        // Spot-check the qualified overlay merge on both levels: the
+        // `news.main.feeds` table description and one column description.
+        let feeds = &tables[0];
+        let feeds_desc = feeds["description"]
+            .as_str()
+            .expect("qualified table description merged");
+        assert!(
+            feeds_desc.contains("one row per configured subscription"),
+            "got {feeds_desc}"
+        );
+        let last_status = feeds["schema"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "last_status")
+            .expect("feeds.last_status in schema");
+        let last_status_desc = last_status["description"]
+            .as_str()
+            .expect("qualified column description merged");
+        assert!(
+            last_status_desc.contains("revalidated"),
+            "got {last_status_desc}"
+        );
+
+        // Drift tripwire: every column the shipped overlay documents must
+        // still exist in the registered schema, and its description must
+        // survive the trip through the endpoint.
+        let overlay: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&overlay_path).unwrap()).unwrap();
+        for overlay_source in overlay["spec"]["sources"].as_sequence().unwrap() {
+            let overlay_name = overlay_source["name"].as_str().unwrap();
+            let table = tables
+                .iter()
+                .find(|t| t["name"] == overlay_name)
+                .unwrap_or_else(|| panic!("overlay entry `{overlay_name}` has no matching table"));
+            let schema = table["schema"].as_array().unwrap();
+            for column in overlay_source["columns"]
+                .as_sequence()
+                .into_iter()
+                .flatten()
+            {
+                let col_name = column["name"].as_str().unwrap();
+                let field = schema
+                    .iter()
+                    .find(|f| f["name"] == col_name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "overlay column `{overlay_name}.{col_name}` is missing \
+                             from the registered schema"
+                        )
+                    });
+                assert!(
+                    field["description"].as_str().is_some_and(|d| !d.is_empty()),
+                    "column `{overlay_name}.{col_name}` lost its overlay description"
+                );
+            }
+        }
     }
 }

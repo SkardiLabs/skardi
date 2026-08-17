@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE rss [
+  <!ENTITY lol "lol">
+  <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+]>
+<rss version="2.0">
+  <channel>
+    <title>&lol3;</title>
+    <link>https://corpus.example/</link>
+    <description>&lol3;</description>
+    <item>
+      <guid>tag:corpus.example,2026:bomb-1</guid>
+      <title>&lol3;</title>
+    </item>
+  </channel>
+</rss>

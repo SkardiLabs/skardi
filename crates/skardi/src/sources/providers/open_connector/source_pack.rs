@@ -135,6 +135,7 @@ impl SourcePackRegistry {
         for pack in [
             super::packs::mock::pack()?,
             super::packs::github::pack()?,
+            super::packs::gmail::pack()?,
             super::packs::notion::pack()?,
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
@@ -148,6 +149,15 @@ impl SourcePackRegistry {
     /// Look up a pack by provider name.
     pub fn get(&self, name: &str) -> Option<&'static SourcePack> {
         self.packs.get(name).copied()
+    }
+
+    /// Every built-in pack, name-sorted so enumeration is deterministic —
+    /// the etl generator's recipe contract suite and its `recipes` coverage
+    /// listing both iterate this (the map itself is private and unordered).
+    pub fn packs(&self) -> impl Iterator<Item = &'static SourcePack> + '_ {
+        let mut packs: Vec<&'static SourcePack> = self.packs.values().copied().collect();
+        packs.sort_by_key(|pack| pack.name);
+        packs.into_iter()
     }
 
     /// Resolve `pack` + `table` to a table definition, with targeted errors
@@ -230,6 +240,30 @@ mod tests {
     }
 
     #[test]
+    fn packs_iterates_every_builtin_in_name_order() {
+        // The enumeration surface the etl generator's contract suite and
+        // `recipes` listing depend on: complete and deterministic — the
+        // backing map is unordered, so the sort here is load-bearing.
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let names: Vec<&str> = registry.packs().map(|p| p.name).collect();
+        // Sortedness, asserted independently of the roster so THIS pin
+        // survives future pack additions untouched…
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "packs() must iterate name-sorted with no duplicates: {names:?}"
+        );
+        // …and completeness as an explicit roster, the one line a new pack
+        // must extend (a stale list here means the generator's coverage
+        // listing silently omits the newcomer).
+        assert_eq!(
+            names,
+            vec![
+                "discord", "feishu", "github", "gmail", "mock", "notion", "slack"
+            ]
+        );
+    }
+
+    #[test]
     fn fixed_values_convert_to_their_json_scalars() {
         // The const-friendly stand-in must round-trip every JSON scalar a
         // pack could pin — numeric/boolean pins are never stringified.
@@ -274,6 +308,25 @@ mod tests {
                 "github.repositories",
                 "github.reviews",
                 "github.workflow_runs",
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_gmail_pack_is_registered() {
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let pack = registry.require("gmail").unwrap();
+        assert_eq!(pack.name, "gmail");
+        assert_eq!(pack.version, 1);
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gmail.drafts",
+                "gmail.filters",
+                "gmail.labels",
+                "gmail.messages",
+                "gmail.threads",
             ]
         );
     }
@@ -332,7 +385,7 @@ mod tests {
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
-        for name in ["mock", "github", "slack"] {
+        for name in ["mock", "github", "gmail", "slack", "notion", "feishu"] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for table in pack.tables {
@@ -357,7 +410,9 @@ mod tests {
             action_id: "t.action",
             row_path: "$.items",
             fields: &[],
-            pagination: PaginationStrategy::SinglePage,
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
             required_resources: &[],
             optional_resources: &[],
             fixed_inputs: &[],

@@ -1,21 +1,35 @@
-//! `chunk` UDF — split text into chunks for inline ingestion.
+//! `chunk` / `chunk_parts` UDFs — split text into chunks for inline ingestion.
 //!
-//! Returns `List<Utf8>` so callers can keep chunks as a list column or expand
-//! them into rows with `UNNEST(chunk(...))`.
+//! `chunk` returns `List<Utf8>` so callers can keep chunks as a list column or
+//! expand them into rows with `UNNEST(chunk(...))`.
+//!
+//! `chunk_parts` returns `List<Struct<chunk_idx Int32, chunk_text Utf8>>` — the
+//! same split with a **stable 0-based ordinal** attached to each chunk. It
+//! exists because no released DataFusion can plan `UNNEST … WITH ORDINALITY`
+//! (datafusion-sql rejects it with a `not_impl_err`; apache/datafusion#11419
+//! is an open feature request), and a `ROW_NUMBER() OVER (ORDER BY 1)` orders
+//! by a constant that can renumber across plan changes — so nothing else
+//! gives an exploded chunk a plan-stable index. The etl generator's ingest
+//! SQL depends on that ordinal for deterministic `doc_id`s (skardi-cloud
+//! `design_docs/skardi_etl_generator.md`).
 //!
 //! Usage:
 //! ```text
 //! chunk('character', text_col, 1000)         -- size only
 //! chunk('character', text_col, 1000, 200)    -- size + overlap
 //! chunk('markdown',  text_col, 1000, 200)
+//! chunk_parts('markdown', text_col, 1000, 200)
 //! ```
 //!
 //! Backed by the [`text-splitter`](https://crates.io/crates/text-splitter) crate.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, ListBuilder, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field};
+use arrow::array::{
+    Array, ArrayRef, Int32Builder, LargeStringArray, ListBuilder, StringArray, StringBuilder,
+    StringViewArray, StructBuilder,
+};
+use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::Result as DfResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
@@ -50,14 +64,27 @@ impl ChunkingRegistry {
     /// chunk(mode, text, size [, overlap]) -> List<Utf8>
     /// ```
     /// - `mode`: `'character'` or `'markdown'`
-    /// - `text`: `Utf8` literal, scalar subquery, or column
+    /// - `text`: string literal, scalar subquery, or column — any string
+    ///   layout (`Utf8`, `LargeUtf8`, `Utf8View`)
     /// - `size`: target max chunk length (characters), positive integer literal
     /// - `overlap`: optional characters of overlap between adjacent chunks; must be `< size`
     pub fn register_chunk_udf(self: &Arc<Self>, ctx: &mut SessionContext) {
         let udf = ScalarUDF::new_from_impl(ChunkingUDF::new(Arc::clone(self)));
         ctx.register_udf(udf);
-        tracing::info!("Registered 'chunk' UDF");
+        let parts = ScalarUDF::new_from_impl(ChunkPartsUDF::new(Arc::clone(self)));
+        ctx.register_udf(parts);
+        tracing::info!("Registered 'chunk' and 'chunk_parts' UDFs");
     }
+}
+
+/// The `chunk_parts` element type: `Struct<chunk_idx Int32, chunk_text Utf8>`.
+/// One definition feeds the return type AND the builder so they cannot
+/// drift apart (a mismatch is a runtime Arrow error, not a compile error).
+fn chunk_part_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("chunk_idx", DataType::Int32, false),
+        Field::new("chunk_text", DataType::Utf8, false),
+    ])
 }
 
 // =============================================================================
@@ -117,35 +144,7 @@ impl ScalarUDFImpl for ChunkingUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
         let args = args.args;
-
-        if args.len() < 3 || args.len() > 4 {
-            return Err(DataFusionError::Execution(format!(
-                "chunk expects 3 or 4 arguments (mode, text, size [, overlap]); got {}",
-                args.len()
-            )));
-        }
-
-        let mode = read_scalar_string(&args[0], "mode")?;
-        let size = read_scalar_usize(&args[2], "size")?;
-        if size == 0 {
-            return Err(DataFusionError::Execution(
-                "chunk: 'size' must be > 0".to_string(),
-            ));
-        }
-        let overlap = if args.len() == 4 {
-            read_scalar_usize(&args[3], "overlap")?
-        } else {
-            0
-        };
-        // text-splitter's ChunkConfig::with_overlap also rejects this; the explicit
-        // check exists so the error names both values instead of a generic message.
-        if overlap >= size {
-            return Err(DataFusionError::Execution(format!(
-                "chunk: 'overlap' ({overlap}) must be strictly less than 'size' ({size})"
-            )));
-        }
-
-        let texts = read_text_column(&args[1], "text")?;
+        let (mode, texts, size, overlap) = parse_chunk_args("chunk", &args)?;
 
         let array: ArrayRef = match mode.as_str() {
             "character" => {
@@ -170,74 +169,278 @@ impl ScalarUDFImpl for ChunkingUDF {
 }
 
 // =============================================================================
+// ChunkPartsUDF — ScalarUDFImpl
+// =============================================================================
+
+/// `chunk_parts(mode, text, size [, overlap]) -> List<Struct<chunk_idx, chunk_text>>`
+///
+/// Argument semantics, validation, and splitters are identical to `chunk` —
+/// the shared decode helpers enforce the same literal-args contract — the
+/// only difference is the element type, which carries the 0-based split
+/// ordinal (see the module doc for why ordinality must come from the UDF).
+#[derive(Debug)]
+struct ChunkPartsUDF {
+    registry: Arc<ChunkingRegistry>,
+    signature: Signature,
+}
+
+impl PartialEq for ChunkPartsUDF {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registry, &other.registry)
+    }
+}
+
+impl Eq for ChunkPartsUDF {}
+
+impl std::hash::Hash for ChunkPartsUDF {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.registry).hash(state);
+    }
+}
+
+impl ChunkPartsUDF {
+    fn new(registry: Arc<ChunkingRegistry>) -> Self {
+        Self {
+            registry,
+            // mode + text + size [+ overlap]
+            signature: Signature::variadic_any(Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ChunkPartsUDF {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "chunk_parts"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(chunk_part_fields()),
+            true,
+        ))))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let args = args.args;
+        let (mode, texts, size, overlap) = parse_chunk_args("chunk_parts", &args)?;
+
+        let array: ArrayRef = match mode.as_str() {
+            "character" => {
+                let cfg = build_config(size, overlap)?;
+                let splitter = TextSplitter::new(cfg);
+                build_parts_array(&texts, |t| splitter.chunks(t))?
+            }
+            "markdown" => {
+                let cfg = build_config(size, overlap)?;
+                let splitter = MarkdownSplitter::new(cfg);
+                build_parts_array(&texts, |t| splitter.chunks(t))?
+            }
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "chunk_parts: unsupported mode '{other}'; supported modes: \
+                     'character', 'markdown'"
+                )));
+            }
+        };
+
+        Ok(ColumnarValue::Array(array))
+    }
+}
+
+/// Build a `List<Struct<chunk_idx, chunk_text>>` by applying `split` to each
+/// non-null row, numbering that row's chunks 0.. in split order — the
+/// ordinal is assigned HERE, inside one deterministic pass over one value,
+/// which is what makes it immune to plan-shape changes.
+fn build_parts_array<'t, F, I>(texts: &[Option<&'t str>], mut split: F) -> DfResult<ArrayRef>
+where
+    F: FnMut(&'t str) -> I,
+    I: Iterator<Item = &'t str>,
+{
+    let mut builder = ListBuilder::new(StructBuilder::from_fields(chunk_part_fields(), 0));
+    for maybe_text in texts {
+        match maybe_text {
+            Some(text) => {
+                for (idx, chunk) in split(text).enumerate() {
+                    let idx = i32::try_from(idx).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "chunk_parts: more than {} chunks in one value",
+                            i32::MAX
+                        ))
+                    })?;
+                    let sb = builder.values();
+                    sb.field_builder::<Int32Builder>(0)
+                        .expect("field 0 is Int32 by construction")
+                        .append_value(idx);
+                    sb.field_builder::<StringBuilder>(1)
+                        .expect("field 1 is Utf8 by construction")
+                        .append_value(chunk);
+                    sb.append(true);
+                }
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+// =============================================================================
 // Argument decoding helpers
 // =============================================================================
 
-fn read_scalar_string(arg: &ColumnarValue, name: &str) -> DfResult<String> {
+/// Parse the shared `(mode, text, size [, overlap])` argument contract —
+/// one implementation for `chunk` and `chunk_parts`, so the two UDFs'
+/// argument semantics cannot drift (identical arity, literal rules, and
+/// bounds; only the element type downstream differs). `udf` names the
+/// caller in every diagnostic.
+fn parse_chunk_args<'a>(
+    udf: &str,
+    args: &'a [ColumnarValue],
+) -> DfResult<(String, Vec<Option<&'a str>>, usize, usize)> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(DataFusionError::Execution(format!(
+            "{udf} expects 3 or 4 arguments (mode, text, size [, overlap]); got {}",
+            args.len()
+        )));
+    }
+
+    let mode = read_scalar_string(udf, &args[0], "mode")?;
+    let size = read_scalar_usize(udf, &args[2], "size")?;
+    if size == 0 {
+        return Err(DataFusionError::Execution(format!(
+            "{udf}: 'size' must be > 0"
+        )));
+    }
+    let overlap = if args.len() == 4 {
+        read_scalar_usize(udf, &args[3], "overlap")?
+    } else {
+        0
+    };
+    // text-splitter's ChunkConfig::with_overlap also rejects this; the explicit
+    // check exists so the error names both values instead of a generic message.
+    if overlap >= size {
+        return Err(DataFusionError::Execution(format!(
+            "{udf}: 'overlap' ({overlap}) must be strictly less than 'size' ({size})"
+        )));
+    }
+
+    let texts = read_text_column(udf, &args[1], "text")?;
+    Ok((mode, texts, size, overlap))
+}
+
+fn read_scalar_string(udf: &str, arg: &ColumnarValue, name: &str) -> DfResult<String> {
     match arg {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
         | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(s.clone()),
         ColumnarValue::Scalar(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => Err(
-            DataFusionError::Execution(format!("chunk: '{name}' argument must not be null")),
+            DataFusionError::Execution(format!("{udf}: '{name}' argument must not be null")),
         ),
         ColumnarValue::Array(_) => Err(DataFusionError::Execution(format!(
-            "chunk: '{name}' must be a literal, not a column"
+            "{udf}: '{name}' must be a literal, not a column"
         ))),
         _ => Err(DataFusionError::Execution(format!(
-            "chunk: '{name}' argument must be a Utf8 literal"
+            "{udf}: '{name}' argument must be a Utf8 literal"
         ))),
     }
 }
 
-fn read_scalar_usize(arg: &ColumnarValue, name: &str) -> DfResult<usize> {
+fn read_scalar_usize(udf: &str, arg: &ColumnarValue, name: &str) -> DfResult<usize> {
     let n: i64 = match arg {
         ColumnarValue::Scalar(ScalarValue::Int64(Some(n))) => *n,
         ColumnarValue::Scalar(ScalarValue::Int32(Some(n))) => i64::from(*n),
         ColumnarValue::Scalar(ScalarValue::Int16(Some(n))) => i64::from(*n),
         ColumnarValue::Scalar(ScalarValue::Int8(Some(n))) => i64::from(*n),
         ColumnarValue::Scalar(ScalarValue::UInt64(Some(n))) => i64::try_from(*n).map_err(|_| {
-            DataFusionError::Execution(format!("chunk: '{name}' value {n} overflows i64"))
+            DataFusionError::Execution(format!("{udf}: '{name}' value {n} overflows i64"))
         })?,
         ColumnarValue::Scalar(ScalarValue::UInt32(Some(n))) => i64::from(*n),
         ColumnarValue::Scalar(ScalarValue::UInt16(Some(n))) => i64::from(*n),
         ColumnarValue::Scalar(ScalarValue::UInt8(Some(n))) => i64::from(*n),
         _ => {
             return Err(DataFusionError::Execution(format!(
-                "chunk: '{name}' argument must be an integer literal"
+                "{udf}: '{name}' argument must be an integer literal"
             )));
         }
     };
     if n < 0 {
         return Err(DataFusionError::Execution(format!(
-            "chunk: '{name}' must be non-negative (got {n})"
+            "{udf}: '{name}' must be non-negative (got {n})"
         )));
     }
     Ok(n as usize)
 }
 
-fn read_text_column<'a>(arg: &'a ColumnarValue, name: &str) -> DfResult<Vec<Option<&'a str>>> {
+/// Pre-flight for LargeUtf8 COLUMNS: chunk output flows through
+/// i32-offset builders (`StringBuilder`), whose offset overflow is a
+/// PANIC in arrow, not an error — and LargeUtf8 is the one layout whose
+/// contract makes >2 GiB legal input. Chunk output ≈ input bytes (more
+/// with overlap), so reject early with a real error instead of
+/// unwinding mid-batch. (A near-2 GiB Utf8 column plus overlap can
+/// still overflow — that exposure predates LargeUtf8 support and is
+/// shared with every i32-offset producer.) Offsets first-to-last, so a
+/// SLICED array counts its own bytes, not the whole buffer's. A free
+/// function over raw offsets so the boundary is unit-testable without a
+/// 2 GiB allocation.
+fn ensure_large_text_fits_i32(udf: &str, name: &str, offsets: &[i64]) -> DfResult<()> {
+    let total_bytes =
+        offsets.last().copied().unwrap_or_default() - offsets.first().copied().unwrap_or_default();
+    if total_bytes > i64::from(i32::MAX) {
+        return Err(DataFusionError::Execution(format!(
+            "{udf}: '{name}' carries more than 2 GiB of text in one batch; \
+             chunk output is built as 32-bit-offset Utf8 and cannot hold it — \
+             split the input into smaller batches"
+        )));
+    }
+    Ok(())
+}
+
+fn read_text_column<'a>(
+    udf: &str,
+    arg: &'a ColumnarValue,
+    name: &str,
+) -> DfResult<Vec<Option<&'a str>>> {
     match arg {
+        // Utf8View and LargeUtf8 included alongside the classic layout:
+        // DataFusion 52 carries computed string expressions as view
+        // arrays/scalars (the same reality open_connector/filters.rs
+        // handles), LargeUtf8 columns arrive from large-string sources,
+        // and the scalar arm below already accepts all three spellings —
+        // a text COLUMN must not be stricter than a text LITERAL. Each
+        // arm is `iter().collect()`: all three arrow string arrays yield
+        // `Option<&str>` with identical null/offset behavior, and one
+        // spelling keeps the arms from diverging.
         ColumnarValue::Array(arr) => {
+            if let Some(view_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
+                return Ok(view_arr.iter().collect());
+            }
+            if let Some(large_arr) = arr.as_any().downcast_ref::<LargeStringArray>() {
+                ensure_large_text_fits_i32(udf, name, large_arr.value_offsets())?;
+                return Ok(large_arr.iter().collect());
+            }
             let str_arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                DataFusionError::Execution(format!("chunk: '{name}' must be a Utf8 column"))
+                DataFusionError::Execution(format!(
+                    "{udf}: '{name}' must be a string column (Utf8, LargeUtf8, or Utf8View)"
+                ))
             })?;
-            Ok((0..str_arr.len())
-                .map(|i| {
-                    if str_arr.is_null(i) {
-                        None
-                    } else {
-                        Some(str_arr.value(i))
-                    }
-                })
-                .collect())
+            Ok(str_arr.iter().collect())
         }
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(vec![Some(s.as_str())]),
-        ColumnarValue::Scalar(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {
-            Ok(vec![None])
-        }
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
+        | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s))) => Ok(vec![Some(s.as_str())]),
+        ColumnarValue::Scalar(
+            ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) | ScalarValue::Utf8View(None),
+        ) => Ok(vec![None]),
         _ => Err(DataFusionError::Execution(format!(
-            "chunk: '{name}' must be Utf8"
+            "{udf}: '{name}' must be a string (Utf8, LargeUtf8, or Utf8View)"
         ))),
     }
 }
@@ -437,6 +640,142 @@ mod tests {
         assert!(list_at(list, 0).len() >= 3); // 250 chars / 100 → ≥3
         assert_eq!(list_at(list, 1).len(), 1); // 50 chars fits in one
         assert!(list.is_null(2)); // null in → null out
+    }
+
+    #[test]
+    fn large_utf8_text_column_chunks_like_utf8() {
+        // A text COLUMN must not be stricter than a text LITERAL: the
+        // scalar arm accepts LargeUtf8, so the array arm must too
+        // (large-string sources hand DataFusion LargeUtf8 columns).
+        let texts = LargeStringArray::from(vec![Some("a".repeat(250)), None]);
+        let result = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(texts)),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap();
+        let arr = match result {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list_at(list, 0).len() >= 3);
+        assert!(list.is_null(1), "null in → null out");
+    }
+
+    #[test]
+    fn utf8view_text_columns_and_scalars_chunk_like_utf8() {
+        // The view arm (DataFusion 52 carries computed string expressions
+        // as view arrays/scalars) — column with a null, then the scalar.
+        let texts = StringViewArray::from(vec![Some("a".repeat(250)), None]);
+        let result = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(texts)),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap();
+        let arr = match result {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(list_at(list, 0).len() >= 3);
+        assert!(list.is_null(1), "null in → null out");
+
+        // LargeUtf8 and Utf8View SCALARS: a literal must never be
+        // stricter than a column.
+        for scalar in [
+            ScalarValue::LargeUtf8(Some("b".repeat(150))),
+            ScalarValue::Utf8View(Some("b".repeat(150))),
+        ] {
+            let result = udf()
+                .invoke_with_args(make_args(vec![
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                    ColumnarValue::Scalar(scalar),
+                    ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+                ]))
+                .unwrap();
+            let arr = match result {
+                ColumnarValue::Array(a) => a,
+                _ => panic!("expected array"),
+            };
+            let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(list_at(list, 0).len(), 2);
+        }
+
+        // Typed NULL scalars of every string layout → a NULL list row.
+        for scalar in [
+            ScalarValue::Utf8(None),
+            ScalarValue::LargeUtf8(None),
+            ScalarValue::Utf8View(None),
+        ] {
+            let result = udf()
+                .invoke_with_args(make_args(vec![
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                    ColumnarValue::Scalar(scalar),
+                    ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+                ]))
+                .unwrap();
+            let arr = match result {
+                ColumnarValue::Array(a) => a,
+                _ => panic!("expected array"),
+            };
+            let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+            assert!(list.is_null(0), "typed NULL text → NULL list");
+        }
+    }
+
+    #[test]
+    fn non_string_text_arguments_name_the_accepted_layouts() {
+        // Column of the wrong type → the array-arm diagnostic.
+        let err = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(arrow::array::Int64Array::from(vec![1, 2]))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be a string column (Utf8, LargeUtf8, or Utf8View)"),
+            "{err}"
+        );
+
+        // Scalar of the wrong type → the scalar-arm diagnostic.
+        let err = udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(7))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be a string (Utf8, LargeUtf8, or Utf8View)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_two_gib_preflight_boundary_is_exact() {
+        // Raw offsets, so the boundary is pinned without a 2 GiB
+        // allocation: exactly i32::MAX passes, one past fails, and a
+        // SLICED array (non-zero first offset) counts its own bytes.
+        let max = i64::from(i32::MAX);
+        assert!(ensure_large_text_fits_i32("chunk", "text", &[0, max]).is_ok());
+        let err = ensure_large_text_fits_i32("chunk", "text", &[0, max + 1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 2 GiB"), "{err}");
+        assert!(err.contains("split the input"), "the fix is named: {err}");
+        // Slice: 10 bytes into a huge buffer — the slice's own span is
+        // what counts.
+        assert!(ensure_large_text_fits_i32("chunk", "text", &[max, max + 10]).is_ok());
+        // Empty offsets: nothing to overflow.
+        assert!(ensure_large_text_fits_i32("chunk", "text", &[]).is_ok());
     }
 
     #[test]
@@ -666,6 +1005,153 @@ mod tests {
         slugs.sort();
         assert!(slugs[0].starts_with("alice/chap1/p0"), "got {slugs:?}");
         assert!(slugs.iter().all(|s| s.starts_with("alice/chap1/p")));
+    }
+
+    // ── chunk_parts ─────────────────────────────────────────────────────
+
+    fn parts_udf() -> ChunkPartsUDF {
+        ChunkPartsUDF::new(Arc::new(ChunkingRegistry::new()))
+    }
+
+    #[test]
+    fn chunk_parts_numbers_chunks_zero_based_per_row() {
+        use arrow::array::{Int32Array, StructArray};
+        let texts = StringArray::from(vec![Some("a".repeat(250)), None, Some("b".repeat(120))]);
+        let result = parts_udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Array(Arc::new(texts)),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap();
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array result");
+        };
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(list.is_null(1), "NULL text row stays NULL");
+
+        // Ordinals restart at 0 for EVERY row — per-value numbering, not a
+        // running counter across the batch.
+        for row in [0, 2] {
+            let inner = list.value(row);
+            let parts = inner.as_any().downcast_ref::<StructArray>().unwrap();
+            let idx = parts
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let text = parts
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ordinals: Vec<i32> = (0..idx.len()).map(|i| idx.value(i)).collect();
+            assert_eq!(
+                ordinals,
+                (0..idx.len() as i32).collect::<Vec<_>>(),
+                "row {row}: split-order ordinals"
+            );
+            // The indexed chunks reassemble the original text (overlap 0).
+            let joined: String = (0..text.len()).map(|i| text.value(i)).collect();
+            let expected_char = if row == 0 { 'a' } else { 'b' };
+            assert!(joined.chars().all(|c| c == expected_char));
+        }
+    }
+
+    #[test]
+    fn chunk_parts_rejects_bad_args_with_its_own_name() {
+        // Shared decode helpers must diagnose as chunk_parts, not chunk.
+        let err = parts_udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("character".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("text".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("not-a-number".to_string()))),
+            ]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("chunk_parts: 'size'"),
+            "error names the right UDF: {err}"
+        );
+
+        let err = parts_udf()
+            .invoke_with_args(make_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("sentence".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("text".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
+            ]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("chunk_parts: unsupported mode"),
+            "{err}"
+        );
+    }
+
+    /// THE plannability pin (etl-generator tasks 1a.1): the exact SQL
+    /// spelling the generator's ingest templates will emit must plan and
+    /// execute on the locked DataFusion. This is the spelling the design
+    /// deliberately deferred to this test; if it breaks on a DF upgrade,
+    /// the generator's templates break with it — fix both together.
+    #[tokio::test]
+    async fn sql_chunk_parts_unnest_yields_ordered_indexed_rows() {
+        use arrow::array::Int64Array;
+        use arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        let ctx = build_ctx();
+        assert!(ctx.udf("chunk_parts").is_ok(), "chunk_parts registered");
+
+        // Two source rows so per-row ordinal restart is visible end to end.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new((*schema).clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x".repeat(220), "y".repeat(150)])),
+            ],
+        )
+        .unwrap();
+        ctx.register_table(
+            "docs",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+
+        let sql = "SELECT id, part['chunk_idx'] AS chunk_idx, part['chunk_text'] AS chunk_text \
+                   FROM (SELECT id, UNNEST(chunk_parts('character', body, 100)) AS part \
+                         FROM docs) \
+                   ORDER BY id, chunk_idx";
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+
+        let mut rows: Vec<(i64, i32, String)> = vec![];
+        for b in &batches {
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let idxs = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            let texts = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), idxs.value(i), texts.value(i).to_string()));
+            }
+        }
+        assert!(rows.len() >= 5, "220/100 + 150/100 chunks, got {rows:?}");
+        // Per-source ordinals restart at 0 and increment densely.
+        for id in [1i64, 2] {
+            let ords: Vec<i32> = rows.iter().filter(|r| r.0 == id).map(|r| r.1).collect();
+            assert_eq!(ords, (0..ords.len() as i32).collect::<Vec<_>>(), "id {id}");
+        }
+        // Reassembly: chunk_idx order reconstructs each body (overlap 0).
+        let body1: String = rows
+            .iter()
+            .filter(|r| r.0 == 1)
+            .map(|r| r.2.as_str())
+            .collect();
+        assert_eq!(body1, "x".repeat(220));
     }
 
     // Cross-UDF composition guards (chunk × candle/gguf/onnx/remote_embed)

@@ -1,9 +1,12 @@
-# Text Chunking (`chunk`)
+# Text Chunking (`chunk`, `chunk_parts`)
 
-> **Build flags:**
+> **Build flags:** `chunking` is part of `skardi-server`'s DEFAULT
+> features — a plain `cargo build --release -p skardi-server` (and the
+> no-`FEATURES` Docker build) ships both `chunk()` and `chunk_parts()`,
+> because generated etl bundles call `chunk_parts` at job run time.
+> Opt out with `--no-default-features`. Embedding UDFs remain opt-in:
 > ```bash
-> cargo build --release -p skardi-server --features chunking   # just chunk()
-> cargo build --release -p skardi-server --features rag        # chunk() + embedding UDFs
+> cargo build --release -p skardi-server --features rag   # + embedding UDFs
 > ```
 >
 > The `rag` umbrella feature bundles `embedding` and `chunking` so the
@@ -21,7 +24,7 @@ chunk(mode, text, size [, overlap]) -> List<Utf8>
 | Argument | Type | Description |
 |----------|------|-------------|
 | `mode` | string literal | Splitter to use. Supported: `'character'`, `'markdown'`. |
-| `text` | `Utf8` | The text to split. May be a literal, a scalar subquery, or a column reference. `NULL` rows pass through unchanged. |
+| `text` | string (`Utf8`, `LargeUtf8`, or `Utf8View`) | The text to split. May be a literal, a scalar subquery, or a column reference — any Arrow string layout. `NULL` rows pass through unchanged. |
 | `size` | integer literal | Target maximum chunk length in characters. Must be `> 0`. |
 | `overlap` | integer literal | Optional. Characters of overlap between adjacent chunks. Must be strictly less than `size`. Defaults to `0`. |
 
@@ -76,6 +79,39 @@ FROM (
 ```
 
 Requires `--features rag` (or `--features "chunking,candle"` if you want to pick à la carte).
+
+### Indexed chunks: `chunk_parts`
+
+```sql
+chunk_parts(mode, text, size [, overlap]) -> List<Struct<chunk_idx Int32, chunk_text Utf8>>
+```
+
+Same arguments, modes, and splitters as `chunk`; the element type differs:
+each part carries its **0-based split ordinal** alongside the text. Use it
+whenever downstream needs a stable chunk index (document reassembly,
+`doc_id = <source>:<id>:<chunk_idx>`-style keys — the shape the etl
+generator's ingest jobs rely on).
+
+The ordinal is assigned *inside* the UDF, in one deterministic pass per
+input value, because DataFusion cannot plan `UNNEST … WITH ORDINALITY`
+([apache/datafusion#11419](https://github.com/apache/datafusion/issues/11419))
+and any plan-side row numbering is at the optimizer's mercy. The spelling
+that plans is projection-position `UNNEST` in a subquery with field access
+outside:
+
+```sql
+SELECT id,
+       part['chunk_idx']  AS chunk_index,
+       part['chunk_text'] AS chunk_text
+FROM (
+  SELECT id, UNNEST(chunk_parts('markdown', body, 1000, 200)) AS part
+  FROM docs
+)
+ORDER BY id, chunk_index;
+```
+
+Ordinals restart at 0 for every input row; a `NULL` input yields a `NULL`
+list, exactly like `chunk`.
 
 ### Keep chunks as a list column
 

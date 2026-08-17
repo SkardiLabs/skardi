@@ -28,10 +28,21 @@ jobs:
         # rust-toolchain.toml, keeping CI in lockstep with the Docker build.
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # `--all-features` runs liteparse-pdfium-sys's build.rs, which
+          # downloads PDFium outside rust-cache's tracked paths — same
+          # arrangement as the test job, and for the same reason (see its
+          # cache-directories note).
+          cache-directories: ~/.cache/pdfium-rs
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
       - name: Build documentation
-        run: cargo doc --no-deps -p skardi
+        # `--all-features`, because that is what docs.rs builds
+        # (package.metadata.docs.rs sets all-features = true): a featureless
+        # pass cannot see feature-gated modules, so their rustdoc warnings
+        # (private_intra_doc_links, say) would sail through CI and surface
+        # as broken links on docs.rs.
+        run: cargo doc --no-deps -p skardi --all-features
 
   test:
     name: Test
@@ -210,6 +221,14 @@ jobs:
         run: cargo check --all
       - name: Execute rust tests
         run: cargo llvm-cov --no-report nextest --all-features
+      - name: Execute doc tests
+        # nextest cannot run doctests, so without this line every doc
+        # example's assertions are dead code in CI and silently rot. Plain
+        # `cargo test --doc` (no coverage: stable llvm-cov cannot instrument
+        # doctests) in this job rather than Docs, because `--all-features`
+        # links PDFium and only this job carries the pdfium-rs cache
+        # arrangement above.
+        run: cargo test --doc -p skardi --all-features
 
       - name: Install integration test dependencies
         run: |
@@ -637,6 +656,58 @@ jobs:
       - name: Stop MinIO
         if: always()
         run: docker rm -f skardi-minio || true
+
+      # Apache AGE gives the graph provider's Postgres path real coverage —
+      # the AgeClient/register_graph_source code is exercised ONLY by the
+      # graph_age_live suite, which self-skips without this backend (the
+      # PR #203 codecov report showed client.rs at 11% for exactly that
+      # reason). Docker-run like MinIO above, but the readiness poll must
+      # go over TCP: the postgres entrypoint runs a TEMPORARY
+      # unix-socket-only server for initdb, so a socket-side pg_isready
+      # can answer "ready" during bootstrap while the real server is
+      # still seconds away — an intermittent red on the whole coverage
+      # job. The bootstrap server never listens on TCP, so -h 127.0.0.1
+      # can only succeed against the real one.
+      - name: Start Apache AGE for graph live tests
+        run: |
+          # PINNED: AGE is the one dependency whose exact behavior this
+          # module encodes (agtype_out spellings, the bare Infinity
+          # token, ag_label.kind values, the PREPARE requirement) — an
+          # upstream :latest rebuild must not move those under an
+          # unrelated PR.
+          docker run -d --name skardi-age \
+            -p 127.0.0.1:15432:5432 \
+            -e POSTGRES_PASSWORD=skardiage \
+            apache/age:release_PG16_1.6.0
+          for i in $(seq 1 30); do
+            if docker exec skardi-age pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then
+              echo "age ready after ${i}s"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "apache/age failed to become ready"
+              docker logs skardi-age
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Execute graph AGE live tests
+        env:
+          SKARDI_AGE_LIVE_URL: postgres://postgres:skardiage@127.0.0.1:15432/postgres
+          # Arms the suite's self-skip into a hard failure here: CI is
+          # where nine silent skips would otherwise read as green.
+          SKARDI_AGE_LIVE_REQUIRED: "1"
+        # `--no-tests=fail`: if the suite is ever renamed out of the
+        # filter's reach, fail loudly instead of reporting success having
+        # run nothing (the documents S3 step's discipline).
+        run: |
+          cargo llvm-cov --no-report nextest --all-features \
+            -E 'binary(graph_age_live)' --no-tests=fail -- --ignored
+
+      - name: Stop Apache AGE
+        if: always()
+        run: docker rm -f skardi-age || true
 
       - name: Generate coverage report (lcov)
         run: cargo llvm-cov report --lcov --output-path lcov.info
