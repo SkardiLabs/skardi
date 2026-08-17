@@ -23,7 +23,7 @@ ad-hoc SQL or a named pipeline call.
 
 | column | value for a pipeline row |
 | --- | --- |
-| `statement_kind` | `"pipeline"` (ad-hoc rows keep `select` / `dml` / …) |
+| `statement_kind` | `"pipeline"` (ad-hoc rows keep `Query` / `Other` — the `Debug` form of the server's `StatementKind` classifier, not SQL verbs; correction from review, the original draft wrongly said `select` / `dml`) |
 | `sql` | the **pipeline name** — the template lives on disk with no secrets; the name is the join key to it and to `metadata.description`, which carries the purpose (written at promotion time) |
 | `session_id` | from the optional `X-Skardi-Session-Id` request header |
 | `ai_context` | NULL — purpose lives in the pipeline description; a synthetic object would masquerade as caller-sent data |
@@ -87,6 +87,12 @@ already-noted gap — out of scope here.)
   fact with no static substitute.
 - Auditing the pipeline dashboard's internal reads, health checks, or
   `GET` endpoints — only `POST /:name/execute`.
+- Auditing job runs (`POST /jobs/:name/run`) in this ledger. Jobs already
+  have their own durable run ledger (parameters, status, run id — the
+  SQLite jobs store), so unlike pipelines they were never unobserved; what
+  they lack is `ai_context`/session attribution in the *query* ledger.
+  Unifying the two ledgers is real future work — best coordinated with the
+  identity-column work in #206 rather than bolted on here.
 
 ## Testing
 

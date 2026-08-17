@@ -1,10 +1,17 @@
-//! Durable audit store for ad-hoc `/query` statements.
+//! Durable audit store for ad-hoc `/query` statements and pipeline
+//! executions.
 //!
 //! Off unless the operator sets `--query-audit-db <path>`. When enabled, every
-//! statement the `/query` endpoint accepts is written to a SQLite database
-//! *before* execution and updated with its outcome afterwards, so the store
-//! answers "what ran, on whose behalf, and did it succeed" rather than merely
-//! "what was attempted".
+//! statement the `/query` endpoint accepts — and every `POST /:name/execute`
+//! pipeline run — is written to a SQLite database *before* execution and
+//! updated with its outcome afterwards, so the store answers "what ran, on
+//! whose behalf, and did it succeed" rather than merely "what was attempted".
+//!
+//! The `sql` column is overloaded by row kind: raw SQL for ad-hoc rows,
+//! the pipeline *name* for `statement_kind = 'pipeline'` rows (the template
+//! lives on disk; parameter values are never recorded). Ad-hoc rows carry
+//! `statement_kind` values from `StatementKind`'s `Debug` form — `Query` /
+//! `Other` — not SQL verbs like `select`.
 //!
 //! Design notes:
 //!

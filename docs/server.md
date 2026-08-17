@@ -178,7 +178,8 @@ execution and updated with its outcome afterwards:
 | `sql` | raw statement text |
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
-| `max_rows`, `statement_kind` | request shape |
+| `max_rows` | requested row cap (`0` on pipeline rows — not applicable) |
+| `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
 | `row_count`, `error` | outcome detail |
 
@@ -220,6 +221,19 @@ A pipeline row differs from an ad-hoc row in four ways:
   `result_conversion_error`), never engine error text — engine errors can
   echo substituted parameter values back, and those must not reach the
   ledger. The full error still goes to the HTTP caller.
+
+Scope of the guarantee: "parameter values never reach the ledger" covers the
+ledger only. The pipeline endpoint's HTTP *error responses* currently echo
+engine error text (which can quote parameter values back to the caller who
+sent them) — that surface is explicitly outside this guarantee and is
+tracked as a follow-up.
+
+Sizing note: with auditing on, every pipeline execution adds two
+`synchronous = FULL` ledger writes on the request's critical path — and the
+write is fail-closed, so a stalled or slow audit disk stalls pipeline
+execution rather than dropping records. Pipelines are typically the
+higher-QPS path (they are the promoted recurring queries), so put the
+ledger on storage you'd trust under your serving load.
 
 `session_id` comes from the optional `X-Skardi-Session-Id` request header
 (non-empty, ≤ 200 characters). A malformed header is rejected with `400
