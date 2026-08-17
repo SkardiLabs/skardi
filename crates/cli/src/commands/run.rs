@@ -7,6 +7,13 @@ use crate::params::build_body;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+/// Maximum session-id length, in characters. Restates the server's
+/// `query_audit::MAX_SESSION_ID_CHARS` under the same name — `skardi-cli`
+/// does not depend on the server crate, so this cannot be a shared item, but
+/// an identical name keeps `grep MAX_SESSION_ID_CHARS` finding every site
+/// that must move together.
+const MAX_SESSION_ID_CHARS: usize = 200;
+
 /// Run `skardi run <name>`: build the request body from `-d`/`-p`, `POST` it
 /// to `/{name}/execute`, and hand the response envelope to [`print_result`].
 ///
@@ -30,18 +37,21 @@ pub async fn run(
     // value to `send()`, whose errors are all mapped to `ApiError::Connect` —
     // so without this check a bad `--session-id` prints a connection error
     // naming a server that was never contacted, and exits with the
-    // "server unreachable" code. The rules mirror the server's
-    // (`query_handlers::MAX_SESSION_ID_CHARS` = 200 and header-value ASCII);
-    // keep the two in sync.
+    // "server unreachable" code. The rules are an exact mirror of the
+    // server's `session_id_from_headers`: visible ASCII plus space, no tab,
+    // no comma (proxies may merge repeated header lines comma-separated),
+    // and the length cap below.
     let invalid_session_id = session_id.as_deref().is_some_and(|sid| {
         sid.is_empty()
-            || sid.chars().count() > 200
-            || !sid.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            || sid.chars().count() > MAX_SESSION_ID_CHARS
+            || !sid
+                .chars()
+                .all(|c| (c.is_ascii_graphic() && c != ',') || c == ' ')
     });
     if invalid_session_id {
         return Err(anyhow!(
-            "--session-id must be non-empty, at most 200 characters, \
-             and contain only visible ASCII"
+            "--session-id must be non-empty, at most {MAX_SESSION_ID_CHARS} \
+             characters, and contain only visible ASCII with no commas"
         ));
     }
 
@@ -236,7 +246,14 @@ mod tests {
             .await;
 
         let client = ApiClient::new(&test_config(&server.uri())).unwrap();
-        for bad in ["", &"x".repeat(201), "sesión-1", "line\nbreak"] {
+        for bad in [
+            "",
+            &"x".repeat(201),
+            "sesión-1",
+            "line\nbreak",
+            "tab\there",
+            "sess-1, sess-2", // proxy-merged duplicate shape
+        ] {
             let result = run(&client, "my-pipe", None, &[], false, Some(bad.to_string())).await;
             let err = result.expect_err("expected validation error");
             assert!(
