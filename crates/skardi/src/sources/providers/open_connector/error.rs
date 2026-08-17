@@ -278,6 +278,22 @@ pub enum OpenConnectorError {
     )]
     PaginationLoop { token: String },
 
+    /// A `single_page` table's premise — one request IS the complete
+    /// collection — was contradicted by the response: the provider signalled
+    /// more data at the declared path. Ending the scan here would be the
+    /// engine's only silent truncation, so it fails instead. Carries the
+    /// continuation's kind, never a row value.
+    #[error(
+        "Open Connector single-page scan is incomplete: the response carries {found} at \
+         '{path}' on page {page}, so one request is not the whole collection; the table's \
+         `single_page` strategy no longer matches the action's behaviour"
+    )]
+    SinglePageIncomplete {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// A binding named a source pack that is not built in.
     #[error(
         "Open Connector binding references unknown source pack '{name}' \

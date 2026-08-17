@@ -135,6 +135,7 @@ impl SourcePackRegistry {
         for pack in [
             super::packs::mock::pack()?,
             super::packs::github::pack()?,
+            super::packs::gmail::pack()?,
             super::packs::notion::pack()?,
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
@@ -253,7 +254,10 @@ mod tests {
         // …and completeness as an explicit roster, the one line a new pack
         // must extend (a stale list here means the generator's coverage
         // listing silently omits the newcomer).
-        assert_eq!(names, vec!["feishu", "github", "mock", "notion", "slack"]);
+        assert_eq!(
+            names,
+            vec!["feishu", "github", "gmail", "mock", "notion", "slack"]
+        );
     }
 
     #[test]
@@ -301,6 +305,25 @@ mod tests {
                 "github.repositories",
                 "github.reviews",
                 "github.workflow_runs",
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_gmail_pack_is_registered() {
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let pack = registry.require("gmail").unwrap();
+        assert_eq!(pack.name, "gmail");
+        assert_eq!(pack.version, 1);
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gmail.drafts",
+                "gmail.filters",
+                "gmail.labels",
+                "gmail.messages",
+                "gmail.threads",
             ]
         );
     }
@@ -359,7 +382,7 @@ mod tests {
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
-        for name in ["mock", "github", "slack"] {
+        for name in ["mock", "github", "gmail", "slack", "notion", "feishu"] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for table in pack.tables {
@@ -384,7 +407,9 @@ mod tests {
             action_id: "t.action",
             row_path: "$.items",
             fields: &[],
-            pagination: PaginationStrategy::SinglePage,
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
             required_resources: &[],
             optional_resources: &[],
             fixed_inputs: &[],

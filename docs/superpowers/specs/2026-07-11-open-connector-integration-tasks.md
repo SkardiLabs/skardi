@@ -305,7 +305,84 @@ event carrying the scan identity and error.
       tests (`cargo test -p skardi --lib sources::providers::open_connector`,
       post-merge with 5.3), 17 pack-scoped (`… packs::feishu`), 842 full
       library suite.
-- [ ] 5.5 Later waves per the design rollout (Google Workspace, Discord, HubSpot, Jira, …) through the source-pack admission gate
+- [x] 5.5 Gmail pack (Google OAuth, page-token cursor pagination): `threads`,
+      `messages`, `drafts`, `labels`, `filters` as stable tables
+      (`packs/gmail.yaml`) — the first Google Workspace pack. The wire
+      contract is Open Connector's normalized rebuild of the Gmail API
+      (Slack-style: camelCase identity, headers flattened into
+      `subject`/`sender`/`to`, `internalDate` re-emitted as RFC 3339
+      `messageTimestamp`; `labels`/`filters` pass provider objects through
+      raw), reconciled against a live gateway v1.3.4 and the OC executor
+      source. Cursor termination is the executor's explicit
+      `nextPageToken: null` (absent and `""` also terminate — one e2e per
+      spelling across the tables). `messages` pins `detail: summary` (ids
+      too thin, full unbounded) with page size 100 — the executor hydrates
+      each listed message (N+1 Gmail calls per page), so the page size
+      bounds the burst; `threads`/`drafts` use Gmail's 500 ceiling and
+      never send `verbose`. `labels`/`filters` take no pagination inputs at
+      all, which required the one engine extension this milestone adds:
+      the loader's **`single_page` strategy spelling** (the engine's
+      `SinglePage` existed but was unreachable from YAML; braced variant so
+      `deny_unknown_fields` still rejects stray keys) plus its optional
+      `next_cursor_path`, which turns the strategy's "one request is the
+      whole collection" premise into a checked assertion — a live
+      continuation fails as `SinglePageIncomplete` rather than returning a
+      prefix as a complete table, closing the engine's one silent
+      truncation. Raw scans (`open_connector_scan`) declare no path and
+      keep the historic one-request behaviour. **No filter pushdown
+      anywhere** (Gmail's `q` is a free-text language, `labelIds` an
+      AND-semantics array — neither maps to a scalar `column op literal`
+      faithfully); `query`/`labelIds`/`includeSpamTrash` are optional
+      resources instead, and the default listing is documented as Gmail's
+      own (excludes SPAM/TRASH; not pinned away because `list_threads`
+      offers no such input — pinning it on `messages` alone would make the
+      two tables describe different mailboxes). `to` is mapped as
+      `to_addresses` (TO is a reserved SQL keyword); header-derived
+      absents stay `""`, never NULL. Excluded, with rationale in the
+      module doc: `search_threads` (strict subset), `list_history`
+      (checkpoint API), `list_forwarding_addresses` (no output schema to
+      fingerprint), `get_profile` (scalar), message bodies (future
+      content surface). `error_path: None` everywhere (executors consume
+      provider errors; failure envelope pinned by e2e). Fingerprints
+      pinned from live capture (`fixtures/gmail/contracts/`, gateway
+      v1.3.4) over the whole declared schema, `anyOf` branches included —
+      a renamed field inside `fetch_emails`' items moves the hash and
+      fails registration. Unlike the other packs' pins, gmail's records a
+      limit of the static walker, not a gap in the gate: the `messages`
+      paths ARE declared, inside `anyOf` branches the helper cannot
+      follow. Input schemas are pinned too (`contracts/inputs/`), since
+      the gate is output-only. **Live-verified end to end
+      against a real mailbox (2026-08-05, gateway v1.3.4 + Google OAuth
+      through the gateway)**: registration passed the fingerprint gate
+      against live discovery for all five actions; every mapped column
+      of every table extracted a real non-NULL value through
+      skardi-server; real multi-page cursor chaining (`maxResults: 1`,
+      three pages) and real final-page null-token termination observed;
+      `query`/`labelIds`/`includeSpamTrash` resources observed narrowing
+      real listings; input bounds `[1,500]` and the `detail` enum
+      enforced by the real gateway. The live pass settled two synthetic
+      guesses (which system labels omit visibility fields; a fresh
+      draft's threadId equals its messageId) and caught one upstream
+      bug: a zero-filter mailbox fails `list_filters` with
+      `internal_error` (Gmail returns an empty body the executor's
+      `response.json()` does not tolerate) — documented in the pack doc,
+      fix belongs upstream. Fixtures are redacted live captures from
+      that pass (mechanically audited against an allowlist); executor
+      absent-spellings the capture lacked are pinned by an inline
+      converter test.
+      **Verification**: 284 open_connector tests (counted by `cargo test
+      -p skardi --lib sources::providers::open_connector`, confirmed
+      against the PR's CI run; 23 new) — five
+      fixture contract suites plus the schema-mismatch and null-parent
+      pins, fingerprint sync + coverage pins, drift-refusal e2e, loader
+      single_page pass/refusal, registry pin, and per-declaration e2e
+      (threads/messages/drafts two-page cursor scans each pinning its own
+      exact wire keys and a distinct termination spelling, single-page
+      one-request pins for labels/filters, optional-resource forwarding
+      with type fidelity and per-table withholding, no-pushdown guard
+      with row identity, LIMIT early-stop, pagination-loop refusal,
+      gateway failure-envelope surfacing, UDTF parity).
+- [ ] 5.6 Later waves per the design rollout (Google Calendar, Google Drive, Discord, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -315,12 +392,13 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.2 (Slack pack — conversations, users, files).
-  Milestones 1–4 and 5.1 (GitHub pack) are merged; this PR adds the second
-  real source pack against Open Connector's normalized Slack contract
-  (reconciled live), plus the engine extensions it required
-  (`total_pages_path` on PageNumber, per-mapping `ValueFormat`,
-  `FieldType::TimestampSecondsUtc`, `FixedValue::StrList`).
+- **Current PR**: milestone 5.5 (Gmail pack — threads, messages, drafts,
+  labels, filters). Milestones 1–4 and 5.1–5.4 (GitHub, Slack, Notion,
+  Feishu packs) are merged; this PR adds the first Google Workspace pack against
+  Open Connector's normalized Gmail contract (reconciled live and
+  verified end to end against a real mailbox), plus the one engine
+  extension it required (the loader's `single_page` strategy spelling
+  for actions that declare no pagination inputs).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in
