@@ -17,12 +17,6 @@
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Mutex as StdMutex;
-#[cfg(test)]
-use std::time::SystemTime;
-#[cfg(test)]
-use tokio::sync::Mutex as AsyncMutex;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -304,12 +298,16 @@ pub(crate) fn recovery_keeps_degraded(e: &GraphError) -> bool {
 
 /// The failed-recovery backoff interval: long enough that a down backend
 /// costs one full re-validation per interval, short enough to notice a
-/// restart promptly.
+/// restart promptly. CLAMPED to [30s, 300s]: query_timeout_seconds may
+/// legitimately be hours for heavy traversals (the same overloading the
+/// preflight ceiling fixed), and an hours-long backoff would keep every
+/// view failing fast — and /data_source reporting degraded — long after
+/// a restart, which "notice a restart promptly" cannot mean.
 fn recovery_backoff_interval(handle: &GraphSourceHandle) -> std::time::Duration {
-    handle
-        .bounds
-        .timeout
-        .max(std::time::Duration::from_secs(30))
+    handle.bounds.timeout.clamp(
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(300),
+    )
 }
 
 /// Time until the next recovery attempt is allowed, when inside backoff.
@@ -388,15 +386,23 @@ pub(crate) async fn revalidate_all_views(
     // Same bounded launch as reachable registration (see
     // validate_views_concurrently): at most the pool's worth in flight,
     // so no probe queues behind its siblings. The whole run gets a
-    // computed BACKSTOP deadline — waves × (per-probe budget + the
-    // client wrap's slack) — which per-probe bounds make all but
-    // unreachable; it exists so a pathological stall can never wedge
-    // the recovery gate forever.
+    // computed BACKSTOP deadline — waves × one probe's WORST-CASE budget
+    // — which per-probe bounds make all but unreachable; it exists so a
+    // pathological stall can never wedge the recovery gate forever. One
+    // probe's budget is 2×timeout + 5s, NOT timeout + 5s: the client
+    // acquires its pooled connection OUTSIDE the client-side wrap (see
+    // AgeClient::execute), and the acquire leg is bounded by
+    // acquire_timeout == the query timeout — a slow-but-answering
+    // backend can legitimately spend up to both legs, and a backstop
+    // tighter than a legal probe would classify "answered slowly" as
+    // "did not answer", the exact confusion the recovery policy exists
+    // to avoid.
     let limit = handle.validation_limit.max(1);
     let waves = n.div_ceil(limit) as u32;
     let deadline = handle
         .bounds
         .timeout
+        .saturating_mul(2)
         .saturating_add(std::time::Duration::from_secs(5))
         .saturating_mul(waves);
     let contracts = handle.view_contracts.iter().cloned().collect();
@@ -454,7 +460,6 @@ pub(crate) async fn validate_views_concurrently(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -517,29 +522,24 @@ mod tests {
         error: Option<String>,
     ) -> (Arc<GraphSourceHandle>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let handle = Arc::new(GraphSourceHandle {
-            client: Arc::new(CountingMock {
+        let handle = Arc::new(GraphSourceHandle::new(
+            Arc::new(CountingMock {
                 rows,
                 error,
                 calls: Arc::clone(&calls),
             }),
-            bounds: QueryBounds {
+            QueryBounds {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(health)),
-            // The provider under test is this source's only view, so its
-            // contract is the whole re-validation set.
-            view_contracts: Arc::new(vec![ViewContract {
+            health,
+            Arc::new(vec![ViewContract {
                 name: "user_posts".to_string(),
                 cypher: "MATCH (u:User) RETURN u.name".to_string(),
                 columns: columns(),
             }]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            4,
+        ));
         (handle, calls)
     }
 
@@ -683,18 +683,16 @@ mod tests {
         // error (the old all-or-nothing line disabled every view on the
         // source permanently over one un-provable sibling, with no
         // startup signal).
-        let handle = Arc::new(GraphSourceHandle {
-            client: Arc::new(PickyMock {
+        let handle = Arc::new(GraphSourceHandle::new(
+            Arc::new(PickyMock {
                 fail_marker: "Broken",
             }),
-            bounds: QueryBounds {
+            QueryBounds {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(GraphSourceHealth::Degraded(
-                "connection refused".to_string(),
-            ))),
-            view_contracts: Arc::new(vec![
+            GraphSourceHealth::Degraded("connection refused".to_string()),
+            Arc::new(vec![
                 ViewContract {
                     name: "good_view".to_string(),
                     cypher: "MATCH (g:Good) RETURN g.name".to_string(),
@@ -706,11 +704,8 @@ mod tests {
                     columns: columns(),
                 },
             ]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            4,
+        ));
         let provider = GraphViewProvider::new(
             handle.clone(),
             "good_view".to_string(),
@@ -971,23 +966,20 @@ mod tests {
         let current = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let handle = Arc::new(GraphSourceHandle {
-            client: Arc::new(GaugeMock {
+        let handle = Arc::new(GraphSourceHandle::new(
+            Arc::new(GaugeMock {
                 current: Arc::clone(&current),
                 peak: Arc::clone(&peak),
                 calls: Arc::clone(&calls),
             }),
-            bounds: QueryBounds {
+            QueryBounds {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-            view_contracts: Arc::new(vec![]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            GraphSourceHealth::Healthy,
+            Arc::new(vec![]),
+            4,
+        ));
         let contracts: Vec<ViewContract> = (0..8)
             .map(|i| ViewContract {
                 name: format!("v{i}"),
@@ -1085,32 +1077,29 @@ mod tests {
     async fn a_wedged_revalidation_hits_the_backstop_deadline() {
         // The backstop exists for the pathological case the per-probe
         // bounds cannot reach: a client future that never resolves. One
-        // contract, timeout 5s → deadline 1 wave × (5s + 5s) = 10s; the
-        // paused clock makes the wait instant.
-        let handle = Arc::new(GraphSourceHandle {
-            client: Arc::new(WedgedClient),
-            bounds: QueryBounds {
+        // contract, timeout 5s → deadline 1 wave × (2×5s + 5s) = 15s
+        // (the probe's worst case is acquire + body, two sequential
+        // timeout-bounded legs); the paused clock makes the wait
+        // instant.
+        let handle = Arc::new(GraphSourceHandle::new(
+            Arc::new(WedgedClient),
+            QueryBounds {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(GraphSourceHealth::Degraded(
-                "down at startup".to_string(),
-            ))),
-            view_contracts: Arc::new(vec![ViewContract {
+            GraphSourceHealth::Degraded("down at startup".to_string()),
+            Arc::new(vec![ViewContract {
                 name: "user_posts".to_string(),
                 cypher: "MATCH (u:User) RETURN u.name".to_string(),
                 columns: columns(),
             }]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            4,
+        ));
         let err = revalidate_all_views(&handle)
             .await
             .expect_err("the wedge cannot pass validation");
         assert!(
-            matches!(err, GraphError::RecoveryDeadlineExceeded { seconds: 10 }),
+            matches!(err, GraphError::RecoveryDeadlineExceeded { seconds: 15 }),
             "{err}"
         );
     }

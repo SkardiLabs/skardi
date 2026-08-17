@@ -43,10 +43,10 @@ pub mod value;
 mod view;
 
 use std::collections::hash_map::Entry;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use std::time::{Duration, SystemTime};
-
-use tokio::sync::Mutex as AsyncMutex;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::RwLock;
+use std::time::Duration;
 
 use datafusion::catalog::{
     CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
@@ -129,22 +129,19 @@ pub async fn register_graph_source(
         Duration::from_secs(config.query_timeout_seconds),
     )
     .await?;
-    let handle = Arc::new(GraphSourceHandle {
-        client: Arc::new(client),
-        bounds: QueryBounds {
+    // Healthy because connect() preflighted successfully, or we would
+    // not be here; no view contracts — the engine-level entry registers
+    // no views (no session context to put them in).
+    let handle = Arc::new(GraphSourceHandle::new(
+        Arc::new(client),
+        QueryBounds {
             timeout: Duration::from_secs(config.query_timeout_seconds),
             max_rows: config.max_rows,
         },
-        // connect() preflighted successfully, or we would not be here.
-        health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-        // The engine-level entry registers no views (no session context
-        // to put them in), so there are no contracts to re-prove.
-        view_contracts: Arc::new(vec![]),
-        recovery_gate: Arc::new(AsyncMutex::new(())),
-        last_failed_recovery: Arc::new(StdMutex::new(None)),
-        health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-        validation_limit: config.max_connections as usize,
-    });
+        GraphSourceHealth::Healthy,
+        Arc::new(vec![]),
+        config.max_connections as usize,
+    ));
     // Poisoning degrades gracefully (AGENTS.md convention) — and it also
     // keeps InvalidConfig meaning what it says instead of moonlighting as
     // a lock error. Entry-based: a duplicate name must leave the ORIGINAL
@@ -489,21 +486,18 @@ async fn register_graph_tables_impl(
             }
         }
     };
-    let handle = Arc::new(GraphSourceHandle {
+    // The SAME contracts the validation probes just proved (or that
+    // recovery will re-prove): recovery asks one question — did the
+    // backend ANSWER — and any response flips Healthy, with a
+    // still-broken view failing its own scans (view::try_recover
+    // documents the policy).
+    let handle = Arc::new(GraphSourceHandle::new(
         client,
         bounds,
-        health: Arc::new(RwLock::new(health)),
-        // The SAME contracts the validation probes just proved (or that
-        // recovery will re-prove): recovery asks one question — did the
-        // backend ANSWER — and any response flips Healthy, with a
-        // still-broken view failing its own scans (view::try_recover
-        // documents the policy).
-        view_contracts: Arc::clone(&contracts),
-        recovery_gate: Arc::new(AsyncMutex::new(())),
-        last_failed_recovery: Arc::new(StdMutex::new(None)),
-        health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-        validation_limit: config.max_connections as usize,
-    });
+        health,
+        Arc::clone(&contracts),
+        config.max_connections as usize,
+    ));
     // Publish the handle BEFORE touching the catalog: register_catalog
     // REPLACES a same-named catalog unconditionally, so with the reverse
     // order a duplicate name would leave the catalog pointing at the new
@@ -607,16 +601,25 @@ pub(crate) fn is_availability_artifact(e: &GraphError) -> bool {
         GraphError::ViewValidationFailed { source, .. } => source.as_ref(),
         other => other,
     };
-    // Deliberately NOT Timeout: a statement timeout means the server
-    // ANSWERED — a view too slow for query_timeout_seconds is a boot-time
+    // Deliberately NOT Timeout: a 57014 statement timeout means the
+    // server ANSWERED — it accepted the query and cancelled it, so a
+    // view too slow for query_timeout_seconds is a boot-time
     // configuration diagnosis ("view 'X' timed out; raise the timeout or
     // simplify the view"), and degrading it instead would boot a source
-    // whose every recovery re-pays the slow view. ConnectionAcquireTimeout
-    // stays: sqlx retries a refused dial until the acquire deadline, so an
-    // UNREACHABLE backend surfaces as PoolTimedOut, not a dial error.
+    // whose every recovery re-pays the slow view. BackendSilent is the
+    // OTHER face of a client-observed timeout — the wrap fired because
+    // nothing came back at all (a mid-probe network partition: the
+    // socket is up so no PoolTimedOut, and no packets return so the
+    // server can never report 57014) — and that IS an availability
+    // failure: silence must degrade, not refuse boot.
+    // ConnectionAcquireTimeout stays: sqlx retries a refused dial until
+    // the acquire deadline, so an UNREACHABLE backend surfaces as
+    // PoolTimedOut, not a dial error.
     matches!(
         underlying,
-        GraphError::Unavailable { .. } | GraphError::ConnectionAcquireTimeout { .. }
+        GraphError::Unavailable { .. }
+            | GraphError::ConnectionAcquireTimeout { .. }
+            | GraphError::BackendSilent { .. }
     )
 }
 
@@ -749,19 +752,16 @@ views:
         let existing = sources();
         existing.write().unwrap_or_else(|p| p.into_inner()).insert(
             "kg".to_string(),
-            Arc::new(GraphSourceHandle {
-                client: Arc::new(StubClient),
-                bounds: QueryBounds {
+            Arc::new(GraphSourceHandle::new(
+                Arc::new(StubClient),
+                QueryBounds {
                     timeout: Duration::from_secs(1),
                     max_rows: 10,
                 },
-                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-                view_contracts: Arc::new(vec![]),
-                recovery_gate: Arc::new(AsyncMutex::new(())),
-                last_failed_recovery: Arc::new(StdMutex::new(None)),
-                health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-                validation_limit: config.max_connections as usize,
-            }),
+                GraphSourceHealth::Healthy,
+                Arc::new(vec![]),
+                config.max_connections as usize,
+            )),
         );
         let mut ctx = SessionContext::new();
         let err = register_graph_tables(
@@ -889,6 +889,11 @@ views:
             source_name: "kg".to_string(),
             reason: "connection refused".to_string(),
         };
+        // The client-side wrap firing means NOTHING came back — silence
+        // is an availability failure (a mid-probe partition must degrade,
+        // never refuse boot), unlike the 57014 Timeout below, which is
+        // the server answering.
+        let silent = GraphError::BackendSilent { seconds: 35 };
         // A statement timeout is the server ANSWERING: a view too slow
         // for query_timeout_seconds must refuse at boot with a
         // diagnosis, not boot a source whose every recovery re-pays it.
@@ -908,7 +913,7 @@ views:
             view: "people".to_string(),
             source: Box::new(e),
         };
-        for e in [acquire, unavailable] {
+        for e in [acquire, unavailable, silent] {
             assert!(is_availability_artifact(&e), "{e}");
             assert!(is_availability_artifact(&wrap(e)), "wrapped");
         }

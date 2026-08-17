@@ -310,19 +310,16 @@ mod params_through_real_substitution {
         let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
         sources.write().unwrap().insert(
             "kg".to_string(),
-            Arc::new(GraphSourceHandle {
-                client: Arc::new(EchoClient),
-                bounds: QueryBounds {
+            Arc::new(GraphSourceHandle::new(
+                Arc::new(EchoClient),
+                QueryBounds {
                     timeout: std::time::Duration::from_secs(5),
                     max_rows: 100,
                 },
-                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-                view_contracts: Arc::new(vec![]),
-                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
-                health_changed_at: Arc::new(std::sync::Mutex::new(std::time::SystemTime::now())),
-                validation_limit: 4,
-            }),
+                GraphSourceHealth::Healthy,
+                Arc::new(vec![]),
+                4,
+            )),
         );
         let ctx = Arc::new(datafusion::prelude::SessionContext::new());
         register_graph_udtfs(&ctx, Arc::clone(&sources)).unwrap();
@@ -384,19 +381,16 @@ spec:
     fn ctx_with_echo() -> Arc<datafusion::prelude::SessionContext> {
         let sources: GraphSources = Arc::new(RwLock::new(HashMap::from([(
             "kg".to_string(),
-            Arc::new(GraphSourceHandle {
-                client: Arc::new(EchoClient) as Arc<dyn GraphClient>,
-                bounds: QueryBounds {
+            Arc::new(GraphSourceHandle::new(
+                Arc::new(EchoClient) as Arc<dyn GraphClient>,
+                QueryBounds {
                     timeout: std::time::Duration::from_secs(5),
                     max_rows: 100,
                 },
-                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-                view_contracts: Arc::new(vec![]),
-                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
-                health_changed_at: Arc::new(std::sync::Mutex::new(std::time::SystemTime::now())),
-                validation_limit: 4,
-            }),
+                GraphSourceHealth::Healthy,
+                Arc::new(vec![]),
+                4,
+            )),
         )])));
         let ctx = Arc::new(datafusion::prelude::SessionContext::new());
         register_graph_udtfs(&ctx, sources).unwrap();

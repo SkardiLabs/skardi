@@ -118,7 +118,9 @@ hold every unrelated source hostage at startup):
   permanently with no startup signal, and `/data_source`'s "degraded"
   would misread as "backend unreachable". Only availability failures
   (the backend did not answer) keep the source degraded — and they arm
-  a backoff of `max(query_timeout_seconds, 30s)`: inside the window,
+  a backoff of `query_timeout_seconds` clamped to `[30s, 300s]` (the
+  traversal timeout may be hours, and an hours-long backoff would hide
+  a restart): inside the window,
   scans fail fast with the cached diagnosis instead of re-paying the
   full N-view re-validation, so a backend that is down for the
   afternoon costs one re-validation per interval, not per query. The

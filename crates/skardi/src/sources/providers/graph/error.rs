@@ -117,6 +117,20 @@ pub enum GraphError {
     )]
     Timeout { seconds: u64 },
 
+    /// The CLIENT-SIDE wrap fired: the backend accepted the connection
+    /// but stopped answering — no result, no error, and (because no
+    /// packets get back) no server-side 57014 either. This is an
+    /// AVAILABILITY failure, deliberately distinct from
+    /// [`GraphError::Timeout`]: a 57014 is the server ANSWERING (it
+    /// accepted the query and cancelled it — a boot-time configuration
+    /// diagnosis), while silence is the archetypal transient blip that
+    /// must degrade rather than refuse boot. Conflating them made a
+    /// mid-validation network partition fail the whole server start.
+    #[error(
+        "the graph backend stopped answering: no response within {seconds}s (the          client-side bound; the server never reported a statement timeout — the          backend or the network path to it is gone)"
+    )]
+    BackendSilent { seconds: u64 },
+
     /// No pooled connection became available within the bound. sqlx
     /// retries a refused dial until the acquire deadline and then
     /// surfaces `PoolTimedOut`, so an UNREACHABLE backend lands here —

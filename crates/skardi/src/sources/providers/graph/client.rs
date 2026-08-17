@@ -606,13 +606,19 @@ impl GraphClient for AgeClient {
         // happened above, bounded by its own acquire_timeout), so the
         // server-side statement_timeout keeps its full budget and stays
         // the authoritative bound; this one covers a backend that stops
-        // answering entirely. saturating_add: the config caps the
-        // timeout, but arithmetic here must not be the thing that panics
-        // if that invariant ever moves.
+        // answering entirely — which is why it maps to BackendSilent,
+        // NOT Timeout: a 57014 is the server answering, silence is an
+        // availability failure, and the registration/recovery
+        // classification keys on that distinction. saturating_add: the
+        // config caps the timeout, but arithmetic here must not be the
+        // thing that panics if that invariant ever moves.
         let rows = tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: bounds.timeout.as_secs(),
+            .map_err(|_| GraphError::BackendSilent {
+                seconds: bounds
+                    .timeout
+                    .saturating_add(Duration::from_secs(5))
+                    .as_secs(),
             })??;
         tracing::debug!(
             source = %self.source_name,
@@ -642,16 +648,26 @@ impl GraphClient for AgeClient {
             _ => bounds.max_rows.saturating_add(1),
         };
         let source = self.source_name.clone();
+        // Acquire OUTSIDE the client-side timeout window — the same
+        // discipline (and rationale) as execute(): acquire and execution
+        // are sequential costs with their own typed bound
+        // (ConnectionAcquireTimeout); sharing one window would let pool
+        // contention eat the catalog read's budget and misreport the
+        // wait as the query's timeout. map_query_error, not
+        // backend_error: a saturated or unreachable pool must surface
+        // from graph_schema as the same typed ConnectionAcquireTimeout
+        // cypher_query reports — and the availability classification
+        // keys on the typed variant.
+        let mut acquired = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| map_query_error(&source, bounds, &e))?;
         let run = async {
-            // map_query_error, not backend_error: a saturated or
-            // unreachable pool must surface from graph_schema as the same
-            // typed ConnectionAcquireTimeout cypher_query reports — and
-            // the availability classification keys on the typed variant.
-            let mut tx = self
-                .pool
+            let mut tx = acquired
                 .begin()
                 .await
-                .map_err(|e| map_query_error(&source, bounds, &e))?;
+                .map_err(|e| backend_error(&source, &e))?;
             // Same protocol discipline as execute(): the SETs ride the
             // SIMPLE protocol as constant text. `sqlx::query` would take
             // the extended protocol and plant a server-side prepared
@@ -709,10 +725,16 @@ impl GraphClient for AgeClient {
                 })
                 .collect()
         };
+        // BackendSilent, not Timeout — same reasoning as execute()'s
+        // wrap: the server answering slowly is 57014; silence is an
+        // availability failure.
         tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: bounds.timeout.as_secs(),
+            .map_err(|_| GraphError::BackendSilent {
+                seconds: bounds
+                    .timeout
+                    .saturating_add(Duration::from_secs(5))
+                    .as_secs(),
             })?
     }
 }

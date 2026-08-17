@@ -308,14 +308,24 @@ impl GraphConfig {
         let mut view_names = HashSet::new();
         for view in &self.views {
             // The view name becomes the catalog table name
-            // `<source>.main.<name>` — bare identifier shape keeps it
-            // addressable without quoting everywhere downstream.
-            if !is_identifier(&view.name) {
+            // `<source>.main.<name>` — LOWERCASE identifier shape, not
+            // just identifier shape: DataFusion normalizes unquoted SQL
+            // identifiers to lowercase (enable_ident_normalization) and
+            // MemorySchemaProvider looks tables up by exact string, so a
+            // view named `userPosts` would register fine, be enumerated
+            // by /data_source, and then be unreachable from any unquoted
+            // SELECT ("table not found" for `userposts`). Rejecting the
+            // spelling here beats silently lowercasing it — the YAML and
+            // the catalog stay the same name.
+            if !is_lowercase_identifier(&view.name) {
                 return Err(GraphError::InvalidConfig {
                     name: name.to_string(),
                     reason: format!(
-                        "view name '{}' must be an identifier ([A-Za-z_][A-Za-z0-9_]*) — \
-                         it becomes the catalog table name {name}.main.{}",
+                        "view name '{}' must be a lowercase identifier \
+                         ([a-z_][a-z0-9_]*) — it becomes the catalog table name \
+                         {name}.main.{}, and DataFusion folds unquoted SQL \
+                         identifiers to lowercase, so an uppercase name would \
+                         register but be unreachable without quoting",
                         view.name, view.name
                     ),
                 });
@@ -397,6 +407,13 @@ fn is_identifier(s: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// [`is_identifier`], restricted to lowercase letters — the shape a name
+/// must have to survive DataFusion's unquoted-identifier folding intact
+/// (see the view-name check in [`GraphConfig::validate`]).
+fn is_lowercase_identifier(s: &str) -> bool {
+    is_identifier(s) && !s.chars().any(|c| c.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -606,7 +623,11 @@ views:
 
     #[test]
     fn view_names_must_be_unique_identifiers() {
-        for bad in ["user-posts", "1posts", "", "user posts"] {
+        // Uppercase included: DataFusion folds unquoted identifiers to
+        // lowercase, so `userPosts` would register yet be unreachable
+        // from SQL — and `Foo`/`foo` would both pass a case-sensitive
+        // duplicate check with only `foo` ever addressable.
+        for bad in ["user-posts", "1posts", "", "user posts", "userPosts", "Foo"] {
             let mut c = base();
             c.views = vec![view(bad, "MATCH (n) RETURN n", vec![column("n", "int")])];
             let err = c.validate("kg", "postgres://h/db").unwrap_err();

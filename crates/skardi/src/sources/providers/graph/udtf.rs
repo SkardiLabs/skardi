@@ -159,6 +159,34 @@ pub struct GraphSourceHandle {
     pub health_changed_at: Arc<StdMutex<SystemTime>>,
 }
 
+impl GraphSourceHandle {
+    /// The one construction site for the synchronisation and bookkeeping
+    /// fields: the recovery gate starts free, the backoff unarmed, and
+    /// `health_changed_at` is stamped at construction BY CONSTRUCTION —
+    /// not by every caller repeating the same three literals (fourteen
+    /// of them, five in other crates' tests, where a subtly wrong
+    /// default would be caught by nothing). Callers pass exactly what
+    /// genuinely varies.
+    pub fn new(
+        client: Arc<dyn GraphClient>,
+        bounds: QueryBounds,
+        health: GraphSourceHealth,
+        view_contracts: Arc<Vec<super::view::ViewContract>>,
+        validation_limit: usize,
+    ) -> Self {
+        Self {
+            client,
+            bounds,
+            health: Arc::new(RwLock::new(health)),
+            view_contracts,
+            recovery_gate: Arc::new(AsyncMutex::new(())),
+            last_failed_recovery: Arc::new(StdMutex::new(None)),
+            validation_limit,
+            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
+        }
+    }
+}
+
 /// Registration-time health of a graph source.
 #[derive(Debug, Clone)]
 pub enum GraphSourceHealth {
@@ -768,43 +796,40 @@ fn degraded_execution_error(degraded: Option<String>, e: GraphError) -> DataFusi
     }
 }
 
-/// The ad-hoc path's recovery entry point, after the caller's own query
-/// SUCCEEDED against a degraded source (the query is itself the
-/// evidence the backend answered). The sequence and policy live in
-/// [`super::view::try_recover`] — one copy for both entry points; this
-/// wrapper only maps the outcome onto the ad-hoc failure policy: NEVER
-/// fail the caller (their rows are good — discarding a correct answer
-/// over a sibling view's contract, or over backoff bookkeeping, would
-/// disable every ad-hoc query and graph_schema — the agent's discovery
-/// surface — for no caller-visible reason). Log and continue; the view
-/// path owns the loud degraded diagnostics.
-async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) {
+/// The ad-hoc path's recovery, after the caller's own query SUCCEEDED
+/// against a degraded source: that success IS the one thing recovery
+/// asks for — the backend answered — so the source flips Healthy
+/// directly, with no re-validation probes and no backoff consultation.
+///
+/// Both omissions are deliberate, not shortcuts:
+/// - **No probes on the response path.** The caller's rows are already
+///   materialized; awaiting an N-view re-validation here held them
+///   hostage for up to the backstop deadline (70s at defaults with 8
+///   views) — and `graph_schema`, the agent's FIRST call, took the same
+///   hit. Under the answered-question policy the probes bought nothing
+///   for this caller: a broken view's own scans report its contract
+///   failure either way (`view::try_recover` documents the policy).
+/// - **The backoff does not apply.** It exists to avoid PAYING for
+///   probes against a backend that stayed down; a caller-provided
+///   successful answer is free evidence the backend is up, and honoring
+///   the window here left /data_source reporting "degraded" — and every
+///   view scan failing fast — for a source demonstrably serving queries.
+///
+/// The view path (`view::ensure_healthy`) keeps the probing sequence:
+/// there the scan's own query has NOT run yet, so the probe is how the
+/// answer is obtained.
+fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) {
     if !degraded {
         return;
     }
-    match super::view::try_recover(handle).await {
-        super::view::RecoveryOutcome::AlreadyHealthy
-        | super::view::RecoveryOutcome::Recovered { broken_view: None } => {}
-        super::view::RecoveryOutcome::Recovered {
-            broken_view: Some(e),
-        } => {
-            tracing::warn!(
-                error = %e,
-                "graph source recovered (the backend answered), but a view failed \
-                 re-validation — its own scans will report this"
-            );
-        }
-        // Inside the backoff window nothing was probed — the caller's
-        // own query already succeeded, so there is nothing to report.
-        super::view::RecoveryOutcome::BackoffActive { .. } => {}
-        super::view::RecoveryOutcome::StillUnavailable { error, .. } => {
-            tracing::warn!(
-                error = %error,
-                "the ad-hoc query succeeded but view re-validation found the backend \
-                 unavailable — the source stays degraded"
-            );
-        }
+    if degraded_reason(handle).is_none() {
+        return; // a racing recovery already flipped it — nothing to do
     }
+    tracing::info!(
+        "graph source recovered: an ad-hoc query answered on a degraded source — \
+         marking healthy (view contracts re-prove on their own scans)"
+    );
+    mark_healthy(handle);
 }
 
 /// The cypher scan: run on first poll, then convert in batch-atomic
@@ -829,9 +854,9 @@ pub(crate) fn cypher_batches(
         };
         let rows = match rows {
             Ok(rows) => {
-                // The backend answered — re-prove the view contracts and
-                // flip Healthy (a no-op for healthy sources).
-                recover_if_degraded(&handle, degraded_at_start).await;
+                // The backend answered — the success itself is the
+                // recovery evidence (a no-op for healthy sources).
+                recover_if_degraded(&handle, degraded_at_start);
                 rows
             }
             // Health is RE-READ at failure time, not the pre-execution
@@ -867,7 +892,7 @@ fn labels_batch(
         let degraded_at_start = degraded_reason(&handle).is_some();
         let labels = match handle.client.labels(handle.bounds, limit).await {
             Ok(labels) => {
-                recover_if_degraded(&handle, degraded_at_start).await;
+                recover_if_degraded(&handle, degraded_at_start);
                 labels
             }
             // Same failure-time re-read as cypher_batches — the
@@ -936,25 +961,22 @@ mod tests {
     }
 
     fn sources_with(rows: Vec<Vec<Value>>) -> GraphSources {
-        let handle = Arc::new(GraphSourceHandle {
-            client: Arc::new(MockClient {
+        let handle = Arc::new(GraphSourceHandle::new(
+            Arc::new(MockClient {
                 rows,
                 labels: vec![
                     ("Person".to_string(), "vertex".to_string()),
                     ("KNOWS".to_string(), "edge".to_string()),
                 ],
             }),
-            bounds: QueryBounds {
+            QueryBounds {
                 timeout: std::time::Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-            view_contracts: Arc::new(vec![]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            GraphSourceHealth::Healthy,
+            Arc::new(vec![]),
+            4,
+        ));
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }
 
@@ -1028,19 +1050,16 @@ mod tests {
         health: GraphSourceHealth,
         client: Arc<dyn GraphClient>,
     ) -> GraphSources {
-        let handle = Arc::new(GraphSourceHandle {
+        let handle = Arc::new(GraphSourceHandle::new(
             client,
-            bounds: QueryBounds {
+            QueryBounds {
                 timeout: std::time::Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(health)),
-            view_contracts: Arc::new(vec![]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            health,
+            Arc::new(vec![]),
+            4,
+        ));
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
     }
 
@@ -1203,24 +1222,19 @@ mod tests {
         };
         // One value per row: the ad-hoc single-column query succeeds,
         // but the two-column view contract hits an arity mismatch.
-        let handle = Arc::new(GraphSourceHandle {
-            client: Arc::new(MockClient {
+        let handle = Arc::new(GraphSourceHandle::new(
+            Arc::new(MockClient {
                 rows: vec![vec![serde_json::json!("ada")]],
                 labels: vec![("Person".to_string(), "vertex".to_string())],
             }),
-            bounds: QueryBounds {
+            QueryBounds {
                 timeout: std::time::Duration::from_secs(5),
                 max_rows: 100,
             },
-            health: Arc::new(RwLock::new(GraphSourceHealth::Degraded(
-                "connection refused at startup".to_string(),
-            ))),
-            view_contracts: Arc::new(vec![contract]),
-            recovery_gate: Arc::new(AsyncMutex::new(())),
-            last_failed_recovery: Arc::new(StdMutex::new(None)),
-            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
-            validation_limit: 4,
-        });
+            GraphSourceHealth::Degraded("connection refused at startup".to_string()),
+            Arc::new(vec![contract]),
+            4,
+        ));
         let sources: GraphSources =
             Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])));
         let ctx = SessionContext::new();
@@ -1604,11 +1618,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stale_degraded_flag_rechecks_under_the_gate_and_returns() {
-        // The ad-hoc twin of the view path's gate-loser re-check: the
-        // caller captured `degraded = true` at stream construction, but
-        // a racing winner already recovered the source — the re-check
-        // under the gate must return without touching health.
+    async fn a_stale_degraded_flag_rechecks_and_returns() {
+        // The caller captured `degraded = true` at stream construction,
+        // but a racing recovery already flipped the source — the
+        // re-check must return without touching health (or its
+        // transition timestamp).
         let sources = sources_with(vec![]);
         let handle = Arc::clone(
             sources
@@ -1617,10 +1631,60 @@ mod tests {
                 .get("kg")
                 .expect("kg registered"),
         );
-        recover_if_degraded(&handle, true).await;
+        let stamped = *handle
+            .health_changed_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        recover_if_degraded(&handle, true);
         assert!(
             health_of(&sources).is_healthy(),
             "a healthy source stays healthy through the stale-flag path"
+        );
+        assert_eq!(
+            stamped,
+            *handle
+                .health_changed_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            "no transition was re-stamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_armed_backoff_does_not_outweigh_a_successful_answer() {
+        // The backoff exists to avoid PAYING for probes against a down
+        // backend; a caller-provided successful answer is free evidence
+        // the backend is up. A prior failed view-scan recovery armed the
+        // backoff — the ad-hoc success must flip the source healthy
+        // anyway, not leave /data_source reporting degraded for a source
+        // demonstrably serving queries.
+        let sources = sources_with_health(
+            GraphSourceHealth::Degraded("connection refused at startup".to_string()),
+            Arc::new(MockClient {
+                rows: vec![vec![serde_json::json!("ada")]],
+                labels: vec![("Person".to_string(), "vertex".to_string())],
+            }),
+        );
+        let handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("kg registered"),
+        );
+        super::super::view::arm_recovery_backoff(&handle);
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("registration");
+        let batches = collect(
+            &ctx,
+            "SELECT name FROM cypher_query('kg', 'MATCH (p) RETURN p.name', '{}', \
+             '{\"name\": \"string\"}')",
+        )
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert!(
+            health_of(&sources).is_healthy(),
+            "the successful answer beats the armed backoff"
         );
     }
 
