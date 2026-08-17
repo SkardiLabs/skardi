@@ -296,7 +296,7 @@ mod tests {
                 assert_eq!(column, "id");
                 assert_eq!(page, 1);
                 assert_eq!(row, 0);
-                assert_eq!(found, "number");
+                assert_eq!(found, "a number");
             }
             other => panic!("expected ConversionFailed, got {other}"),
         }
