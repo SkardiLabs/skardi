@@ -1667,6 +1667,19 @@ async fn register_data_source(
             let graph_sources = optimizer_registry
                 .map(|r| r.graph_sources())
                 .unwrap_or_default();
+            // KNOWN DOUBLING (the repo's existing pattern, but with a new
+            // cost class here): startup builds a PLANNING context
+            // (load_server_config) and a RUNTIME context (setup_app_state),
+            // and each one runs this registration — so the preflight dial,
+            // every view's LIMIT-1 validation Cypher, and the health
+            // classification all execute twice per boot, and two pools per
+            // source exist until sqlx's idle reaper collects the planning
+            // one. A flaky backend can therefore classify differently in
+            // the two passes; only the RUNTIME registration's health is
+            // what /data_source reports. Deduplicating the contexts (or
+            // registering the planning pass from declared schemas only —
+            // the degraded path's exact contract) is tracked as follow-up
+            // work; recording the cost here is this PR's honest floor.
             register_graph_tables(
                 session_ctx,
                 &graph_sources,

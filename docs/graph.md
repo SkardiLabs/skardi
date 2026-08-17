@@ -77,29 +77,46 @@ hold every unrelated source hostage at startup):
 - **Reachable backend, views validate** → the source registers
   healthy. Each view is proven at registration with one live call (the
   Cypher runs fetching at most one row; the result must convert against
-  the declared schema).
+  the declared schema). What that proves, honestly: **arity always**
+  (the backend raises it regardless of row order); **type and
+  `nullable: false` only for the sampled row** — Cypher without
+  `ORDER BY` guarantees nothing about which row comes back, so a view
+  over heterogeneous data can register healthy and still fail a later
+  scan on a different row. The per-row enforcement lives in execution;
+  validation is a bounded preflight, not a proof of the contract over
+  the whole graph.
 - **Reachable backend, a view FAILS validation** → registration is
   REFUSED and the server does not start. A view whose `RETURN` arity or
   types disagree with its declared schema is a contract violation, not
   an outage; the error names the view and the backend's complaint.
 - **Unreachable backend** → the source registers DEGRADED — but only
-  genuine connectivity failures qualify (DNS, refused dial, network
-  timeout: no server answered). A server that ANSWERED with an error —
-  wrong credentials, AGE not installed, the graph missing — fails
-  startup loudly, because that is a configuration problem, not an
-  outage. When degraded does apply: views still register with their
-  declared (planning-sufficient) schemas, `GET /data_source` reports
-  `status: "degraded"`, and the first scan retries the validation of
-  ALL the source's views — failing loudly with the failing view's name
-  and the registration error if the backend is still gone or a view no
-  longer matches, flipping the source back to `healthy` only when every
-  view re-validates (the same all-or-nothing line reachable
-  registration holds). The ad-hoc UDTF path behaves the same way: a
-  `cypher_query` / `graph_schema` call on a degraded source IS the
-  retry — a failure reports the registration error (the real cause,
-  e.g. connection refused) next to the fresh failure rather than a bare
-  timeout, and a success flips the source back to `healthy` once the
-  view contracts re-prove (immediately, for a view-less source).
+  genuine connectivity failures qualify: DNS, a refused dial, a network
+  timeout — no server answered. (A pool acquire timeout counts: sqlx
+  retries a refused dial until the acquire deadline, so an unreachable
+  backend surfaces as `PoolTimedOut`.) A server that ANSWERED with an
+  error — wrong credentials, AGE not installed, the graph missing, or a
+  view whose validation hits the STATEMENT timeout (the server accepted
+  the query; a too-slow view is a boot-time diagnosis, not an outage) —
+  fails startup loudly. When degraded does apply: views still register
+  with their declared (planning-sufficient) schemas, `GET /data_source`
+  reports `status: "degraded"`, and the first scan retries.
+
+  **Recovery answers one question — did the backend come back?** A
+  retry that gets ANY response from the server (all views validate, or
+  a view fails its contract) flips the source `healthy`; a still-broken
+  view then fails its OWN scans with the typed error execution already
+  produces, while every other view works. Recovery deliberately does
+  NOT hold registration's all-or-nothing line: keeping the whole source
+  degraded over one un-provable view would disable every view
+  permanently with no startup signal, and `/data_source`'s "degraded"
+  would misread as "backend unreachable". Only availability failures
+  (the backend did not answer) keep the source degraded — and they arm
+  a backoff of `max(query_timeout_seconds, 30s)`: inside the window,
+  scans fail fast with the cached diagnosis instead of re-paying the
+  full N-view re-validation, so a backend that is down for the
+  afternoon costs one re-validation per interval, not per query. The
+  ad-hoc UDTF path applies the same classification: a `cypher_query` /
+  `graph_schema` call on a degraded source IS the retry.
 
 ## Ad-hoc queries
 

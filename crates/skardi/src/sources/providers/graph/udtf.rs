@@ -112,10 +112,15 @@ pub struct GraphSourceHandle {
     /// "registered degraded and not yet recovered", never as a liveness
     /// probe — /data_source's status field carries the same caveat.
     pub health: Arc<RwLock<GraphSourceHealth>>,
-    /// The validation contract of every YAML view on this source, kept so
-    /// the degraded recovery re-proves ALL of them before the source
-    /// flips Healthy — the same strength as reachable registration, which
-    /// refuses the source unless every view validates. Empty for
+    /// The validation contract of every YAML view on this source. The
+    /// degraded recovery re-proves them to answer ONE question — "did the
+    /// backend come back?" — not to re-litigate every contract: any
+    /// response from the server (validation success OR a contract
+    /// violation) flips the source Healthy, and a still-broken view then
+    /// fails its OWN scans with the typed error execution already
+    /// produces (arity from the backend, types from conversion,
+    /// nullability from build_batch). Only availability artifacts (the
+    /// backend did not answer) keep the source Degraded. Empty for
     /// view-less sources (the engine API included), where a successful
     /// query is itself the recovery evidence.
     pub view_contracts: Arc<Vec<super::view::ViewContract>>,
@@ -128,6 +133,15 @@ pub struct GraphSourceHandle {
     /// validation; the rest see Healthy on wake-up. Never held across a
     /// healthy fast path — that stays a lock-free read.
     pub recovery_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Backoff for FAILED recovery attempts: while the backend stays
+    /// down, every query would otherwise re-pay the full re-validation
+    /// (N views × timeout, serialized behind the gate — a dashboard
+    /// refresh against an afternoon-long outage becomes a pile-up).
+    /// Holds the instant of the last availability-failed attempt; the
+    /// next attempt before `recovery_backoff_interval` elapses returns
+    /// the cached degraded error instead. `tokio::time::Instant`, so the
+    /// paused-clock tests can drive it.
+    pub last_failed_recovery: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
     /// The bounded-concurrency limit for view (re)validation — the
     /// pool's own `max_connections`, so no probe ever queues behind its
     /// siblings in the acquire queue (see
@@ -761,14 +775,31 @@ async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) {
     if degraded_reason(handle).is_none() {
         return;
     }
+    // Inside the failed-recovery backoff window, don't re-pay the
+    // re-validation: the caller's own query already succeeded (or the
+    // caller's own failure is being reported), and the view path owns
+    // the loud degraded diagnostics.
+    if super::view::recovery_backoff_remaining(handle).is_some() {
+        return;
+    }
     match super::view::revalidate_all_views(handle).await {
+        // The backend answered — success or a contract violation both
+        // flip Healthy; a broken view's own scans carry its typed error.
         Ok(()) => mark_healthy(handle),
-        Err(e) => {
+        Err(e) if !super::view::recovery_keeps_degraded(&e) => {
             tracing::warn!(
                 error = %e,
-                "an ad-hoc query succeeded against the recovered backend, but view \
-                 re-validation failed — the source stays degraded (the failing \
-                 view's own scan reports this loudly)"
+                "graph source recovered (the backend answered), but a view failed \
+                 re-validation — its own scans will report this"
+            );
+            mark_healthy(handle);
+        }
+        Err(e) => {
+            super::view::arm_recovery_backoff(handle);
+            tracing::warn!(
+                error = %e,
+                "the ad-hoc query succeeded but view re-validation found the backend \
+                 unavailable — the source stays degraded"
             );
         }
     }
@@ -911,6 +942,7 @@ mod tests {
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
             view_contracts: Arc::new(vec![]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
@@ -979,6 +1011,7 @@ mod tests {
             health: Arc::new(RwLock::new(health)),
             view_contracts: Arc::new(vec![]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
@@ -1081,11 +1114,12 @@ mod tests {
     #[tokio::test]
     async fn a_recovered_query_keeps_its_rows_when_a_sibling_view_fails_revalidation() {
         // The recovery pin: the caller's query ALREADY succeeded, so a
-        // sibling view breaking its contract must not discard those rows
-        // — that would fail every ad-hoc query (and graph_schema, the
-        // discovery surface) forever over one mis-declared view. The
-        // rows come back; the source merely stays degraded, and the
-        // broken view's own scan is where the failure surfaces loudly.
+        // sibling view breaking its contract must not discard those rows.
+        // And because a contract violation is the backend ANSWERING, the
+        // source flips healthy — the broken view's own scans carry its
+        // typed failure (keeping it degraded would re-pay the whole
+        // re-validation on every query and misreport an outage that
+        // isn't one).
         let contract = super::super::view::ViewContract {
             name: "people".to_string(),
             cypher: "MATCH (p:Person) RETURN p.name, p.age".to_string(),
@@ -1118,6 +1152,7 @@ mod tests {
             ))),
             view_contracts: Arc::new(vec![contract]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         let sources: GraphSources =
@@ -1136,8 +1171,9 @@ mod tests {
             "the successful query's rows are emitted, not discarded"
         );
         assert!(
-            !health_of(&sources).is_healthy(),
-            "the failed view re-validation keeps the source degraded"
+            health_of(&sources).is_healthy(),
+            "the backend answered (a contract violation is an answer) — the source \
+             recovers; the broken view's own scans report its failure"
         );
     }
 

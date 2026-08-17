@@ -140,6 +140,7 @@ pub async fn register_graph_source(
         // to put them in), so there are no contracts to re-prove.
         view_contracts: Arc::new(vec![]),
         recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+        last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
         validation_limit: config.max_connections as usize,
     });
     // Poisoning degrades gracefully (AGENTS.md convention) — and it also
@@ -280,7 +281,9 @@ pub async fn register_graph_tables(
         return Err(GraphError::InvalidConfig {
             name: name.to_string(),
             reason: format!(
-                "a catalog named '{name}' already exists in this session — the graph                  source's views would replace it (register_catalog replaces                  unconditionally); rename the source"
+                "a catalog named '{name}' already exists in this session — the graph \
+                 source's views would replace it (register_catalog replaces \
+                 unconditionally); rename the source"
             ),
         });
     }
@@ -317,6 +320,7 @@ pub async fn register_graph_tables(
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
                 recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
                 validation_limit: config.max_connections as usize,
             });
             let contracts = config
@@ -419,6 +423,7 @@ pub async fn register_graph_tables(
                 .collect::<Result<Vec<_>, GraphError>>()?,
         ),
         recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+        last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
         validation_limit: config.max_connections as usize,
     });
     // Publish the handle BEFORE touching the catalog: register_catalog
@@ -494,16 +499,21 @@ pub async fn register_graph_tables(
 /// backend or the pool did not answer in time) rather than a contract
 /// violation. Availability degrades — same classification as the dial;
 /// contract refuses.
-fn is_availability_artifact(e: &GraphError) -> bool {
+pub(crate) fn is_availability_artifact(e: &GraphError) -> bool {
     let underlying = match e {
         GraphError::ViewValidationFailed { source, .. } => source.as_ref(),
         other => other,
     };
+    // Deliberately NOT Timeout: a statement timeout means the server
+    // ANSWERED — a view too slow for query_timeout_seconds is a boot-time
+    // configuration diagnosis ("view 'X' timed out; raise the timeout or
+    // simplify the view"), and degrading it instead would boot a source
+    // whose every recovery re-pays the slow view. ConnectionAcquireTimeout
+    // stays: sqlx retries a refused dial until the acquire deadline, so an
+    // UNREACHABLE backend surfaces as PoolTimedOut, not a dial error.
     matches!(
         underlying,
-        GraphError::Unavailable { .. }
-            | GraphError::Timeout { .. }
-            | GraphError::ConnectionAcquireTimeout { .. }
+        GraphError::Unavailable { .. } | GraphError::ConnectionAcquireTimeout { .. }
     )
 }
 
@@ -645,6 +655,7 @@ views:
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
                 recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
                 validation_limit: config.max_connections as usize,
             }),
         );
@@ -769,12 +780,15 @@ views:
         // per-scan failures. Both bare and ViewValidationFailed-wrapped
         // shapes are classified, because validation wraps the underlying
         // error with the failing view's name.
-        let timeout = GraphError::Timeout { seconds: 30 };
         let acquire = GraphError::ConnectionAcquireTimeout { seconds: 30 };
         let unavailable = GraphError::Unavailable {
             source_name: "kg".to_string(),
             reason: "connection refused".to_string(),
         };
+        // A statement timeout is the server ANSWERING: a view too slow
+        // for query_timeout_seconds must refuse at boot with a
+        // diagnosis, not boot a source whose every recovery re-pays it.
+        let timeout = GraphError::Timeout { seconds: 30 };
         let mismatch = GraphError::TypeMismatch {
             column: "age".to_string(),
             row: 0,
@@ -790,11 +804,11 @@ views:
             view: "people".to_string(),
             source: Box::new(e),
         };
-        for e in [timeout, acquire, unavailable] {
+        for e in [acquire, unavailable] {
             assert!(is_availability_artifact(&e), "{e}");
             assert!(is_availability_artifact(&wrap(e)), "wrapped");
         }
-        for e in [mismatch, arity] {
+        for e in [timeout, mismatch, arity] {
             assert!(!is_availability_artifact(&e), "{e}");
             assert!(!is_availability_artifact(&wrap(e)), "wrapped");
         }

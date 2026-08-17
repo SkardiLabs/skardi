@@ -303,6 +303,7 @@ mod params_through_real_substitution {
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
                 recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
                 validation_limit: 4,
             }),
         );
@@ -375,6 +376,7 @@ spec:
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
                 recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
                 validation_limit: 4,
             }),
         )])));
@@ -424,6 +426,50 @@ spec:
             col.value(0),
             "O'Brien",
             "the apostrophe survives the round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn backslashes_in_params_json_survive_the_literal_round_trip() {
+        // The {params} contract is JSON carried as a SQL STRING LITERAL,
+        // and JSON's escape character is the backslash — the substitution
+        // only escapes apostrophes ('' doubling), so this pins that
+        // DataFusion's dialect keeps backslashes LITERAL inside a
+        // single-quoted string (no C-style escape processing). If a
+        // dialect change ever turned backslashes into escapes, every
+        // graph pipeline param carrying \" or \\ would become a parse
+        // error or silent corruption — this is the tripwire.
+        let ctx = ctx_with_echo();
+        let mut sql = "SELECT who FROM cypher_query('kg', \
+                       'MATCH (p) WHERE p.name = $name RETURN p.name', {params}, \
+                       '{\"who\": \"string\"}')"
+            .to_string();
+        let expected = vec!["params".to_string()];
+        // The JSON text on the wire: {"name": "a\"b\\c"} — an escaped
+        // quote and an escaped backslash, the two escapes serde emits.
+        let value = serde_json::json!({ "name": "a\"b\\c" });
+        let request: HashMap<String, Value> =
+            HashMap::from([("params".to_string(), Value::String(value.to_string()))]);
+        let (missing, unsupported) = substitute_sql_params(&mut sql, &expected, &request);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(unsupported.is_empty(), "{unsupported:?}");
+
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("the literal plans")
+            .collect()
+            .await
+            .expect("executes");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("string column");
+        assert_eq!(
+            col.value(0),
+            "a\"b\\c",
+            "the JSON escapes decode back to the original value"
         );
     }
 

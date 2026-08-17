@@ -627,11 +627,15 @@ impl GraphClient for AgeClient {
         };
         let source = self.source_name.clone();
         let run = async {
+            // map_query_error, not backend_error: a saturated or
+            // unreachable pool must surface from graph_schema as the same
+            // typed ConnectionAcquireTimeout cypher_query reports — and
+            // the availability classification keys on the typed variant.
             let mut tx = self
                 .pool
                 .begin()
                 .await
-                .map_err(|e| backend_error(&source, &e))?;
+                .map_err(|e| map_query_error(&source, bounds, &e))?;
             // Same protocol discipline as execute(): the SETs ride the
             // SIMPLE protocol as constant text. `sqlx::query` would take
             // the extended protocol and plant a server-side prepared

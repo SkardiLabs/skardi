@@ -671,6 +671,8 @@ fn json_kind(v: &Value) -> &'static str {
 /// (tests/graph_views.rs) must run THIS function — a hand-rolled
 /// `str::replace` in the test would keep passing after a substitution
 /// regression, which is the failure the test exists to catch.
+#[doc(hidden)] // pub for the integration suite's real-substitution
+// contract test only — not a supported server API surface.
 pub fn substitute_sql_params(
     sql: &mut String,
     expected_params: &[String],

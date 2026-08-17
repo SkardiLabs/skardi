@@ -157,16 +157,23 @@ pub(crate) fn view_batches(
             limit,
         ))
     })
-    .map_ok(|inner| inner)
     .try_flatten()
     .boxed()
 }
 
-/// The degraded retry: a Degraded source re-validates ALL of its views
-/// against the backend and flips Healthy on success; a failed retry is
-/// the loud error the design asks for ("the first scan retries the
-/// validation and fails loudly"). Called from the lazy scan stream —
-/// the lock is dropped BEFORE any await, never held across it.
+/// The degraded retry, answering ONE question: did the backend come
+/// back? A re-validation pass that gets ANY response from the server —
+/// success or a contract violation — flips the source Healthy, and a
+/// still-broken view then fails its OWN scans with the typed error
+/// execution already produces (the ad-hoc path's reasoning, applied
+/// here: a scan of a healthy view must not be discarded because a
+/// SIBLING's contract is broken — that would disable every view on the
+/// source permanently, with no startup signal). Only availability
+/// artifacts (the backend did not answer) keep the source Degraded, and
+/// those failures arm a BACKOFF so a backend that stays down costs
+/// roughly one loud error per interval instead of a full N-view
+/// re-validation per query. Called from the lazy scan stream — the
+/// health lock is dropped before any await, never held across it.
 pub(crate) async fn ensure_healthy(
     handle: &Arc<GraphSourceHandle>,
     view_name: &str,
@@ -185,19 +192,84 @@ pub(crate) async fn ensure_healthy(
     let Some(registration_error) = degraded_reason(handle) else {
         return Ok(()); // the winner already recovered the source
     };
-    revalidate_all_views(handle).await.map_err(|e| {
-        DataFusionError::Execution(format!(
+    if let Some(remaining) = recovery_backoff_remaining(handle) {
+        return Err(DataFusionError::Execution(format!(
             "graph source of view '{view_name}' is registered DEGRADED (registration \
-             error: {registration_error}) and its first-scan re-validation \
-             failed: {e}"
-        ))
-    })?;
+             error: {registration_error}); the last recovery attempt found the \
+             backend still unavailable, and the next retry is {}s away",
+            remaining.as_secs()
+        )));
+    }
+    match revalidate_all_views(handle).await {
+        Ok(()) => {}
+        // The backend ANSWERED — a broken contract is that view's own
+        // scan-time problem, not grounds to keep every sibling dead.
+        Err(e) if !recovery_keeps_degraded(&e) => {
+            tracing::warn!(
+                error = %e,
+                "graph source recovered (the backend answered), but a view failed \
+                 re-validation — its own scans will report this"
+            );
+        }
+        Err(e) => {
+            arm_recovery_backoff(handle);
+            return Err(DataFusionError::Execution(format!(
+                "graph source of view '{view_name}' is registered DEGRADED (registration \
+                 error: {registration_error}) and its first-scan re-validation \
+                 failed: {e}"
+            )));
+        }
+    }
     *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
     Ok(())
 }
 
+/// Whether a re-validation failure means "the backend did not answer" —
+/// the ONLY class that keeps a source Degraded under recovery. Includes
+/// the whole-recovery backstop (a wedge is not an answer). Statement
+/// timeouts do NOT keep degraded: 57014 is the server answering.
+pub(crate) fn recovery_keeps_degraded(e: &GraphError) -> bool {
+    super::is_availability_artifact(e) || matches!(e, GraphError::RecoveryDeadlineExceeded { .. })
+}
+
+/// The failed-recovery backoff interval: long enough that a down backend
+/// costs one full re-validation per interval, short enough to notice a
+/// restart promptly.
+fn recovery_backoff_interval(handle: &GraphSourceHandle) -> std::time::Duration {
+    handle
+        .bounds
+        .timeout
+        .max(std::time::Duration::from_secs(30))
+}
+
+/// Time until the next recovery attempt is allowed, when inside backoff.
+pub(crate) fn recovery_backoff_remaining(
+    handle: &GraphSourceHandle,
+) -> Option<std::time::Duration> {
+    let last = (*handle
+        .last_failed_recovery
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()))?;
+    recovery_backoff_interval(handle).checked_sub(last.elapsed())
+}
+
+pub(crate) fn arm_recovery_backoff(handle: &GraphSourceHandle) {
+    *handle
+        .last_failed_recovery
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(tokio::time::Instant::now());
+}
+
 /// Prove one view against the live backend: run its Cypher fetching at
-/// most ONE row, then convert what came back. AGE arity mismatches are
+/// most ONE row, then convert what came back. What this proves, stated
+/// honestly: ARITY always (the backend raises it regardless of which
+/// row comes back); TYPE and `nullable: false` only for the sampled row
+/// — Cypher without ORDER BY guarantees nothing about which row that
+/// is, so a heterogeneous view can pass here and still fail at scan
+/// time on a different row (the same unsoundness §Research findings
+/// cites against schema PROBES; the sampling stays deliberately bounded
+/// and the per-row enforcement lives in execution). AGE arity
+/// mismatches are
 /// raised by the backend inside `execute`; type mismatches and
 /// `nullable: false` violations are caught by the conversion. Errors are
 /// wrapped to name the view — the identity an operator needs.
@@ -331,7 +403,13 @@ mod tests {
         ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(message) = &self.error {
-                return Err(GraphError::backend("kg", "io", message));
+                // The canonical still-down signal: recovery classification
+                // keys on the typed variant (a backend ANSWER — even an
+                // error — flips the source healthy now).
+                return Err(GraphError::Unavailable {
+                    source_name: "kg".to_string(),
+                    reason: message.clone(),
+                });
             }
             let mut rows = self.rows.clone();
             if let Some(l) = limit {
@@ -374,6 +452,7 @@ mod tests {
                 columns: columns(),
             }]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         (handle, calls)
@@ -510,13 +589,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_revalidates_every_view_not_just_the_scanned_one() {
-        // The contract-strength parity pin: the SCANNED view is fine, but
-        // a sibling view on the same source violates its contract — the
-        // source must stay degraded and the error must name the broken
-        // view. Reachable registration refuses the source unless every
-        // view validates; recovery holds the same line, or the broken
-        // view would silently downgrade to a scan-time conversion error.
+    async fn a_broken_sibling_no_longer_blocks_recovery_when_the_backend_answers() {
+        // The recovery question is "did the backend come back?", not
+        // "does every contract hold?": the SCANNED view is fine, a
+        // sibling violates its contract — the backend ANSWERED, so the
+        // source flips healthy, the good view's rows come back, and the
+        // broken view fails its OWN scans with the typed conversion
+        // error (the old all-or-nothing line disabled every view on the
+        // source permanently over one un-provable sibling, with no
+        // startup signal).
         let handle = Arc::new(GraphSourceHandle {
             client: Arc::new(PickyMock {
                 fail_marker: "Broken",
@@ -541,6 +622,7 @@ mod tests {
                 },
             ]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         let provider = GraphViewProvider::new(
@@ -549,16 +631,29 @@ mod tests {
             "MATCH (g:Good) RETURN g.name".to_string(),
             columns(),
         );
-        let err = scan_rows(provider)
+        let batches = scan_rows(provider)
             .await
-            .expect_err("a broken sibling view blocks the recovery flip");
-        let msg = err.to_string();
+            .expect("the good view's correct answer is not discarded");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert!(
-            msg.contains("broken_view"),
-            "the failing view is named: {msg}"
+            is_healthy(&handle),
+            "the backend answered — the source recovers"
         );
-        assert!(msg.contains("DEGRADED"), "{msg}");
-        assert!(!is_healthy(&handle), "the source stays degraded");
+
+        // The broken view's own scan carries its own typed failure.
+        let broken = GraphViewProvider::new(
+            Arc::clone(&handle),
+            "broken_view".to_string(),
+            "MATCH (b:Broken) RETURN b.name".to_string(),
+            columns(),
+        );
+        let err = scan_rows(broken)
+            .await
+            .expect_err("the broken view still fails, on its own scans");
+        assert!(
+            !err.to_string().contains("DEGRADED"),
+            "a typed contract error, not a degraded wrap: {err}"
+        );
     }
 
     #[tokio::test]
@@ -602,6 +697,48 @@ mod tests {
         assert!(msg.contains("connection refused"), "{msg}");
         assert!(!is_healthy(&handle), "a failed retry stays Degraded");
         assert_eq!(calls.load(Ordering::Relaxed), 1, "validation only");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_recovery_backs_off_instead_of_repaying_the_validation() {
+        // A backend that stays down must cost roughly ONE re-validation
+        // per backoff interval, not one per query: the second scan inside
+        // the window fails fast with the cached diagnosis (no client
+        // call), and the interval's expiry re-arms a real attempt.
+        let (handle, calls) = handle_with(
+            GraphSourceHealth::Degraded("connection refused".to_string()),
+            vec![],
+            Some("still refused".to_string()),
+        );
+        let err = scan_rows(provider(Arc::clone(&handle)))
+            .await
+            .expect_err("first attempt fails");
+        assert!(err.to_string().contains("DEGRADED"), "{err}");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one validation probe");
+
+        let err = scan_rows(provider(Arc::clone(&handle)))
+            .await
+            .expect_err("inside the window: fast, cached failure");
+        let msg = err.to_string();
+        assert!(msg.contains("next retry"), "names the backoff: {msg}");
+        assert!(msg.contains("connection refused"), "keeps the cause: {msg}");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no re-validation inside the backoff window"
+        );
+
+        // Past the interval (max(timeout, 30s) = 30s here), the next scan
+        // pays a real attempt again.
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let _ = scan_rows(provider(Arc::clone(&handle)))
+            .await
+            .expect_err("still down");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the expired window re-arms a real attempt"
+        );
     }
 
     #[tokio::test]
@@ -743,6 +880,7 @@ mod tests {
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
             view_contracts: Arc::new(vec![]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         let contracts: Vec<ViewContract> = (0..8)
@@ -859,6 +997,7 @@ mod tests {
                 columns: columns(),
             }]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
             validation_limit: 4,
         });
         let err = revalidate_all_views(&handle)

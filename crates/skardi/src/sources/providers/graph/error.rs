@@ -86,7 +86,8 @@ pub enum GraphError {
     /// this fires only if the recovery as a whole stalls past the sum of
     /// its waves' budgets — a should-not-happen guard, not a tuning knob.
     #[error(
-        "degraded recovery did not complete within {seconds}s (every per-view probe is          individually bounded; this is the whole-recovery backstop)"
+        "degraded recovery did not complete within {seconds}s (every per-view probe is \
+         individually bounded; this is the whole-recovery backstop)"
     )]
     RecoveryDeadlineExceeded { seconds: u64 },
 
