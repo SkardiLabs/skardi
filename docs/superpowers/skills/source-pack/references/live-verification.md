@@ -51,6 +51,18 @@ accept it explicitly.
   "request URL must not resolve to private or reserved IP addresses" —
   the fix is on the user's side (e.g. add the provider's API domain to
   the proxy's fake-ip-filter); do not patch the guard.
+- **Node's built-in fetch ignores `HTTPS_PROXY`** — when the machine
+  reaches the provider only through a local proxy (browser and curl
+  work; the gateway's server-side calls don't), the OAuth token
+  exchange fails with the generic `oauth_token_exchange_failed`
+  ("OAuth token request failed.") because the fetch threw, not because
+  the provider rejected (a provider rejection carries its own message,
+  e.g. `invalid_client`). Diagnose by comparing
+  `curl -X POST <tokenUrl>` (proxied, gets a real 4xx) against
+  `node -e 'fetch(<tokenUrl>,{method:"POST"})'` (direct, times out).
+  Fix: restart the gateway with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.14,
+  experimental) so undici honors the proxy env vars — this hit the
+  Discord pack's live pass (5.5).
 - Ask the user to seed the account with a little real data shaped like
   the tables (e.g. for Notion: share a page and a database with the
   integration).

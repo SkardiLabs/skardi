@@ -139,6 +139,7 @@ impl SourcePackRegistry {
             super::packs::notion::pack()?,
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
+            super::packs::discord::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }
@@ -256,7 +257,9 @@ mod tests {
         // listing silently omits the newcomer).
         assert_eq!(
             names,
-            vec!["feishu", "github", "gmail", "mock", "notion", "slack"]
+            vec![
+                "discord", "feishu", "github", "gmail", "mock", "notion", "slack"
+            ]
         );
     }
 

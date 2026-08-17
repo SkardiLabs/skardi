@@ -1,0 +1,12 @@
+{
+  "guilds": [
+    {
+      "id": 100000000000000001,
+      "name": "Redacted Guild Mismatch",
+      "owner": false,
+      "permissions": 123,
+      "permissions_new": "0",
+      "features": []
+    }
+  ]
+}

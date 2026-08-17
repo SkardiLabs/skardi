@@ -278,6 +278,32 @@ pub enum OpenConnectorError {
     )]
     PaginationLoop { token: String },
 
+    /// A keyset cursor that cannot continue the scan: the declared field is
+    /// absent from the page's last row, an empty string, or the wrong JSON
+    /// kind. Stopping instead would silently truncate the scan. The reason
+    /// is value-free — keyset cursors are ROW data, and row values never
+    /// appear in errors.
+    #[error(
+        "Open Connector keyset cursor field '{path}' on page {page} {reason}; \
+         refusing to treat it as end-of-collection"
+    )]
+    PaginationKeysetCursorInvalid {
+        path: String,
+        page: usize,
+        reason: String,
+    },
+
+    /// A keyset provider re-served a cursor already consumed by an earlier
+    /// page — an ordering violation that would loop the scan forever.
+    /// Unlike [`Self::PaginationLoop`], the repeated value is deliberately
+    /// withheld: it is a field of a provider row, and row values never
+    /// appear in errors.
+    #[error(
+        "Open Connector keyset cursor field '{path}' on page {page} repeats a value \
+         already consumed by an earlier page; refusing to loop the scan"
+    )]
+    PaginationKeysetLoop { path: String, page: usize },
+
     /// A `single_page` table's premise — one request IS the complete
     /// collection — was contradicted by the response: the provider signalled
     /// more data at the declared path. Ending the scan here would be the

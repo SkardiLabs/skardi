@@ -587,6 +587,14 @@ mod tests {
                     generated.push(page_param);
                     generated.push(per_page_param);
                 }
+                PaginationStrategy::Keyset {
+                    cursor_param,
+                    page_size_param,
+                    ..
+                } => {
+                    generated.push(cursor_param);
+                    generated.push(page_size_param);
+                }
                 // next_cursor_path is read from the RESPONSE, never sent.
                 PaginationStrategy::SinglePage { .. } => {}
             }

@@ -383,6 +383,48 @@ event carrying the scan identity and error.
       with row identity, LIMIT early-stop, pagination-loop refusal,
       gateway failure-envelope surfacing, UDTF parity).
 - [ ] 5.6 Later waves per the design rollout (Google Calendar, Google Drive, Discord, HubSpot, Jira, …) through the source-pack admission gate
+- [x] 5.6 Discord pack (OAuth user-identity surface, raw passthrough rows, no
+      pagination envelope): guilds, connections, sticker_packs. The provider is
+      @me-only (its own get_user rejects any other id), so channels/messages/
+      members are out of scope by provider surface, not deferral; entitlements
+      is deferred because the upstream executor exposes no pagination inputs
+      (first-page-only). Engine extensions: `PaginationStrategy::Keyset`
+      (cursor = a field of the previous page's LAST ROW, `after`-style; ONLY an
+      empty page terminates — short pages continue, so a silent page-size clamp
+      of the kind the Feishu live pass observed cannot read as completion;
+      missing or non-string cursor on a non-empty page is typed drift, not a
+      quiet stop; a repeated cursor fails with identity only, never quoting the
+      row value) and an explicit `single_page` YAML spelling. Live contract
+      reconciliation 2026-08-07: action IDs + executor passthrough confirmed in
+      source, strict inputs validated to the credential wall via the 403-vs-400
+      probe, three output schemas captured and fingerprint-pinned, then all
+      three tables verified against a REAL account end to end through
+      skardi-server (registration through LIVE discovery; guilds 6 rows and
+      sticker_packs 14 rows with every mapped column non-NULL on real rows;
+      connections 1 real linked-account row — all nine wire keys mapped, the
+      connection_type rename extracting, `revoked` genuinely absent on a
+      non-revoked row with its non-NULL arm on a synthetic fixture row, since
+      capturing it live would revoke a real account link). The real keyset
+      walk (limit 2) covered 3 full pages
+      plus the empty terminator, no duplicate/boundary drop, ascending-
+      snowflake ordering confirmed. The live pass caught one contract defect no
+      mock could: the gateway calls the UNVERSIONED discord.com/api, where
+      `permissions` is a truncated NUMBER and the full bitfield string lives in
+      `permissions_new` — the column now maps `permissions_new`, and the
+      version-coupled risk (a future /api/v10 pin removes that key) is
+      documented in the pack doc with an upstream ask to pin the version.
+      guilds/sticker_packs fixtures are redacted live captures with a
+      mechanical allowlist tripwire test on every person-linked fixture.
+      Operational: Discord 429s rapid probes; the gateway surfaces them loudly.
+      Keyset failures carry precise, value-free diagnostics
+      (`PaginationKeysetCursorInvalid` with per-case reasons,
+      `PaginationKeysetLoop` withholding the repeated row value), pinned by
+      full rendered-message assertions. Verification: 311 tests (`cargo test
+      -p skardi --lib sources::providers::open_connector`; 23 new — 9 keyset
+      engine, 1 loader, 13 pack-scoped `… packs::discord` including
+      per-table wire-declaration e2e for all three tables, UDTF parity, and
+      empty-page schema stability), 868 full library suite.
+- [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,

@@ -23,6 +23,9 @@ gateway **runtime token**.
 > children — dynamic-schema rows are gated on binding-time schema
 > freeze), [Feishu](open-connector-feishu.md) (chats, messages,
 > chat members, tasks, wiki — live-verified against a real workspace),
+> [Discord](open-connector-discord.md) (guilds, connections, sticker
+> packs — live-verified against a real account; entitlements gated on
+> upstream pagination inputs),
 > and [Gmail](open-connector-gmail.md) (threads, messages,
 > drafts, labels, filters — message bodies are deferred to a
 > content-oriented surface). Further provider packs (Google Calendar,
