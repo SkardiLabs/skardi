@@ -37,6 +37,11 @@ use crate::server::AppState;
 /// Optional caller-supplied session header. A header (not a body field)
 /// because the execute body IS the flattened parameter map — a reserved key
 /// could collide with a legitimate SQL parameter of the same name.
+///
+/// Not an auth credential: unrelated to [`require_session`] on the line
+/// above its extraction. The value is caller-asserted, so ledger session
+/// attribution is self-reported rather than derived from an authenticated
+/// principal — the same property as `/query`'s `ai_context.session_id`.
 const SESSION_ID_HEADER: &str = "x-skardi-session-id";
 
 /// Extract and validate the session header. `Ok(None)` when absent; `Err`
@@ -757,16 +762,27 @@ pub async fn execute_pipeline_by_name(
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     require_session(&app_state, &headers).await?;
 
+    let start_time = Instant::now();
+
     let session_id = session_id_from_headers(&headers).map_err(|msg| {
+        // Recorded like every other early reject in this handler — a client
+        // looping on a malformed session id must be visible in metrics.
+        let elapsed_ms = start_time.elapsed().as_millis() as f64;
+        app_state
+            .metrics
+            .record_error(&pipeline_name, elapsed_ms, "parameter_validation_error");
         (
             StatusCode::BAD_REQUEST,
             create_error_response(&msg, "parameter_validation_error", None),
         )
     })?;
 
-    let start_time = Instant::now();
-
+    // `session_id` rides in the INFO marker so operators who stitch sessions
+    // from traces (rather than the opt-in ledger) get attribution too. It is
+    // an opaque, caller-asserted grouping key — value-free by the same
+    // standard as `/query`'s `ai_context` marker field.
     tracing::info!(
+        session_id = session_id.as_deref().unwrap_or_default(),
         "Received execution request for pipeline '{}' with {} parameters",
         pipeline_name,
         request.parameters.len()

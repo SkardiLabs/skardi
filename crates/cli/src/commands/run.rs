@@ -26,6 +26,25 @@ pub async fn run(
     table: bool,
     session_id: Option<String>,
 ) -> Result<()> {
+    // Validate before building the request: reqwest defers an invalid header
+    // value to `send()`, whose errors are all mapped to `ApiError::Connect` —
+    // so without this check a bad `--session-id` prints a connection error
+    // naming a server that was never contacted, and exits with the
+    // "server unreachable" code. The rules mirror the server's
+    // (`query_handlers::MAX_SESSION_ID_CHARS` = 200 and header-value ASCII);
+    // keep the two in sync.
+    let invalid_session_id = session_id.as_deref().is_some_and(|sid| {
+        sid.is_empty()
+            || sid.chars().count() > 200
+            || !sid.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+    });
+    if invalid_session_id {
+        return Err(anyhow!(
+            "--session-id must be non-empty, at most 200 characters, \
+             and contain only visible ASCII"
+        ));
+    }
+
     let body = build_body(data, param_flags)?;
     let path = format!("/{}/execute", encode_component(name));
 
@@ -53,7 +72,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::run;
-    use crate::client::ApiClient;
+    use crate::client::{ApiClient, ApiError};
     use crate::config::ClientConfig;
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
@@ -199,6 +218,36 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    // -- 5b. invalid --session-id fails fast, before any request ----------
+
+    #[tokio::test]
+    async fn run_with_invalid_session_id_errors_without_contacting_server() {
+        let server = MockServer::start().await;
+        // expect(0): the whole point is that no request is ever sent — a
+        // deferred header error would surface as ApiError::Connect and be
+        // misread as "server unreachable".
+        Mock::given(method("POST"))
+            .and(path("/my-pipe/execute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_envelope()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        for bad in ["", &"x".repeat(201), "sesión-1", "line\nbreak"] {
+            let result = run(&client, "my-pipe", None, &[], false, Some(bad.to_string())).await;
+            let err = result.expect_err("expected validation error");
+            assert!(
+                err.to_string().contains("--session-id"),
+                "expected a --session-id validation message, got: {err}"
+            );
+            assert!(
+                err.downcast_ref::<ApiError>().is_none(),
+                "must not be an ApiError (would map to a connection exit code)"
+            );
+        }
     }
 
     // -- 6. no --session-id sends no header -------------------------------
