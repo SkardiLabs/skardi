@@ -350,6 +350,21 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
             ));
         }
     }
+    // The fourth pair of the shared namespace: a pagination input naming a
+    // declared RESOURCE. exec.rs builds the request from the resource
+    // first and applies pagination LAST, so from page 2 onward the cursor
+    // would silently overwrite the binding's resource value — the scan
+    // walks a different collection than the binding asked for, with no
+    // error anywhere. (`after` is an entirely plausible name for both.)
+    for param in &pagination_params {
+        if table.declares_resource(param) {
+            return Err(format!(
+                "{id}: pagination input '{param}' collides with a declared resource — \
+                 pagination is applied last and would overwrite the binding's value \
+                 from page 2 onward"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1037,6 +1052,30 @@ tables:
     columns:
       - { name: id, path: id, type: uint64, nullable: false }"#,
                 "collides with a pagination input",
+            ),
+            (
+                // The keyset shape the review named: `after` as BOTH a
+                // required resource and the cursor input — pagination is
+                // applied last, so page 2+ would silently overwrite the
+                // binding's value and walk a different collection.
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: keyset, cursor_input: after, page_size_input: limit, page_size: 10, row_cursor_field: id }
+    resources: { required: [after] }
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }"#,
+                "pagination input 'after' collides with a declared resource",
+            ),
+            (
+                // Same rule under page_number (page_size_input vs an
+                // optional resource) — the check covers every strategy.
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [perPage] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "pagination input 'perPage' collides with a declared resource",
             ),
             (
                 r#"    action: demo.list

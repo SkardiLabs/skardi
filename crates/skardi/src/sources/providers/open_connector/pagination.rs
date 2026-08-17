@@ -89,7 +89,14 @@ pub enum PaginationStrategy {
     /// truncation this engine treats as the worst failure class. The
     /// empty-page rule is clamp-proof because asking a keyset endpoint
     /// for rows after the true last row returns nothing, at the cost of
-    /// one extra (empty) request per scan — the standard keyset tax.
+    /// one extra (empty) request per scan — the standard keyset tax. That
+    /// terminator also SPENDS a `max_pages` unit (the guard runs before
+    /// each fetch), so a keyset table's real capacity is `max_pages - 1`
+    /// full pages: a collection of exactly `max_pages × page_size` rows
+    /// fails loudly on the terminator rather than completing — an
+    /// asymmetry cursor/page-number don't have (their end signal arrives
+    /// inside page N), chosen and pinned by the pack e2e
+    /// (`max_pages_budget_includes_the_keyset_terminator`).
     ///
     /// The scan assumes the provider orders rows by the cursor field in
     /// the direction the cursor input walks; the loop guard converts a

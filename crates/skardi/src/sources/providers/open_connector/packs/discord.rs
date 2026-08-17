@@ -110,7 +110,7 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_ok,
+        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
         fingerprint_uncovered_columns,
     };
     use crate::sources::providers::open_connector::{
@@ -303,6 +303,48 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_permissions_new_key_fails_naming_the_permissions_column() {
+        // THE version-coupled tripwire, enforced: the yaml, the module
+        // doc, and the pack doc all claim that if the gateway ever pins
+        // /api/v10 (where permissions_new does not exist), the
+        // non-nullable `permissions` mapping is the ONLY thing that
+        // catches the move. This test IS that claim — a wire-faithful
+        // guild row minus exactly permissions_new must fail conversion
+        // naming `permissions` with full page/row identity, and none of
+        // the row's other values may ride along in the message.
+        let mut row = guild_row("g-0001");
+        row.as_object_mut()
+            .expect("guild row is an object")
+            .remove("permissions_new")
+            .expect("the fixture row carries the key this test removes");
+        let page = json!({ "guilds": [row] });
+        let t = table("guilds");
+        let rows = RowPath::parse(t.row_path)
+            .expect("row path")
+            .rows(&page, 3)
+            .expect("row array");
+        let err = RowConverter::new(t.fields)
+            .expect("converter")
+            .convert(rows, 3)
+            .expect_err("the v10 drift must fail conversion, not go NULL");
+        match &err {
+            OpenConnectorError::ConversionFailed {
+                column, page, row, ..
+            } => {
+                assert_eq!(column, "permissions");
+                assert_eq!(*page, 3);
+                assert_eq!(*row, 0);
+            }
+            other => panic!("expected ConversionFailed, got {other}"),
+        }
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("g-0001") && !rendered.contains("guild g-0001"),
+            "row values never appear in the failure: {rendered}"
+        );
+    }
+
+    #[test]
     fn person_linked_fixtures_stay_redacted() {
         // guilds and connections are the person-linked fixtures (the
         // authorizing user's guild MEMBERSHIP and linked-account lists).
@@ -474,6 +516,15 @@ bindings:
         token_env: &'static str,
         tables: &str,
     ) -> (MockGateway, SessionContext) {
+        let config = discord_config(token_env, tables);
+        setup_with_gateway_config(gateway, token_env, config).await
+    }
+
+    async fn setup_with_gateway_config(
+        gateway: MockGateway,
+        token_env: &'static str,
+        config: OpenConnectorConfig,
+    ) -> (MockGateway, SessionContext) {
         let _token = EnvVarGuard::set(token_env, "test-token");
         let gateways = OpenConnectorGateways::default();
         let mut ctx = SessionContext::new();
@@ -481,7 +532,7 @@ bindings:
             &mut ctx,
             "saas",
             &gateway.url,
-            Some(&discord_config(token_env, tables)),
+            Some(&config),
             false,
             HierarchyLevel::Catalog,
             Some(&gateways),
@@ -600,6 +651,201 @@ bindings:
                 "the cursor is the previous page's LAST row id"
             );
         }
+    }
+
+    /// A gateway that always serves FULL keyset pages — the shape whose
+    /// walk only a LIMIT or a bound can end.
+    fn full_page_guilds_gateway() -> impl Fn(&RecordedRequest) -> MockResponse {
+        |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return discord_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/discord.list_my_guilds" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let start = match body["input"]["after"].as_str() {
+                    None => 1,
+                    Some(after) => {
+                        after
+                            .strip_prefix("g-")
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .expect("cursor is a generated id")
+                            + 1
+                    }
+                };
+                let rows: Vec<Value> = (start..start + 200)
+                    .map(|i| guild_row(&format!("g-{i:04}")))
+                    .collect();
+                return MockResponse::ok(&envelope_ok(&json!({ "guilds": rows }).to_string()));
+            }
+            MockResponse::new(404, "{}")
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_stops_keyset_pagination_after_one_request() {
+        // The LIMIT/keyset interaction the strategy makes special: keyset's
+        // contract includes an extra terminating request, but a satisfied
+        // LIMIT must skip it — `done` is set on the LIMIT-satisfied path
+        // BEFORE advance() would prepare the next request, so a LIMIT 5
+        // scan against an endpoint the doc says 429s aggressively costs
+        // exactly ONE gateway call, not two and never a full walk.
+        let gateway = MockGateway::start(full_page_guilds_gateway()).await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_DISCORD_KEYSET_LIMIT", "guilds").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.me.guilds LIMIT 5").await;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 5, "LIMIT truncates the first page");
+        assert_eq!(
+            execute_inputs(&gateway).len(),
+            1,
+            "a satisfied LIMIT issues exactly one request — no empty terminator"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_last_row_cursor_fails_the_scan_as_a_loop() {
+        // The loop arm THROUGH THE PUBLIC ENTRY POINT (the unit tests
+        // cover Pagination::advance directly): a gateway that re-serves
+        // the same last row must fail the QUERY as a keyset loop — and
+        // because the cursor is ROW data, its value never appears.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return discord_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/discord.list_my_guilds" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let rows: Vec<Value> = match body["input"]["after"].as_str() {
+                    None => (1..=200).map(|i| guild_row(&format!("g-{i:04}"))).collect(),
+                    // The ordering violation: page 2 ends on the SAME row
+                    // page 1 ended on.
+                    Some(_) => vec![guild_row("g-0200")],
+                };
+                return MockResponse::ok(&envelope_ok(&json!({ "guilds": rows }).to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_DISCORD_KEYSET_LOOP", "guilds").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.me.guilds")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("a repeated cursor must fail the scan, not spin");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("pagination loop")
+                || rendered.contains("KeysetLoop")
+                || rendered.contains("loop"),
+            "the failure names the loop: {rendered}"
+        );
+        assert!(
+            rendered.contains("id"),
+            "names the cursor field: {rendered}"
+        );
+        assert!(
+            !rendered.contains("g-0200"),
+            "row values never appear in errors: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_cursor_field_fails_the_scan_with_identity() {
+        // The invalid-cursor arm through the public entry point: the last
+        // row's `id` is an empty STRING (a missing key would trip the
+        // non-nullable converter first — this is the shape that reaches
+        // the pagination gate).
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return discord_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/discord.list_my_guilds" {
+                let mut rows: Vec<Value> =
+                    (1..=199).map(|i| guild_row(&format!("g-{i:04}"))).collect();
+                rows.push(guild_row(""));
+                return MockResponse::ok(&envelope_ok(&json!({ "guilds": rows }).to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_DISCORD_KEYSET_EMPTY", "guilds").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.me.guilds")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("an unusable cursor field must fail the scan loudly");
+        let rendered = err.to_string();
+        assert!(rendered.contains("empty string"), "{rendered}");
+        assert!(rendered.contains("id"), "names the field: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn max_pages_budget_includes_the_keyset_terminator() {
+        // The strategy asymmetry, pinned: keyset's end-of-collection
+        // signal is its own EXTRA request, and that request spends a
+        // max_pages unit — so a collection of exactly max_pages full
+        // pages fails LOUDLY on the terminator instead of completing
+        // (cursor/page-number end inside page N and do not have this).
+        // Loud is the chosen side of the tradeoff; this test keeps it
+        // chosen rather than drifting silently.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return discord_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/discord.list_my_guilds" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let rows: Vec<Value> = match body["input"]["after"].as_str() {
+                    None => (1..=200).map(|i| guild_row(&format!("g-{i:04}"))).collect(),
+                    Some(_) => vec![],
+                };
+                return MockResponse::ok(&envelope_ok(&json!({ "guilds": rows }).to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_DISCORD_MAXPAGES
+max_pages: 1
+bindings:
+  - name: me
+    source_pack: discord
+    tables: [guilds]
+"#,
+        )
+        .expect("config parses");
+        let (_gateway, ctx) =
+            setup_with_gateway_config(gateway, "SKARDI_TEST_OC_DISCORD_MAXPAGES", config).await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.me.guilds")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("one full page + the terminator exceeds max_pages: 1");
+        let rendered = err.to_string();
+        assert!(rendered.contains("max_pages"), "{rendered}");
     }
 
     #[tokio::test]

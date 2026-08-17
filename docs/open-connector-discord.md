@@ -6,7 +6,8 @@ public Nitro sticker-pack catalog, as SQL tables over Open Connector's
 
 > **Status: live-verified 2026-08-07** against a real Discord account
 > through skardi-server: registration through LIVE discovery passed the
-> fingerprint gate; `guilds` (6 rows) and `sticker_packs` (14 rows)
+> fingerprint gate (for `sticker_packs` that pin is honest bookkeeping,
+> not a gate — see Design notes); `guilds` (6 rows) and `sticker_packs` (14 rows)
 > scanned end to end with every mapped column non-NULL on real rows; the
 > real keyset walk (`limit: 2`) covered 3 full pages plus the empty
 > terminator with no duplicate and no boundary drop. `connections`
@@ -58,6 +59,17 @@ SELECT name, sku_id
 FROM open_connector_query('saas', 'discord.sticker_packs', '{}');
 ```
 
+A raw one-liner through
+[`open_connector_scan`](open-connector.md#3-open_connector_scan--allowlisted-raw-read-actions)
+(requires the action in the gateway entry's `raw_action_allowlist`):
+
+```sql
+SELECT id, name
+FROM open_connector_scan('saas', 'discord.list_my_guilds',
+                         '{"with_counts": false}', '$.guilds')
+LIMIT 10;
+```
+
 ## Tables
 
 | Table | Action | Resources | Pagination | Filter pushdown |
@@ -83,6 +95,16 @@ Design notes:
 - **`connection_type`, not `type`**: the wire key collides with a SQL
   keyword and would force quoting into every query. The wire key is
   unchanged (`path: type`).
+- **`sticker_packs`' fingerprint is pinnable but unfalsifiable**: the
+  captured contract is a bare
+  `{type: object, properties: {}, additionalProperties: true}` — a
+  schema every output satisfies, so the pin can only catch the gateway
+  DECLARING a different schema, never the rows changing shape under the
+  same declaration. "Passed the fingerprint gate" therefore means less
+  for this table than for `guilds`/`connections`; the row shape rests
+  on the live pass and the conversion tests, and the gate's refusal arm
+  is exercised via `guilds` (`drifted_contract_fails_registration_not_
+  the_scan`).
 - **`permissions` maps the wire key `permissions_new`** (live-pass
   correction). The gateway calls the *unversioned* `discord.com/api`,
   which Discord serves as its legacy default version: there
@@ -98,14 +120,17 @@ Design notes:
   `permissions_new` to every guild object; 6/6 live rows carried it):
   the drift surfaces as a hard `ConversionFailed: missing key` with
   full column/page/row identity instead of a silently always-NULL
-  column. Upstream issue pending (the gateway should pin an API
-  version); this doc links it once filed.
-- **Rate limits are tight**: rapid successive calls to
-  `/users/@me/guilds` return HTTP 429, which the gateway surfaces as a
-  loud scan failure (not a silent stop). A full scan of *n* guilds
-  makes `ceil(n / 200) + 1` requests — the `+1` is the terminating
-  empty page keyset requires — so a typical account costs two requests
-  and stays comfortably clear.
+  column. **The blast radius is chosen, not accidental**: the converter
+  fails the PAGE, so on that drift every `me.guilds` query goes down —
+  including ones that never touch `permissions` — rather than one
+  column degrading to NULL. A table-wide loud outage was picked over a
+  quiet per-column hole because the alternative fails only when someone
+  finally reads `permissions` (possibly weeks after the move), while
+  the outage points at the cause on the FIRST query after it. The
+  tripwire is enforced by
+  `a_missing_permissions_new_key_fails_naming_the_permissions_column`.
+  Upstream issue pending (the gateway should pin an API version); this
+  doc links it once filed.
 - **`entitlements` is deferred, not shipped incomplete**: Discord's
   entitlements API paginates (`before`/`after`/`limit`), but the
   gateway's executor exposes only `exclude_ended`/`exclude_deleted` —
@@ -115,6 +140,36 @@ Design notes:
 - No table declares `error_path`: the provider's executors consume
   Discord's error responses themselves and return the gateway's
   failure envelope.
+
+## Rate limits and freshness
+
+- **429s are retried, then loud.** Rapid successive calls to
+  `/users/@me/guilds` rate-limit quickly, and the relay shape is
+  verified end to end in the gateway's own code: the Discord executor
+  maps a provider 429 to its `rate_limited` error code, and the
+  gateway's runtime API returns that as **HTTP 429** (pinned by its
+  `runtime-api` test). skardi's client retries HTTP 429 with bounded
+  backoff on every call class — for POST execute it is the one
+  retryable status (`RetryPolicy::NonIdempotent`) — so the back-to-back
+  requests keyset issues (including the empty terminator) ride the
+  retry budget rather than failing the scan. Only retry exhaustion
+  surfaces as a scan failure, and loudly.
+- **Request cost**: a full `guilds` scan of *n* rows makes
+  `ceil(n / 200) + 1` requests — the `+1` is keyset's terminating empty
+  page. That terminator **counts against the same `max_pages` budget**
+  (the bound is checked before each fetch), so a keyset table's
+  practical capacity is `max_pages − 1` full pages; a collection of
+  exactly `max_pages × 200` rows fails loudly with
+  `ScanBoundsExceeded` on the terminator rather than completing —
+  pinned by `max_pages_budget_includes_the_keyset_terminator`. Raise
+  `max_pages` if you genuinely have that many guilds.
+- **Freshness**: scans are live by default. Completed scans are cached
+  under the scan cache's usual key — binding, table, pushed inputs,
+  **and LIMIT** (a `LIMIT 5` result is complete *for that key* and is
+  never reused to answer an unlimited query). `connections` and
+  `sticker_packs` are single-request tables; `guilds` fetches pages on
+  demand and a satisfied LIMIT stops after page 1 without the
+  terminator (`limit_stops_keyset_pagination_after_one_request`).
 
 ## Auth
 
