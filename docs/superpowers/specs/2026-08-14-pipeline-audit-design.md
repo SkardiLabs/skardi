@@ -24,7 +24,7 @@ ad-hoc SQL or a named pipeline call.
 | column | value for a pipeline row |
 | --- | --- |
 | `statement_kind` | `"pipeline"` (ad-hoc rows keep `Query` / `Other` — the `Debug` form of the server's `StatementKind` classifier, not SQL verbs; correction from review, the original draft wrongly said `select` / `dml`) |
-| `sql` | the **pipeline name** — the template lives on disk with no secrets; the name is the join key to it and to `metadata.description`, which carries the purpose (written at promotion time) |
+| `sql` | **`name@version`** (from `metadata.version`; revised in review — originally the bare name, but rows outlive template revisions since retention is off by default, so the name alone stops answering *what SQL ran*) — the versioned template lives on disk with no secrets and `metadata.description` carries the purpose (written at promotion time) |
 | `session_id` | from the optional `X-Skardi-Session-Id` request header |
 | `ai_context` | NULL — purpose lives in the pipeline description; a synthetic object would masquerade as caller-sent data |
 | `max_rows` | 0, documented as "not applicable to pipeline rows" (column is NOT NULL; a sentinel beats a schema change) |

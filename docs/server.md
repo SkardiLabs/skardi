@@ -211,9 +211,12 @@ with the same record-before-execute and fail-closed semantics as `/query`
 (a failed pre-execution write returns 503 and the pipeline does not run).
 A pipeline row differs from an ad-hoc row in four ways:
 
-- `statement_kind` is `pipeline`, and the `sql` column holds the pipeline
-  *name*, not SQL — the template lives on disk, and the pipeline's
-  `description` carries its purpose.
+- `statement_kind` is `pipeline`, and the `sql` column holds
+  `name@version` (from `metadata.version`), not SQL — the versioned
+  template lives on disk, and the pipeline's `description` carries its
+  purpose. The version matters because pipelines are exactly the artifacts
+  the promotion loop edits, and rows are kept forever by default: without
+  it, "what SQL ran" stops being answerable once a template is revised.
 - Parameter values are never recorded: params are where PII lives.
   `ai_context` is always NULL on pipeline rows.
 - `max_rows` is stored as `0` (not applicable to pipelines).
@@ -223,16 +226,26 @@ A pipeline row differs from an ad-hoc row in four ways:
   ledger. The full error still goes to the HTTP caller.
 
 Scope of the guarantee: "parameter values never reach the ledger" covers the
-ledger only. The pipeline endpoint's HTTP *error responses* currently echo
-engine error text (which can quote parameter values back to the caller who
-sent them) — that surface is explicitly outside this guarantee and is
-tracked as a follow-up.
+ledger only. Four other surfaces on the pipeline path can still carry
+parameter values, all tracked in
+[#217](https://github.com/SkardiLabs/skardi/issues/217): HTTP `400` bodies
+(`error_details.unsupported_parameters` echoes offending values), HTTP `500`
+bodies (engine error text can quote values back to the caller who sent
+them), a `DEBUG`-level log of the substituted SQL, and — the widest one — an
+`ERROR`-level unsupported-parameter log that is on by default and fans out
+to any configured OTLP collector. Do not read the ledger's redaction as
+meaning the logs are covered: today it is the *logs* that reach external
+systems, not the ledger, which is a local `0600` file.
 
 Sizing note: with auditing on, every pipeline execution adds two
 `synchronous = FULL` ledger writes on the request's critical path — and the
-write is fail-closed, so a stalled or slow audit disk stalls pipeline
-execution rather than dropping records. Pipelines are typically the
-higher-QPS path (they are the promoted recurring queries), so put the
+write is fail-closed, so a failing audit disk turns into `503
+query_audit_error` rather than dropped records (each write is bounded by a
+5-second timeout, so a *hung* fsync is treated as a failed one instead of
+hanging the request). All ledger writes — `/query`'s included — funnel
+through one serialized writer thread, so this is a ceiling on total audited
+throughput, not just a per-request latency adder. Pipelines are typically
+the higher-QPS path (they are the promoted recurring queries), so put the
 ledger on storage you'd trust under your serving load.
 
 `session_id` comes from the optional `X-Skardi-Session-Id` request header
@@ -240,6 +253,13 @@ ledger on storage you'd trust under your serving load.
 parameter_validation_error` rather than silently dropped. With the header
 present, one agent session's ad-hoc queries and pipeline calls interleave
 under a single `session_id` in the ledger, ordered by `created_at`.
+
+Reachability caveat: producing that interleaving from the shipped CLI
+requires both halves, and today only `skardi run --session-id` exists —
+`skardi query` cannot send `ai_context` yet
+([#218](https://github.com/SkardiLabs/skardi/issues/218)), so the ad-hoc
+half of a CLI session lands unattributed until then. Direct HTTP callers
+get the full interleaving today.
 
 ---
 
