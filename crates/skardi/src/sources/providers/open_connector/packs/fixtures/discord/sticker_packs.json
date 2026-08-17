@@ -1,0 +1,46 @@
+{
+  "sticker_packs": [
+    {
+      "id": "796138864933863456",
+      "sku_id": "796138864933863454",
+      "name": "Mallow The Rascal",
+      "description": "Mallow is a quick-tempered but squishy rabbit who would go to battle for her friends.",
+      "stickers": [
+        {
+          "id": "796140620111544330",
+          "name": "Happy",
+          "tags": "mallow, happy, feliz, grin, smile, smiling, :), :D, :],c:, 😊, 😄, 😅, 😆, 😌, 🤗, 😁, 🙂, 😀, 😃, 😺, 😸, :happy, :feliz, :grin",
+          "type": 1,
+          "format_type": 3,
+          "description": "Mallow dances a joyful jig",
+          "asset": "",
+          "pack_id": "796138864933863456",
+          "sort_value": 4
+        }
+      ],
+      "cover_sticker_id": "796140731256799242",
+      "banner_asset_id": "796139192806801428"
+    },
+    {
+      "id": "847199849233514549",
+      "sku_id": "847199849233514547",
+      "name": "Wumpus Beyond",
+      "description": "Say hello to Wumpus!",
+      "stickers": [
+        {
+          "id": "749044136589393960",
+          "name": "Smile",
+          "tags": "wumpus, smile, smiling, grin, hehe, c:, :), :>, :], :D, happy, feliz, 😊, 😄, 😅, 😆, 😌, 🤗, 😁, 🙂, 😀, 😃, 😺, 😸, :smile",
+          "type": 1,
+          "format_type": 3,
+          "description": "Wumpus tilts his head back and smiles",
+          "asset": "",
+          "pack_id": "847199849233514549",
+          "sort_value": 11
+        }
+      ],
+      "cover_sticker_id": "749053689419006003",
+      "banner_asset_id": "761773777976819732"
+    }
+  ]
+}

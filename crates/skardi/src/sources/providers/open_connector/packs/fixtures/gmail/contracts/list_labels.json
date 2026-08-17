@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "properties": {
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail label ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Label display name."
+          },
+          "type": {
+            "type": "string",
+            "description": "Label type."
+          },
+          "messageListVisibility": {
+            "type": "string",
+            "enum": [
+              "show",
+              "hide"
+            ],
+            "description": "Whether messages with this label appear in the message list."
+          },
+          "labelListVisibility": {
+            "type": "string",
+            "enum": [
+              "labelShow",
+              "labelShowIfUnread",
+              "labelHide"
+            ],
+            "description": "Whether the label appears in the label list."
+          },
+          "color": {
+            "type": "object",
+            "properties": {
+              "textColor": {
+                "type": "string",
+                "description": "Hex text color."
+              },
+              "backgroundColor": {
+                "type": "string",
+                "description": "Hex background color."
+              }
+            },
+            "additionalProperties": false,
+            "description": "Gmail label color."
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "id",
+          "name",
+          "type"
+        ],
+        "description": "Gmail label."
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "labels"
+  ],
+  "description": "Label list."
+}

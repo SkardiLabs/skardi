@@ -1,0 +1,27 @@
+{
+  "connections": [
+    {
+      "id": "10000000000000000101",
+      "name": "Redacted Login One",
+      "type": "github",
+      "friend_sync": false,
+      "metadata_visibility": 1,
+      "show_activity": true,
+      "two_way_link": false,
+      "verified": true,
+      "visibility": 1
+    },
+    {
+      "id": "10000000000000000102",
+      "name": "Redacted Player Two",
+      "type": "steam",
+      "friend_sync": false,
+      "metadata_visibility": 1,
+      "show_activity": true,
+      "two_way_link": false,
+      "verified": false,
+      "visibility": 0,
+      "revoked": true
+    }
+  ]
+}

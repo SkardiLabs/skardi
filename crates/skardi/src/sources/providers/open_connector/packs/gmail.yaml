@@ -1,0 +1,143 @@
+# Gmail source pack. Wire contract reconciled against a live Open
+# Connector gateway (v1.3.4): the gmail executors REBUILD rows
+# (Slack-style normalization — camelCase keys, headers flattened into
+# `subject`/`sender`/`to`, `internalDate` re-emitted as an RFC 3339
+# `messageTimestamp`), except `list_labels`/`list_filters`, which pass
+# the provider objects through raw. Inputs are camelCase strict
+# (`pageToken`/`maxResults`; a wrong key is a hard 400). Cursor
+# termination is the executor's explicit `nextPageToken: null` (it maps
+# an absent provider token to null; both spell end-of-collection).
+# `list_labels`/`list_filters` declare no pagination inputs at all —
+# the single_page strategy exists for exactly this shape. Design
+# rationale lives in the module docs of packs/gmail.rs.
+kind: pack
+pack: gmail
+version: 1
+
+tables:
+  threads:
+    action: gmail.list_threads
+    row_path: "$.threads"
+    fingerprint: 329928190ec0a1de0fc75b229692b4212e34d6f0aa9b9ac5fe5405dad55b3b6b
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: maxResults
+      page_size: 500
+    # `verbose` is deliberately never sent: omitted means the summary
+    # shape (the executor checks `=== true`), and the hydrated variant
+    # costs one threads.get per row. `query` scopes the listing with
+    # Gmail's own search syntax — a free-text language no SQL predicate
+    # maps to faithfully, hence a resource, not a filter.
+    resources:
+      optional: [query]
+    columns:
+      - { name: thread_id, path: threadId, type: utf8, nullable: false }
+      # Gmail's excerpt of the latest message's body text (~first 100
+      # chars): truncated message CONTENT under gmail.readonly, not
+      # metadata — the pack doc's caveats call it out for PII sizing.
+      - { name: snippet, path: snippet, type: utf8, nullable: true }
+      - { name: history_id, path: historyId, type: utf8, nullable: true }
+
+  messages:
+    action: gmail.fetch_emails
+    row_path: "$.messages"
+    fingerprint: 2a656f5fcab965512e0ce1b6382466cda2bd79dc28924aae460e054ad3ea29bb
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: maxResults
+      # 100, not the schema's 500 ceiling: the executor hydrates every
+      # listed message with a metadata `messages.get` (batches of 10),
+      # so a page of N rows costs N+1 Gmail calls — the page size bounds
+      # that burst against the per-user quota.
+      page_size: 100
+    # detail=summary pins the bounded row shape: `ids` carries no
+    # metadata worth a table, `full` hydrates entire decoded bodies and
+    # attachment trees (unbounded row size). Bodies belong to a future
+    # content-oriented surface, not a listing table.
+    fixed_inputs:
+      detail: summary
+    resources:
+      optional: [query, labelIds, includeSpamTrash]
+    columns:
+      # Identity non-null, the rest nullable — the convention every pack
+      # follows, kept here as a deliberate trade rather than by default.
+      # Declared drift is caught at registration either way (the
+      # fingerprint hashes the whole schema, anyOf included). What
+      # nullability decides is the OTHER class: an upstream that stops
+      # emitting a key without changing its schema. Non-null would make
+      # that loud, but on a listing table with no filter pushdown it
+      # takes the whole table down with no WHERE to route around it —
+      # too blunt for descriptive columns. Accepted consequence: such
+      # drift shows up as a silently all-NULL column here, so treat a
+      # wholly-NULL subject/sender/labelIds as a contract alarm, not as
+      # mail without senders.
+      - { name: message_id, path: messageId, type: utf8, nullable: false }
+      - { name: thread_id, path: threadId, type: utf8, nullable: false }
+      - { name: label_ids, path: labelIds, type: utf8_list, nullable: true }
+      - { name: subject, path: subject, type: utf8, nullable: true }
+      - { name: sender, path: sender, type: utf8, nullable: true }
+      # Wire key `to`; renamed because TO is a reserved SQL keyword and a
+      # column requiring quotes on every reference is hostile to use.
+      - { name: to_addresses, path: to, type: utf8, nullable: true }
+      # The wire value is an RFC 3339 string (the executor re-emits
+      # Gmail's epoch-millis `internalDate`); `timestamp_ms_utc` names the
+      # Arrow storage — Timestamp(ms, UTC) — and its converter accepts
+      # RFC 3339 or epoch-millis wires alike, same as github's *_at columns.
+      - { name: message_timestamp, path: messageTimestamp, type: timestamp_ms_utc, nullable: true }
+
+  drafts:
+    action: gmail.list_drafts
+    row_path: "$.drafts"
+    fingerprint: 6e41cae2d3e764d7a5a92c220c4db2eb6c9b999eb3fc9b13f5bb514eabb877f1
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: maxResults
+      page_size: 500
+    # `verbose` deliberately never sent, as on threads: the summary row
+    # is the draft id plus its message identity; hydrated drafts cost a
+    # drafts.get per row and carry unbounded bodies.
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: message_id, path: message.messageId, type: utf8, nullable: true }
+      - { name: thread_id, path: message.threadId, type: utf8, nullable: true }
+
+  labels:
+    action: gmail.list_labels
+    row_path: "$.labels"
+    fingerprint: a7b2930049e2c32201c72f0c2378fd0e097c957321befc58593c3e8f35464566
+    # labels.list takes no pagination inputs (strict schema — injecting
+    # one would 400) and returns the complete collection in one response.
+    # next_cursor_path checks that premise rather than trusting it: the
+    # captured contract declares no token field at all, so this only ever
+    # fires if upstream starts paginating — loudly, instead of handing
+    # back a silently short label set.
+    pagination: { strategy: single_page, next_cursor_path: "$.nextPageToken" }
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: message_list_visibility, path: messageListVisibility, type: utf8, nullable: true }
+      - { name: label_list_visibility, path: labelListVisibility, type: utf8, nullable: true }
+      - { name: color, path: color, type: json, nullable: true }
+
+  filters:
+    action: gmail.list_filters
+    row_path: "$.filters"
+    fingerprint: 1ae3e5348bbef770d4a460d873847c49ca14227e0817b03782bf40a3ccdc7300
+    # Same single-response shape as labels, with the same premise check;
+    # requires the gmail.settings.basic OAuth scope (documented in the
+    # pack doc).
+    pagination: { strategy: single_page, next_cursor_path: "$.nextPageToken" }
+    columns:
+      # criteria/action are Gmail's own sparse objects (from/to/subject/
+      # query matchers; add/remove label mutations) — opaque JSON, the
+      # honest mapping for a pair of open-ended sparse shapes.
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: criteria, path: criteria, type: json, nullable: true }
+      - { name: action, path: action, type: json, nullable: true }

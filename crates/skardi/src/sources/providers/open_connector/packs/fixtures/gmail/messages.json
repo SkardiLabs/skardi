@@ -1,0 +1,42 @@
+{
+  "messages": [
+    {
+      "messageId": "1900000000000b00",
+      "threadId": "1900000000000a00",
+      "labelIds": [
+        "DRAFT"
+      ],
+      "subject": "Redacted subject 1",
+      "sender": "Redacted Sender <sender1@example.com>",
+      "to": "recipient1@example.com",
+      "messageTimestamp": "2026-07-30T08:15:42.000Z"
+    },
+    {
+      "messageId": "1900000000000b01",
+      "threadId": "1900000000000a01",
+      "labelIds": [
+        "CATEGORY_UPDATES",
+        "INBOX"
+      ],
+      "subject": "Redacted subject 2",
+      "sender": "Redacted Sender <sender2@example.com>",
+      "to": "recipient2@example.com",
+      "messageTimestamp": "2026-07-29T21:03:11.000Z"
+    },
+    {
+      "messageId": "1900000000000b02",
+      "threadId": "1900000000000a02",
+      "labelIds": [
+        "IMPORTANT",
+        "CATEGORY_UPDATES",
+        "INBOX"
+      ],
+      "subject": "Redacted subject 3",
+      "sender": "Redacted Sender <sender3@example.com>",
+      "to": "recipient3@example.com",
+      "messageTimestamp": "2026-07-28T14:00:00.000Z"
+    }
+  ],
+  "nextPageToken": "00000000000000000001",
+  "resultSizeEstimate": 201
+}

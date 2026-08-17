@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Gmail search query."
+    },
+    "verbose": {
+      "type": "boolean",
+      "description": "Hydrate each thread."
+    },
+    "maxResults": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500,
+      "description": "Maximum number of results to return."
+    },
+    "pageToken": {
+      "type": "string",
+      "description": "Opaque pagination token returned by Gmail."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The input payload for this action."
+}

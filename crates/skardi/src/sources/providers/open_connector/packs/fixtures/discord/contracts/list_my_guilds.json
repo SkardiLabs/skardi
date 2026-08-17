@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "guilds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "description": "A raw Discord API object."
+      },
+      "description": "Guilds returned by Discord."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "guilds"
+  ],
+  "description": "Discord guild list."
+}

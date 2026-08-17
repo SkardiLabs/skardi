@@ -242,8 +242,22 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         } => std::iter::once(cursor_param)
             .chain(page_size_param)
             .collect(),
-        PaginationStrategy::SinglePage => Vec::new(),
+        PaginationStrategy::Keyset {
+            cursor_param,
+            page_size_param,
+            ..
+        } => vec![cursor_param, page_size_param],
+        PaginationStrategy::SinglePage { .. } => Vec::new(),
     };
+    // An empty param name — under ANY strategy — would survive to scan
+    // time as a literal `""` input key: a strict gateway's 400 blamed on
+    // the request, or a lax gateway's page-1 refetch misdiagnosed as a
+    // provider loop. The loader's promise is one complete diagnostic
+    // pass at load, so the check covers every strategy here rather than
+    // living in one arm below.
+    if pagination_params.iter().any(|p| p.is_empty()) {
+        return Err(format!("{id}: pagination input names must be non-empty"));
+    }
     match table.pagination {
         PaginationStrategy::PageNumber {
             page_param,
@@ -275,7 +289,25 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 return Err(format!("{id}: pagination page size must be positive"));
             }
         }
-        PaginationStrategy::SinglePage => {}
+        PaginationStrategy::Keyset {
+            cursor_param,
+            page_size_param,
+            page_size,
+            ..
+        } => {
+            // (row_cursor_field is validated by the strategy itself at
+            // construction; empty input names are rejected above, for
+            // every strategy.)
+            if page_size_param == cursor_param {
+                return Err(format!(
+                    "{id}: pagination declares '{cursor_param}' as both the cursor and page-size input"
+                ));
+            }
+            if page_size == 0 {
+                return Err(format!("{id}: pagination page size must be positive"));
+            }
+        }
+        PaginationStrategy::SinglePage { .. } => {}
     }
     // NOT rejected on purpose: a filter input equal to a FIXED input is
     // the override mechanism itself (a pushed predicate replacing the
@@ -315,6 +347,21 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         if pagination_params.contains(key) {
             return Err(format!(
                 "{id}: fixed input '{key}' collides with a pagination input"
+            ));
+        }
+    }
+    // The fourth pair of the shared namespace: a pagination input naming a
+    // declared RESOURCE. exec.rs builds the request from the resource
+    // first and applies pagination LAST, so from page 2 onward the cursor
+    // would silently overwrite the binding's resource value — the scan
+    // walks a different collection than the binding asked for, with no
+    // error anywhere. (`after` is an entirely plausible name for both.)
+    for param in &pagination_params {
+        if table.declares_resource(param) {
+            return Err(format!(
+                "{id}: pagination input '{param}' collides with a declared resource — \
+                 pagination is applied last and would overwrite the binding's value \
+                 from page 2 onward"
             ));
         }
     }
@@ -460,6 +507,36 @@ enum PaginationDoc {
         #[serde(default)]
         has_more_path: Option<String>,
     },
+    /// No pagination envelope: the next cursor is a field of the previous
+    /// page's LAST ROW (Discord's `after`). Only an empty page terminates
+    /// — `page_size` is a throughput knob, never a termination signal, so
+    /// a provider that silently clamps it cannot truncate the scan.
+    Keyset {
+        cursor_input: String,
+        row_cursor_field: String,
+        page_size_input: String,
+        page_size: u32,
+    },
+    /// One request is the complete collection: for actions whose API has
+    /// no pagination at all (Discord's `/users/@me/connections`) or whose
+    /// strict input schema declares no pagination keys (Gmail
+    /// `list_labels` / `list_filters`), where injecting a page or cursor
+    /// parameter would be rejected as `invalid_input`. The scan issues a
+    /// single request and never advances. A braced variant (not a unit
+    /// one) so `deny_unknown_fields` keeps rejecting stray keys — a
+    /// misspelled pagination field must fail loudly, not ride along
+    /// ignored.
+    SinglePage {
+        /// Optional: where this action would spell "there is more", if it
+        /// has such a field. Declaring it turns the strategy's premise
+        /// into a checked assertion — a live continuation fails the scan
+        /// instead of returning a short answer as a complete one. Declare
+        /// it whenever the action's envelope has such a field, even one
+        /// the provider never populates today: that is precisely the
+        /// tripwire for the day it starts.
+        #[serde(default)]
+        next_cursor_path: Option<String>,
+    },
 }
 
 impl PaginationDoc {
@@ -490,6 +567,20 @@ impl PaginationDoc {
                 page_size_param: page_size_input.map(leak_str),
                 page_size,
                 has_more_path: has_more_path.map(leak_str),
+            },
+            Self::Keyset {
+                cursor_input,
+                row_cursor_field,
+                page_size_input,
+                page_size,
+            } => PaginationStrategy::Keyset {
+                cursor_param: leak_str(cursor_input),
+                row_cursor_field: leak_str(row_cursor_field),
+                page_size_param: leak_str(page_size_input),
+                page_size,
+            },
+            Self::SinglePage { next_cursor_path } => PaginationStrategy::SinglePage {
+                next_cursor_path: next_cursor_path.map(leak_str),
             },
         }
     }
@@ -667,6 +758,7 @@ mod tests {
         for (asset, yaml) in [
             ("mock.yaml", include_str!("mock.yaml")),
             ("github.yaml", include_str!("github.yaml")),
+            ("gmail.yaml", include_str!("gmail.yaml")),
             ("slack.yaml", include_str!("slack.yaml")),
             ("notion.yaml", include_str!("notion.yaml")),
             ("feishu.yaml", include_str!("feishu.yaml")),
@@ -735,6 +827,79 @@ tables:
         )
         .unwrap_err();
         assert!(err.contains("total_page_path"), "{err}");
+    }
+
+    #[test]
+    fn single_page_strategy_parses_and_rejects_stray_keys() {
+        // The pass side: an action with no pagination inputs at all
+        // (Gmail list_labels-style) declares `single_page` and converts
+        // to the engine's SinglePage strategy.
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("single_page is a valid strategy");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::SinglePage {
+                next_cursor_path: None
+            }
+        ));
+
+        // Its one optional parameter: the premise check. Declaring it does
+        // not make the strategy paginate — it makes a live continuation
+        // fail the scan instead of truncating it silently.
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page, next_cursor_path: "$.nextPageToken" }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("single_page accepts an optional next_cursor_path");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::SinglePage {
+                next_cursor_path: Some("$.nextPageToken")
+            }
+        ));
+
+        // The refusal side: single_page takes no OTHER parameters, and a
+        // stray key (a page size someone expected to matter) fails loudly
+        // instead of riding along ignored.
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page, page_size: 10 }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("page_size"), "{err}");
     }
 
     #[test]
@@ -814,6 +979,71 @@ tables:
             "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: epoch_seconds_string }",
         ))
         .expect("lower-bound inexact epoch mapping is legal");
+    }
+
+    #[test]
+    fn keyset_and_single_page_pagination_parse_and_validate() {
+        let base = |pagination: &str| {
+            format!(
+                r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {pagination}
+    columns:
+      - {{ name: id, path: id, type: utf8, nullable: false }}
+"#
+            )
+        };
+        // The two new spellings load…
+        let pack = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: id, page_size_input: limit, page_size: 200 }",
+        ))
+        .expect("keyset parses");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::Keyset { page_size: 200, .. }
+        ));
+        let pack = parse_pack(&base("{ strategy: single_page }")).expect("single_page parses");
+        assert!(matches!(
+            pack.tables[0].pagination,
+            PaginationStrategy::SinglePage { .. }
+        ));
+
+        // …and keyset's authoring mistakes fail at load.
+        let err = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: limit, row_cursor_field: id, page_size_input: limit, page_size: 200 }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("both the cursor and page-size input"), "{err}");
+        let err = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: id, page_size_input: limit, page_size: 0 }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("page size must be positive"), "{err}");
+        let err = parse_pack(&base(
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: \"$.id\", page_size_input: limit, page_size: 200 }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("relative to the row"), "{err}");
+        // An empty input name would reach the wire as a literal "" key —
+        // rejected at load, not misdiagnosed at scan time. The check is
+        // strategy-agnostic: every arm that names inputs is covered.
+        for pagination in [
+            "{ strategy: keyset, cursor_input: \"\", row_cursor_field: id, page_size_input: limit, page_size: 200 }",
+            "{ strategy: keyset, cursor_input: after, row_cursor_field: id, page_size_input: \"\", page_size: 200 }",
+            "{ strategy: cursor, cursor_input: \"\", next_cursor_path: \"$.next\", page_size: 100 }",
+            "{ strategy: cursor, cursor_input: cursor, next_cursor_path: \"$.next\", page_size_input: \"\", page_size: 100 }",
+            "{ strategy: page_number, page_input: \"\", page_size_input: perPage, page_size: 100 }",
+            "{ strategy: page_number, page_input: page, page_size_input: \"\", page_size: 100 }",
+        ] {
+            let err = parse_pack(&base(pagination)).unwrap_err();
+            assert!(err.contains("must be non-empty"), "{err}");
+        }
     }
 
     #[test]
@@ -914,6 +1144,30 @@ tables:
     columns:
       - { name: id, path: id, type: uint64, nullable: false }"#,
                 "collides with a pagination input",
+            ),
+            (
+                // The keyset shape the review named: `after` as BOTH a
+                // required resource and the cursor input — pagination is
+                // applied last, so page 2+ would silently overwrite the
+                // binding's value and walk a different collection.
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: keyset, cursor_input: after, page_size_input: limit, page_size: 10, row_cursor_field: id }
+    resources: { required: [after] }
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }"#,
+                "pagination input 'after' collides with a declared resource",
+            ),
+            (
+                // Same rule under page_number (page_size_input vs an
+                // optional resource) — the check covers every strategy.
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [perPage] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "pagination input 'perPage' collides with a declared resource",
             ),
             (
                 r#"    action: demo.list
