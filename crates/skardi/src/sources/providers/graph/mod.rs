@@ -43,9 +43,10 @@ pub mod value;
 mod view;
 
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::time::{Duration, SystemTime};
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use datafusion::catalog::{
     CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
@@ -139,8 +140,9 @@ pub async fn register_graph_source(
         // The engine-level entry registers no views (no session context
         // to put them in), so there are no contracts to re-prove.
         view_contracts: Arc::new(vec![]),
-        recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-        last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+        recovery_gate: Arc::new(AsyncMutex::new(())),
+        last_failed_recovery: Arc::new(StdMutex::new(None)),
+        health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
         validation_limit: config.max_connections as usize,
     });
     // Poisoning degrades gracefully (AGENTS.md convention) — and it also
@@ -229,6 +231,68 @@ pub async fn register_graph_tables(
     read_write: bool,
     hierarchy_level: HierarchyLevel,
 ) -> Result<(), GraphError> {
+    register_graph_tables_impl(
+        session_ctx,
+        sources,
+        name,
+        connection_string,
+        config,
+        read_write,
+        hierarchy_level,
+        true,
+    )
+    .await
+}
+
+/// [`register_graph_tables`] WITHOUT any network I/O: no preflight dial,
+/// no per-view validation probes — the same pure invariant and config
+/// checks, then a lazy pool and the declared schemas. Registered
+/// Degraded ("no startup probe"), so anything that ever does execute on
+/// this registration re-validates first, exactly like the unreachable-
+/// backend path.
+///
+/// Built for the server's PLANNING context: startup builds a planning
+/// context (pipeline SQL validation — plans only, never executes) and a
+/// runtime context, and registering both eagerly used to dial the
+/// backend and probe every view twice per boot — with a blackholed
+/// backend costing two serial preflight timeouts, and a flapping one
+/// able to classify differently in the two passes. Planning needs only
+/// the declared schemas, which are pure; the runtime registration owns
+/// the reported health.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_graph_tables_lazy(
+    session_ctx: &mut SessionContext,
+    sources: &GraphSources,
+    name: &str,
+    connection_string: &str,
+    config: Option<&GraphConfig>,
+    read_write: bool,
+    hierarchy_level: HierarchyLevel,
+) -> Result<(), GraphError> {
+    register_graph_tables_impl(
+        session_ctx,
+        sources,
+        name,
+        connection_string,
+        config,
+        read_write,
+        hierarchy_level,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_graph_tables_impl(
+    session_ctx: &mut SessionContext,
+    sources: &GraphSources,
+    name: &str,
+    connection_string: &str,
+    config: Option<&GraphConfig>,
+    read_write: bool,
+    hierarchy_level: HierarchyLevel,
+    eager: bool,
+) -> Result<(), GraphError> {
     // Invariants before any network I/O — a doomed registration must not
     // pay for a connection attempt (or hang on an unreachable host).
     if read_write {
@@ -292,138 +356,152 @@ pub async fn register_graph_tables(
         timeout,
         max_rows: config.max_rows,
     };
-    let (client, health): (Arc<dyn GraphClient>, GraphSourceHealth) = match AgeClient::connect(
-        name,
-        connection_string,
-        &config.graph_name,
-        config.username_env.as_deref(),
-        config.password_env.as_deref(),
-        config.max_connections,
-        timeout,
-    )
-    .await
-    {
-        Ok(client) => {
-            // Reachable backend: every view must prove itself NOW.
-            // Any failure is a contract violation, not an outage —
-            // refuse registration (nothing has been published yet).
-            // Validations are independent read-only probes fetching at
-            // most one row each — concurrent, BOUNDED at the pool's own
-            // max_connections: unbounded launch would park the excess in
-            // the pool's acquire queue, where acquire_timeout converts
-            // queue wait into a spurious refusal of a healthy backend
-            // (see validate_views_concurrently's doc).
-            let client: Arc<dyn GraphClient> = Arc::new(client);
-            let probe = Arc::new(GraphSourceHandle {
-                client: Arc::clone(&client),
-                bounds,
-                health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
-                view_contracts: Arc::new(vec![]),
-                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
-                validation_limit: config.max_connections as usize,
-            });
-            let contracts = config
-                .views
-                .iter()
-                .map(|view| {
-                    Ok(view::ViewContract {
-                        name: view.name.clone(),
-                        cypher: view.cypher.clone(),
-                        columns: view.declared_columns()?,
-                    })
+    // The view contracts are materialized ONCE (pure — declared columns
+    // parse, no I/O) and every consumer shares them: the registration
+    // validation probes, the handle's recovery set, and each view
+    // provider's planning schema. One construction site means the
+    // VALIDATED contract can never drift from the contract a scan later
+    // converts with.
+    let contracts: Arc<Vec<view::ViewContract>> = Arc::new(
+        config
+            .views
+            .iter()
+            .map(|view| {
+                Ok(view::ViewContract {
+                    name: view.name.clone(),
+                    cypher: view.cypher.clone(),
+                    columns: view.declared_columns()?,
                 })
-                .collect::<Result<Vec<_>, GraphError>>()?;
-            match view::validate_views_concurrently(
-                &probe,
-                contracts,
-                config.max_connections as usize,
-            )
-            .await
-            {
-                Ok(()) => (client, GraphSourceHealth::Healthy),
-                // The dial's classification applies to VALIDATION too: a
-                // view timing out (the shared backend momentarily loaded,
-                // or the view genuinely heavy) or the pool failing to
-                // hand out a connection are AVAILABILITY artifacts — the
-                // "transient blip" the design says must not hold every
-                // unrelated source hostage at startup — and a slow patch
-                // must not fail harder than an outright outage. Degrade;
-                // the first scan retries. Everything else (type
-                // mismatches, nullable violations, arity, backend 42804)
-                // is a genuine contract violation and keeps refusing.
-                Err(e) if is_availability_artifact(&e) => {
-                    tracing::warn!(
-                        source = name,
-                        error = %e,
-                        "graph view validation hit an availability artifact at \
-                         registration; registering degraded (first scan retries)"
-                    );
-                    (client, GraphSourceHealth::Degraded(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, GraphError>>()?,
+    );
+    let (client, health): (Arc<dyn GraphClient>, GraphSourceHealth) = if !eager {
+        // The lazy (planning) path: config errors (URL parse, unset
+        // credential env) still fail here — those are never transient —
+        // but no network I/O happens.
+        let client = AgeClient::connect_degraded(
+            name,
+            connection_string,
+            &config.graph_name,
+            config.username_env.as_deref(),
+            config.password_env.as_deref(),
+            config.max_connections,
+            timeout,
+        )?;
+        (
+            Arc::new(client) as Arc<dyn GraphClient>,
+            GraphSourceHealth::Degraded(
+                "registered without a startup probe (lazy registration; the first \
+                 query or scan validates against the live backend)"
+                    .to_string(),
+            ),
+        )
+    } else {
+        match AgeClient::connect(
+            name,
+            connection_string,
+            &config.graph_name,
+            config.username_env.as_deref(),
+            config.password_env.as_deref(),
+            config.max_connections,
+            timeout,
+        )
+        .await
+        {
+            Ok(client) => {
+                // Reachable backend: every view must prove itself NOW.
+                // Any failure is a contract violation, not an outage —
+                // refuse registration (nothing has been published yet).
+                // Validations are independent read-only probes fetching at
+                // most one row each — concurrent, BOUNDED at the pool's own
+                // max_connections: unbounded launch would park the excess in
+                // the pool's acquire queue, where acquire_timeout converts
+                // queue wait into a spurious refusal of a healthy backend
+                // (see validate_views_concurrently's doc).
+                let client: Arc<dyn GraphClient> = Arc::new(client);
+                match view::validate_views_concurrently(
+                    &client,
+                    bounds,
+                    contracts.as_ref().clone(),
+                    config.max_connections as usize,
+                )
+                .await
+                {
+                    Ok(()) => (client, GraphSourceHealth::Healthy),
+                    // The dial's classification applies to VALIDATION too: a
+                    // view timing out (the shared backend momentarily loaded,
+                    // or the view genuinely heavy) or the pool failing to
+                    // hand out a connection are AVAILABILITY artifacts — the
+                    // "transient blip" the design says must not hold every
+                    // unrelated source hostage at startup — and a slow patch
+                    // must not fail harder than an outright outage. Degrade;
+                    // the first scan retries. Everything else (type
+                    // mismatches, nullable violations, arity, backend 42804)
+                    // is a genuine contract violation and keeps refusing.
+                    Err(e) if is_availability_artifact(&e) => {
+                        tracing::warn!(
+                            source = name,
+                            error = %e,
+                            "graph view validation hit an availability artifact at \
+                             registration; registering degraded (first scan retries)"
+                        );
+                        (client, GraphSourceHealth::Degraded(e.to_string()))
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
-        }
-        Err(e) => {
-            // Only a genuine AVAILABILITY failure may degrade: DNS, a
-            // refused dial, a network timeout — no server answered.
-            // Everything else (bad credentials, AGE absent, the graph
-            // missing) is a configuration problem the server ANSWERED;
-            // degrading those would let a typo'd graph_name sail through
-            // startup and sit degraded forever, the exact failure the
-            // eager preflight exists to prevent.
-            if !matches!(e, GraphError::Unavailable { .. }) {
-                return Err(e);
+            Err(e) => {
+                // Only a genuine AVAILABILITY failure may degrade: DNS, a
+                // refused dial, a network timeout — no server answered.
+                // Everything else (bad credentials, AGE absent, the graph
+                // missing) is a configuration problem the server ANSWERED;
+                // degrading those would let a typo'd graph_name sail through
+                // startup and sit degraded forever, the exact failure the
+                // eager preflight exists to prevent.
+                if !matches!(e, GraphError::Unavailable { .. }) {
+                    return Err(e);
+                }
+                // Unreachable backend: register DEGRADED. The design's
+                // divergence from Open Connector's hard-fail health check —
+                // this backend is a shared external database whose transient
+                // blip must not hold every unrelated source hostage at
+                // startup. connect_degraded still hard-fails config errors
+                // (URL parse, unset credential env); only the dial is lazy.
+                tracing::warn!(
+                    source = name,
+                    error = %e,
+                    "graph backend unreachable at registration; registering degraded \
+                     (first scan retries the validation)"
+                );
+                let client = AgeClient::connect_degraded(
+                    name,
+                    connection_string,
+                    &config.graph_name,
+                    config.username_env.as_deref(),
+                    config.password_env.as_deref(),
+                    config.max_connections,
+                    timeout,
+                )?;
+                (
+                    Arc::new(client) as Arc<dyn GraphClient>,
+                    GraphSourceHealth::Degraded(e.to_string()),
+                )
             }
-            // Unreachable backend: register DEGRADED. The design's
-            // divergence from Open Connector's hard-fail health check —
-            // this backend is a shared external database whose transient
-            // blip must not hold every unrelated source hostage at
-            // startup. connect_degraded still hard-fails config errors
-            // (URL parse, unset credential env); only the dial is lazy.
-            tracing::warn!(
-                source = name,
-                error = %e,
-                "graph backend unreachable at registration; registering degraded \
-                 (first scan retries the validation)"
-            );
-            let client = AgeClient::connect_degraded(
-                name,
-                connection_string,
-                &config.graph_name,
-                config.username_env.as_deref(),
-                config.password_env.as_deref(),
-                config.max_connections,
-                timeout,
-            )?;
-            (
-                Arc::new(client) as Arc<dyn GraphClient>,
-                GraphSourceHealth::Degraded(e.to_string()),
-            )
         }
     };
     let handle = Arc::new(GraphSourceHandle {
         client,
         bounds,
         health: Arc::new(RwLock::new(health)),
-        // The recovery contract: a degraded source flips Healthy only
-        // after EVERY view re-validates — the same all-or-nothing line
-        // reachable registration holds.
-        view_contracts: Arc::new(
-            config
-                .views
-                .iter()
-                .map(|v| {
-                    Ok(view::ViewContract {
-                        name: v.name.clone(),
-                        cypher: v.cypher.clone(),
-                        columns: v.declared_columns()?,
-                    })
-                })
-                .collect::<Result<Vec<_>, GraphError>>()?,
-        ),
-        recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-        last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+        // The SAME contracts the validation probes just proved (or that
+        // recovery will re-prove): recovery asks one question — did the
+        // backend ANSWER — and any response flips Healthy, with a
+        // still-broken view failing its own scans (view::try_recover
+        // documents the policy).
+        view_contracts: Arc::clone(&contracts),
+        recovery_gate: Arc::new(AsyncMutex::new(())),
+        last_failed_recovery: Arc::new(StdMutex::new(None)),
+        health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
         validation_limit: config.max_connections as usize,
     });
     // Publish the handle BEFORE touching the catalog: register_catalog
@@ -448,22 +526,25 @@ pub async fn register_graph_tables(
             }
         }
     }
-    if !config.views.is_empty() {
+    if !contracts.is_empty() {
         let catalog = Arc::new(MemoryCatalogProvider::new());
         let schema_provider = Arc::new(MemorySchemaProvider::new());
         let build = (|| {
-            for view in &config.views {
+            // Each provider is built from the SAME contract the
+            // validation proved — never a third declared_columns()
+            // parse that could drift from it.
+            for contract in contracts.iter() {
                 let provider = GraphViewProvider::new(
                     Arc::clone(&handle),
-                    view.name.clone(),
-                    view.cypher.clone(),
-                    view.declared_columns()?,
+                    contract.name.clone(),
+                    contract.cypher.clone(),
+                    contract.columns.clone(),
                 );
                 schema_provider
-                    .register_table(view.name.clone(), Arc::new(provider))
+                    .register_table(contract.name.clone(), Arc::new(provider))
                     .map_err(|e| GraphError::InvalidConfig {
                         name: name.to_string(),
-                        reason: format!("failed to register view '{}': {e}", view.name),
+                        reason: format!("failed to register view '{}': {e}", contract.name),
                     })?;
             }
             catalog
@@ -476,6 +557,28 @@ pub async fn register_graph_tables(
         })();
         match build {
             Ok(catalog) => {
+                // TOCTOU re-check: the collision check above ran BEFORE
+                // the dial and the per-view validation — seconds of
+                // network — and register_catalog replaces
+                // unconditionally. The server's serial registration
+                // cannot race this, but an embedder registering
+                // concurrently through SessionContext clones can; a
+                // catalog that appeared in the window must survive.
+                if session_ctx.catalog(name).is_some() {
+                    sources
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(name);
+                    return Err(GraphError::InvalidConfig {
+                        name: name.to_string(),
+                        reason: format!(
+                            "a catalog named '{name}' was registered in this session \
+                             while the graph source was validating — the graph \
+                             source's views would replace it (register_catalog \
+                             replaces unconditionally); rename the source"
+                        ),
+                    });
+                }
                 session_ctx.register_catalog(name, catalog);
                 Ok(())
             }
@@ -654,8 +757,9 @@ views:
                 },
                 health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
                 view_contracts: Arc::new(vec![]),
-                recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-                last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+                recovery_gate: Arc::new(AsyncMutex::new(())),
+                last_failed_recovery: Arc::new(StdMutex::new(None)),
+                health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
                 validation_limit: config.max_connections as usize,
             }),
         );
@@ -853,7 +957,10 @@ views:
     async fn a_reserved_catalog_name_is_rejected_before_any_network() {
         // `register_catalog` replaces unconditionally, so a source named
         // `datafusion` would clobber the built-in catalog (and every
-        // table in it) — caught in pure validation, before any dial.
+        // table in it). The built-ins always exist in a fresh session,
+        // so the generic existing-catalog collision check refuses them
+        // before any dial (the server's validate_data_sources refuses
+        // reserved names for every catalog-mode source type besides).
         let mut ctx = SessionContext::new();
         let err = register_graph_tables(
             &mut ctx,
@@ -867,8 +974,75 @@ views:
         .await
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("reserved"), "{msg}");
+        assert!(msg.contains("already exists"), "{msg}");
         assert!(ctx.catalog("datafusion").is_some(), "built-in untouched");
+    }
+
+    #[tokio::test]
+    async fn lazy_registration_performs_no_dial_and_registers_degraded() {
+        // The planning-context seam: a BLACKHOLED backend (which would
+        // cost the eager path its full preflight timeout) registers
+        // instantly — no network I/O at all — with the declared schema
+        // planning and the health honestly Degraded.
+        let sources = sources();
+        let mut ctx = SessionContext::new();
+        let started = std::time::Instant::now();
+        register_graph_tables_lazy(
+            &mut ctx,
+            &sources,
+            "kg",
+            "postgres://10.255.255.1:5432/none",
+            Some(&config_with_views()),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .expect("lazy registration never dials");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no preflight was paid"
+        );
+        let df = ctx
+            .sql("SELECT user_name FROM kg.main.user_posts")
+            .await
+            .expect("the declared schema plans");
+        assert_eq!(df.schema().field(0).name(), "user_name");
+        let handle = Arc::clone(
+            sources
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("kg")
+                .expect("registered"),
+        );
+        {
+            let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+            match &*health {
+                GraphSourceHealth::Degraded(reason) => {
+                    assert!(reason.contains("without a startup probe"), "{reason}");
+                }
+                GraphSourceHealth::Healthy => panic!("lazy registration must not claim health"),
+            }
+        }
+        // Config errors still fail even on the lazy path.
+        let bad: GraphConfig =
+            serde_yaml::from_str("backend: age\ngraph_name: g\nusername_env: BAD NAME\n")
+                .expect("parses");
+        let mut ctx = SessionContext::new();
+        let err = register_graph_tables_lazy(
+            &mut ctx,
+            &sources,
+            "kg2",
+            DEAD_URL,
+            Some(&bad),
+            false,
+            HierarchyLevel::Catalog,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("environment variable NAME"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

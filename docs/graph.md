@@ -99,7 +99,14 @@ hold every unrelated source hostage at startup):
   the query; a too-slow view is a boot-time diagnosis, not an outage) —
   fails startup loudly. When degraded does apply: views still register
   with their declared (planning-sufficient) schemas, `GET /data_source`
-  reports `status: "degraded"`, and the first scan retries.
+  reports `status: "degraded"` — plus `status_reason` (the registration
+  error, so "unreachable since boot" and "a view's contract is broken"
+  are distinguishable) and `status_changed_at` (when the status last
+  transitioned; health is written only at registration and recovery,
+  so this is NOT a liveness probe) — and the first scan retries. The
+  registration preflight is bounded by `min(query_timeout_seconds,
+  30s)`: the traversal timeout may be hours, but boot never blocks
+  longer than 30s on a dead host.
 
   **Recovery answers one question — did the backend come back?** A
   retry that gets ANY response from the server (all views validate, or

@@ -125,6 +125,18 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
         .expect("graph source should be listed");
     assert_eq!(entry["type"], "graph");
     assert_eq!(entry["status"], "degraded");
+    // The status can explain itself: the degraded REASON (the typed
+    // registration error) and the transition instant ride along, so a
+    // client can tell "unreachable since boot" from "one view's
+    // contract is broken" without reading server logs.
+    let reason = entry["status_reason"]
+        .as_str()
+        .expect("degraded carries a reason");
+    assert!(reason.contains("is unreachable"), "{reason}");
+    let changed_at = entry["status_changed_at"]
+        .as_str()
+        .expect("the transition instant is reported");
+    assert!(changed_at.ends_with('Z'), "RFC 3339: {changed_at}");
     assert!(entry["path"].is_null(), "graph exposes no path");
     assert_eq!(entry["url"], "postgres://127.0.0.1:1/none");
     let tables = entry["tables"].as_array().expect("tables array");
@@ -158,6 +170,10 @@ async fn an_unreachable_backend_registers_degraded_and_reports_status() {
         .cloned()
         .expect("graph source still listed");
     assert_eq!(entry["status"], "healthy");
+    assert!(
+        entry["status_reason"].is_null(),
+        "a healthy source carries no degraded reason"
+    );
 }
 
 /// `type: graph` without `hierarchy_level: catalog` is a config error, not
@@ -304,6 +320,7 @@ mod params_through_real_substitution {
                 view_contracts: Arc::new(vec![]),
                 recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
                 last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+                health_changed_at: Arc::new(std::sync::Mutex::new(std::time::SystemTime::now())),
                 validation_limit: 4,
             }),
         );
@@ -377,6 +394,7 @@ spec:
                 view_contracts: Arc::new(vec![]),
                 recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
                 last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+                health_changed_at: Arc::new(std::sync::Mutex::new(std::time::SystemTime::now())),
                 validation_limit: 4,
             }),
         )])));
@@ -488,7 +506,7 @@ spec:
         assert!(missing.is_empty(), "{missing:?}");
         assert_eq!(
             unsupported,
-            vec!["params: unsupported JSON object".to_string()],
+            vec!["params: unsupported JSON value (an object)".to_string()],
             "an object-shaped param is refused by KIND — the value itself \
              never appears in the 400"
         );

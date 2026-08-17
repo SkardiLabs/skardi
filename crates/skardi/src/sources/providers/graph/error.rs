@@ -197,17 +197,9 @@ impl GraphError {
 }
 
 /// The JSON kind of a value, for type-mismatch diagnostics — kinds only,
-/// never the value itself.
-pub fn json_kind(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
+/// never the value itself. Re-exported from the shared util so the
+/// vocabulary has exactly one definition repo-wide.
+pub use crate::util::json::json_kind;
 
 #[cfg(test)]
 mod tests {

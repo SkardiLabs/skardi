@@ -387,7 +387,7 @@ bindings:
                     "the valid first row converts; the error names the bad row"
                 );
                 assert_eq!(expected, "non-negative integer");
-                assert_eq!(found, "string");
+                assert_eq!(found, "a string");
             }
             other => panic!("expected ConversionFailed, got {other}"),
         }

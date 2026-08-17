@@ -65,7 +65,13 @@ pub struct GraphConfig {
     pub max_connections: u32,
     /// YAML catalog views (milestone 4): each becomes the catalog table
     /// `<source>.main.<name>` — fixed Cypher plus a declared schema.
-    #[serde(default)]
+    ///
+    /// An explicit YAML null (`views: ~`, `views: null` — the natural
+    /// leftover of commenting out every entry) reads as the empty list,
+    /// same as the absent key: `#[serde(default)]` fires only when the
+    /// KEY is missing, so without the custom deserializer the null
+    /// spelling would abort server boot with an opaque serde error.
+    #[serde(default, deserialize_with = "views_null_is_empty")]
     pub views: Vec<GraphView>,
 }
 
@@ -102,6 +108,15 @@ pub struct GraphViewColumn {
 
 fn default_nullable() -> bool {
     true
+}
+
+/// `views: ~` / `views: null` → the empty list (see the field's doc).
+fn views_null_is_empty<'de, D>(deserializer: D) -> Result<Vec<GraphView>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let views: Option<Vec<GraphView>> = Deserialize::deserialize(deserializer)?;
+    Ok(views.unwrap_or_default())
 }
 
 impl GraphView {
@@ -157,20 +172,15 @@ impl GraphConfig {
     /// ad-hoc surface: a keyword-shaped string literal in a view's
     /// Cypher false-positives, and the author rephrases.
     pub fn validate(&self, name: &str, connection_string: &str) -> Result<(), GraphError> {
-        // The source name becomes a CATALOG name; `datafusion` and
-        // `information_schema` are DataFusion's built-ins, and
-        // `register_catalog` replaces unconditionally — a source with
-        // either name would silently clobber the default catalog (and
-        // every table in it).
-        if matches!(name, "datafusion" | "information_schema") {
-            return Err(GraphError::InvalidConfig {
-                name: name.to_string(),
-                reason: "the source name is reserved: it would replace DataFusion's \
-                         built-in catalog of the same name (register_catalog replaces \
-                         unconditionally); choose another name"
-                    .to_string(),
-            });
-        }
+        // NO reserved-name check here, deliberately: the clobber hazard
+        // ("datafusion"/"information_schema" would replace DataFusion's
+        // built-in catalog) belongs to the CATALOG registration path,
+        // and this validate also runs for register_graph_source — the
+        // engine API that registers no catalog at all. The server's
+        // validate_data_sources refuses reserved names for EVERY
+        // catalog-mode source type, and register_graph_tables' generic
+        // existing-catalog collision check covers the built-ins too
+        // (they always exist in a fresh session).
         if self.backend != "age" {
             return Err(GraphError::InvalidConfig {
                 name: name.to_string(),
@@ -362,16 +372,20 @@ impl GraphConfig {
                         ),
                     });
                 }
-                if GraphType::parse(&column.r#type).is_none() {
-                    return Err(GraphError::InvalidConfig {
-                        name: name.to_string(),
-                        reason: format!(
-                            "view '{}' column '{}': unknown type '{}' (accepted types: {})",
-                            view.name, column.name, column.r#type, ACCEPTED_TYPES
-                        ),
-                    });
-                }
             }
+            // Type names are parsed by ONE authority — declared_columns()
+            // — so the two error wordings can never drift; validate only
+            // re-frames its failure with the source identity.
+            view.declared_columns().map_err(|e| {
+                let reason = match e {
+                    GraphError::InvalidConfig { reason, .. } => reason,
+                    other => other.to_string(),
+                };
+                GraphError::InvalidConfig {
+                    name: name.to_string(),
+                    reason: format!("view '{}': {reason}", view.name),
+                }
+            })?;
         }
         Ok(())
     }
@@ -412,14 +426,20 @@ password_env: AGE_PG_PASS
     }
 
     #[test]
-    fn reserved_catalog_names_are_rejected() {
-        // The source name becomes a catalog name, and register_catalog
-        // replaces unconditionally — `datafusion` would clobber the
-        // built-in catalog with every table in it.
-        let c = base();
-        for reserved in ["datafusion", "information_schema"] {
-            let err = c.validate(reserved, "postgres://h/db").unwrap_err();
-            assert!(err.to_string().contains("reserved"), "{err}");
+    fn explicit_null_views_read_as_the_empty_list() {
+        // `views: ~` / `views: null` is what commenting out every entry
+        // leaves behind; #[serde(default)] fires only for the ABSENT key,
+        // so without the custom deserializer these spellings abort boot.
+        for spelling in [
+            "backend: age\ngraph_name: g\nviews: ~\n",
+            "backend: age\ngraph_name: g\nviews: null\n",
+            "backend: age\ngraph_name: g\nviews:\n",
+            "backend: age\ngraph_name: g\n",
+        ] {
+            let c: GraphConfig = serde_yaml::from_str(spelling)
+                .unwrap_or_else(|e| panic!("{spelling:?} must parse: {e}"));
+            assert!(c.views.is_empty(), "{spelling:?}");
+            c.validate("kg", "postgres://h/db").expect("valid");
         }
     }
 

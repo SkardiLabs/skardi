@@ -113,16 +113,10 @@ impl RowPath {
     }
 }
 
-/// Short human-readable kind of a JSON value, for error messages.
+/// Short human-readable kind of a JSON value, for error messages —
+/// the shared repo-wide vocabulary, in this module's String shape.
 pub(crate) fn json_kind(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(_) => "a boolean".to_string(),
-        Value::Number(_) => "a number".to_string(),
-        Value::String(_) => "a string".to_string(),
-        Value::Array(_) => "an array".to_string(),
-        Value::Object(_) => "an object".to_string(),
-    }
+    crate::util::json::json_kind(value).to_string()
 }
 
 #[cfg(test)]

@@ -41,7 +41,10 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::time::SystemTime;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -61,7 +64,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use futures::stream::{self, TryStreamExt};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::client::{GraphClient, QueryBounds, validate_params};
 use super::error::{GraphError, json_kind};
@@ -132,7 +135,7 @@ pub struct GraphSourceHandle {
     /// already flipped it), and only the first arrival pays the
     /// validation; the rest see Healthy on wake-up. Never held across a
     /// healthy fast path — that stays a lock-free read.
-    pub recovery_gate: Arc<tokio::sync::Mutex<()>>,
+    pub recovery_gate: Arc<AsyncMutex<()>>,
     /// Backoff for FAILED recovery attempts: while the backend stays
     /// down, every query would otherwise re-pay the full re-validation
     /// (N views × timeout, serialized behind the gate — a dashboard
@@ -141,12 +144,19 @@ pub struct GraphSourceHandle {
     /// next attempt before `recovery_backoff_interval` elapses returns
     /// the cached degraded error instead. `tokio::time::Instant`, so the
     /// paused-clock tests can drive it.
-    pub last_failed_recovery: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    pub last_failed_recovery: Arc<StdMutex<Option<tokio::time::Instant>>>,
     /// The bounded-concurrency limit for view (re)validation — the
     /// pool's own `max_connections`, so no probe ever queues behind its
     /// siblings in the acquire queue (see
     /// `view::validate_views_concurrently`).
     pub validation_limit: usize,
+    /// When `health` last TRANSITIONED (registration set it, or a
+    /// recovery flipped it Healthy) — surfaced by /data_source so a
+    /// client can tell "degraded since boot" from "recovered an hour
+    /// ago". NOT a liveness probe timestamp: health is only written at
+    /// registration and recovery, and the one-way-Healthy caveat on
+    /// `health` applies to this instant too.
+    pub health_changed_at: Arc<StdMutex<SystemTime>>,
 }
 
 /// Registration-time health of a graph source.
@@ -267,7 +277,7 @@ impl TableFunctionImpl for CypherQueryFunction {
         reject_mutations(&cypher).map_err(plan_error)?;
 
         let params: Value = match params_json.as_deref() {
-            None | Some("") => Value::Object(serde_json::Map::new()),
+            None | Some("") => Value::Object(Map::new()),
             Some(text) => {
                 let parsed: Value = serde_json::from_str(text).map_err(|e| {
                     plan_error(GraphError::InvalidParams {
@@ -724,80 +734,72 @@ pub(crate) fn degraded_reason(handle: &GraphSourceHandle) -> Option<String> {
     }
 }
 
-/// Flip a recovered source Healthy. Idempotent — racing scanners may
-/// both write; the transition is benign either way.
-fn mark_healthy(handle: &GraphSourceHandle) {
+/// Flip a recovered source Healthy and stamp the transition instant.
+/// Idempotent — racing scanners may both write; the transition is
+/// benign either way. The ONLY place health moves (recovery goes
+/// through here; registration sets the initial state at construction),
+/// so the timestamp cannot miss a transition.
+pub(crate) fn mark_healthy(handle: &GraphSourceHandle) {
     *handle.health.write().unwrap_or_else(|p| p.into_inner()) = GraphSourceHealth::Healthy;
+    *handle
+        .health_changed_at
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = SystemTime::now();
 }
 
 /// Wrap an execution failure with the degraded registration context
-/// when the source is degraded; pass healthy sources' errors through
-/// untouched (they never carried a registration failure). The
-/// registration reason names the source (the clients build it from
-/// `backend_error`, whose text carries `on '{source}'`).
+/// when the source is degraded AND the fresh failure actually looks
+/// like unavailability (the same classification registration uses).
+/// A caller-caused failure — a Cypher syntax error from the backend,
+/// `RowCapExceeded`, a statement timeout — keeps ITS OWN headline even
+/// on a degraded source: handing a caller who typo'd their Cypher a
+/// boot-time connectivity story as the lead buries the error they can
+/// act on. Healthy sources' errors pass through untouched (they never
+/// carried a registration failure). The registration reason names the
+/// source (the clients build it from `backend_error`, whose text
+/// carries `on '{source}'`).
 fn degraded_execution_error(degraded: Option<String>, e: GraphError) -> DataFusionError {
     match degraded {
-        Some(reason) => DataFusionError::Execution(format!(
+        Some(reason) if super::is_availability_artifact(&e) => DataFusionError::Execution(format!(
             "graph source is registered DEGRADED (registration error: {reason}); \
-             the query was retried against the backend and failed: {e}"
+                 the query was retried against the backend and failed: {e}"
         )),
-        None => execution_error(e),
+        _ => execution_error(e),
     }
 }
 
-/// Recovery after a successful backend answer on a degraded source:
-/// re-prove the source's view contracts, then flip Healthy. This holds
-/// the recovery path to the same contract strength as reachable
-/// registration (which refuses a source unless EVERY view validates) —
-/// otherwise a contract-violating view would silently downgrade from
-/// "registration refused" to "scan-time conversion error" the moment an
-/// ad-hoc query flipped the source. For a view-less source there is
-/// nothing to re-prove and the successful query is itself the evidence.
-/// NEVER fails the caller: on this path the caller's own query has
-/// ALREADY SUCCEEDED, and whether an UNRELATED view honors its contract
-/// is a different question from whether these rows are good — failing
-/// here would discard a correct answer, permanently (a source with one
-/// mis-declared view would fail every ad-hoc query and graph_schema —
-/// the agent's discovery surface — forever, with a restart then refusing
-/// to start). Instead: flip Healthy only on a clean re-validation, stay
-/// Degraded otherwise with a warning naming the cause, and let the
-/// broken view's OWN scan be the loud failure (view.rs::ensure_healthy
-/// keeps that behaviour).
+/// The ad-hoc path's recovery entry point, after the caller's own query
+/// SUCCEEDED against a degraded source (the query is itself the
+/// evidence the backend answered). The sequence and policy live in
+/// [`super::view::try_recover`] — one copy for both entry points; this
+/// wrapper only maps the outcome onto the ad-hoc failure policy: NEVER
+/// fail the caller (their rows are good — discarding a correct answer
+/// over a sibling view's contract, or over backoff bookkeeping, would
+/// disable every ad-hoc query and graph_schema — the agent's discovery
+/// surface — for no caller-visible reason). Log and continue; the view
+/// path owns the loud degraded diagnostics.
 async fn recover_if_degraded(handle: &Arc<GraphSourceHandle>, degraded: bool) {
     if !degraded {
         return;
     }
-    // SINGLE-FLIGHT with the view path's recovery (the same gate):
-    // concurrent recoveries would each re-prove every view. Re-check
-    // under the gate — a racing winner (view scan or sibling query)
-    // already flipped the source and there is nothing left to prove.
-    let _gate = handle.recovery_gate.lock().await;
-    if degraded_reason(handle).is_none() {
-        return;
-    }
-    // Inside the failed-recovery backoff window, don't re-pay the
-    // re-validation: the caller's own query already succeeded (or the
-    // caller's own failure is being reported), and the view path owns
-    // the loud degraded diagnostics.
-    if super::view::recovery_backoff_remaining(handle).is_some() {
-        return;
-    }
-    match super::view::revalidate_all_views(handle).await {
-        // The backend answered — success or a contract violation both
-        // flip Healthy; a broken view's own scans carry its typed error.
-        Ok(()) => mark_healthy(handle),
-        Err(e) if !super::view::recovery_keeps_degraded(&e) => {
+    match super::view::try_recover(handle).await {
+        super::view::RecoveryOutcome::AlreadyHealthy
+        | super::view::RecoveryOutcome::Recovered { broken_view: None } => {}
+        super::view::RecoveryOutcome::Recovered {
+            broken_view: Some(e),
+        } => {
             tracing::warn!(
                 error = %e,
                 "graph source recovered (the backend answered), but a view failed \
                  re-validation — its own scans will report this"
             );
-            mark_healthy(handle);
         }
-        Err(e) => {
-            super::view::arm_recovery_backoff(handle);
+        // Inside the backoff window nothing was probed — the caller's
+        // own query already succeeded, so there is nothing to report.
+        super::view::RecoveryOutcome::BackoffActive { .. } => {}
+        super::view::RecoveryOutcome::StillUnavailable { error, .. } => {
             tracing::warn!(
-                error = %e,
+                error = %error,
                 "the ad-hoc query succeeded but view re-validation found the backend \
                  unavailable — the source stays degraded"
             );
@@ -816,7 +818,7 @@ pub(crate) fn cypher_batches(
     limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
-        let degraded = degraded_reason(&handle);
+        let degraded_at_start = degraded_reason(&handle).is_some();
         let rows = match handle
             .client
             .execute(&cypher, &params, columns.len(), handle.bounds, limit)
@@ -825,14 +827,19 @@ pub(crate) fn cypher_batches(
             Ok(stream) => stream.try_collect::<Vec<_>>().await,
             Err(e) => Err(e),
         };
-        let rows = match (rows, degraded) {
-            (Ok(rows), degraded) => {
+        let rows = match rows {
+            Ok(rows) => {
                 // The backend answered — re-prove the view contracts and
                 // flip Healthy (a no-op for healthy sources).
-                recover_if_degraded(&handle, degraded.is_some()).await;
+                recover_if_degraded(&handle, degraded_at_start).await;
                 rows
             }
-            (Err(e), degraded) => return Err(degraded_execution_error(degraded, e)),
+            // Health is RE-READ at failure time, not the pre-execution
+            // snapshot: a concurrent scan may have won recovery while
+            // this query was in flight, and citing a registration error
+            // that no longer applies would contradict what
+            // /data_source reports in the same instant.
+            Err(e) => return Err(degraded_execution_error(degraded_reason(&handle), e)),
         };
         let mut batches = Vec::with_capacity(rows.len() / CONVERSION_BATCH_ROWS + 1);
         for (chunk_idx, chunk) in rows.chunks(CONVERSION_BATCH_ROWS).enumerate() {
@@ -857,13 +864,15 @@ fn labels_batch(
     limit: Option<usize>,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>> {
     stream::once(async move {
-        let degraded = degraded_reason(&handle);
+        let degraded_at_start = degraded_reason(&handle).is_some();
         let labels = match handle.client.labels(handle.bounds, limit).await {
             Ok(labels) => {
-                recover_if_degraded(&handle, degraded.is_some()).await;
+                recover_if_degraded(&handle, degraded_at_start).await;
                 labels
             }
-            Err(e) => return Err(degraded_execution_error(degraded, e)),
+            // Same failure-time re-read as cypher_batches — the
+            // pre-execution snapshot can be stale by now.
+            Err(e) => return Err(degraded_execution_error(degraded_reason(&handle), e)),
         };
         let mut names = arrow::array::StringBuilder::new();
         let mut kinds = arrow::array::StringBuilder::new();
@@ -941,8 +950,9 @@ mod tests {
             },
             health: Arc::new(RwLock::new(GraphSourceHealth::Healthy)),
             view_contracts: Arc::new(vec![]),
-            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+            recovery_gate: Arc::new(AsyncMutex::new(())),
+            last_failed_recovery: Arc::new(StdMutex::new(None)),
+            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
             validation_limit: 4,
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
@@ -969,11 +979,27 @@ mod tests {
             .expect("collect")
     }
 
-    /// A client whose every call fails with the given backend error —
-    /// the degraded-retry tests' still-down backend.
+    /// A client whose every call fails — availability-shaped
+    /// (`Unavailable`, the still-down backend of the degraded-retry
+    /// tests) or, with `availability: false`, a backend ANSWER (the
+    /// caller-caused-failure tests).
     #[derive(Debug)]
     struct FailingClient {
         message: String,
+        availability: bool,
+    }
+
+    impl FailingClient {
+        fn error(&self) -> GraphError {
+            if self.availability {
+                GraphError::Unavailable {
+                    source_name: "kg".to_string(),
+                    reason: self.message.clone(),
+                }
+            } else {
+                GraphError::backend("kg", "42601", &self.message)
+            }
+        }
     }
 
     #[async_trait]
@@ -986,7 +1012,7 @@ mod tests {
             _bounds: QueryBounds,
             _limit: Option<usize>,
         ) -> Result<BoxStream<'static, Result<Vec<Value>, GraphError>>, GraphError> {
-            Err(GraphError::backend("kg", "io", &self.message))
+            Err(self.error())
         }
 
         async fn labels(
@@ -994,7 +1020,7 @@ mod tests {
             _bounds: QueryBounds,
             _limit: Option<usize>,
         ) -> Result<Vec<(String, String)>, GraphError> {
-            Err(GraphError::backend("kg", "io", &self.message))
+            Err(self.error())
         }
     }
 
@@ -1010,8 +1036,9 @@ mod tests {
             },
             health: Arc::new(RwLock::new(health)),
             view_contracts: Arc::new(vec![]),
-            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+            recovery_gate: Arc::new(AsyncMutex::new(())),
+            last_failed_recovery: Arc::new(StdMutex::new(None)),
+            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
             validation_limit: 4,
         });
         Arc::new(RwLock::new(HashMap::from([("kg".to_string(), handle)])))
@@ -1042,6 +1069,7 @@ mod tests {
             ),
             Arc::new(FailingClient {
                 message: "could not acquire a connection".to_string(),
+                availability: true,
             }),
         );
         let ctx = SessionContext::new();
@@ -1082,6 +1110,43 @@ mod tests {
             .await
             .expect_err("labels fail too");
         assert!(err.to_string().contains("DEGRADED"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_caller_error_on_a_degraded_source_keeps_its_own_headline() {
+        // The degraded framing is for failures that LOOK like
+        // unavailability. A caller who typo'd their Cypher gets the
+        // backend's syntax error as the headline — not a boot-time
+        // connectivity story with their actual error trailing after a
+        // colon (and the source stays degraded either way; a backend
+        // ANSWER on the error path is handled by recovery, not here).
+        let sources = sources_with_health(
+            GraphSourceHealth::Degraded(
+                "graph backend error on 'kg' [io]: Connection refused".to_string(),
+            ),
+            Arc::new(FailingClient {
+                message: "syntax error at or near \"RETRUN\"".to_string(),
+                availability: false,
+            }),
+        );
+        let ctx = SessionContext::new();
+        register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("registration");
+        let err = ctx
+            .sql(
+                "SELECT name FROM cypher_query('kg', 'RETRUN 1', '{}', \
+                 '{\"name\": \"string\"}')",
+            )
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("the backend refuses the Cypher");
+        let msg = err.to_string();
+        assert!(msg.contains("syntax error"), "{msg}");
+        assert!(
+            !msg.contains("DEGRADED"),
+            "a caller-caused failure is not wrapped in connectivity framing: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1151,8 +1216,9 @@ mod tests {
                 "connection refused at startup".to_string(),
             ))),
             view_contracts: Arc::new(vec![contract]),
-            recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
-            last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+            recovery_gate: Arc::new(AsyncMutex::new(())),
+            last_failed_recovery: Arc::new(StdMutex::new(None)),
+            health_changed_at: Arc::new(StdMutex::new(SystemTime::now())),
             validation_limit: 4,
         });
         let sources: GraphSources =
@@ -1183,6 +1249,7 @@ mod tests {
             GraphSourceHealth::Healthy,
             Arc::new(FailingClient {
                 message: "syntax error at or near".to_string(),
+                availability: false,
             }),
         );
         let ctx = SessionContext::new();

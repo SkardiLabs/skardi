@@ -1,6 +1,24 @@
-//! Canonical JSON helpers shared by fingerprinting and cache keys.
+//! Canonical JSON helpers shared by fingerprinting and cache keys —
+//! plus [`json_kind`], the one kind-vocabulary for error messages.
 
 use serde_json::Value;
+
+/// The JSON kind of a value, for diagnostics — kinds only, NEVER the
+/// value itself (the never-echo-values discipline every error path in
+/// this repo shares). This is the single definition: graph errors, Open
+/// Connector conversion and row-path extraction, and the server's
+/// parameter substitution all point here, so the vocabulary cannot
+/// drift between the places that enforce the same guarantee.
+pub fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
 /// Serialize a JSON value in canonical form: object keys sorted recursively,
 /// arrays kept in order, strings via `serde_json` escaping. Two semantically
 /// equal values always produce the same string, which is what compatibility

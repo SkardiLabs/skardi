@@ -99,8 +99,26 @@ pub struct DataSourceResponse {
     /// boot, so its status is observable here. Every other source fails
     /// startup when unreachable, hence is healthy by construction and
     /// omits the field.
+    ///
+    /// NOT a liveness probe, in either direction: "degraded" advances to
+    /// "healthy" only when query traffic recovers the source (a rarely
+    /// queried source can report degraded after its backend recovered),
+    /// and "healthy" is one-way — a backend that died after recovery
+    /// still reads healthy until its queries fail. `status_reason` and
+    /// `status_changed_at` carry what IS known: why, and since when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Why the source is degraded (the registration/recovery error) —
+    /// "unreachable since boot" and "one view's contract is broken" call
+    /// for different operator actions, and the bare status string could
+    /// not distinguish them. Absent when healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// When `status` last TRANSITIONED (RFC 3339): registration time, or
+    /// the recovery that flipped it healthy. Same non-probe caveat as
+    /// `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_changed_at: Option<String>,
     /// Registered tables with their schemas
     pub tables: Vec<TableInfo>,
 }
@@ -523,21 +541,40 @@ pub async fn get_data_sources(
         // GraphSourceHandle::health) — "healthy" means "recovered since
         // registration", and a backend that died afterwards still reads
         // healthy until its queries fail.
-        let status = if data_source.source_type == DataSourceType::Graph {
-            let sources = app_state
-                .graph_sources
-                .read()
-                .unwrap_or_else(|p| p.into_inner());
-            sources.get(&data_source.name).map(|handle| {
-                let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
-                match &*health {
-                    GraphSourceHealth::Healthy => "healthy".to_string(),
-                    GraphSourceHealth::Degraded(_) => "degraded".to_string(),
+        let (status, status_reason, status_changed_at) =
+            if data_source.source_type == DataSourceType::Graph {
+                let sources = app_state
+                    .graph_sources
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner());
+                match sources.get(&data_source.name) {
+                    Some(handle) => {
+                        let (status, reason) = {
+                            let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+                            match &*health {
+                                GraphSourceHealth::Healthy => ("healthy".to_string(), None),
+                                // The payload is the registration error's summary
+                                // — the identity-only, value-free text the graph
+                                // module builds — so relaying it here leaks
+                                // nothing new.
+                                GraphSourceHealth::Degraded(reason) => {
+                                    ("degraded".to_string(), Some(reason.clone()))
+                                }
+                            }
+                        };
+                        let changed_at = *handle
+                            .health_changed_at
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let changed_at = chrono::DateTime::<chrono::Utc>::from(changed_at)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        (Some(status), reason, Some(changed_at))
+                    }
+                    None => (None, None, None),
                 }
-            })
-        } else {
-            None
-        };
+            } else {
+                (None, None, None)
+            };
 
         // Catalog-mode sources register a whole catalog named after the
         // source — their tables live at `<source>.<schema>.<table>`, not
@@ -582,6 +619,8 @@ pub async fn get_data_sources(
             path,
             url,
             status,
+            status_reason,
+            status_changed_at,
             tables,
         });
     }
@@ -627,17 +666,10 @@ fn row_cell_to_sql(v: &Value) -> String {
 
 /// The JSON kind name for parameter error messages — parameter VALUES
 /// never appear in errors (they can carry user data; the 400 body and
-/// logs must not echo them), only their shape.
-fn json_kind(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
+/// logs must not echo them), only their shape. The vocabulary is the
+/// repo-wide shared definition (`skardi::util::json::json_kind`) so the
+/// never-echo-values discipline is maintained in one place.
+use skardi::util::json::json_kind;
 
 /// Substitute `{param}` placeholders in `sql` with their SQL-safe values.
 ///
@@ -765,7 +797,7 @@ pub fn substitute_sql_params(
                         json_kind(param_value)
                     );
                     unsupported_params.push(format!(
-                        "{}: unsupported JSON {}",
+                        "{}: unsupported JSON value ({})",
                         param_name,
                         json_kind(param_value)
                     ));
@@ -978,11 +1010,11 @@ mod tests {
         // about a value (values can carry user data).
         for (v, kind) in [
             (serde_json::Value::Null, "null"),
-            (serde_json::json!(true), "boolean"),
-            (serde_json::json!(42.5), "number"),
-            (serde_json::json!("s3cret"), "string"),
-            (serde_json::json!(["s3cret"]), "array"),
-            (serde_json::json!({"k": "s3cret"}), "object"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(42.5), "a number"),
+            (serde_json::json!("s3cret"), "a string"),
+            (serde_json::json!(["s3cret"]), "an array"),
+            (serde_json::json!({"k": "s3cret"}), "an object"),
         ] {
             assert_eq!(json_kind(&v), kind);
             assert!(!kind.contains("s3cret"));

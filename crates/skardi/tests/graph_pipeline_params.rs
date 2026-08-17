@@ -101,6 +101,7 @@ async fn pipeline_params_placeholder_reaches_cypher_params() {
             view_contracts: Arc::new(vec![]),
             recovery_gate: Arc::new(tokio::sync::Mutex::new(())),
             last_failed_recovery: Arc::new(std::sync::Mutex::new(None)),
+            health_changed_at: Arc::new(std::sync::Mutex::new(std::time::SystemTime::now())),
             validation_limit: 4,
         }),
     )])));

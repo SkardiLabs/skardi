@@ -15,6 +15,7 @@
 //! whole-graph `RETURN` fails loudly at `max_rows + 1` instead of
 //! buffering the world.
 
+use std::io::ErrorKind as IoErrorKind;
 use std::time::Duration;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,6 +192,18 @@ impl Drop for OpenTxnGuard {
     }
 }
 
+/// Ceiling on the REGISTRATION preflight (dial + per-connection setup +
+/// the graph-existence probe). `query_timeout_seconds` means "how long
+/// may a traversal run" — config permits a day — and must not double as
+/// "how long may server startup block on a dead host": the preflight is
+/// three tiny statements, so 30s is generous. The trade this ceiling
+/// makes explicit: a backend that WOULD answer slower than the bound
+/// classifies Unavailable and boots degraded (the first scan carries the
+/// real diagnosis) — acceptable for a probe this small, unlike the
+/// serial multi-minute boot stall the uncapped bound allowed. The pool's
+/// own acquire_timeout stays at the full query bound.
+const PREFLIGHT_TIMEOUT_CEILING: Duration = Duration::from_secs(30);
+
 /// Apache AGE over the workspace's sqlx-postgres stack.
 #[derive(Debug)]
 pub struct AgeClient {
@@ -225,10 +238,12 @@ impl AgeClient {
         // sizing. Running the same per-connection setup here first means
         // auth failures, setup failures, and the graph probe all fail
         // FAST with their real, named error (the eager-fail contract in
-        // mod.rs's docstring). The whole preflight is bounded by the
-        // same acquire_timeout: a blackholed address or a stuck TLS/auth
-        // handshake must not hold startup hostage — it degrades like any
-        // other unreachable backend.
+        // mod.rs's docstring). The whole preflight is bounded by
+        // min(acquire_timeout, PREFLIGHT_TIMEOUT_CEILING): a blackholed
+        // address or a stuck TLS/auth handshake must not hold startup
+        // hostage — it degrades like any other unreachable backend — and
+        // an operator raising query_timeout_seconds for heavy traversals
+        // must not thereby raise the boot stall (see the ceiling's doc).
         let preflight = async {
             let mut conn = sqlx::postgres::PgConnection::connect_with(&options)
                 .await
@@ -260,13 +275,14 @@ impl AgeClient {
             }
             Ok::<_, GraphError>(())
         };
-        tokio::time::timeout(acquire_timeout, preflight)
+        let preflight_timeout = acquire_timeout.min(PREFLIGHT_TIMEOUT_CEILING);
+        tokio::time::timeout(preflight_timeout, preflight)
             .await
             .map_err(|_| GraphError::Unavailable {
                 source_name: source_name.to_string(),
                 reason: format!(
                     "the registration preflight did not complete within {}s",
-                    acquire_timeout.as_secs()
+                    preflight_timeout.as_secs()
                 ),
             })??;
         Ok(Self::from_pool(
@@ -805,14 +821,25 @@ fn backend_error(source: &str, e: &sqlx::Error) -> GraphError {
 }
 
 /// Map a DIAL failure (the registration preflight's `connect_with`).
-/// Only a transport-level `io` error means "no server answered" — the
-/// degraded-registration qualifier. A `Database` error here is the
+/// Only a transport-level `io` error that says "no server answered"
+/// qualifies for degraded registration. A `Database` error here is the
 /// SERVER answering (bad credentials, `28P01`), and a TLS failure is a
 /// client configuration problem; both stay [`backend_error`] so they
 /// hard-fail registration instead of degrading.
+///
+/// The `Io` variant is NOT uniformly "nobody answered": with this
+/// workspace's `tls-rustls` feature the TLS handshake runs through
+/// `RustlsSocket::complete_io()`, and rustls wraps TLS protocol errors —
+/// certificate-verification failures included — as
+/// `io::Error(InvalidData)`, which sqlx's `handshake()` propagates into
+/// `Error::Io` (`sqlx::Error::Tls` covers only pre-handshake
+/// configuration failures: bad CA file, invalid hostname, client-cert
+/// setup). `InvalidData` therefore means we WERE talking to something
+/// whose TLS setup is broken — a misconfiguration that must refuse boot,
+/// exactly like a bad credential, never sit degraded.
 fn connect_error(source: &str, e: &sqlx::Error) -> GraphError {
     match e {
-        sqlx::Error::Io(io) => GraphError::Unavailable {
+        sqlx::Error::Io(io) if io.kind() != IoErrorKind::InvalidData => GraphError::Unavailable {
             source_name: source.to_string(),
             reason: io.to_string(),
         },
@@ -859,6 +886,42 @@ pub fn validate_params(params: &Value) -> Result<(), GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_io_errors_split_on_talking_versus_nobody_answered() {
+        // rustls wraps TLS protocol errors — certificate verification
+        // included — as io::Error(InvalidData), and sqlx's handshake
+        // propagates that into Error::Io. That is a CONFIGURATION
+        // failure of a server we reached: it must hard-fail (a Backend
+        // classification), never sit degraded behind boot.
+        let tls = sqlx::Error::Io(std::io::Error::new(
+            IoErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(
+            !matches!(connect_error("kg", &tls), GraphError::Unavailable { .. }),
+            "a TLS handshake failure is not an outage"
+        );
+        // A refused/unroutable dial IS "nobody answered" — the degraded
+        // qualifier.
+        for kind in [
+            IoErrorKind::ConnectionRefused,
+            IoErrorKind::TimedOut,
+            IoErrorKind::ConnectionReset,
+        ] {
+            let e = sqlx::Error::Io(std::io::Error::new(kind, "dial failed"));
+            assert!(
+                matches!(connect_error("kg", &e), GraphError::Unavailable { .. }),
+                "{kind:?} must degrade"
+            );
+        }
+        // A non-Io variant (a Database answer, pool bookkeeping) never
+        // takes the Unavailable path either.
+        assert!(!matches!(
+            connect_error("kg", &sqlx::Error::PoolTimedOut),
+            GraphError::Unavailable { .. }
+        ));
+    }
 
     #[test]
     fn dollar_tags_never_collide_with_the_text() {

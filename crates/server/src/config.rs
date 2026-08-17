@@ -230,6 +230,11 @@ pub enum ConfigError {
     #[error("Duplicate data source name: {name}")]
     DuplicateDataSourceName { name: String },
 
+    #[error(
+        "Data source '{name}' uses a reserved name: a catalog-mode source registers a DataFusion catalog under its own name, and register_catalog replaces the built-in '{name}' catalog (and every table in it) unconditionally. Choose another name."
+    )]
+    ReservedCatalogSourceName { name: String },
+
     #[error("Data source registration failed: {name} - {error}")]
     DataSourceRegistrationFailed { name: String, error: String },
 
@@ -476,10 +481,18 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
 
     let mut session_ctx = SessionContext::new_with_state(state);
 
-    // Register data sources with optimizer registry support
-    register_data_sources_with_registry(&mut session_ctx, &data_sources, &optimizer_registry)
-        .await
-        .with_context(|| "Failed to register data sources")?;
+    // Register data sources with optimizer registry support. This is
+    // the PLANNING context: it validates pipeline SQL and is discarded
+    // for execution purposes, so expensive-startup providers (graph)
+    // register lazily from declared schemas (see RegistrationPass).
+    register_data_sources_for_pass(
+        &mut session_ctx,
+        &data_sources,
+        &optimizer_registry,
+        RegistrationPass::Planning,
+    )
+    .await
+    .with_context(|| "Failed to register data sources")?;
 
     // Register UDFs
     optimizer_registry
@@ -1022,6 +1035,20 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
         if CATALOG_SUPPORTED_SOURCES.contains(&source.source_type)
             && source.hierarchy_level == HierarchyLevel::Catalog
         {
+            // A catalog-mode source's name becomes a DataFusion CATALOG
+            // name, and register_catalog replaces unconditionally — a
+            // source named after a built-in would silently swallow the
+            // default catalog and every table in it. This guards EVERY
+            // catalog-registering type (rss, open_connector, clickhouse …),
+            // not just graph: the hazard is the catalog path, not any one
+            // provider. (Engine-API paths that register no catalog — e.g.
+            // graph's register_graph_source — are deliberately exempt.)
+            if matches!(source.name.as_str(), "datafusion" | "information_schema") {
+                return Err(ConfigError::ReservedCatalogSourceName {
+                    name: source.name.clone(),
+                }
+                .into());
+            }
             for conflicting in &["table", "schema", "database"] {
                 if source
                     .options
@@ -1200,19 +1227,53 @@ pub async fn register_data_sources(
     Ok(())
 }
 
+/// Which of the two startup contexts a registration serves. The
+/// PLANNING context (load_server_config) only validates pipeline SQL —
+/// it plans, never executes — so providers whose startup work is
+/// expensive network I/O can register lazily there from declared
+/// schemas; the RUNTIME context (setup_app_state) is the one queries
+/// execute on and the one /data_source reports, so it pays the real
+/// preflight. Today only graph branches on this (it is the one type
+/// with per-view startup probes on top of the dial); the other
+/// twice-dialing types (mongodb, dynamodb, open_connector) are
+/// pre-existing candidates for the same treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationPass {
+    Planning,
+    Runtime,
+}
+
 /// Register data sources with DataFusion SessionContext and OptimizerRegistry
 pub async fn register_data_sources_with_registry(
     session_ctx: &mut SessionContext,
     data_sources: &[DataSource],
     optimizer_registry: &Arc<crate::optimizer_registry::OptimizerRegistry>,
 ) -> Result<()> {
+    register_data_sources_for_pass(
+        session_ctx,
+        data_sources,
+        optimizer_registry,
+        RegistrationPass::Runtime,
+    )
+    .await
+}
+
+/// [`register_data_sources_with_registry`], with the pass named — the
+/// planning context registers graph sources lazily (no dial, no
+/// per-view probes; see [`RegistrationPass`]).
+pub async fn register_data_sources_for_pass(
+    session_ctx: &mut SessionContext,
+    data_sources: &[DataSource],
+    optimizer_registry: &Arc<crate::optimizer_registry::OptimizerRegistry>,
+    pass: RegistrationPass,
+) -> Result<()> {
     tracing::info!(
-        "Registering {} data sources with DataFusion and optimizer registry",
+        "Registering {} data sources with DataFusion and optimizer registry ({pass:?} pass)",
         data_sources.len()
     );
 
     for source in data_sources {
-        register_data_source(session_ctx, source, Some(optimizer_registry))
+        register_data_source_for_pass(session_ctx, source, Some(optimizer_registry), pass)
             .await
             .with_context(|| format!("Failed to register data source: {}", source.name))?;
     }
@@ -1226,6 +1287,21 @@ async fn register_data_source(
     session_ctx: &mut SessionContext,
     source: &DataSource,
     optimizer_registry: Option<&Arc<crate::optimizer_registry::OptimizerRegistry>>,
+) -> Result<()> {
+    register_data_source_for_pass(
+        session_ctx,
+        source,
+        optimizer_registry,
+        RegistrationPass::Runtime,
+    )
+    .await
+}
+
+async fn register_data_source_for_pass(
+    session_ctx: &mut SessionContext,
+    source: &DataSource,
+    optimizer_registry: Option<&Arc<crate::optimizer_registry::OptimizerRegistry>>,
+    pass: RegistrationPass,
 ) -> Result<()> {
     tracing::info!(
         "Registering data source: {} (type: {:?})",
@@ -1667,30 +1743,44 @@ async fn register_data_source(
             let graph_sources = optimizer_registry
                 .map(|r| r.graph_sources())
                 .unwrap_or_default();
-            // KNOWN DOUBLING (the repo's existing pattern, but with a new
-            // cost class here): startup builds a PLANNING context
-            // (load_server_config) and a RUNTIME context (setup_app_state),
-            // and each one runs this registration — so the preflight dial,
-            // every view's LIMIT-1 validation Cypher, and the health
-            // classification all execute twice per boot, and two pools per
-            // source exist until sqlx's idle reaper collects the planning
-            // one. A flaky backend can therefore classify differently in
-            // the two passes; only the RUNTIME registration's health is
-            // what /data_source reports. Deduplicating the contexts (or
-            // registering the planning pass from declared schemas only —
-            // the degraded path's exact contract) is tracked as follow-up
-            // work; recording the cost here is this PR's honest floor.
-            register_graph_tables(
-                session_ctx,
-                &graph_sources,
-                &source.name,
-                connection_string,
-                source.graph.as_ref(),
-                source.access_mode.is_read_write(),
-                source.hierarchy_level,
-            )
-            .await
-            .map_err(|e| {
+            // Startup builds a PLANNING context (load_server_config) and
+            // a RUNTIME context (setup_app_state), and both register
+            // every source. Graph would be the most expensive occupant
+            // of that doubling — the preflight dial PLUS every view's
+            // LIMIT-1 validation Cypher — so the planning pass registers
+            // it LAZILY: pure validation and declared schemas only, no
+            // network I/O, no second pool dial (planning only plans;
+            // pipelines execute on the runtime engine, and /data_source
+            // reports the runtime registration's health). This also
+            // removes the two-pass disagreement window a flapping
+            // backend had: exactly one pass classifies health.
+            let result = match pass {
+                RegistrationPass::Runtime => {
+                    register_graph_tables(
+                        session_ctx,
+                        &graph_sources,
+                        &source.name,
+                        connection_string,
+                        source.graph.as_ref(),
+                        source.access_mode.is_read_write(),
+                        source.hierarchy_level,
+                    )
+                    .await
+                }
+                RegistrationPass::Planning => {
+                    skardi::sources::providers::graph::register_graph_tables_lazy(
+                        session_ctx,
+                        &graph_sources,
+                        &source.name,
+                        connection_string,
+                        source.graph.as_ref(),
+                        source.access_mode.is_read_write(),
+                        source.hierarchy_level,
+                    )
+                    .await
+                }
+            };
+            result.map_err(|e| {
                 tracing::error!("Graph registration failed for '{}': {:?}", source.name, e);
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
