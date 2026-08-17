@@ -8,7 +8,7 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode};
 use datafusion::prelude::SessionContext;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -227,8 +227,87 @@ async fn successful_execution_is_audited_with_session() {
     assert_eq!(row["statement_kind"], "pipeline");
     assert_eq!(row["sql"], TEST_PIPELINE_NAME);
     assert_eq!(row["status"], "succeeded");
-    assert!(row["row_count"].as_u64().is_some());
+    // Deterministic fixture: Apple rows at 1299.0 and 999.0 pass the 1500.0
+    // cap; the 2499.0 one doesn't. An exact count catches a handler that
+    // records the wrong number, which "is a number" would wave past.
+    assert_eq!(row["row_count"], json!(2));
     assert!(row["ai_context"].is_null());
+}
+
+/// The branch's central invariant, pinned end-to-end: no parameter value may
+/// reach any column of the ledger row — not `sql`, not `error`, not a future
+/// `ai_context` change. Greps the whole serialized row for a canary value so
+/// the test survives refactors of which column would leak.
+#[tokio::test]
+async fn parameter_values_never_reach_the_ledger() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let resp = execute_with_headers(
+        &state,
+        &[("x-skardi-session-id", "sess-pii")],
+        json!({"brand": "PII-CANARY-42", "max_price": 1.0}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let rows = store.list_by_session("sess-pii").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        !rows[0].to_string().contains("PII-CANARY-42"),
+        "a parameter value reached the ledger: {}",
+        rows[0]
+    );
+}
+
+/// The `to_str` reject (a header value outside visible ASCII) can't be built
+/// through `execute_with_headers` — `Request::builder().header()` refuses the
+/// bytes client-side — so this constructs the `HeaderValue` directly.
+#[tokio::test]
+async fn non_visible_ascii_session_header_is_400_and_records_nothing() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let app = configure_routes(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/{TEST_PIPELINE_NAME}/execute"))
+        .header("content-type", "application/json")
+        .header(
+            "x-skardi-session-id",
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        )
+        .body(Body::from(valid_params().to_string()))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+    assert!(
+        body["error"].as_str().unwrap().contains("visible ASCII"),
+        "expected the ASCII reject, got {body}"
+    );
+    assert_eq!(store.count().await.unwrap(), 0);
+}
+
+/// The docs promise the header is validated whether or not auditing is
+/// enabled; this pins the audit-off half of that promise.
+#[tokio::test]
+async fn session_header_is_validated_even_with_auditing_off() {
+    let (state, _tmp) = make_app_state(None).await;
+    let resp = execute_with_headers(
+        &state,
+        &[("x-skardi-session-id", "x".repeat(201).as_str())],
+        valid_params(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("x-skardi-session-id"),
+        "expected the session-header reject, got {body}"
+    );
 }
 
 #[tokio::test]
@@ -289,15 +368,26 @@ async fn malformed_session_header_is_400_and_records_nothing() {
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
     for bad in [String::new(), "x".repeat(201)] {
+        // The body must be one that would otherwise succeed, so the header is
+        // the only possible reject cause — an invalid body 400s with the same
+        // error_type at parameter validation, which would make this test pass
+        // even with the header check deleted.
         let resp = execute_with_headers(
             &state,
             &[("x-skardi-session-id", bad.as_str())],
-            json!({"limit": 5}),
+            valid_params(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_to_json(resp).await;
         assert_eq!(body["error_type"], json!("parameter_validation_error"));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("x-skardi-session-id"),
+            "expected the session-header reject, got {body}"
+        );
     }
     assert_eq!(store.count().await.unwrap(), 0);
 }
@@ -306,18 +396,27 @@ async fn malformed_session_header_is_400_and_records_nothing() {
 async fn duplicate_session_header_is_400_and_records_nothing() {
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    // Valid body for the same reason as the malformed-header test above: the
+    // header must be the only possible reject cause.
     let resp = execute_with_headers(
         &state,
         &[
             ("x-skardi-session-id", "sess-1"),
             ("x-skardi-session-id", "sess-2"),
         ],
-        json!({"limit": 5}),
+        valid_params(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("parameter_validation_error"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must not be sent more than once"),
+        "expected the duplicate-header reject, got {body}"
+    );
     assert_eq!(store.count().await.unwrap(), 0);
 }
 
