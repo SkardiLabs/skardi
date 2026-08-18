@@ -37,6 +37,18 @@ const TEST_JOB_NAME: &str = "ingest-all";
 /// `sql = "<name>@<version>"`.
 const TEST_JOB_VERSION: &str = "1.0.0";
 
+/// Name of the second fixture job registered by `make_app_state`: its SQL
+/// requires a `min_id` parameter that the submit-time param-validation step
+/// checks for *inside* `executor.submit` — i.e. strictly after the
+/// existence pre-check, header validation, and audit write the handler does
+/// itself. Submitting with no parameters is therefore a deterministic,
+/// post-audit-write rejection (`JobSubmitError::MissingParameters`),
+/// exercising the `Err` arm of the outcome-stamp contract.
+const REJECTING_JOB_NAME: &str = "ingest-filtered";
+
+/// Version set in the rejecting fixture job's `metadata.version`.
+const REJECTING_JOB_VERSION: &str = "1.0.0";
+
 fn write_yaml(path: &std::path::Path, content: &str) {
     let mut f = std::fs::File::create(path).unwrap();
     f.write_all(content.as_bytes()).unwrap();
@@ -88,6 +100,33 @@ spec:
     let mut jobs_map = HashMap::new();
     jobs_map.insert(job.name().to_string(), job);
 
+    // A second job whose SQL requires a parameter (`min_id`) that the
+    // caller never supplies in the rejection tests below — `executor.submit`
+    // rejects it with `JobSubmitError::MissingParameters` *after* the
+    // handler's own existence/header/audit-write steps have already run,
+    // giving a deterministic post-audit-write failure to assert on.
+    let rejecting_yaml_path = tmp.path().join("j2.yaml");
+    write_yaml(
+        &rejecting_yaml_path,
+        r#"
+kind: job
+metadata:
+  name: "ingest-filtered"
+  version: "1.0.0"
+spec:
+  query: |
+    SELECT id FROM src WHERE id >= {min_id}
+  destination:
+    table: "dest"
+    mode: append
+"#,
+    );
+    let rejecting_job = JobDefinition::load_from_file(&rejecting_yaml_path, Arc::clone(&ctx))
+        .await
+        .unwrap()
+        .unwrap();
+    jobs_map.insert(rejecting_job.name().to_string(), rejecting_job);
+
     let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
     let data_source_types: HashMap<String, DataSourceType> = HashMap::new();
     let executor = Some(Arc::new(JobExecutor::new(
@@ -133,17 +172,17 @@ async fn body_to_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// POST `body` to `/jobs/{TEST_JOB_NAME}/run`, attaching the given extra
-/// headers.
-async fn submit_with_headers(
+/// POST `body` to `/jobs/{job_name}/run`, attaching the given extra headers.
+async fn submit_job_with_headers(
     state: &AppState,
+    job_name: &str,
     headers: &[(&str, &str)],
     body: Value,
 ) -> axum::response::Response {
     let app = configure_routes(state.clone());
     let mut builder = Request::builder()
         .method("POST")
-        .uri(format!("/jobs/{TEST_JOB_NAME}/run"))
+        .uri(format!("/jobs/{job_name}/run"))
         .header("content-type", "application/json");
     for (name, value) in headers {
         builder = builder.header(*name, *value);
@@ -151,6 +190,16 @@ async fn submit_with_headers(
     app.oneshot(builder.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap()
+}
+
+/// POST `body` to `/jobs/{TEST_JOB_NAME}/run`, attaching the given extra
+/// headers.
+async fn submit_with_headers(
+    state: &AppState,
+    headers: &[(&str, &str)],
+    body: Value,
+) -> axum::response::Response {
+    submit_job_with_headers(state, TEST_JOB_NAME, headers, body).await
 }
 
 /// Poll `/jobs/runs/:run_id` until it reaches a terminal state, so
@@ -327,5 +376,51 @@ async fn parameter_values_never_reach_the_audit_row() {
         !rows[0].to_string().contains("PII-CANARY-77"),
         "a parameter value reached the audit ledger: {}",
         rows[0]
+    );
+}
+
+/// The `Err` half of "outcome stamped on both arms": a submission that
+/// clears the handler's own existence pre-check, header validation, and
+/// audit write, then gets rejected by `executor.submit` itself
+/// (`JobSubmitError::MissingParameters`, since `ingest-filtered` requires
+/// `min_id` and this submits none). Pins that the ledger row still gets a
+/// terminal stamp — `failed`, the fixed `category()` string (not the
+/// human-readable message), and a null `run_id` because no run was ever
+/// created — and that the HTTP response keeps the endpoint's existing
+/// rejection contract (400, `missing_parameters`) unchanged.
+#[tokio::test]
+async fn submit_rejection_after_audit_write_is_recorded_failed() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let resp = submit_job_with_headers(
+        &state,
+        REJECTING_JOB_NAME,
+        &[("x-skardi-session-id", "sess-reject")],
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error_type"], json!("missing_parameters"));
+
+    let rows = store.list_by_session("sess-reject").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        row["sql"],
+        format!("{REJECTING_JOB_NAME}@{REJECTING_JOB_VERSION}")
+    );
+    assert_eq!(row["status"], json!("failed"));
+    assert_eq!(row["error"], json!("missing_parameters"));
+    assert!(row["run_id"].is_null());
+
+    // Confirms the executor never created a run for the rejected submission
+    // — the same "not submitted" observability the audit-write-failure test
+    // above uses.
+    let executor = state.jobs.clone().unwrap();
+    let runs = executor.store().list_runs(None, 10).await.unwrap();
+    assert!(
+        runs.is_empty(),
+        "a run was created despite the rejection: {runs:?}"
     );
 }
