@@ -34,7 +34,7 @@
 //! pruned at startup and hourly thereafter. Without that flag rows are kept
 //! forever, and pruning/rotation is the operator's call.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -46,9 +46,18 @@ use tokio_rusqlite::{Connection, params, rusqlite};
 /// EBS/NFS, a full dm-thin pool) is also treated as failed — otherwise the
 /// request hangs with it, and because the store is one serialized writer
 /// thread, every subsequent audited request queues behind it. A timed-out
-/// write may still land later on the writer thread; that leaves an orphaned
-/// `started` row, which the next startup reconciles to `unknown` exactly
-/// like a crash mid-query.
+/// write may still land later on the writer thread; for `record_outcome`
+/// (and the retention prune) that leaves an orphaned `started` row, which
+/// the next startup reconciles to `unknown` exactly like a crash mid-query.
+/// The two pre-execution writers (`record_started`,
+/// `record_pipeline_started`) know more than that — a timeout there means
+/// the caller has already told the requester "503, did not run" — so they
+/// follow up with a corrective UPDATE instead of leaving that ambiguity for
+/// startup to paper over; see `QueryAuditStore::spawn_timeout_correction`.
+///
+/// Individual stores may override this via `write_timeout` (tests only, to
+/// exercise the timeout branch without waiting out the real bound); the
+/// const remains the production default.
 pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum length of a session id, in characters — shared by `/query`'s
@@ -61,15 +70,56 @@ pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// CLI crate does not depend on this one; keep them in sync.
 pub(crate) const MAX_SESSION_ID_CHARS: usize = 200;
 
-/// Await a ledger write, bounding it with [`AUDIT_WRITE_TIMEOUT`]. Elapsed
-/// is an error like any other write failure — see the timeout const for why.
+/// Error from [`bounded`] that keeps "the write timed out" distinguishable
+/// from "the write ran and failed" (e.g. `ConnectionClosed`). Only the
+/// pre-execution writers act on that distinction — see
+/// [`QueryAuditStore::spawn_timeout_correction`] — everywhere else this
+/// converts straight to `anyhow::Error` via `?`, same as before.
+#[derive(Debug)]
+enum BoundedError {
+    /// Elapsed `timeout` without the write completing. It may still land
+    /// later on the writer thread.
+    TimedOut(anyhow::Error),
+    /// The write itself returned an error.
+    Other(anyhow::Error),
+}
+
+impl BoundedError {
+    fn is_timeout(&self) -> bool {
+        matches!(self, BoundedError::TimedOut(_))
+    }
+}
+
+impl std::fmt::Display for BoundedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoundedError::TimedOut(e) | BoundedError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BoundedError {}
+
+// `anyhow`'s blanket `impl<E: StdError + Send + Sync + 'static> From<E> for
+// anyhow::Error` covers the `BoundedError -> anyhow::Error` conversion `?`
+// needs at every call site below — an explicit `impl From<BoundedError> for
+// anyhow::Error` here would conflict with it.
+
+/// Await a ledger write, bounding it with `timeout` (production callers pass
+/// [`AUDIT_WRITE_TIMEOUT`]; tests may pass a shorter bound via
+/// `QueryAuditStore::write_timeout`). Elapsed is an error like any other
+/// write failure — see the timeout const for why — but callers that need to
+/// react specifically to a timeout can check [`BoundedError::is_timeout`].
 async fn bounded<T>(
     write: impl Future<Output = tokio_rusqlite::Result<T>>,
     what: &'static str,
-) -> Result<T> {
-    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
-        Ok(result) => result.context(what),
-        Err(_) => bail!("{what}: timed out after {AUDIT_WRITE_TIMEOUT:?}"),
+    timeout: Duration,
+) -> std::result::Result<T, BoundedError> {
+    match tokio::time::timeout(timeout, write).await {
+        Ok(result) => result.context(what).map_err(BoundedError::Other),
+        Err(_) => Err(BoundedError::TimedOut(anyhow!(
+            "{what}: timed out after {timeout:?}"
+        ))),
     }
 }
 
@@ -117,7 +167,9 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_session_created
 CREATE INDEX IF NOT EXISTS idx_query_audit_created
     ON query_audit (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_query_audit_status
-    ON query_audit (status);";
+    ON query_audit (status);
+CREATE INDEX IF NOT EXISTS idx_query_audit_statement_kind
+    ON query_audit (statement_kind);";
 
 /// Outcome of an audited statement.
 ///
@@ -147,6 +199,10 @@ impl QueryAuditStatus {
 pub struct QueryAuditStore {
     conn: Connection,
     path: PathBuf,
+    /// Bound passed to [`bounded`] for every write. [`AUDIT_WRITE_TIMEOUT`]
+    /// in production; overridable in tests via [`Self::with_write_timeout`]
+    /// so the timeout branch can be exercised without waiting 5s.
+    write_timeout: Duration,
 }
 
 impl std::fmt::Debug for QueryAuditStore {
@@ -206,7 +262,11 @@ impl QueryAuditStore {
             }
         }
 
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            write_timeout: AUDIT_WRITE_TIMEOUT,
+        })
     }
 
     /// Open an in-memory ledger. Tests only — nothing is durable.
@@ -223,11 +283,22 @@ impl QueryAuditStore {
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
+            write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Override the write bound. Tests only — lets a test exercise the
+    /// timeout branch (finding: "the timeout branch that fail-closed rests
+    /// on is untested") in milliseconds instead of waiting out the real
+    /// [`AUDIT_WRITE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
     }
 
     /// Close the backing connection, leaving the store permanently unwritable.
@@ -261,7 +332,7 @@ impl QueryAuditStore {
         let statement_kind = statement_kind.to_string();
         let row_id = id.clone();
 
-        bounded(
+        match bounded(
             self.conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
@@ -282,10 +353,18 @@ impl QueryAuditStore {
                 Ok(())
             }),
             "Failed to write pre-execution query-audit record",
+            self.write_timeout,
         )
-        .await?;
-
-        Ok(id)
+        .await
+        {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                if e.is_timeout() {
+                    self.spawn_timeout_correction(id);
+                }
+                Err(e.into())
+            }
+        }
     }
 
     /// Insert a `started` row for a pipeline execution.
@@ -310,7 +389,7 @@ impl QueryAuditStore {
         let session_id = session_id.map(str::to_string);
         let row_id = id.clone();
 
-        bounded(
+        match bounded(
             self.conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
@@ -330,10 +409,18 @@ impl QueryAuditStore {
                 Ok(())
             }),
             "Failed to write pre-execution pipeline-audit record",
+            self.write_timeout,
         )
-        .await?;
-
-        Ok(id)
+        .await
+        {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                if e.is_timeout() {
+                    self.spawn_timeout_correction(id);
+                }
+                Err(e.into())
+            }
+        }
     }
 
     /// Update a record with its terminal outcome.
@@ -361,9 +448,64 @@ impl QueryAuditStore {
                 Ok(())
             }),
             "Failed to update query-audit record",
+            self.write_timeout,
         )
         .await?;
         Ok(())
+    }
+
+    /// Best-effort correction for a pre-execution write that timed out from
+    /// the caller's point of view, submitted as a follow-up UPDATE on a
+    /// cloned connection.
+    ///
+    /// Why this is safe: `tokio_rusqlite::Connection` funnels every `call`
+    /// onto one dedicated writer thread via a FIFO channel. The abandoned
+    /// INSERT's `call` was already sent into that channel before `bounded`
+    /// gave up on it (the timeout races the *await*, not the *send* — the
+    /// future is polled at least once, which is when the message goes onto
+    /// the channel). This UPDATE's `call` is only sent afterwards, from the
+    /// spawned task below, so it is queued strictly after the INSERT and is
+    /// guaranteed to be applied to the real row if the INSERT ever lands —
+    /// turning a fact we already know ("the request was told 503, did not
+    /// run") into the ledger's `failed`/`audit_write_timeout`, instead of
+    /// letting startup reconciliation later guess `unknown` ("may have run
+    /// after a crash") for a row we know did not run. If the INSERT itself
+    /// never lands (e.g. the connection died rather than merely stalled),
+    /// this UPDATE matches no row and is a harmless no-op.
+    ///
+    /// Fire-and-forget by design: the request has already returned 503 by
+    /// the time this could resolve, so the caller does not await it. Any
+    /// failure here can only be observed via logging.
+    fn spawn_timeout_correction(&self, id: String) {
+        let conn = self.conn.clone();
+        tokio::spawn(async move {
+            let finished_at = chrono::Utc::now().to_rfc3339();
+            let outcome = conn
+                .call(move |conn| -> SqlResult<usize> {
+                    conn.execute(
+                        "UPDATE query_audit
+                            SET status = ?2, finished_at = ?3, error = ?4
+                          WHERE id = ?1 AND status = ?5",
+                        params![
+                            id,
+                            QueryAuditStatus::Failed.as_str(),
+                            finished_at,
+                            "audit_write_timeout",
+                            QueryAuditStatus::Started.as_str(),
+                        ],
+                    )
+                })
+                .await;
+            match outcome {
+                // 0 rows means either the INSERT never landed, or it landed
+                // and something else already moved it off `started` —
+                // either way there is nothing to correct.
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "Failed to apply audit-write-timeout correction to query-audit record: {e}"
+                ),
+            }
+        });
     }
 
     /// Rewrite rows still marked `started` to `unknown`. Called at startup so a
@@ -392,21 +534,48 @@ impl QueryAuditStore {
         Ok(updated)
     }
 
-    /// Delete records created before `cutoff` (RFC 3339). Returns the row count.
+    /// Delete records created before `cutoff` (RFC 3339). Returns the total
+    /// row count deleted.
+    ///
+    /// Runs as repeated bounded, `PRUNE_BATCH_SIZE`-row deletes rather than
+    /// one unbounded `DELETE`. This store's connection is a single
+    /// serialized writer thread shared with every audited request's
+    /// pre-execution INSERT (see the module docs); an unbounded delete over
+    /// a multi-million-row backlog under `synchronous = FULL` can exceed
+    /// [`AUDIT_WRITE_TIMEOUT`] on its own — which, on that shared thread,
+    /// would make every *other* concurrent `/query` and pipeline-execute
+    /// request time out and 503 even though nothing is wrong with them, and
+    /// the prune itself still would not have finished. Chunking keeps each
+    /// individual write comfortably inside the bound (wrapped in `bounded`
+    /// like every other write) and yields between chunks so writes queued
+    /// behind the prune get a chance to interleave rather than all landing
+    /// after it.
     pub async fn prune_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<usize> {
         let cutoff = cutoff.to_rfc3339();
-        let deleted = self
-            .conn
-            .call(move |conn| -> SqlResult<usize> {
-                let n = conn.execute(
-                    "DELETE FROM query_audit WHERE created_at < ?1",
-                    params![cutoff],
-                )?;
-                Ok(n)
-            })
-            .await
-            .context("Failed to prune query-audit records")?;
-        Ok(deleted)
+        let mut total = 0usize;
+        loop {
+            let batch_cutoff = cutoff.clone();
+            let deleted = bounded(
+                self.conn.call(move |conn| -> SqlResult<usize> {
+                    let n = conn.execute(
+                        "DELETE FROM query_audit WHERE id IN (
+                            SELECT id FROM query_audit WHERE created_at < ?1 LIMIT ?2
+                         )",
+                        params![batch_cutoff, PRUNE_BATCH_SIZE as i64],
+                    )?;
+                    Ok(n)
+                }),
+                "Failed to prune query-audit records",
+                self.write_timeout,
+            )
+            .await?;
+            if deleted == 0 {
+                break;
+            }
+            total += deleted;
+            tokio::task::yield_now().await;
+        }
+        Ok(total)
     }
 
     /// Fetch one record as a JSON object. Test/diagnostic helper.
@@ -548,8 +717,17 @@ const PIPELINE_STATEMENT_KIND: &str = "pipeline";
 /// sentinel needs a new value (or a dedicated column) first.
 const PIPELINE_MAX_ROWS_SENTINEL: i64 = 0;
 
+/// Rows deleted per [`QueryAuditStore::prune_before`] batch. Small enough
+/// that a batch delete is comfortably inside [`AUDIT_WRITE_TIMEOUT`] even on
+/// a slow disk; see that method's doc comment for why batching exists at
+/// all.
+const PRUNE_BATCH_SIZE: usize = 1000;
+
 /// Random-ish unique row id. Avoids a `uuid` dependency: the timestamp keeps
-/// ids ordered and the counter disambiguates within the same nanosecond.
+/// ids ordered and the zero-padded hex counter disambiguates within the same
+/// nanosecond without breaking lexicographic order — `list_by_session`'s
+/// `id ASC` tie-break (and any other string sort) depends on same-width
+/// hex; an unpadded counter would sort `…-f` after `…-10`.
 fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -558,7 +736,7 @@ fn new_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:x}-{seq:x}")
+    format!("{nanos:x}-{seq:016x}")
 }
 
 #[cfg(test)]
@@ -693,6 +871,120 @@ mod tests {
 
         assert_eq!(store.prune_before(chrono::Utc::now()).await.unwrap(), 1);
         assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_across_multiple_batches() {
+        // PRUNE_BATCH_SIZE is 1000; insert more than two batches' worth so a
+        // single-DELETE implementation and a chunked one would both "work"
+        // in the sense of deleting everything, but only the chunked one
+        // does it as more than one bounded write.
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let total_rows = (PRUNE_BATCH_SIZE * 2) + 500;
+        for _ in 0..total_rows {
+            store
+                .record_started("SELECT 1", None, 1, "Query")
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.count().await.unwrap(), total_rows);
+
+        let deleted = store.prune_before(chrono::Utc::now()).await.unwrap();
+        assert_eq!(deleted, total_rows);
+        assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_pipeline_started_times_out_when_writer_thread_is_blocked() {
+        // Finding: the timeout branch that fail-closed rests on had no test
+        // exercising it directly — `close_for_test` only covers the
+        // immediate-error path (`ConnectionClosed`). This makes the bound
+        // injectable so a test can pin it far below AUDIT_WRITE_TIMEOUT.
+        let store = QueryAuditStore::open_in_memory()
+            .await
+            .unwrap()
+            .with_write_timeout(Duration::from_millis(100));
+
+        // Occupy the dedicated writer thread well past the bound so the
+        // next write has to wait behind it instead of running immediately.
+        let blocker = store.conn.clone();
+        let blocker_task = tokio::spawn(async move {
+            let _ = blocker
+                .call(|_conn| -> SqlResult<()> {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(())
+                })
+                .await;
+        });
+        // Give the blocking call a moment to actually start running on the
+        // writer thread before racing it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let started = std::time::Instant::now();
+        let result = store
+            .record_pipeline_started("weekly-churn", "1.0.0", None)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "should have returned near the 100ms bound rather than waiting \
+             out the full 400ms blocking call: {elapsed:?}"
+        );
+
+        blocker_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_pipeline_start_is_corrected_to_failed_once_it_lands() {
+        // Covers the finding-2 fix: a pre-execution write that times out
+        // from the caller's perspective, but whose INSERT still lands later
+        // on the writer thread, must not sit there as an ambiguous
+        // `started` -> `unknown` row. It should end up `failed` with
+        // `audit_write_timeout` instead. The FIFO ordering the fix relies
+        // on (INSERT queued before the corrective UPDATE) is guaranteed by
+        // the crate, not by timing, so this is asserted with a bounded poll
+        // rather than a fixed sleep — not because the outcome is racy, only
+        // because *when* the writer thread gets to it is not.
+        let store = QueryAuditStore::open_in_memory()
+            .await
+            .unwrap()
+            .with_write_timeout(Duration::from_millis(100));
+
+        let blocker = store.conn.clone();
+        let blocker_task = tokio::spawn(async move {
+            let _ = blocker
+                .call(|_conn| -> SqlResult<()> {
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(())
+                })
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let result = store
+            .record_pipeline_started("weekly-churn", "1.0.0", Some("sess-timeout"))
+            .await;
+        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+
+        blocker_task.await.unwrap();
+
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = store.list_by_session("sess-timeout").await.unwrap();
+            if rows
+                .first()
+                .is_some_and(|r| r["status"] != json!("started"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["status"], json!("failed"));
+        assert_eq!(rows[0]["error"], json!("audit_write_timeout"));
+        assert!(!rows[0]["finished_at"].is_null());
     }
 
     #[tokio::test]
