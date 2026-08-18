@@ -364,6 +364,9 @@ impl JobExecutor {
             Some(DataSourceType::Rss) => Err(JobSubmitError::Internal(anyhow::anyhow!(
                 "rss sources are read-only and cannot be used as a job destination"
             ))),
+            Some(DataSourceType::Graph) => Err(JobSubmitError::Internal(anyhow::anyhow!(
+                "graph sources are read-only and cannot be used as a job destination"
+            ))),
             None => {
                 // A dotted identifier whose root is not a known source is
                 // almost certainly a typo — a real catalog-registered source

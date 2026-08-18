@@ -321,7 +321,12 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             target: ScanTarget {
                 table_id: Arc::from(format!("raw:{action_id}")),
                 action_id: Arc::from(action_id),
-                pagination: PaginationStrategy::SinglePage,
+                // No premise to check: a raw action declares no pagination
+                // contract, and its caller drives paging through the input
+                // JSON (documented as "one request, one page").
+                pagination: PaginationStrategy::SinglePage {
+                    next_cursor_path: None,
+                },
                 error_path: None,
                 fixed_inputs: &[],
                 source_pack_version: 0,

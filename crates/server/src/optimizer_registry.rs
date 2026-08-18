@@ -11,6 +11,7 @@
 use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use lance::dataset::Dataset;
+use skardi::sources::providers::graph::udtf::{GraphSources, register_graph_udtfs};
 use skardi::sources::providers::lance::{register_lance_fts_udtf, register_lance_knn_udtf};
 use skardi::sources::providers::mongo::fts_table_function::register_mongo_fts_udtf;
 use skardi::sources::providers::open_connector::{
@@ -42,6 +43,11 @@ pub struct OptimizerRegistry {
     /// filled during data-source registration and used by the
     /// open_connector_query / open_connector_scan table functions.
     open_connector_gateways: OpenConnectorGateways,
+    /// Graph source handles indexed by connection (data source) name,
+    /// filled during data-source registration and used by the
+    /// cypher_query / graph_schema table functions; also surfaced on
+    /// AppState so /data_source can report each source's health.
+    graph_sources: GraphSources,
 }
 
 impl OptimizerRegistry {
@@ -50,6 +56,7 @@ impl OptimizerRegistry {
         Self {
             dataset_registry: Arc::new(RwLock::new(HashMap::new())),
             open_connector_gateways: OpenConnectorGateways::default(),
+            graph_sources: GraphSources::default(),
         }
     }
 
@@ -122,6 +129,13 @@ impl OptimizerRegistry {
             tracing::info!("Registering Open Connector table functions");
             register_open_connector_udtfs(ctx, self.open_connector_gateways())?;
             tracing::info!("✓ Registered open_connector_query and open_connector_scan");
+        }
+
+        // Register graph table functions
+        if source_types.contains(&DataSourceType::Graph) {
+            tracing::info!("Registering graph table functions");
+            register_graph_udtfs(ctx, self.graph_sources())?;
+            tracing::info!("✓ Registered cypher_query and graph_schema");
         }
 
         Ok(())
@@ -225,6 +239,12 @@ impl OptimizerRegistry {
         Arc::clone(&self.open_connector_gateways)
     }
 
+    /// Get a clone of the graph source map to share with
+    /// `register_graph_tables` and the graph UDTFs.
+    pub fn graph_sources(&self) -> GraphSources {
+        Arc::clone(&self.graph_sources)
+    }
+
     /// Alias for `datasets()` — used when passing to `register_postgres_tables`.
     pub fn pg_knn_pools(&self) -> DatasetRegistry {
         self.datasets()
@@ -297,6 +317,7 @@ mod tests {
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         }];
 
         registry
@@ -336,6 +357,7 @@ mod tests {
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         }];
 
         // Should not register Lance functions for CSV-only data sources
