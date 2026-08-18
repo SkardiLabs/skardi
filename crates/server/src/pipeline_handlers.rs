@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::engine::Engine;
 use skardi::pipeline::pipeline::Pipeline;
+use skardi::sources::providers::graph::udtf::GraphSourceHealth;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -155,6 +156,32 @@ pub struct DataSourceResponse {
     pub path: Option<String>,
     /// Sanitized URL for database sources (PostgreSQL)
     pub url: Option<String>,
+    /// Registration health — currently only graph sources report one: a
+    /// graph source whose backend was unreachable at startup registers
+    /// DEGRADED (the degraded-registration semantics) instead of failing
+    /// boot, so its status is observable here. Every other source fails
+    /// startup when unreachable, hence is healthy by construction and
+    /// omits the field.
+    ///
+    /// NOT a liveness probe, in either direction: "degraded" advances to
+    /// "healthy" only when query traffic recovers the source (a rarely
+    /// queried source can report degraded after its backend recovered),
+    /// and "healthy" is one-way — a backend that died after recovery
+    /// still reads healthy until its queries fail. `status_reason` and
+    /// `status_changed_at` carry what IS known: why, and since when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Why the source is degraded (the registration/recovery error) —
+    /// "unreachable since boot" and "one view's contract is broken" call
+    /// for different operator actions, and the bare status string could
+    /// not distinguish them. Absent when healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// When `status` last TRANSITIONED (RFC 3339): registration time, or
+    /// the recovery that flipped it healthy. Same non-probe caveat as
+    /// `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_changed_at: Option<String>,
     /// Registered tables with their schemas
     pub tables: Vec<TableInfo>,
 }
@@ -544,8 +571,10 @@ pub async fn get_data_sources(
             | DataSourceType::OpenConnector
             | DataSourceType::Dynamodb
             // RSS has no path: its feed URLs live in the typed `rss:` block,
-            // not in `path`.
-            | DataSourceType::Rss => None,
+            // not in `path`. Graph likewise: the connection lives in
+            // `connection_string`.
+            | DataSourceType::Rss
+            | DataSourceType::Graph => None,
         };
 
         let url = match data_source.source_type {
@@ -557,13 +586,58 @@ pub async fn get_data_sources(
             | DataSourceType::Influxdb
             | DataSourceType::Clickhouse
             | DataSourceType::OpenConnector
-            | DataSourceType::Dynamodb => {
+            | DataSourceType::Dynamodb
+            // Graph validation rejects credentials embedded in the URL, so
+            // the connection string is safe to report like any db source's.
+            | DataSourceType::Graph => {
                 // For database sources, return the connection string as-is
                 // (credentials are not stored in connection strings, only in env vars)
                 data_source.connection_string.clone()
             }
             _ => None,
         };
+
+        // Only graph sources report a status (see the field's doc): read the
+        // handle's registration health. A missing handle reports nothing —
+        // the same degrade-quietly policy as the table-listing fallbacks.
+        // NOT a liveness probe: health only moves toward Healthy (see
+        // GraphSourceHandle::health) — "healthy" means "recovered since
+        // registration", and a backend that died afterwards still reads
+        // healthy until its queries fail.
+        let (status, status_reason, status_changed_at) =
+            if data_source.source_type == DataSourceType::Graph {
+                let sources = app_state
+                    .graph_sources
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner());
+                match sources.get(&data_source.name) {
+                    Some(handle) => {
+                        let (status, reason) = {
+                            let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+                            match &*health {
+                                GraphSourceHealth::Healthy => ("healthy".to_string(), None),
+                                // The payload is the registration error's summary
+                                // — the identity-only, value-free text the graph
+                                // module builds — so relaying it here leaks
+                                // nothing new.
+                                GraphSourceHealth::Degraded(reason) => {
+                                    ("degraded".to_string(), Some(reason.clone()))
+                                }
+                            }
+                        };
+                        let changed_at = *handle
+                            .health_changed_at
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let changed_at = chrono::DateTime::<chrono::Utc>::from(changed_at)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        (Some(status), reason, Some(changed_at))
+                    }
+                    None => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            };
 
         // Catalog-mode sources register a whole catalog named after the
         // source — their tables live at `<source>.<schema>.<table>`, not
@@ -607,6 +681,9 @@ pub async fn get_data_sources(
             r#type: source_type_str.to_string(),
             path,
             url,
+            status,
+            status_reason,
+            status_changed_at,
             tables,
         });
     }
@@ -618,20 +695,6 @@ pub async fn get_data_sources(
         "count": data_source_responses.len(),
         "timestamp": chrono::Utc::now().to_rfc3339()
     })))
-}
-
-/// Name of a JSON value's type, for value-free diagnostics. Logs must never
-/// carry the value itself — only `unsupported_params` (which feeds the HTTP
-/// 400 body the caller already knows the value of) may do that.
-fn json_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 /// Render a single scalar JSON value as the SQL literal form used inside an
@@ -668,6 +731,13 @@ fn row_cell_to_sql(v: &Value) -> Option<String> {
     }
 }
 
+/// The JSON kind name for parameter error messages — parameter VALUES
+/// never appear in errors (they can carry user data; the 400 body and
+/// logs must not echo them), only their shape. The vocabulary is the
+/// repo-wide shared definition (`skardi::util::json::json_kind`) so the
+/// never-echo-values discipline is maintained in one place.
+use skardi::util::json::json_kind;
+
 /// Substitute `{param}` placeholders in `sql` with their SQL-safe values.
 ///
 /// `expected_params` must be sorted longest-first so that a shorter name (e.g. `user`) cannot
@@ -696,7 +766,13 @@ fn row_cell_to_sql(v: &Value) -> Option<String> {
 /// empty batches see a clear instruction to filter client-side.
 ///
 /// Returns `(missing_params, unsupported_params)` — both empty on full success.
-fn substitute_sql_params(
+/// `pub` for the integration suites: the graph `{params}` contract test
+/// (tests/graph_views.rs) must run THIS function — a hand-rolled
+/// `str::replace` in the test would keep passing after a substitution
+/// regression, which is the failure the test exists to catch.
+#[doc(hidden)] // pub for the integration suite's real-substitution
+// contract test only — not a supported server API surface.
+pub fn substitute_sql_params(
     sql: &mut String,
     expected_params: &[String],
     parameters: &HashMap<String, Value>,
@@ -747,7 +823,10 @@ fn substitute_sql_params(
                                  non-zero number of cells.",
                                 param_name
                             );
-                            unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                            unsupported_params.push(format!(
+                                "{}: inconsistent or empty row widths in a tuple list",
+                                param_name
+                            ));
                             continue;
                         }
                         let rendered_rows: Option<Vec<String>> = row_arrays
@@ -787,7 +866,10 @@ fn substitute_sql_params(
                              list).",
                             param_name
                         );
-                        unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                        unsupported_params.push(format!(
+                            "{}: mixed-shape array (all scalars or all arrays)",
+                            param_name
+                        ));
                         continue;
                     } else {
                         // Flat scalar array — the original vector-literal form.
@@ -827,9 +909,13 @@ fn substitute_sql_params(
                     tracing::error!(
                         "Unsupported parameter type for {}: {}",
                         param_name,
-                        json_type_name(param_value)
+                        json_kind(param_value)
                     );
-                    unsupported_params.push(format!("{}: {:?}", param_name, param_value));
+                    unsupported_params.push(format!(
+                        "{}: unsupported JSON value ({})",
+                        param_name,
+                        json_kind(param_value)
+                    ));
                     continue;
                 }
             };
@@ -1166,6 +1252,23 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    #[test]
+    fn json_kind_names_every_shape_and_never_the_value() {
+        // The kind vocabulary is the ONLY thing parameter errors may say
+        // about a value (values can carry user data).
+        for (v, kind) in [
+            (serde_json::Value::Null, "null"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(42.5), "a number"),
+            (serde_json::json!("s3cret"), "a string"),
+            (serde_json::json!(["s3cret"]), "an array"),
+            (serde_json::json!({"k": "s3cret"}), "an object"),
+        ] {
+            assert_eq!(json_kind(&v), kind);
+            assert!(!kind.contains("s3cret"));
+        }
+    }
+
     async fn create_test_pipeline_with_params() -> StandardPipeline {
         let temp_dir = TempDir::new().unwrap();
         let pipeline_content = r#"
@@ -1230,6 +1333,7 @@ spec:
             crate::auth::layer::AuthLayer::None,
             None,
             None,
+            Default::default(),
         )
     }
 
@@ -1280,6 +1384,7 @@ spec:
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         };
 
         // Create pipeline that queries the registered data source
@@ -1323,6 +1428,7 @@ spec:
             crate::auth::layer::AuthLayer::None,
             None,
             None,
+            Default::default(),
         );
 
         let request = ExecuteRequest {
@@ -1953,6 +2059,7 @@ spec:
                 description: None,
                 open_connector: None,
                 rss: None,
+                graph: None,
             });
         }
 
@@ -2009,6 +2116,7 @@ spec:
                 )
                 .expect("parse rss config"),
             ),
+            graph: None,
         };
 
         let mut session_ctx = SessionContext::new();
@@ -2048,6 +2156,7 @@ spec:
             crate::auth::layer::AuthLayer::None,
             None,
             None,
+            Default::default(),
         );
 
         let Json(body) = get_data_sources(State(app_state)).await.unwrap();

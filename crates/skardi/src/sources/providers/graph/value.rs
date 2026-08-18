@@ -11,8 +11,10 @@
 //!   there is no schema inference anywhere), so a `node` column expects
 //!   the vertex object shape and fails with a typed error otherwise.
 //! - **JSON → Arrow.** [`build_batch`] converts one buffered batch of rows
-//!   against the declared columns. Every declared column is nullable
-//!   (Cypher can produce null in any position); a non-null value of the
+//!   against the declared columns. Ad-hoc declared columns are always
+//!   nullable (Cypher can produce null in any position); YAML views may
+//!   declare `nullable: false` as an author's assertion, and a null met
+//!   under it is [`GraphError::NotNullViolation`]. A non-null value of the
 //!   wrong JSON kind is [`GraphError::TypeMismatch`] carrying kinds, never
 //!   values.
 //!
@@ -117,6 +119,12 @@ impl GraphType {
 pub struct DeclaredColumn {
     pub name: String,
     pub ty: GraphType,
+    /// Ad-hoc `cypher_query` columns are always nullable (Cypher can
+    /// produce null in any position and the ad-hoc JSON object cannot
+    /// declare otherwise, design §Schema handling); YAML views may
+    /// declare `false` as an author's assertion, enforced by
+    /// [`build_batch`] as [`GraphError::NotNullViolation`].
+    pub nullable: bool,
 }
 
 /// The vertex STRUCT's fields — one definition feeds the planned type AND
@@ -168,15 +176,15 @@ pub fn path_fields() -> Fields {
     ])
 }
 
-/// The planned schema for a set of declared columns. Every field is
-/// nullable — Cypher can produce null in any position, and there is no
-/// way to declare otherwise on the ad-hoc surface (design §Schema
-/// handling).
+/// The planned schema for a set of declared columns. Each field carries
+/// its declaration's nullable bit — `true` everywhere on the ad-hoc
+/// surface, where nulls cannot be declared away (design §Schema
+/// handling); YAML views may declare `nullable: false`.
 pub fn declared_schema(columns: &[DeclaredColumn]) -> Arc<Schema> {
     Arc::new(Schema::new(
         columns
             .iter()
-            .map(|c| Field::new(&c.name, c.ty.arrow_type(), true))
+            .map(|c| Field::new(&c.name, c.ty.arrow_type(), c.nullable))
             .collect::<Vec<_>>(),
     ))
 }
@@ -291,6 +299,20 @@ pub fn build_batch(
     }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for (col_idx, col) in columns.iter().enumerate() {
+        // A declared `nullable: false` is the author's assertion about
+        // the view's Cypher — enforce it BEFORE conversion so the null
+        // surfaces as its own typed error, not as a struct field that
+        // happens to be empty.
+        if !col.nullable {
+            for (i, row) in rows.iter().enumerate() {
+                if matches!(row[col_idx], Value::Null) {
+                    return Err(GraphError::NotNullViolation {
+                        column: col.name.clone(),
+                        row: row_base + i,
+                    });
+                }
+            }
+        }
         let cells = rows.iter().map(|r| &r[col_idx]);
         let array: ArrayRef = match col.ty {
             GraphType::String => {
@@ -749,6 +771,7 @@ mod tests {
         DeclaredColumn {
             name: name.to_string(),
             ty,
+            nullable: true,
         }
     }
 
@@ -1019,6 +1042,42 @@ mod tests {
             msg.contains("carries 1 columns but 2 were declared"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn a_null_under_nullable_false_is_a_typed_violation_with_identity() {
+        // YAML views may assert `nullable: false`; a null met under it is
+        // NotNullViolation naming the column and the ABSOLUTE row — never
+        // a value (there is none to leak, but the discipline holds).
+        let columns = vec![DeclaredColumn {
+            name: "n".to_string(),
+            ty: GraphType::Int,
+            nullable: false,
+        }];
+        let rows = vec![vec![serde_json::json!(1)], vec![Value::Null]];
+        let err = build_batch(&columns, &rows, 10).unwrap_err();
+        assert!(matches!(err, GraphError::NotNullViolation { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("'n'"), "{msg}");
+        assert!(msg.contains("row 11"), "absolute row index: {msg}");
+        assert!(msg.contains("nullable: false"), "{msg}");
+        // The same null under a nullable declaration keeps passing.
+        build_batch(&[col("n", GraphType::Int)], &rows, 10).expect("nullable passes");
+    }
+
+    #[test]
+    fn declared_schema_carries_each_columns_nullable_bit() {
+        let columns = vec![
+            col("opt", GraphType::String),
+            DeclaredColumn {
+                name: "req".to_string(),
+                ty: GraphType::Int,
+                nullable: false,
+            },
+        ];
+        let schema = declared_schema(&columns);
+        assert!(schema.field(0).is_nullable());
+        assert!(!schema.field(1).is_nullable());
     }
 
     #[test]

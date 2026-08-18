@@ -388,7 +388,15 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState::new(config, engine, session_ctx, AuthLayer::None, None, None)
+        AppState::new(
+            config,
+            engine,
+            session_ctx,
+            AuthLayer::None,
+            None,
+            None,
+            Default::default(),
+        )
     }
 
     #[tokio::test]
@@ -436,7 +444,15 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState::new(config, engine, session_ctx, layer, None, None)
+        AppState::new(
+            config,
+            engine,
+            session_ctx,
+            layer,
+            None,
+            None,
+            Default::default(),
+        )
     }
 
     #[tokio::test]

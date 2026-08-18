@@ -207,6 +207,7 @@ spec:
         AuthLayer::None,
         None,
         query_audit,
+        Default::default(),
     );
     (state, tmp)
 }

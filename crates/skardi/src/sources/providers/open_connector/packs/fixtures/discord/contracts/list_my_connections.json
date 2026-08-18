@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "connections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "description": "A raw Discord API object."
+      },
+      "description": "The current user's connected external accounts."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "connections"
+  ],
+  "description": "Discord user connections."
+}

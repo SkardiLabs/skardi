@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "userId": {
+      "type": "string",
+      "description": "Gmail user ID. Omit to use the connected mailbox."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The input payload for this action."
+}

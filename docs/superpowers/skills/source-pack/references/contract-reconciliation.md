@@ -169,6 +169,23 @@ the canonicalized schema (computed by
 canonicalization elsewhere) and locks pin ↔ fixture with a sync test.
 Record the gateway version you captured against.
 
+**Save `data.inputSchema` too**, under `contracts/inputs/<action_name>.json`
+(gmail is the first pack to do this), and assert the table's generated
+key set against it — every key declared, required keys supplied, page
+size inside the declared bounds, fixed values inside their enums. It is
+free: the same discovery response carries both halves. Know what it does
+and does not buy. **The fingerprint gate is OUTPUT-only** —
+`fingerprint_schema` hashes the output schema alone and nothing reads
+`ActionMetadata::input_schema` — so a renamed input key passes
+registration and then 400s every scan against an
+`additionalProperties: false` action, which is all of them. Pinning the
+input schema locks two committed artifacts against each other, so it
+catches that drift on re-capture, not live. **Open engine follow-up:**
+an `expected_input_fingerprint` compared at registration, symmetric with
+the output pin, would close it for every pack at once — until it lands,
+input reconciliation is a point-in-time claim, so re-check inputs on
+every gateway bump rather than trusting a green suite.
+
 **The captured contract is fingerprint input, not column truth.** For
 passthrough executors the declared output schema can under-declare
 fields the wire carries, misname them (Notion declared `archived`;

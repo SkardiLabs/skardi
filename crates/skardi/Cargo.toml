@@ -166,8 +166,9 @@ url = { workspace = true }
 uuid = { workspace = true }
 # The design's NAMED dependency for graph `properties` extraction
 # (graph-engine-bypass §Schema handling): ecosystem json_get family
-# instead of a homegrown twin. Registered via graph::register_graph_udtfs
-# — note it also installs ->/->>/? operator rewrites session-wide.
+# instead of a homegrown twin. Registered by the server session (its
+# register_all also installs ->/->>/? operator rewrites session-wide, so
+# it must not hide behind graph::register_graph_udtfs).
 datafusion-functions-json = "0.52"
 
 [dev-dependencies]

@@ -568,7 +568,9 @@ impl ScanState {
         // page would fail a scan whose result is already complete for its
         // key.
         if !self.done {
-            let more = self.pagination.advance(&envelope, rows.len())?;
+            let more = self
+                .pagination
+                .advance(&envelope, rows.len(), rows.last())?;
             if !more {
                 self.done = true;
                 self.store_cache();

@@ -7,6 +7,7 @@ use skardi::jobs::JobDefinition;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::clickhouse::register_clickhouse_tables;
 use skardi::sources::providers::dynamodb::register_dynamodb_tables;
+use skardi::sources::providers::graph::register_graph_tables;
 use skardi::sources::providers::iceberg::register_iceberg_table;
 use skardi::sources::providers::influxdb::register_influxdb_tables;
 use skardi::sources::providers::lance::register_lance_table;
@@ -22,6 +23,7 @@ use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
 use skardi::sources::sql_validator::{AdhocSqlPolicy, SqlValidatorConfig, validate_sql};
+use skardi::util::json_getters::register_json_getter_udfs;
 use skardi::util::json_pack::register_json_pack_udf;
 use std::collections::HashMap;
 use std::path::Path;
@@ -172,6 +174,12 @@ pub struct DataSource {
     /// naming the missing feature rather than an opaque serde error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rss: Option<skardi::sources::providers::rss::RssConfig>,
+    /// Typed graph-engine configuration. Required when `type` is `graph`,
+    /// rejected for every other type: backend name, graph name, credential
+    /// env-var names, and the `views:` list do not fit the flat `options`
+    /// map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<skardi::sources::providers::graph::config::GraphConfig>,
 }
 
 /// Top-level envelope for context YAML files:
@@ -221,6 +229,11 @@ pub enum ConfigError {
 
     #[error("Duplicate data source name: {name}")]
     DuplicateDataSourceName { name: String },
+
+    #[error(
+        "Data source '{name}' uses a reserved name: a catalog-mode source registers a DataFusion catalog under its own name, and register_catalog replaces the built-in '{name}' catalog (and every table in it) unconditionally. Choose another name."
+    )]
+    ReservedCatalogSourceName { name: String },
 
     #[error("Data source registration failed: {name} - {error}")]
     DataSourceRegistrationFailed { name: String, error: String },
@@ -329,6 +342,27 @@ pub enum ConfigError {
         "Data source '{name}' has type 'rss' but does not set hierarchy_level to 'catalog'. RSS sources are exposed as DataFusion catalogs ('{name}.main.feeds' and '{name}.main.items'); add `hierarchy_level: catalog`."
     )]
     RssHierarchyRequired { name: String },
+
+    #[error(
+        "Data source '{name}' has type 'graph' but no 'graph' config block. The typed graph configuration (backend, graph_name, views, …) is required."
+    )]
+    MissingGraphConfig { name: String },
+
+    #[error(
+        "Data source '{name}' sets a 'graph' config block but its type is '{source_type}'. The 'graph' field is only valid for type 'graph'."
+    )]
+    UnexpectedGraphConfig {
+        name: String,
+        source_type: DataSourceType,
+    },
+
+    #[error("Data source '{name}' has an invalid 'graph' config: {reason}")]
+    InvalidGraphConfig { name: String, reason: String },
+
+    #[error(
+        "Data source '{name}' has type 'graph' but does not set hierarchy_level to 'catalog'. Graph views are registered as catalog tables ('{name}.main.<view>'); add `hierarchy_level: catalog`."
+    )]
+    GraphHierarchyRequired { name: String },
 
     #[error("Data source '{name}' has a non-UTF8 path: {path:?}")]
     NonUtf8Path { name: String, path: PathBuf },
@@ -447,10 +481,18 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
 
     let mut session_ctx = SessionContext::new_with_state(state);
 
-    // Register data sources with optimizer registry support
-    register_data_sources_with_registry(&mut session_ctx, &data_sources, &optimizer_registry)
-        .await
-        .with_context(|| "Failed to register data sources")?;
+    // Register data sources with optimizer registry support. This is
+    // the PLANNING context: it validates pipeline SQL and is discarded
+    // for execution purposes, so expensive-startup providers (graph)
+    // register lazily from declared schemas (see RegistrationPass).
+    register_data_sources_for_pass(
+        &mut session_ctx,
+        &data_sources,
+        &optimizer_registry,
+        RegistrationPass::Planning,
+    )
+    .await
+    .with_context(|| "Failed to register data sources")?;
 
     // Register UDFs
     optimizer_registry
@@ -480,6 +522,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
     // metadata/frontmatter serialization boundary)
     register_json_pack_udf(&mut session_ctx);
+    // The json_get family is the extraction tool for every JSON column,
+    // graph node/relationship properties included; UDFs only, never the
+    // `->` operator rewrite — see util::json_getters.
+    register_json_getter_udfs(&session_ctx)?;
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
@@ -813,6 +859,10 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     // pair `main.feeds`/`main.items`, so per-table `options` must be rejected
     // by the same guard.
     DataSourceType::Rss,
+    // Graph is catalog-only as well: one source is one catalog exposing the
+    // declared views as `main.<view>`, with per-table `options` rejected by
+    // the same guard.
+    DataSourceType::Graph,
 ];
 
 /// Data source types that support read_write access mode
@@ -935,11 +985,70 @@ fn validate_data_sources(data_sources: &[DataSource]) -> Result<()> {
             (_, None) => {}
         }
 
+        // The graph typed config, on the same terms as `rss` above:
+        // required for `type: graph`, rejected for every other type.
+        // `GraphConfig::validate()` is pure (no network I/O — a reachable
+        // backend's view validation happens at registration), so it is
+        // safe on this path; it needs the connection string for the scheme
+        // allowlist and the embedded-credential rejection.
+        match (&source.source_type, &source.graph) {
+            (DataSourceType::Graph, Some(config)) => {
+                // Hierarchy defaults to Table, so without this a minimal
+                // config would pass validation and fail at registration
+                // with the provider's wrapped hierarchy error.
+                if source.hierarchy_level != HierarchyLevel::Catalog {
+                    return Err(ConfigError::GraphHierarchyRequired {
+                        name: source.name.clone(),
+                    }
+                    .into());
+                }
+                let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                    ConfigError::MissingConnectionString {
+                        name: source.name.clone(),
+                    }
+                })?;
+                config
+                    .validate(&source.name, connection_string)
+                    .map_err(|e| ConfigError::InvalidGraphConfig {
+                        name: source.name.clone(),
+                        reason: e.to_string(),
+                    })?;
+            }
+            (DataSourceType::Graph, None) => {
+                return Err(ConfigError::MissingGraphConfig {
+                    name: source.name.clone(),
+                }
+                .into());
+            }
+            (_, Some(_)) => {
+                return Err(ConfigError::UnexpectedGraphConfig {
+                    name: source.name.clone(),
+                    source_type: source.source_type,
+                }
+                .into());
+            }
+            (_, None) => {}
+        }
+
         // Catalog mode must not mix with per-table / per-schema options
         // ("database" is ClickHouse's schema-analog spelling)
         if CATALOG_SUPPORTED_SOURCES.contains(&source.source_type)
             && source.hierarchy_level == HierarchyLevel::Catalog
         {
+            // A catalog-mode source's name becomes a DataFusion CATALOG
+            // name, and register_catalog replaces unconditionally — a
+            // source named after a built-in would silently swallow the
+            // default catalog and every table in it. This guards EVERY
+            // catalog-registering type (rss, open_connector, clickhouse …),
+            // not just graph: the hazard is the catalog path, not any one
+            // provider. (Engine-API paths that register no catalog — e.g.
+            // graph's register_graph_source — are deliberately exempt.)
+            if matches!(source.name.as_str(), "datafusion" | "information_schema") {
+                return Err(ConfigError::ReservedCatalogSourceName {
+                    name: source.name.clone(),
+                }
+                .into());
+            }
             for conflicting in &["table", "schema", "database"] {
                 if source
                     .options
@@ -1118,19 +1227,53 @@ pub async fn register_data_sources(
     Ok(())
 }
 
+/// Which of the two startup contexts a registration serves. The
+/// PLANNING context (load_server_config) only validates pipeline SQL —
+/// it plans, never executes — so providers whose startup work is
+/// expensive network I/O can register lazily there from declared
+/// schemas; the RUNTIME context (setup_app_state) is the one queries
+/// execute on and the one /data_source reports, so it pays the real
+/// preflight. Today only graph branches on this (it is the one type
+/// with per-view startup probes on top of the dial); the other
+/// twice-dialing types (mongodb, dynamodb, open_connector) are
+/// pre-existing candidates for the same treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationPass {
+    Planning,
+    Runtime,
+}
+
 /// Register data sources with DataFusion SessionContext and OptimizerRegistry
 pub async fn register_data_sources_with_registry(
     session_ctx: &mut SessionContext,
     data_sources: &[DataSource],
     optimizer_registry: &Arc<crate::optimizer_registry::OptimizerRegistry>,
 ) -> Result<()> {
+    register_data_sources_for_pass(
+        session_ctx,
+        data_sources,
+        optimizer_registry,
+        RegistrationPass::Runtime,
+    )
+    .await
+}
+
+/// [`register_data_sources_with_registry`], with the pass named — the
+/// planning context registers graph sources lazily (no dial, no
+/// per-view probes; see [`RegistrationPass`]).
+pub async fn register_data_sources_for_pass(
+    session_ctx: &mut SessionContext,
+    data_sources: &[DataSource],
+    optimizer_registry: &Arc<crate::optimizer_registry::OptimizerRegistry>,
+    pass: RegistrationPass,
+) -> Result<()> {
     tracing::info!(
-        "Registering {} data sources with DataFusion and optimizer registry",
+        "Registering {} data sources with DataFusion and optimizer registry ({pass:?} pass)",
         data_sources.len()
     );
 
     for source in data_sources {
-        register_data_source(session_ctx, source, Some(optimizer_registry))
+        register_data_source_for_pass(session_ctx, source, Some(optimizer_registry), pass)
             .await
             .with_context(|| format!("Failed to register data source: {}", source.name))?;
     }
@@ -1144,6 +1287,21 @@ async fn register_data_source(
     session_ctx: &mut SessionContext,
     source: &DataSource,
     optimizer_registry: Option<&Arc<crate::optimizer_registry::OptimizerRegistry>>,
+) -> Result<()> {
+    register_data_source_for_pass(
+        session_ctx,
+        source,
+        optimizer_registry,
+        RegistrationPass::Runtime,
+    )
+    .await
+}
+
+async fn register_data_source_for_pass(
+    session_ctx: &mut SessionContext,
+    source: &DataSource,
+    optimizer_registry: Option<&Arc<crate::optimizer_registry::OptimizerRegistry>>,
+    pass: RegistrationPass,
 ) -> Result<()> {
     tracing::info!(
         "Registering data source: {} (type: {:?})",
@@ -1557,6 +1715,73 @@ async fn register_data_source(
                     source.name,
                     e
                 );
+                ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{:?}", e),
+                }
+            })?;
+        }
+        DataSourceType::Graph => {
+            tracing::info!(
+                "Registering graph source: {} (hierarchy_level: {:?})",
+                source.name,
+                source.hierarchy_level
+            );
+
+            let connection_string = source.connection_string.as_ref().ok_or_else(|| {
+                ConfigError::MissingConnectionString {
+                    name: source.name.clone(),
+                }
+            })?;
+
+            // Same contract as open_connector above: validate_data_sources
+            // already enforced the invariants; the provider re-checks them so
+            // the CLI path is covered. Without a registry (the embedder seam)
+            // a throwaway map stands in — the same behaviour open_connector
+            // has with no gateways map: view providers hold Arc'd handles
+            // regardless, and UDTF resolution had no registry there anyway.
+            let graph_sources = optimizer_registry
+                .map(|r| r.graph_sources())
+                .unwrap_or_default();
+            // Startup builds a PLANNING context (load_server_config) and
+            // a RUNTIME context (setup_app_state), and both register
+            // every source. Graph would be the most expensive occupant
+            // of that doubling — the preflight dial PLUS every view's
+            // LIMIT-1 validation Cypher — so the planning pass registers
+            // it LAZILY: pure validation and declared schemas only, no
+            // network I/O, no second pool dial (planning only plans;
+            // pipelines execute on the runtime engine, and /data_source
+            // reports the runtime registration's health). This also
+            // removes the two-pass disagreement window a flapping
+            // backend had: exactly one pass classifies health.
+            let result = match pass {
+                RegistrationPass::Runtime => {
+                    register_graph_tables(
+                        session_ctx,
+                        &graph_sources,
+                        &source.name,
+                        connection_string,
+                        source.graph.as_ref(),
+                        source.access_mode.is_read_write(),
+                        source.hierarchy_level,
+                    )
+                    .await
+                }
+                RegistrationPass::Planning => {
+                    skardi::sources::providers::graph::register_graph_tables_lazy(
+                        session_ctx,
+                        &graph_sources,
+                        &source.name,
+                        connection_string,
+                        source.graph.as_ref(),
+                        source.access_mode.is_read_write(),
+                        source.hierarchy_level,
+                    )
+                    .await
+                }
+            };
+            result.map_err(|e| {
+                tracing::error!("Graph registration failed for '{}': {:?}", source.name, e);
                 ConfigError::DataSourceRegistrationFailed {
                     name: source.name.clone(),
                     error: format!("{:?}", e),
@@ -2588,6 +2813,7 @@ options:
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         }
     }
 
@@ -2674,6 +2900,7 @@ options:
             description: None,
             open_connector,
             rss: None,
+            graph: None,
         }
     }
 
@@ -2888,6 +3115,7 @@ feeds:
             description: None,
             open_connector: None,
             rss: config_yaml.map(|yaml| serde_yaml::from_str(yaml).expect("parse rss config")),
+            graph: None,
         }
     }
 
@@ -3013,6 +3241,153 @@ feeds:
         );
     }
 
+    /// A minimal valid `graph:` block with one view. The URL points at a
+    /// closed port — validation is pure (no network I/O), so it passes
+    /// here; reachability is registration's concern.
+    const VALID_GRAPH_CONFIG: &str = r#"
+backend: age
+graph_name: knowledge
+views:
+  - name: user_posts
+    cypher: MATCH (u:User) RETURN u.name AS user_name
+    schema:
+      - name: user_name
+        type: string
+"#;
+
+    fn graph_source(name: &str, config_yaml: Option<&str>, access_mode: AccessMode) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::Graph,
+            path: PathBuf::new(),
+            connection_string: Some("postgres://127.0.0.1:1/none".to_string()),
+            schema: None,
+            options: None,
+            hierarchy_level: HierarchyLevel::Catalog,
+            access_mode,
+            enable_cache: false,
+            description: None,
+            open_connector: None,
+            rss: None,
+            graph: config_yaml.map(|yaml| serde_yaml::from_str(yaml).expect("parse graph config")),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_graph_with_typed_config() {
+        let source = graph_source("kg", Some(VALID_GRAPH_CONFIG), AccessMode::ReadOnly);
+        validate_data_sources(&[source]).expect("valid graph source");
+    }
+
+    #[test]
+    fn validate_rejects_graph_without_typed_config() {
+        let source = graph_source("kg", None, AccessMode::ReadOnly);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingGraphConfig { name } if name == "kg"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_graph_config_on_wrong_type() {
+        let mut source = dynamodb_source(
+            "products",
+            Some("http://localhost:8000"),
+            None,
+            AccessMode::ReadOnly,
+        );
+        source.graph = Some(serde_yaml::from_str(VALID_GRAPH_CONFIG).expect("parse graph config"));
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnexpectedGraphConfig { name, source_type }
+                    if name == "products" && *source_type == DataSourceType::Dynamodb
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_graph_table_hierarchy() {
+        // hierarchy_level defaults to Table; a minimal config must fail at
+        // validation, not at registration with the provider's wrapped error.
+        let mut source = graph_source("kg", Some(VALID_GRAPH_CONFIG), AccessMode::ReadOnly);
+        source.hierarchy_level = HierarchyLevel::Table;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::GraphHierarchyRequired { name } if name == "kg"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_graph_invalid_config() {
+        // `backend: neo4j` is a later milestone; GraphConfig::validate names
+        // it, and validation must surface that as a typed config error.
+        let source = graph_source(
+            "kg",
+            Some("backend: neo4j\ngraph_name: knowledge\n"),
+            AccessMode::ReadOnly,
+        );
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::InvalidGraphConfig { name, reason }
+                    if name == "kg" && reason.contains("not supported")
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_graph_without_connection_string() {
+        let mut source = graph_source("kg", Some(VALID_GRAPH_CONFIG), AccessMode::ReadOnly);
+        source.connection_string = None;
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::MissingConnectionString { name } if name == "kg"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_graph_read_write() {
+        // The graph milestone is read-only, so `Graph` is absent from
+        // WRITABLE_SOURCE_TYPES and the generic access_mode gate rejects
+        // read_write — there is no graph-specific check for it.
+        let source = graph_source("kg", Some(VALID_GRAPH_CONFIG), AccessMode::ReadWrite);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnsupportedWriteMode { name, source_type }
+                    if name == "kg" && *source_type == DataSourceType::Graph
+            ),
+            "got {config_err}"
+        );
+    }
+
     /// A `type: rss` source in a build without the `rss` feature must fail at
     /// registration with a message naming the feature — the typed `rss:` block
     /// still parses (RssConfig compiles featureless), so the failure is a
@@ -3128,6 +3503,7 @@ spec:
             options,
             open_connector: None,
             rss: None,
+            graph: None,
             hierarchy_level: HierarchyLevel::default(),
             access_mode,
             enable_cache: false,

@@ -24,10 +24,15 @@ use datafusion::prelude::SessionContext;
 use sqlx::Executor;
 use sqlx::postgres::PgPoolOptions;
 
+use skardi::sources::hierarchy::HierarchyLevel;
 use skardi::sources::providers::graph::client::{AgeClient, GraphClient, QueryBounds};
 use skardi::sources::providers::graph::config::GraphConfig;
-use skardi::sources::providers::graph::udtf::GraphSources;
-use skardi::sources::providers::graph::{register_graph_source, register_graph_udtfs};
+use skardi::sources::providers::graph::error::GraphError;
+use skardi::sources::providers::graph::udtf::{GraphSourceHealth, GraphSources};
+use skardi::sources::providers::graph::{
+    register_graph_source, register_graph_tables, register_graph_udtfs,
+};
+use skardi::util::json_getters::register_json_getter_udfs;
 
 fn live_url() -> Option<String> {
     let url = std::env::var("SKARDI_AGE_LIVE_URL")
@@ -147,6 +152,10 @@ async fn live_ctx(url: &str, graph: &str) -> (SessionContext, GraphSources) {
         .expect("registration connects eagerly");
     let ctx = SessionContext::new();
     register_graph_udtfs(&ctx, Arc::clone(&sources)).expect("udtfs register");
+    // The getter family is the session's registration, not the graph
+    // UDTFs' (register_graph_udtfs' doc) — register_json_getter_udfs
+    // installs the UDFs without the `->` operator rewrite.
+    register_json_getter_udfs(&ctx).expect("json getters register");
     (ctx, sources)
 }
 
@@ -643,6 +652,236 @@ async fn duplicate_registration_keeps_the_original_connection() {
     drop_graph(&pool, &graph).await;
 }
 
+/// YAML views end to end against a REAL AGE backend: registration
+/// validates each view's Cypher and contract against the live graph
+/// (this suite is the only place that path meets real agtype), the
+/// catalog tables answer plain SQL — projection, WHERE, a
+/// `nullable: false` assertion, a relationship STRUCT — and a view
+/// whose declared arity contradicts its RETURN clause refuses the whole
+/// registration, publishing neither handle nor catalog.
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn yaml_views_register_and_scan_against_a_live_backend() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("views");
+    let pool = seed_graph(&url, &graph).await;
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        std::env::set_var("SKARDI_AGE_VW_USER", user.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_VW_PASS", pass.unwrap_or_default());
+    }
+
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        r#"
+backend: age
+graph_name: {graph}
+username_env: SKARDI_AGE_VW_USER
+password_env: SKARDI_AGE_VW_PASS
+views:
+  - name: people
+    cypher: MATCH (p:Person) RETURN p.name, p.age
+    schema:
+      - {{name: name, type: string, nullable: false}}
+      - {{name: age, type: int}}
+  - name: knows
+    cypher: MATCH (a:Person)-[k:KNOWS]->(b:Person) RETURN a.name, k, b.name
+    schema:
+      - {{name: src, type: string}}
+      - {{name: rel, type: relationship}}
+      - {{name: dst, type: string}}
+"#
+    ))
+    .expect("config parses");
+    let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let mut ctx = SessionContext::new();
+    register_json_getter_udfs(&ctx).expect("getters");
+    register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg",
+        &clean_url,
+        Some(&config),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect("both views validate against the live graph");
+    {
+        let sources = sources.read().unwrap_or_else(|p| p.into_inner());
+        let handle = sources.get("kg").expect("handle published");
+        let health = handle.health.read().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            matches!(&*health, GraphSourceHealth::Healthy),
+            "a reachable, contract-honoring registration is healthy: {health:?}"
+        );
+    }
+
+    // Plain SQL over the node view: projection, WHERE, ordering. The
+    // nullable:false assertion on `name` held at validation (every
+    // seeded person has a name) — `age` is nullable and cyd/颱風 prove it.
+    let batches = collect(
+        &ctx,
+        "SELECT name, age FROM kg.main.people WHERE age IS NOT NULL ORDER BY name",
+    )
+    .await;
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string");
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["ada", "bob"],
+        "SQL WHERE filtered the null ages"
+    );
+
+    // The relationship view: the STRUCT columns carry the canonical
+    // shape, and its JSON properties answer the getter family.
+    let batches = collect(
+        &ctx,
+        "SELECT src, rel.\"type\" AS rel_type, json_get_int(rel.properties, 'since') AS since, dst \
+         FROM kg.main.knows ORDER BY since",
+    )
+    .await;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "the three seeded KNOWS edges");
+    let first = &batches[0];
+    let rel_type = first
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("type string");
+    assert_eq!(rel_type.value(0), "KNOWS");
+
+    // A view whose declared arity contradicts its RETURN clause: the
+    // live backend answers, the contract check refuses, the error names
+    // the view, and NOTHING is published under the new source name.
+    let bad: GraphConfig = serde_yaml::from_str(&format!(
+        r#"
+backend: age
+graph_name: {graph}
+username_env: SKARDI_AGE_VW_USER
+password_env: SKARDI_AGE_VW_PASS
+views:
+  - name: lopsided
+    cypher: MATCH (p:Person) RETURN p.name, p.age
+    schema:
+      - {{name: name, type: string}}
+"#
+    ))
+    .expect("config parses");
+    let err = register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg2",
+        &clean_url,
+        Some(&bad),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect_err("an arity mismatch is a contract violation, not an outage");
+    let msg = err.to_string();
+    assert!(msg.contains("lopsided"), "the error names the view: {msg}");
+    assert!(
+        !sources
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key("kg2"),
+        "a refused registration publishes no handle"
+    );
+    assert!(ctx.catalog("kg2").is_none(), "nor a catalog");
+
+    drop_graph(&pool, &graph).await;
+}
+
+/// The server entry (`register_graph_tables`) must hard-fail every
+/// registration error that is NOT a connectivity failure: a typo'd
+/// graph_name and a wrong password are server-answered contract/config
+/// problems — degrading them would let a misconfiguration sail through
+/// startup and sit degraded forever.
+#[tokio::test]
+#[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
+async fn server_registration_hard_fails_non_availability_errors() {
+    let Some(url) = live_url() else {
+        eprintln!("skipping live AGE test: set SKARDI_AGE_LIVE_URL to run");
+        return;
+    };
+    let graph = unique_graph("hardfail");
+    let pool = seed_graph(&url, &graph).await;
+    let (clean_url, user, pass) = split_creds(&url);
+    unsafe {
+        std::env::set_var("SKARDI_AGE_HF_USER", user.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_HF_PASS", pass.unwrap_or_default());
+        std::env::set_var("SKARDI_AGE_HF_WRONG", "definitely_wrong_pw_9");
+    }
+
+    // A typo'd graph_name: the server answered (no such graph) — refused,
+    // not degraded.
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}_misspelled\nusername_env: SKARDI_AGE_HF_USER\npassword_env: SKARDI_AGE_HF_PASS\n"
+    ))
+    .expect("config parses");
+    let sources: GraphSources = Arc::new(RwLock::new(HashMap::new()));
+    let mut ctx = SessionContext::new();
+    let err = register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg",
+        &clean_url,
+        Some(&config),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect_err("a typo'd graph is a configuration error, not an outage");
+    let msg = err.to_string();
+    assert!(msg.contains("does not exist"), "{msg}");
+    assert!(!matches!(err, GraphError::Unavailable { .. }), "{msg}");
+    assert!(
+        sources.read().unwrap_or_else(|p| p.into_inner()).is_empty(),
+        "a refused registration publishes no handle"
+    );
+    assert!(ctx.catalog("kg").is_none(), "nor a catalog");
+
+    // A wrong password: the server answers 28P01 — also refused.
+    let config: GraphConfig = serde_yaml::from_str(&format!(
+        "backend: age\ngraph_name: {graph}\nusername_env: SKARDI_AGE_HF_USER\npassword_env: SKARDI_AGE_HF_WRONG\n"
+    ))
+    .expect("config parses");
+    let err = register_graph_tables(
+        &mut ctx,
+        &sources,
+        "kg",
+        &clean_url,
+        Some(&config),
+        false,
+        HierarchyLevel::Catalog,
+    )
+    .await
+    .expect_err("an auth failure must not degrade either");
+    let msg = err.to_string();
+    assert!(msg.contains("password authentication failed"), "{msg}");
+    assert!(!matches!(err, GraphError::Unavailable { .. }), "{msg}");
+    assert!(
+        !msg.contains("definitely_wrong_pw_9"),
+        "the credential never echoes: {msg}"
+    );
+
+    drop_graph(&pool, &graph).await;
+}
+
 #[tokio::test]
 #[ignore = "needs a live Postgres+AGE (set SKARDI_AGE_LIVE_URL); see module doc"]
 async fn a_typoed_graph_name_fails_registration_not_discovery() {
@@ -844,8 +1083,10 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
 
     // ── #8: pool saturation is bounded and TYPED. max_connections
     // defaults to 4; hold all four sessions, then a query's acquire
-    // must time out as GraphError::Timeout — not a generic Backend
-    // error after sqlx's unrelated 30s default.
+    // must time out as GraphError::ConnectionAcquireTimeout — not a
+    // generic Backend error after sqlx's unrelated 30s default, and not
+    // the statement Timeout either (the query never started, so
+    // "narrow the traversal" would mislead).
     // A dedicated 1-connection client (the registered source's handle
     // hides the concrete type behind dyn GraphClient).
     let (clean_url, user, pass) = split_creds(&url);
@@ -889,8 +1130,12 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
         .expect("no connection can be acquired");
     let msg = err.to_string();
     assert!(
-        msg.contains("timed out after 1s"),
-        "saturation surfaces as the typed Timeout: {msg}"
+        msg.contains("could not acquire a connection"),
+        "saturation surfaces as the typed ConnectionAcquireTimeout: {msg}"
+    );
+    assert!(
+        msg.contains("within 1s"),
+        "bounded by the configured timeout, not sqlx's 30s default: {msg}"
     );
     drop(_held);
 
@@ -917,23 +1162,30 @@ async fn error_paths_bounds_and_binding_hardening_holds_end_to_end() {
          carries the name value — the silent swap the docs warn about"
     );
 
-    // ── #4 (rewriter scope): register_all installs the ->/->> operator
-    // rewrite session-wide; pin that it works over a node's properties
-    // JSON, since that is the documented reason it is registered.
-    let batches = collect(
-        &ctx,
-        "SELECT v.properties->>'name' AS n FROM cypher_query('kg', \
-         'MATCH (v:Person {name: \"bob\"}) RETURN v', '{}', '{\"v\": \"node\"}')",
-    )
-    .await;
-    let n = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(n.value(0), "bob", "the ->> rewrite reaches graph queries");
-
     drop_graph(&pool, &graph).await;
+}
+
+/// The federation-pushdown contract that replaced the old `register_all`
+/// pin (#4 in the live test above): with ONLY the getter UDFs registered —
+/// the session shape every front-end now uses — `->>` must NOT be silently
+/// rewritten to `json_get`. DataFusion 52 has no native Arrow-operator
+/// planner either, so the observable contract is a loud planning error
+/// naming the operator. Deliberate, not a regression: see
+/// `util::json_getters`' module doc. No backend needed — planning only.
+#[tokio::test]
+async fn arrow_operators_keep_native_planning() {
+    let ctx = SessionContext::new();
+    register_json_getter_udfs(&ctx).expect("json getters register");
+    let err = ctx
+        .sql("SELECT '{\"a\":1}'::text ->> 'a'")
+        .await
+        .expect_err("no rewrite means no plan");
+    let msg = err.to_string();
+    assert!(msg.contains("->>"), "the operator is named: {msg}");
+    assert!(
+        msg.contains("not yet supported"),
+        "native (unsupported), not rewritten: {msg}"
+    );
 }
 
 #[tokio::test]

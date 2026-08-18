@@ -259,17 +259,17 @@ A pipeline row differs from an ad-hoc row in four ways:
   ledger. The full error still goes to the HTTP caller.
 
 Scope of the guarantee: "parameter values never reach the ledger" covers the
-ledger only. The widest leak — an `ERROR`-level unsupported-parameter log
-that was on by default and fanned out to any configured OTLP collector — is
-closed: that line now logs the parameter's name and JSON type, never its
-contents. Three surfaces still carry parameter values and are tracked in
-[#217](https://github.com/SkardiLabs/skardi/issues/217): HTTP `400` bodies
-(`error_details.unsupported_parameters` echoes offending values), HTTP `500`
-bodies (engine error text can quote values back to the caller who sent
-them), and a `DEBUG`-level log of the substituted SQL. The first two reach
-only the caller who supplied the values; the third requires an operator to
-raise `RUST_LOG`. Do not read the ledger's redaction as implying the logs
-are fully covered.
+ledger only. Two of the four surfaces that used to carry parameter values are
+now closed — the `ERROR`-level unsupported-parameter log (on by default,
+fanning out to any configured OTLP collector) and the HTTP `400` body's
+`unsupported_parameters` list both name the parameter and its JSON *kind*
+now, never its contents. Two remain, tracked in
+[#217](https://github.com/SkardiLabs/skardi/issues/217): a `DEBUG`-level log
+of the substituted SQL (needs an operator to raise `RUST_LOG`, then egresses
+to the trace sink), and HTTP `500` bodies, where engine error text can quote
+a value back to the caller who sent it — `/query` redacts both to "see
+server logs"; the pipeline endpoint does not yet. Do not read the ledger's
+redaction as implying the logs are fully covered.
 
 Sizing note: with auditing on, every pipeline execution adds two
 `synchronous = FULL` ledger writes on the request's critical path — and the

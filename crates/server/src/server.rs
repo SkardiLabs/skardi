@@ -7,7 +7,9 @@ use datafusion::prelude::SessionContext;
 use skardi::engine::datafusion::DataFusionEngine;
 use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
+use skardi::sources::providers::graph::udtf::GraphSources;
 use skardi::sources::sql_validator::AdhocSqlPolicy;
+use skardi::util::json_getters::register_json_getter_udfs;
 use skardi::util::json_pack::register_json_pack_udf;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -67,6 +69,10 @@ pub struct AppState {
     /// `--query-audit-db`. `None` means raw SQL is never persisted anywhere.
     /// See [`crate::query_audit`].
     pub query_audit: Option<Arc<QueryAuditStore>>,
+    /// Graph source handles by connection name (shared with the
+    /// OptimizerRegistry that data-source registration fills). Read by
+    /// `/data_source` to report each graph source's registration health.
+    pub graph_sources: GraphSources,
 }
 
 impl AppState {
@@ -85,6 +91,7 @@ impl AppState {
         auth_layer: AuthLayer,
         jobs: Option<Arc<JobExecutor>>,
         query_audit: Option<Arc<QueryAuditStore>>,
+        graph_sources: GraphSources,
     ) -> Self {
         let adhoc_policy = Arc::new(crate::config::adhoc_policy_from_sources(
             &config.data_sources,
@@ -98,6 +105,7 @@ impl AppState {
             jobs,
             adhoc_policy,
             query_audit,
+            graph_sources,
         }
     }
 }
@@ -192,6 +200,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
     // metadata/frontmatter serialization boundary)
     register_json_pack_udf(&mut session_ctx);
+    // The json_get family is the extraction tool for every JSON column,
+    // graph node/relationship properties included; UDFs only, never the
+    // `->` operator rewrite — see util::json_getters.
+    register_json_getter_udfs(&session_ctx)?;
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;
@@ -285,6 +297,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         auth_layer,
         jobs_bundle,
         query_audit,
+        // The registry's map is the one data-source registration filled —
+        // sharing the Arc is what makes /data_source's health read live.
+        optimizer_registry.graph_sources(),
     );
 
     tracing::info!("Application state setup completed successfully");
@@ -513,6 +528,7 @@ spec:
             description: None,
             open_connector: None,
             rss: None,
+            graph: None,
         }];
 
         let pipeline = create_test_pipeline().await;
