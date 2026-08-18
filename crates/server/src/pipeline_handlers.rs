@@ -14,7 +14,7 @@ use anyhow::Result;
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
@@ -27,11 +27,74 @@ use std::time::Instant;
 
 use crate::auth::routes::require_session;
 use crate::config::{DataSourceType, HierarchyLevel};
+use crate::query_audit::{MAX_SESSION_ID_CHARS, QueryAuditStatus, finish_audit};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
+
+/// Optional caller-supplied session header. A header (not a body field)
+/// because the execute body IS the flattened parameter map — a reserved key
+/// could collide with a legitimate SQL parameter of the same name.
+///
+/// Not an auth credential: unrelated to [`require_session`] on the line
+/// above its extraction. The value is caller-asserted, so ledger session
+/// attribution is self-reported rather than derived from an authenticated
+/// principal — the same property as `/query`'s `ai_context.session_id`.
+const SESSION_ID_HEADER: &str = "x-skardi-session-id";
+
+/// Extract and validate the session header. `Ok(None)` when absent; `Err`
+/// when present but malformed — silently dropping a malformed value would
+/// corrupt session stitching, the one job this field has.
+///
+/// Allowed characters are visible ASCII graphic characters, excluding comma —
+/// no space, no tab, no other whitespace or control character. Space is
+/// rejected (not just trimmed) because `httparse` strips leading/trailing
+/// whitespace per RFC 9110 §5.5 before this code ever sees the value: if
+/// interior/exterior spaces were merely tolerated, `"  sess-1  "` would be
+/// recorded under the different key `sess-1` (silently breaking the session
+/// stitching this field exists for) while `"   "` would 400 here — the exact
+/// fail-late round trip a client-side check exists to prevent. A grouping
+/// key has no legitimate use for spaces, so this rejects them outright
+/// instead of defining trimming semantics. This predicate is mirrored
+/// exactly by the CLI's own check in `crates/cli/src/commands/run.rs`.
+fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let mut values = headers.get_all(SESSION_ID_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must not be sent more than once"
+        ));
+    }
+    let s = value
+        .to_str()
+        .map_err(|_| format!("{SESSION_ID_HEADER} must contain only visible ASCII characters"))?;
+    // Commas are rejected because RFC 9110 §5.3 lets any intermediary merge
+    // repeated header lines into one comma-joined value — without this, a
+    // duplicate sent through such a proxy would slip past the duplicate
+    // check above as a single merged "id1, id2". Spaces (and every other
+    // non-graphic character, including tab) are rejected for the trimming
+    // reason above.
+    if !s.chars().all(|c| c.is_ascii_graphic() && c != ',') {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must contain only visible ASCII characters, \
+             with no spaces and no commas (proxies may merge repeated header \
+             lines into one comma-separated value)"
+        ));
+    }
+    if s.is_empty() {
+        return Err(format!("{SESSION_ID_HEADER} must not be empty"));
+    }
+    if s.chars().count() > MAX_SESSION_ID_CHARS {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must be at most {MAX_SESSION_ID_CHARS} characters"
+        ));
+    }
+    Ok(Some(s.to_string()))
+}
 
 /// Request structure for pipeline execution
 #[derive(Debug, Deserialize)]
@@ -638,27 +701,31 @@ pub async fn get_data_sources(
 /// array placeholder or a row tuple cell.
 ///
 /// Number/Bool/Null render verbatim; String is single-quoted and escaped.
-/// Anything else falls back to `Value::to_string()`, matching the previous
-/// behaviour for unexpected nested shapes.
-fn scalar_to_sql(v: &Value) -> String {
+/// `Array` and `Object` return `None` — neither has a safe scalar SQL
+/// literal form, and the previous fallback (`Value::to_string()`, emitting
+/// raw unquoted JSON text) let a nested object splice unescaped, attacker-
+/// controlled text straight into the SQL string.
+fn scalar_to_sql(v: &Value) -> Option<String> {
     match v {
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => format!("'{}'", s.replace("'", "''")),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => "NULL".to_string(),
-        other => other.to_string(),
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(format!("'{}'", s.replace("'", "''"))),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => Some("NULL".to_string()),
+        Value::Array(_) | Value::Object(_) => None,
     }
 }
 
 /// Render one cell of a row tuple. Scalars use `scalar_to_sql`; a nested
 /// array is rendered as the bracketed scalar form `[a, b, c]` so VECTOR /
 /// pgvector columns accept the literal as a row-cell value (the same shape
-/// `Value::Array` of scalars produces at the top level).
-fn row_cell_to_sql(v: &Value) -> String {
+/// `Value::Array` of scalars produces at the top level). `None` propagates
+/// from either level — a nested array containing a non-scalar is just as
+/// unrenderable as a bare non-scalar cell.
+fn row_cell_to_sql(v: &Value) -> Option<String> {
     match v {
         Value::Array(inner) => {
-            let elements: Vec<String> = inner.iter().map(scalar_to_sql).collect();
-            format!("[{}]", elements.join(", "))
+            let elements: Option<Vec<String>> = inner.iter().map(scalar_to_sql).collect();
+            elements.map(|els| format!("[{}]", els.join(", ")))
         }
         _ => scalar_to_sql(v),
     }
@@ -762,15 +829,35 @@ pub fn substitute_sql_params(
                             ));
                             continue;
                         }
-                        let rows: Vec<String> = row_arrays
+                        let rendered_rows: Option<Vec<String>> = row_arrays
                             .iter()
                             .map(|cells| {
-                                let rendered: Vec<String> =
+                                let rendered_cells: Option<Vec<String>> =
                                     cells.iter().map(row_cell_to_sql).collect();
-                                format!("({})", rendered.join(", "))
+                                rendered_cells.map(|cells| format!("({})", cells.join(", ")))
                             })
                             .collect();
-                        rows.join(", ")
+                        match rendered_rows {
+                            Some(rows) => rows.join(", "),
+                            None => {
+                                // A cell is a nested object (or an array
+                                // containing one) — no safe SQL literal form
+                                // exists, and the previous fallback spliced
+                                // its raw JSON text, unquoted, into the SQL
+                                // string. Reject the whole parameter, same
+                                // shape as every other unsupported-shape
+                                // reject in this function; value-free per
+                                // the ERROR-log policy above.
+                                tracing::error!(
+                                    "Unsupported cell type inside VALUES tuple list for {}: \
+                                     every cell must be a scalar or an array of scalars.",
+                                    param_name
+                                );
+                                unsupported_params
+                                    .push(format!("{}: {:?}", param_name, param_value));
+                                continue;
+                            }
+                        }
                     } else if arr.iter().any(|v| v.is_array()) {
                         tracing::error!(
                             "Mixed-shape array for {} (some elements are arrays, \
@@ -786,11 +873,39 @@ pub fn substitute_sql_params(
                         continue;
                     } else {
                         // Flat scalar array — the original vector-literal form.
-                        let elements: Vec<String> = arr.iter().map(scalar_to_sql).collect();
-                        format!("[{}]", elements.join(", "))
+                        // Every element must actually be a scalar: a nested
+                        // object here (`{"p": [{"a": 1}]}`) is neither an
+                        // array (so it never reaches the tuple-list/mixed-
+                        // shape branches above) nor a scalar `scalar_to_sql`
+                        // can render — reject rather than let the previous
+                        // `Value::to_string()` fallback splice raw JSON text
+                        // into the vector literal.
+                        match arr
+                            .iter()
+                            .map(scalar_to_sql)
+                            .collect::<Option<Vec<String>>>()
+                        {
+                            Some(elements) => format!("[{}]", elements.join(", ")),
+                            None => {
+                                tracing::error!(
+                                    "Unsupported element type inside array parameter {}: \
+                                     every element must be a scalar.",
+                                    param_name
+                                );
+                                unsupported_params
+                                    .push(format!("{}: {:?}", param_name, param_value));
+                                continue;
+                            }
+                        }
                     }
                 }
                 _ => {
+                    // Value-free by design: this log is ERROR-level (on by
+                    // default) and fans out to any configured OTLP
+                    // collector, unlike `unsupported_params` below, which
+                    // only ever reaches the caller who already supplied the
+                    // value in their own request body. Only the parameter
+                    // name and the JSON type name are logged.
                     tracing::error!(
                         "Unsupported parameter type for {}: {}",
                         param_name,
@@ -825,15 +940,9 @@ pub async fn execute_pipeline_by_name(
 
     let start_time = Instant::now();
 
-    tracing::info!(
-        "Received execution request for pipeline '{}' with {} parameters",
-        pipeline_name,
-        request.parameters.len()
-    );
-
     // Acquire read lock and get the specified pipeline
     // Extract what we need and drop the lock immediately
-    let (sql_template, expected_params) = {
+    let (sql_template, pipeline_version, expected_params) = {
         let config = app_state.config.read().map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -846,6 +955,17 @@ pub async fn execute_pipeline_by_name(
         })?;
 
         let pipeline = config.pipelines.get(&pipeline_name).ok_or_else(|| {
+            // Deliberately a log, not a metric: a metric here would let an
+            // unauthenticated caller mint unbounded label cardinality from
+            // arbitrary URL segments (see the comment on `session_id`
+            // validation below for why that reject is deferred past this
+            // point). A log field has no such cardinality constraint, and
+            // without it endpoint-enumeration probes against this
+            // unauthenticated route left no trace at all.
+            tracing::warn!(
+                requested_pipeline = %pipeline_name,
+                "Rejected execute request for unknown pipeline"
+            );
             (
                 StatusCode::NOT_FOUND,
                 create_error_response(
@@ -866,8 +986,58 @@ pub async fn execute_pipeline_by_name(
         // Sort longest-first so a shorter name (e.g. `{user}`) cannot corrupt a longer one
         // (`{user_id}`) during str::replace when both appear in the same SQL template.
         expected_params.sort_by_key(|b| std::cmp::Reverse(b.len()));
-        (query_def.sql.clone(), expected_params)
+        (
+            query_def.sql.clone(),
+            pipeline.version().to_string(),
+            expected_params,
+        )
     };
+
+    // Validated only after the pipeline lookup, deliberately: the reject
+    // below records a metric labeled by `pipeline_name`, and before the
+    // lookup that label is an arbitrary caller-supplied URL segment — an
+    // unauthenticated caller could mint unbounded metric cardinality until
+    // real pipelines overflow the OTel stream cap. Post-lookup the label is
+    // bounded to configured names (and an unknown pipeline correctly 404s
+    // regardless of header shape).
+    let session_id = session_id_from_headers(&headers).map_err(|msg| {
+        // Recorded like every other early reject in this handler — a client
+        // looping on a malformed session id must be visible in metrics.
+        let elapsed_ms = start_time.elapsed().as_millis() as f64;
+        app_state
+            .metrics
+            .record_error(&pipeline_name, elapsed_ms, "parameter_validation_error");
+        (
+            StatusCode::BAD_REQUEST,
+            create_error_response(
+                &msg,
+                "parameter_validation_error",
+                Some(serde_json::json!({"header": SESSION_ID_HEADER})),
+            ),
+        )
+    })?;
+
+    // `session_id` rides in the INFO marker so operators who stitch sessions
+    // from traces (rather than the opt-in ledger) get attribution too. It is
+    // an opaque, caller-asserted grouping key — value-free by the same
+    // standard as `/query`'s `ai_context` marker field.
+    //
+    // Two arms rather than `unwrap_or_default()`: an unattributed request has
+    // no session id at all, and logging `session_id=""` on every such request
+    // would misrepresent absence as an empty-string value.
+    match session_id.as_deref() {
+        Some(session_id) => tracing::info!(
+            session_id,
+            "Received execution request for pipeline '{}' with {} parameters",
+            pipeline_name,
+            request.parameters.len()
+        ),
+        None => tracing::info!(
+            "Received execution request for pipeline '{}' with {} parameters",
+            pipeline_name,
+            request.parameters.len()
+        ),
+    }
 
     let mut sql = sql_template;
 
@@ -913,12 +1083,58 @@ pub async fn execute_pipeline_by_name(
         ));
     }
 
+    // Raw parameter values are never written to the ledger — only the
+    // pipeline name, which doubles as the join key back to the on-disk
+    // template. Committed *before* execution, so a write failure means the
+    // pipeline does not run at all: an audited server must not execute
+    // anything it cannot account for.
+    let audit_id = match &app_state.query_audit {
+        Some(store) => match store
+            .record_pipeline_started(&pipeline_name, &pipeline_version, session_id.as_deref())
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!("Pipeline audit write failed; refusing to execute: {e}");
+                let elapsed_ms = start_time.elapsed().as_millis() as f64;
+                app_state
+                    .metrics
+                    .record_error(&pipeline_name, elapsed_ms, "query_audit_error");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    create_error_response(
+                        "Query auditing is enabled but the audit record could not be \
+                         written; the pipeline was not executed",
+                        "query_audit_error",
+                        None,
+                    ),
+                ));
+            }
+        },
+        None => None,
+    };
+
     // Execute the query using the DataFusion engine
     let record_batch = match app_state.engine.execute(&sql).await {
         Ok(batch) => batch,
         Err(e) => {
             tracing::error!("Query execution failed: {}", e);
             tracing::debug!("Failed SQL query: {}", sql); // Log SQL for debugging but don't expose in response
+
+            // A fixed, value-free error kind — not `e.to_string()`. Parameter
+            // values are substituted directly into `sql` as literals, and a
+            // type-mismatch engine error can quote the offending literal back
+            // (e.g. `price <= 'not-a-number'`). Persisting the raw engine
+            // error would smuggle a caller-supplied parameter value into the
+            // ledger, which parameter values must never enter.
+            finish_audit(
+                app_state.query_audit.as_deref(),
+                audit_id.as_deref(),
+                QueryAuditStatus::Failed,
+                None,
+                Some("query_execution_error"),
+            )
+            .await;
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state
@@ -940,11 +1156,29 @@ pub async fn execute_pipeline_by_name(
         }
     };
 
-    // Convert RecordBatch to JSON
-    let data = match record_batch_to_json(&record_batch) {
+    // Convert RecordBatch to JSON.
+    //
+    // `record_batch_to_json` yields a `Box<dyn Error>`, which is not `Send`.
+    // Flatten it to a message up front: holding the box across the audit
+    // await below would make the whole handler future non-`Send` (see the
+    // identical note in `query_handlers::execute_query`).
+    let data = match record_batch_to_json(&record_batch).map_err(|e| e.to_string()) {
         Ok(json_data) => json_data,
         Err(e) => {
             tracing::error!("Failed to convert results to JSON: {}", e);
+
+            // A fixed, value-free error kind, for the same reason as the
+            // engine-execution branch above: substituted parameter values can
+            // echo through error text derived from the query/result, and
+            // parameter values must never reach the ledger.
+            finish_audit(
+                app_state.query_audit.as_deref(),
+                audit_id.as_deref(),
+                QueryAuditStatus::Failed,
+                Some(record_batch.num_rows()),
+                Some("result_conversion_error"),
+            )
+            .await;
 
             let elapsed_ms = start_time.elapsed().as_millis() as f64;
             app_state
@@ -952,7 +1186,7 @@ pub async fn execute_pipeline_by_name(
                 .record_error(&pipeline_name, elapsed_ms, "result_conversion_error");
 
             let error_details = serde_json::json!({
-                "conversion_error": e.to_string(),
+                "conversion_error": e,
                 "record_batch_schema": format!("{:?}", record_batch.schema()),
                 "record_batch_rows": record_batch.num_rows()
             });
@@ -966,8 +1200,22 @@ pub async fn execute_pipeline_by_name(
         }
     };
 
-    let execution_time = start_time.elapsed().as_millis() as u64;
     let row_count = record_batch.num_rows();
+
+    finish_audit(
+        app_state.query_audit.as_deref(),
+        audit_id.as_deref(),
+        QueryAuditStatus::Succeeded,
+        Some(row_count),
+        None,
+    )
+    .await;
+
+    // Measured *after* the outcome write, so the reported latency includes
+    // the second fsync on the critical path — otherwise the exact cost the
+    // audit ledger adds (the thing docs/server.md tells operators to size
+    // for) is invisible in `pipeline_latency_ms` until requests time out.
+    let execution_time = start_time.elapsed().as_millis() as u64;
 
     app_state
         .metrics
@@ -1599,36 +1847,77 @@ spec:
     }
 
     #[test]
-    fn test_substitute_tuple_list_covers_bool_null_and_fallback_cells() {
-        // Locks down the three less-common scalar_to_sql arms that the other
-        // tuple-list tests don't reach: Bool, Null, and the fallback for an
-        // unexpected JSON shape (Object). All three flow through
+    fn test_substitute_tuple_list_covers_bool_and_null_cells() {
+        // Locks down the two less-common scalar_to_sql arms that the other
+        // tuple-list tests don't reach: Bool and Null. Both flow through
         // row_cell_to_sql's `_ => scalar_to_sql(v)` branch.
-        let mut sql = "INSERT INTO t (active, last_login, raw) VALUES {rows}".to_string();
-        let mut obj = serde_json::Map::new();
-        obj.insert("k".to_string(), Value::String("v".to_string()));
+        let mut sql = "INSERT INTO t (active, last_login) VALUES {rows}".to_string();
         let params_map = params(&[(
             "rows",
-            Value::Array(vec![Value::Array(vec![
-                Value::Bool(true),
-                Value::Null,
-                Value::Object(obj),
-            ])]),
+            Value::Array(vec![Value::Array(vec![Value::Bool(true), Value::Null])]),
         )]);
         let (missing, unsupported) =
             substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
 
         assert!(missing.is_empty());
         assert!(unsupported.is_empty());
-        // Bool → `true`, Null → `NULL`, Object falls through to
-        // `Value::to_string()` which emits the JSON form `{"k":"v"}`.
-        // The Object case isn't useful SQL on most engines, but it's the
-        // pre-existing behaviour for "any other JSON shape" — locking it
-        // here means a future change has to be deliberate.
+        // Bool → `true`, Null → `NULL`.
         assert_eq!(
             sql,
-            "INSERT INTO t (active, last_login, raw) VALUES (true, NULL, {\"k\":\"v\"})"
+            "INSERT INTO t (active, last_login) VALUES (true, NULL)"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // SQL-injection guard: a JSON object nested inside an array parameter must never be
+    // spliced into SQL as raw, unquoted text. Two reachable paths, both
+    // exercised below with the injection-shaped payload from the review.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_substitute_tuple_list_rejects_nested_object_cell() {
+        // Path (a): an object nested inside a row-tuple-list cell used to
+        // fall through `scalar_to_sql`'s `other => other.to_string()` catch-
+        // all and render as raw, unquoted JSON text — e.g. `{"a": "x'; -- "}`
+        // spliced straight into `VALUES (...)`, closing the string literal
+        // and injecting a comment that swallows the rest of the statement.
+        // It must be rejected instead, leaving the SQL unsubstituted.
+        let mut sql = "INSERT INTO t (a) VALUES {rows}".to_string();
+        let mut obj = serde_json::Map::new();
+        obj.insert("a".to_string(), Value::String("x'; -- ".to_string()));
+        let params_map = params(&[(
+            "rows",
+            Value::Array(vec![Value::Array(vec![Value::Object(obj)])]),
+        )]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].starts_with("rows: "));
+        // Placeholder left untouched on rejection — no injected text reaches
+        // the SQL string at all.
+        assert_eq!(sql, "INSERT INTO t (a) VALUES {rows}");
+    }
+
+    #[test]
+    fn test_substitute_flat_scalar_array_rejects_nested_object_element() {
+        // Path (b): a flat array whose elements are all non-arrays (so
+        // neither the tuple-list branch nor the mixed-shape branch fires)
+        // but one element is an object rather than a scalar. This used to
+        // fall through to `scalar_to_sql`'s catch-all and render as raw JSON
+        // text inside the `[...]` vector literal. Must be rejected instead.
+        let mut sql = "SELECT vector_to_text({p})".to_string();
+        let mut obj = serde_json::Map::new();
+        obj.insert("a".to_string(), Value::Number(1.into()));
+        let params_map = params(&[("p", Value::Array(vec![Value::Object(obj)]))]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].starts_with("p: "));
+        assert_eq!(sql, "SELECT vector_to_text({p})");
     }
 
     #[test]

@@ -178,12 +178,20 @@ execution and updated with its outcome afterwards:
 | `sql` | raw statement text |
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
-| `max_rows`, `statement_kind` | request shape |
+| `max_rows` | requested row cap (`0` on pipeline rows — not applicable) |
+| `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
 | `row_count`, `error` | outcome detail |
 
-Indexed on `(session_id, created_at)`, `created_at` and `status`, so an agent
-session can be reconstructed with plain SQL.
+Indexed on `(session_id, created_at)`, `created_at`, `status` and
+`statement_kind`, so an agent session can be reconstructed — and a single row
+kind selected — with plain SQL.
+
+What is **not** here: job runs. `POST /jobs/:name/run` executes its own SQL
+through the same engine but is recorded in the separate jobs run ledger (see
+[jobs.md](jobs.md)), not in `query_audit`. An operator reasoning about
+coverage during an incident should read this ledger as "ad-hoc queries and
+pipeline executions", not "everything the server ran".
 
 Failure semantics are explicit:
 
@@ -191,17 +199,110 @@ Failure semantics are explicit:
   to audit never runs silently unaudited.
 - **Before execution.** If the pre-execution write fails, the request is
   rejected with `503 query_audit_error` and the statement is **not executed**.
+  Each write is bounded (5s), so a *hung* fsync fails the request rather than
+  hanging it. Because an abandoned write may still land on the writer thread
+  afterwards, a timed-out pre-execution write is followed by a corrective
+  update marking that row `failed` with `error = audit_write_timeout` — the
+  server knows the statement did not run, and the ledger says so rather than
+  degrading to the ambiguous `unknown`.
 - **After execution.** A failed outcome update is logged only; the query
   already ran. The row stays `started` and the next startup reconciles it to
   `unknown`, as it does for statements killed mid-flight.
 
 Retention is opt-in: `--query-audit-retention-days <n>` deletes records older
 than `n` days at startup and hourly thereafter. Without it, records are kept
-forever and pruning is the operator's call.
+forever and pruning is the operator's call. The prune deletes in batches,
+yielding between them: it shares the ledger's single writer thread with the
+fail-closed write path, so an unchunked delete over a large backlog would
+starve concurrent requests into `503 query_audit_error`. Enabling retention
+for the first time on a big ledger is therefore slow, not disruptive. Each
+batch is bounded like any other write, so on pathologically slow storage the
+*startup* prune can fail and abort startup — the same fail-closed stance
+that makes a broken ledger fatal rather than silently skipped. Later hourly
+prunes only warn.
 
 The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
 including the WAL sidecars). It is a local database, never the OTLP/tracing
 pipeline, so enabling it does not push query text to external collectors.
+
+#### Pipeline executions in the ledger
+
+When `--query-audit-db` is configured, `POST /:pipeline/execute` is audited
+with the same record-before-execute and fail-closed semantics as `/query`
+(a failed pre-execution write returns 503 and the pipeline does not run).
+A pipeline row differs from an ad-hoc row in four ways:
+
+- `statement_kind` is `pipeline`, and the `sql` column holds
+  `name@version` (from `metadata.version`), not SQL — the versioned
+  template lives on disk, and the pipeline's `description` carries its
+  purpose. The version matters because pipelines are exactly the artifacts
+  the promotion loop edits, and rows are kept forever by default: without
+  it, "what SQL ran" stops being answerable once a template is revised.
+
+  **Parse rule:** split on the *last* `@` (`rsplit_once('@')`). Pipeline
+  names are not charset-restricted, so a name may itself contain `@`
+  (`billing@eu@1.0.0` is the pipeline `billing@eu` at version `1.0.0`). A
+  trailing `@` with nothing after it means the pipeline declared an empty
+  `metadata.version` — a config smell in the pipeline, not a truncated row.
+
+  The version pins the **template**, not the exact statement: parameter
+  substitution is textual, so two executions of `weekly-churn@1.0.0` run
+  the same SQL skeleton with different literals. Values are deliberately
+  not recorded (see the confidentiality note above), so the ledger
+  identifies the artifact and its revision, not the byte-exact statement.
+- Parameter values are never recorded: params are where PII lives.
+  `ai_context` is always NULL on pipeline rows.
+- `max_rows` is stored as `0` (not applicable to pipelines).
+- On failure, `error` holds a fixed kind (`query_execution_error` or
+  `result_conversion_error`), never engine error text — engine errors can
+  echo substituted parameter values back, and those must not reach the
+  ledger. The full error still goes to the HTTP caller.
+
+Scope of the guarantee: "parameter values never reach the ledger" covers the
+ledger only. Two of the four surfaces that used to carry parameter values are
+now closed — the `ERROR`-level unsupported-parameter log (on by default,
+fanning out to any configured OTLP collector) and the HTTP `400` body's
+`unsupported_parameters` list both name the parameter and its JSON *kind*
+now, never its contents. Two remain, tracked in
+[#217](https://github.com/SkardiLabs/skardi/issues/217): a `DEBUG`-level log
+of the substituted SQL (needs an operator to raise `RUST_LOG`, then egresses
+to the trace sink), and HTTP `500` bodies, where engine error text can quote
+a value back to the caller who sent it — `/query` redacts both to "see
+server logs"; the pipeline endpoint does not yet. Do not read the ledger's
+redaction as implying the logs are fully covered.
+
+Sizing note: with auditing on, every pipeline execution adds two
+`synchronous = FULL` ledger writes on the request's critical path — and the
+write is fail-closed, so a failing audit disk turns into `503
+query_audit_error` rather than dropped records (each write is bounded by a
+5-second timeout, so a *hung* fsync is treated as a failed one instead of
+hanging the request). All ledger writes — `/query`'s included — funnel
+through one serialized writer thread, so this is a ceiling on total audited
+throughput, not just a per-request latency adder. Pipelines are typically
+the higher-QPS path (they are the promoted recurring queries), so put the
+ledger on storage you'd trust under your serving load.
+
+`session_id` comes from the optional `X-Skardi-Session-Id` request header
+(non-empty, ≤ 200 characters, visible ASCII with no spaces, tabs or commas).
+A malformed header is rejected with `400 parameter_validation_error` — carrying
+`details.header` so an agent can tell a header reject from a parameter reject
+— rather than silently dropped. With the header present, one agent session's
+ad-hoc queries and pipeline calls interleave under a single `session_id` in
+the ledger, ordered by `created_at`.
+
+**`session_id` is caller-asserted, not authenticated.** It groups executions;
+it does not attest to their origin. Any caller may stamp its executions with
+another agent's session id, or omit the header and land unattributed. Treat it
+as a correlation key when reading the ledger, never as evidence of who ran
+what. (Spaces are rejected precisely because HTTP intermediaries may trim
+surrounding whitespace, which would silently re-key an execution.)
+
+Reachability caveat: producing that interleaving from the shipped CLI
+requires both halves, and today only `skardi run --session-id` exists —
+`skardi query` cannot send `ai_context` yet
+([#218](https://github.com/SkardiLabs/skardi/issues/218)), so the ad-hoc
+half of a CLI session lands unattributed until then. Direct HTTP callers
+get the full interleaving today.
 
 ---
 

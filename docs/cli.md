@@ -146,6 +146,16 @@ sends an array. A value only falls back to a plain string when it isn't
 valid JSON on its own (e.g. `-p name=hello`). This matters because the
 server substitutes typed literals into the pipeline's SQL.
 
+`--session-id <ID>` — sent as `X-Skardi-Session-Id`; groups this
+execution with an agent session in the server's query audit ledger. The
+value is validated client-side before any request is sent (non-empty,
+≤ 200 characters, visible ASCII, no spaces, tabs or commas — byte-for-byte
+the rules the server enforces, so nothing can pass here and be rejected or
+silently rewritten there), so a bad value fails fast instead of surfacing as
+a connection error. When the server has auditing enabled, a `503` with `error_type
+"query_audit_error"` means the pipeline **did not run** and the call is
+safe to retry.
+
 Calling a pipeline that doesn't exist on the server returns a friendly
 error instead of a raw 404:
 

@@ -145,8 +145,23 @@ impl ApiClient {
     /// start with `/`) and return the parsed JSON body, or an `ApiError` on
     /// failure.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, ApiError> {
+        self.post_with_headers(path, body, &[]).await
+    }
+
+    /// Like [`Self::post`], but attaches each `(name, value)` pair in
+    /// `headers` to the request before auth — e.g. the `x-skardi-session-id`
+    /// header for `skardi run --session-id`.
+    pub async fn post_with_headers(
+        &self,
+        path: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.http.post(&url).json(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         request = self.with_auth(request);
 
         self.send(request, url).await
