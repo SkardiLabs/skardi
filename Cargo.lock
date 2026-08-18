@@ -9670,6 +9670,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rusqlite",
+ "tracing",
 ]
 
 [[package]]

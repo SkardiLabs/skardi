@@ -9,7 +9,14 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = { workspace = true }
 tokio-rusqlite = { workspace = true }
+# The pipeline-audit path (#213) bounds its ledger write with
+# `tokio::time::timeout` and reports a lost outcome through `tracing`. Both
+# arrived with that change while this crate was being extracted, so they are
+# declared here rather than inherited from the server that used to host the
+# module.
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

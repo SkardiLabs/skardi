@@ -68,7 +68,10 @@ pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `skardi-cli` restates this cap under the same name (`run.rs`) because the
 /// CLI crate does not depend on this one; keep them in sync.
-pub(crate) const MAX_SESSION_ID_CHARS: usize = 200;
+/// `pub` because the handlers that enforce this bound now live in a
+/// different crate: `pub(crate)` was the right scope while this module was
+/// inside the server, and the extraction is what widened it.
+pub const MAX_SESSION_ID_CHARS: usize = 200;
 
 /// Error from [`bounded`] that keeps "the write timed out" distinguishable
 /// from "the write ran and failed" (e.g. `ConnectionClosed`). Only the
@@ -129,7 +132,10 @@ async fn bounded<T>(
 /// the statement, so it is logged rather than surfaced: the row simply stays
 /// `started` and the next startup reconciles it to `unknown`. No-op when
 /// auditing is off. Callers pass `app_state.query_audit.as_deref()`.
-pub(crate) async fn finish_audit(
+/// `pub` for the same reason as [`MAX_SESSION_ID_CHARS`] — the ad-hoc and
+/// pipeline handlers both stamp their terminal outcome through this, and they
+/// are no longer in this crate.
+pub async fn finish_audit(
     store: Option<&QueryAuditStore>,
     audit_id: Option<&str>,
     status: QueryAuditStatus,
