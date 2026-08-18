@@ -1,11 +1,14 @@
-# Dropbox source pack. Wire contract is Open Connector's, RECONCILED
-# AGAINST THE v1.3.5 PROVIDER SOURCE ONLY — no live gateway has answered
-# any of it (no Node runtime on the authoring box; see the module doc's
-# provenance banner and
-# docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md). Every
-# fingerprint below is the hash of a source-derived schema, not of a
-# captured one, so registration against a real gateway is expected to
-# fail the contract gate until the live pass re-pins it.
+# Dropbox source pack. Wire contract is Open Connector's. LIVE-VERIFIED
+# 2026-08-18 against a self-hosted Open Connector gateway at commit
+# a3efa99 and a real (free-tier) Dropbox account: all five actions
+# discovered, all five pinned fingerprints matched LIVE discovery
+# unchanged, and all three tables scanned real rows end to end. The
+# fingerprints below were derived from the provider source and the live
+# capture confirmed them byte-for-byte, so nothing needed re-pinning.
+# Two claims remain unobserved rather than confirmed, and are labelled
+# where they live: `shared_links.expires_at` (paid-tier link expiry) and
+# `file_search.match_type = 'content'` (content indexing never landed
+# during the pass).
 #
 # Every list executor NORMALIZES rows through `mapDropboxMetadata`: a
 # fixed camelCase shape whose fifteen keys are ALL declared `required`
@@ -22,15 +25,17 @@
 # ONLY property. Feeding the cursor back to the opening action would not
 # be a quiet truncation but a hard 400, because `list_folder`'s input
 # schema is `additionalProperties: false` and does not declare `cursor`
-# — read off the schema, NOT yet observed on the wire. Hence
+# — read off the schema and CONFIRMED on the wire 2026-08-18 (the
+# opening action refuses a `cursor` input, bare or alongside the full
+# input; the continue action refuses anything beyond it). Hence
 # `continuation: {action, fingerprint, inputs: cursor_only}`, whose
 # input-side claim registration now checks against the continuation
 # action's discovered input schema.
 #
 # TERMINATION. `list_folder` answers its FINAL page with a NON-EMPTY
-# cursor (the executor's `requireString(payload.cursor)`, and the
-# contract declares `cursor` a plain required string, not a nullable
-# one). Cursor-spelling termination would refetch and fail as a
+# cursor — OBSERVED 2026-08-18: the last page carried `hasMore: false`
+# beside a 259-character cursor, and following that cursor returns an
+# empty page. Cursor-spelling termination would refetch and fail as a
 # PaginationLoop, so `has_more_path` is load-bearing here, not
 # decorative. shared_links and search DO null their cursors, but declare
 # `$.hasMore` too: it is the provider's authoritative signal in all
@@ -42,8 +47,14 @@
 # declares no error_path.
 #
 # Scopes: files/file_search need `files.metadata.read`; shared_links
-# needs `sharing.read`. No content or write scope is required by any
-# table here, so a read-only connection serves the whole pack.
+# needs `sharing.read` — confirmed per-action in the live gateway's
+# `requiredScopes` metadata. No content or write scope is required by any
+# table here. NOTE that this is a statement about the ACTIONS, not about
+# what an operator can provision: the gateway's dropbox provider
+# requests the union of all six dropbox scopes (including
+# `files.content.write` and `sharing.write`) at authorize time, so a
+# connection created through its OAuth flow carries more than this pack
+# uses. See docs/open-connector-dropbox.md.
 #
 # Design rationale lives in the module docs of packs/dropbox.rs.
 kind: pack
@@ -62,10 +73,9 @@ tables:
       cursor_input: cursor
       next_cursor_path: "$.cursor"
       page_size_input: limit
-      # The schema's declared maximum. UNVERIFIED AT THE BOUNDARY: a
-      # declared cap can exceed the wire's (Feishu declared 100 and
-      # hard-failed above 50), so one probe at 2000 and one at 2001 are
-      # owed before this number is trustworthy. Continuation pages carry
+      # The schema's declared maximum, VERIFIED AT THE BOUNDARY
+      # (2026-08-18): `limit: 2000` returns rows, `limit: 2001` is
+      # refused. Continuation pages carry
       # no `limit` at all — the continue action declares none — and
       # Dropbox sizes them from this opening request. `page_size` is the
       # size REQUESTED per page; it neither caps nor floors a pushed-down
@@ -123,10 +133,10 @@ tables:
     fingerprint: 7f7c822b99a1afcbf4ea81371527a14ab4d24918dbde170eb115037003144067
     # No continuation block: the executor `compactObject`s `path` and
     # `cursor` together and the input schema declares both, so pages 2..N
-    # repeat the action with the full input, the engine's default. NOT
-    # verified on the wire — this is design-spec open question 1, and if
-    # Dropbox rejects the pair, the fix is `continuation: {fingerprint,
-    # inputs: cursor_only}` here with no code change.
+    # repeat the action with the full input, the engine's default.
+    # CONFIRMED on the wire 2026-08-18 (design-spec open question 1):
+    # `list_shared_links` accepts `path` and `cursor` in one request, so
+    # no `cursor_only` continuation is needed here.
     pagination:
       strategy: cursor
       cursor_input: cursor
@@ -163,17 +173,29 @@ tables:
       # legal.
       - { name: url, path: url, type: utf8, nullable: true }
       - { name: id, path: id, type: utf8, nullable: true }
-      - { name: path_display, path: pathDisplay, type: utf8, nullable: true }
       - { name: path_lower, path: pathLower, type: utf8, nullable: true }
+      # Populates only on a link Dropbox let the account set an expiry on
+      # — a paid-tier feature. Structurally reachable, so mapped, but the
+      # live pass could not observe a non-NULL value (free account:
+      # `settings_error/not_authorized`).
       - { name: expires_at, path: expiresAt, type: timestamp_ms_utc, nullable: true }
       - { name: client_modified, path: clientModified, type: timestamp_ms_utc, nullable: true }
       - { name: server_modified, path: serverModified, type: timestamp_ms_utc, nullable: true }
       - { name: rev, path: rev, type: utf8, nullable: true }
       - { name: size_bytes, path: sizeBytes, type: int64, nullable: true }
-      - { name: is_downloadable, path: isDownloadable, type: boolean, nullable: true }
-      - { name: content_hash, path: contentHash, type: utf8, nullable: true }
-      - { name: sharing_info, path: sharingInfo, type: json, nullable: true }
       - { name: link_permissions, path: linkPermissions, type: json, nullable: true }
+      # path_display / is_downloadable / content_hash / sharing_info are
+      # DELIBERATELY ABSENT, the mirror image of the three columns files
+      # omits. `sharing/list_shared_links` returns SharedLinkMetadata,
+      # which carries `path_lower` but has NO `path_display`,
+      # `is_downloadable`, `content_hash` or `sharing_info` field at all;
+      # the shared normalizer reads those four off keys the payload never
+      # has, so mapping them shipped four structurally always-NULL
+      # columns. Live evidence (2026-08-18): 0/5 non-NULL across 3 file
+      # links and 2 folder links, and decisively, a file whose
+      # files-row carries all four came back with all four NULL on its
+      # own shared_links row — same file, same normalizer, different
+      # endpoint. Pinned by a negative-space guard test.
 
   # Dropbox's search_v2 over files and folders. `query` is required: a
   # search table without one is not a table (the GitHub owner/repo
@@ -187,8 +209,9 @@ tables:
       cursor_input: cursor
       next_cursor_path: "$.cursor"
       page_size_input: maxResults
-      # search_v2's declared maximum; unverified at the boundary, like
-      # files' 2000 above.
+      # search_v2's declared maximum, verified at the boundary
+      # 2026-08-18 like files' 2000 above: 1000 returns rows, 1001 is
+      # refused.
       page_size: 1000
       has_more_path: "$.hasMore"
       continuation:

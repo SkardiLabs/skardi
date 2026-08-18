@@ -20,20 +20,40 @@ into a fixed camelCase shape — `tag`, `name`, `id`, `pathDisplay`,
   `size`) never reach a row, so mapping them would have produced
   always-NULL columns.
 - Every column below sits **inside** the contract-fingerprint gate, and
-  the fingerprint coverage gap is empty — the opposite of the passthrough
-  packs, where real rows are the only column truth.
+  the fingerprint coverage gap is empty — unlike the passthrough packs,
+  where columns ride `additionalProperties` outside any gate.
 
-> **⚠ NOT live-verified.** Reconciled against the Open Connector v1.3.5
-> provider *source* only. No live gateway has answered any of this pack
-> and no Dropbox account has been read, so every committed fingerprint is
-> the hash of a source-derived schema rather than a captured one, and the
-> bundled fixtures are authored shapes rather than redacted captures.
-> **Registration against a real gateway is expected to fail the contract
-> gate until the pins are re-captured** — that is the gate working. The
-> runbook that closes this out is
-> [the live-evaluation plan](superpowers/plans/2026-08-18-dropbox-live-evaluation.md);
-> its acceptance table lists every statement here that is currently an
-> inference.
+That gate is narrower than it looks, and the live pass proved it. Because
+*all five* list actions publish the *same* normalized 15-key schema, a
+fingerprint match says nothing about whether a given key is populated for
+a given action: `shared_links` passed the gate while returning NULL for
+four keys its endpoint has no field for. **Real rows are still the only
+column truth here too** — the gate protects the row *shape*, not the
+per-action field coverage.
+
+> **✅ Live-verified 2026-08-18** against a self-hosted Open Connector
+> gateway at commit `a3efa99` and a real free-tier Dropbox account. All
+> five actions were discovered, all five committed fingerprints matched
+> live discovery **unchanged** (registration passed on the first try), and
+> all three tables scanned real rows end to end — every mapped column
+> carrying a real non-NULL value somewhere. The pass removed four columns
+> from `shared_links` that cannot populate; see that table below.
+>
+> Two things remain **unobserved** rather than confirmed, neither a
+> defect: `shared_links.expires_at` needs paid-tier link expiry, and
+> `file_search.match_type = 'content'` needs Dropbox content indexing,
+> which did not land during the pass. The row fixtures in-repo are still
+> authored shapes rather than redacted captures.
+>
+> **Known gateway blocker, not specific to this pack:** at commit
+> `a3efa99` the gateway's `GET /v1/actions/<id>` does not serialize the
+> `execution` block, so Skardi's default-deny action registry refuses
+> every action from *every* source pack (reproduced with the merged
+> `github` pack). Registration needs a gateway that publishes
+> `execution.locallyExecutable` on that route — filed upstream as
+> [oomol-lab/open-connector#358](https://github.com/oomol-lab/open-connector/issues/358).
+> Skardi's gate is correct and was deliberately left alone: no
+> compatibility fallback reads the classification from another route.
 
 ## Binding
 
@@ -92,7 +112,7 @@ FROM open_connector_query('saas', 'dropbox.file_search',
 | Table | Action(s) | Row path | Required resource | Optional resources | Columns |
 |---|---|---|---|---|---|
 | `files` | `dropbox.list_folder` → `dropbox.list_folder_continue` | `$.entries` | — | `path` | 12 |
-| `shared_links` | `dropbox.list_shared_links` (continues on itself) | `$.links` | — | `path`, `directOnly` | 15 |
+| `shared_links` | `dropbox.list_shared_links` (continues on itself) | `$.links` | — | `path`, `directOnly` | 11 |
 | `file_search` | `dropbox.search_files` → `dropbox.search_files_continue` | `$.matches` | `query` | `path` | 13 |
 
 **No table pushes any filter.** Dropbox's remaining list inputs are
@@ -134,11 +154,28 @@ values — `size_bytes IS NULL` for a folder, `= 0` for an empty file.
 
 ### `shared_links` — links for the account, or for one path
 
-Columns: everything `files` has, plus `url`, `expires_at` and
+Columns: `tag`, `name`, `url`, `id`, `path_lower`, `expires_at`,
+`client_modified`, `server_modified`, `rev`, `size_bytes`,
 `link_permissions`. `url` is the natural identity but stays **nullable**:
 the executor spells it `optionalString(record.url) ?? null`, so a
 non-null declaration would fail scans on a row the gateway considers
 legal.
+
+**Four columns `files` has are deliberately absent here** — the mirror
+image of the three `files` omits, and the one defect the live pass
+caught. `sharing/list_shared_links` returns `SharedLinkMetadata`, which
+carries `path_lower` but has no `path_display`, `is_downloadable`,
+`content_hash` or `sharing_info` field at all, so mapping them shipped
+four structurally always-NULL columns. Measured live at 0/5 non-NULL, and
+settled decisively by pointing both endpoints at one file: a file whose
+`files` row carries all four returns all four NULL on its own
+`shared_links` row. The fingerprint gate cannot catch this class — both
+actions publish the same normalized 15-key schema — so only real rows
+can.
+
+`expires_at` stays mapped but is **unverified**: it populates only on a
+link with an expiry, and Dropbox refuses to set one on a free account
+(`settings_error/not_authorized`).
 
 `directOnly` is exposed as a binding resource rather than pinned because
 neither setting is an honest default: pinned `true`, links a file
@@ -197,8 +234,8 @@ it is declared, a page that omits it fails as contract drift rather than
 guessing.
 
 Page sizes are the schemas' declared maxima (`limit: 2000`,
-`maxResults: 1000`) and are **unprobed at the boundary**; a declared cap
-can exceed the wire's. Continuation pages carry no page-size input at
+`maxResults: 1000`) and were **probed at the boundary**: both return
+rows, while `limit: 2001` and `maxResults: 1001` are refused. Continuation pages carry no page-size input at
 all — Dropbox sizes them from the request that opened the listing.
 `shared_links` has no page-size input, so its `page_size` is an inert
 placeholder.
@@ -217,10 +254,18 @@ Two scopes cover the whole pack:
 | `files.metadata.read` | `files`, `file_search` |
 | `sharing.read` | `shared_links` |
 
-No content scope and no write scope is required by any shipped table, so
-a read-only connection serves all three. Every permission change
-invalidates the grant snapshot — re-run the authorization rather than
-debugging a stale token.
+No content scope and no write scope is required by any shipped table —
+confirmed against the live gateway's per-action `requiredScopes`.
+
+**That is a statement about the actions, not about what you can
+provision.** The gateway's dropbox provider builds its OAuth scope list
+as the union of every `dropbox.*` action's permissions, so its authorize
+request asks for all six — `account_info.read`, `files.metadata.read`,
+`files.content.read`, `files.content.write`, `sharing.read`,
+`sharing.write`. A connection created through that flow therefore carries
+write access this pack never exercises; narrowing it is a gateway-side
+change, not a pack setting. Every permission change invalidates the grant
+snapshot — re-run the authorization rather than debugging a stale token.
 
 Self-check that the gateway build carries all five actions before
 debugging anything else (a too-old gateway fails registration with
@@ -250,8 +295,11 @@ are cached per the scan cache's usual keying (binding, table, pushed
 inputs, projection, LIMIT).
 
 Dropbox cursors can expire or be invalidated mid-listing, and a long
-recursive scan of a large account may outlive one. Behavior at that
-boundary is an open question the live pass records.
+recursive scan of a large account may outlive one. The live pass found no
+expiry to document: a `list_folder` cursor replayed ~40 minutes later,
+after files and shared links had been added to the listed tree, still
+returned rows. That is a lower bound, not a guarantee — no upper bound
+was established.
 
 ## Tables deliberately not shipped
 

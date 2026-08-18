@@ -699,19 +699,45 @@ event carrying the scan identity and error.
       the fixtures (native Docs DO report `sizeBytes`; every grant
       carries `permissionDetails`; shared-drive rows drop exactly
       `owners`+`shared`).
-- [ ] 5.10 Dropbox pack (OAuth, cursor pagination with SPLIT-ACTION
+- [x] 5.10 Dropbox pack (OAuth, cursor pagination with SPLIT-ACTION
       continuation, normalized wire shape — `mapDropboxMetadata` rebuilds
       every row into a strict fully-`required` camelCase object): files,
       shared_links, file_search.
-      **NOT live-verified — deliberately left unticked.** Reconciled against
-      the v1.3.5 provider SOURCE only; the authoring box has no Node runtime
-      and no Dropbox account was available, so contract capture and live
-      verification are recorded as blocked in the design spec. Every
-      committed fingerprint hashes a source-derived schema and will fail the
-      contract gate against a real gateway until re-captured; the row
-      fixtures are authored shapes, not redacted captures; the declared page
-      sizes (2000 / 1000) are unprobed at the boundary. Runbook to close it
-      out: `docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md`.
+      **Live-verified 2026-08-18** against a self-hosted gateway at commit
+      `a3efa99` and a real free-tier Dropbox account, per the runbook
+      `docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md`. All five
+      actions discovered; all five committed fingerprints matched LIVE
+      discovery unchanged, so registration passed the contract gate with no
+      re-pinning (the source-derived captures turned out byte-identical to the
+      live ones, and the opener/continuation schema identity is a fact about
+      the wire). Page sizes probed at the boundary: 2000 and 1000 return rows,
+      2001 and 1001 are refused. Termination confirmed as designed — the final
+      `list_folder` page carries `hasMore: false` beside a NON-empty
+      259-character cursor, so `has_more_path` is load-bearing. Real
+      multi-page pagination through `list_folder_continue` (`pages=2
+      rows=378`), and `LIMIT` collapsed the same scan to `pages=1 rows=1`.
+      Both design-spec open questions answered on the wire: `{path, cursor}`
+      together IS accepted by `list_shared_links` (no `cursor_only` needed),
+      and `matches[].metadata` can never be null (the executor always returns
+      a full object), so `file_search.tag`/`name` stay non-nullable.
+      **What the live pass changed:** `shared_links` lost four columns —
+      `path_display`, `is_downloadable`, `content_hash`, `sharing_info` —
+      which `sharing/list_shared_links` has no field for and which measured
+      0/5 non-NULL; a file whose `files` row carries all four returns all four
+      NULL on its own `shared_links` row. 15 → 11 columns, pinned by a
+      negative-space test. Per-column coverage after the trim: 12/12 on
+      `files` (378 rows), 11/11 on `shared_links` bar the labelled
+      `expires_at`, 13/13 on `file_search`. Two claims left UNOBSERVED, both
+      environmental: `shared_links.expires_at` (paid-tier link expiry) and
+      `file_search.match_type = 'content'` (content indexing did not land).
+      Row fixtures remain authored shapes rather than redacted captures,
+      because the verified account holds personal files.
+      **Gateway prerequisite, filed upstream, not worked around:** at commit
+      `a3efa99` the gateway's `GET /v1/actions/<id>` omits the `execution`
+      block, so Skardi's default-deny action registry refuses every action
+      from EVERY pack (reproduced with the merged `github` pack). Filed as
+      oomol-lab/open-connector#358. Skardi's gate is correct and was
+      deliberately left untouched — no compatibility fallback was added.
       Engine extension (backward-compatible, opt-in, `None` for every
       pre-existing pack): `pagination.continuation` — pages 2..N may target a
       DIFFERENT action (`list_folder` → `list_folder_continue`) and, with
@@ -722,7 +748,12 @@ event carrying the scan identity and error.
       (cursor declared, nothing else `required`, no-input-schema refused).
       Because the rows are normalized and strictly declared, every mapped
       column sits inside the fingerprint gate and the coverage-gap pin is
-      empty — the opposite of the passthrough packs. Verification: 965
+      empty. That is narrower than it sounds, and the live pass proved it:
+      all five list actions publish the SAME normalized 15-key schema, so a
+      fingerprint match says nothing about whether a key is populated for a
+      given action — which is exactly how the four `shared_links` columns
+      passed every contract-level check while being structurally always-NULL.
+      Real rows remain the only column truth here too. Verification: 965
       full library suite, 324 open_connector (`cargo test -p skardi --lib
       sources::providers::open_connector`), 25 pack-scoped (`… --lib
       packs::dropbox`).

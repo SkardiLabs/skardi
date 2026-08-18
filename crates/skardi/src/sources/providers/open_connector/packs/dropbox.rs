@@ -2,36 +2,54 @@
 //! Connector `dropbox.*` read actions (OAuth2, cursor pagination with
 //! split-action continuation).
 //!
-//! # Provenance: NOT live-verified
+//! # Provenance: live-verified 2026-08-18
 //!
-//! Everything below is reconciled against the Open Connector **v1.3.5
-//! provider source** (`src/providers/dropbox/`) and nothing else. No live
-//! gateway has answered any of it, and no Dropbox account has been read:
-//! the authoring box has no Node runtime, so the design spec's step 2
-//! (contract capture) and step 5 (live verification) are recorded as
-//! blocked, not done. Concretely, and stated here so no reader infers
-//! otherwise from the confidence of the prose:
+//! Authored against the Open Connector provider source
+//! (`src/providers/dropbox/`) and then verified end to end against a
+//! self-hosted Open Connector gateway at commit `a3efa99` and a real
+//! (free-tier) Dropbox account. What the live pass established:
 //!
-//! - the five `fixtures/dropbox/contracts/*.json` files are schemas
-//!   derived from the executor source, not captured from `GET
-//!   /v1/actions/<id>`; the `*_continue.json` pair is byte-identical to
-//!   its opener because it was derived that way, which is a hypothesis
-//!   about the wire rather than an observation of it;
-//! - every `fingerprint:` in `dropbox.yaml` therefore hashes a
-//!   source-derived schema. Registration against a real gateway is
-//!   EXPECTED to fail the contract gate until the live pass re-pins them
-//!   — that failure is the gate working, not a regression;
-//! - the row fixtures are hand-authored in the executor's shape, not
-//!   redacted live captures, so no mapped column has been shown to carry
-//!   a real non-NULL value;
-//! - declared page sizes (`limit: 2000`, `maxResults: 1000`) are the
-//!   schema's maxima, unprobed at the boundary — a declared cap can
-//!   exceed the wire's (Feishu declared 100, hard-failed above 50).
+//! - the five `fixtures/dropbox/contracts/*.json` captures came back
+//!   byte-identical to the source-derived schemas they replaced, so every
+//!   `fingerprint:` in `dropbox.yaml` matched LIVE discovery unchanged and
+//!   registration passed the contract gate on the first try. The
+//!   `*_continue.json` files being identical to their openers is a fact
+//!   about the wire, not an artifact of how they were derived;
+//! - all three tables scanned real rows, and every mapped column carried a
+//!   real non-NULL value somewhere — 12/12 on `files` (378 rows), 13/13 on
+//!   `file_search`, and 11/11 on `shared_links` AFTER the live pass removed
+//!   four columns that cannot populate (see the `shared_links` note below);
+//! - the declared page sizes are the wire's maxima, probed at the boundary:
+//!   `limit: 2000` and `maxResults: 1000` return rows, 2001 and 1001 are
+//!   refused;
+//! - real multi-page pagination ran through `list_folder_continue`
+//!   (`pages=2 rows=378`), and `LIMIT` pushdown collapsed the same scan to
+//!   `pages=1 rows=1`, stopping before the continuation request.
 //!
-//! The runbook that closes all of this out is
-//! `docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md`. Its
-//! acceptance table is the list of statements in this file that are
-//! currently inferences.
+//! What the live pass did NOT change: the row fixtures are still
+//! hand-authored pages in the executor's shape rather than redacted live
+//! captures, because the account read during the pass holds personal
+//! files. `shared_links.json` was corrected to the live shape (the four
+//! removed keys now null, as the wire has them), and
+//! `files_type_mismatch.json` stays deliberately synthetic. Re-deriving
+//! the fixtures from redacted captures remains open.
+//!
+//! Two claims remain UNOBSERVED rather than confirmed, and neither is a
+//! defect: `shared_links.expires_at` needs paid-tier link expiry (a free
+//! account is refused with `settings_error/not_authorized`), and
+//! `file_search.match_type = 'content'` needs Dropbox content indexing,
+//! which never landed during the pass. Both columns stay mapped because
+//! both are structurally reachable.
+//!
+//! One gateway defect the pass uncovered, which is NOT specific to this
+//! pack: `GET /v1/actions/<id>` — the endpoint `discover_action` reads —
+//! does not serialize the `execution` block, so Skardi's default-deny
+//! action registry refuses every action from every pack against a
+//! stock gateway at that commit. Reproduced with the merged `github` pack,
+//! so it is not this pack's bug; filed upstream as
+//! oomol-lab/open-connector#358 (the gateway's catalog routes already
+//! compute the field). Skardi's default-deny gate is correct and is left
+//! untouched — no fallback reads the classification from another route.
 //!
 //! **Rows are NORMALIZED, not passed through.** Every list executor maps
 //! entries through `mapDropboxMetadata`, which rebuilds each one into a
@@ -58,7 +76,8 @@
 //!   style difference: `list_folder` does not declare `cursor`, and its
 //!   input schema is `additionalProperties: false`, so feeding the cursor
 //!   back to the opening action is a hard 400 rather than a quiet
-//!   truncation — read off the declared schema, not observed on the wire.
+//!   truncation — read off the declared schema and CONFIRMED on the wire
+//!   2026-08-18, bare and alongside the full input.
 //!   The engine's `continuation: {action, fingerprint, inputs:
 //!   cursor_only}` exists for this shape.
 //!
@@ -76,11 +95,11 @@
 //!   missing read/write classification.
 //!
 //! - **`has_more_path` is load-bearing on `files`, not decorative.**
-//!   `list_folder` answers its FINAL page with a NON-EMPTY cursor — the
-//!   executor's `requireString(payload.cursor)`, and the captured
-//!   contract declares `cursor` a plain required string rather than a
-//!   nullable one. Null-cursor termination alone would refetch and fail
-//!   as a `PaginationLoop`. `shared_links` and `file_search` DO null
+//!   `list_folder` answers its FINAL page with a NON-EMPTY cursor —
+//!   OBSERVED live 2026-08-18, where the final page carried
+//!   `hasMore: false` beside a 259-character cursor and following that
+//!   cursor returned an empty page. Null-cursor termination alone would
+//!   refetch and fail as a `PaginationLoop`. `shared_links` and `file_search` DO null
 //!   their cursors (`anyOf: [string, null]` in their contracts), but
 //!   declare `$.hasMore` too: it is the provider's authoritative signal
 //!   in all three, and one termination rule across the pack beats three.
@@ -101,6 +120,20 @@
 //!   They live on `shared_links`, where they populate. A negative-space
 //!   test pins their absence.
 //!
+//! - **Four columns are deliberately absent from `shared_links`** — the
+//!   mirror image of the three above, and the one defect the live pass
+//!   caught. `sharing/list_shared_links` returns SharedLinkMetadata,
+//!   which carries `path_lower` but has NO `path_display`,
+//!   `is_downloadable`, `content_hash` or `sharing_info` field at all, so
+//!   the shared normalizer reads those four off keys the payload never
+//!   has. They were mapped here until 2026-08-18, when the live pass
+//!   measured them at 0/5 non-NULL and then settled it decisively: a file
+//!   whose `files` row carries all four came back with all four NULL on
+//!   its own `shared_links` row — same file, same normalizer, different
+//!   endpoint. The fingerprint gate cannot catch this class, because both
+//!   actions publish the same normalized 15-key schema; only real rows
+//!   can. A negative-space test pins the absence.
+//!
 //! - **No filter is pushed by any table.** Dropbox's remaining list
 //!   inputs are scan-shape controls (`recursive`, `includeDeleted`,
 //!   `limit`, `filenameOnly`), not column predicates. `path` is a
@@ -112,13 +145,13 @@
 //!   and Inexact would still push a rev ID as though it were a path.
 //!   Guard tests prove no filter key ever reaches the wire.
 //!
-//! - **`shared_links` continues through its own action, on inference.**
-//!   The executor `compactObject`s `path` and `cursor` together and the
-//!   input schema declares both, so no `continuation` block is declared
-//!   and pages 2..N repeat the action with the full input. This is design
-//!   spec open question 1 and is unresolved on the wire; if Dropbox
-//!   rejects the pair, the fix is a `continuation: {fingerprint, inputs:
-//!   cursor_only}` block here and no code change.
+//! - **`shared_links` continues through its own action.** The executor
+//!   `compactObject`s `path` and `cursor` together and the input schema
+//!   declares both, so no `continuation` block is declared and pages
+//!   2..N repeat the action with the full input. This was design spec
+//!   open question 1; the live pass answered it YES on 2026-08-18 —
+//!   `list_shared_links` accepts `path` and `cursor` in one request — so
+//!   no `cursor_only` continuation is needed here.
 //!
 //! - **`directOnly` is a binding-level resource, not a pin.** It is a
 //!   scan-shape boolean — the class of input this pack otherwise pins
@@ -180,9 +213,17 @@
 //!   `get_shared_link_file`) return base64 payloads, not rows.
 //!
 //! Authorization: `files` and `file_search` need the
-//! `files.metadata.read` scope; `shared_links` needs `sharing.read`. No
-//! content or write scope is required by any shipped table, so a
-//! read-only Dropbox connection serves the whole pack.
+//! `files.metadata.read` scope; `shared_links` needs `sharing.read` —
+//! both confirmed against the live gateway's per-action `requiredScopes`.
+//! No content or write scope is required by any shipped table.
+//!
+//! That is a statement about the ACTIONS, not about what an operator can
+//! provision. The gateway's dropbox provider builds its OAuth scope list
+//! as the union of every `dropbox.*` action's permissions, so its
+//! authorize request asks for all six — including `files.content.write`
+//! and `sharing.write` — and a connection created through that flow
+//! carries write access this pack never exercises. Narrowing it is a
+//! gateway-side change; see `docs/open-connector-dropbox.md`.
 
 use std::sync::OnceLock;
 
@@ -386,6 +427,25 @@ mod tests {
             .collect();
         for present in ["url", "expires_at", "link_permissions"] {
             assert!(shared.contains(&present), "shared_links must map {present}");
+        }
+        // The mirror image, and the defect the live pass caught:
+        // `sharing/list_shared_links` returns SharedLinkMetadata, which
+        // has no `path_display`, `is_downloadable`, `content_hash` or
+        // `sharing_info` field at all, so these four were four
+        // structurally always-NULL columns. Observed live 2026-08-18 as
+        // 0/5 non-NULL, and decisively: a file whose files-row carries
+        // all four returns all four NULL on its own shared_links row.
+        for absent in [
+            "path_display",
+            "is_downloadable",
+            "content_hash",
+            "sharing_info",
+        ] {
+            assert!(
+                !shared.contains(&absent),
+                "shared_links must not map '{absent}': SharedLinkMetadata never \
+                 carries it, so the column would be structurally always-NULL"
+            );
         }
 
         // `includeHighlights` is never sent, so `highlight_spans` stays
