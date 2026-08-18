@@ -99,7 +99,9 @@ already-noted gap — out of scope here.)
   SQLite jobs store), so unlike pipelines they were never unobserved; what
   they lack is `ai_context`/session attribution in the *query* ledger.
   Unifying the two ledgers is real future work — best coordinated with the
-  identity-column work in #206 rather than bolted on here.
+  identity-column work in #206 rather than bolted on here. Superseded by
+  `2026-08-18-jobs-audit-design.md`, which adds submission-event
+  attribution while leaving run records in the jobs ledger.
 
 ## Testing
 

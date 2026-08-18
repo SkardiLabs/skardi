@@ -178,6 +178,19 @@ On startup the server:
 When the server was started without `--jobs`, every endpoint above
 returns `503 Service Unavailable` with `error_type: jobs_disabled`.
 
+### Session attribution
+
+`POST /jobs/:name/run` accepts an optional `X-Skardi-Session-Id` request
+header (non-empty, ≤ 200 characters) that attributes the submission to an
+agent session in the query audit ledger. A malformed header is rejected
+with `400 parameter_validation_error` — the header is always validated once
+the job exists, regardless of audit configuration. When `--query-audit-db`
+is configured, the submission is recorded as a `job` row with the session
+id and `name@version` in the ledger, with the submission's outcome
+(`succeeded` or `failed`) and any bridge `run_id`. When the server has
+auditing enabled, a `503` with `error_type: query_audit_error` means the
+job **was not submitted** and the call is safe to retry.
+
 ---
 
 ## Submitting a run from the CLI

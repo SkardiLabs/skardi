@@ -179,7 +179,8 @@ execution and updated with its outcome afterwards:
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
 | `max_rows` | requested row cap (`0` on pipeline rows — not applicable) |
-| `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows. Consumers filtering the ledger must match these exact strings. |
+| `run_id` | job_runs.id bridge, job rows only |
+| `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows, `job` for job rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
 | `row_count`, `error` | outcome detail |
 
@@ -303,6 +304,23 @@ requires both halves, and today only `skardi run --session-id` exists —
 ([#218](https://github.com/SkardiLabs/skardi/issues/218)), so the ad-hoc
 half of a CLI session lands unattributed until then. Direct HTTP callers
 get the full interleaving today.
+
+#### Job submissions in the ledger
+
+`POST /jobs/:name/run` is audited as a *submission event*: the row's
+lifecycle is the submission's, not the run's. `statement_kind` is `job`,
+`sql` holds `name@version`, and on acceptance the row is stamped
+`succeeded` with the `run_id` that bridges to the jobs ledger — which
+remains the authority on the run itself (parameters, progress, outcome).
+A rejected submission is stamped `failed` with the executor's fixed error
+category, never its message text. Unlike pipelines, a job's parameter
+validation happens inside the executor — after the audit write — so a
+parameter rejection leaves a `failed` row rather than recording nothing.
+Record-before-submit and the fail-closed `503 query_audit_error` behave
+exactly as for pipelines: a job the ledger cannot account for is not
+submitted. The same `X-Skardi-Session-Id` header (same validation)
+attributes the submission, so `list_by_session` returns an agent session's
+ad-hoc queries, pipeline calls, and job submissions in one ordered read.
 
 ---
 
