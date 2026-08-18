@@ -37,21 +37,28 @@ pub async fn run(
     // value to `send()`, whose errors are all mapped to `ApiError::Connect` —
     // so without this check a bad `--session-id` prints a connection error
     // naming a server that was never contacted, and exits with the
-    // "server unreachable" code. The rules are an exact mirror of the
-    // server's `session_id_from_headers`: visible ASCII plus space, no tab,
-    // no comma (proxies may merge repeated header lines comma-separated),
-    // and the length cap below.
+    // "server unreachable" code. The rules are now an EXACT mirror of the
+    // server's `session_id_from_headers` — visible ASCII graphic characters,
+    // no comma, no space — with no trimming semantics to reason about on
+    // either side: previously this check let space through, but the server
+    // sees whatever `httparse` hands it after stripping leading/trailing
+    // whitespace per RFC 9110 §5.5 (interior whitespace untouched). That gap
+    // meant `--session-id "  sess-1  "` passed here and got silently
+    // recorded server-side under the different key `sess-1` (breaking the
+    // session stitching this field exists for), while `--session-id "   "`
+    // passed here and then 400ed server-side — the exact fail-late round
+    // trip this client-side check exists to prevent. A grouping key has no
+    // legitimate use for spaces, so both sides now reject them outright
+    // instead of defining trimming semantics.
     let invalid_session_id = session_id.as_deref().is_some_and(|sid| {
         sid.is_empty()
             || sid.chars().count() > MAX_SESSION_ID_CHARS
-            || !sid
-                .chars()
-                .all(|c| (c.is_ascii_graphic() && c != ',') || c == ' ')
+            || !sid.chars().all(|c| c.is_ascii_graphic() && c != ',')
     });
     if invalid_session_id {
         return Err(anyhow!(
             "--session-id must be non-empty, at most {MAX_SESSION_ID_CHARS} \
-             characters, and contain only visible ASCII with no commas"
+             characters, and contain only visible ASCII with no spaces and no commas"
         ));
     }
 
@@ -253,6 +260,8 @@ mod tests {
             "line\nbreak",
             "tab\there",
             "sess-1, sess-2", // proxy-merged duplicate shape
+            "   ",            // spaces-only
+            "sess 1",         // interior space
         ] {
             let result = run(&client, "my-pipe", None, &[], false, Some(bad.to_string())).await;
             let err = result.expect_err("expected validation error");

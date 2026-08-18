@@ -15,13 +15,15 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use std::collections::HashMap;
-use std::io::Write;
-use std::sync::Arc;
+use std::io::{self, Write as _};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tower::ServiceExt;
+use tracing_subscriber::layer::SubscriberExt;
 
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::config::{CliArgs, ServerConfig};
+use skardi_server::logging::build_env_filter;
 use skardi_server::query_audit::QueryAuditStore;
 use skardi_server::semantics::SemanticsRegistry;
 use skardi_server::server::{AppState, configure_routes};
@@ -431,6 +433,15 @@ async fn malformed_session_header_is_400_and_records_nothing() {
         // The shape a proxy produces by merging two header lines (RFC 9110
         // §5.3) — must be rejected like a direct duplicate.
         "sess-1, sess-2".to_string(),
+        // Spaces-only and an interior space: a grouping key has no
+        // legitimate use for spaces, and tolerating them either invites the
+        // fail-late round trip described on `session_id_from_headers` (a
+        // value that's all whitespace would 400 here but pass a
+        // pre-transport client-side check that merely tolerated space) or
+        // silent misattribution (interior spaces surviving wire transport
+        // unstripped, unlike the leading/trailing case httparse handles).
+        "   ".to_string(),
+        "sess 1".to_string(),
     ] {
         // The body must be one that would otherwise succeed, so the header is
         // the only possible reject cause — an invalid body 400s with the same
@@ -451,6 +462,15 @@ async fn malformed_session_header_is_400_and_records_nothing() {
                 .unwrap()
                 .contains("x-skardi-session-id"),
             "expected the session-header reject, got {body}"
+        );
+        // The header reject must carry a details payload naming the offending
+        // header — previously it passed `None`, so an agent branching on
+        // `error_type` alone (the contract `docs/pipelines.md` sells) could
+        // not tell a bad header apart from a bad SQL parameter, which also
+        // returns `parameter_validation_error`.
+        assert_eq!(
+            body["details"]["header"], "x-skardi-session-id",
+            "expected the header reject to name the offending header, got {body}"
         );
     }
     assert_eq!(store.count().await.unwrap(), 0);
@@ -551,4 +571,103 @@ async fn unknown_pipeline_with_malformed_header_is_404() {
     let body = body_to_json(resp).await;
     assert_eq!(body["error_type"], json!("pipeline_not_found"));
     assert_eq!(store.count().await.unwrap(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Finding 1: an unknown-pipeline request must be observable somewhere even
+// though the ordering fix in `execute_pipeline_by_name` deliberately defers
+// the metric-emitting reject past the pipeline lookup (see the comment on
+// `unknown_pipeline_with_malformed_header_is_404` above). The 404 branch logs
+// a `tracing::warn!` naming the requested pipeline; this test captures the
+// tracing subscriber's own formatted output — not just the HTTP response —
+// so a future change that silently drops the log would fail here even though
+// the response body is untouched.
+// ---------------------------------------------------------------------------
+
+/// Shared buffer behind a `MakeWriter`, so the test can read back everything
+/// the fmt layer formatted. Mirrors the identical harness in
+/// `query_plan_logging.rs`.
+#[derive(Clone, Default)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+    }
+}
+
+impl io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Runs `unknown_pipeline_with_malformed_header_is_404`'s request under a
+/// captured subscriber and returns everything it formatted.
+///
+/// Deliberately a plain `#[test]` driving its own current-thread runtime
+/// (the same pattern `query_plan_logging.rs` uses), rather than
+/// `#[tokio::test]`: `tracing::subscriber::with_default` installs a
+/// thread-local dispatcher, which only stays valid across `.await` points if
+/// the whole future is guaranteed to stay on one OS thread — true for a
+/// runtime built with `new_current_thread`, not guaranteed for the
+/// multi-threaded default some other test binaries opt into.
+fn capture_unknown_pipeline_request_logs() -> String {
+    let capture = CaptureWriter::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(build_env_filter(Some("warn"), false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false),
+        );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let (state, _tmp) = make_app_state(None).await;
+            let app = configure_routes(state);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/no-such-pipeline/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap();
+            let resp = app.oneshot(request).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        });
+    });
+
+    capture.contents()
+}
+
+#[test]
+fn unknown_pipeline_request_is_logged() {
+    let logs = capture_unknown_pipeline_request_logs();
+    assert!(
+        logs.contains("no-such-pipeline"),
+        "expected the unknown pipeline name in the captured log output, got:\n{logs}"
+    );
+    assert!(
+        logs.to_uppercase().contains("WARN"),
+        "expected a WARN-level record, got:\n{logs}"
+    );
 }
