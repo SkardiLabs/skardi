@@ -35,6 +35,7 @@
 //! forever, and pruning/rotation is the operator's call.
 
 use anyhow::{Context, Result, anyhow};
+use axum::http::HeaderMap;
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -61,10 +62,11 @@ use tokio_rusqlite::{Connection, params, rusqlite};
 pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum length of a session id, in characters — shared by `/query`'s
-/// `ai_context.session_id` and the pipeline execute endpoint's
-/// `x-skardi-session-id` header (see `query_handlers::validate_ai_context`
-/// and `pipeline_handlers::session_id_from_headers`), so the two paths can't
-/// drift apart. It is an opaque grouping key, not a payload.
+/// `ai_context.session_id` and the `x-skardi-session-id` header consumed by
+/// both the pipeline execute endpoint and the jobs submit endpoint (see
+/// `query_handlers::validate_ai_context` and [`session_id_from_headers`]),
+/// so all three paths can't drift apart. It is an opaque grouping key, not a
+/// payload.
 ///
 /// `skardi-cli` restates this cap under the same name (`run.rs`) because the
 /// CLI crate does not depend on this one; keep them in sync.
@@ -72,6 +74,67 @@ pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// different crate: `pub(crate)` was the right scope while this module was
 /// inside the server, and the extraction is what widened it.
 pub const MAX_SESSION_ID_CHARS: usize = 200;
+
+/// Optional caller-supplied session header. A header (not a body field)
+/// because the pipeline-execute body IS the flattened parameter map — a
+/// reserved key could collide with a legitimate SQL parameter of the same
+/// name. The jobs submit endpoint shares the header for the same reason:
+/// its body is the job's parameter map.
+///
+/// Not an auth credential: unrelated to `require_session`. The value is
+/// caller-asserted, so ledger session attribution is self-reported rather
+/// than derived from an authenticated principal — the same property as
+/// `/query`'s `ai_context.session_id`.
+pub(crate) const SESSION_ID_HEADER: &str = "x-skardi-session-id";
+
+/// Extract and validate the session header. `Ok(None)` when absent; `Err`
+/// when present but malformed — silently dropping a malformed value would
+/// corrupt session stitching, the one job this field has.
+///
+/// Allowed characters are visible ASCII graphic characters, excluding comma —
+/// no space, no tab, no other whitespace or control character. Space is
+/// rejected (not just trimmed) because `httparse` strips leading/trailing
+/// whitespace per RFC 9110 §5.5 before this code ever sees the value: if
+/// spaces were merely tolerated, `"  sess-1  "` would be recorded under the
+/// different key `sess-1` (silently breaking the session stitching this
+/// field exists for) while `"   "` would 400 here — the exact fail-late
+/// round trip a client-side check exists to prevent. A grouping key has no
+/// legitimate use for spaces, so this rejects them outright instead of
+/// defining trimming semantics. Commas are rejected because RFC 9110 §5.3
+/// lets any intermediary merge repeated header lines into one comma-joined
+/// value, which would otherwise slip a duplicate past the check below as a
+/// single merged `"id1, id2"`. This predicate is mirrored exactly by the
+/// CLI's own check in `crates/cli/src/session.rs`.
+pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let mut values = headers.get_all(SESSION_ID_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must not be sent more than once"
+        ));
+    }
+    let s = value
+        .to_str()
+        .map_err(|_| format!("{SESSION_ID_HEADER} must contain only visible ASCII characters"))?;
+    if !s.chars().all(|c| c.is_ascii_graphic() && c != ',') {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must contain only visible ASCII characters, \
+             with no spaces and no commas (proxies may merge repeated header \
+             lines into one comma-separated value)"
+        ));
+    }
+    if s.is_empty() {
+        return Err(format!("{SESSION_ID_HEADER} must not be empty"));
+    }
+    if s.chars().count() > MAX_SESSION_ID_CHARS {
+        return Err(format!(
+            "{SESSION_ID_HEADER} must be at most {MAX_SESSION_ID_CHARS} characters"
+        ));
+    }
+    Ok(Some(s.to_string()))
+}
 
 /// Error from [`bounded`] that keeps "the write timed out" distinguishable
 /// from "the write ran and failed" (e.g. `ConnectionClosed`). Only the
@@ -532,7 +595,7 @@ impl QueryAuditStore {
         let session_id = session_id.map(str::to_string);
         let row_id = id.clone();
 
-        bounded(
+        match bounded(
             self.conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
@@ -554,9 +617,21 @@ impl QueryAuditStore {
             "Failed to write pre-execution job-audit record",
             self.write_timeout,
         )
-        .await?;
-
-        Ok(id)
+        .await
+        {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                // Same reasoning as `record_pipeline_started`: this is a
+                // pre-execution write, so a timeout means the caller has
+                // already been told "503, the job was not submitted" — a
+                // fact worth recording precisely instead of letting startup
+                // reconcile the abandoned row to the ambiguous `unknown`.
+                if e.is_timeout() {
+                    self.spawn_timeout_correction(id);
+                }
+                Err(e.into())
+            }
+        }
     }
 
     /// Update a job-submission record with its terminal outcome, stamping the

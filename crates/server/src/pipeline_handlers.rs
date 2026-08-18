@@ -27,74 +27,14 @@ use std::time::Instant;
 
 use crate::auth::routes::require_session;
 use crate::config::{DataSourceType, HierarchyLevel};
-use crate::query_audit::{MAX_SESSION_ID_CHARS, QueryAuditStatus, finish_audit};
+use crate::query_audit::{
+    QueryAuditStatus, SESSION_ID_HEADER, finish_audit, session_id_from_headers,
+};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
-
-/// Optional caller-supplied session header. A header (not a body field)
-/// because the execute body IS the flattened parameter map — a reserved key
-/// could collide with a legitimate SQL parameter of the same name.
-///
-/// Not an auth credential: unrelated to [`require_session`] on the line
-/// above its extraction. The value is caller-asserted, so ledger session
-/// attribution is self-reported rather than derived from an authenticated
-/// principal — the same property as `/query`'s `ai_context.session_id`.
-const SESSION_ID_HEADER: &str = "x-skardi-session-id";
-
-/// Extract and validate the session header. `Ok(None)` when absent; `Err`
-/// when present but malformed — silently dropping a malformed value would
-/// corrupt session stitching, the one job this field has.
-///
-/// Allowed characters are visible ASCII graphic characters, excluding comma —
-/// no space, no tab, no other whitespace or control character. Space is
-/// rejected (not just trimmed) because `httparse` strips leading/trailing
-/// whitespace per RFC 9110 §5.5 before this code ever sees the value: if
-/// interior/exterior spaces were merely tolerated, `"  sess-1  "` would be
-/// recorded under the different key `sess-1` (silently breaking the session
-/// stitching this field exists for) while `"   "` would 400 here — the exact
-/// fail-late round trip a client-side check exists to prevent. A grouping
-/// key has no legitimate use for spaces, so this rejects them outright
-/// instead of defining trimming semantics. This predicate is mirrored
-/// exactly by the CLI's own check in `crates/cli/src/commands/run.rs`.
-fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, String> {
-    let mut values = headers.get_all(SESSION_ID_HEADER).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(format!(
-            "{SESSION_ID_HEADER} must not be sent more than once"
-        ));
-    }
-    let s = value
-        .to_str()
-        .map_err(|_| format!("{SESSION_ID_HEADER} must contain only visible ASCII characters"))?;
-    // Commas are rejected because RFC 9110 §5.3 lets any intermediary merge
-    // repeated header lines into one comma-joined value — without this, a
-    // duplicate sent through such a proxy would slip past the duplicate
-    // check above as a single merged "id1, id2". Spaces (and every other
-    // non-graphic character, including tab) are rejected for the trimming
-    // reason above.
-    if !s.chars().all(|c| c.is_ascii_graphic() && c != ',') {
-        return Err(format!(
-            "{SESSION_ID_HEADER} must contain only visible ASCII characters, \
-             with no spaces and no commas (proxies may merge repeated header \
-             lines into one comma-separated value)"
-        ));
-    }
-    if s.is_empty() {
-        return Err(format!("{SESSION_ID_HEADER} must not be empty"));
-    }
-    if s.chars().count() > MAX_SESSION_ID_CHARS {
-        return Err(format!(
-            "{SESSION_ID_HEADER} must be at most {MAX_SESSION_ID_CHARS} characters"
-        ));
-    }
-    Ok(Some(s.to_string()))
-}
 
 /// Request structure for pipeline execution
 #[derive(Debug, Deserialize)]
@@ -932,7 +872,7 @@ pub fn substitute_sql_params(
 /// Execute pipeline endpoint - POST /:name/execute
 pub async fn execute_pipeline_by_name(
     State(app_state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Path(pipeline_name): Path<String>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -1446,7 +1386,7 @@ spec:
         // Execute the pipeline by name
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
-            axum::http::HeaderMap::new(),
+            HeaderMap::new(),
             Path(pipeline_name),
             Json(request),
         )
@@ -1495,7 +1435,7 @@ spec:
 
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
-            axum::http::HeaderMap::new(),
+            HeaderMap::new(),
             Path("test-pipeline".to_string()),
             Json(request),
         )
@@ -1524,7 +1464,7 @@ spec:
 
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
-            axum::http::HeaderMap::new(),
+            HeaderMap::new(),
             Path("test-pipeline".to_string()),
             Json(request),
         )
@@ -1545,7 +1485,7 @@ spec:
 
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
-            axum::http::HeaderMap::new(),
+            HeaderMap::new(),
             Path("nonexistent-pipeline".to_string()),
             Json(request),
         )
@@ -1580,7 +1520,7 @@ spec:
         // by checking it gets to the SQL execution phase (not parameter validation error)
         let result = execute_pipeline_by_name(
             axum::extract::State(app_state),
-            axum::http::HeaderMap::new(),
+            HeaderMap::new(),
             Path("test-pipeline".to_string()),
             Json(request),
         )

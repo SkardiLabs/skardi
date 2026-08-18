@@ -14,13 +14,14 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::jobs::{JobRun, JobSubmitError};
 use std::collections::HashMap;
 
+use crate::query_audit::{QueryAuditStatus, QueryAuditStore, session_id_from_headers};
 use crate::server::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +75,29 @@ fn submit_error_status(err: &JobSubmitError) -> StatusCode {
     }
 }
 
+/// Stamp the terminal outcome onto a job-submission audit record.
+///
+/// Mirrors `query_audit::finish_audit`'s policy: a failure (or timeout) here
+/// cannot un-submit a job that already reached the executor, so it is logged
+/// rather than surfaced — the row simply stays `started` and the next
+/// startup reconciles it to `unknown`. No-op when auditing is off or when
+/// the pre-submit write itself failed (no `audit_id`, which fails the
+/// request closed before this point is ever reached).
+async fn finish_job_audit(
+    store: Option<&QueryAuditStore>,
+    audit_id: Option<&str>,
+    run_id: Option<&str>,
+    status: QueryAuditStatus,
+    error: Option<&str>,
+) {
+    let (Some(store), Some(id)) = (store, audit_id) else {
+        return;
+    };
+    if let Err(e) = store.record_job_outcome(id, run_id, status, error).await {
+        tracing::error!("Failed to record job-audit outcome for {id}: {e}");
+    }
+}
+
 fn job_run_to_json(run: &JobRun) -> Value {
     serde_json::json!({
         "run_id": run.id,
@@ -92,6 +116,7 @@ fn job_run_to_json(run: &JobRun) -> Value {
 /// `POST /jobs/:name/run`
 pub async fn submit_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(req): Json<SubmitRunRequest>,
 ) -> Result<Json<SubmitRunResponse>, (StatusCode, Json<JobErrorResponse>)> {
@@ -106,11 +131,85 @@ pub async fn submit_job_run(
         ));
     };
 
+    // Existence + version pre-check, ahead of header validation: the reject
+    // below would otherwise label a metric/log line with an arbitrary
+    // caller-supplied URL segment (the metric-cardinality / status-precedence
+    // lesson from #213 round 3, mirrored from `execute_pipeline_by_name`).
+    // Post-lookup, `name` is bounded to configured jobs, and an unknown job
+    // correctly 404s regardless of header shape. This races benignly with
+    // `executor.submit`'s own name resolution a few lines down — both sides
+    // read the same `RwLock`-guarded config, so a job removed between the
+    // two lookups just becomes a 404 either way.
+    let version = {
+        let config = app_state.config.read().unwrap_or_else(|p| p.into_inner());
+        match config.jobs.get(&name) {
+            Some(def) => def.version().to_string(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    error_json(
+                        &format!("Job '{name}' not found"),
+                        "unknown_job",
+                        Some(serde_json::json!({ "job": name })),
+                    ),
+                ));
+            }
+        }
+    };
+
+    let session_id = session_id_from_headers(&headers).map_err(|msg| {
+        (
+            StatusCode::BAD_REQUEST,
+            error_json(&msg, "parameter_validation_error", None),
+        )
+    })?;
+
+    tracing::info!(
+        session_id = session_id.as_deref().unwrap_or_default(),
+        "Received submit request for job '{}'",
+        name
+    );
+
+    // Record-before-submit, fail-closed: a write failure here means the job
+    // is never handed to the executor. An audited server must not run
+    // anything it cannot account for.
+    let audit_id = match &app_state.query_audit {
+        Some(store) => match store
+            .record_job_submitted(&name, &version, session_id.as_deref())
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!("Job audit write failed; refusing to submit: {e}");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_json(
+                        "Query auditing is enabled but the audit record could not be \
+                         written; the job was not submitted",
+                        "query_audit_error",
+                        None,
+                    ),
+                ));
+            }
+        },
+        None => None,
+    };
+
     match executor.submit(&name, req.parameters).await {
-        Ok(run_id) => Ok(Json(SubmitRunResponse {
-            run_id,
-            status: "pending".to_string(),
-        })),
+        Ok(run_id) => {
+            finish_job_audit(
+                app_state.query_audit.as_deref(),
+                audit_id.as_deref(),
+                Some(&run_id),
+                QueryAuditStatus::Succeeded,
+                None,
+            )
+            .await;
+            Ok(Json(SubmitRunResponse {
+                run_id,
+                status: "pending".to_string(),
+            }))
+        }
         Err(err) => {
             let status = submit_error_status(&err);
             let kind = err.category().to_string();
@@ -123,6 +222,14 @@ pub async fn submit_job_run(
                 JobSubmitError::UnknownJob(job) => Some(serde_json::json!({ "job": job })),
                 _ => None,
             };
+            finish_job_audit(
+                app_state.query_audit.as_deref(),
+                audit_id.as_deref(),
+                None,
+                QueryAuditStatus::Failed,
+                Some(&kind),
+            )
+            .await;
             Err((status, error_json(&msg, &kind, details)))
         }
     }
