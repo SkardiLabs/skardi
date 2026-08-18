@@ -213,11 +213,14 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
         // helper the YAML path uses — is what keeps a drifted continuation
         // action from being refused by one path and admitted by the other.
         for action_id in table.actions() {
-            discovered_action(&handle, &gateway, action_id)?;
-        }
-        for (action_id, expected) in table.gated_actions() {
             let meta = discovered_action(&handle, &gateway, action_id)?;
-            if meta.fingerprint() != expected {
+            // `gated_actions()` yields the table's own action only when it
+            // pins a fingerprint, so an unpinned table still has to be
+            // discovered above — that is why discovery drives the loop and
+            // the expectation is looked up inside it.
+            if let Some((_, expected)) = table.gated_actions().find(|(id, _)| *id == action_id)
+                && meta.fingerprint() != expected
+            {
                 return Err(plan_error(OpenConnectorError::ActionContractMismatch {
                     table: table.id.to_string(),
                     reason: format!(
@@ -225,6 +228,14 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                         meta.fingerprint()
                     ),
                 }));
+            }
+            // Same input-schema check the YAML path runs, on the same
+            // helper: `cursor_only` must not be admitted by one entry point
+            // and refused by the other.
+            if table.continuation.is_some_and(|c| c.action_id == action_id) {
+                table
+                    .check_continuation_inputs(meta.input_schema())
+                    .map_err(plan_error)?;
             }
         }
 

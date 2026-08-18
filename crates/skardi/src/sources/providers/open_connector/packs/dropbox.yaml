@@ -1,8 +1,15 @@
-# Dropbox source pack. Wire contract is Open Connector's, reconciled
-# against a live gateway (v1.3.5, 2026-08-16). Every list executor
-# NORMALIZES rows through `mapDropboxMetadata`: a fixed camelCase shape
-# whose fifteen keys are ALL declared `required` under
-# `additionalProperties: false`. Mapping Dropbox's own snake_case
+# Dropbox source pack. Wire contract is Open Connector's, RECONCILED
+# AGAINST THE v1.3.5 PROVIDER SOURCE ONLY — no live gateway has answered
+# any of it (no Node runtime on the authoring box; see the module doc's
+# provenance banner and
+# docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md). Every
+# fingerprint below is the hash of a source-derived schema, not of a
+# captured one, so registration against a real gateway is expected to
+# fail the contract gate until the live pass re-pins it.
+#
+# Every list executor NORMALIZES rows through `mapDropboxMetadata`: a
+# fixed camelCase shape whose fifteen keys are ALL declared `required`
+# under `additionalProperties: false`. Mapping Dropbox's own snake_case
 # (`path_display`, `client_modified`, `size`) would have produced
 # all-NULL columns — the Slack 5.2 failure mode. The upside of that
 # strictness: unlike the passthrough packs, every column below sits
@@ -12,10 +19,13 @@
 # continues a listing through a DIFFERENT action than the one that
 # opened it: `list_folder` → `list_folder_continue`, `search_files` →
 # `search_files_continue`, each continue action declaring `cursor` as its
-# ONLY property. Feeding the cursor back to the opening action is not a
-# quiet truncation but a hard 400 — verified live:
-#   POST dropbox.list_folder {"cursor":"abc"} → 400 invalid_input
-# hence `continuation: {action, fingerprint, inputs: cursor_only}`.
+# ONLY property. Feeding the cursor back to the opening action would not
+# be a quiet truncation but a hard 400, because `list_folder`'s input
+# schema is `additionalProperties: false` and does not declare `cursor`
+# — read off the schema, NOT yet observed on the wire. Hence
+# `continuation: {action, fingerprint, inputs: cursor_only}`, whose
+# input-side claim registration now checks against the continuation
+# action's discovered input schema.
 #
 # TERMINATION. `list_folder` answers its FINAL page with a NON-EMPTY
 # cursor (the executor's `requireString(payload.cursor)`, and the
@@ -52,10 +62,14 @@ tables:
       cursor_input: cursor
       next_cursor_path: "$.cursor"
       page_size_input: limit
-      # The schema's declared maximum, which doubles as the
-      # limit-pushdown ceiling. Continuation pages carry no `limit` (the
-      # continue action rejects it); Dropbox sizes them from this
-      # opening request, so the ceiling still holds.
+      # The schema's declared maximum. UNVERIFIED AT THE BOUNDARY: a
+      # declared cap can exceed the wire's (Feishu declared 100 and
+      # hard-failed above 50), so one probe at 2000 and one at 2001 are
+      # owed before this number is trustworthy. Continuation pages carry
+      # no `limit` at all — the continue action declares none — and
+      # Dropbox sizes them from this opening request. `page_size` is the
+      # size REQUESTED per page; it neither caps nor floors a pushed-down
+      # SQL LIMIT, which the exec applies by truncating batches.
       page_size: 2000
       # NOT optional here: see the TERMINATION note above.
       has_more_path: "$.hasMore"
@@ -107,19 +121,34 @@ tables:
     action: dropbox.list_shared_links
     row_path: "$.links"
     fingerprint: 7f7c822b99a1afcbf4ea81371527a14ab4d24918dbde170eb115037003144067
-    # No continuation block: this action takes `cursor` itself (verified
-    # live — `{path, cursor}` together pass the strict schema), so pages
-    # 2..N repeat it with the full input, the engine's default.
+    # No continuation block: the executor `compactObject`s `path` and
+    # `cursor` together and the input schema declares both, so pages 2..N
+    # repeat the action with the full input, the engine's default. NOT
+    # verified on the wire — this is design-spec open question 1, and if
+    # Dropbox rejects the pair, the fix is `continuation: {fingerprint,
+    # inputs: cursor_only}` here with no code change.
     pagination:
       strategy: cursor
       cursor_input: cursor
       next_cursor_path: "$.cursor"
       # No page-size input exists on this action; Dropbox sizes the
-      # pages. `page_size` is therefore unused for requests and only
-      # bounds LIMIT pushdown.
+      # pages. With no `page_size_input`, `page_size` is inert — the
+      # cursor strategy reads it only in `Pagination::apply`, under
+      # `page_size_param`, and nothing else in the engine consults it.
+      # The schema requires the key, so it is a placeholder, not a bound.
       page_size: 100
       has_more_path: "$.hasMore"
     resources:
+      # `directOnly` is a scan-shape boolean, not a collection selector —
+      # the class of input this pack otherwise PINS (`recursive`,
+      # `includeDeleted`). It is a resource rather than a fixed input
+      # because neither setting is the honest default for a table named
+      # `shared_links`: pinned true, links inherited from a shared parent
+      # vanish; pinned false, the same file can appear through several
+      # ancestors. Leaving it to the binding makes that a per-deployment
+      # choice instead of a pack-wide guess. Resource values keep their
+      # YAML type, so `directOnly: true` reaches the strict schema as a
+      # JSON boolean — pinned by a forwarding test.
       optional: [path, directOnly]
     # `path` is a resource, not an `eq` push onto path_lower: the input
     # accepts paths, file IDs AND rev IDs, so the mapping would be
@@ -158,6 +187,8 @@ tables:
       cursor_input: cursor
       next_cursor_path: "$.cursor"
       page_size_input: maxResults
+      # search_v2's declared maximum; unverified at the boundary, like
+      # files' 2000 above.
       page_size: 1000
       has_more_path: "$.hasMore"
       continuation:

@@ -36,12 +36,25 @@ pub struct CursorContinuation {
     /// action serves most of a large scan, so gating only the action that
     /// served page one would leave the rest of the collection unguarded
     /// against contract drift.
+    ///
+    /// Scope worth knowing before relying on it: a fingerprint hashes the
+    /// action's OUTPUT schema, so this pin guards the ROW shape pages 2..N
+    /// deliver. Where an opener and its continuation publish the same
+    /// output schema — the Dropbox case — the two hashes are equal and this
+    /// pin can only fail together with the opener's. What actually differs
+    /// between the two actions is their INPUTS, and those are covered by
+    /// `SourcePackTable::check_continuation_inputs` instead, not here.
     pub expected_fingerprint: &'static str,
     /// Whether pages 2..N carry ONLY the cursor. Required whenever the
     /// continuation action's schema accepts nothing else; kept separate
     /// from `action_id` because the two vary independently — a provider can
     /// continue through the same action while still rejecting the original
     /// inputs alongside a cursor.
+    ///
+    /// Checked at registration against the continuation action's discovered
+    /// input schema (`SourcePackTable::check_continuation_inputs`), because
+    /// the fingerprint above cannot: a wrong claim here is otherwise a hard
+    /// 400 on page two of a live scan rather than a startup error.
     pub cursor_only: bool,
 }
 
@@ -371,8 +384,8 @@ impl Pagination {
     /// Deliberately omits the page-size input that [`Self::apply`] sends:
     /// Dropbox's `list_folder_continue` declares `cursor` as its sole
     /// property, so a `limit` alongside it is a 400. Continuation pages are
-    /// sized by the request that began the listing, which keeps
-    /// `page_size`'s role as the limit-pushdown ceiling honest.
+    /// sized by the request that began the listing — a provider guarantee,
+    /// not something this engine enforces.
     ///
     /// A no-op on the first page (no token yet) and for non-cursor
     /// strategies, neither of which a continuation can reach.

@@ -699,6 +699,33 @@ event carrying the scan identity and error.
       the fixtures (native Docs DO report `sizeBytes`; every grant
       carries `permissionDetails`; shared-drive rows drop exactly
       `owners`+`shared`).
+- [ ] 5.10 Dropbox pack (OAuth, cursor pagination with SPLIT-ACTION
+      continuation, normalized wire shape — `mapDropboxMetadata` rebuilds
+      every row into a strict fully-`required` camelCase object): files,
+      shared_links, file_search.
+      **NOT live-verified — deliberately left unticked.** Reconciled against
+      the v1.3.5 provider SOURCE only; the authoring box has no Node runtime
+      and no Dropbox account was available, so contract capture and live
+      verification are recorded as blocked in the design spec. Every
+      committed fingerprint hashes a source-derived schema and will fail the
+      contract gate against a real gateway until re-captured; the row
+      fixtures are authored shapes, not redacted captures; the declared page
+      sizes (2000 / 1000) are unprobed at the boundary. Runbook to close it
+      out: `docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md`.
+      Engine extension (backward-compatible, opt-in, `None` for every
+      pre-existing pack): `pagination.continuation` — pages 2..N may target a
+      DIFFERENT action (`list_folder` → `list_folder_continue`) and, with
+      `inputs: cursor_only`, carry the cursor and nothing else. Both actions
+      are discovered and fingerprint-gated at both gate call sites; because a
+      fingerprint hashes the OUTPUT schema, `cursor_only` is additionally
+      checked against the continuation action's discovered INPUT schema
+      (cursor declared, nothing else `required`, no-input-schema refused).
+      Because the rows are normalized and strictly declared, every mapped
+      column sits inside the fingerprint gate and the coverage-gap pin is
+      empty — the opposite of the passthrough packs. Verification: 965
+      full library suite, 324 open_connector (`cargo test -p skardi --lib
+      sources::providers::open_connector`), 25 pack-scoped (`… --lib
+      packs::dropbox`).
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -708,26 +735,15 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.9 (Google Drive pack — files, drives,
-  file_permissions; PR #226). Milestones 1–4 and 5.1–5.8 (GitHub, Slack,
-  Notion, Feishu, Gmail, Discord, Outlook, OneDrive packs) are merged;
-  this PR adds the second Google pack over normalized rows, with zero
-  engine changes — the pack-shaping decisions are the two-dot action IDs
-  (`googledrive.files.list`, verified engine-safe), the load-bearing
-  all-drives fixed-input pair on `files`, and the five knowingly
-  outside-the-gate `restrictions.*` columns on `drives`. Live
-  verification (phase 4) ran 2026-08-25 against a real Workspace
-  account and closed both load-bearing items: design record R1
-  resolved in its favor (zero shared drives at first, then the account
-  proved able to CREATE one, so `drives` was verified on real rows and
-  all five restriction spellings came back verbatim), and the pinned
-  all-drives pair really surfaced a shared-drive file through a live
-  scan. Its pack-changing findings were all fixture-level corrections
-  (native Docs DO report `sizeBytes`; every grant carries
-  `permissionDetails`; shared-drive rows drop exactly
-  `owners`+`shared`), plus three columns recorded as structural
-  residuals (`drives.org_unit_id`, `drives.theme_id`,
-  `file_permissions.expiration_time`).
+- **Current PR**: milestone 5.10 (Dropbox pack + `pagination.continuation`)
+  — open as #216, **not live-verified**; see the entry above.
+  Milestones 1–4 and 5.1–5.9 (GitHub, Slack, Notion, Feishu, Gmail,
+  Discord, Outlook, OneDrive, Google Drive packs) are merged; this PR adds
+  the Dropbox pack against Open Connector's normalized Dropbox contract
+  (reconciled against the v1.3.5 provider source only), plus the one engine
+  extension it required: `pagination.continuation`, which lets pages 2..N
+  target a different action and, with `inputs: cursor_only`, carry the
+  cursor alone.
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

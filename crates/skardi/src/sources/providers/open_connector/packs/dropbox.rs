@@ -2,6 +2,37 @@
 //! Connector `dropbox.*` read actions (OAuth2, cursor pagination with
 //! split-action continuation).
 //!
+//! # Provenance: NOT live-verified
+//!
+//! Everything below is reconciled against the Open Connector **v1.3.5
+//! provider source** (`src/providers/dropbox/`) and nothing else. No live
+//! gateway has answered any of it, and no Dropbox account has been read:
+//! the authoring box has no Node runtime, so the design spec's step 2
+//! (contract capture) and step 5 (live verification) are recorded as
+//! blocked, not done. Concretely, and stated here so no reader infers
+//! otherwise from the confidence of the prose:
+//!
+//! - the five `fixtures/dropbox/contracts/*.json` files are schemas
+//!   derived from the executor source, not captured from `GET
+//!   /v1/actions/<id>`; the `*_continue.json` pair is byte-identical to
+//!   its opener because it was derived that way, which is a hypothesis
+//!   about the wire rather than an observation of it;
+//! - every `fingerprint:` in `dropbox.yaml` therefore hashes a
+//!   source-derived schema. Registration against a real gateway is
+//!   EXPECTED to fail the contract gate until the live pass re-pins them
+//!   — that failure is the gate working, not a regression;
+//! - the row fixtures are hand-authored in the executor's shape, not
+//!   redacted live captures, so no mapped column has been shown to carry
+//!   a real non-NULL value;
+//! - declared page sizes (`limit: 2000`, `maxResults: 1000`) are the
+//!   schema's maxima, unprobed at the boundary — a declared cap can
+//!   exceed the wire's (Feishu declared 100, hard-failed above 50).
+//!
+//! The runbook that closes all of this out is
+//! `docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md`. Its
+//! acceptance table is the list of statements in this file that are
+//! currently inferences.
+//!
 //! **Rows are NORMALIZED, not passed through.** Every list executor maps
 //! entries through `mapDropboxMetadata`, which rebuilds each one into a
 //! fixed camelCase shape — `tag` / `name` / `id` / `pathDisplay` /
@@ -24,13 +55,25 @@
 //!   opened it: `list_folder` → `list_folder_continue`, `search_files` →
 //!   `search_files_continue`, each continue action declaring `cursor` as
 //!   its ONLY property under `additionalProperties: false`. This is not a
-//!   style difference — feeding the cursor back to the opening action is
-//!   a hard 400, verified live against v1.3.5 (`POST dropbox.list_folder
-//!   {"cursor":"abc"}` → 400 `invalid_input`). The engine's
-//!   `continuation: {action, fingerprint, inputs: cursor_only}` exists
-//!   for this shape, and BOTH actions are fingerprint-gated: the
-//!   continue action serves most of a long scan, so pinning only the
-//!   opener would leave the rest unguarded against drift.
+//!   style difference: `list_folder` does not declare `cursor`, and its
+//!   input schema is `additionalProperties: false`, so feeding the cursor
+//!   back to the opening action is a hard 400 rather than a quiet
+//!   truncation — read off the declared schema, not observed on the wire.
+//!   The engine's `continuation: {action, fingerprint, inputs:
+//!   cursor_only}` exists for this shape.
+//!
+//!   Both actions are fingerprint-gated, but be precise about what that
+//!   buys: a fingerprint hashes the OUTPUT schema, and an opener and its
+//!   continuation publish the same one here, so the continuation pin
+//!   guards the row shape of pages 2..N and cannot fail alone. The claim
+//!   that actually keeps the scan alive is `cursor_only`, an INPUT claim,
+//!   and registration checks it separately against the continuation
+//!   action's discovered input schema
+//!   (`SourcePackTable::check_continuation_inputs`): the cursor input must
+//!   be a declared property and no other input may be required. A
+//!   continuation action publishing no input schema is refused rather
+//!   than trusted, the same default-deny posture raw scans take toward a
+//!   missing read/write classification.
 //!
 //! - **`has_more_path` is load-bearing on `files`, not decorative.**
 //!   `list_folder` answers its FINAL page with a NON-EMPTY cursor — the
@@ -69,6 +112,26 @@
 //!   and Inexact would still push a rev ID as though it were a path.
 //!   Guard tests prove no filter key ever reaches the wire.
 //!
+//! - **`shared_links` continues through its own action, on inference.**
+//!   The executor `compactObject`s `path` and `cursor` together and the
+//!   input schema declares both, so no `continuation` block is declared
+//!   and pages 2..N repeat the action with the full input. This is design
+//!   spec open question 1 and is unresolved on the wire; if Dropbox
+//!   rejects the pair, the fix is a `continuation: {fingerprint, inputs:
+//!   cursor_only}` block here and no code change.
+//!
+//! - **`directOnly` is a binding-level resource, not a pin.** It is a
+//!   scan-shape boolean — the class of input this pack otherwise pins
+//!   (`recursive`, `includeDeleted`, `fileStatus`) — and it is exposed
+//!   because neither setting is an honest default for a table named
+//!   `shared_links`: pinned `true`, links a file inherits from a shared
+//!   ancestor disappear; pinned `false`, one file can surface through
+//!   several ancestors. Which of those a deployment wants is not a pack
+//!   decision. Resource values keep their YAML type
+//!   (`OpenConnectorBinding::resource` is a `BTreeMap<String, Value>`),
+//!   so `directOnly: true` reaches the strict schema as a JSON boolean
+//!   rather than the string `"true"`; a forwarding test pins that.
+//!
 //! - **`file_search` requires `query`.** A search table without one is
 //!   not a table (the GitHub `owner`/`repo` precedent), and the
 //!   requirement is enforced before any HTTP. `fileStatus: active` is
@@ -83,6 +146,20 @@
 //!   the declared schema (`anyOf: [array, null]`) contradicts the
 //!   executor (`readObjectArray`, which returns `[]` and never null).
 //!   Recorded as a wire-vs-contract contradiction; not worth a column.
+//!
+//! - **`file_search`'s `metadata` nullability is UNRESOLVED, and it is
+//!   the one open question that can fail a live scan.** The derived
+//!   contract declares `matches[].metadata` a required, non-nullable
+//!   object, and `tag` / `name` are mapped `nullable: false` on that
+//!   basis — so a real `metadata: null` row would fail the scan rather
+//!   than yield NULLs. `fixtures/dropbox/file_search_null_parent.json` is
+//!   a SYNTHETIC probe of that path (it encodes a shape the derived
+//!   contract says cannot occur, deliberately, like the schema-mismatch
+//!   fixture): it proves the converter names the offending non-nullable
+//!   column instead of quietly emitting an all-NULL row. If the live pass
+//!   finds that Dropbox can null a match's metadata, `tag` and `name`
+//!   become nullable and that fixture graduates from synthetic to
+//!   captured.
 //!
 //! - **No `error_path` anywhere.** `dropboxRpcRequest` throws on any
 //!   non-2xx, so Dropbox's in-band `error_summary` envelope AND its 429
@@ -179,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_fingerprints_match_the_captured_contracts() {
+    fn pinned_fingerprints_match_the_committed_contracts() {
         // Locks pin ↔ fixture for BOTH actions of a split-action table.
         // Collects every mismatch and prints the actual hash, which is
         // also how the pins are obtained the first time.
@@ -272,9 +349,10 @@ mod tests {
             );
         }
 
-        // shared_links takes the cursor on its OWN action (verified live:
-        // `{path, cursor}` together pass the strict schema), so it needs
-        // no continuation at all.
+        // shared_links takes the cursor on its OWN action — the executor
+        // `compactObject`s `{path, cursor}` together and the schema
+        // declares both — so it needs no continuation. Inference from the
+        // source, not a wire observation: design spec open question 1.
         let shared = table("shared_links");
         assert!(shared.continuation.is_none());
         assert_eq!(shared.gated_actions().count(), 1);
@@ -320,8 +398,10 @@ mod tests {
         }
     }
 
-    // ── Contract tests: fixtures are provider-shaped redacted pages,
-    // covering all six admission-gate categories. ──────────────────────
+    // ── Contract tests. The fixtures are provider-SHAPED pages authored
+    // from the executor source, not redacted live captures (module doc,
+    // provenance banner); they cover all six admission-gate
+    // categories. ─────────────────────────────────────────────────────
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -488,9 +568,16 @@ mod tests {
 
     #[test]
     fn a_null_metadata_parent_nulls_its_children_not_the_scan() {
-        // The null-parent category: `metadata: null` makes every nested
-        // NULLABLE column SQL NULL. The non-nullable ones (tag, name)
-        // must still fail — a quiet all-NULL row would hide the drift.
+        // The null-parent category. The fixture is SYNTHETIC on purpose:
+        // the derived contract declares `matches[].metadata` a required,
+        // non-nullable object, so this shape is one the gateway is not
+        // supposed to produce — like the schema-mismatch fixture. What it
+        // pins is the converter's behavior IF it ever does: `metadata:
+        // null` makes every nested NULLABLE column SQL NULL, and the
+        // non-nullable ones (tag, name) fail loudly, because a quiet
+        // all-NULL row would hide the drift. If the live pass finds that
+        // Dropbox can null a match's metadata, `tag`/`name` become
+        // nullable and this fixture graduates to a real capture.
         let table = table("file_search");
         let page: Value = serde_json::from_str(include_str!(
             "fixtures/dropbox/file_search_null_parent.json"
@@ -541,15 +628,40 @@ mod tests {
 
     // ── Integration: the pack against a mock gateway, end to end. ───────
 
-    /// Discovery serving the live-captured contracts, so every mock
+    /// Discovery serving the committed contracts (source-DERIVED, not
+    /// captured — see the module doc's provenance banner), so every mock
     /// registration exercises the fingerprint gate's PASS side — for the
     /// continuation actions too.
+    /// The continue actions' INPUT schema, as `additionalProperties:
+    /// false` with `cursor` its only property. Serving this — rather than
+    /// the `{}` a lazier mock would send — is what makes every
+    /// registration below exercise the PASS side of the `cursor_only`
+    /// input gate. Derived from the v1.3.5 executor source, like everything
+    /// else in this pack; the live pass replaces it with the real
+    /// `data.inputSchema`.
+    const CURSOR_ONLY_INPUT_SCHEMA: &str = r#"{
+        "type": "object",
+        "properties": { "cursor": { "type": "string" } },
+        "required": ["cursor"],
+        "additionalProperties": false
+    }"#;
+
     fn dropbox_discovery(path: &str) -> MockResponse {
-        // Each action reads its OWN captured contract even where two are
-        // byte-identical today (an opener and its continuation share an
-        // output schema): keeping them separate is what makes a future
-        // divergence visible instead of silently inherited.
-        let output_schema = match path.rsplit('/').next().unwrap_or_default() {
+        // Each action reads its OWN contract file even though the two
+        // continue files are byte-identical to their openers today: they
+        // were DERIVED that way, so keeping the files separate is what
+        // lets the live capture split them without touching this helper.
+        let action = path.rsplit('/').next().unwrap_or_default();
+        // Only the continue actions carry a declared input schema here:
+        // the openers' inputs are not gated, and leaving them `{}` keeps
+        // the difference visible.
+        let input_schema = match action {
+            "dropbox.list_folder_continue" | "dropbox.search_files_continue" => {
+                CURSOR_ONLY_INPUT_SCHEMA
+            }
+            _ => "{}",
+        };
+        let output_schema = match action {
             "dropbox.list_folder" => include_str!("fixtures/dropbox/contracts/list_folder.json"),
             "dropbox.list_folder_continue" => {
                 include_str!("fixtures/dropbox/contracts/list_folder_continue.json")
@@ -563,7 +675,7 @@ mod tests {
             }
             _ => r#"{"type": "object"}"#,
         };
-        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+        MockResponse::ok(&discovery_ok(input_schema, output_schema, true, None))
     }
 
     fn dropbox_config(token_env: &str, tables: &str) -> OpenConnectorConfig {
@@ -662,8 +774,9 @@ bindings:
         // dropbox.list_folder with the pinned complete-collection inputs
         // and the page-size hint; page two goes to
         // dropbox.list_folder_continue carrying the cursor and NOTHING
-        // else — against the real gateway anything more is a 400
-        // (verified live: `cursor` alone on list_folder → invalid_input).
+        // else — against the real gateway anything more is a 400, since
+        // the continue action declares `cursor` as its only property under
+        // additionalProperties: false.
         // The final page answers hasMore:false with a NON-EMPTY cursor,
         // the Dropbox shape that makes has_more_path load-bearing.
         let gateway = MockGateway::start(|req| {
@@ -989,6 +1102,344 @@ bindings:
         assert!(
             table("files").error_path.is_none(),
             "no in-band error path is declared for Dropbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_search_pages_through_its_own_continue_action() {
+        // `files`' two-page e2e does not cover this table: the action id,
+        // the page-size input (`maxResults`, not `limit`) and the
+        // continuation pin are all file_search's own declarations, and
+        // shared engine constants are not shared coverage.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return dropbox_discovery(&req.path);
+            }
+            match req.path.as_str() {
+                "/v1/actions/dropbox.search_files" => MockResponse::ok(&envelope_ok(
+                    &json!({"matches": [
+                                {"matchType": "filename", "metadata": entry("s1"),
+                                 "highlightSpans": []}],
+                            "cursor": "s-2", "hasMore": true})
+                    .to_string(),
+                )),
+                "/v1/actions/dropbox.search_files_continue" => {
+                    let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    match body["input"].get("cursor").and_then(Value::as_str) {
+                        Some("s-2") => MockResponse::ok(&envelope_ok(
+                            &json!({"matches": [
+                                        {"matchType": "content", "metadata": entry("s2"),
+                                         "highlightSpans": []}],
+                                    "cursor": null, "hasMore": false})
+                            .to_string(),
+                        )),
+                        other => MockResponse::new(400, format!("bad cursor {other:?}")),
+                    }
+                }
+                _ => MockResponse::new(404, "{}"),
+            }
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_DROPBOX_SEARCH_PAGES",
+            "file_search",
+        )
+        .await;
+
+        let batches = collect(&ctx, "SELECT name FROM saas.ws.file_search ORDER BY name").await;
+        assert_eq!(names_of(&batches), vec!["s1", "s2"]);
+
+        let calls = execute_calls(&gateway);
+        assert_eq!(calls.len(), 2, "two pages");
+
+        let (path, input) = &calls[0];
+        assert_eq!(path, "/v1/actions/dropbox.search_files");
+        let mut keys: Vec<&str> = input
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["fileStatus", "maxResults", "query"],
+            "page one carries EXACTLY the required resource, the pin and the page size"
+        );
+        assert_eq!(
+            input["maxResults"],
+            json!(1000),
+            "this table's own page size"
+        );
+
+        let (path, input) = &calls[1];
+        assert_eq!(
+            path, "/v1/actions/dropbox.search_files_continue",
+            "page two targets THIS table's continue action"
+        );
+        assert_eq!(
+            input,
+            &json!({"cursor": "s-2"}),
+            "no query, no fileStatus, no maxResults — the continue action declares none of them"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_links_forwards_both_of_its_optional_resources() {
+        // `directOnly` is the pack's only boolean resource, so this also
+        // pins that resource values keep their YAML type: a string "true"
+        // would be rejected by the action's strict schema.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return dropbox_discovery(&req.path);
+            }
+            if req.path == "/v1/actions/dropbox.list_shared_links" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"links": [entry("l1")], "cursor": null, "hasMore": false}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_DROPBOX_RESOURCES", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_DROPBOX_RESOURCES
+bindings:
+  - name: ws
+    source_pack: dropbox
+    resource:
+      path: /Redacted Folder/redacted-report.pdf
+      directOnly: true
+    tables: [shared_links]
+"#,
+        )
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("registration succeeds");
+
+        let batches = collect(&ctx, "SELECT name FROM saas.ws.shared_links").await;
+        assert_eq!(names_of(&batches), vec!["l1"]);
+
+        let calls = execute_calls(&gateway);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            json!({"path": "/Redacted Folder/redacted-report.pdf", "directOnly": true}),
+            "both resources forward verbatim, and directOnly is a JSON boolean"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_files_page_without_the_has_more_signal_fails_the_scan() {
+        // `has_more_path` is called load-bearing in three places in this
+        // pack; this is the failure arm of that declaration reached through
+        // SQL, not through the engine's own unit tests. A page missing the
+        // signal must fail as contract drift — never terminate quietly,
+        // which is how a truncated scan would look green.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return dropbox_discovery(&req.path);
+            }
+            if req.path == "/v1/actions/dropbox.list_folder" {
+                // A well-formed page in every respect EXCEPT the declared
+                // has-more flag.
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"entries": [entry("a")], "cursor": "cur-2"}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_DROPBOX_NO_HAS_MORE", "files").await;
+
+        let err = ctx
+            .sql("SELECT name FROM saas.ws.files")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a page missing the declared has-more signal must fail");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("$.hasMore") && rendered.contains("absent"),
+            "the error names the declared path and what was found: {rendered}"
+        );
+        assert_eq!(
+            execute_calls(&gateway).len(),
+            1,
+            "the scan stops at the drifted page instead of continuing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drifted_opening_contract_fails_registration_for_every_table() {
+        // The continuation-drift case is covered above; this is the arm
+        // each table owns, so no table rides another's pin.
+        for (short, action) in [
+            ("files", "dropbox.list_folder"),
+            ("shared_links", "dropbox.list_shared_links"),
+            ("file_search", "dropbox.search_files"),
+        ] {
+            let drifted = action.to_string();
+            let gateway = MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                    if req.path.ends_with(&drifted) {
+                        return MockResponse::ok(&discovery_ok(
+                            "{}",
+                            r#"{"type":"object","properties":{"drifted":{"type":"string"}}}"#,
+                            true,
+                            None,
+                        ));
+                    }
+                    return dropbox_discovery(&req.path);
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await;
+            let env = format!("SKARDI_TEST_OC_DROPBOX_DRIFT_{}", short.to_uppercase());
+            let _token = EnvVarGuard::set(&env, "test-token");
+            let mut ctx = SessionContext::new();
+            let err = register_open_connector_tables(
+                &mut ctx,
+                "saas",
+                &gateway.url,
+                Some(&dropbox_config(&env, short)),
+                false,
+                HierarchyLevel::Catalog,
+                None,
+            )
+            .await
+            .expect_err("a drifted opening contract must fail registration");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(&format!("dropbox.{short}")) && rendered.contains(action),
+                "{short}: error must name the table and the drifted action: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_continue_action_demanding_more_than_a_cursor_fails_registration() {
+        // The fail arm of the `cursor_only` INPUT gate, reached through the
+        // public registration entry point. The fingerprint cannot catch
+        // this — the output schema is untouched — and without the gate the
+        // only symptom is a 400 on page two of a live scan.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                if req.path.ends_with("dropbox.list_folder_continue") {
+                    // Same OUTPUT schema as the captured contract, so the
+                    // fingerprint gate passes; the INPUT schema now also
+                    // requires `path`, which a cursor-only page never sends.
+                    return MockResponse::ok(&discovery_ok(
+                        r#"{"type":"object",
+                             "properties":{"cursor":{"type":"string"},"path":{"type":"string"}},
+                             "required":["cursor","path"],
+                             "additionalProperties":false}"#,
+                        include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
+                        true,
+                        None,
+                    ));
+                }
+                return dropbox_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_DROPBOX_CURSOR_ONLY", "test-token");
+        let mut ctx = SessionContext::new();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&dropbox_config(
+                "SKARDI_TEST_OC_DROPBOX_CURSOR_ONLY",
+                "files",
+            )),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect_err("a continue action requiring more than the cursor must fail registration");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("dropbox.list_folder_continue") && rendered.contains("path"),
+            "the error names the continuation action and the unsatisfiable input: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continue_action_without_an_input_schema_is_refused() {
+        // Default-deny on an unverifiable claim, mirroring how raw scans
+        // treat a missing read/write classification: `cursor_only` asserts
+        // something about inputs, and a gateway that declares no inputs
+        // cannot confirm it.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                if req.path.ends_with("dropbox.list_folder_continue") {
+                    return MockResponse::ok(&discovery_ok(
+                        "{}",
+                        include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
+                        true,
+                        None,
+                    ));
+                }
+                return dropbox_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_DROPBOX_NO_INPUT_SCHEMA", "test-token");
+        let mut ctx = SessionContext::new();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&dropbox_config(
+                "SKARDI_TEST_OC_DROPBOX_NO_INPUT_SCHEMA",
+                "files",
+            )),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+        .expect_err("an unverifiable cursor_only claim must be refused");
+        assert!(
+            err.to_string().contains("no input schema"),
+            "the error says why it cannot be verified: {err}"
         );
     }
 

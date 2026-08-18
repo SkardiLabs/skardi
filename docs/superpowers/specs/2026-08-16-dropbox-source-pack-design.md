@@ -1,10 +1,16 @@
 # Dropbox Source Pack (milestone 5.5)
 
-**Status:** Draft for review — no implementation started
-**Date:** 2026-08-16
+**Status:** Steps 1, 3, 4 landed (engine extension, pack, docs). Steps 2
+(contract capture) and 5 (live verification) remain BLOCKED on a Node
+runtime and a Dropbox account — so every fingerprint in the shipped pack
+is source-derived and will fail the contract gate against a real gateway
+until re-pinned. Runbook for the blocked steps:
+[2026-08-18-dropbox-live-evaluation.md](../plans/2026-08-18-dropbox-live-evaluation.md).
+**Date:** 2026-08-16 (status updated 2026-08-18)
 **Branch:** `feature/open-connector-dropbox-pack`
 **Gateway reconciled against:** oomol-lab/open-connector **v1.3.5** (source
-read; live probe still outstanding — see [Open questions](#open-questions))
+read; live probe still outstanding — see [Open questions](#open-questions)
+and the [live-evaluation runbook](../plans/2026-08-18-dropbox-live-evaluation.md))
 
 ## Summary
 
@@ -329,7 +335,10 @@ the docs, and a `/code-review` pass on the diff.
 
 ## Open questions
 
-1. **`list_shared_links` with both `path` and `cursor`.** The executor
+1. **`list_shared_links` with both `path` and `cursor`.** STILL OPEN. The
+   shipped pack declares no `continuation` for this table, i.e. it ships
+   the inference that the combination is accepted; the yaml and module doc
+   label it as an inference rather than an observation. The executor
    `compactObject`s them together, but Dropbox may reject the combination.
    If it does, this table needs `continuation: {inputs: cursor_only}` as
    well — which the proposed design already spells without a code change.
@@ -337,11 +346,18 @@ the docs, and a `/code-review` pass on the diff.
 2. **`list_folder` cursor lifetime.** Dropbox cursors can expire or be
    invalidated mid-listing; a long recursive scan may hit it. Behavior and
    whether it warrants a documented bound is a phase-4 observation.
-3. **Whether `recursive: true` is the right pin** — the alternative is
+3. **Can `matches[].metadata` be null?** NEW, found in self-review. The
+   derived contract declares it a required non-nullable object, and
+   `file_search` maps `tag`/`name` as `nullable: false` on that basis — so
+   a real null-metadata match would fail the scan rather than yield NULLs.
+   `file_search_null_parent.json` is labelled synthetic and pins the
+   converter's behavior if it ever happens. If the wire can null it, those
+   two columns become nullable and the fixture graduates to a capture.
+4. **Whether `recursive: true` is the right pin** — the alternative is
    pinning it off and making the subtree the user's choice via a second
    table. Flagging because it is the single most consequential contract
    decision in this pack.
-4. **Engine-extension appetite.** If `pagination.continuation` is not
+5. **Engine-extension appetite.** If `pagination.continuation` is not
    wanted in this milestone, the honest fallback is a one-table pack
    (`shared_links`) with `files` and `file_search` deferred as
    gate-failing — worse, but not misleading.

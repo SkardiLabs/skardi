@@ -37,10 +37,14 @@ gateway **runtime token**.
 > search — live-verified against a real MSA drive; search rows are a
 > reduced projection and search continuations currently fail upstream
 > on personal drives, loudly, per the pack doc),
-> and [Google Drive](open-connector-google-drive.md) (files, drives,
+> [Google Drive](open-connector-google-drive.md) (files, drives,
 > file permissions — live-verified against a real Workspace account,
 > shared-drive rows included; three structurally unreachable columns
-> stay documented as residuals per the pack doc).
+> stay documented as residuals per the pack doc),
+> and [Dropbox](open-connector-dropbox.md) (files, shared links, file
+> search — split-action cursor continuation; **not yet live-verified**,
+> so its pinned fingerprints will fail the contract gate against a real
+> gateway until they are re-captured).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
@@ -288,6 +292,47 @@ page — a page without it fails as contract drift rather than guessing.
 Declare it only for providers that always emit the signal; for the
 omit-when-false pattern (Slack's `response_metadata`), leave it undeclared
 and let the cursor spellings terminate the scan.
+
+Some providers continue a listing through a **different action** than the
+one that opened it — Dropbox's `list_folder` → `list_folder_continue`,
+whose input schema declares `cursor` as its only property. A cursor-paginated
+pack table declares that with an optional `continuation` block; absent, pages
+2..N repeat the table's own action with the full assembled input, exactly as
+before:
+
+```yaml
+pagination:
+  strategy: cursor
+  cursor_input: cursor
+  next_cursor_path: "$.cursor"
+  page_size_input: limit
+  page_size: 2000
+  has_more_path: "$.hasMore"
+  continuation:
+    action: dropbox.list_folder_continue   # default: the table's own action
+    fingerprint: <blake3-hex>              # required, never optional
+    inputs: cursor_only                    # cursor_only | full (default: full)
+```
+
+Page 1 always uses the table's own action with the full input. `inputs:
+cursor_only` makes pages 2..N carry the cursor and nothing else — no
+resources, no fixed inputs, no page size — for continue actions that declare
+nothing else; the listing's shape was committed by the request that opened
+it, and the provider sizes continuation pages from that request.
+
+Both actions are discovered and fingerprint-gated at registration, so an
+undiscovered or drifted continue action fails at startup rather than on page
+two of the first scan. Because a fingerprint hashes the *output* schema, the
+`cursor_only` claim — which is about inputs — is checked separately against
+the continue action's discovered **input** schema: the cursor input must be a
+declared property and no other input may be `required`. A continue action
+that publishes no input schema is refused rather than trusted, the same
+default-deny posture raw scans take toward a missing read/write
+classification. Two authoring invariants are enforced by the loader: a
+`continuation` on a non-cursor strategy is a parse error, and a table that
+pins its continuation's fingerprint must pin its own action's too (half a
+gate reads as gated while verifying only pages 2..N).
+
 Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
 *kind*, never the value.
@@ -307,9 +352,14 @@ otherwise report `RowPathNotFound` on an in-band error page.
 
 Each pack table pins the full relational contract and an expected
 action-contract fingerprint captured from a live gateway (a canonicalized
-BLAKE3 hash of the discovered output schema; both the github and slack
-packs are pinned, with the captured schemas committed next to each pack
-under `fixtures/<provider>/contracts/`). At registration a pinned
+BLAKE3 hash of the discovered output schema; every built-in pack is
+pinned, with the schemas committed next to each pack under
+`fixtures/<provider>/contracts/` — captured from a live gateway except
+Dropbox's, which are source-derived pending its live pass). Split-action
+tables pin BOTH the opening action and the continuation action; where the
+two publish the same output schema, the continuation pin guards the row
+shape of pages 2..N and its input-side claim is gated separately (see
+[Bounds, retries, and errors](#bounds-retries-and-errors)). At registration a pinned
 table's fingerprint is compared against the discovered contract and any
 difference — breaking or additive, since a hash cannot tell them apart —
 fails with a targeted error instead of silently changing a table's

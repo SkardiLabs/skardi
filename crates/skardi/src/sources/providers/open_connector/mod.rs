@@ -259,6 +259,16 @@ pub async fn register_open_connector_tables(
                     .into());
                 }
             }
+            // The fingerprint covers the OUTPUT schema, so `cursor_only` —
+            // a claim about what the continuation action ACCEPTS — needs its
+            // own check against the discovered input schema, or its only
+            // failure surface is a 400 on page two of a live scan.
+            table.check_continuation_inputs(
+                table
+                    .continuation
+                    .and_then(|c| registry.get(c.action_id))
+                    .and_then(ActionMetadata::input_schema),
+            )?;
 
             let provider = OpenConnectorTableProvider::new(
                 Arc::clone(&client),
