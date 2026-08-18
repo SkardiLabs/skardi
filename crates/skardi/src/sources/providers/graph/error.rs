@@ -29,6 +29,19 @@ pub enum GraphError {
     #[error("graph source '{name}': {reason}")]
     InvalidConfig { name: String, reason: String },
 
+    /// A YAML view failed its live validation — at registration, or at
+    /// the degraded recovery retry. The failing identity is a VIEW, not
+    /// a source, so it does not ride [`GraphError::InvalidConfig`]
+    /// (whose rendering would call it one). Carries the TYPED underlying
+    /// error, not its rendering: registration classifies availability
+    /// artifacts (timeouts, unreachable) apart from genuine contract
+    /// violations, and a stringified reason would erase that boundary.
+    #[error("graph view '{view}' failed validation: {source}")]
+    ViewValidationFailed {
+        view: String,
+        source: Box<GraphError>,
+    },
+
     /// The fast-path keyword guard blocked caller-supplied Cypher. Names
     /// the blocked keyword and its byte offset — NEVER the query text
     /// (inline Cypher literals are values).
@@ -68,6 +81,26 @@ pub enum GraphError {
         found: &'static str,
     },
 
+    /// The degraded recovery's whole-run backstop elapsed. Each view
+    /// probe is individually bounded (server-side timeout + client wrap);
+    /// this fires only if the recovery as a whole stalls past the sum of
+    /// its waves' budgets — a should-not-happen guard, not a tuning knob.
+    #[error(
+        "degraded recovery did not complete within {seconds}s (every per-view probe is \
+         individually bounded; this is the whole-recovery backstop)"
+    )]
+    RecoveryDeadlineExceeded { seconds: u64 },
+
+    /// A column declared `nullable: false` (YAML views only — the ad-hoc
+    /// surface cannot declare it) met a null from the backend. Identity
+    /// only, never the value.
+    #[error(
+        "graph column '{column}' at result row {row}: declared nullable: false but the \
+         backend returned null; relax the declaration to nullable: true or filter \
+         nulls in the view's Cypher (e.g. WHERE ... IS NOT NULL)"
+    )]
+    NotNullViolation { column: String, row: usize },
+
     /// The scan hit the per-source row cap. Loud and typed — never a
     /// silent truncation.
     #[error(
@@ -83,6 +116,42 @@ pub enum GraphError {
          narrow the traversal or raise the timeout"
     )]
     Timeout { seconds: u64 },
+
+    /// The CLIENT-SIDE wrap fired: the backend accepted the connection
+    /// but stopped answering — no result, no error, and (because no
+    /// packets get back) no server-side 57014 either. This is an
+    /// AVAILABILITY failure, deliberately distinct from
+    /// [`GraphError::Timeout`]: a 57014 is the server ANSWERING (it
+    /// accepted the query and cancelled it — a boot-time configuration
+    /// diagnosis), while silence is the archetypal transient blip that
+    /// must degrade rather than refuse boot. Conflating them made a
+    /// mid-validation network partition fail the whole server start.
+    #[error(
+        "the graph backend stopped answering: no response within {seconds}s (the          client-side bound; the server never reported a statement timeout — the          backend or the network path to it is gone)"
+    )]
+    BackendSilent { seconds: u64 },
+
+    /// No pooled connection became available within the bound. sqlx
+    /// retries a refused dial until the acquire deadline and then
+    /// surfaces `PoolTimedOut`, so an UNREACHABLE backend lands here —
+    /// not in a dial error. Distinct from [`GraphError::Timeout`]: the
+    /// query never started, so "narrow the traversal" would be
+    /// actively misleading advice.
+    #[error(
+        "could not acquire a connection to the graph backend within {seconds}s: the \
+         backend may be unreachable, or every pooled connection is checked out (the \
+         query never started)"
+    )]
+    ConnectionAcquireTimeout { seconds: u64 },
+
+    /// The backend could not be REACHED at registration — a connectivity
+    /// failure (DNS, refused dial, network timeout), meaning no server
+    /// answered at all. This is the ONLY variant that qualifies for
+    /// degraded registration: anything the server answered (bad
+    /// credentials, missing extension, missing graph) is a configuration
+    /// problem that must fail startup loudly, never degrade.
+    #[error("graph backend '{source_name}' is unreachable: {reason}")]
+    Unavailable { source_name: String, reason: String },
 
     /// A driver/backend failure. `code` is the backend's error code
     /// verbatim; `message` is a bounded snippet (see
@@ -142,17 +211,9 @@ impl GraphError {
 }
 
 /// The JSON kind of a value, for type-mismatch diagnostics — kinds only,
-/// never the value itself.
-pub fn json_kind(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
+/// never the value itself. Re-exported from the shared util so the
+/// vocabulary has exactly one definition repo-wide.
+pub use crate::util::json::json_kind;
 
 #[cfg(test)]
 mod tests {

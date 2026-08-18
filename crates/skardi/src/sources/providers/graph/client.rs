@@ -15,6 +15,7 @@
 //! whole-graph `RETURN` fails loudly at `max_rows + 1` instead of
 //! buffering the world.
 
+use std::io::ErrorKind as IoErrorKind;
 use std::time::Duration;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,6 +192,18 @@ impl Drop for OpenTxnGuard {
     }
 }
 
+/// Ceiling on the REGISTRATION preflight (dial + per-connection setup +
+/// the graph-existence probe). `query_timeout_seconds` means "how long
+/// may a traversal run" — config permits a day — and must not double as
+/// "how long may server startup block on a dead host": the preflight is
+/// three tiny statements, so 30s is generous. The trade this ceiling
+/// makes explicit: a backend that WOULD answer slower than the bound
+/// classifies Unavailable and boots degraded (the first scan carries the
+/// real diagnosis) — acceptable for a probe this small, unlike the
+/// serial multi-minute boot stall the uncapped bound allowed. The pool's
+/// own acquire_timeout stays at the full query bound.
+const PREFLIGHT_TIMEOUT_CEILING: Duration = Duration::from_secs(30);
+
 /// Apache AGE over the workspace's sqlx-postgres stack.
 #[derive(Debug)]
 pub struct AgeClient {
@@ -216,21 +229,7 @@ impl AgeClient {
         max_connections: u32,
         acquire_timeout: Duration,
     ) -> Result<Self, GraphError> {
-        let mut options: PgConnectOptions =
-            connection_string
-                .parse()
-                .map_err(|e: sqlx::Error| GraphError::InvalidConfig {
-                    name: source_name.to_string(),
-                    reason: format!("connection_string does not parse: {e}"),
-                })?;
-        if let Some(env) = username_env {
-            let user = read_env(source_name, "username_env", env)?;
-            options = options.username(&user);
-        }
-        if let Some(env) = password_env {
-            let pass = read_env(source_name, "password_env", env)?;
-            options = options.password(&pass);
-        }
+        let options = build_options(source_name, connection_string, username_env, password_env)?;
         // PREFLIGHT on a single direct connection, before any pool
         // exists: sqlx treats an `after_connect` error as a failed
         // attempt and RETRIES until acquire_timeout, discarding the
@@ -239,11 +238,16 @@ impl AgeClient {
         // sizing. Running the same per-connection setup here first means
         // auth failures, setup failures, and the graph probe all fail
         // FAST with their real, named error (the eager-fail contract in
-        // mod.rs's docstring).
-        {
+        // mod.rs's docstring). The whole preflight is bounded by
+        // min(acquire_timeout, PREFLIGHT_TIMEOUT_CEILING): a blackholed
+        // address or a stuck TLS/auth handshake must not hold startup
+        // hostage — it degrades like any other unreachable backend — and
+        // an operator raising query_timeout_seconds for heavy traversals
+        // must not thereby raise the boot stall (see the ceiling's doc).
+        let preflight = async {
             let mut conn = sqlx::postgres::PgConnection::connect_with(&options)
                 .await
-                .map_err(|e| backend_error(source_name, &e))?;
+                .map_err(|e| connect_error(source_name, &e))?;
             per_connection_setup(&mut conn)
                 .await
                 .map_err(|e| backend_error(source_name, &e))?;
@@ -269,30 +273,61 @@ impl AgeClient {
                     ),
                 });
             }
-        }
-        // Lazy pool: the preflight above already proved the environment,
-        // so the pool's own connections dial on demand.
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            // Queueing on a saturated pool is bounded by the SAME knob
-            // as the query itself — sqlx's 30s default is unrelated to
-            // query_timeout_seconds and would surface as a generic
-            // driver failure after possibly LONGER than the configured
-            // bound ("every query is bounded" covers the queue too).
-            .acquire_timeout(acquire_timeout)
-            .after_connect(|conn, _meta| Box::pin(per_connection_setup(conn)))
-            .connect_lazy_with(options);
+            Ok::<_, GraphError>(())
+        };
+        let preflight_timeout = acquire_timeout.min(PREFLIGHT_TIMEOUT_CEILING);
+        tokio::time::timeout(preflight_timeout, preflight)
+            .await
+            .map_err(|_| GraphError::Unavailable {
+                source_name: source_name.to_string(),
+                reason: format!(
+                    "the registration preflight did not complete within {}s",
+                    preflight_timeout.as_secs()
+                ),
+            })??;
+        Ok(Self::from_pool(
+            build_pool(options, max_connections, acquire_timeout),
+            source_name,
+            graph_name,
+        ))
+    }
+
+    /// Connect WITHOUT the preflight probe: URL parsing and env-var
+    /// resolution still fail here (those are config errors, never
+    /// transient), but no network I/O happens — the lazy pool dials on
+    /// first acquire. Used by degraded registration
+    /// (`register_graph_tables`): an unreachable shared backend must not
+    /// take server startup — and every unrelated source — down with it;
+    /// the first scan surfaces the real backend error instead.
+    pub fn connect_degraded(
+        source_name: &str,
+        connection_string: &str,
+        graph_name: &str,
+        username_env: Option<&str>,
+        password_env: Option<&str>,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self, GraphError> {
+        let options = build_options(source_name, connection_string, username_env, password_env)?;
+        Ok(Self::from_pool(
+            build_pool(options, max_connections, acquire_timeout),
+            source_name,
+            graph_name,
+        ))
+    }
+
+    fn from_pool(pool: PgPool, source_name: &str, graph_name: &str) -> Self {
         tracing::debug!(
             source = source_name,
             graph = graph_name,
             "graph source connected"
         );
-        Ok(Self {
+        Self {
             pool,
             graph_name: graph_name.to_string(),
             source_name: source_name.to_string(),
             prepare_seq: AtomicU64::new(0),
-        })
+        }
     }
 
     /// The pool, for the live leak-regression test ONLY (the
@@ -302,6 +337,52 @@ impl AgeClient {
     pub fn pool_for_tests(&self) -> &PgPool {
         &self.pool
     }
+}
+
+/// URL parse + credential env resolution — PURE (no network I/O), so its
+/// errors are config errors and hard-fail in every connect path,
+/// degraded included.
+fn build_options(
+    source_name: &str,
+    connection_string: &str,
+    username_env: Option<&str>,
+    password_env: Option<&str>,
+) -> Result<PgConnectOptions, GraphError> {
+    let mut options: PgConnectOptions =
+        connection_string
+            .parse()
+            .map_err(|e: sqlx::Error| GraphError::InvalidConfig {
+                name: source_name.to_string(),
+                reason: format!("connection_string does not parse: {e}"),
+            })?;
+    if let Some(env) = username_env {
+        let user = read_env(source_name, "username_env", env)?;
+        options = options.username(&user);
+    }
+    if let Some(env) = password_env {
+        let pass = read_env(source_name, "password_env", env)?;
+        options = options.password(&pass);
+    }
+    Ok(options)
+}
+
+/// The lazy pool shared by both connect paths: connections dial on
+/// demand, each running [`per_connection_setup`] via `after_connect`.
+fn build_pool(
+    options: PgConnectOptions,
+    max_connections: u32,
+    acquire_timeout: Duration,
+) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        // Queueing on a saturated pool is bounded by the SAME knob
+        // as the query itself — sqlx's 30s default is unrelated to
+        // query_timeout_seconds and would surface as a generic
+        // driver failure after possibly LONGER than the configured
+        // bound ("every query is bounded" covers the queue too).
+        .acquire_timeout(acquire_timeout)
+        .after_connect(|conn, _meta| Box::pin(per_connection_setup(conn)))
+        .connect_lazy_with(options)
 }
 
 /// Per-connection session state, shared by the registration preflight
@@ -525,13 +606,19 @@ impl GraphClient for AgeClient {
         // happened above, bounded by its own acquire_timeout), so the
         // server-side statement_timeout keeps its full budget and stays
         // the authoritative bound; this one covers a backend that stops
-        // answering entirely. saturating_add: the config caps the
-        // timeout, but arithmetic here must not be the thing that panics
-        // if that invariant ever moves.
+        // answering entirely — which is why it maps to BackendSilent,
+        // NOT Timeout: a 57014 is the server answering, silence is an
+        // availability failure, and the registration/recovery
+        // classification keys on that distinction. saturating_add: the
+        // config caps the timeout, but arithmetic here must not be the
+        // thing that panics if that invariant ever moves.
         let rows = tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: bounds.timeout.as_secs(),
+            .map_err(|_| GraphError::BackendSilent {
+                seconds: bounds
+                    .timeout
+                    .saturating_add(Duration::from_secs(5))
+                    .as_secs(),
             })??;
         tracing::debug!(
             source = %self.source_name,
@@ -561,9 +648,23 @@ impl GraphClient for AgeClient {
             _ => bounds.max_rows.saturating_add(1),
         };
         let source = self.source_name.clone();
+        // Acquire OUTSIDE the client-side timeout window — the same
+        // discipline (and rationale) as execute(): acquire and execution
+        // are sequential costs with their own typed bound
+        // (ConnectionAcquireTimeout); sharing one window would let pool
+        // contention eat the catalog read's budget and misreport the
+        // wait as the query's timeout. map_query_error, not
+        // backend_error: a saturated or unreachable pool must surface
+        // from graph_schema as the same typed ConnectionAcquireTimeout
+        // cypher_query reports — and the availability classification
+        // keys on the typed variant.
+        let mut acquired = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| map_query_error(&source, bounds, &e))?;
         let run = async {
-            let mut tx = self
-                .pool
+            let mut tx = acquired
                 .begin()
                 .await
                 .map_err(|e| backend_error(&source, &e))?;
@@ -624,10 +725,16 @@ impl GraphClient for AgeClient {
                 })
                 .collect()
         };
+        // BackendSilent, not Timeout — same reasoning as execute()'s
+        // wrap: the server answering slowly is 57014; silence is an
+        // availability failure.
         tokio::time::timeout(bounds.timeout.saturating_add(Duration::from_secs(5)), run)
             .await
-            .map_err(|_| GraphError::Timeout {
-                seconds: bounds.timeout.as_secs(),
+            .map_err(|_| GraphError::BackendSilent {
+                seconds: bounds
+                    .timeout
+                    .saturating_add(Duration::from_secs(5))
+                    .as_secs(),
             })?
     }
 }
@@ -735,6 +842,33 @@ fn backend_error(source: &str, e: &sqlx::Error) -> GraphError {
     GraphError::backend(source, code.as_deref().unwrap_or("io"), &message)
 }
 
+/// Map a DIAL failure (the registration preflight's `connect_with`).
+/// Only a transport-level `io` error that says "no server answered"
+/// qualifies for degraded registration. A `Database` error here is the
+/// SERVER answering (bad credentials, `28P01`), and a TLS failure is a
+/// client configuration problem; both stay [`backend_error`] so they
+/// hard-fail registration instead of degrading.
+///
+/// The `Io` variant is NOT uniformly "nobody answered": with this
+/// workspace's `tls-rustls` feature the TLS handshake runs through
+/// `RustlsSocket::complete_io()`, and rustls wraps TLS protocol errors —
+/// certificate-verification failures included — as
+/// `io::Error(InvalidData)`, which sqlx's `handshake()` propagates into
+/// `Error::Io` (`sqlx::Error::Tls` covers only pre-handshake
+/// configuration failures: bad CA file, invalid hostname, client-cert
+/// setup). `InvalidData` therefore means we WERE talking to something
+/// whose TLS setup is broken — a misconfiguration that must refuse boot,
+/// exactly like a bad credential, never sit degraded.
+fn connect_error(source: &str, e: &sqlx::Error) -> GraphError {
+    match e {
+        sqlx::Error::Io(io) if io.kind() != IoErrorKind::InvalidData => GraphError::Unavailable {
+            source_name: source.to_string(),
+            reason: io.to_string(),
+        },
+        other => backend_error(source, other),
+    }
+}
+
 /// Postgres cancels a statement-timeout overrun with SQLSTATE 57014 —
 /// surface it as the typed timeout, not a generic backend error.
 fn map_query_error(source: &str, bounds: QueryBounds, e: &sqlx::Error) -> GraphError {
@@ -745,9 +879,13 @@ fn map_query_error(source: &str, bounds: QueryBounds, e: &sqlx::Error) -> GraphE
             seconds: bounds.timeout.as_secs(),
         };
     }
-    // A pool-acquire timeout is the queueing flavor of the same bound.
+    // A pool-acquire timeout is NOT the statement timeout: sqlx retries
+    // a refused dial until the acquire deadline, so an unreachable
+    // backend surfaces as PoolTimedOut and the query never ran. The
+    // honest variant keeps "narrow the traversal" off an error it
+    // cannot help.
     if matches!(e, sqlx::Error::PoolTimedOut) {
-        return GraphError::Timeout {
+        return GraphError::ConnectionAcquireTimeout {
             seconds: bounds.timeout.as_secs(),
         };
     }
@@ -770,6 +908,42 @@ pub fn validate_params(params: &Value) -> Result<(), GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_io_errors_split_on_talking_versus_nobody_answered() {
+        // rustls wraps TLS protocol errors — certificate verification
+        // included — as io::Error(InvalidData), and sqlx's handshake
+        // propagates that into Error::Io. That is a CONFIGURATION
+        // failure of a server we reached: it must hard-fail (a Backend
+        // classification), never sit degraded behind boot.
+        let tls = sqlx::Error::Io(std::io::Error::new(
+            IoErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(
+            !matches!(connect_error("kg", &tls), GraphError::Unavailable { .. }),
+            "a TLS handshake failure is not an outage"
+        );
+        // A refused/unroutable dial IS "nobody answered" — the degraded
+        // qualifier.
+        for kind in [
+            IoErrorKind::ConnectionRefused,
+            IoErrorKind::TimedOut,
+            IoErrorKind::ConnectionReset,
+        ] {
+            let e = sqlx::Error::Io(std::io::Error::new(kind, "dial failed"));
+            assert!(
+                matches!(connect_error("kg", &e), GraphError::Unavailable { .. }),
+                "{kind:?} must degrade"
+            );
+        }
+        // A non-Io variant (a Database answer, pool bookkeeping) never
+        // takes the Unavailable path either.
+        assert!(!matches!(
+            connect_error("kg", &sqlx::Error::PoolTimedOut),
+            GraphError::Unavailable { .. }
+        ));
+    }
 
     #[test]
     fn dollar_tags_never_collide_with_the_text() {
@@ -873,5 +1047,113 @@ mod tests {
         assert!(validate_params(&serde_json::json!({"a": 1})).is_ok());
         let err = validate_params(&serde_json::json!([1])).unwrap_err();
         assert!(err.to_string().contains("an array"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_blackholed_backend_fails_the_preflight_as_unavailable_within_the_bound() {
+        // 10.255.255.1 is unroutable in practice: the dial neither
+        // connects nor is refused quickly, so without the preflight
+        // timeout this connect would hang for the OS TCP timeout
+        // (minutes) — holding startup hostage and never reaching the
+        // degraded branch. Bounded at 1s it must surface as Unavailable,
+        // the degraded qualifier. (Networks that RST unroutable
+        // addresses take the io-error path to the same variant, so the
+        // assertion holds either way.)
+        let started = std::time::Instant::now();
+        let err = AgeClient::connect(
+            "kg",
+            "postgres://10.255.255.1:5432/none",
+            "knowledge",
+            None,
+            None,
+            1,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a blackhole cannot be reached");
+        assert!(
+            matches!(err, GraphError::Unavailable { .. }),
+            "classified as an availability failure: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "bounded by the configured timeout, not the OS's"
+        );
+    }
+
+    #[test]
+    fn only_transport_failures_classify_as_unavailable() {
+        // A refused dial (no server answered) is the degraded qualifier.
+        let io: sqlx::Error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused").into();
+        let err = connect_error("kg", &io);
+        assert!(matches!(err, GraphError::Unavailable { .. }), "{err}");
+        assert!(err.to_string().contains("unreachable"), "{err}");
+        // Anything else — a server-answered error, pool semantics, TLS —
+        // is a configuration problem that must hard-fail registration.
+        let err = connect_error("kg", &sqlx::Error::PoolTimedOut);
+        assert!(matches!(err, GraphError::Backend { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_pool_acquire_timeout_is_not_misreported_as_a_statement_timeout() {
+        // sqlx retries a refused dial until the acquire deadline, so an
+        // UNREACHABLE backend surfaces as PoolTimedOut — the query never
+        // started. Mapping that to the statement Timeout would blame
+        // the query ("narrow the traversal") for a connection problem.
+        let bounds = QueryBounds {
+            timeout: std::time::Duration::from_secs(3),
+            max_rows: 10,
+        };
+        let err = map_query_error("kg", bounds, &sqlx::Error::PoolTimedOut);
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GraphError::ConnectionAcquireTimeout { seconds: 3 }),
+            "{msg}"
+        );
+        assert!(msg.contains("never started"), "{msg}");
+        assert!(!msg.contains("narrow the traversal"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn connect_degraded_hard_fails_config_errors_but_never_dials() {
+        // Unparseable URL: a config error, hard-failed even on the
+        // degraded path.
+        let err = AgeClient::connect_degraded(
+            "kg",
+            "not a url",
+            "g",
+            None,
+            None,
+            4,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not parse"), "{err}");
+        // Unset credential env var: same — config, not transient.
+        let err = AgeClient::connect_degraded(
+            "kg",
+            "postgres://127.0.0.1:1/none",
+            "g",
+            Some("SKARDI_TEST_GRAPH_DEFINITELY_UNSET"),
+            None,
+            4,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not set"), "{err}");
+        // A closed port is NOT probed: the lazy pool builds fine and the
+        // backend is first touched on acquire (degraded registration's
+        // whole point).
+        AgeClient::connect_degraded(
+            "kg",
+            "postgres://127.0.0.1:1/none",
+            "g",
+            None,
+            None,
+            4,
+            Duration::from_secs(1),
+        )
+        .expect("no dial at connect_degraded");
     }
 }

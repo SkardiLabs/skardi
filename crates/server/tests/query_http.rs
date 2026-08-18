@@ -60,6 +60,7 @@ fn data_source(name: &str, access_mode: AccessMode) -> DataSource {
         description: None,
         open_connector: None,
         rss: None,
+        graph: None,
     }
 }
 
@@ -94,7 +95,15 @@ fn make_state_with_audit(query_audit: Option<Arc<QueryAuditStore>>) -> AppState 
             query_audit_retention_days: None,
         },
     };
-    AppState::new(config, engine, ctx, AuthLayer::None, None, query_audit)
+    AppState::new(
+        config,
+        engine,
+        ctx,
+        AuthLayer::None,
+        None,
+        query_audit,
+        Default::default(),
+    )
 }
 
 async fn post_query(state: AppState, body: Value) -> axum::response::Response {

@@ -1,4 +1,4 @@
-# Graph sources (Cypher over AGE) — milestone status
+# Graph sources (Cypher over AGE)
 
 Read-only Cypher against a property graph, surfaced as SQL tables
 (design: `docs/superpowers/specs/2026-08-08-graph-engine-bypass-design.md`).
@@ -6,13 +6,128 @@ Skardi does not parse or store graphs — the graph engine owns storage
 and traversal; Skardi forwards read-only Cypher and maps results into
 Arrow rows with a planning-time-stable schema.
 
-**Milestone status: M1 (Apache AGE) is engine-level API.** The
-`cypher_query` / `graph_schema` UDTFs are registered per session via
-`register_graph_source` + `register_graph_udtfs`; `type: graph` YAML
-data sources, catalog views, and server wiring land with milestone 4.
-Nothing here is reachable through a stock `skardi-server` yet.
+**Milestone status: M4.** `type: graph` data sources register from
+context YAML, `views:` become catalog tables (`kg.main.people`), the
+`cypher_query` / `graph_schema` UDTFs are available in every server
+session, and pipeline parameters can reach Cypher parameters. Backend:
+Apache AGE (openCypher inside Postgres). Neo4j and Kuzu are later
+milestones.
 
-## Call shapes
+## Server configuration
+
+```yaml
+kind: context
+spec:
+  data_sources:
+    - name: kg
+      type: graph
+      hierarchy_level: catalog        # required: views live at kg.main.<view>
+      connection_string: postgres://localhost:5432/graphrag
+      graph:
+        backend: age
+        graph_name: knowledge         # AGE graphs are named per database
+        username_env: KG_READER_USER  # env-var NAMES, never values
+        password_env: KG_READER_PASS
+        query_timeout_seconds: 30     # server-side statement_timeout + client wrap
+        max_rows: 10000               # typed overflow error, never silent truncation
+        views:
+          - name: people
+            cypher: |
+              MATCH (p:Person) RETURN p.name AS name, p.age AS age
+            schema:
+              - name: name
+                type: string
+              - name: age
+                type: int
+```
+
+Then:
+
+```sql
+SELECT * FROM kg.main.people ORDER BY name;
+```
+
+View columns use the same lowercase type vocabulary as the ad-hoc
+`columns` argument: `string|str|utf8`, `int|integer|bigint`,
+`float|double`, `bool|boolean`, `json`, `node`, `relationship`, `path`.
+Every column defaults to `nullable: true`; a view may declare
+`nullable: false` as an author's assertion — a null arriving in such a
+column is a typed error naming the column and row, not a silent
+corruption.
+
+## A view's Cypher must carry its own bound
+
+SQL-side predicates over a view do NOT push down into its Cypher:
+`SELECT * FROM kg.main.people WHERE name = 'ada'` fetches the view's
+rows (up to `max_rows`) and filters locally. A SQL `LIMIT` does push to
+the consumption side (the fetch stops early), but a bare `WHERE` over a
+view larger than `max_rows` fails with a typed `RowCapExceeded` — even
+when the query wants one row. So write selective reads INTO the view's
+Cypher (`WHERE` / `LIMIT` there), or use the ad-hoc `cypher_query`
+where the predicate is yours to place. Filter→Cypher parameterization
+is a possible future improvement; today the bound lives in the view.
+
+## Registration semantics: healthy, degraded, refused
+
+Availability and contract violations part ways deliberately (this
+diverges from Open Connector's hard-fail health check — the graph
+backend is a shared external database whose transient blip must not
+hold every unrelated source hostage at startup):
+
+- **Reachable backend, views validate** → the source registers
+  healthy. Each view is proven at registration with one live call (the
+  Cypher runs fetching at most one row; the result must convert against
+  the declared schema). What that proves, honestly: **arity always**
+  (the backend raises it regardless of row order); **type and
+  `nullable: false` only for the sampled row** — Cypher without
+  `ORDER BY` guarantees nothing about which row comes back, so a view
+  over heterogeneous data can register healthy and still fail a later
+  scan on a different row. The per-row enforcement lives in execution;
+  validation is a bounded preflight, not a proof of the contract over
+  the whole graph.
+- **Reachable backend, a view FAILS validation** → registration is
+  REFUSED and the server does not start. A view whose `RETURN` arity or
+  types disagree with its declared schema is a contract violation, not
+  an outage; the error names the view and the backend's complaint.
+- **Unreachable backend** → the source registers DEGRADED — but only
+  genuine connectivity failures qualify: DNS, a refused dial, a network
+  timeout — no server answered. (A pool acquire timeout counts: sqlx
+  retries a refused dial until the acquire deadline, so an unreachable
+  backend surfaces as `PoolTimedOut`.) A server that ANSWERED with an
+  error — wrong credentials, AGE not installed, the graph missing, or a
+  view whose validation hits the STATEMENT timeout (the server accepted
+  the query; a too-slow view is a boot-time diagnosis, not an outage) —
+  fails startup loudly. When degraded does apply: views still register
+  with their declared (planning-sufficient) schemas, `GET /data_source`
+  reports `status: "degraded"` — plus `status_reason` (the registration
+  error, so "unreachable since boot" and "a view's contract is broken"
+  are distinguishable) and `status_changed_at` (when the status last
+  transitioned; health is written only at registration and recovery,
+  so this is NOT a liveness probe) — and the first scan retries. The
+  registration preflight is bounded by `min(query_timeout_seconds,
+  30s)`: the traversal timeout may be hours, but boot never blocks
+  longer than 30s on a dead host.
+
+  **Recovery answers one question — did the backend come back?** A
+  retry that gets ANY response from the server (all views validate, or
+  a view fails its contract) flips the source `healthy`; a still-broken
+  view then fails its OWN scans with the typed error execution already
+  produces, while every other view works. Recovery deliberately does
+  NOT hold registration's all-or-nothing line: keeping the whole source
+  degraded over one un-provable view would disable every view
+  permanently with no startup signal, and `/data_source`'s "degraded"
+  would misread as "backend unreachable". Only availability failures
+  (the backend did not answer) keep the source degraded — and they arm
+  a backoff of `query_timeout_seconds` clamped to `[30s, 300s]` (the
+  traversal timeout may be hours, and an hours-long backoff would hide
+  a restart): inside the window,
+  scans fail fast with the cached diagnosis instead of re-paying the
+  full N-view re-validation, so a backend that is down for the
+  afternoon costs one re-validation per interval, not per query. The
+  ad-hoc UDTF path applies the same classification: a `cypher_query` /
+  `graph_schema` call on a degraded source IS the retry.
+
+## Ad-hoc queries
 
 ```sql
 -- Declared columns (REQUIRED on AGE; listed IN RETURN ORDER — the
@@ -30,26 +145,66 @@ FROM cypher_query(
 SELECT * FROM graph_schema('kg');
 
 -- Node/relationship `properties` are JSON text; the json_get family is
--- registered alongside:
+-- registered on every server session:
 SELECT json_get_str(n.properties, 'name')
 FROM cypher_query('kg', 'MATCH (n) RETURN n', '{}', '{"n": "node"}');
 ```
 
-Accepted column types: `string|str|utf8`, `int|integer|bigint`,
-`float|double`, `bool|boolean`, `json`, `node`, `relationship`, `path`.
-Every column is nullable. Writes are rejected twice: a keyword guard at
-plan time (UX), and the backend's `READ ONLY` transaction (the actual
-boundary).
+Writes are rejected twice: a keyword guard at plan time (UX), and the
+backend's `READ ONLY` transaction (the actual boundary).
 
-## Session-wide side effect, stated plainly
+## Pipelines: request parameters → Cypher parameters
 
-`register_graph_udtfs` also runs `datafusion-functions-json`'s
-`register_all`, which installs 12 UDFs **plus `->` / `->>` / `?`
-operator rewrites for every query in the session** — not just graph
-ones. Additive today; before milestone 4 wires this into the server
-session it will be re-homed next to skardi's other UDF registrations
-and checked against datafusion-federation (the rewrite runs before
-federation planning). Know this before calling it on a shared session.
+Pipeline parameters are substituted into SQL textually, and the two
+passes (inference vs execution) disagree about nested-literal
+positions — a `{param}` inside the params JSON string literal cannot
+work. The settled spelling is **the placeholder occupies the whole
+`params` argument**:
+
+```yaml
+kind: pipeline
+metadata:
+  name: people-over-age
+spec:
+  query: |
+    SELECT name, age
+    FROM cypher_query(
+      'kg',
+      'MATCH (p:Person) WHERE p.age > $min RETURN p.name AS name, p.age AS age',
+      {params},
+      '{"name": "string", "age": "int"}'
+    )
+```
+
+At pipeline-load time `{params}` becomes `NULL`, which the UDTF accepts
+as "no parameters" (schema inference needs only the literal `columns`).
+At request time the caller passes the params JSON **as a string**:
+
+```bash
+curl -X POST localhost:8080/people-over-age/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"params": "{\"min\": 40}"}'
+```
+
+The connection, cypher, and columns arguments stay strict literals —
+they determine the plan, so a placeholder cannot produce one.
+
+## JSON getters, without the operator rewrite
+
+The server session registers the `datafusion-functions-json` getter
+UDFs (`json_get`, `json_get_str`, `json_get_int`, …) unconditionally —
+they are the extraction tool for every JSON column, graph `properties`
+first among them. It deliberately does NOT install the crate's
+`->` / `->>` / `?` operator rewrite: the rewrite would convert those
+operators into `json_get(...)` calls at planning time, session-wide,
+which datafusion-table-providers' unparser cannot translate back for
+federated sources. Use `json_get_str(col, 'key')` explicitly.
+
+Pick the getter that matches the property's JSON type: `json_get_str`
+returns NULL (not a coercion) when the stored value is a number, so a
+numeric property like `age` or `since` needs `json_get_int` /
+`json_get_float` — a silently-NULL column is the usual symptom of the
+wrong getter.
 
 ## Least-privilege deployment recipe
 
@@ -76,18 +231,8 @@ failing registration by upgrading the credential to superuser. If AGE
 is genuinely absent, registration fails with a named
 `ag_catalog.ag_graph` probe error.
 
-Config carries credentials as environment-variable NAMES only:
-
-```yaml
-# The shape milestone 4 will register; today these values feed
-# register_graph_source directly.
-backend: age
-graph_name: knowledge
-username_env: KG_READER_USER
-password_env: KG_READER_PASS
-query_timeout_seconds: 30   # server-side statement_timeout + client wrap
-max_rows: 10000             # typed overflow error, never silent truncation
-```
+Config carries credentials as environment-variable NAMES only; a
+password embedded in `connection_string` is rejected at config load.
 
 ## Bounds
 
@@ -97,3 +242,13 @@ server-side `statement_timeout` plus a client-side wrap;
 `RowCapExceeded`, and the fetch is a real SQL LIMIT of
 `min(limit, max_rows + 1)` so the wire is bounded too. `max_connections`
 (1..=64) sizes the pool; pool queueing is bounded by the same timeout.
+
+## Troubleshooting
+
+| Symptom | Cause → fix |
+|---|---|
+| `Operator ->> is not yet supported` (also `->`, `?`) | The `->`/`->>` operator rewrite is deliberately NOT installed on the server session (it would rewrite those operators session-wide, ahead of federated pushdown planning). Use the getter UDFs instead: `properties->>'name'` → `json_get_str(properties, 'name')`; `properties->'a'->>'b'` → `json_get_str(properties, 'a', 'b')`; `properties ? 'key'` → `json_contains(properties, 'key')`. |
+| `graph source is registered DEGRADED (registration error: ... Connection refused ...)` | The backend was unreachable at startup and the retried query still can't reach it. Check the host/port and credentials in the env vars; the source flips back to `healthy` on its own once a query succeeds. |
+| `graph view '<name>' failed validation: ...` (at startup) | A reachable backend rejected the view's contract — the `RETURN` clause's arity or types disagree with the declared `schema`. The error carries the backend's complaint; align the declaration with the Cypher and restart. |
+| `graph scan exceeded max_rows = …` on a view scan | The view returned more rows than the source allows. SQL-side `WHERE` over a view does not push into Cypher — bound the view's Cypher itself (`WHERE`/`LIMIT`), or raise `max_rows`. See "A view's Cypher must carry its own bound". |
+| `graph query timed out after Ns` | The statement ran past `query_timeout_seconds` server-side; narrow the traversal or raise the timeout. (If the backend was never reached, you'll see `could not acquire a connection …` instead — that one is connectivity, not query shape.) |
