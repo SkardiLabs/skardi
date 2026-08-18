@@ -171,7 +171,8 @@ const INIT_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS query_audit (
     org_id         TEXT,
     workspace_id   TEXT,
     user_id        TEXT,
-    run_id         TEXT
+    run_id         TEXT,
+    job_run_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_audit_session_created
     ON query_audit (session_id, created_at DESC);
@@ -183,24 +184,42 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_statement_kind
     ON query_audit (statement_kind);";
 
 /// The five identity columns, in order. `CREATE TABLE IF NOT EXISTS` cannot
-/// retrofit an existing table, so [`ensure_identity_columns`] reconciles the
+/// retrofit an existing table, so [`ensure_added_columns`] reconciles the
 /// live schema on every open — additive, idempotent, and a no-op on fresh
 /// databases.
 const IDENTITY_COLUMNS: [&str; 5] = ["request_id", "org_id", "workspace_id", "user_id", "run_id"];
 
-fn ensure_identity_columns(conn: &rusqlite::Connection) -> SqlResult<()> {
+/// Columns bridging a ledger row to another ledger's record of the same work.
+/// Reconciled by the same mechanism as [`IDENTITY_COLUMNS`], but kept a
+/// separate list because they answer a different question: identity is *who
+/// asked*, a bridge is *what the work became*.
+///
+/// `job_run_id` holds `job_runs.id` for `statement_kind = 'job'` rows.
+/// Deliberately not the identity envelope's `run_id`, which names the caller's
+/// own run — one column, one meaning.
+const BRIDGE_COLUMNS: [&str; 1] = ["job_run_id"];
+
+/// Add any of `columns` the live table is missing, as nullable `TEXT`.
+fn ensure_added_columns(conn: &rusqlite::Connection, columns: &[&str]) -> SqlResult<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(query_audit)")?;
     let existing: std::collections::HashSet<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<_, _>>()?;
-    for col in IDENTITY_COLUMNS {
-        if !existing.contains(col) {
+    for col in columns {
+        if !existing.contains(*col) {
             conn.execute(
                 &format!("ALTER TABLE query_audit ADD COLUMN {col} TEXT"),
                 [],
             )?;
         }
     }
+    Ok(())
+}
+
+/// Every column added to `query_audit` after its original DDL.
+fn ensure_schema_additions(conn: &rusqlite::Connection) -> SqlResult<()> {
+    ensure_added_columns(conn, &IDENTITY_COLUMNS)?;
+    ensure_added_columns(conn, &BRIDGE_COLUMNS)?;
     Ok(())
 }
 
@@ -292,7 +311,7 @@ impl QueryAuditStore {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "FULL")?;
             conn.execute_batch(INIT_SCHEMA_SQL)?;
-            ensure_identity_columns(conn)?;
+            ensure_schema_additions(conn)?;
             Ok(())
         })
         .await
@@ -324,7 +343,7 @@ impl QueryAuditStore {
             .context("Failed to open in-memory query-audit db")?;
         conn.call(|conn| -> SqlResult<()> {
             conn.execute_batch(INIT_SCHEMA_SQL)?;
-            ensure_identity_columns(conn)?;
+            ensure_schema_additions(conn)?;
             Ok(())
         })
         .await
@@ -492,6 +511,89 @@ impl QueryAuditStore {
                 Err(e.into())
             }
         }
+    }
+
+    /// Insert a `started` row for a job *submission*.
+    ///
+    /// The row's lifecycle is the submission's, not the run's: `succeeded`
+    /// means "accepted and enqueued" (stamped with the `job_run_id` that
+    /// bridges to the jobs ledger, the authority on the run itself), `failed` means
+    /// the executor rejected it. Stores `name@version`; parameter values are
+    /// never recorded here — `job_runs.parameters` is a separate concern.
+    pub async fn record_job_submitted(
+        &self,
+        job_name: &str,
+        version: &str,
+        session_id: Option<&str>,
+    ) -> Result<String> {
+        let id = new_id();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let name_at_version = format!("{job_name}@{version}");
+        let session_id = session_id.map(str::to_string);
+        let row_id = id.clone();
+
+        bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
+                conn.execute(
+                    "INSERT INTO query_audit
+                        (id, created_at, sql, ai_context, session_id, max_rows,
+                         statement_kind, status)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                    params![
+                        row_id,
+                        created_at,
+                        name_at_version,
+                        session_id,
+                        PIPELINE_MAX_ROWS_SENTINEL,
+                        JOB_STATEMENT_KIND,
+                        QueryAuditStatus::Started.as_str(),
+                    ],
+                )?;
+                Ok(())
+            }),
+            "Failed to write pre-execution job-audit record",
+            self.write_timeout,
+        )
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Update a job-submission record with its terminal outcome, stamping the
+    /// `job_run_id` that bridges this row to the jobs ledger's authoritative
+    /// record of the run itself. `job_run_id` is `None` when the submission was
+    /// rejected before a run was ever created.
+    ///
+    /// Distinct from the identity envelope's `run_id` ([`QueryIdentity`]),
+    /// which names the *caller's* run rather than the job run this submission
+    /// produced. One column, one meaning.
+    pub async fn record_job_outcome(
+        &self,
+        id: &str,
+        job_run_id: Option<&str>,
+        status: QueryAuditStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let status = status.as_str();
+        let job_run_id = job_run_id.map(str::to_string);
+        let error = error.map(str::to_string);
+        bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
+                conn.execute(
+                    "UPDATE query_audit
+                        SET status = ?2, finished_at = ?3, job_run_id = ?4, error = ?5
+                      WHERE id = ?1",
+                    params![id, status, finished_at, job_run_id, error],
+                )?;
+                Ok(())
+            }),
+            "Failed to update job-audit record",
+            self.write_timeout,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Update a record with its terminal outcome.
@@ -668,7 +770,8 @@ impl QueryAuditStore {
                 let mut stmt = conn.prepare(
                     "SELECT id, created_at, finished_at, sql, ai_context, session_id,
                             max_rows, statement_kind, status, row_count, error,
-                            request_id, org_id, workspace_id, user_id, run_id
+                            request_id, org_id, workspace_id, user_id, run_id,
+                            job_run_id
                        FROM query_audit WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -691,6 +794,7 @@ impl QueryAuditStore {
                             "workspace_id": row.get::<_, Option<String>>(13)?,
                             "user_id": row.get::<_, Option<String>>(14)?,
                             "run_id": row.get::<_, Option<String>>(15)?,
+                            "job_run_id": row.get::<_, Option<String>>(16)?,
                         }))
                     })
                     .ok();
@@ -793,8 +897,14 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 /// Statement-kind marker distinguishing pipeline rows from ad-hoc SQL rows.
 const PIPELINE_STATEMENT_KIND: &str = "pipeline";
 
+/// Statement-kind marker for job-submission rows. Nothing outside this
+/// module reads it directly (Task 2 goes through `record_job_submitted`),
+/// so it stays private, mirroring `PIPELINE_STATEMENT_KIND`'s narrowing.
+const JOB_STATEMENT_KIND: &str = "job";
+
 /// `max_rows` does not apply to pipeline executions, but the column is NOT
-/// NULL; pipeline rows store this sentinel.
+/// NULL; pipeline rows store this sentinel. Job-submission rows share it for
+/// the same reason — `max_rows` has no meaning for a job run either.
 ///
 /// The sentinel is unambiguous only because `/query` rejects
 /// `max_rows: Some(0)` up front (the `Some(0)` arm in
@@ -1261,5 +1371,116 @@ mod tests {
         assert_eq!(n, 1);
         let row = store.get(&id).await.unwrap().unwrap();
         assert_eq!(row["status"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn job_row_round_trips_with_job_run_id() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", Some("sess-j"))
+            .await
+            .unwrap();
+        store
+            .record_job_outcome(&id, Some("run-abc123"), QueryAuditStatus::Succeeded, None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["sql"], json!("nightly-backfill@2.1.0"));
+        assert_eq!(row["statement_kind"], json!("job"));
+        assert_eq!(row["session_id"], json!("sess-j"));
+        assert_eq!(row["status"], json!("succeeded"));
+        assert_eq!(row["job_run_id"], json!("run-abc123"));
+        // The identity envelope's `run_id` is a different column with a
+        // different meaning and must stay untouched by the bridge stamp.
+        assert!(row["run_id"].is_null());
+        assert_eq!(row["max_rows"], json!(0));
+        assert!(row["ai_context"].is_null());
+        assert!(row["row_count"].is_null());
+    }
+
+    #[tokio::test]
+    async fn rejected_job_submission_records_fixed_kind_and_null_job_run_id() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", None)
+            .await
+            .unwrap();
+        store
+            .record_job_outcome(&id, None, QueryAuditStatus::Failed, Some("schema_mismatch"))
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("failed"));
+        assert_eq!(row["error"], json!("schema_mismatch"));
+        assert!(row["job_run_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_by_session_interleaves_all_three_kinds_in_order() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let ctx = serde_json::json!({"purpose": "p", "session_id": "sess-all"});
+        store
+            .record_started("SELECT 1", Some(&ctx), 10, "Query")
+            .await
+            .unwrap();
+        store
+            .record_pipeline_started("weekly-churn", "1.0.0", Some("sess-all"))
+            .await
+            .unwrap();
+        store
+            .record_job_submitted("nightly-backfill", "2.1.0", Some("sess-all"))
+            .await
+            .unwrap();
+        let rows = store.list_by_session("sess-all").await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["statement_kind"], json!("Query"));
+        assert_eq!(rows[1]["statement_kind"], json!("pipeline"));
+        assert_eq!(rows[2]["statement_kind"], json!("job"));
+        assert_eq!(rows[2]["sql"], json!("nightly-backfill@2.1.0"));
+    }
+
+    #[tokio::test]
+    async fn orphaned_job_rows_reconcile_to_unknown() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", None)
+            .await
+            .unwrap();
+        let n = store.reconcile_orphaned("test restart").await.unwrap();
+        assert_eq!(n, 1);
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn open_migrates_old_schema_without_job_run_id_column() {
+        // A database created before job_run_id existed must open and serve job
+        // rows after migration. Covers the bridge column specifically: #206's
+        // identity columns have their own old-schema fixture, and both are
+        // reconciled by the same `ensure_schema_additions` step.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("old.db");
+        {
+            // Original DDL: INIT_SCHEMA_SQL before either the identity
+            // columns or the bridge column existed.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE query_audit (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    finished_at TEXT, sql TEXT NOT NULL, ai_context TEXT,
+                    session_id TEXT, max_rows INTEGER NOT NULL,
+                    statement_kind TEXT NOT NULL, status TEXT NOT NULL,
+                    row_count INTEGER, error TEXT);",
+            )
+            .unwrap();
+        }
+        let store = QueryAuditStore::open(&path).await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["statement_kind"], json!("job"));
+        assert!(row["job_run_id"].is_null());
     }
 }
