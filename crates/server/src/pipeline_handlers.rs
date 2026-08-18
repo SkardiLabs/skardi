@@ -27,14 +27,13 @@ use std::time::Instant;
 
 use crate::auth::routes::require_session;
 use crate::config::{DataSourceType, HierarchyLevel};
-use crate::query_audit::{
-    QueryAuditStatus, SESSION_ID_HEADER, finish_audit, session_id_from_headers,
-};
+use crate::query_audit::{QueryAuditStatus, finish_audit};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
 use crate::semantics::SemanticsRegistry;
 use crate::server::AppState;
+use crate::session_header::{SESSION_ID_HEADER, session_id_from_headers};
 
 /// Request structure for pipeline execution
 #[derive(Debug, Deserialize)]

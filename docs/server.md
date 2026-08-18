@@ -178,7 +178,7 @@ execution and updated with its outcome afterwards:
 | `sql` | raw statement text |
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
-| `max_rows` | requested row cap (`0` on pipeline rows — not applicable) |
+| `max_rows` | requested row cap (`0` on pipeline and job rows — not applicable) |
 | `run_id` | job_runs.id bridge, job rows only |
 | `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows, `job` for job rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |

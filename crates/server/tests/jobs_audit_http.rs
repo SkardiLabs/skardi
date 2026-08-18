@@ -1,7 +1,7 @@
 //! HTTP integration tests for job-submission auditing (`POST
 //! /jobs/:name/run`) — mirrors `pipeline_audit_http.rs`'s coverage of the
 //! pipeline path, but exercises the jobs path: record-before-submit, the
-//! shared `x-skardi-session-id` header, the run_id stamp on success, and
+//! shared `x-skardi-session-id` header, the job_run_id stamp on success, and
 //! value-free recording (only `name@version` is ever written, never
 //! parameter values).
 
@@ -163,6 +163,7 @@ spec:
         AuthLayer::None,
         executor,
         query_audit,
+        Default::default(),
     );
     (state, tmp)
 }
@@ -230,7 +231,7 @@ async fn wait_for_terminal(state: &AppState, run_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn submission_is_audited_with_session_and_run_id() {
+async fn submission_is_audited_with_session_and_job_run_id() {
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
     let resp = submit_with_headers(&state, &[("x-skardi-session-id", "sess-j")], json!({})).await;
@@ -246,7 +247,10 @@ async fn submission_is_audited_with_session_and_run_id() {
     assert_eq!(row["statement_kind"], json!("job"));
     assert_eq!(row["sql"], format!("{TEST_JOB_NAME}@{TEST_JOB_VERSION}"));
     assert_eq!(row["status"], json!("succeeded"));
-    assert_eq!(row["run_id"], json!(run_id));
+    assert_eq!(row["job_run_id"], json!(run_id));
+    // #206's identity envelope owns `run_id` — the caller's own run, not the
+    // job run this submission produced. The bridge stamp must not touch it.
+    assert!(row["run_id"].is_null());
     assert!(row["ai_context"].is_null());
     assert!(row["row_count"].is_null());
 }
@@ -309,6 +313,29 @@ async fn malformed_header_on_real_job_is_400_and_records_nothing() {
         "expected the session-header reject, got {body}"
     );
     assert_eq!(store.count().await.unwrap(), 0);
+}
+
+/// The docs promise the header is validated whether or not auditing is
+/// enabled; this pins the audit-off half of that promise (mirrors
+/// `pipeline_audit_http.rs`'s `session_header_is_validated_even_with_auditing_off`).
+#[tokio::test]
+async fn session_header_is_validated_even_with_auditing_off() {
+    let (state, _tmp) = make_app_state(None).await;
+    let resp = submit_with_headers(
+        &state,
+        &[("x-skardi-session-id", "x".repeat(201).as_str())],
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("x-skardi-session-id"),
+        "expected the session-header reject, got {body}"
+    );
 }
 
 #[tokio::test]
@@ -385,7 +412,7 @@ async fn parameter_values_never_reach_the_audit_row() {
 /// (`JobSubmitError::MissingParameters`, since `ingest-filtered` requires
 /// `min_id` and this submits none). Pins that the ledger row still gets a
 /// terminal stamp — `failed`, the fixed `category()` string (not the
-/// human-readable message), and a null `run_id` because no run was ever
+/// human-readable message), and a null `job_run_id` because no run was ever
 /// created — and that the HTTP response keeps the endpoint's existing
 /// rejection contract (400, `missing_parameters`) unchanged.
 #[tokio::test]
@@ -412,7 +439,7 @@ async fn submit_rejection_after_audit_write_is_recorded_failed() {
     );
     assert_eq!(row["status"], json!("failed"));
     assert_eq!(row["error"], json!("missing_parameters"));
-    assert!(row["run_id"].is_null());
+    assert!(row["job_run_id"].is_null());
 
     // Confirms the executor never created a run for the rejected submission
     // — the same "not submitted" observability the audit-write-failure test

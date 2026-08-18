@@ -26,8 +26,8 @@ pub enum JobCmd {
         /// back to a plain string otherwise.
         #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
         params: Vec<String>,
-        /// Session id recorded with this run in the server's audit ledger
-        /// (sent as the X-Skardi-Session-Id header).
+        /// Session id recorded with this submission in the server's audit
+        /// ledger (sent as the X-Skardi-Session-Id header).
         #[arg(long)]
         session_id: Option<String>,
     },

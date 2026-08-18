@@ -15,6 +15,7 @@ pub mod query_handlers;
 pub mod remote_storage;
 pub mod response;
 pub mod server;
+pub mod session_header;
 pub mod telemetry;
 
 // Re-export `skardi::semantics` so server code can use `crate::semantics::...`.

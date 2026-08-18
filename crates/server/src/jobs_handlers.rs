@@ -21,8 +21,9 @@ use serde_json::Value;
 use skardi::jobs::{JobRun, JobSubmitError};
 use std::collections::HashMap;
 
-use crate::query_audit::{QueryAuditStatus, QueryAuditStore, session_id_from_headers};
+use crate::query_audit::{QueryAuditStatus, QueryAuditStore};
 use crate::server::AppState;
+use crate::session_header::session_id_from_headers;
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitRunRequest {
@@ -86,14 +87,17 @@ fn submit_error_status(err: &JobSubmitError) -> StatusCode {
 async fn finish_job_audit(
     store: Option<&QueryAuditStore>,
     audit_id: Option<&str>,
-    run_id: Option<&str>,
+    job_run_id: Option<&str>,
     status: QueryAuditStatus,
     error: Option<&str>,
 ) {
     let (Some(store), Some(id)) = (store, audit_id) else {
         return;
     };
-    if let Err(e) = store.record_job_outcome(id, run_id, status, error).await {
+    if let Err(e) = store
+        .record_job_outcome(id, job_run_id, status, error)
+        .await
+    {
         tracing::error!("Failed to record job-audit outcome for {id}: {e}");
     }
 }
@@ -136,10 +140,21 @@ pub async fn submit_job_run(
     // caller-supplied URL segment (the metric-cardinality / status-precedence
     // lesson from #213 round 3, mirrored from `execute_pipeline_by_name`).
     // Post-lookup, `name` is bounded to configured jobs, and an unknown job
-    // correctly 404s regardless of header shape. This races benignly with
-    // `executor.submit`'s own name resolution a few lines down — both sides
-    // read the same `RwLock`-guarded config, so a job removed between the
-    // two lookups just becomes a 404 either way.
+    // correctly 404s regardless of header shape. This check and
+    // `executor.submit`'s own name resolution a few lines down read two
+    // *different* maps: this one is `app_state.config` (a
+    // `std::sync::RwLock<ServerConfig>`), the executor's is its own
+    // `Arc<tokio::sync::RwLock<HashMap<String, JobDefinition>>>` built from
+    // `config.jobs.clone()` at construction (see
+    // `crates/skardi/src/jobs/executor.rs`). Both are startup snapshots of
+    // the same job set, and today nothing writes to either map after
+    // startup, so the two lookups can never actually disagree. If a future
+    // hot-reload updates one map without the other, this pre-check and
+    // `executor.submit` could resolve different versions of the same job —
+    // the ledger might record a version the run didn't use, or this could
+    // 404 a job the executor would still accept (or vice versa). That
+    // divergence is that future feature's problem to solve, not something
+    // this handler guards against today.
     let version = {
         let config = app_state.config.read().unwrap_or_else(|p| p.into_inner());
         match config.jobs.get(&name) {
