@@ -241,15 +241,22 @@ Send `X-Skardi-Session-Id: <id>` (non-empty, ≤ 200 chars) with an execute
 request to group this run with the rest of an agent session in the query
 audit ledger (`--query-audit-db`). The header is optional. It is always
 validated — a malformed value (empty, over 200 characters, outside visible
-ASCII, containing a comma or tab, or sent more than once) is rejected with
-`400 parameter_validation_error` whether or not auditing is enabled; a
-comma is rejected because proxies may merge repeated header lines into one
-comma-separated value (RFC 9110 §5.3), which would otherwise smuggle a
-duplicate past the duplicate check. A
-well-formed value is simply unused when `--query-audit-db` is not
-configured. It is a header rather than a body field because the request body
-is the parameter map itself — a reserved key could collide with a SQL
+ASCII, containing a space, tab or comma, or sent more than once) is rejected
+with `400 parameter_validation_error` whether or not auditing is enabled. The
+reject carries `details.header` so an agent can branch on it without parsing
+the message. Two of those rules earn their keep: a **comma** is rejected
+because proxies may merge repeated header lines into one comma-separated
+value (RFC 9110 §5.3), which would otherwise smuggle a duplicate past the
+duplicate check; a **space** is rejected because HTTP parsers trim leading and
+trailing whitespace (RFC 9110 §5.5), so ` sess-1 ` would be silently recorded
+under the different key `sess-1` — breaking the session stitching the field
+exists for. A well-formed value is simply unused when `--query-audit-db` is
+not configured. It is a header rather than a body field because the request
+body is the parameter map itself — a reserved key could collide with a SQL
 parameter of the same name.
+
+`session_id` is caller-asserted, not authenticated: it groups executions, it
+does not attest to their origin.
 
 ---
 

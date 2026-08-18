@@ -47,9 +47,16 @@ of the same name. `X-Skardi-Session-Id` avoids that, requires no change to
 the inferred request schema, and is ignorable by existing callers.
 
 Validation mirrors `ai_context.session_id` on `/query`: non-empty, ≤ 200
-chars. A malformed header (empty, oversized, or non-UTF-8) → 400
-`parameter_validation_error` — silently dropping it would corrupt session
-stitching, the one job the field has.
+chars. A malformed header (empty, oversized, outside visible ASCII, or
+containing a space, tab or comma — the last three added in review) → 400
+`parameter_validation_error` with `details.header` — silently dropping it
+would corrupt session stitching, the one job the field has. Space and tab
+are rejected because HTTP parsers trim surrounding whitespace, so an
+untrimmed value would be recorded under a different key than the caller
+sent; comma because intermediaries may merge repeated header lines
+comma-separated (RFC 9110 §5.3, §5.5). The CLI enforces the identical
+predicate before transport, so no value can pass client-side and be
+rewritten or rejected server-side.
 
 ### Semantics (mirroring `/query` exactly)
 

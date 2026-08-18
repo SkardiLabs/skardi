@@ -183,8 +183,15 @@ execution and updated with its outcome afterwards:
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
 | `row_count`, `error` | outcome detail |
 
-Indexed on `(session_id, created_at)`, `created_at` and `status`, so an agent
-session can be reconstructed with plain SQL.
+Indexed on `(session_id, created_at)`, `created_at`, `status` and
+`statement_kind`, so an agent session can be reconstructed — and a single row
+kind selected — with plain SQL.
+
+What is **not** here: job runs. `POST /jobs/:name/run` executes its own SQL
+through the same engine but is recorded in the separate jobs run ledger (see
+[jobs.md](jobs.md)), not in `query_audit`. An operator reasoning about
+coverage during an incident should read this ledger as "ad-hoc queries and
+pipeline executions", not "everything the server ran".
 
 Failure semantics are explicit:
 
@@ -192,13 +199,23 @@ Failure semantics are explicit:
   to audit never runs silently unaudited.
 - **Before execution.** If the pre-execution write fails, the request is
   rejected with `503 query_audit_error` and the statement is **not executed**.
+  Each write is bounded (5s), so a *hung* fsync fails the request rather than
+  hanging it. Because an abandoned write may still land on the writer thread
+  afterwards, a timed-out pre-execution write is followed by a corrective
+  update marking that row `failed` with `error = audit_write_timeout` — the
+  server knows the statement did not run, and the ledger says so rather than
+  degrading to the ambiguous `unknown`.
 - **After execution.** A failed outcome update is logged only; the query
   already ran. The row stays `started` and the next startup reconciles it to
   `unknown`, as it does for statements killed mid-flight.
 
 Retention is opt-in: `--query-audit-retention-days <n>` deletes records older
 than `n` days at startup and hourly thereafter. Without it, records are kept
-forever and pruning is the operator's call.
+forever and pruning is the operator's call. The prune deletes in batches,
+yielding between them: it shares the ledger's single writer thread with the
+fail-closed write path, so an unchunked delete over a large backlog would
+starve concurrent requests into `503 query_audit_error`. Enabling retention
+for the first time on a big ledger is therefore slow, not disruptive.
 
 The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
 including the WAL sidecars). It is a local database, never the OTLP/tracing
@@ -217,6 +234,18 @@ A pipeline row differs from an ad-hoc row in four ways:
   purpose. The version matters because pipelines are exactly the artifacts
   the promotion loop edits, and rows are kept forever by default: without
   it, "what SQL ran" stops being answerable once a template is revised.
+
+  **Parse rule:** split on the *last* `@` (`rsplit_once('@')`). Pipeline
+  names are not charset-restricted, so a name may itself contain `@`
+  (`billing@eu@1.0.0` is the pipeline `billing@eu` at version `1.0.0`). A
+  trailing `@` with nothing after it means the pipeline declared an empty
+  `metadata.version` — a config smell in the pipeline, not a truncated row.
+
+  The version pins the **template**, not the exact statement: parameter
+  substitution is textual, so two executions of `weekly-churn@1.0.0` run
+  the same SQL skeleton with different literals. Values are deliberately
+  not recorded (see the confidentiality note above), so the ledger
+  identifies the artifact and its revision, not the byte-exact statement.
 - Parameter values are never recorded: params are where PII lives.
   `ai_context` is always NULL on pipeline rows.
 - `max_rows` is stored as `0` (not applicable to pipelines).
@@ -226,16 +255,17 @@ A pipeline row differs from an ad-hoc row in four ways:
   ledger. The full error still goes to the HTTP caller.
 
 Scope of the guarantee: "parameter values never reach the ledger" covers the
-ledger only. Four other surfaces on the pipeline path can still carry
-parameter values, all tracked in
+ledger only. The widest leak — an `ERROR`-level unsupported-parameter log
+that was on by default and fanned out to any configured OTLP collector — is
+closed: that line now logs the parameter's name and JSON type, never its
+contents. Three surfaces still carry parameter values and are tracked in
 [#217](https://github.com/SkardiLabs/skardi/issues/217): HTTP `400` bodies
 (`error_details.unsupported_parameters` echoes offending values), HTTP `500`
 bodies (engine error text can quote values back to the caller who sent
-them), a `DEBUG`-level log of the substituted SQL, and — the widest one — an
-`ERROR`-level unsupported-parameter log that is on by default and fans out
-to any configured OTLP collector. Do not read the ledger's redaction as
-meaning the logs are covered: today it is the *logs* that reach external
-systems, not the ledger, which is a local `0600` file.
+them), and a `DEBUG`-level log of the substituted SQL. The first two reach
+only the caller who supplied the values; the third requires an operator to
+raise `RUST_LOG`. Do not read the ledger's redaction as implying the logs
+are fully covered.
 
 Sizing note: with auditing on, every pipeline execution adds two
 `synchronous = FULL` ledger writes on the request's critical path — and the
@@ -249,10 +279,19 @@ the higher-QPS path (they are the promoted recurring queries), so put the
 ledger on storage you'd trust under your serving load.
 
 `session_id` comes from the optional `X-Skardi-Session-Id` request header
-(non-empty, ≤ 200 characters). A malformed header is rejected with `400
-parameter_validation_error` rather than silently dropped. With the header
-present, one agent session's ad-hoc queries and pipeline calls interleave
-under a single `session_id` in the ledger, ordered by `created_at`.
+(non-empty, ≤ 200 characters, visible ASCII with no spaces, tabs or commas).
+A malformed header is rejected with `400 parameter_validation_error` — carrying
+`details.header` so an agent can tell a header reject from a parameter reject
+— rather than silently dropped. With the header present, one agent session's
+ad-hoc queries and pipeline calls interleave under a single `session_id` in
+the ledger, ordered by `created_at`.
+
+**`session_id` is caller-asserted, not authenticated.** It groups executions;
+it does not attest to their origin. Any caller may stamp its executions with
+another agent's session id, or omit the header and land unattributed. Treat it
+as a correlation key when reading the ledger, never as evidence of who ran
+what. (Spaces are rejected precisely because HTTP intermediaries may trim
+surrounding whitespace, which would silently re-key an execution.)
 
 Reachability caveat: producing that interleaving from the shipped CLI
 requires both halves, and today only `skardi run --session-id` exists —
