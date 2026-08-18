@@ -1,4 +1,4 @@
-# Microsoft 365 Source Packs (Outlook + OneDrive)
+# Outlook Source Pack (Microsoft 365)
 
 **Status:** Draft for review — phases 1–2 complete, phase 3 not started
 **Date:** 2026-08-14
@@ -11,30 +11,31 @@ Microsoft 365 reaches Skardi as **two source packs, not one**: `outlook`
 (mail) and `one_drive` (files). Open Connector has no `microsoft365`
 service — it splits Microsoft Graph into three separate services with
 three separate OAuth connections, and every existing Skardi pack is 1:1
-with one Open Connector service. Four tables pass the source-pack
-admission gate:
+with one Open Connector service. **This document covers the `outlook`
+pack only** — the `one_drive` pack ships as its own milestone and PR,
+and its phase-1/2 reconciliation and table design live in this
+document's original two-pack revision in git history. Two tables pass
+the source-pack admission gate:
 
 | Table | Action | Pagination | Resources |
 |---|---|---|---|
 | `outlook.messages` | `outlook.list_messages` | cursor `nextLink` → `$.nextLink` | optional `mailFolderId` |
 | `outlook.mail_folders` | `outlook.list_mail_folders` | cursor `nextLink` → `$.nextLink` | — |
-| `one_drive.drive_items` | `one_drive.list_folder_children` | cursor `nextLink` → `$.nextLink` | optional `driveId`, `folderItemId`, `folderPath` |
-| `one_drive.drive_item_search` | `one_drive.search_items` | cursor `nextLink` → `$.nextLink` | required `query`; optional `driveId` |
 
 The whole `excel` service is **deferred at the gate**: its list actions
 emit a `nextLink` but do not accept one, so their pagination cannot be
 completed. Teams, SharePoint, Calendar, OneNote, To Do and Planner are
 absent from Open Connector entirely — there is nothing to bind.
 
-Two properties of this provider set the shape of the work. First, all
-three list actions are **raw passthrough** over `additionalProperties:
+Two properties of this provider set the shape of the work. First, both
+list actions are **raw passthrough** over `additionalProperties:
 true` item schemas, and `outlook.list_messages` declares *no timestamp
 field at all* — `receivedDateTime` and every other date live wholly
 outside the fingerprint gate. A mail table without `receivedDateTime` is
 useless, so phase 4 (live real-row verification) is a hard prerequisite
 here rather than a final check. Second, Outlook exposes filtering only as
 a raw OData `$filter` **expression**, which a `(input_field, literal)`
-filter mapping cannot compose; both packs therefore ship with zero
+filter mapping cannot compose; the pack therefore ships with zero
 predicate pushdown, following the Notion pack's precedent.
 
 ## What Open Connector actually exposes for Microsoft 365
@@ -103,8 +104,6 @@ Every action is `additionalProperties: false`, so a wrong key is a hard
 |---|---|---|
 | `outlook.list_messages` | `mailFolderId`, `top` (1–1000), `filter`, `orderby`, `select[]`, `nextLink` (`format: uri`), `bodyContentType` (`text`\|`html`) | none |
 | `outlook.list_mail_folders` | `nextLink` (`format: uri`), `includeHiddenFolders`, `top` (1–1000), `select[]` | none |
-| `one_drive.list_folder_children` | `driveId`, `folderItemId`, `folderPath`, `top` (1–999), `select[]`, `expand[]`, `orderBy`, `nextLink` (`format: uri`) | none |
-| `one_drive.search_items` | `driveId`, `query`, `top` (1–999), `select[]`, `expand[]`, `orderBy`, `nextLink` (`format: uri`) | none |
 
 Note `outlook.list_messages` spells its sort input `orderby` (all
 lower-case) while `one_drive` spells it `orderBy`. Neither is mapped by
@@ -121,7 +120,6 @@ per the reconciliation reference:
 | `{"per_page":5}` → `outlook.list_messages` | 400 `invalid_input` |
 | `{"top":50}` → `outlook.list_messages` | 403 `authorization_failed`, "Connect outlook with OAuth first." |
 | `{"top":100,"includeHiddenFolders":true}` → `outlook.list_mail_folders` | 403 (reaches credential wall) |
-| `{"top":200}` → `one_drive.list_folder_children` | 403 (reaches credential wall) |
 | `{"top":1000}` / `{"top":1001}` → `outlook.list_messages` | 403 / 400 — declared bound is enforced |
 
 The two responses differ, so a 403 genuinely proves the input passed the
@@ -142,8 +140,7 @@ if (target.hostname !== graphHost) {
 `{"nextLink":"https://evil.example.com/v1.0/me/messages"}` reaches the
 credential wall (403) rather than being accepted, and `assertAllowed…`
 additionally restricts the path to `/v1.0/me/messages`,
-`/v1.0/me/mailFolders/{id}/messages` and `/v1.0/me/mailFolders` (an
-equivalent `children` / `search` split exists for OneDrive).
+`/v1.0/me/mailFolders/{id}/messages` and `/v1.0/me/mailFolders`.
 
 Consequence for phase 3: **every cursor in a fixture or a `MockGateway`
 stub must be URI-shaped.** A `"cursor-2"`-style token would pass the
@@ -153,7 +150,7 @@ GitHub pack.
 
 ### Rows are raw Graph objects, and the mail schema declares no dates
 
-All three executors pass Graph's objects through untouched:
+Both executors pass Graph's objects through untouched:
 
 ```ts
 return {
@@ -172,11 +169,6 @@ true`) and under-declare heavily. Declared properties are:
   `parentFolderId`, no `categories`.
 - **mailFolders**: `id`, `displayName`, `parentFolderId`,
   `childFolderCount`, `unreadItemCount`, `totalItemCount`, `isHidden`.
-- **driveItems**: `id`, `name`, `webUrl`, `description`, `cTag`, `eTag`,
-  `size`, `createdDateTime`, `lastModifiedDateTime`, `createdBy`,
-  `lastModifiedBy`, `parentReference`, `file`, `folder`, `root`,
-  `deleted`, `fileSystemInfo`, `remoteItem`, `shared`, `specialFolder`,
-  `searchResult`.
 
 This is the Notion `archived`/`is_archived` trap at a larger scale.
 Passthrough columns ride `additionalProperties`, so a mis-spelled or
@@ -190,9 +182,9 @@ reviewed set rather than an accident.
 
 ### In-band errors: `error_path: None`
 
-`assertOutlookResponse` (and the OneDrive equivalent) throws
+`assertOutlookResponse` throws
 `ProviderRequestError` on any non-2xx, so Graph's error envelope never
-reaches Skardi as an HTTP-200 body. Both packs declare `error_path:
+reaches Skardi as an HTTP-200 body. The pack declares `error_path:
 None`, and an e2e test will pin that a Graph failure (e.g. a scope
 error) surfaces through the gateway-failure path instead.
 
@@ -206,7 +198,7 @@ wiki. Phase 4 must still follow the real final page's token to confirm
 no non-empty terminal cursor exists.
 
 The engine sends `page_size_param` on every request, including cursor
-pages (`pagination.rs`). The Outlook and OneDrive executors ignore every
+pages (`pagination.rs`). The Outlook executors ignore every
 other input once `nextLink` is present, because Graph embeds `$top`,
 `$select` and `$filter` in the link itself:
 
@@ -269,57 +261,21 @@ reveals their existence without listing them. This is a documented
 limitation of the table, not a defect — the collection the table claims
 to be (root-level folders) does terminate completely.
 
-### `one_drive.drive_items`
-
-`row_path: "$.items"`, optional resources `driveId`, `folderItemId`,
-`folderPath`. With no folder resource the executor lists the drive
-root's children (`buildListFolderChildrenPath` → `/root/children`), so
-an unscoped binding is well-defined.
-Columns: `id`, `name`, `web_url`, `description`, `size`, `e_tag`,
-`c_tag`, `created_date_time`, `last_modified_date_time`,
-`created_by_display_name`, `last_modified_by_display_name`,
-`parent_drive_id`, `parent_id`, `parent_path`, `file_mime_type`,
-`folder_child_count`. A non-null `folder_child_count` is the folder
-discriminator, since Graph marks type by facet presence
-(`file` vs `folder`) rather than a type field.
-
-**Direct children only, non-recursive** — one binding sees one folder
-level. That is what makes `drive_item_search` worth shipping.
-
-### `one_drive.drive_item_search`
-
-`row_path: "$.items"`, **required resource `query`**, optional
-`driveId`. The binding pins the search term, and the table is "the drive
-items matching this binding's query" — the same semantics as
-`notion.block_children` requiring a `blockId`.
-
-Notion's empty-query trick does **not** transfer: `query` is
-`minLength: 1`, and `{"query":"","top":200}` is a hard 400
-`invalid_input`. There is consequently no "complete drive listing"
-spelling available at all, which is why the query is a resource instead
-of a fixed input.
-
-Same column set as `drive_items`; `search_result` is left unmapped
-(an opaque relevance facet).
-
 ### Filters: none, deliberately
 
-Neither pack maps a single filter, and the reason is structural rather
-than an omission:
-
-- `outlook.list_messages` exposes filtering only as `filter`, a raw
-  OData **expression** string (`receivedDateTime ge 2026-01-01T00:00:00Z`).
-  A `FilterMapping` renders one value into one input field; it cannot
-  compose an expression, and pushing a bare value into `$filter` would
-  produce a 400 or, worse, a silently wrong query.
-- `one_drive.list_folder_children` and `search_items` have no filter
-  input at all.
+The pack maps no filter, and the reason is structural rather than an
+omission: `outlook.list_messages` exposes filtering only as `filter`, a
+raw OData **expression** string
+(`receivedDateTime ge 2026-01-01T00:00:00Z`). A `FilterMapping` renders
+one value into one input field; it cannot compose an expression, and
+pushing a bare value into `$filter` would produce a 400 or, worse, a
+silently wrong query.
 
 The Notion pack ships zero filters for comparable reasons, so this is
 precedented. Consequences to state honestly in the pack doc: predicates
 are re-applied locally by DataFusion after a full scan, bounded by
 `max_rows`/`max_pages`; the practical scoping tools are the
-`mailFolderId` / folder resources and `LIMIT` early-stop.
+`mailFolderId` resource and `LIMIT` early-stop.
 
 Each unmapped input needs a negative-space guard test proving no
 `filter`, `orderby`, `orderBy`, `select` or `expand` key ever reaches
@@ -360,7 +316,7 @@ Live verification is not a formality for this pack. It must:
 1. Confirm the real spelling of every undeclared message column
    (`receivedDateTime` et al.) — the whole set is invisible to the
    fingerprint gate and would be silently always-NULL if misspelled.
-2. Confirm the wire's real `top` ceiling against the declared 1000/999.
+2. Confirm the wire's real `top` ceiling against the declared 1000.
    Feishu declared 100 and hard-failed above 50 (skardi PR #186); a
    declared bound is not a wire bound.
 3. Follow the token returned by the **real final page** and confirm
@@ -370,15 +326,14 @@ Live verification is not a formality for this pack. It must:
    round-trips through the executor's host/path allowlist.
 5. Confirm `includeHiddenFolders: true` actually returns rows (a pinned
    input that returns nothing looks identical to an empty account).
-6. Confirm a real `mailFolderId` and a real `folderItemId`/`folderPath`
-   forward verbatim, and that a real `query` returns rows.
+6. Confirm a real `mailFolderId` forwards verbatim.
 7. Re-derive every fixture as a redacted live capture, with a mechanical
    audit of surviving string values.
 
 **This needs the user's own Microsoft account and Azure app** — an Entra
 app registration with `http://localhost:3000/oauth/callback` as a
-redirect URI, `PUT /api/oauth/configs/{outlook,one_drive}` with their
-`clientId`/`clientSecret`, and a browser authorization per service.
+redirect URI, `PUT /api/oauth/configs/outlook` with its
+`clientId`/`clientSecret`, and a browser authorization for the service.
 Credentials stay entirely on the user's side.
 
 ## Authz and rate limits
@@ -388,15 +343,14 @@ unions the gateway requests are:
 
 - `outlook`: `User.Read`, `Mail.ReadWrite`, `Mail.Send`,
   `MailboxSettings.ReadWrite`, `offline_access`
-- `one_drive`: `User.Read`, `Files.ReadWrite`, `offline_access`
 
-Read-only scopes exist in the providers' own scope maps (`Mail.Read`,
-`Mail.ReadBasic`, `MailboxSettings.Read`, `Files.Read`) and go unused by
-the unions. Worse, the *read* actions declare
+Read-only scopes exist in the provider's own scope map (`Mail.Read`,
+`Mail.ReadBasic`, `MailboxSettings.Read`) and go unused by
+the union. Worse, the *read* actions declare
 `requiredScopes: [User.Read, Mail.ReadWrite]`, so the gateway's own
 scope check would refuse a correctly-scoped read-only token. A user
-binding this pack must therefore grant send-mail and file-write
-permission to read their mailbox and drive. Skardi's tables remain
+binding this pack must therefore grant send-mail
+permission to read their mailbox. Skardi's tables remain
 read-only by construction, but the consent screen is not, and the pack
 doc must say so rather than let the user discover it at the Microsoft
 consent prompt.
@@ -430,13 +384,6 @@ stable contract that a later split would have to break. A single
 `docs/open-connector-microsoft-365.md` still covers both packs, so the
 product-level story survives the split.
 
-**`query` as a required resource rather than deferring
-`drive_item_search`.** `list_folder_children` is non-recursive, so
-without search a binding can see exactly one folder level and there is
-no way to sweep a drive. Required resources already define what a table
-lists elsewhere (`notion.block_children`/`blockId`), so a pinned search
-term is consistent with existing semantics.
-
 **Recipients as `json` rather than extending
 `utf8_list_from_object_key` to nested key paths.** The extension is
 small and backward-compatible, but it is an engine surface added for one
@@ -467,7 +414,7 @@ body as known-upstream facts.
 
 ## Milestone numbering
 
-Two open PRs already claim 5.5 — #192 (Gmail pack) and #198 (Discord
-pack) — and they settle into 5.5 and 5.6 between them. This work takes
-**5.7**, to be re-checked against their merge order before the
-tasks-spec entry is ticked.
+#192 (Gmail) and #198 (Discord) merged as 5.5 and 5.6. The `outlook`
+pack takes **5.7**; the `one_drive` pack follows as its own milestone
+and PR, restoring its design from this document's two-pack revision in
+git history.
