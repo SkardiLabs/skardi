@@ -7,6 +7,7 @@
 
 use crate::client::{ApiClient, encode_component};
 use crate::params::build_body;
+use crate::session::validate_session_id;
 use anyhow::Result;
 use clap::Subcommand;
 use serde::Deserialize;
@@ -25,6 +26,10 @@ pub enum JobCmd {
         /// back to a plain string otherwise.
         #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
         params: Vec<String>,
+        /// Session id recorded with this run in the server's audit ledger
+        /// (sent as the X-Skardi-Session-Id header).
+        #[arg(long)]
+        session_id: Option<String>,
     },
     /// Print the current status of one run.
     Status {
@@ -60,10 +65,29 @@ struct RunIdResponse {
 /// Run `skardi job <cmd>` against `client`.
 pub async fn run(client: &ApiClient, cmd: JobCmd) -> Result<()> {
     match cmd {
-        JobCmd::Run { job, params } => {
+        JobCmd::Run {
+            job,
+            params,
+            session_id,
+        } => {
+            if let Some(sid) = &session_id {
+                validate_session_id(sid)?;
+            }
+
             let body = build_body(None, &params)?;
             let path = format!("/jobs/{}/run", encode_component(&job));
-            let response = client.post(&path, &Value::Object(body)).await?;
+            let response = match &session_id {
+                Some(sid) => {
+                    client
+                        .post_with_headers(
+                            &path,
+                            &Value::Object(body),
+                            &[("x-skardi-session-id", sid)],
+                        )
+                        .await?
+                }
+                None => client.post(&path, &Value::Object(body)).await?,
+            };
             let resp: RunIdResponse = serde_json::from_value(response)?;
             println!(
                 "submitted: {} ({})",
@@ -130,10 +154,10 @@ fn print_run_list(resp: &Value) {
 #[cfg(test)]
 mod tests {
     use super::{JobCmd, run};
-    use crate::client::ApiClient;
+    use crate::client::{ApiClient, ApiError};
     use crate::config::ClientConfig;
     use serde_json::json;
-    use wiremock::matchers::{body_json, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_config(server: &str) -> ClientConfig {
@@ -166,11 +190,82 @@ mod tests {
             JobCmd::Run {
                 job: "nightly_sync".to_string(),
                 params: vec!["day=2026-07-23".to_string(), "batch=500".to_string()],
+                session_id: None,
             },
         )
         .await;
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    // -- 1b. `job run --session-id` sends x-skardi-session-id header --------
+
+    #[tokio::test]
+    async fn job_run_with_session_id_sets_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/jobs/nightly_sync/run"))
+            .and(header("x-skardi-session-id", "sess-9"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"run_id": "r-1", "status": "pending"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let result = run(
+            &client,
+            JobCmd::Run {
+                job: "nightly_sync".to_string(),
+                params: vec![],
+                session_id: Some("sess-9".to_string()),
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    // -- 1c. invalid `--session-id` errors before any request is sent -------
+
+    #[tokio::test]
+    async fn job_run_with_invalid_session_id_errors_without_request() {
+        let server = MockServer::start().await;
+        // expect(0): the whole point is that no request is ever sent — a
+        // deferred header error would surface as ApiError::Connect and be
+        // misread as "server unreachable".
+        Mock::given(method("POST"))
+            .and(path("/jobs/nightly_sync/run"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"run_id": "r-1", "status": "pending"})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let result = run(
+            &client,
+            JobCmd::Run {
+                job: "nightly_sync".to_string(),
+                params: vec![],
+                session_id: Some("bad,id".to_string()),
+            },
+        )
+        .await;
+
+        let err = result.expect_err("expected validation error");
+        assert!(
+            err.to_string().contains("--session-id"),
+            "expected a --session-id validation message, got: {err}"
+        );
+        assert!(
+            err.downcast_ref::<ApiError>().is_none(),
+            "must not be an ApiError (would map to a connection exit code)"
+        );
     }
 
     // -- 2. `job list` with a filter sends both limit and job query params --

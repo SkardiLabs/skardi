@@ -4,15 +4,9 @@
 use crate::client::{ApiClient, ApiError, encode_component};
 use crate::output::print_result;
 use crate::params::build_body;
+use crate::session::validate_session_id;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-
-/// Maximum session-id length, in characters. Restates the server's
-/// `query_audit::MAX_SESSION_ID_CHARS` under the same name — `skardi-cli`
-/// does not depend on the server crate, so this cannot be a shared item, but
-/// an identical name keeps `grep MAX_SESSION_ID_CHARS` finding every site
-/// that must move together.
-const MAX_SESSION_ID_CHARS: usize = 200;
 
 /// Run `skardi run <name>`: build the request body from `-d`/`-p`, `POST` it
 /// to `/{name}/execute`, and hand the response envelope to [`print_result`].
@@ -33,33 +27,8 @@ pub async fn run(
     table: bool,
     session_id: Option<String>,
 ) -> Result<()> {
-    // Validate before building the request: reqwest defers an invalid header
-    // value to `send()`, whose errors are all mapped to `ApiError::Connect` —
-    // so without this check a bad `--session-id` prints a connection error
-    // naming a server that was never contacted, and exits with the
-    // "server unreachable" code. The rules are now an EXACT mirror of the
-    // server's `session_id_from_headers` — visible ASCII graphic characters,
-    // no comma, no space — with no trimming semantics to reason about on
-    // either side: previously this check let space through, but the server
-    // sees whatever `httparse` hands it after stripping leading/trailing
-    // whitespace per RFC 9110 §5.5 (interior whitespace untouched). That gap
-    // meant `--session-id "  sess-1  "` passed here and got silently
-    // recorded server-side under the different key `sess-1` (breaking the
-    // session stitching this field exists for), while `--session-id "   "`
-    // passed here and then 400ed server-side — the exact fail-late round
-    // trip this client-side check exists to prevent. A grouping key has no
-    // legitimate use for spaces, so both sides now reject them outright
-    // instead of defining trimming semantics.
-    let invalid_session_id = session_id.as_deref().is_some_and(|sid| {
-        sid.is_empty()
-            || sid.chars().count() > MAX_SESSION_ID_CHARS
-            || !sid.chars().all(|c| c.is_ascii_graphic() && c != ',')
-    });
-    if invalid_session_id {
-        return Err(anyhow!(
-            "--session-id must be non-empty, at most {MAX_SESSION_ID_CHARS} \
-             characters, and contain only visible ASCII with no spaces and no commas"
-        ));
+    if let Some(sid) = &session_id {
+        validate_session_id(sid)?;
     }
 
     let body = build_body(data, param_flags)?;
