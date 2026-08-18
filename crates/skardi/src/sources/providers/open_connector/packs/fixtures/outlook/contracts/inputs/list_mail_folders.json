@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "properties": {
+    "nextLink": {
+      "type": "string",
+      "description": "Opaque pagination URL returned by a previous Outlook response.",
+      "format": "uri"
+    },
+    "includeHiddenFolders": {
+      "type": "boolean",
+      "description": "Whether to include hidden mail folders."
+    },
+    "top": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "description": "Maximum number of mail folders to return."
+    },
+    "select": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A string value."
+      },
+      "description": "Mail folder fields to request from Microsoft Graph.",
+      "minItems": 1
+    }
+  },
+  "additionalProperties": false,
+  "description": "Outlook action input."
+}
