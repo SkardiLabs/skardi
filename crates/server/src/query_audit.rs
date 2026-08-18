@@ -478,31 +478,41 @@ impl QueryAuditStore {
     /// failure here can only be observed via logging.
     fn spawn_timeout_correction(&self, id: String) {
         let conn = self.conn.clone();
+        // The correction is triggered by a stalled writer, which is exactly
+        // the condition under which awaiting it could never resolve — so the
+        // task gives up on the *await*, not on the work. The UPDATE closure
+        // is already in the channel by then and runs whenever the writer
+        // drains, whether or not anyone is still listening; bounding the
+        // await only stops one parked task per timed-out write from
+        // accumulating for the duration of the stall.
+        let correction_bound = self.write_timeout;
         tokio::spawn(async move {
             let finished_at = chrono::Utc::now().to_rfc3339();
-            let outcome = conn
-                .call(move |conn| -> SqlResult<usize> {
-                    conn.execute(
-                        "UPDATE query_audit
+            let update = conn.call(move |conn| -> SqlResult<usize> {
+                conn.execute(
+                    "UPDATE query_audit
                             SET status = ?2, finished_at = ?3, error = ?4
                           WHERE id = ?1 AND status = ?5",
-                        params![
-                            id,
-                            QueryAuditStatus::Failed.as_str(),
-                            finished_at,
-                            "audit_write_timeout",
-                            QueryAuditStatus::Started.as_str(),
-                        ],
-                    )
-                })
-                .await;
-            match outcome {
+                    params![
+                        id,
+                        QueryAuditStatus::Failed.as_str(),
+                        finished_at,
+                        "audit_write_timeout",
+                        QueryAuditStatus::Started.as_str(),
+                    ],
+                )
+            });
+            match tokio::time::timeout(correction_bound, update).await {
                 // 0 rows means either the INSERT never landed, or it landed
                 // and something else already moved it off `started` —
                 // either way there is nothing to correct.
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
                     "Failed to apply audit-write-timeout correction to query-audit record: {e}"
+                ),
+                Err(_) => tracing::warn!(
+                    "Audit-write-timeout correction still queued after {correction_bound:?}; \
+                     it will apply when the writer drains"
                 ),
             }
         });

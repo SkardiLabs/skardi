@@ -574,7 +574,8 @@ async fn unknown_pipeline_with_malformed_header_is_404() {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 1: an unknown-pipeline request must be observable somewhere even
+// Observability regression guard: an unknown-pipeline request must be
+// observable somewhere even
 // though the ordering fix in `execute_pipeline_by_name` deliberately defers
 // the metric-emitting reject past the pipeline lookup (see the comment on
 // `unknown_pipeline_with_malformed_header_is_404` above). The 404 branch logs

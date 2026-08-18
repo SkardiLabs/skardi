@@ -878,8 +878,7 @@ pub async fn execute_pipeline_by_name(
             // unauthenticated route left no trace at all.
             tracing::warn!(
                 requested_pipeline = %pipeline_name,
-                "Rejected execute request for unknown pipeline '{}'",
-                pipeline_name
+                "Rejected execute request for unknown pipeline"
             );
             (
                 StatusCode::NOT_FOUND,
@@ -1764,7 +1763,7 @@ spec:
     }
 
     // -------------------------------------------------------------------------
-    // Finding 5: a JSON object nested inside an array parameter must never be
+    // SQL-injection guard: a JSON object nested inside an array parameter must never be
     // spliced into SQL as raw, unquoted text. Two reachable paths, both
     // exercised below with the injection-shaped payload from the review.
     // -------------------------------------------------------------------------

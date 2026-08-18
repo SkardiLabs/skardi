@@ -215,7 +215,11 @@ forever and pruning is the operator's call. The prune deletes in batches,
 yielding between them: it shares the ledger's single writer thread with the
 fail-closed write path, so an unchunked delete over a large backlog would
 starve concurrent requests into `503 query_audit_error`. Enabling retention
-for the first time on a big ledger is therefore slow, not disruptive.
+for the first time on a big ledger is therefore slow, not disruptive. Each
+batch is bounded like any other write, so on pathologically slow storage the
+*startup* prune can fail and abort startup — the same fail-closed stance
+that makes a broken ledger fatal rather than silently skipped. Later hourly
+prunes only warn.
 
 The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
 including the WAL sidecars). It is a local database, never the OTLP/tracing
