@@ -9661,6 +9661,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "skardi-query-audit"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rusqlite",
+ "tracing",
+]
+
+[[package]]
 name = "skardi-server"
 version = "0.5.0"
 dependencies = [
@@ -9691,6 +9704,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "skardi",
+ "skardi-query-audit",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
