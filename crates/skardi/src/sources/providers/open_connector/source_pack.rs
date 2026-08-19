@@ -141,6 +141,7 @@ impl SourcePackRegistry {
             super::packs::feishu::pack()?,
             super::packs::discord::pack()?,
             super::packs::outlook::pack()?,
+            super::packs::one_drive::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }
@@ -259,7 +260,15 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "discord", "feishu", "github", "gmail", "mock", "notion", "outlook", "slack"
+                "discord",
+                "feishu",
+                "github",
+                "gmail",
+                "mock",
+                "notion",
+                "one_drive",
+                "outlook",
+                "slack"
             ]
         );
     }
@@ -387,7 +396,15 @@ mod tests {
         // ambiguity error above.
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         for name in [
-            "mock", "github", "gmail", "slack", "notion", "feishu", "discord", "outlook",
+            "mock",
+            "github",
+            "gmail",
+            "slack",
+            "notion",
+            "feishu",
+            "discord",
+            "outlook",
+            "one_drive",
         ] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();

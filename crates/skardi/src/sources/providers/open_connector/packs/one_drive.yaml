@@ -1,0 +1,184 @@
+# OneDrive (Microsoft 365) source pack. Wire contract reconciled against
+# a live Open Connector gateway (v1.3.4, open-connector at `2410fbe`):
+# the one_drive executors pass Microsoft Graph's driveItem objects
+# through RAW (GitHub-style — `readCollectionItems(payload.value)` only
+# re-wraps each element, no renaming or rebuilding), and the row object
+# declares `additionalProperties: true`.
+#
+# Unlike the sibling `outlook` pack, that passthrough surface costs this
+# pack nothing: every column below resolves INSIDE the declared item
+# schema (16/16), so the fingerprint gate covers the whole table. An
+# UPSTREAM rename or retype of a mapped key therefore changes the hash
+# and fails registration; an AUTHOR's typo here leaves the hash intact
+# and is caught instead by the coverage test in CI, which would report
+# the column as uncovered. Either way it is loud rather than a silently
+# always-NULL column. That is also why this pack needs no `select` pin — the
+# lever `outlook.messages` uses to turn misspellings loud is already
+# provided here by declared coverage, and driveItem rows carry metadata
+# only (no `body.content` equivalent), so payloads cannot approach the
+# client's 16 MiB response cap.
+#
+# Both tables read the SAME declared output schema — Graph returns the
+# same driveItem collection shape for a folder listing and for a search —
+# so the two `fingerprint` values below are identical BY CONSTRUCTION,
+# not by copy-paste (`both_tables_share_one_contract_fingerprint` holds
+# this, and live discovery confirmed the two schemas byte-identical).
+#
+# Pagination is Graph's `@odata.nextLink`, re-exposed by the gateway as a
+# `nextLink` input/output pair: the cursor is a COMPLETE URL
+# (`format: uri`), null on the final page. The executors ignore every
+# other query input once `nextLink` is set (the URL embeds its own
+# `$top`/`$select`), and each action pins its own allowlisted path set —
+# a children cursor is REJECTED by `search_items` and vice versa, so the
+# two tables' cursors are not interchangeable. Every mock/fixture cursor
+# must therefore be URI-shaped.
+#
+# Inputs are camelCase strict (`additionalProperties: false` — a wrong
+# key is a hard 400; `filter`, `orderby`, `skip`, `page` and `perPage`
+# were each verified to 400). In-band Graph errors are consumed by the
+# executor into a failure envelope, so no table declares `error_path`.
+kind: pack
+pack: one_drive
+version: 1
+
+tables:
+  drive_items:
+    action: one_drive.list_folder_children
+    row_path: "$.items"
+    fingerprint: 6fc6a6b319766064e084865122b06db8e5562b35193ae9dadc4d64b8f9ac207b
+    pagination:
+      strategy: cursor
+      cursor_input: nextLink
+      next_cursor_path: "$.nextLink"
+      page_size_input: top
+      # The declared ceiling (`top`: 1–999; 1000 and 0 both 400 against
+      # the live gateway). driveItem rows are metadata-only, so a full
+      # page stays orders of magnitude under the 16 MiB response cap.
+      # It bounds REQUESTS, not bytes: `top` is sent verbatim and is
+      # never narrowed to the SQL LIMIT, so `LIMIT 10` costs exactly one
+      # request but still transfers up to 999 items. A declared
+      # bound is not a wire bound (feishu declared 100 and hard-failed
+      # above 50, skardi PR #186), so phase 4 must confirm 999 live.
+      page_size: 999
+    # All three resources are optional because each one INDIVIDUALLY
+    # names a well-defined, completely-terminating collection: with no
+    # resource the executor lists the drive ROOT's children
+    # (`buildListFolderChildrenPath` → `/root/children`), `folderItemId`
+    # or `folderPath` scope it to one folder, and `driveId` selects a
+    # non-default drive. `folderItemId` and `folderPath` are ALTERNATIVES
+    # — both are declared, so a binding may set both, and which one the
+    # executor then honours is unprobed (phase 4). Note also that
+    # `folderPath` is declared "Path from the drive root, starting with
+    # /" but enforced only as `minLength: 1`, so a slash-less path passes
+    # validation and fails in the executor.
+    # `select`/`expand`/`orderBy` are deliberately
+    # never sent (negative-space guarded): `orderBy` would only reorder a
+    # set the scan reads in full, and `select` would narrow rows the
+    # declared coverage above already protects. Note the camelCase — the
+    # live gateway 400s lower-case `orderby`, which is the spelling the
+    # sibling `outlook` service uses.
+    resources:
+      optional: [driveId, folderItemId, folderPath]
+    columns:
+      # Identity non-null, the rest nullable — the convention every pack
+      # follows (rationale recorded in gmail.yaml's messages table).
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: web_url, path: webUrl, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: size, path: size, type: int64, nullable: true }
+      # Graph's two concurrency tags are both mapped: `eTag` changes on
+      # any item change, `cTag` only on CONTENT change, so the pair
+      # distinguishes a metadata rename from a real edit.
+      - { name: e_tag, path: eTag, type: utf8, nullable: true }
+      - { name: c_tag, path: cTag, type: utf8, nullable: true }
+      # ISO 8601 strings on the wire; `timestamp_ms_utc` names the Arrow
+      # storage — Timestamp(ms, UTC) — and its converter accepts RFC 3339
+      # or epoch-millis alike (see gmail.yaml's message_timestamp).
+      - { name: created_date_time, path: createdDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: last_modified_date_time, path: lastModifiedDateTime, type: timestamp_ms_utc, nullable: true }
+      # `createdBy`/`lastModifiedBy` are identitySets: declared with
+      # `user`/`application`/`device` arms, of which only the user arm's
+      # display name answers "who touched this". The `id` siblings are
+      # left unmapped (opaque Graph directory IDs, useless without a
+      # directory join this pack cannot perform).
+      - { name: created_by_display_name, path: createdBy.user.displayName, type: utf8, nullable: true }
+      - { name: last_modified_by_display_name, path: lastModifiedBy.user.displayName, type: utf8, nullable: true }
+      # itemReference: `path` is the human-readable location
+      # ("/drive/root:/Documents"), `driveId`/`id` the join keys back to
+      # this same table. `driveType`/`siteId`/`name` stay unmapped —
+      # per-drive constants and a SharePoint-only field.
+      - { name: parent_drive_id, path: parentReference.driveId, type: utf8, nullable: true }
+      - { name: parent_id, path: parentReference.id, type: utf8, nullable: true }
+      - { name: parent_path, path: parentReference.path, type: utf8, nullable: true }
+      # Graph marks item TYPE by facet presence, not a type field, so
+      # these two columns are the discriminator: a non-null
+      # `file_mime_type` means file, a non-null `folder_child_count`
+      # means folder. Mapping one scalar out of each facet keeps that
+      # queryable in SQL without a JSON column.
+      - { name: file_mime_type, path: file.mimeType, type: utf8, nullable: true }
+      - { name: folder_child_count, path: folder.childCount, type: int64, nullable: true }
+      # Declared but deliberately unmapped, all seven of them facets
+      # declared as bare open objects (`properties` absent, so any child
+      # path would be passthrough anyway): `fileSystemInfo` (client-side
+      # clock, duplicating the server timestamps above), `root`,
+      # `deleted`, `shared`, `specialFolder`, `remoteItem` and
+      # `searchResult`. Each is presence-as-signal rather than data; the
+      # two facets that carry an analytically useful scalar (`file`,
+      # `folder`) are mapped above. `folder.view` and `file.hashes` are
+      # the same story one level down.
+
+  drive_item_search:
+    action: one_drive.search_items
+    row_path: "$.items"
+    # Identical to drive_items' pin by construction — same declared
+    # output schema upstream (see the module header).
+    fingerprint: 6fc6a6b319766064e084865122b06db8e5562b35193ae9dadc4d64b8f9ac207b
+    pagination:
+      strategy: cursor
+      cursor_input: nextLink
+      next_cursor_path: "$.nextLink"
+      page_size_input: top
+      page_size: 999
+    # `query` is REQUIRED, and the enforcement is worth stating precisely
+    # because it is not where it looks: the input schema's `required`
+    # array is EMPTY, and `query` is merely `minLength: 1`. So an empty
+    # string 400s as `invalid_input` at the schema layer, but a MISSING
+    # query and a whitespace-only query both pass validation and are
+    # rejected by the executor's own trim check
+    # (`ProviderRequestError(400, "query is required")`) — all three
+    # verified live. Declaring it a required resource is what keeps
+    # Skardi from ever generating those two executor-layer failures.
+    #
+    # Notion's empty-query trick therefore does not transfer: there is no
+    # spelling of "search everything", which is why the query is a
+    # resource (the binding pins the term, and the table is "the drive
+    # items matching this binding's query" — same semantics as
+    # notion.block_children requiring a blockId) rather than a fixed
+    # input. `list_folder_children` being non-recursive is what makes
+    # this table worth shipping: it is the only way to see a whole drive.
+    resources:
+      required: [query]
+      optional: [driveId]
+    # Same column set as drive_items — the same declared driveItem shape,
+    # so the same 16 columns with the same rationale. `searchResult`, the
+    # one facet unique to this action's rows, stays unmapped: it is an
+    # opaque relevance hint (declared as a bare object), not data a query
+    # can act on.
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: web_url, path: webUrl, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: size, path: size, type: int64, nullable: true }
+      - { name: e_tag, path: eTag, type: utf8, nullable: true }
+      - { name: c_tag, path: cTag, type: utf8, nullable: true }
+      - { name: created_date_time, path: createdDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: last_modified_date_time, path: lastModifiedDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: created_by_display_name, path: createdBy.user.displayName, type: utf8, nullable: true }
+      - { name: last_modified_by_display_name, path: lastModifiedBy.user.displayName, type: utf8, nullable: true }
+      - { name: parent_drive_id, path: parentReference.driveId, type: utf8, nullable: true }
+      - { name: parent_id, path: parentReference.id, type: utf8, nullable: true }
+      - { name: parent_path, path: parentReference.path, type: utf8, nullable: true }
+      - { name: file_mime_type, path: file.mimeType, type: utf8, nullable: true }
+      - { name: folder_child_count, path: folder.childCount, type: int64, nullable: true }

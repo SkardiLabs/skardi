@@ -1,0 +1,221 @@
+{
+  "items": [
+    {
+      "id": "01SYNTHETICFILEAAAAAAAAAAAAAAAAAAAA",
+      "name": "quarterly-report.xlsx",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/quarterly-report.xlsx",
+      "description": "Numbers for the quarterly review",
+      "size": 48213,
+      "eTag": "\"{11111111-1111-1111-1111-111111111111},3\"",
+      "cTag": "\"c:{11111111-1111-1111-1111-111111111111},2\"",
+      "createdDateTime": "2026-07-01T09:15:00Z",
+      "lastModifiedDateTime": "2026-08-14T16:42:00Z",
+      "createdBy": {
+        "user": {
+          "id": "aaaaaaaa-1111-2222-3333-444444444444",
+          "displayName": "Person One"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "id": "bbbbbbbb-1111-2222-3333-444444444444",
+          "displayName": "Person Two"
+        }
+      },
+      "parentReference": {
+        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "id": "01SYNTHETICROOTAAAAAAAAAAAAAAAAAAAA",
+        "name": "Documents",
+        "path": "/drive/root:/Documents",
+        "driveType": "personal"
+      },
+      "file": {
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "hashes": {
+          "quickXorHash": "SyntheticHashAAAAAAAAAAAAAAA="
+        }
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2026-07-01T09:15:00Z",
+        "lastModifiedDateTime": "2026-08-14T16:42:00Z"
+      },
+      "@odata.etag": "\"{11111111-1111-1111-1111-111111111111},3\""
+    },
+    {
+      "id": "01SYNTHETICFOLDERAAAAAAAAAAAAAAAAA",
+      "name": "Projects",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/Projects",
+      "size": 1049216,
+      "eTag": "\"{22222222-2222-2222-2222-222222222222},1\"",
+      "cTag": "\"c:{22222222-2222-2222-2222-222222222222},0\"",
+      "createdDateTime": "2026-06-12T11:00:00Z",
+      "lastModifiedDateTime": "2026-08-18T08:05:00Z",
+      "createdBy": {
+        "user": {
+          "id": "aaaaaaaa-1111-2222-3333-444444444444",
+          "displayName": "Person One"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "id": "aaaaaaaa-1111-2222-3333-444444444444",
+          "displayName": "Person One"
+        }
+      },
+      "parentReference": {
+        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "id": "01SYNTHETICROOTAAAAAAAAAAAAAAAAAAAA",
+        "name": "Documents",
+        "path": "/drive/root:/Documents",
+        "driveType": "personal"
+      },
+      "folder": {
+        "childCount": 7,
+        "view": {
+          "viewType": "thumbnails",
+          "sortBy": "name",
+          "sortOrder": "ascending"
+        }
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2026-06-12T11:00:00Z",
+        "lastModifiedDateTime": "2026-08-18T08:05:00Z"
+      }
+    },
+    {
+      "id": "01SYNTHETICEMPTYFOLDERAAAAAAAAAAAA",
+      "name": "Archive",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/Archive",
+      "size": 0,
+      "createdDateTime": "2026-05-02T14:30:00Z",
+      "lastModifiedDateTime": "2026-05-02T14:30:00Z",
+      "parentReference": {
+        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "id": "01SYNTHETICROOTAAAAAAAAAAAAAAAAAAAA",
+        "path": "/drive/root:/Documents",
+        "driveType": "personal"
+      },
+      "folder": {
+        "childCount": 0
+      }
+    },
+    {
+      "id": "01SYNTHETICNULLSAAAAAAAAAAAAAAAAAA",
+      "name": "untitled.txt",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/untitled.txt",
+      "description": null,
+      "size": null,
+      "eTag": null,
+      "cTag": null,
+      "createdDateTime": null,
+      "lastModifiedDateTime": null,
+      "createdBy": {
+        "user": null
+      },
+      "lastModifiedBy": null,
+      "parentReference": null,
+      "file": {
+        "mimeType": null
+      },
+      "folder": null
+    },
+    {
+      "id": "01SYNTHETICEMPTYSTRAAAAAAAAAAAAAAA",
+      "name": "",
+      "webUrl": "",
+      "description": "",
+      "size": 0,
+      "eTag": "",
+      "cTag": "",
+      "createdDateTime": "2026-08-19T00:00:00Z",
+      "lastModifiedDateTime": "2026-08-19T00:00:00Z",
+      "createdBy": {
+        "user": {
+          "id": "",
+          "displayName": ""
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "id": "",
+          "displayName": ""
+        }
+      },
+      "parentReference": {
+        "driveId": "",
+        "id": "",
+        "path": ""
+      },
+      "file": {
+        "mimeType": ""
+      }
+    },
+    {
+      "id": "01SYNTHETICAPPARMAAAAAAAAAAAAAAAAA",
+      "name": "sync-log.json",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/sync-log.json",
+      "size": 902,
+      "eTag": "\"{33333333-3333-3333-3333-333333333333},1\"",
+      "cTag": "\"c:{33333333-3333-3333-3333-333333333333},1\"",
+      "createdDateTime": "2026-08-01T05:00:00Z",
+      "lastModifiedDateTime": "2026-08-01T05:00:00Z",
+      "createdBy": {
+        "application": {
+          "id": "cccccccc-1111-2222-3333-444444444444",
+          "displayName": "Synthetic Sync App"
+        }
+      },
+      "lastModifiedBy": {
+        "application": {
+          "id": "cccccccc-1111-2222-3333-444444444444",
+          "displayName": "Synthetic Sync App"
+        }
+      },
+      "parentReference": {
+        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "id": "01SYNTHETICROOTAAAAAAAAAAAAAAAAAAAA",
+        "path": "/drive/root:/Documents",
+        "driveType": "personal"
+      },
+      "file": {
+        "mimeType": "application/json"
+      },
+      "shared": {
+        "scope": "users"
+      }
+    },
+    {
+      "id": "01SYNTHETICSPECIALAAAAAAAAAAAAAAAA",
+      "name": "Photos",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Photos",
+      "size": 20480,
+      "createdDateTime": "2026-01-04T10:00:00Z",
+      "lastModifiedDateTime": "2026-08-10T19:20:00Z",
+      "createdBy": {
+        "user": {
+          "id": "aaaaaaaa-1111-2222-3333-444444444444",
+          "displayName": "Person One"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "id": "aaaaaaaa-1111-2222-3333-444444444444",
+          "displayName": "Person One"
+        }
+      },
+      "parentReference": {
+        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "id": "01SYNTHETICROOTPARENTAAAAAAAAAAAAA",
+        "path": "/drive/root:",
+        "driveType": "personal"
+      },
+      "folder": {
+        "childCount": 128
+      },
+      "specialFolder": {
+        "name": "photos"
+      }
+    }
+  ],
+  "nextLink": null
+}

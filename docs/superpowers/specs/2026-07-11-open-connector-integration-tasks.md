@@ -495,6 +495,81 @@ event carrying the scan identity and error.
       helper quartet into `testutil` — seven-way duplication across the
       packs, so it belongs in its own cross-pack PR rather than a
       half-migration here.
+- [ ] 5.8 OneDrive pack (OAuth user token, cursor pagination over Graph
+      `@odata.nextLink`, raw-passthrough rows): `drive_items`,
+      `drive_item_search`. The second Microsoft 365 pack — Open Connector has
+      no `microsoft365` service, so M365 ships one pack per service (`outlook`
+      is 5.7 above, merged in PR #212; the whole `excel` service stays
+      deferred at the gate, its list actions emitting `nextLink` but
+      accepting none).
+      This pack is independent of that one — it touches no engine code, only
+      `packs/` plus the two registration rosters, so whichever of the two
+      lands second will conflict merely in those rosters and in
+      `docs/open-connector.md`'s status paragraph. Phases 1–2 recorded in
+      `docs/superpowers/specs/2026-08-19-open-connector-one-drive-pack-design.md`;
+      the phase-1/2 material was reconciled 2026-08-14 alongside outlook's,
+      narrowed out of that branch in `0a76447`, restored here and
+      **re-verified live 2026-08-19** (both committed contract captures still
+      byte-identical to live discovery, so the v1.3.4 / `2410fbe` pin has not
+      drifted). Phase 3 implemented: `packs/one_drive.yaml` +
+      `packs/one_drive.rs`, both tables cursor-over-`nextLink` with URI-shaped
+      cursors everywhere; `page_size: 999` (the declared ceiling — live probes
+      confirm 999 passes while 1000 and 0 both 400); zero filter mappings
+      because neither action exposes a filter input AT ALL (structural, not an
+      omission); zero fixed inputs — notably **no `select` pin**, because all
+      16 columns of both tables resolve inside the declared item schema, so
+      the coverage-gap pin is EMPTY and drift is already loud at registration
+      (the sharpest contrast with outlook's thirteen uncovered `messages`
+      columns, which is exactly what its `select` pin exists to protect).
+      Both tables share ONE contract fingerprint by construction (Graph
+      declares the same driveItem collection schema for a listing and a
+      search; a test states this so it is not "fixed"). `query` is a required
+      resource on the search table, and the live probes pinned down why the
+      mechanism is subtler than it looks: the input schema's `required` array
+      is empty and `query` is only `minLength: 1`, so an EMPTY string 400s as
+      `invalid_input` while a MISSING or whitespace-only query passes
+      validation and dies in the executor's own trim check — declaring it
+      required is what stops Skardi generating the latter two. Facet presence
+      is the item-type discriminator (`file_mime_type` / `folder_child_count`,
+      the latter keeping 0 distinct from NULL). Docs:
+      `docs/open-connector-one-drive.md` + the status note in
+      `docs/open-connector.md`. **Phase 4 (live real-row verification) NOT
+      done** — `one_drive` needs its own OAuth grant (the outlook
+      authorization does not cover it; valid inputs answer `403 "Connect
+      one_drive with OAuth first."`), so the row fixtures are still SYNTHETIC
+      and the design record's seven-item list stays open — including the real
+      `top` wire bound, a genuinely null terminal `nextLink`, non-NULL
+      coverage of every mapped column, whether a real `folderItemId`/
+      `folderPath`/`query` actually returns rows (not just HTTP 200), and
+      whether setting `folderItemId` and `folderPath` together silently
+      prefers one. The sharpest of them is whether a real search cursor
+      survives the executor's path allowlist — the analogous parenthesized
+      OData form is what breaks outlook's folder-scoped pagination upstream —
+      and specifically whether a rejected link ERRORS rather than coming back
+      as `nextLink: null`, since a null cursor is this pack's only
+      end-of-collection signal and the two are indistinguishable to the
+      engine. That is the one path from this design to silent truncation, so
+      it is the live pass's first job. Following gmail (5.5), both halves of each
+      action's contract are committed — `contracts/inputs/` alongside the
+      output captures, re-fetched live 2026-08-19 — and a test locks every
+      key the pack can send against them, so the output-only fingerprint
+      gate's blind spot (a renamed input key registers cleanly, then 400s
+      every scan) is at least caught on re-capture; it also turns four
+      prose claims into checked facts: `top`'s 1–999 bounds contain the
+      pinned 999, `nextLink` is declared `format: uri`, `query` carries
+      `minLength: 1` while no `required` array exists, and
+      `filter`/`orderby`/`skip`/`page`/`perPage` are absent from the input
+      surface entirely. Verification: 25 new pack-scoped tests
+      (`cargo test -p skardi --lib sources::providers::open_connector::packs::one_drive`
+      — 14 contract/conversion plus 11 e2e: per-table wire-declaration scans
+      with exact key sets, null-cursor termination (the only spelling either
+      action can emit, both declaring `nextLink` required), pagination-loop
+      and failure-envelope arms, LIMIT early-stop proving `top` is NOT
+      narrowed, resource forwarding/withholding, a search binding with no
+      `query` refused before any HTTP, a contract-legal item with no `id`
+      failing the page, no-pushdown row identity, UDTF parity, drift-refusal
+      at registration, and a key-scoped default-deny fixture audit with
+      self-trip probes); full-suite counts pending CI.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -504,14 +579,14 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.7 (Outlook pack — messages, mail_folders).
-  Milestones 1–4 and 5.1–5.6 (GitHub, Slack, Notion, Feishu, Gmail,
-  Discord packs) are merged; this PR adds the first Microsoft 365 pack
-  over raw Graph passthrough rows (reconciled live and verified end to
-  end against a real MSA mailbox), with zero engine changes — the
-  pack-shaping decisions are the messages `select` pin and the
-  one-pack-per-OC-service split (`one_drive` follows as its own
-  milestone; the whole `excel` service is deferred at the gate).
+- **Current PR**: milestone 5.8 (OneDrive pack — drive_items,
+  drive_item_search). Milestones 1–4 and 5.1–5.7 (GitHub, Slack, Notion,
+  Feishu, Gmail, Discord, Outlook packs) are merged; this PR adds the
+  second Microsoft 365 pack over raw Graph passthrough rows, with zero
+  engine changes — the pack-shaping decisions are the empty coverage gap
+  (no `select` pin needed, unlike outlook) and the shared driveItem
+  fingerprint across both tables. Live verification (phase 4) has NOT
+  run yet — it needs a separate `one_drive` OAuth grant.
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

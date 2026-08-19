@@ -31,9 +31,11 @@ gateway **runtime token**.
 > content-oriented surface),
 > and [Outlook](open-connector-microsoft-365.md) (messages, mail
 > folders — live-verified against a real MSA mailbox; message bodies
-> deferred as on Gmail; the `one_drive` pack ships as its own milestone,
-> while the whole `excel` service is deferred at the admission gate over
-> incomplete pagination — both per the pack doc).
+> deferred as on Gmail; the whole `excel` service is deferred at the
+> admission gate over incomplete pagination per the pack doc). The
+> [OneDrive](open-connector-one-drive.md) pack (drive items, drive item
+> search) is implemented but **not yet live-verified** — it is not
+> advertised as supported until that pass runs against a real drive.
 > Further provider packs (Google Calendar,
 > Google Drive, Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
