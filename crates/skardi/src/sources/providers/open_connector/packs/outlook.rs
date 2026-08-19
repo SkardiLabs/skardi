@@ -542,18 +542,22 @@ mod tests {
             })
         }
 
-        /// `graph.microsoft.com` is the *cursor's* host, and a cursor
-        /// copied from a capture is exactly what must never land here:
-        /// its `$skiptoken` is live mailbox state, and the
-        /// folder-scoped form embeds a real folder id. Admitting the
-        /// host wholesale would pre-authorize that leak, so a Graph URL
-        /// passes only while carrying the same redaction marker every
-        /// captured id carries — a future multi-page fixture stays
-        /// possible, an as-captured one fails.
+        /// An allowed host is necessary but not sufficient: on every one
+        /// of them the interesting half of the URL is live mailbox state.
+        /// A captured cursor on `graph.microsoft.com` carries a
+        /// `$skiptoken` (and, folder-scoped, a real folder id); the
+        /// message `EntryId` behind OWA's `?ItemID=` encodes a persistent
+        /// mailbox identifier — the same class of value, on the host a
+        /// real `webLink` actually uses.
+        /// Matching a host prefix alone would pre-authorize that leak by
+        /// passing an as-captured URL unchanged, so every arm must also
+        /// carry a redaction marker: a future multi-page or re-captured
+        /// fixture stays possible, one that skipped the id remap fails.
         fn is_redacted_url(url: &str) -> bool {
-            url.starts_with("https://outlook.live.com/owa/?ItemID=")
+            let host_allowed = url.starts_with("https://outlook.live.com/owa/?ItemID=")
                 || url.starts_with("https://outlook.office365.com/owa/?ItemID=")
-                || (url.starts_with("https://graph.microsoft.com/") && url.contains("Synthetic"))
+                || url.starts_with("https://graph.microsoft.com/");
+            host_allowed && (url.contains("Synthetic") || url.contains("redacted-"))
         }
 
         fn audit(value: &Value, path: &str) {

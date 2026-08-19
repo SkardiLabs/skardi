@@ -193,12 +193,15 @@ error) surfaces through the gateway-failure path instead.
 
 ### Pagination: cursor with a null terminator
 
-`nextLink` is `null` on the final page (`readNextLink` normalizes a
-missing `@odata.nextLink` to `null`), so termination is the plain
-null/absent/empty cursor spelling and `has_more_path` is **not**
-declared — Graph carries no separate has-more boolean, unlike Feishu
-wiki. Phase 4 must still follow the real final page's token to confirm
-no non-empty terminal cursor exists.
+`nextLink` is `null` on the final page, and that is the *only* spelling
+the outlook executors produce: they write the key unconditionally
+(`typeof payload["@odata.nextLink"] === "string" ? … : null`), so a
+terminal page is never an omitted key and never `""`. The `readNextLink`
+helper that normalizes a missing `@odata.nextLink` belongs to
+`one_drive`/`excel`, not here. `has_more_path` is **not** declared —
+Graph carries no separate has-more boolean, unlike Feishu wiki. Phase 4
+must still follow the real final page's token to confirm no non-empty
+terminal cursor exists.
 
 The engine sends `page_size_param` on every request, including cursor
 pages (`pagination.rs`). The Outlook executors ignore every
