@@ -26,9 +26,13 @@ gateway **runtime token**.
 > [Discord](open-connector-discord.md) (guilds, connections, sticker
 > packs — live-verified against a real account; entitlements gated on
 > upstream pagination inputs),
-> and [Gmail](open-connector-gmail.md) (threads, messages,
+> [Gmail](open-connector-gmail.md) (threads, messages,
 > drafts, labels, filters — message bodies are deferred to a
-> content-oriented surface). Further provider packs (Google Calendar,
+> content-oriented surface),
+> and [Outlook](open-connector-microsoft-365.md) (messages, mail
+> folders — live verification pending; message bodies deferred as on
+> Gmail, the `one_drive` and `excel` services gated per the pack doc).
+> Further provider packs (Google Calendar,
 > Google Drive, Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the

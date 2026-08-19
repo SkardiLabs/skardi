@@ -140,6 +140,7 @@ impl SourcePackRegistry {
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
             super::packs::discord::pack()?,
+            super::packs::outlook::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }
@@ -258,7 +259,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "discord", "feishu", "github", "gmail", "mock", "notion", "slack"
+                "discord", "feishu", "github", "gmail", "mock", "notion", "outlook", "slack"
             ]
         );
     }

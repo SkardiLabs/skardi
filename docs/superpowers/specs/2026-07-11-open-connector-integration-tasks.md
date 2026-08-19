@@ -435,11 +435,30 @@ event carrying the scan identity and error.
       accept no `nextLink` input, so their pagination cannot be completed.
       Phases 1–2 (live contract reconciliation against gateway v1.3.4, table
       design) are recorded in
-      `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`;
-      phases 3–5 pending. Note `outlook.list_messages` declares no timestamp
-      field at all, so `receivedDateTime` and every other date ride
-      `additionalProperties` passthrough outside the fingerprint gate — live
-      real-row verification is a prerequisite here, not a final check.
+      `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`.
+      Phase 3 implemented: `packs/outlook.yaml` + `packs/outlook.rs`, both
+      tables cursor-over-`nextLink` (URI-shaped cursors everywhere — the
+      gateway pins format/host/path), `messages` pins `select` to exactly the
+      mapped fields (bounds responses away from the 16 MiB cap and turns a
+      misspelled passthrough column into a loud Graph 400; a test locks the
+      pin to the column set) with `page_size: 100`, `mail_folders` pins
+      `includeHiddenFolders: true` (complete root-level set, `is_hidden`
+      queryable); zero filter mappings (OData `$filter` expressions cannot be
+      composed by a scalar mapping — Notion precedent); input schemas captured
+      from the pinned gateway (`contracts/inputs/`) with the gmail-style
+      acceptance test; fingerprint sync + coverage-gap pins (mail_folders
+      empty; messages' thirteen passthrough/nested columns an explicit set);
+      synthetic six-category fixtures; per-table cursor e2e with exact
+      key-set wire pins, both termination spellings, loop/invalid-cursor
+      failure arms, LIMIT early-stop, resource forwarding/withholding,
+      no-pushdown row identity, gateway failure-envelope surfacing, UDTF
+      parity, drift-refusal at registration. Note `outlook.list_messages`
+      declares no timestamp field at all, so `receivedDateTime` and every
+      other date ride `additionalProperties` passthrough outside the
+      fingerprint gate — **phase 4 (live real-row verification, fixture
+      re-derivation as redacted captures, real `top` ceiling, select-400
+      behavior) is a prerequisite for ticking this entry**, and test counts
+      get pinned from CI at that point; phase 5 review then precedes ready.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,

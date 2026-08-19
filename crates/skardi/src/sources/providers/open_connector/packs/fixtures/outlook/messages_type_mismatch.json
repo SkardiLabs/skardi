@@ -1,0 +1,53 @@
+{
+  "messages": [
+    {
+      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMHZhbA==",
+      "subject": "Valid first row",
+      "bodyPreview": "Converts cleanly",
+      "importance": "normal",
+      "isRead": true,
+      "isDraft": false,
+      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-valid",
+      "flag": { "flagStatus": "notFlagged" },
+      "from": { "emailAddress": { "name": "Redacted", "address": "sender@example.com" } },
+      "sender": { "emailAddress": { "name": "Redacted", "address": "sender@example.com" } },
+      "toRecipients": [],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "receivedDateTime": "2026-08-14T09:15:42Z",
+      "sentDateTime": "2026-08-14T09:15:38Z",
+      "createdDateTime": "2026-08-14T09:15:40Z",
+      "lastModifiedDateTime": "2026-08-14T09:15:44Z",
+      "hasAttachments": false,
+      "conversationId": "AAQkAGE1M2IyNGNmconv-val",
+      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox",
+      "categories": [],
+      "internetMessageId": "<redacted-valid@example.com>"
+    },
+    {
+      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwYmFk==",
+      "subject": "String where boolean is declared",
+      "bodyPreview": "",
+      "importance": "normal",
+      "isRead": "yes",
+      "isDraft": false,
+      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-bad",
+      "flag": { "flagStatus": "notFlagged" },
+      "from": { "emailAddress": { "name": "Redacted", "address": "sender@example.com" } },
+      "sender": { "emailAddress": { "name": "Redacted", "address": "sender@example.com" } },
+      "toRecipients": [],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "receivedDateTime": "2026-08-13T18:02:11Z",
+      "sentDateTime": "2026-08-13T18:02:05Z",
+      "createdDateTime": "2026-08-13T18:02:10Z",
+      "lastModifiedDateTime": "2026-08-13T18:02:11Z",
+      "hasAttachments": false,
+      "conversationId": "AAQkAGE1M2IyNGNmconv-bad",
+      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox",
+      "categories": [],
+      "internetMessageId": "<redacted-bad@example.com>"
+    }
+  ],
+  "nextLink": null
+}

@@ -1,0 +1,110 @@
+{
+  "messages": [
+    {
+      "@odata.etag": "W/\"CQAAABYAAAA1\"",
+      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMQ==",
+      "createdDateTime": "2026-08-14T09:15:40Z",
+      "lastModifiedDateTime": "2026-08-14T09:15:44Z",
+      "changeKey": "CQAAABYAAAA1",
+      "categories": ["Redacted Category"],
+      "receivedDateTime": "2026-08-14T09:15:42Z",
+      "sentDateTime": "2026-08-14T09:15:38Z",
+      "hasAttachments": true,
+      "internetMessageId": "<redacted-0001@example.com>",
+      "subject": "Redacted subject 1",
+      "bodyPreview": "Redacted preview text 1",
+      "importance": "normal",
+      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox",
+      "conversationId": "AAQkAGE1M2IyNGNmconv-0001",
+      "isDraft": false,
+      "isRead": false,
+      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-0001",
+      "inferenceClassification": "focused",
+      "flag": { "flagStatus": "notFlagged" },
+      "sender": {
+        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+      },
+      "from": {
+        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+      },
+      "toRecipients": [
+        { "emailAddress": { "name": "Redacted Recipient", "address": "recipient1@example.com" } }
+      ],
+      "ccRecipients": [
+        { "emailAddress": { "name": "Redacted Cc", "address": "cc1@example.com" } }
+      ],
+      "bccRecipients": [],
+      "replyTo": []
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAAA2\"",
+      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMg==",
+      "createdDateTime": "2026-08-13T18:02:10Z",
+      "lastModifiedDateTime": "2026-08-13T18:02:11Z",
+      "changeKey": "CQAAABYAAAA2",
+      "categories": [],
+      "receivedDateTime": "2026-08-13T18:02:11Z",
+      "sentDateTime": "2026-08-13T18:02:05Z",
+      "hasAttachments": false,
+      "internetMessageId": "<redacted-0002@example.com>",
+      "subject": null,
+      "bodyPreview": "",
+      "importance": "high",
+      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox",
+      "conversationId": "AAQkAGE1M2IyNGNmconv-0002",
+      "isDraft": false,
+      "isRead": true,
+      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-0002",
+      "inferenceClassification": "other",
+      "flag": { "flagStatus": "flagged" },
+      "sender": {
+        "emailAddress": { "name": "Redacted Sender 2", "address": "sender2@example.com" }
+      },
+      "from": {
+        "emailAddress": { "name": "Redacted Sender 2", "address": "sender2@example.com" }
+      },
+      "toRecipients": [
+        { "emailAddress": { "name": "Redacted Recipient", "address": "recipient1@example.com" } },
+        { "emailAddress": { "name": "Redacted Other", "address": "recipient2@example.com" } }
+      ],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "replyTo": []
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAAA3\"",
+      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMw==",
+      "createdDateTime": "2026-08-12T07:45:00Z",
+      "lastModifiedDateTime": "2026-08-12T07:45:03Z",
+      "changeKey": "CQAAABYAAAA3",
+      "categories": ["Redacted Category", "Redacted Second"],
+      "receivedDateTime": "2026-08-12T07:45:01Z",
+      "sentDateTime": "2026-08-12T07:44:55Z",
+      "hasAttachments": false,
+      "internetMessageId": "<redacted-0003@example.com>",
+      "subject": "Redacted subject 3",
+      "bodyPreview": "Redacted preview text 3",
+      "importance": "low",
+      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-archive",
+      "conversationId": "AAQkAGE1M2IyNGNmconv-0001",
+      "isDraft": true,
+      "isRead": true,
+      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-0003",
+      "inferenceClassification": "focused",
+      "flag": { "flagStatus": "notFlagged" },
+      "sender": {
+        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+      },
+      "from": {
+        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+      },
+      "toRecipients": [],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "replyTo": [
+        { "emailAddress": { "name": "Redacted Reply", "address": "reply1@example.com" } }
+      ]
+    }
+  ],
+  "nextLink": "https://graph.microsoft.com/v1.0/me/messages?%24select=id%2csubject&%24top=100&%24skiptoken=RFRM9NextPage0001"
+}

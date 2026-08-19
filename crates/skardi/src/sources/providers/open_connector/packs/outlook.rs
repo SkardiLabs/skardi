@@ -1,0 +1,1249 @@
+//! Outlook (Microsoft 365) source pack: `messages` and `mail_folders`
+//! over Open Connector's `outlook` service, reconciled against a live
+//! gateway (v1.3.4, open-connector at `2410fbe`) on 2026-08-14. Design
+//! record: `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`.
+//!
+//! **Status: phases 1–3. The phase-4 live pass has NOT run yet** — no
+//! real mailbox has been scanned, so every fixture in
+//! `fixtures/outlook/` is synthetic (provider-shaped per the captured
+//! contracts and the executor source, and saying so), and the
+//! passthrough column set is provisional. This pack must not leave
+//! draft until phase 4 replaces the fixtures with redacted live
+//! captures and settles the passthrough spellings.
+//!
+//! Design decisions, each held by a test:
+//!
+//! - **One pack per Open Connector service.** There is no
+//!   `microsoft365` service upstream: Graph is split into `outlook`
+//!   (mail only — no calendar, no contacts), `one_drive`, and `excel`,
+//!   each with its own OAuth connection, and a Skardi binding carries
+//!   exactly one `connection_alias`. A cross-service pack would
+//!   silently span two OAuth grants and fail half its tables at scan
+//!   time. `one_drive` ships as its own pack; the whole `excel`
+//!   service is deferred at the admission gate (its list actions emit
+//!   `nextLink` but accept none, so pagination cannot be completed).
+//! - **Rows are RAW Graph passthrough** (`payload.value` untouched,
+//!   GitHub-style), and the declared item schema under-declares
+//!   heavily: `list_messages` declares 15 properties and **no date
+//!   field of any kind**. `receivedDateTime`, `sentDateTime`,
+//!   `hasAttachments`, `conversationId`, `parentFolderId`,
+//!   `categories`, `internetMessageId` — and the `emailAddress`
+//!   nesting under the declared-but-loose `from`/`sender` — all ride
+//!   `additionalProperties` passthrough OUTSIDE the fingerprint gate.
+//!   The coverage-gap pin (`columns_the_coverage_walker_cannot_resolve
+//!   _are_pinned`) keeps that surface an explicitly reviewed set:
+//!   thirteen uncovered columns on `messages`, zero on `mail_folders`.
+//! - **`select` is pinned to exactly the mapped fields** on
+//!   `messages`. Unpinned, Graph returns its default full
+//!   representation — `body.content` (HTML mail) on every row — which
+//!   at the declared `top` ceiling would blow the client's 16 MiB
+//!   response cap; pinned, payloads shrink by orders of magnitude,
+//!   rows become deterministic, and a misspelled passthrough column
+//!   turns into a loud Graph 400 instead of an always-NULL column.
+//!   Cost: the pin and the column set must move together —
+//!   `select_pin_mirrors_the_mapped_columns` enforces that
+//!   mechanically, so neither can drift without the other. `body` is
+//!   deliberately outside both the columns and the pin (full message
+//!   content belongs behind an explicit content surface, not in every
+//!   `SELECT *`). `page_size: 100` (not the schema's 1000) keeps even
+//!   selected pages far from the response cap; phase 4 must confirm
+//!   the wire's real `top` ceiling (Feishu declared 100 and failed
+//!   above 50) and the 400-on-misspelled-select behavior this design
+//!   leans on.
+//! - **The cursor is a URL.** Graph's `@odata.nextLink` is re-exposed
+//!   as a `nextLink` input/output pair: `format: uri` is enforced
+//!   before credentials, and the executor pins host
+//!   `graph.microsoft.com` plus an allowlisted path set. Termination
+//!   is the executor's explicit `null` (`readNextLink` normalizes a
+//!   missing key to null); the engine also accepts absent/empty — one
+//!   e2e per spelling across the two tables. Every fixture and mock
+//!   cursor is therefore URI-shaped: an opaque `"cursor-2"` token
+//!   would pass the mocks and 400 against the real gateway, the exact
+//!   mock-encoded-wrong-assumption class the original GitHub pack
+//!   shipped. The engine sends `top` on continuation requests too;
+//!   the executor ignores every input once `nextLink` is present
+//!   (Graph embeds `$top`/`$select` in the link), pinned in the
+//!   cursor e2e so nobody assumes the page size is re-applied.
+//! - **Zero filter pushdown, structurally.** The only filter input is
+//!   `filter`, a raw OData *expression* string; a
+//!   `FilterMapping` renders one value into one input field and
+//!   cannot compose an expression (the Notion pack is the precedent).
+//!   Predicates re-apply locally in DataFusion after the bounded
+//!   fetch; the practical scoping tools are the `mailFolderId`
+//!   resource and `LIMIT` early-stop. `filter`, `orderby`, and
+//!   `bodyContentType` never reach the wire — negative-space guarded
+//!   by the exact-key-set assertions in every e2e.
+//! - **`mailFolderId` is an optional resource** (the verbatim OC input
+//!   key): omitted, the table is the whole mailbox
+//!   (`/v1.0/me/messages`); bound, it is one folder's listing
+//!   (`/v1.0/me/mailFolders/{id}/messages`). Both collections are
+//!   well-defined, hence optional rather than required.
+//! - **`mail_folders` pins `includeHiddenFolders: true`** — the
+//!   `state=all` move: Graph hides hidden folders by default, the pin
+//!   makes the table the complete root-level set, and `is_hidden`
+//!   keeps the distinction queryable. Root-level only: the executor
+//!   calls `me/mailFolders` without recursion; nested folders are
+//!   revealed by `child_folder_count`, not enumerated. That
+//!   collection terminates completely — an honest small collection,
+//!   not a truncated large one.
+//! - **`error_path: None`**: `assertOutlookResponse` throws on any
+//!   non-2xx, so Graph's error envelope never reaches Skardi as an
+//!   HTTP-200 body; a scope failure surfaces through the gateway
+//!   failure envelope, pinned end to end.
+//! - **The registration gate is output-only** (`fingerprint_schema`
+//!   hashes the output schema; nothing reads
+//!   `ActionMetadata::input_schema`), and these actions are
+//!   `additionalProperties: false` strict. This pack ships the input
+//!   half of its own capture (`fixtures/outlook/contracts/inputs/`,
+//!   same gateway pin, cross-checked byte-identical against
+//!   per-action discovery) plus
+//!   `generated_inputs_are_accepted_by_the_captured_input_contracts`
+//!   — both sides committed artifacts, so it catches drift on
+//!   re-capture, not live; the registration-time input fingerprint
+//!   remains tracked engine work.
+//! - **Excluded actions**: `get_message`, `get_profile`,
+//!   `get_mailbox_settings` are single-object reads (no collection to
+//!   list); `create_draft`, `update_draft`, `send_draft`,
+//!   `send_email`, `reply_email`, `update_mailbox_settings` are
+//!   writes, out by the read-only allowlist. That accounts for all
+//!   eleven `outlook` actions.
+//! - **The OAuth consent is read-write for a read-only pack.** The
+//!   service's scope union requests `Mail.ReadWrite` + `Mail.Send` +
+//!   `MailboxSettings.ReadWrite`, and the read actions themselves
+//!   declare `requiredScopes: [User.Read, Mail.ReadWrite]` although
+//!   `Mail.Read` suffices at the Graph level — so the gateway's own
+//!   scope check would refuse a correctly-scoped read-only token.
+//!   Nothing Skardi-side can narrow the consent screen; the pack doc
+//!   says so plainly, the tables stay read-only by construction, and
+//!   the misdeclaration is an upstream issue candidate (same class as
+//!   open-connector#268).
+
+use std::sync::OnceLock;
+
+use crate::sources::providers::open_connector::error::OpenConnectorError;
+use crate::sources::providers::open_connector::source_pack::SourcePack;
+
+use super::loader;
+
+static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
+
+/// The Outlook pack, parsed once from the embedded YAML asset.
+pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
+    loader::builtin("outlook.yaml", include_str!("outlook.yaml"), &PACK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::hierarchy::HierarchyLevel;
+    use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
+    use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+    use crate::sources::providers::open_connector::row_path::RowPath;
+    use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
+    use crate::sources::providers::open_connector::testutil::{
+        EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_err, envelope_ok,
+        fingerprint_uncovered_columns,
+    };
+    use crate::sources::providers::open_connector::{
+        OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
+        register_open_connector_udtfs,
+    };
+    use arrow::array::{
+        Array, BooleanArray, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
+    };
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::SessionContext;
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+
+    /// Every cursor in this module is URI-shaped on purpose: the real
+    /// gateway validates `nextLink` as `format: uri` before credentials
+    /// and the executor pins its host and path — an opaque token would
+    /// pass these mocks and 400 live.
+    const PAGE2_URI: &str =
+        "https://graph.microsoft.com/v1.0/me/messages?%24top=100&%24skiptoken=RFRM9Page2";
+    const FOLDERS_PAGE2_URI: &str =
+        "https://graph.microsoft.com/v1.0/me/mailFolders?%24top=1000&%24skiptoken=RFRM9Folders2";
+
+    /// Look up a table by short name; the assets are test-pinned to parse.
+    fn table(short: &str) -> &'static SourcePackTable {
+        pack()
+            .expect("embedded asset is test-pinned to parse")
+            .tables
+            .iter()
+            .find(|t| t.id.rsplit('.').next() == Some(short))
+            .unwrap_or_else(|| panic!("table {short}"))
+    }
+
+    /// Discovery serving the captured contracts, so every mock
+    /// registration exercises the fingerprint gate's pass side.
+    fn outlook_discovery(path: &str) -> MockResponse {
+        let output_schema = if path.ends_with("outlook.list_messages") {
+            include_str!("fixtures/outlook/contracts/list_messages.json")
+        } else if path.ends_with("outlook.list_mail_folders") {
+            include_str!("fixtures/outlook/contracts/list_mail_folders.json")
+        } else {
+            r#"{"type": "object"}"#
+        };
+        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+    }
+
+    // ── Contract tests: fixture pages are SYNTHETIC (provider-shaped
+    // per the captured contracts and the executor source) until the
+    // phase-4 live pass replaces them with redacted live captures. They
+    // pin the conversion contract per the admission gate: null-bearing,
+    // null-parent, nested, extra-field, empty-page, schema-mismatch. ─
+
+    fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
+        let page: Value = serde_json::from_str(fixture).expect("fixture parses");
+        convert_page(table, &page)
+    }
+
+    fn convert_page(table: &SourcePackTable, page: &Value) -> RecordBatch {
+        let rows = RowPath::parse(table.row_path)
+            .expect("row path")
+            .rows(page, 1)
+            .expect("row array");
+        RowConverter::new(table.fields)
+            .expect("converter")
+            .convert(rows, 1)
+            .expect("page converts")
+    }
+
+    fn utf8<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+        batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("column {name}"))
+            .as_any()
+            .downcast_ref()
+            .expect("Utf8 column")
+    }
+
+    fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArray {
+        batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("column {name}"))
+            .as_any()
+            .downcast_ref()
+            .expect("Boolean column")
+    }
+
+    #[test]
+    fn messages_fixture_converts_the_designed_row_shape() {
+        // Synthetic provider-shaped page (phase 4 swaps in a redacted
+        // live capture): declared fields, the emailAddress nesting under
+        // from/sender, opaque-JSON recipients, RFC 3339 passthrough
+        // timestamps, a null-bearing subject, and unmapped extras
+        // (@odata.etag, changeKey, inferenceClassification, replyTo)
+        // riding along ignored.
+        let batch = convert_fixture(
+            table("messages"),
+            include_str!("fixtures/outlook/messages.json"),
+        );
+        assert_eq!(batch.num_rows(), 3);
+        assert!(utf8(&batch, "id").value(0).starts_with("AAMkAGE1M2IyNGNm"));
+        assert_eq!(utf8(&batch, "subject").value(0), "Redacted subject 1");
+        // Null-bearing: an explicit null subject is SQL NULL, while the
+        // same row's empty bodyPreview stays an empty string.
+        assert!(utf8(&batch, "subject").is_null(1));
+        assert_eq!(utf8(&batch, "body_preview").value(1), "");
+        // Nested scalar paths through the loose from/sender objects.
+        assert_eq!(utf8(&batch, "from_address").value(0), "sender1@example.com");
+        assert_eq!(utf8(&batch, "from_name").value(0), "Redacted Sender 1");
+        assert_eq!(
+            utf8(&batch, "sender_address").value(2),
+            "sender1@example.com"
+        );
+        // Recipient lists survive as opaque JSON.
+        let to: Value =
+            serde_json::from_str(utf8(&batch, "to_recipients").value(1)).expect("valid JSON");
+        assert_eq!(to[1]["emailAddress"]["address"], "recipient2@example.com");
+        // Booleans and passthrough columns extract on every row.
+        assert!(boolean(&batch, "has_attachments").value(0));
+        assert!(!boolean(&batch, "is_read").value(0));
+        assert!(boolean(&batch, "is_draft").value(2));
+        let ts: &TimestampMillisecondArray = batch
+            .column_by_name("received_date_time")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("timestamp");
+        assert!((0..3).all(|i| !ts.is_null(i)));
+        assert_eq!(
+            utf8(&batch, "conversation_id").value(0),
+            utf8(&batch, "conversation_id").value(2),
+            "rows 1 and 3 share a conversation"
+        );
+        // categories: utf8_list keeps the two-entry row intact and the
+        // empty row an empty list, not NULL.
+        let categories: &ListArray = batch
+            .column_by_name("categories")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("List column");
+        assert_eq!(categories.value(2).len(), 2);
+        assert!(!categories.is_null(1));
+        assert_eq!(categories.value(1).len(), 0);
+    }
+
+    #[test]
+    fn mail_folders_fixture_converts_with_hidden_and_visible_rows() {
+        // Synthetic provider-shaped page: the includeHiddenFolders pin
+        // is what makes a hidden row reachable at all, so the fixture
+        // carries one; sizeInBytes rides along unmapped (a phase-4
+        // column candidate).
+        let batch = convert_fixture(
+            table("mail_folders"),
+            include_str!("fixtures/outlook/mail_folders.json"),
+        );
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(utf8(&batch, "display_name").value(0), "Inbox");
+        assert!(!boolean(&batch, "is_hidden").value(0));
+        assert!(boolean(&batch, "is_hidden").value(2));
+        let counts: &Int64Array = batch
+            .column_by_name("total_item_count")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("Int64 column");
+        assert_eq!(counts.value(0), 214);
+        assert_eq!(counts.value(2), 0);
+        assert_eq!(
+            utf8(&batch, "parent_folder_id").value(1),
+            "AQMkAGE1M2IyNGNmLjAAAA-folder-msgroot"
+        );
+    }
+
+    #[test]
+    fn null_parent_on_a_nested_path_becomes_sql_null() {
+        // Drafts carry no from/sender on the real wire; a nullable
+        // column behind a null (or absent) parent must become SQL NULL,
+        // never an error — the admission gate's null-parent category.
+        let batch = convert_page(
+            table("messages"),
+            &json!({"messages": [
+                {"id": "m-1", "from": null},
+                {"id": "m-2"},
+            ]}),
+        );
+        assert!(utf8(&batch, "from_address").is_null(0));
+        assert!(utf8(&batch, "from_name").is_null(0));
+        assert!(utf8(&batch, "sender_address").is_null(1));
+        assert!(utf8(&batch, "to_recipients").is_null(1));
+    }
+
+    #[test]
+    fn absent_passthrough_keys_convert_as_pinned() {
+        // The passthrough columns sit wholly outside the declared
+        // schema, so "key not present" is a legal row shape the select
+        // pin can only mitigate live: absent keys are SQL NULL, and the
+        // whole row still converts.
+        let batch = convert_page(
+            table("messages"),
+            &json!({"messages": [
+                {"id": "m-1", "subject": "s"},
+            ]}),
+        );
+        assert!(boolean(&batch, "has_attachments").is_null(0));
+        assert!(utf8(&batch, "conversation_id").is_null(0));
+        assert!(utf8(&batch, "internet_message_id").is_null(0));
+        assert!(
+            batch
+                .column_by_name("received_date_time")
+                .expect("column")
+                .is_null(0)
+        );
+    }
+
+    #[test]
+    fn empty_page_keeps_schema_stable() {
+        // Zero rows still yield the full column set — an empty mailbox
+        // must DESCRIBE like a populated one.
+        let batch = convert_page(table("messages"), &json!({"messages": []}));
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), table("messages").fields.len());
+    }
+
+    #[test]
+    fn messages_mismatch_fixture_fails_with_the_targeted_error() {
+        // Admission-gate schema-mismatch fixture (deliberately synthetic
+        // — a live wire cannot be made to produce one): a string where
+        // boolean is declared fails with the full row-scoped identity,
+        // never a quiet null and never the offending value.
+        let page: Value =
+            serde_json::from_str(include_str!("fixtures/outlook/messages_type_mismatch.json"))
+                .expect("fixture parses");
+        let t = table("messages");
+        let rows = RowPath::parse(t.row_path)
+            .expect("row path")
+            .rows(&page, 1)
+            .expect("row array");
+        let err = RowConverter::new(t.fields)
+            .expect("converter")
+            .convert(rows, 1)
+            .expect_err("a string where boolean is declared must fail conversion");
+        match err {
+            OpenConnectorError::ConversionFailed {
+                column,
+                page,
+                row,
+                found,
+                ..
+            } => {
+                assert_eq!(column, "is_read");
+                assert_eq!(page, 1);
+                assert_eq!(row, 1, "the valid first row converts");
+                assert_eq!(found, "a string");
+            }
+            other => panic!("expected ConversionFailed, got {other}"),
+        }
+    }
+
+    #[test]
+    fn pinned_fingerprints_match_the_reconciled_contracts() {
+        // Pin <-> captured-contract lock through the SAME function
+        // registration uses; mismatch output is also how pins are
+        // (re)taken after an upstream upgrade.
+        let contracts = [
+            (
+                "messages",
+                include_str!("fixtures/outlook/contracts/list_messages.json"),
+            ),
+            (
+                "mail_folders",
+                include_str!("fixtures/outlook/contracts/list_mail_folders.json"),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (short, contract) in contracts {
+            let schema: Value = serde_json::from_str(contract).expect("contract fixture parses");
+            let actual = fingerprint_schema(Some(&schema));
+            let t = table(short);
+            if t.expected_fingerprint != Some(actual.as_str()) {
+                mismatches.push(format!(
+                    "{}: pinned {:?}, contract fixture hashes to {actual}",
+                    t.id, t.expected_fingerprint
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn generated_inputs_are_accepted_by_the_captured_input_contracts() {
+        // The fingerprint gate hashes OUTPUT schemas only, and these
+        // actions are `additionalProperties: false` strict — an
+        // undeclared key is a hard 400 on every scan. Both sides here
+        // are committed artifacts (gateway v1.3.4 capture), so this
+        // locks the pack's declarations against the captured input
+        // halves and catches drift on re-capture, not live; the
+        // registration-time input fingerprint stays tracked engine work.
+        for (short, contract) in [
+            (
+                "messages",
+                include_str!("fixtures/outlook/contracts/inputs/list_messages.json"),
+            ),
+            (
+                "mail_folders",
+                include_str!("fixtures/outlook/contracts/inputs/list_mail_folders.json"),
+            ),
+        ] {
+            let schema: Value =
+                serde_json::from_str(contract).expect("input contract fixture parses");
+            let properties = &schema["properties"];
+            let t = table(short);
+
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{short}: the action's input schema is strict"
+            );
+
+            let mut generated: Vec<&str> = t
+                .required_resources
+                .iter()
+                .chain(t.optional_resources)
+                .copied()
+                .collect();
+            generated.extend(t.fixed_inputs.iter().map(|(key, _)| *key));
+            match t.pagination {
+                PaginationStrategy::Cursor {
+                    cursor_param,
+                    page_size_param,
+                    ..
+                } => {
+                    generated.push(cursor_param);
+                    generated.extend(page_size_param);
+                }
+                _ => panic!("{short}: both tables declare the cursor strategy"),
+            }
+            for key in &generated {
+                assert!(
+                    !properties[*key].is_null(),
+                    "{short}: `{key}` is not declared by the action's input schema"
+                );
+            }
+
+            if let Some(required) = schema["required"].as_array() {
+                for entry in required {
+                    let entry = entry.as_str().expect("required entries are strings");
+                    assert!(
+                        generated.contains(&entry),
+                        "{short}: the action requires `{entry}`, which this table never sends"
+                    );
+                }
+            }
+
+            if let PaginationStrategy::Cursor {
+                page_size_param: Some(param),
+                page_size,
+                ..
+            } = t.pagination
+            {
+                let declared = &properties[param];
+                if let Some(minimum) = declared["minimum"].as_u64() {
+                    assert!(
+                        u64::from(page_size) >= minimum,
+                        "{short}: page size {page_size} is below `{param}`'s minimum {minimum}"
+                    );
+                }
+                if let Some(maximum) = declared["maximum"].as_u64() {
+                    assert!(
+                        u64::from(page_size) <= maximum,
+                        "{short}: page size {page_size} exceeds `{param}`'s maximum {maximum}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_pin_mirrors_the_mapped_columns() {
+        // The select pin's one cost is that the pin and the column set
+        // must move together: a mapped column whose top-level wire key
+        // is missing from the pin would be always-NULL by our own hand.
+        // This makes the two inseparable — and pins that the list has
+        // no strays and no duplicates.
+        let t = table("messages");
+        let select = t
+            .fixed_inputs
+            .iter()
+            .find_map(|(key, value)| match (key, value) {
+                (&"select", FixedValue::StrList(items)) => Some(*items),
+                _ => None,
+            })
+            .expect("messages pins a select StrList");
+        let pinned: BTreeSet<&str> = select.iter().copied().collect();
+        assert_eq!(select.len(), pinned.len(), "select entries are unique");
+        let mapped: BTreeSet<&str> = t
+            .fields
+            .iter()
+            .map(|f| f.path.split('.').next().expect("non-empty path"))
+            .collect();
+        assert_eq!(
+            pinned, mapped,
+            "select must be exactly the mapped columns' top-level wire keys"
+        );
+    }
+
+    #[test]
+    fn columns_the_coverage_walker_cannot_resolve_are_pinned() {
+        // messages: the walker resolves only the declared top-level
+        // properties, so every passthrough column — and the emailAddress
+        // nesting under the declared-but-loose from/sender — is outside
+        // the gate: drift there surfaces at scan time (or as a Graph 400
+        // through the select pin), never at registration. Pinned so the
+        // gap stays a reviewed set. mail_folders: fully declared, the
+        // deliberate contrast.
+        for (short, contract, expected) in [
+            (
+                "messages",
+                include_str!("fixtures/outlook/contracts/list_messages.json"),
+                &[
+                    "from_address",
+                    "from_name",
+                    "sender_address",
+                    "sender_name",
+                    "received_date_time",
+                    "sent_date_time",
+                    "created_date_time",
+                    "last_modified_date_time",
+                    "has_attachments",
+                    "conversation_id",
+                    "parent_folder_id",
+                    "categories",
+                    "internet_message_id",
+                ] as &[&str],
+            ),
+            (
+                "mail_folders",
+                include_str!("fixtures/outlook/contracts/list_mail_folders.json"),
+                &[],
+            ),
+        ] {
+            let t = table(short);
+            assert_eq!(
+                fingerprint_uncovered_columns(contract, t.row_path, t.fields),
+                expected,
+                "fingerprint coverage changed for {short}"
+            );
+        }
+    }
+
+    // ── Integration: the pack against a mock gateway, end to end. ───────
+
+    fn outlook_config(token_env: &str, tables: &str, resource: &str) -> OpenConnectorConfig {
+        let resource_line = if resource.is_empty() {
+            String::new()
+        } else {
+            format!("resource: {resource}")
+        };
+        serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: m365
+    source_pack: outlook
+    {resource_line}
+    tables: [{tables}]
+"#
+        ))
+        .expect("config parses")
+    }
+
+    async fn setup_with_gateway(
+        gateway: MockGateway,
+        token_env: &'static str,
+        tables: &str,
+        resource: &str,
+    ) -> (MockGateway, SessionContext) {
+        let _token = EnvVarGuard::set(token_env, "test-token");
+        let gateways = OpenConnectorGateways::default();
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&outlook_config(token_env, tables, resource)),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("gateway registration succeeds");
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
+        (gateway, ctx)
+    }
+
+    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect")
+    }
+
+    fn column_values(batches: &[RecordBatch], name: &str) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let values = batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("column {name}"))
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 column")
+                    .clone();
+                (0..values.len()).map(move |i| values.value(i).to_string())
+            })
+            .collect()
+    }
+
+    fn execute_inputs(gateway: &MockGateway, action_path: &str) -> Vec<Value> {
+        gateway
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with(action_path))
+            .map(|r| {
+                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn input_keys(input: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = input
+            .as_object()
+            .expect("input object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The full select pin, as the wire must carry it on every request.
+    fn select_json() -> Value {
+        json!([
+            "id",
+            "subject",
+            "bodyPreview",
+            "importance",
+            "isRead",
+            "isDraft",
+            "webLink",
+            "flag",
+            "from",
+            "sender",
+            "toRecipients",
+            "ccRecipients",
+            "bccRecipients",
+            "receivedDateTime",
+            "sentDateTime",
+            "createdDateTime",
+            "lastModifiedDateTime",
+            "hasAttachments",
+            "conversationId",
+            "parentFolderId",
+            "categories",
+            "internetMessageId"
+        ])
+    }
+
+    fn message_row(id: &str) -> Value {
+        json!({
+            "id": id,
+            "subject": format!("subject {id}"),
+            "isRead": false,
+            "isDraft": false,
+            "receivedDateTime": "2026-08-14T09:15:42Z",
+            "conversationId": format!("conv-{id}"),
+            "from": {"emailAddress": {"name": "Redacted", "address": "sender@example.com"}}
+        })
+    }
+
+    fn folder_row(id: &str, hidden: bool) -> Value {
+        json!({
+            "id": id,
+            "displayName": format!("Folder {id}"),
+            "parentFolderId": "root",
+            "childFolderCount": 0,
+            "unreadItemCount": 1,
+            "totalItemCount": 2,
+            "isHidden": hidden
+        })
+    }
+
+    #[tokio::test]
+    async fn messages_cursor_scan_pages_with_its_own_declared_inputs() {
+        // Two-page cursor scan pinning MESSAGES' wire declaration: no
+        // nextLink on page 1, the URI cursor verbatim afterwards, the
+        // select pin and top=100 on EVERY request (top rides
+        // continuation requests too — the executor ignores it there,
+        // but the engine sends it and this pins that shape), explicit
+        // null termination (the executor's spelling), row identity
+        // across pages, exact key sets.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let page = match body["input"].get("nextLink").and_then(Value::as_str) {
+                    None => json!({"messages": [message_row("m-1"), message_row("m-2")],
+                                    "nextLink": PAGE2_URI}),
+                    Some(uri) if uri == PAGE2_URI => {
+                        json!({"messages": [message_row("m-3")], "nextLink": null})
+                    }
+                    Some(other) => return MockResponse::new(400, format!("bad cursor {other}")),
+                };
+                return MockResponse::ok(&envelope_ok(&page.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_MESSAGES", "messages", "").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.m365.messages ORDER BY id").await;
+        assert_eq!(column_values(&batches, "id"), vec!["m-1", "m-2", "m-3"]);
+
+        let inputs = execute_inputs(&gateway, "outlook.list_messages");
+        assert_eq!(inputs.len(), 2, "two cursor pages");
+        assert_eq!(inputs[1]["nextLink"], PAGE2_URI, "the URI cursor verbatim");
+        for (page, (input, expected_keys)) in inputs
+            .iter()
+            .zip([vec!["select", "top"], vec!["nextLink", "select", "top"]])
+            .enumerate()
+        {
+            assert_eq!(input["top"], 100, "bounded page size: {input}");
+            assert_eq!(input["select"], select_json(), "select pin: {input}");
+            // Exactly the declared inputs, nothing else — filter,
+            // orderby, bodyContentType and the unbound mailFolderId
+            // must never reach a strict schema.
+            assert_eq!(input_keys(input), expected_keys, "page {} keys", page + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_folders_cursor_scan_pages_with_its_own_declared_inputs() {
+        // mail_folders' own wire pin: includeHiddenFolders=true and
+        // top=1000 on every request, plus the second end-of-collection
+        // spelling — the final page OMITS nextLink entirely (the real
+        // executor normalizes that to null; the engine accepts both,
+        // one e2e per spelling across the pack's tables).
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_mail_folders" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let page = match body["input"].get("nextLink").and_then(Value::as_str) {
+                    None => json!({"mailFolders": [folder_row("f-1", false)],
+                                    "nextLink": FOLDERS_PAGE2_URI}),
+                    Some(uri) if uri == FOLDERS_PAGE2_URI => {
+                        json!({"mailFolders": [folder_row("f-2", true)]})
+                    }
+                    Some(other) => return MockResponse::new(400, format!("bad cursor {other}")),
+                };
+                return MockResponse::ok(&envelope_ok(&page.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_OUTLOOK_FOLDERS",
+            "mail_folders",
+            "",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id, is_hidden FROM saas.m365.mail_folders ORDER BY id",
+        )
+        .await;
+        assert_eq!(column_values(&batches, "id"), vec!["f-1", "f-2"]);
+
+        let inputs = execute_inputs(&gateway, "outlook.list_mail_folders");
+        assert_eq!(inputs.len(), 2, "absent-cursor spelling terminates");
+        for (page, (input, expected_keys)) in inputs
+            .iter()
+            .zip([
+                vec!["includeHiddenFolders", "top"],
+                vec!["includeHiddenFolders", "nextLink", "top"],
+            ])
+            .enumerate()
+        {
+            assert_eq!(
+                input["includeHiddenFolders"],
+                json!(true),
+                "the state=all pin"
+            );
+            assert_eq!(input["top"], 1000);
+            assert_eq!(input_keys(input), expected_keys, "page {} keys", page + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_resource_forwards_verbatim_and_only_where_declared() {
+        // One binding carries mailFolderId: messages receives it
+        // verbatim, mail_folders — which declares no resources — never
+        // sees it (a strict schema would 400 the stray key).
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" {
+                let empty = match req.path.as_str() {
+                    "/v1/actions/outlook.list_messages" => {
+                        json!({"messages": [], "nextLink": null})
+                    }
+                    "/v1/actions/outlook.list_mail_folders" => {
+                        json!({"mailFolders": [], "nextLink": null})
+                    }
+                    _ => return MockResponse::new(404, "{}"),
+                };
+                return MockResponse::ok(&envelope_ok(&empty.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_OUTLOOK_RESOURCES",
+            "messages, mail_folders",
+            r#"{ mailFolderId: "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox" }"#,
+        )
+        .await;
+
+        for sql in [
+            "SELECT * FROM saas.m365.messages",
+            "SELECT * FROM saas.m365.mail_folders",
+        ] {
+            let batches = collect(&ctx, sql).await;
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        }
+
+        let inputs = execute_inputs(&gateway, "outlook.list_messages");
+        assert_eq!(
+            input_keys(&inputs[0]),
+            vec!["mailFolderId", "select", "top"]
+        );
+        assert_eq!(
+            inputs[0]["mailFolderId"],
+            "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox"
+        );
+
+        let inputs = execute_inputs(&gateway, "outlook.list_mail_folders");
+        assert_eq!(input_keys(&inputs[0]), vec!["includeHiddenFolders", "top"]);
+    }
+
+    #[tokio::test]
+    async fn predicates_stay_local_against_a_provider_that_cannot_narrow() {
+        // The no-pushdown guard, row identity included: a subject
+        // equality predicate never reaches the wire (no filter mappings
+        // exist — Outlook's `filter` is an OData expression no mapping
+        // can compose) and DataFusion applies it locally.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                let mut wanted = message_row("m-1");
+                wanted["subject"] = json!("needle");
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"messages": [wanted, message_row("m-2"), message_row("m-3")],
+                             "nextLink": null})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_LOCAL", "messages", "").await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.m365.messages WHERE subject = 'needle'",
+        )
+        .await;
+        assert_eq!(column_values(&batches, "id"), vec!["m-1"]);
+
+        let inputs = execute_inputs(&gateway, "outlook.list_messages");
+        assert_eq!(
+            input_keys(&inputs[0]),
+            vec!["select", "top"],
+            "the predicate stayed local; no filter/orderby key was pushed"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_stops_cursor_pagination_early() {
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                // Every page advertises another; only LIMIT can stop this.
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"messages": [message_row("m-1"), message_row("m-2")],
+                             "nextLink": PAGE2_URI})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_LIMIT", "messages", "").await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.m365.messages LIMIT 2").await;
+        assert_eq!(column_values(&batches, "id").len(), 2);
+        assert_eq!(
+            execute_inputs(&gateway, "outlook.list_messages").len(),
+            1,
+            "one page satisfied LIMIT"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_of_an_empty_mailbox_is_clean() {
+        // An empty collection is an empty result set, not an error, and
+        // still costs exactly one request per table.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" {
+                let empty = match req.path.as_str() {
+                    "/v1/actions/outlook.list_messages" => {
+                        json!({"messages": [], "nextLink": null})
+                    }
+                    "/v1/actions/outlook.list_mail_folders" => {
+                        json!({"mailFolders": [], "nextLink": null})
+                    }
+                    _ => return MockResponse::new(404, "{}"),
+                };
+                return MockResponse::ok(&envelope_ok(&empty.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_OUTLOOK_EMPTY",
+            "messages, mail_folders",
+            "",
+        )
+        .await;
+
+        for (table, action) in [
+            ("messages", "outlook.list_messages"),
+            ("mail_folders", "outlook.list_mail_folders"),
+        ] {
+            let batches = collect(&ctx, &format!("SELECT id FROM saas.m365.{table}")).await;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                0,
+                "{table}: an empty collection is an empty result set"
+            );
+            assert_eq!(
+                execute_inputs(&gateway, action).len(),
+                1,
+                "{table}: an empty page still means exactly one request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_cursor_fails_as_a_pagination_loop() {
+        // A gateway that stops advancing must fail loudly, not spin —
+        // and with URI cursors the repeated value is a graph.microsoft.com
+        // URL, not row data, so the engine's loop error may name it.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"messages": [message_row("m-1")], "nextLink": PAGE2_URI}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_LOOP", "messages", "").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.m365.messages")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a non-advancing cursor must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("pagination loop") && message.contains("RFRM9Page2"),
+            "loop identity is named: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_string_cursor_fails_as_invalid() {
+        // A present-but-non-string nextLink must fail as cursor drift,
+        // never read as end-of-collection: treating it as termination
+        // would silently truncate the scan.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"messages": [message_row("m-1")], "nextLink": 42}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_BADCUR", "messages", "").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.m365.messages")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a non-string cursor must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("$.nextLink")
+                && message.contains("a number")
+                && message.contains("not a string"),
+            "cursor path and found kind are named: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_errors_surface_through_the_gateway_failure_envelope() {
+        // error_path is None on purpose: assertOutlookResponse throws on
+        // any non-2xx, so a Graph failure (e.g. the scope misdeclaration
+        // biting a narrowly-consented token) arrives as the gateway's
+        // failure envelope — whose errorCode must reach the user, named.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                return MockResponse::new(
+                    403,
+                    envelope_err(
+                        "authorization_failed",
+                        "Access token does not carry the required scopes.",
+                    ),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_SCOPE", "messages", "").await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.m365.messages")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a missing-scope failure must fail the scan");
+        let message = err.to_string();
+        assert!(
+            message.contains("authorization_failed") && message.contains("outlook.list_messages"),
+            "the gateway's error code and the action are named: {message}"
+        );
+        assert!(
+            !message.contains("row path"),
+            "never the misleading row-path error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udtf_parity_for_mail_folders() {
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_mail_folders" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"mailFolders": [folder_row("f-1", false)], "nextLink": null})
+                        .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) =
+            setup_with_gateway(gateway, "SKARDI_TEST_OC_OUTLOOK_UDTF", "mail_folders", "").await;
+
+        let from_table = collect(
+            &ctx,
+            "SELECT id, display_name, is_hidden FROM saas.m365.mail_folders",
+        )
+        .await;
+        let from_udtf = collect(
+            &ctx,
+            "SELECT id, display_name, is_hidden \
+             FROM open_connector_query('saas', 'outlook.mail_folders', '{}')",
+        )
+        .await;
+        assert_eq!(from_table[0].schema(), from_udtf[0].schema());
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&from_table)
+                .unwrap()
+                .to_string(),
+            arrow::util::pretty::pretty_format_batches(&from_udtf)
+                .unwrap()
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn drifted_contract_fails_registration_not_the_scan() {
+        // The pin's refusal side: a gateway whose discovered output
+        // schema differs from the captured contract is refused at
+        // REGISTRATION, table and action named. (Every other e2e proves
+        // the pass side via outlook_discovery's captured contracts.)
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_OUTLOOK_DRIFT", "test-token");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&outlook_config(
+                "SKARDI_TEST_OC_OUTLOOK_DRIFT",
+                "messages",
+                "",
+            )),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("a drifted contract must fail registration");
+        let message = err.to_string();
+        assert!(
+            message.contains("outlook.messages")
+                && message.contains("outlook.list_messages")
+                && message.contains("fingerprint mismatch"),
+            "table, action, and cause are named: {message}"
+        );
+    }
+}
