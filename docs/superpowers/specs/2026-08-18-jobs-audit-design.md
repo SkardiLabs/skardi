@@ -138,18 +138,10 @@ owned by the server.
 - `GET /jobs/*` reads, run polling, cancellation — reads and control-plane
   operations, not data-touching submissions. (Cancel arguably mutates; it
   acts on a run already attributed at submission.)
-- Backfilling `require_session` onto jobs handlers: they perform **no auth
-  check at all** today, unlike `/query` and pipelines. Pre-existing as a
-  *submission* concern, but this change gives it a second edge worth stating
-  plainly: `POST /jobs/:name/run` becomes the audit ledger's only
-  unauthenticated write path. An unauthenticated caller can therefore mint
-  arbitrary `session_id` values into `query_audit` — including ones belonging
-  to real agent sessions, which the Learn stage stitches on and cannot
-  distinguish — and can queue unrate-limited work onto the store's single
-  serialized writer thread, whose stalls 503 every concurrent `/query` and
-  pipeline execute. Called out in `docs/server.md`'s ledger section so an
-  operator enabling `--query-audit-db` behind auth knows one seam is not
-  gated; the fix is a scope of its own.
+- Backfilling `require_session` onto jobs handlers. **Done as a follow-up**
+  (`2026-08-19-jobs-auth-design.md`), because this change is what made the
+  gap load-bearing: it turned `POST /jobs/:name/run` into the audit ledger's
+  only unauthenticated write path.
 - **Guaranteeing** the `job_run_id` correlation. The column exists because
   name + timestamp is ambiguous under concurrent submissions of the same
   job, and it removes that ambiguity on the happy path — but the stamp is
