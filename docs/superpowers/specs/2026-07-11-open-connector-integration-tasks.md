@@ -481,8 +481,20 @@ event carrying the scan identity and error.
       2026-08-19: live display names were all CJK, so cross-account
       folder semantics need Graph's locale-independent discriminator;
       mail_folders' coverage gap goes empty → one pinned column). Test
-      counts get pinned from CI on the next push; phase 5 review then
-      precedes ready.
+      counts from CI on `ef5125f` (`cargo llvm-cov nextest
+      --all-features`: 1864 tests plus the 237-test ignored suite, all
+      green): 368 `sources::providers::open_connector` tests, 24 of them
+      pack-scoped `…::packs::outlook`, inside a 1716-test skardi library
+      binary. Phase 5 (self-review) ran 2026-08-19 — sixteen findings,
+      fifteen fixed: vacuous test defenses (cardinality assertions arrow
+      satisfies with `""` on null slots, mapped columns with no positive
+      witness), a redaction audit that admitted an as-captured cursor or
+      `webLink` on a host-prefix match alone, doc claims the pack's own
+      fixtures contradict, and two hardcoded builtin-asset rosters
+      lagging two shipped packs. Deferred: consolidating the pack-test
+      helper quartet into `testutil` — seven-way duplication across the
+      packs, so it belongs in its own cross-pack PR rather than a
+      half-migration here.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
