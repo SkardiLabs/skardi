@@ -85,10 +85,18 @@
 //!   as a `nextLink` input/output pair: `format: uri` is enforced
 //!   before credentials, and the executor pins host
 //!   `graph.microsoft.com` plus an allowlisted path set. Termination
-//!   is the executor's explicit `null` (`readNextLink` normalizes a
-//!   missing key to null); the engine also accepts absent/empty — one
-//!   e2e per spelling across the two tables. Every fixture and mock
-//!   cursor is therefore URI-shaped: an opaque `"cursor-2"` token
+//!   has exactly ONE spelling on this service: the executor writes
+//!   `nextLink` unconditionally (`typeof payload["@odata.nextLink"]
+//!   === "string" ? … : null` — not the `readNextLink` helper, which
+//!   belongs to `one_drive`/`excel`), so a terminal page is an
+//!   explicit `null`, never an omitted key and never `""`. The engine
+//!   tolerates all three spellings for providers that use them, all
+//!   three pinned together by `pagination.rs`'s
+//!   `cursor_ends_on_missing_null_or_empty_next`; both cursor e2es
+//!   here therefore terminate on `null`, the only shape this gateway
+//!   can produce. Same doctrine covers the cursor's own form: every
+//!   fixture and mock cursor is URI-shaped, since an opaque
+//!   `"cursor-2"` token
 //!   would pass the mocks and 400 against the real gateway, the exact
 //!   mock-encoded-wrong-assumption class the original GitHub pack
 //!   shipped. The engine sends `top` on continuation requests too;
@@ -230,6 +238,52 @@ mod tests {
     // re-audits them mechanically on every run. Row shapes the live
     // wire does not produce (explicit nulls, hidden folders, the
     // schema-mismatch page) stay inline-synthetic and say so. ─
+    //
+    // ── The redaction convention, written down because the script that
+    // applied it was a one-off: the next re-capture re-derives it from
+    // here, and `fixtures_stay_redacted` enforces the mechanical half.
+    // Two rules govern every choice below — nothing carrying the
+    // mailbox's identity survives, and nothing the tests reason about
+    // changes shape.
+    //
+    // PRESERVED VERBATIM (this is what makes a capture worth more than
+    // a hand-written page): key spellings; which keys each row carries
+    // (under the select pin every field is present — emptiness is
+    // spelled "" / [], and `wellKnownName` is an explicit null on the
+    // custom folder, key present); row count and wire order (newest
+    // first); the unmapped extra `@odata.etag`; `wellKnownName`,
+    // `importance`, `flagStatus` and the other enum-ish values (Graph's
+    // vocabulary, not the account's); and Graph's habit of repeating an
+    // address as the display name (seven recipient entries here) — a
+    // quirk a hand-written page got wrong.
+    //
+    // REPLACED, deterministically and length-preserving so id handling
+    // stays honest: ids keep their real prefix and length and carry the
+    // `Synthetic` marker — messages `AQMkADAwATM3SyntheticMessage0001`
+    // padded to 144, folders and `parentFolderId` to 112,
+    // `conversationId` to 72, `@odata.etag` inside its `W/"…"` wrapper;
+    // identities become `Person N` / `personN@example.com`;
+    // `internetMessageId` becomes `<synthetic-NNNN@mail.example.com>`
+    // (brackets and subdomain kept — real ones have both); free text
+    // becomes `Synthetic subject N` / `Synthetic preview N` /
+    // `Category A`; `webLink` keeps its host and embeds the row's OWN
+    // synthetic id; timestamps are coarsened to the minute with their
+    // ordering intact. Folder `displayName`s were CJK on the live
+    // mailbox and became their English equivalents — which is exactly
+    // why `well_known_name` is a column.
+    //
+    // CURSORS: these captures terminate, so `nextLink` is null. A
+    // multi-page fixture may be added, but its cursor must be redacted
+    // like an id and carry the `Synthetic` marker — the audit admits a
+    // `graph.microsoft.com` URL on no other terms, because an
+    // as-captured cursor holds live skiptoken state and, in the
+    // folder-scoped form, a real folder id.
+    //
+    // A new placeholder family must be added to the audit's
+    // `PLACEHOLDERS` list in the same change, or the audit rejects it.
+    // Fault-injection fixtures (`messages_type_mismatch.json`) are
+    // NEVER re-captured: the wire does not produce a type-wrong row, so
+    // that page stays hand-written and synthetic. ─
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -284,11 +338,24 @@ mod tests {
         // The draft (row 8): subject and recipients are EMPTY on the
         // real wire, never null — "" and [] respectively.
         assert!(boolean(&batch, "is_draft").value(8));
+        // EMPTY, not null — the distinction is the point, and `value`
+        // alone cannot see it (a null slot also reads as ""), so the
+        // validity check carries the claim.
+        assert!(!utf8(&batch, "subject").is_null(8));
         assert_eq!(utf8(&batch, "subject").value(8), "");
         assert_eq!(utf8(&batch, "to_recipients").value(8), "[]");
         // Nested scalar paths through the loose from/sender objects.
+        // Both pairs assert positively: these four columns sit in the
+        // fingerprint coverage gap and the select pin only guards the
+        // top-level `from`/`sender` keys, so a broken `emailAddress.*`
+        // segment would surface nowhere but here.
         assert_eq!(utf8(&batch, "from_address").value(0), "person1@example.com");
         assert_eq!(utf8(&batch, "from_name").value(0), "Person 1");
+        assert_eq!(
+            utf8(&batch, "sender_address").value(0),
+            "person1@example.com"
+        );
+        assert_eq!(utf8(&batch, "sender_name").value(0), "Person 1");
         // Recipient lists survive as opaque JSON; live Graph often
         // repeats the address as the display name — shape preserved.
         let cc: Value =
@@ -313,6 +380,24 @@ mod tests {
             .expect("timestamp");
         assert!((0..9).all(|i| !ts.is_null(i)));
         assert!(ts.value(0) > ts.value(8), "wire order is newest-first");
+        // `parentFolderId` rides passthrough (coverage gap, so the
+        // fingerprint gate is blind to it) and is the documented join
+        // key to `mail_folders.id` — a silent null here answers folder
+        // accounting with an empty join rather than an error. Pin a real
+        // value, not just distinctness: a null slot reads as "".
+        assert!(
+            utf8(&batch, "parent_folder_id")
+                .value(0)
+                .starts_with("AQMkADAwATM3SyntheticFolder")
+        );
+        assert_eq!(
+            (0..9)
+                .map(|i| utf8(&batch, "parent_folder_id").value(i))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4,
+            "nine messages across four folders"
+        );
         // The reply pair (rows 1 and 7) shares a conversation.
         assert_eq!(
             utf8(&batch, "conversation_id").value(1),
@@ -397,11 +482,20 @@ mod tests {
             .downcast_ref()
             .expect("Int64 column");
         assert_eq!(counts.value(7), 5, "the five seeded inbox messages");
-        // Root-level listing: one shared parent across all nine rows.
+        // Root-level listing: one shared parent across all nine rows —
+        // the mailbox root, which is itself NOT one of the rows. Pin the
+        // id and not just the set size: `StringArray::value` returns ""
+        // for a null slot (it checks bounds, not validity), so nine
+        // nulls would also collapse to a one-element set and a vanished
+        // `parentFolderId` would pass unnoticed. This column has no
+        // select pin to lean on either — only `messages` pins select.
         let parents: std::collections::HashSet<_> = (0..9)
             .map(|i| utf8(&batch, "parent_folder_id").value(i))
             .collect();
         assert_eq!(parents.len(), 1);
+        let root = utf8(&batch, "parent_folder_id").value(0);
+        assert!(root.starts_with("AQMkADAwATM3SyntheticFolder0006"));
+        assert_eq!(root.len(), 112);
     }
 
     #[test]
@@ -414,6 +508,54 @@ mod tests {
         // identity, every URL must keep only the allowed provider
         // shapes, and any string that itself parses as JSON is decoded
         // and audited one level deeper (the Feishu round-2 lesson).
+        // Today's fixtures are clean; what this guards is the NEXT
+        // re-capture, so each rule is written to fail closed on the
+        // shapes a raw capture would actually carry.
+
+        /// BOTH halves of every `@` must be placeholders: the domain
+        /// example.com or a subdomain, the local part one of the
+        /// capture's placeholder families. Each rule here answers a way
+        /// a real identity slips through — `contains("example.com")`
+        /// passes `user@example.com.evil.tld` and lets one placeholder
+        /// vouch for a real address sharing the same string; checking
+        /// only the domain passes a half-redacted `bob.smith@example.com`
+        /// (a regex that swaps domains leaves real names behind). Tokens
+        /// are cut at the first character no address may hold, so
+        /// `<id@mail.example.com>` sheds its brackets.
+        fn is_redacted_identity(value: &str) -> bool {
+            const PLACEHOLDERS: [&str; 4] = ["person", "synthetic-", "redacted-", "sender"];
+            fn is_local_char(c: char) -> bool {
+                c.is_ascii_alphanumeric() || "._+-".contains(c)
+            }
+            fn is_domain_char(c: char) -> bool {
+                c.is_ascii_alphanumeric() || c == '.' || c == '-'
+            }
+            value.match_indices('@').all(|(at, _)| {
+                let head = &value[..at];
+                let local = &head[head.rfind(|c: char| !is_local_char(c)).map_or(0, |i| i + 1)..];
+                let tail = &value[at + 1..];
+                let domain = &tail[..tail
+                    .find(|c: char| !is_domain_char(c))
+                    .unwrap_or(tail.len())];
+                (domain == "example.com" || domain.ends_with(".example.com"))
+                    && PLACEHOLDERS.iter().any(|prefix| local.starts_with(prefix))
+            })
+        }
+
+        /// `graph.microsoft.com` is the *cursor's* host, and a cursor
+        /// copied from a capture is exactly what must never land here:
+        /// its `$skiptoken` is live mailbox state, and the
+        /// folder-scoped form embeds a real folder id. Admitting the
+        /// host wholesale would pre-authorize that leak, so a Graph URL
+        /// passes only while carrying the same redaction marker every
+        /// captured id carries — a future multi-page fixture stays
+        /// possible, an as-captured one fails.
+        fn is_redacted_url(url: &str) -> bool {
+            url.starts_with("https://outlook.live.com/owa/?ItemID=")
+                || url.starts_with("https://outlook.office365.com/owa/?ItemID=")
+                || (url.starts_with("https://graph.microsoft.com/") && url.contains("Synthetic"))
+        }
+
         fn audit(value: &Value, path: &str) {
             match value {
                 Value::Object(map) => {
@@ -431,16 +573,20 @@ mod tests {
                     assert!(s.is_ascii(), "non-ASCII string at {path}: {s:?}");
                     if s.contains('@') {
                         assert!(
-                            s.contains("example.com"),
-                            "@-bearing value at {path} is not an example.com identity: {s:?}"
+                            is_redacted_identity(s),
+                            "@-bearing value at {path} is not a redacted identity: {s:?}"
                         );
                     }
-                    if s.starts_with("http") {
+                    // Every occurrence, not just a leading one: the
+                    // capture carries `bodyPreview` (255 chars of real
+                    // mail body), where a link sits mid-sentence — ASCII
+                    // and @-free, so nothing else here would catch it.
+                    let lowered = s.to_ascii_lowercase();
+                    for (offset, _) in lowered.match_indices("http") {
+                        let url = &s[offset..];
                         assert!(
-                            s.starts_with("https://outlook.live.com/owa/?ItemID=")
-                                || s.starts_with("https://outlook.office365.com/owa/?ItemID=")
-                                || s.starts_with("https://graph.microsoft.com/"),
-                            "URL at {path} outside the allowed shapes: {s:?}"
+                            is_redacted_url(url),
+                            "URL at {path} outside the allowed shapes: {url:?}"
                         );
                     }
                     if let Ok(nested) = serde_json::from_str::<Value>(s) {
@@ -486,9 +632,16 @@ mod tests {
 
     #[test]
     fn null_parent_on_a_nested_path_becomes_sql_null() {
-        // Drafts carry no from/sender on the real wire; a nullable
-        // column behind a null (or absent) parent must become SQL NULL,
-        // never an error — the admission gate's null-parent category.
+        // SYNTHETIC, and a converter-contract pin rather than a wire
+        // shape: the live capture's draft (row 8 of `messages.json`)
+        // carries `from` and `sender` like every other row, and under
+        // the select pin no field is ever absent or null. But these
+        // paths ride `additionalProperties` passthrough, which promises
+        // nothing of the sort, so the conversion contract has to hold on
+        // its own terms — a nullable column behind a null (or absent)
+        // parent becomes SQL NULL, never an error. Deleting this test
+        // because "the wire never does that" would drop the only
+        // coverage of the admission gate's null-parent category.
         let batch = convert_page(
             table("messages"),
             &json!({"messages": [
@@ -528,6 +681,11 @@ mod tests {
                 .is_null(0)
         );
         assert!(utf8(&batch, "subject").is_null(1));
+        // The other half of that distinction needs the validity bit:
+        // were "" to collapse into SQL NULL, `value` would still hand
+        // back "" and this test — the one test for the difference —
+        // would keep passing.
+        assert!(!utf8(&batch, "body_preview").is_null(1));
         assert_eq!(utf8(&batch, "body_preview").value(1), "");
     }
 
@@ -863,31 +1021,18 @@ bindings:
     }
 
     /// The full select pin, as the wire must carry it on every request.
+    /// Derived from the pack, never transcribed: the e2e wire pins and
+    /// the YAML `select` are then the same list by construction, so a
+    /// column change touches two places (the YAML columns and the YAML
+    /// select, held together by `select_pin_mirrors_the_mapped_columns`)
+    /// and never this file — a hand-copied twenty-two-entry array is a
+    /// third place to forget.
     fn select_json() -> Value {
-        json!([
-            "id",
-            "subject",
-            "bodyPreview",
-            "importance",
-            "isRead",
-            "isDraft",
-            "webLink",
-            "flag",
-            "from",
-            "sender",
-            "toRecipients",
-            "ccRecipients",
-            "bccRecipients",
-            "receivedDateTime",
-            "sentDateTime",
-            "createdDateTime",
-            "lastModifiedDateTime",
-            "hasAttachments",
-            "conversationId",
-            "parentFolderId",
-            "categories",
-            "internetMessageId"
-        ])
+        table("messages")
+            .fixed_inputs
+            .iter()
+            .find_map(|(key, value)| (*key == "select").then(|| value.to_json()))
+            .expect("messages pins a select")
     }
 
     fn message_row(id: &str) -> Value {
@@ -900,6 +1045,34 @@ bindings:
             "conversationId": format!("conv-{id}"),
             "from": {"emailAddress": {"name": "Redacted", "address": "sender@example.com"}}
         })
+    }
+
+    /// Health, discovery, and one empty page per table — the shared stub
+    /// for e2es that assert on the *inputs* a scan sends rather than on
+    /// rows (slack's `conversations_gateway` precedent).
+    async fn empty_collections_gateway() -> MockGateway {
+        MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" {
+                let empty = match req.path.as_str() {
+                    "/v1/actions/outlook.list_messages" => {
+                        json!({"messages": [], "nextLink": null})
+                    }
+                    "/v1/actions/outlook.list_mail_folders" => {
+                        json!({"mailFolders": [], "nextLink": null})
+                    }
+                    _ => return MockResponse::new(404, "{}"),
+                };
+                return MockResponse::ok(&envelope_ok(&empty.to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await
     }
 
     fn folder_row(id: &str, hidden: bool) -> Value {
@@ -971,10 +1144,14 @@ bindings:
     #[tokio::test]
     async fn mail_folders_cursor_scan_pages_with_its_own_declared_inputs() {
         // mail_folders' own wire pin: includeHiddenFolders=true and
-        // top=1000 on every request, plus the second end-of-collection
-        // spelling — the final page OMITS nextLink entirely (the real
-        // executor normalizes that to null; the engine accepts both,
-        // one e2e per spelling across the pack's tables).
+        // top=1000 on every request, terminating on the one spelling
+        // outlook actually emits. The executor writes `nextLink`
+        // unconditionally (`typeof payload["@odata.nextLink"] ===
+        // "string" ? … : null`), so an omitted key is a shape this
+        // gateway cannot produce and has no business in a mock; the
+        // engine's tolerance for the omitted and empty-string spellings
+        // is pinned where it belongs, in `pagination.rs`'s
+        // `cursor_ends_on_missing_null_or_empty_next`.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -988,7 +1165,7 @@ bindings:
                     None => json!({"mailFolders": [folder_row("f-1", false)],
                                     "nextLink": FOLDERS_PAGE2_URI}),
                     Some(uri) if uri == FOLDERS_PAGE2_URI => {
-                        json!({"mailFolders": [folder_row("f-2", true)]})
+                        json!({"mailFolders": [folder_row("f-2", true)], "nextLink": null})
                     }
                     Some(other) => return MockResponse::new(400, format!("bad cursor {other}")),
                 };
@@ -1013,7 +1190,7 @@ bindings:
         assert_eq!(column_values(&batches, "id"), vec!["f-1", "f-2"]);
 
         let inputs = execute_inputs(&gateway, "outlook.list_mail_folders");
-        assert_eq!(inputs.len(), 2, "absent-cursor spelling terminates");
+        assert_eq!(inputs.len(), 2, "the null cursor terminates the scan");
         for (page, (input, expected_keys)) in inputs
             .iter()
             .zip([
@@ -1037,30 +1214,8 @@ bindings:
         // One binding carries mailFolderId: messages receives it
         // verbatim, mail_folders — which declares no resources — never
         // sees it (a strict schema would 400 the stray key).
-        let gateway = MockGateway::start(|req| {
-            if req.method == "GET" && req.path == "/v1/health" {
-                return MockResponse::ok("{}");
-            }
-            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return outlook_discovery(&req.path);
-            }
-            if req.method == "POST" {
-                let empty = match req.path.as_str() {
-                    "/v1/actions/outlook.list_messages" => {
-                        json!({"messages": [], "nextLink": null})
-                    }
-                    "/v1/actions/outlook.list_mail_folders" => {
-                        json!({"mailFolders": [], "nextLink": null})
-                    }
-                    _ => return MockResponse::new(404, "{}"),
-                };
-                return MockResponse::ok(&envelope_ok(&empty.to_string()));
-            }
-            MockResponse::new(404, "{}")
-        })
-        .await;
         let (gateway, ctx) = setup_with_gateway(
-            gateway,
+            empty_collections_gateway().await,
             "SKARDI_TEST_OC_OUTLOOK_RESOURCES",
             "messages, mail_folders",
             r#"{ mailFolderId: "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox" }"#,
@@ -1168,30 +1323,8 @@ bindings:
     async fn scan_of_an_empty_mailbox_is_clean() {
         // An empty collection is an empty result set, not an error, and
         // still costs exactly one request per table.
-        let gateway = MockGateway::start(|req| {
-            if req.method == "GET" && req.path == "/v1/health" {
-                return MockResponse::ok("{}");
-            }
-            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
-                return outlook_discovery(&req.path);
-            }
-            if req.method == "POST" {
-                let empty = match req.path.as_str() {
-                    "/v1/actions/outlook.list_messages" => {
-                        json!({"messages": [], "nextLink": null})
-                    }
-                    "/v1/actions/outlook.list_mail_folders" => {
-                        json!({"mailFolders": [], "nextLink": null})
-                    }
-                    _ => return MockResponse::new(404, "{}"),
-                };
-                return MockResponse::ok(&envelope_ok(&empty.to_string()));
-            }
-            MockResponse::new(404, "{}")
-        })
-        .await;
         let (gateway, ctx) = setup_with_gateway(
-            gateway,
+            empty_collections_gateway().await,
             "SKARDI_TEST_OC_OUTLOOK_EMPTY",
             "messages, mail_folders",
             "",
@@ -1335,6 +1468,72 @@ bindings:
         assert!(
             !message.contains("row path"),
             "never the misleading row-path error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_first_page_fails_the_whole_scan() {
+        // The pack's loudest live finding — a folder-scoped scan 400ing
+        // on page two against the gateway's own cursor — is a MID-scan
+        // failure, and every "loud, never silent" promise in this file
+        // rests on the engine failing the scan instead of serving page
+        // one as the whole collection. Nothing pinned that arm: the
+        // engine's own failure test fails on the FIRST request
+        // (`pages_fetched: 0`), and the loop/drift tests fail on the
+        // cursor's shape rather than on a page that never arrives. So
+        // this replays the real defect's envelope, one page in.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return outlook_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/outlook.list_messages" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                if body["input"].get("nextLink").is_none() {
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({"messages": [message_row("m-1"), message_row("m-2")],
+                                 "nextLink": PAGE2_URI})
+                        .to_string(),
+                    ));
+                }
+                return MockResponse::new(
+                    400,
+                    envelope_err(
+                        "provider_request_failed",
+                        "nextLink must target Outlook message pagination endpoints",
+                    ),
+                );
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_OUTLOOK_PAGE_TWO_FAILS",
+            "messages",
+            "",
+        )
+        .await;
+
+        let err = ctx
+            .sql("SELECT id FROM saas.m365.messages")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a failure on page two must fail the scan, never truncate it");
+        let message = err.to_string();
+        assert!(
+            message.contains("provider_request_failed")
+                && message.contains("outlook.list_messages"),
+            "the gateway's error code and the action are named: {message}"
+        );
+        assert_eq!(
+            execute_inputs(&gateway, "outlook.list_messages").len(),
+            2,
+            "the scan reached page two — page one's rows are not a result"
         );
     }
 

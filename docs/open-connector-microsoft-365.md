@@ -126,7 +126,10 @@ gateway validates it as `format: uri` before credentials, and the
 executor pins the host to `graph.microsoft.com` plus an allowlisted
 path set — a binding can neither follow a foreign link nor be given
 one. Termination is the executor's explicit `nextLink: null` on the
-final page (absent and empty spellings also terminate). A non-advancing
+final page, and that is the only spelling this service produces — the
+executor writes the key unconditionally, so it never omits it and never
+sends `""` (Skardi's engine accepts those spellings from providers that
+do use them). A non-advancing
 gateway fails as a pagination loop; a present-but-non-string cursor
 fails as cursor drift, never as end-of-collection. Continuation
 requests still carry `top` (the engine sends the page size on every

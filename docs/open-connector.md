@@ -30,8 +30,9 @@ gateway **runtime token**.
 > drafts, labels, filters — message bodies are deferred to a
 > content-oriented surface),
 > and [Outlook](open-connector-microsoft-365.md) (messages, mail
-> folders — live verification pending; message bodies deferred as on
-> Gmail, the `one_drive` and `excel` services gated per the pack doc).
+> folders — live-verified against a real MSA mailbox; message bodies
+> deferred as on Gmail, the `one_drive` and `excel` services gated per
+> the pack doc).
 > Further provider packs (Google Calendar,
 > Google Drive, Jira, …) ship one pack per release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);

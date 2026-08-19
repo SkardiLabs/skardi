@@ -446,10 +446,15 @@ event carrying the scan identity and error.
       queryable); zero filter mappings (OData `$filter` expressions cannot be
       composed by a scalar mapping — Notion precedent); input schemas captured
       from the pinned gateway (`contracts/inputs/`) with the gmail-style
-      acceptance test; fingerprint sync + coverage-gap pins (mail_folders
-      empty; messages' thirteen passthrough/nested columns an explicit set);
-      synthetic six-category fixtures; per-table cursor e2e with exact
-      key-set wire pins, both termination spellings, loop/invalid-cursor
+      acceptance test; fingerprint sync + coverage-gap pins (mail_folders one
+      column, `well_known_name`; messages' thirteen passthrough/nested columns
+      an explicit set); redacted live-capture fixtures (nine messages, nine
+      root folders) re-audited every run by `fixtures_stay_redacted`, with the
+      shapes the live wire cannot produce (explicit nulls, a hidden folder, the
+      type-mismatch page) kept inline-synthetic; per-table cursor e2e with exact
+      key-set wire pins, termination on the executor's one spelling (explicit
+      `null` — the engine's tolerance for absent/empty is pinned in
+      `pagination.rs`, not re-mocked here), loop/invalid-cursor
       failure arms, LIMIT early-stop, resource forwarding/withholding,
       no-pushdown row identity, gateway failure-envelope surfacing, UDTF
       parity, drift-refusal at registration. Note `outlook.list_messages`
@@ -487,13 +492,14 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.5 (Gmail pack — threads, messages, drafts,
-  labels, filters). Milestones 1–4 and 5.1–5.4 (GitHub, Slack, Notion,
-  Feishu packs) are merged; this PR adds the first Google Workspace pack against
-  Open Connector's normalized Gmail contract (reconciled live and
-  verified end to end against a real mailbox), plus the one engine
-  extension it required (the loader's `single_page` strategy spelling
-  for actions that declare no pagination inputs).
+- **Current PR**: milestone 5.7 (Outlook pack — messages, mail_folders).
+  Milestones 1–4 and 5.1–5.6 (GitHub, Slack, Notion, Feishu, Gmail,
+  Discord packs) are merged; this PR adds the first Microsoft 365 pack
+  over raw Graph passthrough rows (reconciled live and verified end to
+  end against a real MSA mailbox), with zero engine changes — the
+  pack-shaping decisions are the messages `select` pin and the
+  one-pack-per-OC-service split (`one_drive` follows as its own
+  milestone; the whole `excel` service is deferred at the gate).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in
