@@ -240,6 +240,57 @@ all — Dropbox sizes them from the request that opened the listing.
 `shared_links` has no page-size input, so its `page_size` is an inert
 placeholder.
 
+### Bounding the cost of a scan
+
+**Read this before the first `SELECT * FROM dropbox.files` on a real
+account.** This pack's `files` table pins `recursive: true` and takes no
+column predicate, so an unqualified scan walks the **entire account**,
+every folder, from the bound `path` down. It is the pack most in need of
+a bound and the one whose bound is easiest to get wrong, because page
+size is the only lever in play.
+
+The arithmetic, with the default safety bounds
+(`max_pages: 100`, `max_rows: 100000`):
+
+| Account size | Pages at `limit: 2000` | Under the defaults |
+|---|---|---|
+| 10,000 entries | 5 | fine |
+| 100,000 entries | 50 | at the `max_rows` edge — the scan **fails** on the entry that crosses 100,000 |
+| 500,000 entries | 250 | fails at `max_pages: 100` |
+
+Per the fail-don't-truncate rule, a collection larger than the bounds
+surfaces as `ScanBoundsExceeded`, never as a silently partial result — so
+an over-large account is an error you see, not rows you quietly miss.
+Note that "entries" counts **files and folders**, not files: a deep tree
+inflates the count well past what a user would call their file count.
+
+Three ways to keep a scan bounded, in the order worth trying:
+
+1. **Bind a narrower `path`.** The binding's `path` resource is the only
+   true scoping lever this table has — `/Engineering` instead of `/`
+   turns a whole-account walk into a subtree walk. A separate binding per
+   subtree is cheap.
+2. **Push a `LIMIT`.** It stops pagination as soon as enough rows are
+   emitted, before the next request is issued — the live pass confirmed a
+   two-page scan collapsing to `pages=1 rows=1`. Note this is a *scan*
+   bound, not a *selection* bound: which rows you get is Dropbox's
+   traversal order, not yours.
+3. **Raise the bounds deliberately.** `max_pages` / `max_rows` in the
+   gateway's `open_connector:` block, documented in
+   [the integration guide](open-connector.md#bounds-retries-and-errors).
+   Raise them because you decided the account is that large, not because
+   a scan failed.
+
+Every predicate in a `WHERE` clause is evaluated **locally, after** the
+fetch — this pack declares no filters (Dropbox's list endpoints expose no
+faithful column predicate), so `WHERE name = 'x'` narrows the result and
+not the scan. `file_search` is the table that pushes a search term, via
+its required `query` resource.
+
+`shared_links` and `file_search` are bounded by the account's link count
+and by Dropbox's own result cap respectively, and neither is a recursive
+walk; the arithmetic above is about `files`.
+
 ## Authorization
 
 The gateway's dropbox provider uses OAuth against a Dropbox app the
@@ -263,9 +314,22 @@ as the union of every `dropbox.*` action's permissions, so its authorize
 request asks for all six — `account_info.read`, `files.metadata.read`,
 `files.content.read`, `files.content.write`, `sharing.read`,
 `sharing.write`. A connection created through that flow therefore carries
-write access this pack never exercises; narrowing it is a gateway-side
-change, not a pack setting. Every permission change invalidates the grant
-snapshot — re-run the authorization rather than debugging a stale token.
+write access this pack never exercises; narrowing the gateway's *request*
+is a gateway-side change, not a pack setting.
+
+**You can still enforce least privilege, one level up.** Dropbox grants
+the intersection of what the authorize request asks for and what the app
+declares, so ticking only `files.metadata.read` and `sharing.read` on the
+app's **Permissions** tab caps every token that app can ever mint — the
+gateway asking for six does not widen a grant the app cannot make.
+Provision this pack against an app scoped to those two, not against a
+shared app carrying the write scopes for something else. The cost of
+skipping this is real: a leaked or misused token from a fully-scoped app
+can mutate the account's Dropbox, and the pack would never notice,
+because it never calls a write action.
+
+Every permission change invalidates the grant snapshot — re-run the
+authorization rather than debugging a stale token.
 
 Self-check that the gateway build carries all five actions before
 debugging anything else (a too-old gateway fails registration with
@@ -289,7 +353,22 @@ gateway *failure* envelopes rather than as HTTP 200 rows. No table
 declares an `error_path`, and the provider's own code arrives through the
 gateway-failure path.
 
-The client's bounded retry/backoff handles transient 429/5xx envelopes.
+**Retries on the execute path are narrower than on the discovery path,
+and the difference matters for a throttled Dropbox scan.** A `429` is a
+pre-execution rate-limit rejection — nothing ran — so it is retried, with
+`Retry-After` honored when present and bounded exponential backoff with
+jitter otherwise, both capped. A `5xx` on an execute call is **terminal**:
+the action may have run, and re-sending could re-execute it, so the scan
+fails rather than risking a duplicate. (Health and discovery calls are
+idempotent and do retry 5xx.) Retries are also bounded by the scan
+deadline, so a long `Retry-After` cannot outlast the scan.
+
+The practical consequence: sustained Dropbox throttling exhausts the
+retry budget and the scan fails with a retry-exhausted error. The remedy
+is to re-run the query — completed scans are cached, so a retry does not
+re-fetch what already succeeded — or to narrow the scan per
+[Bounding the cost of a scan](#bounding-the-cost-of-a-scan).
+
 Scans fetch pages on demand and stop early under `LIMIT`; completed scans
 are cached per the scan cache's usual keying (binding, table, pushed
 inputs, projection, LIMIT).

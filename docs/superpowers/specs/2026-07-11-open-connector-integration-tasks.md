@@ -743,9 +743,21 @@ event carrying the scan identity and error.
       DIFFERENT action (`list_folder` → `list_folder_continue`) and, with
       `inputs: cursor_only`, carry the cursor and nothing else. Both actions
       are discovered and fingerprint-gated at both gate call sites; because a
-      fingerprint hashes the OUTPUT schema, `cursor_only` is additionally
-      checked against the continuation action's discovered INPUT schema
-      (cursor declared, nothing else `required`, no-input-schema refused).
+      fingerprint hashes the OUTPUT schema, the INPUT side is checked
+      separately against the continuation action's discovered input schema,
+      in BOTH directions of `inputs:` — `cursor_only` (cursor declared,
+      nothing else `required`) and `full` when it targets a different action
+      (the table's guaranteed keys satisfy `required`; under
+      `additionalProperties: false` every key it can send is declared).
+      A missing input schema is refused, as is a `required` that is present
+      but not an array of strings. Three loader-side authoring refusals
+      beyond the parse-level ones: a continuation pinned while the table's
+      own action is not; a same-action continuation pinning a DIFFERENT
+      fingerprint (unsatisfiable — one action, one contract); and
+      `cursor_only` paired with an `Exact`-fidelity filter, which would
+      apply the predicate on page one, drop it on pages 2..N, and have no
+      `Filter` node left to re-apply it — silently returning rows the query
+      excluded.
       Because the rows are normalized and strictly declared, every mapped
       column sits inside the fingerprint gate and the coverage-gap pin is
       empty. That is narrower than it sounds, and the live pass proved it:
@@ -767,14 +779,13 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 ## Review notes
 
 - **Current PR**: milestone 5.10 (Dropbox pack + `pagination.continuation`)
-  — open as #216, **not live-verified**; see the entry above.
+  — open as #216, live-verified 2026-08-18; see the entry above.
   Milestones 1–4 and 5.1–5.9 (GitHub, Slack, Notion, Feishu, Gmail,
   Discord, Outlook, OneDrive, Google Drive packs) are merged; this PR adds
-  the Dropbox pack against Open Connector's normalized Dropbox contract
-  (reconciled against the v1.3.5 provider source only), plus the one engine
-  extension it required: `pagination.continuation`, which lets pages 2..N
-  target a different action and, with `inputs: cursor_only`, carry the
-  cursor alone.
+  the Dropbox pack against Open Connector's normalized Dropbox contract,
+  plus the one engine extension it required: `pagination.continuation`,
+  which lets pages 2..N target a different action and, with
+  `inputs: cursor_only`, carry the cursor alone.
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

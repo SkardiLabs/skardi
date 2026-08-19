@@ -209,15 +209,20 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
         // Same discovery and compatibility gates as YAML registration: every
         // action the table executes must have been discovered when the
         // gateway registered, and must still match the pack's expected
-        // contract fingerprint. Iterating `gated_actions()` — the same
-        // helper the YAML path uses — is what keeps a drifted continuation
-        // action from being refused by one path and admitted by the other.
+        // contract fingerprint.
+        //
+        // The loop is driven by `actions()`, NOT by `gated_actions()`,
+        // because an UNPINNED table still has to have been discovered and
+        // `gated_actions()` skips it. The expectation is looked up inside
+        // by action id, so the two paths check the same pairs — with one
+        // caveat that the loader is what closes: a lookup by id can only
+        // return one expectation per id, so a same-action continuation
+        // pinning a fingerprint different from the table's own would be
+        // half-checked here. `packs::loader` refuses that combination at
+        // registration (it is unsatisfiable by any gateway anyway), which
+        // is what makes this lookup equivalent to iterating the pairs.
         for action_id in table.actions() {
             let meta = discovered_action(&handle, &gateway, action_id)?;
-            // `gated_actions()` yields the table's own action only when it
-            // pins a fingerprint, so an unpinned table still has to be
-            // discovered above — that is why discovery drives the loop and
-            // the expectation is looked up inside it.
             if let Some((_, expected)) = table.gated_actions().find(|(id, _)| *id == action_id)
                 && meta.fingerprint() != expected
             {
@@ -235,6 +240,9 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
             if table.continuation.is_some_and(|c| c.action_id == action_id) {
                 table
                     .check_continuation_inputs(meta.input_schema())
+                    .map_err(plan_error)?;
+                table
+                    .check_full_continuation_inputs(meta.input_schema())
                     .map_err(plan_error)?;
             }
         }

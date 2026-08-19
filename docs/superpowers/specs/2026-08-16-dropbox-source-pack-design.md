@@ -1,15 +1,16 @@
 # Dropbox Source Pack (milestone 5.5)
 
-**Status:** Steps 1, 3, 4 landed (engine extension, pack, docs). Steps 2
-(contract capture) and 5 (live verification) remain BLOCKED on a Node
-runtime and a Dropbox account — so every fingerprint in the shipped pack
-is source-derived and will fail the contract gate against a real gateway
-until re-pinned. Runbook for the blocked steps:
+**Status:** ALL SIX STEPS LANDED. Steps 1, 3, 4 (engine extension, pack,
+docs) shipped first; steps 2 and 5 (contract capture, live verification)
+were unblocked once a Node runtime and a Dropbox account became
+available, and RAN on 2026-08-18 — every fingerprint in the shipped pack
+is now a hash of a live capture, and registration passed the contract
+gate unchanged. Run record:
 [2026-08-18-dropbox-live-evaluation.md](../plans/2026-08-18-dropbox-live-evaluation.md).
-**Date:** 2026-08-16 (status updated 2026-08-18)
+**Date:** 2026-08-16 (status updated 2026-08-19)
 **Branch:** `feature/open-connector-dropbox-pack`
 **Gateway reconciled against:** oomol-lab/open-connector **v1.3.5** (source
-read; live probe still outstanding — see [Open questions](#open-questions)
+read, then probed live at commit `a3efa99` — see [Open questions](#open-questions)
 and the [live-evaluation runbook](../plans/2026-08-18-dropbox-live-evaluation.md))
 
 ## Summary
@@ -335,24 +336,23 @@ the docs, and a `/code-review` pass on the diff.
 
 ## Open questions
 
-1. **`list_shared_links` with both `path` and `cursor`.** STILL OPEN. The
-   shipped pack declares no `continuation` for this table, i.e. it ships
-   the inference that the combination is accepted; the yaml and module doc
-   label it as an inference rather than an observation. The executor
-   `compactObject`s them together, but Dropbox may reject the combination.
-   If it does, this table needs `continuation: {inputs: cursor_only}` as
-   well — which the proposed design already spells without a code change.
-   Resolvable only on the live wire.
-2. **`list_folder` cursor lifetime.** Dropbox cursors can expire or be
-   invalidated mid-listing; a long recursive scan may hit it. Behavior and
-   whether it warrants a documented bound is a phase-4 observation.
-3. **Can `matches[].metadata` be null?** NEW, found in self-review. The
-   derived contract declares it a required non-nullable object, and
-   `file_search` maps `tag`/`name` as `nullable: false` on that basis — so
-   a real null-metadata match would fail the scan rather than yield NULLs.
-   `file_search_null_parent.json` is labelled synthetic and pins the
-   converter's behavior if it ever happens. If the wire can null it, those
-   two columns become nullable and the fixture graduates to a capture.
+1. **`list_shared_links` with both `path` and `cursor`.** ANSWERED YES
+   on the wire, 2026-08-18. Dropbox accepts the combination, so this table
+   correctly ships with no `continuation` block and needs no
+   `inputs: cursor_only`. The yaml and module doc now record it as an
+   observation rather than an inference.
+2. **`list_folder` cursor lifetime.** ANSWERED as a lower bound only,
+   2026-08-18: a cursor replayed ~40 minutes later — after files and
+   shared links had been added to the listed tree — still returned rows.
+   No upper bound was established, so this is documented in
+   `docs/open-connector-dropbox.md` as a lower bound and not as a
+   guarantee. No pack change warranted.
+3. **Can `matches[].metadata` be null?** ANSWERED NO, 2026-08-18: the
+   executor always returns a full metadata object, so
+   `file_search.tag`/`name` stay `nullable: false` and the mapping stands.
+   `file_search_null_parent.json` therefore stays SYNTHETIC permanently —
+   it pins the converter's behavior against a shape the contract forbids,
+   which is its purpose, not a placeholder awaiting a capture.
 4. **Whether `recursive: true` is the right pin** — the alternative is
    pinning it off and making the subtree the user's choice via a second
    table. Flagging because it is the single most consequential contract
@@ -438,10 +438,12 @@ UDTF-path equivalent.
 **Gate:** full `cargo test -p skardi --lib` green before any pack work —
 this step touches the engine every pack rides on.
 
-### Step 2 — Contract capture (blocked: needs Node)
+### Step 2 — Contract capture — DONE (2026-08-18)
 
-Prerequisite: a Node runtime (none installed — `node`/`npm` absent).
-Then, from the open-connector v1.3.5 checkout: start the gateway, capture
+All five contracts captured from a live gateway at commit `a3efa99` and
+committed to `packs/fixtures/dropbox/contracts/`; each came back
+byte-identical to the source-derived schema it replaced, so no pin
+changed. What the step called for, as executed: from the open-connector v1.3.5 checkout: start the gateway, capture
 `data.outputSchema` for all five actions (`list_folder`,
 `list_folder_continue`, `list_shared_links`, `search_files`,
 `search_files_continue`) into `packs/fixtures/dropbox/contracts/`,
@@ -498,9 +500,20 @@ tasks-spec entry per A3 — left unticked until step 5 passes, since the
 entry's verification blurb must state live status honestly; the
 supported-packs paragraph in `docs/open-connector.md`.
 
-### Step 5 — Live verification (blocked: needs Node + a Dropbox account)
+### Step 5 — Live verification — DONE (2026-08-18)
 
-Needs from the user: the Node runtime (step 2's) and a free Dropbox
+Ran against a self-hosted gateway at commit `a3efa99` and a real
+free-tier Dropbox account. The outcome in full is recorded in the
+module-doc provenance banner in `packs/dropbox.rs` and in the run record;
+in short: all five fingerprints matched live discovery unchanged, all
+three tables scanned real rows, page sizes were probed at the boundary,
+real multi-page pagination ran through `list_folder_continue`, and the
+pass DROPPED four `shared_links` columns it found could never populate.
+Two claims stayed unobserved rather than confirmed
+(`shared_links.expires_at`, `file_search.match_type = 'content'`), and
+one gateway defect was filed upstream
+(oomol-lab/open-connector#358). What the step called for, as executed: a
+free Dropbox
 account with an OAuth app carrying `files.metadata.read` +
 `sharing.read`, configured in the gateway (`PUT /api/connections/dropbox`
 — user-held; I never touch the credential). Then, per table: probe at the
@@ -534,6 +547,8 @@ engine extensions shipping inside the pack PR that needs them:
 2. `feat(sources): Dropbox source pack — files, shared_links, file_search`
 3. `docs(sources): Dropbox pack docs + milestone 5.5 entry`
 
-Steps 1, 3, 4 are executable now, in order, with placeholder pins.
-Steps 2 and 5 are blocked on the two user-provided prerequisites; the
-PR stays Draft until step 5 completes.
+Steps 1, 3, 4 landed first, in order, with placeholder pins. Steps 2 and
+5 were blocked at authoring time on two user-provided prerequisites; both
+arrived, both steps ran on 2026-08-18, and the placeholder pins were
+replaced by live captures in the same pass (they turned out identical, so
+no pin text changed).

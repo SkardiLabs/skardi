@@ -15,10 +15,14 @@
 //!   registration passed the contract gate on the first try. The
 //!   `*_continue.json` files being identical to their openers is a fact
 //!   about the wire, not an artifact of how they were derived;
-//! - all three tables scanned real rows, and every mapped column carried a
-//!   real non-NULL value somewhere — 12/12 on `files` (378 rows), 13/13 on
-//!   `file_search`, and 11/11 on `shared_links` AFTER the live pass removed
-//!   four columns that cannot populate (see the `shared_links` note below);
+//! - all three tables scanned real rows, and every column the pack
+//!   DECLARES carried a real non-NULL value somewhere — 12/12 on `files`
+//!   (378 rows) and 13/13 on `file_search`. `shared_links` is 11/11 of
+//!   what it declares, and it declares 11 because the pass DROPPED four
+//!   columns it found could never populate: the denominator was cut to
+//!   fit the observation, so read this as "nothing shipped is
+//!   structurally always-NULL", not as coverage of the surface the pack
+//!   originally declared (see the `shared_links` note below);
 //! - the declared page sizes are the wire's maxima, probed at the boundary:
 //!   `limit: 2000` and `maxResults: 1000` return rows, 2001 and 1001 are
 //!   refused;
@@ -180,19 +184,19 @@
 //!   executor (`readObjectArray`, which returns `[]` and never null).
 //!   Recorded as a wire-vs-contract contradiction; not worth a column.
 //!
-//! - **`file_search`'s `metadata` nullability is UNRESOLVED, and it is
-//!   the one open question that can fail a live scan.** The derived
+//! - **`file_search`'s `metadata` nullability was the one open question
+//!   that could fail a live scan; the pass CLOSED it.** The captured
 //!   contract declares `matches[].metadata` a required, non-nullable
 //!   object, and `tag` / `name` are mapped `nullable: false` on that
 //!   basis — so a real `metadata: null` row would fail the scan rather
-//!   than yield NULLs. `fixtures/dropbox/file_search_null_parent.json` is
-//!   a SYNTHETIC probe of that path (it encodes a shape the derived
-//!   contract says cannot occur, deliberately, like the schema-mismatch
-//!   fixture): it proves the converter names the offending non-nullable
-//!   column instead of quietly emitting an all-NULL row. If the live pass
-//!   finds that Dropbox can null a match's metadata, `tag` and `name`
-//!   become nullable and that fixture graduates from synthetic to
-//!   captured.
+//!   than yield NULLs. It cannot occur: the executor always builds a full
+//!   metadata object, so the mapping stands.
+//!   `fixtures/dropbox/file_search_null_parent.json` therefore stays a
+//!   SYNTHETIC probe, permanently (it encodes a shape the contract says
+//!   cannot occur, deliberately, like the schema-mismatch fixture): it
+//!   pins that IF the gateway ever drifted into producing one, the
+//!   converter names the offending non-nullable column instead of quietly
+//!   emitting an all-NULL row.
 //!
 //! - **No `error_path` anywhere.** `dropboxRpcRequest` throws on any
 //!   non-2xx, so Dropbox's in-band `error_summary` envelope AND its 429
@@ -392,8 +396,9 @@ mod tests {
 
         // shared_links takes the cursor on its OWN action — the executor
         // `compactObject`s `{path, cursor}` together and the schema
-        // declares both — so it needs no continuation. Inference from the
-        // source, not a wire observation: design spec open question 1.
+        // declares both — so it needs no continuation. CONFIRMED on the
+        // wire 2026-08-18 (design-spec open question 1, now closed):
+        // `list_shared_links` accepts `path` and `cursor` together.
         let shared = table("shared_links");
         assert!(shared.continuation.is_none());
         assert_eq!(shared.gated_actions().count(), 1);
@@ -539,12 +544,36 @@ mod tests {
 
     #[test]
     fn empty_page_converts_to_zero_rows() {
+        // Through the real row path, off a real fixture page — this is
+        // the `files` arm, which also pins that `$.entries: []` resolves
+        // rather than erroring as a missing row path.
         let batch = convert_fixture(
             table("files"),
             include_str!("fixtures/dropbox/files_empty.json"),
         );
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.schema().fields().len(), table("files").fields.len());
+    }
+
+    #[test]
+    fn every_table_converts_an_empty_page_and_keeps_its_schema() {
+        // The sibling packs' pin (`github.rs`, `slack.rs`), applied to all
+        // three tables rather than just the one with an empty fixture: an
+        // empty result must keep the STABLE schema, or a query over an
+        // empty account changes shape.
+        for table in pack().expect("embedded asset parses").tables {
+            let batch = RowConverter::new(table.fields)
+                .expect("converter")
+                .convert(&[], 1)
+                .expect("empty page");
+            assert_eq!(batch.num_rows(), 0, "{}", table.id);
+            assert_eq!(
+                batch.schema().fields().len(),
+                table.fields.len(),
+                "{} keeps its stable schema on empty results",
+                table.id
+            );
+        }
     }
 
     #[test]
@@ -627,17 +656,23 @@ mod tests {
     }
 
     #[test]
-    fn a_null_metadata_parent_nulls_its_children_not_the_scan() {
+    fn a_null_metadata_parent_fails_the_scan_naming_the_non_nullable_column() {
         // The null-parent category. The fixture is SYNTHETIC on purpose:
         // the derived contract declares `matches[].metadata` a required,
         // non-nullable object, so this shape is one the gateway is not
         // supposed to produce — like the schema-mismatch fixture. What it
-        // pins is the converter's behavior IF it ever does: `metadata:
-        // null` makes every nested NULLABLE column SQL NULL, and the
-        // non-nullable ones (tag, name) fail loudly, because a quiet
-        // all-NULL row would hide the drift. If the live pass finds that
+        // pins is the converter's behavior IF it ever does: the row is
+        // NOT produced. `tag` is mapped `nullable: false` under that
+        // parent, so the conversion fails and names the column, because a
+        // quiet all-NULL row would hide the drift.
+        //
+        // Nothing here asserts what a null parent does to the NULLABLE
+        // columns beside it — the conversion short-circuits before any
+        // batch exists, so that is unobservable from this fixture and is
+        // deliberately not claimed. If the live pass ever finds that
         // Dropbox can null a match's metadata, `tag`/`name` become
-        // nullable and this fixture graduates to a real capture.
+        // nullable, this fixture graduates to a real capture, and THAT is
+        // the test that would pin the surviving columns.
         let table = table("file_search");
         let page: Value = serde_json::from_str(include_str!(
             "fixtures/dropbox/file_search_null_parent.json"
@@ -903,9 +938,15 @@ bindings:
 
     #[tokio::test]
     async fn shared_links_pages_through_its_own_action_with_the_full_input() {
-        // The contrast case: this action takes the cursor itself, so no
-        // continuation is declared and page two repeats the action with
-        // its resources intact.
+        // The contrast case to the `files` split-action test: this action
+        // takes the cursor itself, so no continuation is declared and page
+        // two repeats the action with its resources INTACT.
+        //
+        // The binding therefore has to bind resources. With none bound,
+        // page two's input is `{cursor}` either way and the test would
+        // stay green against a `cursor_only` continuation — i.e. it could
+        // not fail if the behavior it names regressed. Both resources are
+        // bound below and page two is asserted to still carry them.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -928,12 +969,33 @@ bindings:
             MockResponse::new(404, "{}")
         })
         .await;
-        let (gateway, ctx) = setup_with_gateway(
-            gateway,
-            "SKARDI_TEST_OC_DROPBOX_SHARED_LINKS",
-            "shared_links",
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_DROPBOX_SHARED_LINKS", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_DROPBOX_SHARED_LINKS
+bindings:
+  - name: ws
+    source_pack: dropbox
+    resource:
+      path: /Redacted Folder/redacted-report.pdf
+      directOnly: true
+    tables: [shared_links]
+"#,
         )
-        .await;
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("registration succeeds");
 
         let batches = collect(&ctx, "SELECT name FROM saas.ws.shared_links ORDER BY name").await;
         assert_eq!(names_of(&batches), vec!["l1", "l2"]);
@@ -946,8 +1008,21 @@ bindings:
                 "both pages use the same action"
             );
         }
-        assert!(calls[0].1.get("cursor").is_none());
-        assert_eq!(calls[1].1["cursor"], json!("sl-2"));
+        // The assertion the test is named for: page two is the FULL input,
+        // not just the cursor. Compared as whole objects, so a resource
+        // silently dropped on continuation goes red here.
+        assert_eq!(
+            calls[0].1,
+            json!({"path": "/Redacted Folder/redacted-report.pdf", "directOnly": true}),
+            "page one carries both resources and no cursor"
+        );
+        assert_eq!(
+            calls[1].1,
+            json!({"path": "/Redacted Folder/redacted-report.pdf", "directOnly": true,
+                   "cursor": "sl-2"}),
+            "page two REPEATS both resources alongside the cursor — this is what \
+             `inputs: cursor_only` would have removed"
+        );
         assert!(
             calls[0].1.get("limit").is_none() && calls[1].1.get("limit").is_none(),
             "this action declares no page-size input"

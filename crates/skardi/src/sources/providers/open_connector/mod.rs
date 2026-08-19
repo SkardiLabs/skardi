@@ -263,12 +263,16 @@ pub async fn register_open_connector_tables(
             // a claim about what the continuation action ACCEPTS — needs its
             // own check against the discovered input schema, or its only
             // failure surface is a 400 on page two of a live scan.
-            table.check_continuation_inputs(
-                table
-                    .continuation
-                    .and_then(|c| registry.get(c.action_id))
-                    .and_then(ActionMetadata::input_schema),
-            )?;
+            let continuation_input_schema = table
+                .continuation
+                .and_then(|c| registry.get(c.action_id))
+                .and_then(ActionMetadata::input_schema);
+            table.check_continuation_inputs(continuation_input_schema)?;
+            // `inputs: full` — the DEFAULT — gets the same treatment when
+            // it names a different action: the opener's inputs satisfying
+            // the continue action is an assumption about two independently
+            // discovered schemas, not a fact, until it is checked.
+            table.check_full_continuation_inputs(continuation_input_schema)?;
 
             let provider = OpenConnectorTableProvider::new(
                 Arc::clone(&client),

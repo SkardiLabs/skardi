@@ -42,9 +42,8 @@ gateway **runtime token**.
 > shared-drive rows included; three structurally unreachable columns
 > stay documented as residuals per the pack doc),
 > and [Dropbox](open-connector-dropbox.md) (files, shared links, file
-> search — split-action cursor continuation; **not yet live-verified**,
-> so its pinned fingerprints will fail the contract gate against a real
-> gateway until they are re-captured).
+> search — split-action cursor continuation; live-verified against a real
+> account, all five pins captured from a live gateway).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
@@ -323,15 +322,39 @@ it, and the provider sizes continuation pages from that request.
 Both actions are discovered and fingerprint-gated at registration, so an
 undiscovered or drifted continue action fails at startup rather than on page
 two of the first scan. Because a fingerprint hashes the *output* schema, the
-`cursor_only` claim — which is about inputs — is checked separately against
-the continue action's discovered **input** schema: the cursor input must be a
-declared property and no other input may be `required`. A continue action
-that publishes no input schema is refused rather than trusted, the same
-default-deny posture raw scans take toward a missing read/write
-classification. Two authoring invariants are enforced by the loader: a
-`continuation` on a non-cursor strategy is a parse error, and a table that
-pins its continuation's fingerprint must pin its own action's too (half a
-gate reads as gated while verifying only pages 2..N).
+input side is checked separately, against the continue action's discovered
+**input** schema — in both directions of `inputs:`, since a wrong claim
+either way is a hard 400 on page two of a live scan:
+
+- `inputs: cursor_only` — the cursor input must be a declared property and
+  no other input may be `required`.
+- `inputs: full` (the default) targeting a **different** action — every
+  input the table sends on every request must satisfy that action's
+  `required`, and under `additionalProperties: false` every input the table
+  *can* send must be a declared property. When the continuation names the
+  table's own action the check is skipped: one action has one input schema,
+  and page one already satisfied it.
+
+A continue action that publishes no input schema is refused rather than
+trusted, the same default-deny posture raw scans take toward a missing
+read/write classification — as is a `required` list that is present but is
+not an array of strings, since a gate that cannot read its input has
+verified nothing.
+
+Four authoring invariants are enforced by the loader:
+
+- a `continuation` on a non-cursor strategy is a parse error;
+- a table that pins its continuation's fingerprint must pin its own
+  action's too (half a gate reads as gated while verifying only pages 2..N);
+- a same-action continuation may not pin a fingerprint different from the
+  table's own — one action has one contract, so no gateway can satisfy
+  both;
+- `inputs: cursor_only` may not be paired with an **Exact**-fidelity
+  filter. Exact pushdown deletes the `Filter` node from the plan, so page
+  one would apply the predicate as an action input while pages 2..N could
+  not, with no node left to re-apply it — silently returning rows the query
+  excluded. Declare such a filter `Inexact` instead: the `Filter` node
+  survives, and the lost input makes pages 2..N merely wasteful.
 
 Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
@@ -354,8 +377,8 @@ Each pack table pins the full relational contract and an expected
 action-contract fingerprint captured from a live gateway (a canonicalized
 BLAKE3 hash of the discovered output schema; every built-in pack is
 pinned, with the schemas committed next to each pack under
-`fixtures/<provider>/contracts/` — captured from a live gateway except
-Dropbox's, which are source-derived pending its live pass). Split-action
+`fixtures/<provider>/contracts/`, all captured from a live gateway).
+Split-action
 tables pin BOTH the opening action and the continuation action; where the
 two publish the same output schema, the continuation pin guards the row
 shape of pages 2..N and its input-side claim is gated separately (see

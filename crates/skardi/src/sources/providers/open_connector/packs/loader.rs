@@ -426,6 +426,48 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                  which is the default; drop the block or declare `inputs: cursor_only`"
             ));
         }
+        // One action, one discovered schema, one fingerprint. Two pins that
+        // disagree cannot BOTH be satisfied by any gateway, so this is
+        // unsatisfiable by construction rather than merely suspicious —
+        // and left to runtime it surfaces as a contract-gate failure
+        // pointing at the schema instead of at the two lines that cannot
+        // both be right. (The `open_connector_query` path looks the
+        // expectation up by action id and would silently check the first
+        // of the two; refusing here is what makes that lookup sound.)
+        if continuation.action_id == table.action_id
+            && table.expected_fingerprint != Some(continuation.expected_fingerprint)
+        {
+            return Err(format!(
+                "{id}: continuation names the table's own action '{}' but pins a different \
+                 fingerprint ({} vs {}); one action has one contract, so no gateway can \
+                 satisfy both",
+                continuation.action_id,
+                table.expected_fingerprint.unwrap_or("<none>"),
+                continuation.expected_fingerprint
+            ));
+        }
+        // `cursor_only` deliberately drops every non-cursor input on pages
+        // 2..N. An `Exact` filter is mapped to
+        // `TableProviderFilterPushDown::Exact`, which DELETES the `Filter`
+        // node from the plan — so page one applies the predicate as an
+        // action input and pages 2..N cannot, with no node left to
+        // re-apply it. That returns rows the query excluded, silently:
+        // the same failure class as a pushdown leak, and refused the same
+        // way. `Inexact` stays legal — the `Filter` node survives, so
+        // pages 2..N are merely wasteful, never wrong.
+        if continuation.cursor_only
+            && let Some(filter) = table
+                .filters
+                .iter()
+                .find(|f| matches!(f.fidelity, Fidelity::Exact))
+        {
+            return Err(format!(
+                "{id}: filter on '{}' is Exact, which removes the Filter node from the \
+                 plan, but `inputs: cursor_only` cannot carry the predicate past page one; \
+                 declare the filter Inexact or drop `cursor_only`",
+                filter.input_field
+            ));
+        }
     }
     Ok(())
 }
@@ -1675,9 +1717,72 @@ tables:
       - { name: id, path: id, type: uint64, nullable: false }"#,
                 "missing field `fingerprint`",
             ),
+            // One action has one contract, so two disagreeing pins on it
+            // cannot both be satisfied by any gateway.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "pins a different fingerprint",
+            ),
+            // The silent-wrong-rows pairing: an Exact filter deletes the
+            // Filter node from the plan, and `cursor_only` cannot carry
+            // the predicate past page one.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { action: demo.list_continue, fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: true }
+    filters:
+      - { column: state, op: eq, input: state, fidelity: exact }"#,
+                "cannot carry the predicate past page one",
+            ),
         ] {
             let err = pack_with(body).expect_err(expected);
             assert!(err.contains(expected), "want {expected:?} in: {err}");
         }
+    }
+
+    #[test]
+    fn an_inexact_filter_stays_legal_alongside_a_cursor_only_continuation() {
+        // The contrast case for the gate above. `Inexact` maps to
+        // `TableProviderFilterPushDown::Inexact`, which KEEPS the `Filter`
+        // node, so pages 2..N losing the pushed input is merely wasteful —
+        // DataFusion re-applies the predicate and the rows stay correct.
+        // Refusing this too would have been a false alarm.
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { action: demo.list_continue, fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: true }
+    filters:
+      - { column: state, op: eq, input: state, fidelity: inexact }"#,
+        )
+        .expect("an Inexact filter cannot return rows the query excluded");
+        assert_eq!(pack.tables[0].filters.len(), 1);
     }
 }

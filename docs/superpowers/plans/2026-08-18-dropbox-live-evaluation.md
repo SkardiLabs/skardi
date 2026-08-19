@@ -1,37 +1,60 @@
 # Dropbox pack — personal-account live evaluation
 
+> **✅ THIS RUN COMPLETED on 2026-08-18** against a self-hosted Open
+> Connector gateway at commit `a3efa99` and a real free-tier Dropbox
+> account. Nothing below is outstanding except the two rows explicitly
+> marked so in the acceptance table. The pack is **live-verified**, not
+> provisional: every fingerprint is a hash of a live capture, and
+> registration passed the contract gate on the first try.
+>
+> The authoritative outcome record is the provenance banner in
+> `crates/skardi/src/sources/providers/open_connector/packs/dropbox.rs`
+> and the 5.5 entry in
+> `specs/2026-07-11-open-connector-integration-tasks.md`. This document is
+> kept as the **method** — what was probed and how — so the next pack's
+> live pass can copy it.
+
 **Runbook for phases 2 + 4/5 of the source-pack skill, instantiated for
 `packs/dropbox.{yaml,rs}` on `feature/open-connector-dropbox-pack`.**
 
 Generic method: `docs/superpowers/skills/source-pack/references/live-verification.md`.
 This document is the Dropbox-specific version — exact actions, exact
 inputs, exact SQL, and the specific claims on this branch that only a
-live wire can settle.
+live wire could settle.
 
-## 0. Why this run exists
+## 0. Why this run existed, and what it settled
 
-The pack was authored from source-reading alone. The execution plan
-(`specs/2026-08-16-dropbox-source-pack-design.md`, steps 2 and 5) marks
-contract capture and live verification **blocked** on two things this box
-did not have: a Node runtime and a Dropbox account. Everything downstream
-of that block is provisional:
+The pack was authored from source-reading alone, and the execution plan
+(`specs/2026-08-16-dropbox-source-pack-design.md`, steps 2 and 5) marked
+contract capture and live verification blocked on two things the
+authoring box did not have: a Node runtime and a Dropbox account. Both
+arrived; both steps ran. The acceptance table, with the outcome column
+filled in:
 
-| Artifact | Current state | What this run turns it into |
+| Artifact | State before the run | Outcome |
 |---|---|---|
-| `fingerprint:` on 3 tables, `continuation.fingerprint:` on 2 | hashes of source-derived schemas; labelled as such, and expected to fail the gate live | hashes of `data.outputSchema` from a live gateway |
-| `fixtures/dropbox/contracts/*.json` (5 files) | derived from the executor source; each `*_continue.json` is byte-identical to its opener *because it was derived that way* | five independent captures, which either confirm the identity or split it |
-| `fixtures/dropbox/*.json` (6 row fixtures) | authored in the executor's shape (`id:aaaa…`, `Redacted Folder`) | redacted live captures |
-| Every mapped column | never observed carrying a real value | non-NULL somewhere in a seeded account, or dropped |
-| `limit: 2000` / `maxResults: 1000` | the schemas' declared maxima, unprobed | probed at the boundary (a declared cap can exceed the wire's) |
-| Q1 — `{path, cursor}` together on `list_shared_links` | shipped as an inference, labelled as one | answered; if rejected, `shared_links` gains a `cursor_only` continuation (no code change) |
-| Q2 — `list_folder` cursor lifetime | unknown | observed, and documented as a bound if it matters |
-| Q3 — can `matches[].metadata` be null? | contract says no, so `file_search.tag`/`name` are non-nullable and the fixture that tests it is labelled synthetic | answered; if yes, those columns become nullable and the fixture graduates |
-| `cursor_only` on the two continue actions | gated at registration against the discovered **input** schema, but only ever seen against a derived schema | gated against the real one |
+| `fingerprint:` on 3 tables, `continuation.fingerprint:` on 2 | hashes of source-derived schemas, expected to fail the gate live | ✅ all five matched LIVE discovery **unchanged** — the "expected to fail" warning was simply wrong |
+| `fixtures/dropbox/contracts/*.json` (5 files) | derived from the executor source; each `*_continue.json` byte-identical to its opener *because it was derived that way* | ✅ replaced by five independent captures, which **confirmed** the identity — it is a fact about the wire |
+| `fixtures/dropbox/*.json` (6 row fixtures) | authored in the executor's shape (`id:aaaa…`, `Redacted Folder`) | ⚠️ **still authored** — the account read holds personal files, so its pages were not committed. Two were corrected to the live shape; two are deliberately impossible. Per-file provenance: `fixtures/dropbox/README.md`. Re-deriving from redacted captures stays open |
+| Every mapped column | never observed carrying a real value | ✅ 12/12 on `files` (378 rows), 13/13 on `file_search`, 11/11 on `shared_links` — after the run **dropped four** `shared_links` columns it proved could never populate (15 → 11) |
+| `limit: 2000` / `maxResults: 1000` | the schemas' declared maxima, unprobed | ✅ probed at the boundary: 2000 and 1000 return rows, 2001 and 1001 are refused |
+| Q1 — `{path, cursor}` together on `list_shared_links` | shipped as an inference, labelled as one | ✅ **accepted** — no `cursor_only` continuation needed, the shipped shape was right |
+| Q2 — `list_folder` cursor lifetime | unknown | ✅ lower bound only: a cursor replayed ~40 min later, after the tree changed, still returned rows. No upper bound established; documented as a bound, not a guarantee |
+| Q3 — can `matches[].metadata` be null? | contract says no, so `file_search.tag`/`name` are non-nullable and the fixture that tests it is labelled synthetic | ✅ **no** — the executor always returns a full object. The columns stay non-nullable and the fixture stays synthetic permanently |
+| `cursor_only` on the two continue actions | gated at registration against the discovered **input** schema, but only ever seen against a derived schema | ✅ gated against the real one. Feeding `cursor` to the OPENING action is a hard schema rejection, so `cursor_only` is mandatory, not an optimization |
 
-Read that table as the acceptance criteria. The run is done when every
-row's middle column is gone. The claims themselves are already labelled
-honestly in the pack (module-doc provenance banner, yaml headers) — this
-run is what removes the labels.
+Two claims remain **unobserved** rather than confirmed, both
+environmental rather than defects, and both labelled where they live:
+`shared_links.expires_at` needs paid-tier link expiry (a free account is
+refused `settings_error/not_authorized`), and
+`file_search.match_type = 'content'` needs Dropbox content indexing,
+which never landed during the pass.
+
+One gateway defect was found and filed rather than worked around:
+`GET /v1/actions/<id>` omits the `execution` block at commit `a3efa99`,
+so Skardi's default-deny action registry refuses every action from
+*every* pack — reproduced with the merged `github` pack, so not this
+pack's bug. Filed as oomol-lab/open-connector#358.
 
 ## 1. Prerequisites
 
