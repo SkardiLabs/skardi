@@ -61,7 +61,10 @@ WHERE is_read = false
 ORDER BY received_date_time DESC
 LIMIT 20;
 
--- Folder accounting, joined to the messages that live there:
+-- Folder accounting, joined to the messages that live there. Note that
+-- `mail_folders` is root-level only, so this inner join silently drops
+-- messages sitting in nested folders; use a LEFT JOIN and keep the NULL
+-- bucket when total completeness matters more than folder names.
 SELECT f.display_name, count(*) AS mails
 FROM saas.m365.messages m
 JOIN saas.m365.mail_folders f ON m.parent_folder_id = f.id
@@ -191,8 +194,11 @@ through a skardi-server SQL scan:
   mailbox (9 messages, 9 root folders): all 22 selected message fields
   arrived with the pinned spellings — including all four passthrough
   timestamps, `hasAttachments`, `conversationId`, `categories`, and the
-  `emailAddress` nesting — and all 7 folder fields. Under the select
-  pin no field was ever absent or null; emptiness is spelled `""`/`[]`.
+  `emailAddress` nesting — and all 8 folder columns. Under the select
+  pin no message field was ever absent or null; emptiness is spelled
+  `""`/`[]`. The single null of the whole pass is `wellKnownName` on the
+  custom folder, which is Graph's spelling for "not a well-known
+  folder" — preserved as an explicit null in the fixture.
 - **Live discovery schemas were byte-identical** to the committed
   contract captures (both actions, both halves); registration passed
   the fingerprint gate against live discovery.

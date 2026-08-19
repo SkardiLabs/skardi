@@ -762,6 +762,8 @@ mod tests {
             ("slack.yaml", include_str!("slack.yaml")),
             ("notion.yaml", include_str!("notion.yaml")),
             ("feishu.yaml", include_str!("feishu.yaml")),
+            ("discord.yaml", include_str!("discord.yaml")),
+            ("outlook.yaml", include_str!("outlook.yaml")),
         ] {
             // parse_pack performs the full structural + cross-field
             // validation pass itself; parsing IS the gate.

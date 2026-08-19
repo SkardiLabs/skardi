@@ -284,13 +284,21 @@ Each unmapped input needs a negative-space guard test proving no
 `filter`, `orderby`, `orderBy`, `select` or `expand` key ever reaches
 the wire.
 
-## Open decision for review: pin `select` on `outlook.messages`?
+## Decided (2026-08-19): `select` is pinned on `outlook.messages`
 
-The pack sends no `select`, so Graph returns its **default full message
-representation on every row — including `body.content`**. Skardi's
-client caps a response at `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. At the
-declared maximum `top: 1000`, a page of ordinary HTML mail (100 KB of
-body each is unremarkable) is far past that cap, and the scan fails on a
+**Approved and shipped** — both levers below, as recommended:
+`fixed_inputs.select` pins exactly the mapped fields (22 entries) and
+`page_size: 100`. Phase-4 live verification confirmed the property the
+pin leans on: a misspelled select field returns a Graph 400 naming the
+property, never a silently always-NULL column. The analysis that
+produced the decision is kept below as the record.
+
+Unpinned, the pack would send no `select`, so Graph returns its
+**default full message representation on every row — including
+`body.content`**. Skardi's client caps a response at
+`DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB. At the declared maximum
+`top: 1000`, a page of ordinary HTML mail (100 KB of body each is
+unremarkable) is far past that cap, and the scan fails on a
 response-size error rather than on anything the user did.
 
 Two levers, and they interact:
@@ -307,10 +315,11 @@ Two levers, and they interact:
    natural candidate) so a single page cannot approach the cap even
    unpinned. Note `page_size` doubles as the LIMIT-pushdown ceiling.
 
-Recommendation: do both — pin `select` to the mapped fields *and* set
-`page_size: 100`. Flagged here rather than implemented because pinning
-`select` adds a fixed input that changes what the wire returns, and the
-mapped-field list it must mirror is not final until phase 4.
+Recommendation, since taken: do both — pin `select` to the mapped fields
+*and* set `page_size: 100`. The cost lever 1 names — the pin and the
+column set must be maintained together — is carried mechanically by
+`select_pin_mirrors_the_mapped_columns`, which fails the moment the two
+drift apart.
 
 ## What phase 4 must settle
 
@@ -384,8 +393,10 @@ scan time when only one service is connected — a failure that surfaces
 late and reads as a Skardi bug. Every existing pack (`github`, `slack`,
 `notion`, `feishu`) is 1:1 with an OC service, and table IDs are a
 stable contract that a later split would have to break. A single
-`docs/open-connector-microsoft-365.md` still covers both packs, so the
-product-level story survives the split.
+`docs/open-connector-microsoft-365.md` holds the Microsoft 365 story for
+both packs — it ships covering `outlook` alone and gains the `one_drive`
+tables with that milestone — so the product-level story survives the
+split.
 
 **Recipients as `json` rather than extending
 `utf8_list_from_object_key` to nested key paths.** The extension is
