@@ -18,14 +18,11 @@ Teams, SharePoint, Calendar, OneNote, To Do and Planner do not exist in
 Open Connector at all; notably, **`outlook` is mail-only** — there is
 no calendar or contacts action to bind.
 
-> **Status: live verification pending.** The wire contract below is
-> reconciled against a live gateway (v1.3.4, open-connector at
-> `2410fbe`; inputs validated to the credential wall, row shapes read
-> from the executor source, output schemas fingerprint-pinned from
-> discovery), but no real mailbox has been scanned yet. The passthrough
-> column set — including every timestamp — is provisional until that
-> pass runs, and the pack's fixtures are synthetic. This banner comes
-> down when phase 4 completes.
+> **Status: live-verified.** The wire contract below is reconciled
+> against a live gateway (v1.3.4, open-connector at `2410fbe`) and was
+> verified against a real mailbox on 2026-08-19 — every mapped column
+> carried real values end to end, and the pack's fixtures are redacted
+> live captures. Details in [Live verification](#live-verification-phase-4).
 
 **The wire contract is Open Connector's, not Microsoft Graph's**: the
 gateway's outlook executors pass Graph's objects through **raw**
