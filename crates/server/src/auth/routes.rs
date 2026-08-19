@@ -407,6 +407,10 @@ mod tests {
     }
 
     async fn make_better_auth_state() -> AppState {
+        // Held only across the env mutation + `build` below: once the layer
+        // exists it no longer reads the environment, so callers need not
+        // keep the guard.
+        let _env = crate::auth::test_env::lock().await;
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
         use crate::semantics::SemanticsRegistry;
