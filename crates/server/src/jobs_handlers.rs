@@ -156,6 +156,15 @@ pub async fn submit_job_run(
     // divergence is that future feature's problem to solve, not something
     // this handler guards against today.
     let version = {
+        // Recover from poisoning rather than 500, per the repo's error-handling
+        // policy for `std::sync` locks. `execute_pipeline_by_name` maps the
+        // same lock's poison to `500 internal_error`
+        // (`pipeline_handlers.rs`); the divergence is deliberate, not an
+        // oversight. `ServerConfig` is a startup snapshot that nothing mutates
+        // in production (the only `config.write()` in the tree is test-only),
+        // so a poisoned guard carries no torn state and the read below is
+        // still sound — failing the request would trade a correct answer for
+        // an outage.
         let config = app_state.config.read().unwrap_or_else(|p| p.into_inner());
         match config.jobs.get(&name) {
             Some(def) => def.version().to_string(),
@@ -179,8 +188,13 @@ pub async fn submit_job_run(
         )
     })?;
 
+    // Recorded as an `Option`, not `unwrap_or_default()`: the empty string is
+    // the one value `session_id_from_headers` rejects outright, so rendering
+    // "absent" as `""` would collide with a shape the validator calls
+    // malformed. `None` keeps "no header sent" distinguishable in log-based
+    // analysis — the same distinction NULL-vs-value preserves in the ledger.
     tracing::info!(
-        session_id = session_id.as_deref().unwrap_or_default(),
+        session_id = ?session_id,
         "Received submit request for job '{}'",
         name
     );

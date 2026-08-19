@@ -16,7 +16,10 @@ use skardi::sources::sql_validator::{SqlValidationError, StatementKind, validate
 use std::time::Instant;
 
 use crate::auth::routes::require_session;
-use crate::query_audit::{MAX_SESSION_ID_CHARS, QueryAuditStatus, finish_audit};
+use crate::query_audit::{
+    MAX_SESSION_ID_CHARS, OTHER_STATEMENT_KIND, QUERY_STATEMENT_KIND, QueryAuditStatus,
+    finish_audit,
+};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
@@ -126,6 +129,21 @@ fn validate_context_string(
 // is the ledger's, not `/query`'s, and it is shared with `pipeline_handlers`.
 
 /// Execute ad-hoc SQL endpoint - POST /query
+/// The ledger's `statement_kind` marker for an ad-hoc statement of the given
+/// kind.
+///
+/// Lives here rather than in `skardi-query-audit` because [`StatementKind`]
+/// comes from `skardi`, which that crate deliberately does not depend on
+/// (#206). The marker *strings* are still owned by the ledger — this only
+/// translates the classifier onto them, so the two cannot drift into two
+/// vocabularies.
+fn adhoc_statement_kind(kind: StatementKind) -> &'static str {
+    match kind {
+        StatementKind::Query => QUERY_STATEMENT_KIND,
+        StatementKind::Other => OTHER_STATEMENT_KIND,
+    }
+}
+
 pub async fn execute_query(
     State(app_state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -232,9 +250,9 @@ pub async fn execute_query(
     // anything it cannot account for.
     let audit_id = match &app_state.query_audit {
         Some(store) => {
-            let kind = format!("{statement_kind:?}");
+            let kind = adhoc_statement_kind(statement_kind);
             match store
-                .record_started(&request.sql, request.ai_context.as_ref(), max_rows, &kind)
+                .record_started(&request.sql, request.ai_context.as_ref(), max_rows, kind)
                 .await
             {
                 Ok(id) => Some(id),

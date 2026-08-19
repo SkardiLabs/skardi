@@ -179,14 +179,18 @@ execution and updated with its outcome afterwards:
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
 | `max_rows` | requested row cap (`0` on pipeline and job rows — not applicable) |
-| `run_id` | job_runs.id bridge, job rows only |
-| `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows, `job` for job rows. Consumers filtering the ledger must match these exact strings. |
+| `job_run_id` | `job_runs.id` bridge, job rows only. Distinct from the identity envelope's `run_id`, which names the *caller's* run — one column, one meaning. |
+| `request_id`, `org_id`, `workspace_id`, `user_id`, `run_id` | caller-identity envelope; all NULL on this server, filled by distributions that authenticate their callers |
+| `statement_kind` | `query` or `other` for ad-hoc rows (the server's statement *classification* — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows, `job` for job rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
 | `row_count`, `error` | outcome detail |
 
 Indexed on `(session_id, created_at)`, `created_at`, `status` and
 `statement_kind`, so an agent session can be reconstructed — and a single row
-kind selected — with plain SQL.
+kind selected — with plain SQL. `job_run_id` carries its own partial index
+(`WHERE job_run_id IS NOT NULL`) so the reverse lookup — given a run id from
+`GET /jobs/runs`, which session submitted it — does not scan a table that is
+append-only and has retention off by default.
 
 What is **not** here: job runs. `POST /jobs/:name/run` executes its own SQL
 through the same engine but is recorded in the separate jobs run ledger (see
@@ -310,7 +314,7 @@ get the full interleaving today.
 `POST /jobs/:name/run` is audited as a *submission event*: the row's
 lifecycle is the submission's, not the run's. `statement_kind` is `job`,
 `sql` holds `name@version`, and on acceptance the row is stamped
-`succeeded` with the `run_id` that bridges to the jobs ledger — which
+`succeeded` with the `job_run_id` that bridges to the jobs ledger — which
 remains the authority on the run itself (parameters, progress, outcome).
 A rejected submission is stamped `failed` with the executor's fixed error
 category, never its message text. Unlike pipelines, a job's parameter
@@ -321,6 +325,30 @@ exactly as for pipelines: a job the ledger cannot account for is not
 submitted. The same `X-Skardi-Session-Id` header (same validation)
 attributes the submission, so `list_by_session` returns an agent session's
 ad-hoc queries, pipeline calls, and job submissions in one ordered read.
+
+Two properties of this seam an operator should know before relying on it:
+
+- **It is the ledger's only unauthenticated write path.** `/query` and
+  `POST /:pipeline/execute` both call `require_session` before writing
+  anything; the jobs handlers perform no auth check at all. The header is
+  self-reported on every endpoint — it never attests to origin — but on the
+  other two the caller is at least authenticated. Here neither is true, so
+  anyone who can reach `POST /jobs/:name/run` can mint arbitrary
+  `session_id` values into `query_audit`, including ones belonging to real
+  sessions, and can queue writes onto the ledger's single serialized writer
+  thread (shared with every audited request). If you enable
+  `--query-audit-db` behind auth, note that this one seam is not gated.
+  Backfilling the check is tracked separately.
+
+- **The `job_run_id` bridge is best-effort and one-directional.** It is
+  stamped after `executor.submit` returns, so if that write fails, times out,
+  or the process dies in the window, the run exists in `job_runs` but the row
+  keeps `job_run_id = NULL` (and reconciles to `unknown` on restart). `job_runs`
+  carries no `session_id` and no audit-row id, so there is no reverse pointer
+  to rebuild the correlation from — it is lost, not merely delayed. Exact
+  correlation is the column's purpose, so treat it as *usually* exact rather
+  than guaranteed; making it reconstructable needs a durable half in the
+  jobs ledger, which is out of scope here.
 
 ---
 
