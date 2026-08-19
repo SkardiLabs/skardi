@@ -104,7 +104,12 @@ pins `includeHiddenFolders: true` (Graph hides hidden folders by
 default) and keeps the distinction queryable through `is_hidden`.
 Root-level only — the executor does not recurse; `child_folder_count`
 reveals nested folders without enumerating them. Folder ids from this
-table are what a `mailFolderId` resource wants.
+table are what a `mailFolderId` resource wants. `well_known_name`
+carries Graph's locale-independent folder discriminator
+(`inbox`/`sentitems`/`drafts`/…, null on custom folders) — prefer it
+over `display_name` for cross-account queries, since Graph renders
+display names in the account's language (a real MSA mailbox says
+"收件箱", not "Inbox").
 
 **No filter pushdown anywhere** — Outlook exposes filtering only as
 `filter`, a raw OData *expression* string
@@ -132,6 +137,15 @@ request); the executor ignores it there because the link embeds its own
 `$top` — cosmetic, but pinned in tests so nobody assumes the page size
 is re-applied mid-scan.
 
+**Known upstream defect (found in the phase-4 live pass):** Graph's
+continuation URL for a *folder-scoped* listing uses the OData
+parenthesized form `/v1.0/me/mailFolders('{id}')/messages`, which the
+executor's own path allowlist rejects — a `mailFolderId`-bound scan
+whose folder exceeds one page (`page_size: 100`) fails loudly with a
+gateway 400 on its second page. Whole-mailbox scans are unaffected
+(`/v1.0/me/messages` paginates cleanly). Gateway fix tracked upstream
+on oomol-lab/open-connector.
+
 ## Authorization
 
 **The OAuth consent is read-write for a read-only pack.** The gateway's
@@ -156,8 +170,9 @@ throttling logic of its own.
 Both actions' output schemas are captured from gateway discovery
 (v1.3.4) and pinned; registration re-hashes live discovery and refuses
 on mismatch. Because rows are raw passthrough, the fingerprint covers
-less than the column set: `mail_folders` is fully declared (empty
-coverage gap, pinned), while `messages` has a pinned thirteen-column
+less than the column set: `mail_folders` has a pinned one-column gap
+(`well_known_name`, undeclared upstream), while `messages` has a
+pinned thirteen-column
 gap — the four timestamps, threading fields, `categories`,
 `internet_message_id`, and the `emailAddress` nesting under the
 declared-but-loose `from`/`sender`. Drift in those surfaces at scan
@@ -165,3 +180,43 @@ time (or as a Graph 400 through the select pin), not at registration.
 Input schemas are captured too (`contracts/inputs/`), locked to the
 pack's generated keys by test — the registration gate itself remains
 output-only, an engine-wide limit tracked for separate work.
+
+## Live verification (phase 4)
+
+Verified on 2026-08-19 against the pinned gateway (v1.3.4, open-connector
+`2410fbe`) and a real personal (MSA) mailbox over OAuth, end to end
+through a skardi-server SQL scan:
+
+- **Every mapped column carried real non-NULL values** across a seeded
+  mailbox (9 messages, 9 root folders): all 22 selected message fields
+  arrived with the pinned spellings — including all four passthrough
+  timestamps, `hasAttachments`, `conversationId`, `categories`, and the
+  `emailAddress` nesting — and all 7 folder fields. Under the select
+  pin no field was ever absent or null; emptiness is spelled `""`/`[]`.
+- **Live discovery schemas were byte-identical** to the committed
+  contract captures (both actions, both halves); registration passed
+  the fingerprint gate against live discovery.
+- **Pagination**: a forced `top=2` walk followed real cursors five
+  pages to a genuinely-null terminal `nextLink`; no non-empty terminal
+  token exists. `top=1000` is accepted on the wire; `top=1001` is a
+  schema 400 before credentials. A foreign-host cursor is refused with
+  "nextLink must target graph.microsoft.com".
+- **Select misspellings fail loudly**: a bad field name returns a Graph
+  400 naming the property, surfaced through the gateway failure
+  envelope — the behavior the select pin's design leans on.
+- **`mailFolderId` forwards verbatim** (an inbox-scoped binding
+  returned exactly that folder's rows), with the multi-page upstream
+  caveat above.
+- **Caveats recorded honestly**: this mailbox had no hidden folders, so
+  `includeHiddenFolders: true` was accepted but its on/off responses
+  were identical — the pin's effect is unobservable against a folder
+  set with nothing hidden. Wire rows carry unmapped extras
+  (`@odata.etag` on messages, `sizeInBytes` on folders), left out
+  deliberately; `wellKnownName` was promoted to the `well_known_name`
+  column as a direct consequence of this pass (the live mailbox's
+  display names were all CJK).
+
+The bundled `messages.json` and `mail_folders.json` fixtures are
+redacted derivations of these captures (deterministic id maps,
+placeholder identities, minute-coarsened timestamps), re-audited on
+every test run by `fixtures_stay_redacted`.

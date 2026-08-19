@@ -3,13 +3,42 @@
 //! gateway (v1.3.4, open-connector at `2410fbe`) on 2026-08-14. Design
 //! record: `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`.
 //!
-//! **Status: phases 1–3. The phase-4 live pass has NOT run yet** — no
-//! real mailbox has been scanned, so every fixture in
-//! `fixtures/outlook/` is synthetic (provider-shaped per the captured
-//! contracts and the executor source, and saying so), and the
-//! passthrough column set is provisional. This pack must not leave
-//! draft until phase 4 replaces the fixtures with redacted live
-//! captures and settles the passthrough spellings.
+//! **Status: phases 1–4 complete.** The phase-4 live pass ran on
+//! 2026-08-19 against the same gateway pin (v1.3.4, `2410fbe`) and a
+//! real personal (MSA) mailbox over OAuth: all 22 selected message
+//! fields and all 7 folder fields arrived with the pinned spellings
+//! and carried non-NULL values through a skardi-server SQL scan; live
+//! discovery schemas were byte-identical to the committed contract
+//! captures (both halves, both actions); a forced `top=2` walk
+//! followed real cursors five pages to a genuinely-null terminal
+//! `nextLink`; and `messages.json`/`mail_folders.json` are redacted
+//! live captures (enforced by `fixtures_stay_redacted`). Live findings
+//! that shape the pack:
+//!
+//! - **Folder-scoped pagination is broken upstream.** Graph's
+//!   continuation URL for a scoped listing is the OData parenthesized
+//!   form `/v1.0/me/mailFolders('{id}')/messages`, and the executor's
+//!   own path allowlist accepts only the slash form — so a
+//!   `mailFolderId`-scoped scan 400s on its second page ("nextLink
+//!   must target Outlook message pagination endpoints"), refusing the
+//!   very cursor its previous response returned. Loud, never silent;
+//!   folders within one page (`page_size: 100`) are unaffected, and
+//!   the whole-mailbox path (`/v1.0/me/messages`) paginates fine.
+//!   Upstream gateway defect; tracked on oomol-lab/open-connector.
+//! - **Wire rows carry unmapped extras**: `@odata.etag` on messages
+//!   and `sizeInBytes` on folders, both left unmapped deliberately
+//!   (a volatile concurrency token and a constantly-fluctuating
+//!   operational metric — neither answers an analytical question).
+//!   `wellKnownName` was the third such extra and got PROMOTED to the
+//!   `well_known_name` column after the live pass: the live mailbox's
+//!   `displayName`s were all CJK, so folder semantics need Graph's
+//!   language-independent discriminator (explicit null on custom
+//!   folders).
+//! - **This mailbox had no hidden folders**: `includeHiddenFolders:
+//!   true` was accepted and returned the complete root set, but
+//!   on/off returned identical rows, so the pin's effect is
+//!   unobservable against this account. `is_hidden` itself converts
+//!   fine (false on every live row; the true arm is inline-synthetic).
 //!
 //! Design decisions, each held by a test:
 //!
@@ -32,7 +61,8 @@
 //!   `additionalProperties` passthrough OUTSIDE the fingerprint gate.
 //!   The coverage-gap pin (`columns_the_coverage_walker_cannot_resolve
 //!   _are_pinned`) keeps that surface an explicitly reviewed set:
-//!   thirteen uncovered columns on `messages`, zero on `mail_folders`.
+//!   thirteen uncovered columns on `messages`, one on `mail_folders`
+//!   (`well_known_name`, the deliberate post-live-pass addition).
 //! - **`select` is pinned to exactly the mapped fields** on
 //!   `messages`. Unpinned, Graph returns its default full
 //!   representation — `body.content` (HTML mail) on every row — which
@@ -46,10 +76,11 @@
 //!   deliberately outside both the columns and the pin (full message
 //!   content belongs behind an explicit content surface, not in every
 //!   `SELECT *`). `page_size: 100` (not the schema's 1000) keeps even
-//!   selected pages far from the response cap; phase 4 must confirm
-//!   the wire's real `top` ceiling (Feishu declared 100 and failed
-//!   above 50) and the 400-on-misspelled-select behavior this design
-//!   leans on.
+//!   selected pages far from the response cap. Phase 4 confirmed both
+//!   load-bearing assumptions live: `top=1000` is accepted on the
+//!   wire (1001 is a schema 400 before credentials — unlike Feishu,
+//!   the declared bound IS the wire bound), and a misspelled select
+//!   field fails loudly with a Graph 400 naming the bad property.
 //! - **The cursor is a URL.** Graph's `@odata.nextLink` is re-exposed
 //!   as a `nextLink` input/output pair: `format: uri` is enforced
 //!   before credentials, and the executor pins host
@@ -77,7 +108,9 @@
 //!   key): omitted, the table is the whole mailbox
 //!   (`/v1.0/me/messages`); bound, it is one folder's listing
 //!   (`/v1.0/me/mailFolders/{id}/messages`). Both collections are
-//!   well-defined, hence optional rather than required.
+//!   well-defined, hence optional rather than required. Live caveat:
+//!   scoped listings larger than one page die on the upstream
+//!   allowlist defect above until the gateway fix lands.
 //! - **`mail_folders` pins `includeHiddenFolders: true`** — the
 //!   `state=all` move: Graph hides hidden folders by default, the pin
 //!   makes the table the complete root-level set, and `is_hidden`
@@ -189,11 +222,14 @@ mod tests {
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
     }
 
-    // ── Contract tests: fixture pages are SYNTHETIC (provider-shaped
-    // per the captured contracts and the executor source) until the
-    // phase-4 live pass replaces them with redacted live captures. They
-    // pin the conversion contract per the admission gate: null-bearing,
-    // null-parent, nested, extra-field, empty-page, schema-mismatch. ─
+    // ── Contract tests: `messages.json` and `mail_folders.json` are
+    // REDACTED LIVE CAPTURES (2026-08-19, MSA mailbox through the
+    // pinned gateway) — real envelope keys, real field presence per
+    // row, ids/names/free text replaced deterministically, capture
+    // timestamps coarsened to the minute. `fixtures_stay_redacted`
+    // re-audits them mechanically on every run. Row shapes the live
+    // wire does not produce (explicit nulls, hidden folders, the
+    // schema-mismatch page) stay inline-synthetic and say so. ─
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -230,90 +266,222 @@ mod tests {
     }
 
     #[test]
-    fn messages_fixture_converts_the_designed_row_shape() {
-        // Synthetic provider-shaped page (phase 4 swaps in a redacted
-        // live capture): declared fields, the emailAddress nesting under
-        // from/sender, opaque-JSON recipients, RFC 3339 passthrough
-        // timestamps, a null-bearing subject, and unmapped extras
-        // (@odata.etag, changeKey, inferenceClassification, replyTo)
-        // riding along ignored.
+    fn messages_fixture_converts_the_live_row_shapes() {
+        // Redacted live capture: nine rows exactly as the pinned
+        // gateway returned them under the select pin (wire order,
+        // newest first). What live rows established that the old
+        // synthetic page had wrong: under the pin NO field is ever
+        // absent or null — emptiness is spelled "" / [] — and the only
+        // extra key is @odata.etag (no changeKey, no
+        // inferenceClassification, no replyTo).
         let batch = convert_fixture(
             table("messages"),
             include_str!("fixtures/outlook/messages.json"),
         );
-        assert_eq!(batch.num_rows(), 3);
-        assert!(utf8(&batch, "id").value(0).starts_with("AAMkAGE1M2IyNGNm"));
-        assert_eq!(utf8(&batch, "subject").value(0), "Redacted subject 1");
-        // Null-bearing: an explicit null subject is SQL NULL, while the
-        // same row's empty bodyPreview stays an empty string.
-        assert!(utf8(&batch, "subject").is_null(1));
-        assert_eq!(utf8(&batch, "body_preview").value(1), "");
+        assert_eq!(batch.num_rows(), 9);
+        assert!(utf8(&batch, "id").value(0).starts_with("AQMkADAwATM3"));
+        assert_eq!(utf8(&batch, "subject").value(0), "Synthetic subject 1");
+        // The draft (row 8): subject and recipients are EMPTY on the
+        // real wire, never null — "" and [] respectively.
+        assert!(boolean(&batch, "is_draft").value(8));
+        assert_eq!(utf8(&batch, "subject").value(8), "");
+        assert_eq!(utf8(&batch, "to_recipients").value(8), "[]");
         // Nested scalar paths through the loose from/sender objects.
-        assert_eq!(utf8(&batch, "from_address").value(0), "sender1@example.com");
-        assert_eq!(utf8(&batch, "from_name").value(0), "Redacted Sender 1");
-        assert_eq!(
-            utf8(&batch, "sender_address").value(2),
-            "sender1@example.com"
-        );
-        // Recipient lists survive as opaque JSON.
-        let to: Value =
-            serde_json::from_str(utf8(&batch, "to_recipients").value(1)).expect("valid JSON");
-        assert_eq!(to[1]["emailAddress"]["address"], "recipient2@example.com");
+        assert_eq!(utf8(&batch, "from_address").value(0), "person1@example.com");
+        assert_eq!(utf8(&batch, "from_name").value(0), "Person 1");
+        // Recipient lists survive as opaque JSON; live Graph often
+        // repeats the address as the display name — shape preserved.
+        let cc: Value =
+            serde_json::from_str(utf8(&batch, "cc_recipients").value(2)).expect("valid JSON");
+        assert_eq!(cc[0]["emailAddress"]["address"], "person3@example.com");
+        assert_eq!(cc[0]["emailAddress"]["name"], "person3@example.com");
+        // The bcc'd send (row 0) — bcc is only ever visible on the
+        // sender's own copy, so the capture holds exactly one.
+        let bcc: Value =
+            serde_json::from_str(utf8(&batch, "bcc_recipients").value(0)).expect("valid JSON");
+        assert_eq!(bcc.as_array().map(Vec::len), Some(1));
         // Booleans and passthrough columns extract on every row.
-        assert!(boolean(&batch, "has_attachments").value(0));
-        assert!(!boolean(&batch, "is_read").value(0));
-        assert!(boolean(&batch, "is_draft").value(2));
+        assert!(boolean(&batch, "has_attachments").value(5));
+        assert!(!boolean(&batch, "is_read").value(2));
+        let flag: Value = serde_json::from_str(utf8(&batch, "flag").value(7)).expect("valid JSON");
+        assert_eq!(flag["flagStatus"], "flagged");
         let ts: &TimestampMillisecondArray = batch
             .column_by_name("received_date_time")
             .expect("column")
             .as_any()
             .downcast_ref()
             .expect("timestamp");
-        assert!((0..3).all(|i| !ts.is_null(i)));
+        assert!((0..9).all(|i| !ts.is_null(i)));
+        assert!(ts.value(0) > ts.value(8), "wire order is newest-first");
+        // The reply pair (rows 1 and 7) shares a conversation.
         assert_eq!(
-            utf8(&batch, "conversation_id").value(0),
-            utf8(&batch, "conversation_id").value(2),
-            "rows 1 and 3 share a conversation"
+            utf8(&batch, "conversation_id").value(1),
+            utf8(&batch, "conversation_id").value(7),
         );
-        // categories: utf8_list keeps the two-entry row intact and the
-        // empty row an empty list, not NULL.
+        assert_eq!(
+            batch
+                .column_by_name("conversation_id")
+                .expect("column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8")
+                .iter()
+                .flatten()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            8,
+            "nine rows, eight conversations"
+        );
+        // categories: the one categorized row keeps its entry; empty
+        // rows are empty lists, not NULL.
         let categories: &ListArray = batch
             .column_by_name("categories")
             .expect("column")
             .as_any()
             .downcast_ref()
             .expect("List column");
-        assert_eq!(categories.value(2).len(), 2);
+        assert_eq!(categories.value(4).len(), 1);
         assert!(!categories.is_null(1));
         assert_eq!(categories.value(1).len(), 0);
+        // Self-consistency the redaction must preserve: webLink embeds
+        // the row's own (synthetic) id.
+        assert!(
+            utf8(&batch, "web_link")
+                .value(0)
+                .ends_with(utf8(&batch, "id").value(0))
+        );
     }
 
     #[test]
-    fn mail_folders_fixture_converts_with_hidden_and_visible_rows() {
-        // Synthetic provider-shaped page: the includeHiddenFolders pin
-        // is what makes a hidden row reachable at all, so the fixture
-        // carries one; sizeInBytes rides along unmapped (a phase-4
-        // column candidate).
+    fn mail_folders_fixture_converts_the_live_root_set() {
+        // Redacted live capture: the complete root-level set of a real
+        // MSA mailbox under the includeHiddenFolders pin — eight
+        // well-known folders plus one custom folder (its subfolder is
+        // counted, not listed). Every row is visible: this account had
+        // no hidden folders, so the is_hidden=true arm lives in the
+        // synthetic test below. sizeInBytes rides along unmapped (a
+        // deferred candidate, see module doc); well_known_name is
+        // mapped, and the wire spells its custom-folder case as an
+        // EXPLICIT null (key present), pinned here.
         let batch = convert_fixture(
             table("mail_folders"),
             include_str!("fixtures/outlook/mail_folders.json"),
         );
-        assert_eq!(batch.num_rows(), 3);
-        assert_eq!(utf8(&batch, "display_name").value(0), "Inbox");
-        assert!(!boolean(&batch, "is_hidden").value(0));
-        assert!(boolean(&batch, "is_hidden").value(2));
+        assert_eq!(batch.num_rows(), 9);
+        assert_eq!(utf8(&batch, "display_name").value(0), "Custom Folder");
+        assert_eq!(utf8(&batch, "display_name").value(7), "Inbox");
+        // well_known_name: Graph's locale-independent discriminator —
+        // a value on every system folder, explicit null on the custom
+        // one.
+        assert_eq!(utf8(&batch, "well_known_name").value(7), "inbox");
+        assert_eq!(utf8(&batch, "well_known_name").value(6), "sentitems");
+        assert!(utf8(&batch, "well_known_name").is_null(0));
+        let hidden: &BooleanArray = batch
+            .column_by_name("is_hidden")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("Boolean column");
+        assert!((0..9).all(|i| !hidden.value(i)));
+        let children: &Int64Array = batch
+            .column_by_name("child_folder_count")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("Int64 column");
+        assert_eq!(children.value(0), 1, "the custom folder's subfolder");
         let counts: &Int64Array = batch
             .column_by_name("total_item_count")
             .expect("column")
             .as_any()
             .downcast_ref()
             .expect("Int64 column");
-        assert_eq!(counts.value(0), 214);
-        assert_eq!(counts.value(2), 0);
-        assert_eq!(
-            utf8(&batch, "parent_folder_id").value(1),
-            "AQMkAGE1M2IyNGNmLjAAAA-folder-msgroot"
+        assert_eq!(counts.value(7), 5, "the five seeded inbox messages");
+        // Root-level listing: one shared parent across all nine rows.
+        let parents: std::collections::HashSet<_> = (0..9)
+            .map(|i| utf8(&batch, "parent_folder_id").value(i))
+            .collect();
+        assert_eq!(parents.len(), 1);
+    }
+
+    #[test]
+    fn fixtures_stay_redacted() {
+        // Mechanical re-audit of the redaction guarantee, so it is
+        // enforced by CI rather than by memory: every string leaf in
+        // every row fixture must be ASCII (the live mailbox's real
+        // names, folder names, and categories were all CJK — a cheap
+        // broad net), every @-bearing value must be an example.com
+        // identity, every URL must keep only the allowed provider
+        // shapes, and any string that itself parses as JSON is decoded
+        // and audited one level deeper (the Feishu round-2 lesson).
+        fn audit(value: &Value, path: &str) {
+            match value {
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        assert!(key.is_ascii(), "non-ASCII key at {path}: {key:?}");
+                        audit(child, &format!("{path}.{key}"));
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        audit(child, &format!("{path}[{i}]"));
+                    }
+                }
+                Value::String(s) => {
+                    assert!(s.is_ascii(), "non-ASCII string at {path}: {s:?}");
+                    if s.contains('@') {
+                        assert!(
+                            s.contains("example.com"),
+                            "@-bearing value at {path} is not an example.com identity: {s:?}"
+                        );
+                    }
+                    if s.starts_with("http") {
+                        assert!(
+                            s.starts_with("https://outlook.live.com/owa/?ItemID=")
+                                || s.starts_with("https://outlook.office365.com/owa/?ItemID=")
+                                || s.starts_with("https://graph.microsoft.com/"),
+                            "URL at {path} outside the allowed shapes: {s:?}"
+                        );
+                    }
+                    if let Ok(nested) = serde_json::from_str::<Value>(s) {
+                        if nested.is_object() || nested.is_array() {
+                            audit(&nested, &format!("{path}<decoded>"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (name, fixture) in [
+            ("messages", include_str!("fixtures/outlook/messages.json")),
+            (
+                "mail_folders",
+                include_str!("fixtures/outlook/mail_folders.json"),
+            ),
+            (
+                "messages_type_mismatch",
+                include_str!("fixtures/outlook/messages_type_mismatch.json"),
+            ),
+        ] {
+            audit(
+                &serde_json::from_str(fixture).expect("fixture parses"),
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_folder_row_converts() {
+        // SYNTHETIC: the live mailbox had no hidden folders (the pin's
+        // on/off responses were identical), so the is_hidden=true
+        // conversion arm is pinned here rather than by the capture.
+        let batch = convert_page(
+            table("mail_folders"),
+            &json!({"mailFolders": [
+                {"id": "f-hidden", "displayName": "Hidden", "isHidden": true},
+            ]}),
         );
+        assert!(boolean(&batch, "is_hidden").value(0));
     }
 
     #[test]
@@ -339,11 +507,15 @@ mod tests {
         // The passthrough columns sit wholly outside the declared
         // schema, so "key not present" is a legal row shape the select
         // pin can only mitigate live: absent keys are SQL NULL, and the
-        // whole row still converts.
+        // whole row still converts. Row 2 pins the explicit-null arm
+        // (SYNTHETIC — the live wire under the select pin never nulls
+        // a field, but passthrough offers no such guarantee): null is
+        // SQL NULL while "" stays an empty string.
         let batch = convert_page(
             table("messages"),
             &json!({"messages": [
                 {"id": "m-1", "subject": "s"},
+                {"id": "m-2", "subject": null, "bodyPreview": ""},
             ]}),
         );
         assert!(boolean(&batch, "has_attachments").is_null(0));
@@ -355,6 +527,8 @@ mod tests {
                 .expect("column")
                 .is_null(0)
         );
+        assert!(utf8(&batch, "subject").is_null(1));
+        assert_eq!(utf8(&batch, "body_preview").value(1), "");
     }
 
     #[test]
@@ -555,8 +729,11 @@ mod tests {
         // nesting under the declared-but-loose from/sender — is outside
         // the gate: drift there surfaces at scan time (or as a Graph 400
         // through the select pin), never at registration. Pinned so the
-        // gap stays a reviewed set. mail_folders: fully declared, the
-        // deliberate contrast.
+        // gap stays a reviewed set. mail_folders: seven declared columns
+        // plus one deliberate passthrough — well_known_name, added after
+        // the live pass because display_name is locale-dependent (no
+        // select pin exists on this action, so its only guards are this
+        // pin and the live-derived fixture).
         for (short, contract, expected) in [
             (
                 "messages",
@@ -580,7 +757,7 @@ mod tests {
             (
                 "mail_folders",
                 include_str!("fixtures/outlook/contracts/list_mail_folders.json"),
-                &[],
+                &["well_known_name"],
             ),
         ] {
             let t = table(short);

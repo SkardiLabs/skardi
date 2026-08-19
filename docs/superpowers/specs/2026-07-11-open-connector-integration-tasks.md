@@ -455,10 +455,29 @@ event carrying the scan identity and error.
       parity, drift-refusal at registration. Note `outlook.list_messages`
       declares no timestamp field at all, so `receivedDateTime` and every
       other date ride `additionalProperties` passthrough outside the
-      fingerprint gate — **phase 4 (live real-row verification, fixture
-      re-derivation as redacted captures, real `top` ceiling, select-400
-      behavior) is a prerequisite for ticking this entry**, and test counts
-      get pinned from CI at that point; phase 5 review then precedes ready.
+      fingerprint gate. Phase 4 (live real-row verification) ran
+      2026-08-19 against a real MSA mailbox through the pinned gateway:
+      every mapped column carried non-NULL values through a skardi-server
+      SQL scan, live discovery was byte-identical to the committed
+      contracts (both actions, both halves), a forced top=2 walk hit a
+      genuinely-null terminal cursor, top=1000 is the real wire bound
+      (1001 → schema 400), select misspellings 400 loudly, `mailFolderId`
+      forwards verbatim, and the fixtures were re-derived as redacted
+      live captures with a `fixtures_stay_redacted` CI tripwire.
+      Findings: folder-scoped continuation uses Graph's parenthesized
+      `mailFolders('{id}')/messages` form, which the executor's own
+      allowlist rejects — scoped scans past one page 400 until the
+      upstream gateway fix (issue to be filed on
+      oomol-lab/open-connector); the live mailbox had no hidden folders,
+      so the `includeHiddenFolders` pin's effect was unobservable
+      (recorded as caveat); wire extras `@odata.etag` and `sizeInBytes`
+      remain deliberately unmapped, while `wellKnownName` was promoted
+      to a `well_known_name` column post-pass (Owen-approved
+      2026-08-19: live display names were all CJK, so cross-account
+      folder semantics need Graph's locale-independent discriminator;
+      mail_folders' coverage gap goes empty → one pinned column). Test
+      counts get pinned from CI on the next push; phase 5 review then
+      precedes ready.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,

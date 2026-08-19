@@ -5,9 +5,10 @@
 # the declared item schemas under-declare heavily — `list_messages`
 # declares no date field at all, and every timestamp/threading column
 # below rides `additionalProperties` passthrough OUTSIDE the fingerprint
-# gate. Those passthrough spellings are provisional until the phase-4
-# live pass scans real rows (tracked in the module doc of
-# packs/outlook.rs, where the full design rationale lives).
+# gate. Every passthrough spelling was verified against real rows in
+# the phase-4 live pass (2026-08-19, MSA mailbox; findings in the
+# module doc of packs/outlook.rs, where the full design rationale
+# lives).
 #
 # Pagination is Graph's `@odata.nextLink`, re-exposed by the gateway as
 # a `nextLink` input/output pair: the cursor is a COMPLETE URL
@@ -71,7 +72,11 @@ tables:
     # `mailFolderId` scopes the table to one folder (the executor swaps
     # /me/messages for /me/mailFolders/{id}/messages); omitted, the
     # table is the whole mailbox — both collections are well-defined,
-    # hence optional. `filter`/`orderby` are raw OData EXPRESSIONS no
+    # hence optional. Live caveat (phase 4): Graph's scoped
+    # continuation URL uses the OData parenthesized form
+    # mailFolders('{id}')/messages, which the gateway's own allowlist
+    # rejects — scoped scans past one page 400 until the upstream fix.
+    # `filter`/`orderby` are raw OData EXPRESSIONS no
     # (input_field, literal) mapping can compose, and `bodyContentType`
     # shapes a field this pack deliberately does not map — none of the
     # three ever reaches the wire (negative-space guarded in tests).
@@ -106,9 +111,10 @@ tables:
       - { name: to_recipients, path: toRecipients, type: json, nullable: true }
       - { name: cc_recipients, path: ccRecipients, type: json, nullable: true }
       - { name: bcc_recipients, path: bccRecipients, type: json, nullable: true }
-      # ── Passthrough columns: undeclared upstream, provisional until
-      # the phase-4 live pass. The select pin above turns a misspelling
-      # here into a loud Graph 400 rather than an always-NULL column. ──
+      # ── Passthrough columns: undeclared upstream; every spelling
+      # live-verified in phase 4 (non-NULL on real rows). The select
+      # pin above turns a misspelling here into a loud Graph 400
+      # rather than an always-NULL column — confirmed live. ──
       - { name: received_date_time, path: receivedDateTime, type: timestamp_ms_utc, nullable: true }
       - { name: sent_date_time, path: sentDateTime, type: timestamp_ms_utc, nullable: true }
       - { name: created_date_time, path: createdDateTime, type: timestamp_ms_utc, nullable: true }
@@ -122,6 +128,13 @@ tables:
       # content belongs behind an explicit content surface, not in every
       # SELECT * — and excluding it from the select pin is what keeps
       # response sizes bounded.
+      # `replyTo` is the other declared-but-unmapped property: it is
+      # empty on ordinary mail (populated mostly by newsletter/bulk
+      # senders) and its content duplicates the recipient-list JSON
+      # shape — excluded for want of a query that needs it, not by
+      # accident. Mapping it later is a pure additive change (it is
+      # declared upstream, so the column would sit INSIDE the
+      # fingerprint gate — add it to the select pin alongside).
 
   mail_folders:
     action: outlook.list_mail_folders
@@ -146,11 +159,17 @@ tables:
     fixed_inputs:
       includeHiddenFolders: true
     columns:
-      # All seven columns are declared upstream — this table's
-      # fingerprint coverage gap is pinned EMPTY, the deliberate
-      # contrast to messages' passthrough surface.
+      # Seven columns are declared upstream; well_known_name is the one
+      # passthrough exception (undeclared, live-verified 2026-08-19),
+      # added because display_name is locale-dependent — a real MSA
+      # mailbox renders it in the account language ("收件箱"), so
+      # cross-account folder semantics need Graph's stable
+      # discriminator (inbox/sentitems/…; explicit null on custom
+      # folders). The fingerprint coverage gap is pinned to exactly
+      # this column.
       - { name: id, path: id, type: utf8, nullable: false }
       - { name: display_name, path: displayName, type: utf8, nullable: true }
+      - { name: well_known_name, path: wellKnownName, type: utf8, nullable: true }
       - { name: parent_folder_id, path: parentFolderId, type: utf8, nullable: true }
       - { name: child_folder_count, path: childFolderCount, type: int64, nullable: true }
       - { name: unread_item_count, path: unreadItemCount, type: int64, nullable: true }

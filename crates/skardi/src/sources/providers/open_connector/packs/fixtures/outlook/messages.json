@@ -1,110 +1,417 @@
 {
   "messages": [
     {
-      "@odata.etag": "W/\"CQAAABYAAAA1\"",
-      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMQ==",
-      "createdDateTime": "2026-08-14T09:15:40Z",
-      "lastModifiedDateTime": "2026-08-14T09:15:44Z",
-      "changeKey": "CQAAABYAAAA1",
-      "categories": ["Redacted Category"],
-      "receivedDateTime": "2026-08-14T09:15:42Z",
-      "sentDateTime": "2026-08-14T09:15:38Z",
-      "hasAttachments": true,
-      "internetMessageId": "<redacted-0001@example.com>",
-      "subject": "Redacted subject 1",
-      "bodyPreview": "Redacted preview text 1",
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0001\"",
+      "id": "AQMkADAwATM3SyntheticMessage0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:46:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:46:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:46:00Z",
+      "sentDateTime": "2026-08-19T03:46:00Z",
+      "hasAttachments": false,
+      "internetMessageId": "<synthetic-0001@mail.example.com>",
+      "subject": "Synthetic subject 1",
+      "bodyPreview": "Synthetic preview 1",
       "importance": "normal",
-      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox",
-      "conversationId": "AAQkAGE1M2IyNGNmconv-0001",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": true,
       "isDraft": false,
-      "isRead": false,
-      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-0001",
-      "inferenceClassification": "focused",
-      "flag": { "flagStatus": "notFlagged" },
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "sender": {
-        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+        "emailAddress": {
+          "name": "Person 1",
+          "address": "person1@example.com"
+        }
       },
       "from": {
-        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+        "emailAddress": {
+          "name": "Person 1",
+          "address": "person1@example.com"
+        }
       },
       "toRecipients": [
-        { "emailAddress": { "name": "Redacted Recipient", "address": "recipient1@example.com" } }
+        {
+          "emailAddress": {
+            "name": "person2@example.com",
+            "address": "person2@example.com"
+          }
+        }
       ],
-      "ccRecipients": [
-        { "emailAddress": { "name": "Redacted Cc", "address": "cc1@example.com" } }
+      "ccRecipients": [],
+      "bccRecipients": [
+        {
+          "emailAddress": {
+            "name": "person3@example.com",
+            "address": "person3@example.com"
+          }
+        }
       ],
-      "bccRecipients": [],
-      "replyTo": []
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
     },
     {
-      "@odata.etag": "W/\"CQAAABYAAAA2\"",
-      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMg==",
-      "createdDateTime": "2026-08-13T18:02:10Z",
-      "lastModifiedDateTime": "2026-08-13T18:02:11Z",
-      "changeKey": "CQAAABYAAAA2",
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0002\"",
+      "id": "AQMkADAwATM3SyntheticMessage0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:45:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:45:00Z",
       "categories": [],
-      "receivedDateTime": "2026-08-13T18:02:11Z",
-      "sentDateTime": "2026-08-13T18:02:05Z",
+      "receivedDateTime": "2026-08-19T03:45:00Z",
+      "sentDateTime": "2026-08-19T03:45:00Z",
       "hasAttachments": false,
-      "internetMessageId": "<redacted-0002@example.com>",
-      "subject": null,
-      "bodyPreview": "",
-      "importance": "high",
-      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-inbox",
-      "conversationId": "AAQkAGE1M2IyNGNmconv-0002",
-      "isDraft": false,
+      "internetMessageId": "<synthetic-0002@mail.example.com>",
+      "subject": "Synthetic subject 2",
+      "bodyPreview": "Synthetic preview 2",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "isRead": true,
-      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-0002",
-      "inferenceClassification": "other",
-      "flag": { "flagStatus": "flagged" },
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "sender": {
-        "emailAddress": { "name": "Redacted Sender 2", "address": "sender2@example.com" }
+        "emailAddress": {
+          "name": "Person 1",
+          "address": "person1@example.com"
+        }
       },
       "from": {
-        "emailAddress": { "name": "Redacted Sender 2", "address": "sender2@example.com" }
+        "emailAddress": {
+          "name": "Person 1",
+          "address": "person1@example.com"
+        }
       },
       "toRecipients": [
-        { "emailAddress": { "name": "Redacted Recipient", "address": "recipient1@example.com" } },
-        { "emailAddress": { "name": "Redacted Other", "address": "recipient2@example.com" } }
+        {
+          "emailAddress": {
+            "name": "Person 2",
+            "address": "person2@example.com"
+          }
+        }
       ],
       "ccRecipients": [],
       "bccRecipients": [],
-      "replyTo": []
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
     },
     {
-      "@odata.etag": "W/\"CQAAABYAAAA3\"",
-      "id": "AAMkAGE1M2IyNGNmLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMw==",
-      "createdDateTime": "2026-08-12T07:45:00Z",
-      "lastModifiedDateTime": "2026-08-12T07:45:03Z",
-      "changeKey": "CQAAABYAAAA3",
-      "categories": ["Redacted Category", "Redacted Second"],
-      "receivedDateTime": "2026-08-12T07:45:01Z",
-      "sentDateTime": "2026-08-12T07:44:55Z",
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0003\"",
+      "id": "AQMkADAwATM3SyntheticMessage0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:44:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:45:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:44:00Z",
+      "sentDateTime": "2026-08-19T03:44:00Z",
       "hasAttachments": false,
-      "internetMessageId": "<redacted-0003@example.com>",
-      "subject": "Redacted subject 3",
-      "bodyPreview": "Redacted preview text 3",
-      "importance": "low",
-      "parentFolderId": "AQMkAGE1M2IyNGNmLjAAAA-folder-archive",
-      "conversationId": "AAQkAGE1M2IyNGNmconv-0001",
-      "isDraft": true,
-      "isRead": true,
-      "webLink": "https://outlook.office365.com/owa/?ItemID=redacted-0003",
-      "inferenceClassification": "focused",
-      "flag": { "flagStatus": "notFlagged" },
+      "internetMessageId": "<synthetic-0003@mail.example.com>",
+      "subject": "Synthetic subject 3",
+      "bodyPreview": "Synthetic preview 3",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": false,
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "sender": {
-        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
       },
       "from": {
-        "emailAddress": { "name": "Redacted Sender 1", "address": "sender1@example.com" }
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "person1@example.com",
+            "address": "person1@example.com"
+          }
+        }
+      ],
+      "ccRecipients": [
+        {
+          "emailAddress": {
+            "name": "person3@example.com",
+            "address": "person3@example.com"
+          }
+        }
+      ],
+      "bccRecipients": [],
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0004\"",
+      "id": "AQMkADAwATM3SyntheticMessage0004AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:44:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:44:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:44:00Z",
+      "sentDateTime": "2026-08-19T03:44:00Z",
+      "hasAttachments": false,
+      "internetMessageId": "<synthetic-0004@mail.example.com>",
+      "subject": "Synthetic subject 4",
+      "bodyPreview": "Synthetic preview 4",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0004AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": true,
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0004AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sender": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "from": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "person3@example.com",
+            "address": "person3@example.com"
+          }
+        }
+      ],
+      "ccRecipients": [
+        {
+          "emailAddress": {
+            "name": "person1@example.com",
+            "address": "person1@example.com"
+          }
+        }
+      ],
+      "bccRecipients": [],
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0005\"",
+      "id": "AQMkADAwATM3SyntheticMessage0005AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:43:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:43:00Z",
+      "categories": [
+        "Category A"
+      ],
+      "receivedDateTime": "2026-08-19T03:43:00Z",
+      "sentDateTime": "2026-08-19T03:43:00Z",
+      "hasAttachments": false,
+      "internetMessageId": "<synthetic-0005@mail.example.com>",
+      "subject": "Synthetic subject 5",
+      "bodyPreview": "Synthetic preview 5",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0005AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": false,
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0005AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sender": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "from": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "person1@example.com",
+            "address": "person1@example.com"
+          }
+        }
+      ],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0006\"",
+      "id": "AQMkADAwATM3SyntheticMessage0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:43:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:43:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:43:00Z",
+      "sentDateTime": "2026-08-19T03:43:00Z",
+      "hasAttachments": true,
+      "internetMessageId": "<synthetic-0006@mail.example.com>",
+      "subject": "Synthetic subject 6",
+      "bodyPreview": "Synthetic preview 6",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": false,
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sender": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "from": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "person1@example.com",
+            "address": "person1@example.com"
+          }
+        }
+      ],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0007\"",
+      "id": "AQMkADAwATM3SyntheticMessage0007AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:42:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:42:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:42:00Z",
+      "sentDateTime": "2026-08-19T03:42:00Z",
+      "hasAttachments": false,
+      "internetMessageId": "<synthetic-0007@mail.example.com>",
+      "subject": "Synthetic subject 7",
+      "bodyPreview": "Synthetic preview 7",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0007AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": false,
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0007AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sender": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "from": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "person1@example.com",
+            "address": "person1@example.com"
+          }
+        }
+      ],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0008\"",
+      "id": "AQMkADAwATM3SyntheticMessage0008AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:38:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:45:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:38:00Z",
+      "sentDateTime": "2026-08-19T03:38:00Z",
+      "hasAttachments": false,
+      "internetMessageId": "<synthetic-0008@mail.example.com>",
+      "subject": "Synthetic subject 8",
+      "bodyPreview": "Synthetic preview 8",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": true,
+      "isDraft": false,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0008AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sender": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "from": {
+        "emailAddress": {
+          "name": "Person 2",
+          "address": "person2@example.com"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "person1@example.com",
+            "address": "person1@example.com"
+          }
+        }
+      ],
+      "ccRecipients": [],
+      "bccRecipients": [],
+      "flag": {
+        "flagStatus": "flagged"
+      }
+    },
+    {
+      "@odata.etag": "W/\"CQAAABYAAASynthetic0009\"",
+      "id": "AQMkADAwATM3SyntheticMessage0009AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "createdDateTime": "2026-08-19T03:35:00Z",
+      "lastModifiedDateTime": "2026-08-19T03:35:00Z",
+      "categories": [],
+      "receivedDateTime": "2026-08-19T03:35:00Z",
+      "sentDateTime": "2026-08-19T03:35:00Z",
+      "hasAttachments": false,
+      "internetMessageId": "<synthetic-0009@mail.example.com>",
+      "subject": "",
+      "bodyPreview": "Synthetic preview 9",
+      "importance": "normal",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0004AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "conversationId": "AQQkADAwSyntheticConv0008AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "isRead": true,
+      "isDraft": true,
+      "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATM3SyntheticMessage0009AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sender": {
+        "emailAddress": {
+          "name": "Person 1",
+          "address": "person1@example.com"
+        }
+      },
+      "from": {
+        "emailAddress": {
+          "name": "Person 1",
+          "address": "person1@example.com"
+        }
       },
       "toRecipients": [],
       "ccRecipients": [],
       "bccRecipients": [],
-      "replyTo": [
-        { "emailAddress": { "name": "Redacted Reply", "address": "reply1@example.com" } }
-      ]
+      "flag": {
+        "flagStatus": "notFlagged"
+      }
     }
   ],
-  "nextLink": "https://graph.microsoft.com/v1.0/me/messages?%24select=id%2csubject&%24top=100&%24skiptoken=RFRM9NextPage0001"
+  "nextLink": null
 }

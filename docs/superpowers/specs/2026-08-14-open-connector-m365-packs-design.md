@@ -1,6 +1,9 @@
 # Outlook Source Pack (Microsoft 365)
 
-**Status:** Draft for review — phases 1–2 complete, phase 3 not started
+**Status:** Phases 1–4 complete (phase 3 implemented 2026-08-19; phase 4
+live-verified the same day against a real MSA mailbox — outcomes
+recorded in the tasks doc's 5.7 entry and packs/outlook.rs's module
+doc). Phase 5 review pending.
 **Date:** 2026-08-14
 **Branch:** `feature/open-connector-m365-packs`
 **Milestone:** 5.7 (see [Milestone numbering](#milestone-numbering))
