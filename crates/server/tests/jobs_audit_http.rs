@@ -457,3 +457,118 @@ async fn submit_rejection_after_audit_write_is_recorded_failed() {
         "a run was created despite the rejection: {runs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The submission bridge: durable in `job_runs`, best-effort in `query_audit`
+
+#[tokio::test]
+async fn submission_bridge_points_both_ways() {
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+
+    let resp =
+        submit_with_headers(&state, &[("x-skardi-session-id", "sess-bridge")], json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let run_id = body_to_json(resp).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_terminal(&state, &run_id).await;
+
+    let rows = store.list_by_session("sess-bridge").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let audit_id = rows[0]["id"].as_str().unwrap();
+
+    // Forward: audit row -> run. Stamped after `executor.submit` returned,
+    // so this half is best-effort.
+    assert_eq!(rows[0]["job_run_id"], json!(run_id));
+
+    // Reverse: run -> audit row. Written in the INSERT that created the run,
+    // so this half is durable the moment the run exists.
+    let executor = state.jobs.clone().unwrap();
+    let run = executor.store().get_run(&run_id).await.unwrap().unwrap();
+    assert_eq!(
+        run.submission_id.as_deref(),
+        Some(audit_id),
+        "the run does not point back at its audit row"
+    );
+}
+
+#[tokio::test]
+async fn correlation_survives_a_lost_forward_stamp() {
+    // The failure this whole change exists for: `record_job_outcome` fails,
+    // times out, or the process dies before it lands, so the audit row keeps
+    // `job_run_id = NULL` and reconciles to `unknown`. Before the reverse pointer
+    // that lost the correlation permanently — `job_runs` carried neither a
+    // session id nor an audit-row id to rebuild from.
+    //
+    // Reproduced at the executor seam rather than over HTTP, because the
+    // point is precisely that no forward stamp is ever written: the handler
+    // would race to write one.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let executor = state.jobs.clone().unwrap();
+
+    let audit_id = store
+        .record_job_submitted(TEST_JOB_NAME, TEST_JOB_VERSION, Some("sess-lost"))
+        .await
+        .unwrap();
+    let run_id = executor
+        .submit(TEST_JOB_NAME, HashMap::new(), Some(&audit_id))
+        .await
+        .unwrap();
+
+    // No `record_job_outcome` call — then a restart reconciles the orphan.
+    store.reconcile_orphaned("simulated crash").await.unwrap();
+
+    let rows = store.list_by_session("sess-lost").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], json!("unknown"));
+    assert!(
+        rows[0]["job_run_id"].is_null(),
+        "precondition: the forward stamp must be missing"
+    );
+
+    // Recoverable anyway, from the half that was durable.
+    let recovered = executor
+        .store()
+        .get_run_by_submission_id(rows[0]["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .expect("the correlation was lost");
+    assert_eq!(recovered.id, run_id);
+    assert_eq!(recovered.job_name, TEST_JOB_NAME);
+}
+
+#[tokio::test]
+async fn unaudited_server_leaves_submission_id_null() {
+    // No ledger means no token to carry; the column must stay NULL rather
+    // than pick up some stand-in that would collide in the reverse lookup.
+    let (state, _tmp) = make_app_state(None).await;
+    let resp = submit_with_headers(&state, &[], json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+
+    let executor = state.jobs.clone().unwrap();
+    let run = executor.store().get_run(&run_id).await.unwrap().unwrap();
+    assert!(run.submission_id.is_none());
+}
+
+#[tokio::test]
+async fn run_detail_exposes_the_submission_id() {
+    // The reverse pointer is only useful to an operator if it is readable
+    // from the runs API, not just from the ledger file.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+
+    let resp = submit_with_headers(&state, &[("x-skardi-session-id", "sess-api")], json!({})).await;
+    let run_id = body_to_json(resp).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = wait_for_terminal(&state, &run_id).await;
+
+    let rows = store.list_by_session("sess-api").await.unwrap();
+    assert_eq!(detail["submission_id"], rows[0]["id"]);
+}

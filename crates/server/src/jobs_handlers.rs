@@ -140,6 +140,7 @@ fn job_run_to_json(run: &JobRun) -> Value {
         "rows_written": run.rows_written,
         "snapshot_id": run.snapshot_id,
         "error": run.error,
+        "submission_id": run.submission_id,
     })
 }
 
@@ -273,7 +274,14 @@ pub async fn submit_job_run(
         None => None,
     };
 
-    match executor.submit(&name, req.parameters).await {
+    // The audit row id doubles as the run's submission token, so the two
+    // ledgers point at each other. This half is durable at run-creation time;
+    // the `run_id` stamp below is best-effort, and if it is lost the
+    // correlation is still recoverable through `get_run_by_submission_id`.
+    match executor
+        .submit(&name, req.parameters, audit_id.as_deref())
+        .await
+    {
         Ok(run_id) => {
             finish_job_audit(
                 app_state.query_audit.as_deref(),

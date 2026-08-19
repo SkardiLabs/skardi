@@ -142,22 +142,13 @@ owned by the server.
   (`2026-08-19-jobs-auth-design.md`), because this change is what made the
   gap load-bearing: it turned `POST /jobs/:name/run` into the audit ledger's
   only unauthenticated write path.
-- **Guaranteeing** the `job_run_id` correlation. The column exists because
-  name + timestamp is ambiguous under concurrent submissions of the same
-  job, and it removes that ambiguity on the happy path — but the stamp is
-  written after `executor.submit` has already created the run, best-effort.
-  If it fails, times out, or the process dies first, the run exists in
-  `job_runs` while the audit row keeps `run_id = NULL` and reconciles to
-  `unknown`. Because `job_runs` carries neither `session_id` nor an
-  audit-row id, there is no reverse pointer: the correlation is
-  unrecoverable, not merely delayed, and `unknown` on a job row means
-  "definitely submitted, linkage lost" rather than the "may have run after a
-  crash" it means on a query row. Closing this needs a durable half in the
-  jobs ledger — an `audit_id` (or `session_id`) column on `job_runs`, plumbed
-  through `executor.submit` — which puts a server-layer audit concern into
-  the core `skardi` crate's jobs subsystem, a layering decision this change
-  does not make. Stated in `docs/server.md` so consumers read `job_run_id` as
-  usually-exact rather than guaranteed.
+- **Guaranteeing** the `job_run_id` correlation on its own. The stamp is
+  written after `executor.submit` has already created the run, best-effort, so
+  a failure/timeout/crash in that window leaves `job_run_id = NULL` on a row
+  that reconciles to `unknown`. **Closed as a follow-up**
+  (`2026-08-19-jobs-bridge-design.md`) by giving `job_runs` a durable
+  `submission_id` reverse pointer, written in the INSERT that creates the
+  run.
 - Reconciling the jobs ledger's raw-parameter storage with the query
   ledger's never-store-values stance. Flagged: `job_runs.parameters` holds
   exactly what `query_audit` refuses to hold, and deserves the same

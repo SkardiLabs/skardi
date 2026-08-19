@@ -179,7 +179,7 @@ execution and updated with its outcome afterwards:
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
 | `max_rows` | requested row cap (`0` on pipeline and job rows — not applicable) |
-| `job_run_id` | `job_runs.id` bridge, job rows only. Distinct from the identity envelope's `run_id`, which names the *caller's* run — one column, one meaning. |
+| `job_run_id` | `job_runs.id` bridge, job rows only; NULL if the outcome stamp was lost — see `job_runs.submission_id` for the durable reverse pointer. Distinct from the identity envelope's `run_id`, which names the *caller's* run — one column, one meaning. |
 | `request_id`, `org_id`, `workspace_id`, `user_id`, `run_id` | caller-identity envelope; all NULL on this server, filled by distributions that authenticate their callers |
 | `statement_kind` | `query` or `other` for ad-hoc rows (the server's statement *classification* — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows, `job` for job rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
@@ -338,15 +338,20 @@ Two properties of this seam an operator should know before relying on it:
   submissions with another session's id. Read `session_id` as a correlation
   key, never as evidence of who ran what.
 
-- **The `job_run_id` bridge is best-effort and one-directional.** It is
-  stamped after `executor.submit` returns, so if that write fails, times out,
-  or the process dies in the window, the run exists in `job_runs` but the row
-  keeps `job_run_id = NULL` (and reconciles to `unknown` on restart). `job_runs`
-  carries no `session_id` and no audit-row id, so there is no reverse pointer
-  to rebuild the correlation from — it is lost, not merely delayed. Exact
-  correlation is the column's purpose, so treat it as *usually* exact rather
-  than guaranteed; making it reconstructable needs a durable half in the
-  jobs ledger, which is out of scope here.
+- **The `job_run_id` bridge is best-effort, but the correlation is not.**
+  `query_audit.job_run_id` is stamped *after* `executor.submit` returns, so if
+  that write fails, times out, or the process dies in the window, the audit
+  row keeps `job_run_id = NULL` and reconciles to `unknown`. The correlation
+  survives anyway: `job_runs.submission_id` holds the audit row's id, written
+  in the same INSERT that creates the run, so it is durable the moment the
+  run exists. Read the pair as one bridge with a fast half and a reliable
+  half — `job_run_id` for the common lookup, `submission_id` when it is NULL.
+  Both directions are indexed.
+
+  `submission_id` is NULL for runs submitted to a server with no
+  `--query-audit-db`, and is surfaced on `GET /jobs/runs` and
+  `GET /jobs/runs/:run_id`. The jobs subsystem stores it verbatim and never
+  interprets it — it has no notion of the audit ledger.
 
 ---
 
