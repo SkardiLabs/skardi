@@ -1,0 +1,104 @@
+{
+  "mailFolders": [
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0005AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Custom Folder",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 1,
+      "unreadItemCount": 0,
+      "totalItemCount": 0,
+      "sizeInBytes": 0,
+      "wellKnownName": null,
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0007AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Outbox",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 0,
+      "totalItemCount": 0,
+      "sizeInBytes": 0,
+      "wellKnownName": "outbox",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0008AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Junk Email",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 0,
+      "totalItemCount": 0,
+      "sizeInBytes": 0,
+      "wellKnownName": "junkemail",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0009AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Archive",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 0,
+      "totalItemCount": 0,
+      "sizeInBytes": 0,
+      "wellKnownName": "archive",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0010AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Conversation History",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 1,
+      "unreadItemCount": 0,
+      "totalItemCount": 0,
+      "sizeInBytes": 0,
+      "wellKnownName": "conversationhistory",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0011AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Deleted Items",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 0,
+      "totalItemCount": 0,
+      "sizeInBytes": 0,
+      "wellKnownName": "deleteditems",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0001AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Sent Items",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 0,
+      "totalItemCount": 2,
+      "sizeInBytes": 27574,
+      "wellKnownName": "sentitems",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0003AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Inbox",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 3,
+      "totalItemCount": 5,
+      "sizeInBytes": 403039,
+      "wellKnownName": "inbox",
+      "isHidden": false
+    },
+    {
+      "id": "AQMkADAwATM3SyntheticFolder0004AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "displayName": "Drafts",
+      "parentFolderId": "AQMkADAwATM3SyntheticFolder0006AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "childFolderCount": 0,
+      "unreadItemCount": 0,
+      "totalItemCount": 1,
+      "sizeInBytes": 2501,
+      "wellKnownName": "drafts",
+      "isHidden": false
+    }
+  ],
+  "nextLink": null
+}

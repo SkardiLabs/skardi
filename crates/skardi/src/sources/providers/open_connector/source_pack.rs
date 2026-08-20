@@ -140,6 +140,7 @@ impl SourcePackRegistry {
             super::packs::slack::pack()?,
             super::packs::feishu::pack()?,
             super::packs::discord::pack()?,
+            super::packs::outlook::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }
@@ -258,7 +259,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "discord", "feishu", "github", "gmail", "mock", "notion", "slack"
+                "discord", "feishu", "github", "gmail", "mock", "notion", "outlook", "slack"
             ]
         );
     }
@@ -385,7 +386,9 @@ mod tests {
         // segments. New packs must keep this invariant or bindings hit the
         // ambiguity error above.
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
-        for name in ["mock", "github", "gmail", "slack", "notion", "feishu"] {
+        for name in [
+            "mock", "github", "gmail", "slack", "notion", "feishu", "discord", "outlook",
+        ] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for table in pack.tables {

@@ -749,24 +749,23 @@ enum FormatDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::providers::open_connector::source_pack::SourcePackRegistry;
 
-    /// Every shipped asset parses AND passes the same structural checks
-    /// binding performs — this is what keeps `builtin`'s panic
-    /// unreachable in a released binary.
+    /// Every registered asset parses AND passes the same structural
+    /// checks binding performs. Driven off `SourcePackRegistry::builtins()`
+    /// rather than a hand-listed roster: the roster construct had already
+    /// drifted for a full milestone (`discord.yaml` shipped in 5.6
+    /// unlisted), and whatever registration sees, this test now sees —
+    /// an asset cannot be shipped and skipped. WHAT is registered is the
+    /// registry name-list test's pin, not this one's.
     #[test]
     fn builtin_assets_parse_and_validate() {
-        for (asset, yaml) in [
-            ("mock.yaml", include_str!("mock.yaml")),
-            ("github.yaml", include_str!("github.yaml")),
-            ("gmail.yaml", include_str!("gmail.yaml")),
-            ("slack.yaml", include_str!("slack.yaml")),
-            ("notion.yaml", include_str!("notion.yaml")),
-            ("feishu.yaml", include_str!("feishu.yaml")),
-        ] {
-            // parse_pack performs the full structural + cross-field
-            // validation pass itself; parsing IS the gate.
-            let pack = parse_pack(yaml).unwrap_or_else(|e| panic!("{asset}: {e}"));
-            assert!(!pack.tables.is_empty(), "{asset}: no tables");
+        let registry =
+            SourcePackRegistry::builtins().expect("every embedded asset parses and validates");
+        for pack in registry.packs() {
+            // parse_pack rejects an empty `tables` today; this stays as
+            // the second layer should that rejection ever move.
+            assert!(!pack.tables.is_empty(), "{}: no tables", pack.name);
         }
     }
 

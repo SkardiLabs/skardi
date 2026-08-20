@@ -424,7 +424,77 @@ event carrying the scan identity and error.
       engine, 1 loader, 13 pack-scoped `… packs::discord` including
       per-table wire-declaration e2e for all three tables, UDTF parity, and
       empty-page schema stability), 868 full library suite.
-- [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
+- [x] 5.7 Outlook pack (OAuth user token, cursor pagination over Graph
+      `@odata.nextLink`, raw-passthrough rows): messages, mail_folders. Open
+      Connector has no `microsoft365` service; it splits Graph into `outlook`
+      (mail only — no calendar or contacts), `one_drive` and `excel`, with one
+      OAuth connection each, so Microsoft 365 ships one pack per service:
+      `one_drive` follows as its own milestone and PR, and the whole `excel`
+      service is deferred at the gate — its list actions emit `nextLink` but
+      accept no `nextLink` input, so their pagination cannot be completed.
+      Phases 1–2 (live contract reconciliation against gateway v1.3.4, table
+      design) are recorded in
+      `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`.
+      Phase 3 implemented: `packs/outlook.yaml` + `packs/outlook.rs`, both
+      tables cursor-over-`nextLink` (URI-shaped cursors everywhere — the
+      gateway pins format/host/path), `messages` pins `select` to exactly the
+      mapped fields (bounds responses away from the 16 MiB cap and turns a
+      misspelled passthrough column into a loud Graph 400; a test locks the
+      pin to the column set) with `page_size: 100`, `mail_folders` pins
+      `includeHiddenFolders: true` (complete root-level set, `is_hidden`
+      queryable); zero filter mappings (OData `$filter` expressions cannot be
+      composed by a scalar mapping — Notion precedent); input schemas captured
+      from the pinned gateway (`contracts/inputs/`) with the gmail-style
+      acceptance test; fingerprint sync + coverage-gap pins (mail_folders one
+      column, `well_known_name`; messages' thirteen passthrough/nested columns
+      an explicit set); redacted live-capture fixtures (nine messages, nine
+      root folders) re-audited every run by `fixtures_stay_redacted`, with the
+      shapes the live wire cannot produce (explicit nulls, a hidden folder, the
+      type-mismatch page) kept inline-synthetic; per-table cursor e2e with exact
+      key-set wire pins, termination on the executor's one spelling (explicit
+      `null` — the engine's tolerance for absent/empty is pinned in
+      `pagination.rs`, not re-mocked here), loop/invalid-cursor
+      failure arms, LIMIT early-stop, resource forwarding/withholding,
+      no-pushdown row identity, gateway failure-envelope surfacing, UDTF
+      parity, drift-refusal at registration. Note `outlook.list_messages`
+      declares no timestamp field at all, so `receivedDateTime` and every
+      other date ride `additionalProperties` passthrough outside the
+      fingerprint gate. Phase 4 (live real-row verification) ran
+      2026-08-19 against a real MSA mailbox through the pinned gateway:
+      every mapped column carried non-NULL values through a skardi-server
+      SQL scan, live discovery was byte-identical to the committed
+      contracts (both actions, both halves), a forced top=2 walk hit a
+      genuinely-null terminal cursor, top=1000 is the real wire bound
+      (1001 → schema 400), select misspellings 400 loudly, `mailFolderId`
+      forwards verbatim, and the fixtures were re-derived as redacted
+      live captures with a `fixtures_stay_redacted` CI tripwire.
+      Findings: folder-scoped continuation uses Graph's parenthesized
+      `mailFolders('{id}')/messages` form, which the executor's own
+      allowlist rejected — scoped scans past one page 400ed until the
+      upstream fix (open-connector#372, merged 2026-08-19; tagged
+      releases through v1.3.5 predate it); the live mailbox had no
+      hidden folders,
+      so the `includeHiddenFolders` pin's effect was unobservable
+      (recorded as caveat); wire extras `@odata.etag` and `sizeInBytes`
+      remain deliberately unmapped, while `wellKnownName` was promoted
+      to a `well_known_name` column post-pass (Owen-approved
+      2026-08-19: live display names were all CJK, so cross-account
+      folder semantics need Graph's locale-independent discriminator;
+      mail_folders' coverage gap goes empty → one pinned column). Test
+      counts from CI on `ef5125f` (`cargo llvm-cov nextest
+      --all-features`: 1864 tests plus the 237-test ignored suite, all
+      green): 368 `sources::providers::open_connector` tests, 24 of them
+      pack-scoped `…::packs::outlook`, inside a 1716-test skardi library
+      binary. Phase 5 (self-review) ran 2026-08-19 — sixteen findings,
+      fifteen fixed: vacuous test defenses (cardinality assertions arrow
+      satisfies with `""` on null slots, mapped columns with no positive
+      witness), a redaction audit that admitted an as-captured cursor or
+      `webLink` on a host-prefix match alone, doc claims the pack's own
+      fixtures contradict, and two hardcoded builtin-asset rosters
+      lagging two shipped packs. Deferred: consolidating the pack-test
+      helper quartet into `testutil` — seven-way duplication across the
+      packs, so it belongs in its own cross-pack PR rather than a
+      half-migration here.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -434,13 +504,14 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.5 (Gmail pack — threads, messages, drafts,
-  labels, filters). Milestones 1–4 and 5.1–5.4 (GitHub, Slack, Notion,
-  Feishu packs) are merged; this PR adds the first Google Workspace pack against
-  Open Connector's normalized Gmail contract (reconciled live and
-  verified end to end against a real mailbox), plus the one engine
-  extension it required (the loader's `single_page` strategy spelling
-  for actions that declare no pagination inputs).
+- **Current PR**: milestone 5.7 (Outlook pack — messages, mail_folders).
+  Milestones 1–4 and 5.1–5.6 (GitHub, Slack, Notion, Feishu, Gmail,
+  Discord packs) are merged; this PR adds the first Microsoft 365 pack
+  over raw Graph passthrough rows (reconciled live and verified end to
+  end against a real MSA mailbox), with zero engine changes — the
+  pack-shaping decisions are the messages `select` pin and the
+  one-pack-per-OC-service split (`one_drive` follows as its own
+  milestone; the whole `excel` service is deferred at the gate).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

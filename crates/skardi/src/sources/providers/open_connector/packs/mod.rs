@@ -8,4 +8,5 @@ pub mod github;
 pub mod gmail;
 pub mod mock;
 pub mod notion;
+pub mod outlook;
 pub mod slack;
