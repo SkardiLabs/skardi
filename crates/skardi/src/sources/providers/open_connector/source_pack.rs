@@ -344,9 +344,9 @@ impl SourcePackTable {
     /// request:
     ///
     /// 1. every `required` input is one the pack sends on every request
-    ///    ([`Self::guaranteed_input_keys`]);
+    ///    (`guaranteed_input_keys`);
     /// 2. under `additionalProperties: false`, every key the pack COULD
-    ///    send ([`Self::possible_input_keys`]) is a declared property.
+    ///    send (`possible_input_keys`) is a declared property.
     ///
     /// # Errors
     /// [`OpenConnectorError::ActionContractMismatch`] naming the
