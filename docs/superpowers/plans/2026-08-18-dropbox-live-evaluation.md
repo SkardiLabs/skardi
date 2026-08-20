@@ -9,7 +9,7 @@
 >
 > The authoritative outcome record is the provenance banner in
 > `crates/skardi/src/sources/providers/open_connector/packs/dropbox.rs`
-> and the 5.5 entry in
+> and the 5.7 entry in
 > `specs/2026-07-11-open-connector-integration-tasks.md`. This document is
 > kept as the **method** — what was probed and how — so the next pack's
 > live pass can copy it.
@@ -452,7 +452,7 @@ Files that must change as a result of this run:
   pagination section; it is a YAML-authored engine feature that no
   user-facing doc mentions.
 - `docs/superpowers/specs/2026-07-11-open-connector-integration-tasks.md`
-  — the 5.5 entry, ticked only now.
+  — the 5.7 entry, ticked only now.
 - `docs/superpowers/specs/2026-08-16-dropbox-source-pack-design.md` —
   status is still "no implementation started"; close out steps 2 and 5
   and answer the open questions.

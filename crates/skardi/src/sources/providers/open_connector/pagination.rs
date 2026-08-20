@@ -1152,7 +1152,7 @@ mod tests {
         let mut pagination = cursor();
         assert!(
             pagination
-                .advance(&json!({"next_cursor": "c2"}), 50)
+                .advance(&json!({"next_cursor": "c2"}), 50, None)
                 .unwrap()
         );
 

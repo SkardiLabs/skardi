@@ -284,7 +284,12 @@ impl SourcePackTable {
                 per_page_param,
                 ..
             } => vec![page_param, per_page_param],
-            PaginationStrategy::SinglePage => Vec::new(),
+            PaginationStrategy::Keyset {
+                cursor_param,
+                page_size_param,
+                ..
+            } => vec![cursor_param, page_size_param],
+            PaginationStrategy::SinglePage { .. } => Vec::new(),
         }
     }
 
@@ -917,7 +922,9 @@ mod tests {
         // cursor strategy), so this pins that a hand-built table cannot slip
         // through the gate by having no cursor input to check.
         let table = SourcePackTable {
-            pagination: PaginationStrategy::SinglePage,
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
             ..cursor_only_table()
         };
         let err = table

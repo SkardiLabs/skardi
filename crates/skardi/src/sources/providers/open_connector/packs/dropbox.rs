@@ -601,7 +601,7 @@ mod tests {
             "page 7",
             "row 1",
             "expected integer",
-            "found string",
+            "found a string",
         ] {
             assert!(
                 rendered.contains(fragment),
