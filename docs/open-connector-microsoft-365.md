@@ -55,6 +55,17 @@ spec:
 ```
 
 ```sql
+-- The 20 newest messages. Graph returns newest-first and a bare LIMIT
+-- stops pagination early, so this reads one page, not the mailbox.
+SELECT from_address, subject, received_date_time
+FROM saas.m365.messages
+LIMIT 20;
+
+-- The same shape with a predicate or ORDER BY reads the WHOLE table:
+-- nothing pushes down (see "No filter pushdown" below), the sort turns
+-- LIMIT into a top-k above the scan, and at the default bounds the
+-- scan fails past 10 000 messages. Scope it with a mailFolderId
+-- binding before running it against a real mailbox.
 SELECT from_address, subject, received_date_time
 FROM saas.m365.messages
 WHERE is_read = false
@@ -119,7 +130,8 @@ actions carry none at all. Every predicate runs in DataFusion after the
 bounded fetch; `LIMIT` stops pagination early; the practical scoping
 tools are the `mailFolderId` resource and `LIMIT`. The default safety
 bounds fail (never truncate) an unfiltered scan past `max_pages` ×
-page-size rows.
+page-size rows — at the defaults, 100 pages × 100 rows = **10 000
+messages per scan** (`max_rows`' 100 000 never binds first here).
 
 ## Pagination
 
