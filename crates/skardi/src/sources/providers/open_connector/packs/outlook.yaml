@@ -75,7 +75,9 @@ tables:
     # hence optional. Live caveat (phase 4): Graph's scoped
     # continuation URL uses the OData parenthesized form
     # mailFolders('{id}')/messages, which the gateway's own allowlist
-    # rejects — scoped scans past one page 400 until the upstream fix.
+    # rejected — fixed upstream in open-connector#372 (merged
+    # 2026-08-19); releases through v1.3.5 predate the fix and still
+    # 400 scoped scans past one page.
     # `filter`/`orderby` are raw OData EXPRESSIONS no
     # (input_field, literal) mapping can compose, and `bodyContentType`
     # shapes a field this pack deliberately does not map — none of the

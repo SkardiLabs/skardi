@@ -48,7 +48,7 @@ Probed live against a local gateway (v1.3.4, `open-connector` at
 
 | Service | Actions | List-shaped read actions | Gate verdict |
 |---|---|---|---|
-| `outlook` | 11 — **mail only**, no calendar or contacts | `list_messages`, `list_mail_folders` | ✅ both paginate completely |
+| `outlook` | 11 — **mail only**, no calendar or contacts | `list_messages`, `list_mail_folders` | ✅ both paginate completely — with a phase-4 asterisk: folder-scoped continuation required the executor-allowlist fix open-connector#372 (item 4 below) |
 | `one_drive` | 13 | `list_folder_children`, `search_items` | ✅ both paginate completely |
 | `excel` | 31 | `list_worksheets`, `list_tables`, `list_table_rows`, `list_table_columns`, `list_drive_item_children`, `search_files` | ❌ all deferred |
 
@@ -425,9 +425,23 @@ provide it. Upstream `nextLink` inputs are the fix.
    scope).
 3. `outlook.list_messages` spells its sort input `orderby` while
    `one_drive` spells it `orderBy`.
+4. **Found in the phase-4 live pass, since fixed:** the outlook
+   executor's `nextLink` path allowlist accepted only the slash form
+   `/v1.0/me/mailFolders/{id}/messages`, while Graph's folder-scoped
+   continuation uses the OData parenthesized form
+   `mailFolders('{id}')/messages` — a `mailFolderId`-bound scan 400ed
+   on its second page against the gateway's own cursor. Fixed upstream
+   in open-connector#372 (merged 2026-08-19); tagged releases through
+   v1.3.5 predate the fix. This did not retract the gate verdict:
+   unlike Excel's silent single page, the failure is loud and mid-scan
+   (the engine fails the whole scan rather than serving page one as
+   the collection), and the unbound table paginates completely — so
+   `mailFolderId` shipped with the caveat documented rather than being
+   withheld.
 
 Neither of the first two blocks this milestone; both belong in the PR
-body as known-upstream facts.
+body as known-upstream facts, as does the fourth, which the live pass
+found and #372 has since fixed.
 
 ## Milestone numbering
 

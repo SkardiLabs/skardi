@@ -471,9 +471,10 @@ event carrying the scan identity and error.
       live captures with a `fixtures_stay_redacted` CI tripwire.
       Findings: folder-scoped continuation uses Graph's parenthesized
       `mailFolders('{id}')/messages` form, which the executor's own
-      allowlist rejects — scoped scans past one page 400 until the
-      upstream gateway fix (issue to be filed on
-      oomol-lab/open-connector); the live mailbox had no hidden folders,
+      allowlist rejected — scoped scans past one page 400ed until the
+      upstream fix (open-connector#372, merged 2026-08-19; tagged
+      releases through v1.3.5 predate it); the live mailbox had no
+      hidden folders,
       so the `includeHiddenFolders` pin's effect was unobservable
       (recorded as caveat); wire extras `@odata.etag` and `sizeInBytes`
       remain deliberately unmapped, while `wellKnownName` was promoted

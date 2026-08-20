@@ -140,14 +140,17 @@ request); the executor ignores it there because the link embeds its own
 `$top` — cosmetic, but pinned in tests so nobody assumes the page size
 is re-applied mid-scan.
 
-**Known upstream defect (found in the phase-4 live pass):** Graph's
-continuation URL for a *folder-scoped* listing uses the OData
+**Upstream defect found in the phase-4 live pass, since fixed:**
+Graph's continuation URL for a *folder-scoped* listing uses the OData
 parenthesized form `/v1.0/me/mailFolders('{id}')/messages`, which the
-executor's own path allowlist rejects — a `mailFolderId`-bound scan
-whose folder exceeds one page (`page_size: 100`) fails loudly with a
-gateway 400 on its second page. Whole-mailbox scans are unaffected
-(`/v1.0/me/messages` paginates cleanly). Gateway fix tracked upstream
-on oomol-lab/open-connector.
+executor's path allowlist used to reject — a `mailFolderId`-bound scan
+whose folder exceeded one page (`page_size: 100`) failed loudly with a
+gateway 400 on its second page. Fixed upstream in
+[open-connector#372](https://github.com/oomol-lab/open-connector/pull/372)
+(merged 2026-08-19, live-verified in that PR); gateways predating the
+fix — every tagged release through v1.3.5 — still carry the defect.
+Whole-mailbox scans are unaffected either way (`/v1.0/me/messages`
+paginates cleanly).
 
 ## Authorization
 

@@ -6,7 +6,7 @@
 //! **Status: phases 1–4 complete.** The phase-4 live pass ran on
 //! 2026-08-19 against the same gateway pin (v1.3.4, `2410fbe`) and a
 //! real personal (MSA) mailbox over OAuth: all 22 selected message
-//! fields and all 7 folder fields arrived with the pinned spellings
+//! fields and all 8 folder fields arrived with the pinned spellings
 //! and carried non-NULL values through a skardi-server SQL scan; live
 //! discovery schemas were byte-identical to the committed contract
 //! captures (both halves, both actions); a forced `top=2` walk
@@ -15,16 +15,18 @@
 //! live captures (enforced by `fixtures_stay_redacted`). Live findings
 //! that shape the pack:
 //!
-//! - **Folder-scoped pagination is broken upstream.** Graph's
-//!   continuation URL for a scoped listing is the OData parenthesized
-//!   form `/v1.0/me/mailFolders('{id}')/messages`, and the executor's
-//!   own path allowlist accepts only the slash form — so a
-//!   `mailFolderId`-scoped scan 400s on its second page ("nextLink
-//!   must target Outlook message pagination endpoints"), refusing the
-//!   very cursor its previous response returned. Loud, never silent;
-//!   folders within one page (`page_size: 100`) are unaffected, and
-//!   the whole-mailbox path (`/v1.0/me/messages`) paginates fine.
-//!   Upstream gateway defect; tracked on oomol-lab/open-connector.
+//! - **Folder-scoped pagination was broken upstream** — fixed in
+//!   open-connector#372 (merged 2026-08-19); tagged releases through
+//!   v1.3.5 predate the fix. Graph's continuation URL for a scoped
+//!   listing is the OData parenthesized form
+//!   `/v1.0/me/mailFolders('{id}')/messages`, and the executor's path
+//!   allowlist accepted only the slash form — so against a pre-fix
+//!   gateway a `mailFolderId`-scoped scan 400s on its second page
+//!   ("nextLink must target Outlook message pagination endpoints"),
+//!   refusing the very cursor its previous response returned. Loud,
+//!   never silent; folders within one page (`page_size: 100`) are
+//!   unaffected, and the whole-mailbox path (`/v1.0/me/messages`)
+//!   paginates fine everywhere.
 //! - **Wire rows carry unmapped extras**: `@odata.etag` on messages
 //!   and `sizeInBytes` on folders, both left unmapped deliberately
 //!   (a volatile concurrency token and a constantly-fluctuating
@@ -506,8 +508,10 @@ mod tests {
         // names, folder names, and categories were all CJK — a cheap
         // broad net), every @-bearing value must be an example.com
         // identity, every URL must keep only the allowed provider
-        // shapes, and any string that itself parses as JSON is decoded
-        // and audited one level deeper (the Feishu round-2 lesson).
+        // shapes, every value under an id-bearing key must carry a
+        // redaction marker, and any string that itself parses as JSON
+        // is decoded and audited one level deeper (the Feishu round-2
+        // lesson).
         // Today's fixtures are clean; what this guards is the NEXT
         // re-capture, so each rule is written to fail closed on the
         // shapes a raw capture would actually carry.
@@ -561,10 +565,27 @@ mod tests {
         }
 
         fn audit(value: &Value, path: &str) {
+            // The one key-aware rule, in the same spirit as
+            // `is_redacted_url` requiring a marker on an allowed host:
+            // the value rules below cannot see a raw Graph id — it is
+            // ASCII, `@`-free and scheme-free. On `messages` the gap
+            // is masked (`webLink` embeds the row's own id, so a
+            // forgotten message-id remap trips the URL rule), but
+            // `mail_folders` has no URL column, and its ids are
+            // persistent mailbox-scoped handles.
+            const ID_KEYS: [&str; 4] = ["id", "parentFolderId", "conversationId", "@odata.etag"];
             match value {
                 Value::Object(map) => {
                     for (key, child) in map {
                         assert!(key.is_ascii(), "non-ASCII key at {path}: {key:?}");
+                        if ID_KEYS.contains(&key.as_str()) {
+                            if let Value::String(v) = child {
+                                assert!(
+                                    v.contains("Synthetic") || v.contains("redacted-"),
+                                    "id-bearing value at {path}.{key} carries no redaction marker"
+                                );
+                            }
+                        }
                         audit(child, &format!("{path}.{key}"));
                     }
                 }
@@ -585,9 +606,16 @@ mod tests {
                     // capture carries `bodyPreview` (255 chars of real
                     // mail body), where a link sits mid-sentence — ASCII
                     // and @-free, so nothing else here would catch it.
+                    // The token is cut at the first character no URL can
+                    // hold, so the marker must sit inside the URL itself
+                    // — prose later in the same value cannot vouch for
+                    // it.
                     let lowered = s.to_ascii_lowercase();
                     for (offset, _) in lowered.match_indices("http") {
                         let url = &s[offset..];
+                        let url = &url[..url
+                            .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>')
+                            .unwrap_or(url.len())];
                         assert!(
                             is_redacted_url(url),
                             "URL at {path} outside the allowed shapes: {url:?}"
@@ -1485,7 +1513,11 @@ bindings:
         // engine's own failure test fails on the FIRST request
         // (`pages_fetched: 0`), and the loop/drift tests fail on the
         // cursor's shape rather than on a page that never arrives. So
-        // this replays the real defect's envelope, one page in.
+        // this replays the real defect's envelope, one page in. The
+        // defect itself is fixed upstream (open-connector#372), but
+        // the pin outlives it: any gateway refusing a mid-scan cursor
+        // — a pre-fix release, a future allowlist regression — must
+        // fail the scan the same way.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
