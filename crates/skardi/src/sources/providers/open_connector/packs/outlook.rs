@@ -270,7 +270,14 @@ mod tests {
     // becomes `Synthetic subject N` / `Synthetic preview N` /
     // `Category A`; `webLink` keeps its host and embeds the row's OWN
     // synthetic id; timestamps are coarsened to the minute with their
-    // ordering intact. Folder `displayName`s were CJK on the live
+    // ordering intact — the live wire sent whole seconds (`…:SSZ`, no
+    // fractional part, on all four fields of all nine rows), and the
+    // coarsening rewrites only a trailing `:SSZ`, so sub-second digits
+    // in a future capture survive redaction rather than being
+    // flattened: they carry no identity, and they are the half of
+    // RFC 3339 the converter actually has to cope with (that branch is
+    // exercised today by the notion/gmail fixtures over the same
+    // `parse_timestamp`). Folder `displayName`s were CJK on the live
     // mailbox and became their English equivalents — which is exactly
     // why `well_known_name` is a column.
     //
