@@ -187,7 +187,7 @@ with `400 parameter_validation_error` — the header is always validated once
 the job exists, regardless of audit configuration. When `--query-audit-db`
 is configured, the submission is recorded as a `job` row with the session
 id and `name@version` in the ledger, with the submission's outcome
-(`succeeded` or `failed`) and any bridge `run_id`. When the server has
+(`succeeded` or `failed`) and the `job_run_id` bridge to the run. When the server has
 auditing enabled, a `503` with `error_type: query_audit_error` means the
 job **was not submitted** and the call is safe to retry.
 

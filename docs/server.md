@@ -328,17 +328,34 @@ ad-hoc queries, pipeline calls, and job submissions in one ordered read.
 
 Two properties of this seam an operator should know before relying on it:
 
-- **It is the ledger's only unauthenticated write path.** `/query` and
+- **It is the ledger's only unauthenticated write path, and that costs
+  availability, not just attribution.** `/query` and
   `POST /:pipeline/execute` both call `require_session` before writing
-  anything; the jobs handlers perform no auth check at all. The header is
-  self-reported on every endpoint — it never attests to origin — but on the
-  other two the caller is at least authenticated. Here neither is true, so
-  anyone who can reach `POST /jobs/:name/run` can mint arbitrary
-  `session_id` values into `query_audit`, including ones belonging to real
-  sessions, and can queue writes onto the ledger's single serialized writer
-  thread (shared with every audited request). If you enable
-  `--query-audit-db` behind auth, note that this one seam is not gated.
-  Backfilling the check is tracked separately.
+  anything; the jobs handlers perform no auth check at all. Two distinct
+  consequences, the second the more serious:
+
+  1. *Forged attribution.* The header is self-reported on every endpoint — it
+     never attests to origin — but on the other two the caller is at least
+     authenticated. Here neither is true, so anyone who can reach
+     `POST /jobs/:name/run` can mint arbitrary `session_id` values into
+     `query_audit`, including ones belonging to real sessions. A forged row
+     lands inside a legitimate session's `list_by_session` read and is
+     indistinguishable from a real submission.
+
+  2. *Denial of service against the other two endpoints.* Every submission —
+     including ones the executor will reject — issues writes on the ledger's
+     **single serialized writer thread**, shared with every audited request.
+     `/query` and `POST /:pipeline/execute` are fail-closed on that thread:
+     when work on it exceeds the write timeout, they return `503` by design.
+     Before job auditing existed, `POST /jobs/:name/run` did not touch that
+     thread at all. It now does, unrate-limited and unauthenticated — so an
+     anonymous caller can stall writes that two *authenticated* endpoints
+     block on, plus grow a ledger whose retention is off by default.
+
+  Weigh the second one when deciding where to enable `--query-audit-db`: if
+  the deployment is behind auth, this seam is not gated and the exposure is
+  to the availability of the endpoints that are. Backfilling the check is
+  tracked separately.
 
 - **The `job_run_id` bridge is best-effort and one-directional.** It is
   stamped after `executor.submit` returns, so if that write fails, times out,

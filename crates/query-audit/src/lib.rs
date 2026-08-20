@@ -255,12 +255,44 @@ fn ensure_added_columns(conn: &rusqlite::Connection, columns: &[&str]) -> SqlRes
     Ok(())
 }
 
-/// Every column added to `query_audit` after its original DDL, plus the
-/// indexes that can only be built once those columns exist.
+/// Normalise the pre-#219 `statement_kind` casing on rows already on disk.
+///
+/// Ad-hoc rows used to record the `Debug` form of `StatementKind` — `Query`
+/// and `Other`. They now record [`QUERY_STATEMENT_KIND`] /
+/// [`OTHER_STATEMENT_KIND`], so without this a ledger written before the
+/// change holds both casings for one concept: `WHERE statement_kind =
+/// 'query'` (the filter `docs/server.md` documents) silently returns only
+/// post-upgrade rows, and `= 'Query'` silently loses everything after.
+/// `idx_query_audit_statement_kind` makes both look fast, so the only symptom
+/// is wrong counts. The ledger is append-only with retention off by default,
+/// so those rows never age out on their own.
+///
+/// Idempotent and a no-op on fresh databases, like the column reconcile it
+/// sits beside. `statement_kind` carries no `COLLATE NOCASE`, so the match is
+/// case-sensitive and normalised rows cannot be rewritten again. `pipeline`
+/// and `job` were lowercase from the start and are untouched.
+fn normalise_statement_kind_casing(conn: &rusqlite::Connection) -> SqlResult<()> {
+    for (legacy, current) in [
+        ("Query", QUERY_STATEMENT_KIND),
+        ("Other", OTHER_STATEMENT_KIND),
+    ] {
+        conn.execute(
+            "UPDATE query_audit SET statement_kind = ?1 WHERE statement_kind = ?2",
+            params![current, legacy],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every column added to `query_audit` after its original DDL, the indexes
+/// that can only be built once those columns exist, and the one-shot data
+/// normalisations that keep an existing file consistent with what the current
+/// code writes.
 fn ensure_schema_additions(conn: &rusqlite::Connection) -> SqlResult<()> {
     ensure_added_columns(conn, &IDENTITY_COLUMNS)?;
     ensure_added_columns(conn, &BRIDGE_COLUMNS)?;
     conn.execute_batch(JOB_RUN_ID_INDEX_SQL)?;
+    normalise_statement_kind_casing(conn)?;
     Ok(())
 }
 
@@ -351,6 +383,20 @@ impl QueryAuditStore {
             // engine.
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "FULL")?;
+            // SQLite installs no busy handler by default: a write that finds
+            // the lock held returns `SQLITE_BUSY` immediately. Two servers
+            // pointed at one `--query-audit-db` — the case
+            // `ensure_added_columns` and the `started`-only guard are written
+            // for — would then fail on the lock before ever reaching the
+            // races being guarded: B's `ALTER TABLE` during A's INSERT aborts
+            // B's startup with `database is locked`, and an audited request
+            // that loses the lock 503s under a fail-closed policy that was
+            // meant for real write failures. Bounded by the same
+            // `AUDIT_WRITE_TIMEOUT` the callers already wait out, so waiting
+            // for the lock cannot outlast the request bound. Matches the
+            // sqlite source provider, which defaults `busy_timeout_ms` to
+            // 5000 rather than taking SQLite's default.
+            conn.busy_timeout(AUDIT_WRITE_TIMEOUT)?;
             conn.execute_batch(INIT_SCHEMA_SQL)?;
             ensure_schema_additions(conn)?;
             Ok(())
@@ -1585,6 +1631,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_normalises_legacy_statement_kind_casing() {
+        // A ledger written before the casing change holds `Query` / `Other`
+        // (the leaked `Debug` form). After upgrading, the documented filter
+        // `WHERE statement_kind = 'query'` must see those rows too — otherwise
+        // every pre-upgrade ad-hoc statement is silently invisible to the
+        // intention-mining consumer the ledger exists for.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("legacy-casing.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE query_audit (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    finished_at TEXT, sql TEXT NOT NULL, ai_context TEXT,
+                    session_id TEXT, max_rows INTEGER NOT NULL,
+                    statement_kind TEXT NOT NULL, status TEXT NOT NULL,
+                    row_count INTEGER, error TEXT);",
+            )
+            .unwrap();
+            for (id, kind) in [
+                ("old-q", "Query"),
+                ("old-o", "Other"),
+                ("old-p", "pipeline"),
+            ] {
+                conn.execute(
+                    "INSERT INTO query_audit
+                        (id, created_at, sql, max_rows, statement_kind, status, session_id)
+                     VALUES (?1, '2026-08-01T00:00:00Z', 'SELECT 1', 10, ?2, 'succeeded', 'sess-legacy')",
+                    params![id, kind],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = QueryAuditStore::open(&path).await.unwrap();
+        store
+            .record_started(
+                "SELECT 2",
+                Some(&json!({ "session_id": "sess-legacy" })),
+                10,
+                QUERY_STATEMENT_KIND,
+            )
+            .await
+            .unwrap();
+
+        let rows = store.list_by_session("sess-legacy").await.unwrap();
+        let kinds: Vec<&str> = rows
+            .iter()
+            .map(|r| r["statement_kind"].as_str().unwrap())
+            .collect();
+        // Both pre-upgrade ad-hoc rows now answer to the documented filter,
+        // alongside the post-upgrade one. `pipeline` was already lowercase.
+        assert_eq!(kinds.iter().filter(|k| **k == "query").count(), 2);
+        assert_eq!(kinds.iter().filter(|k| **k == "other").count(), 1);
+        assert_eq!(kinds.iter().filter(|k| **k == "pipeline").count(), 1);
+        assert!(
+            !kinds.iter().any(|k| *k == "Query" || *k == "Other"),
+            "legacy casing survived the migration: {kinds:?}"
+        );
+
+        // Idempotent: a second open must not disturb the normalised rows.
+        drop(store);
+        let store = QueryAuditStore::open(&path).await.unwrap();
+        let rows = store.list_by_session("sess-legacy").await.unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter()
+                .all(|r| r["statement_kind"] != json!("Query")
+                    && r["statement_kind"] != json!("Other")),
+            "second open reintroduced legacy casing"
+        );
+    }
+
+    #[tokio::test]
     async fn open_creates_job_run_id_index_on_migrated_and_fresh_databases() {
         // The index cannot live in INIT_SCHEMA_SQL — that batch also runs
         // against pre-column databases, where indexing job_run_id would fail
@@ -1683,7 +1803,11 @@ mod tests {
 
         let row = store.get(&id).await.unwrap().unwrap();
         assert_eq!(row["status"], json!("unknown"));
-        assert!(row["run_id"].is_null(), "terminal row was resurrected");
+        // `job_run_id`, not `run_id`: the bridge stamp is the only column
+        // `record_job_outcome` writes, so it is the only one whose absence
+        // proves the guard blocked the late write. `run_id` is #206's
+        // identity envelope — always NULL here regardless of the guard.
+        assert!(row["job_run_id"].is_null(), "terminal row was resurrected");
     }
 
     #[tokio::test]

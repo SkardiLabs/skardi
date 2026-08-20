@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::query_audit::{QueryAuditStatus, QueryAuditStore};
 use crate::server::AppState;
-use crate::session_header::session_id_from_headers;
+use crate::session_header::{SESSION_ID_HEADER, session_id_from_headers};
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitRunRequest {
@@ -184,7 +184,17 @@ pub async fn submit_job_run(
     let session_id = session_id_from_headers(&headers).map_err(|msg| {
         (
             StatusCode::BAD_REQUEST,
-            error_json(&msg, "parameter_validation_error", None),
+            // `details.header` matches what `execute_pipeline_by_name` returns
+            // for the identical rejection. `error_type` alone cannot
+            // discriminate here: this endpoint also returns
+            // `parameter_validation_error` for genuine job-parameter
+            // rejections, so the header field is the only machine-readable
+            // way for a client to tell the two apart.
+            error_json(
+                &msg,
+                "parameter_validation_error",
+                Some(serde_json::json!({ "header": SESSION_ID_HEADER })),
+            ),
         )
     })?;
 

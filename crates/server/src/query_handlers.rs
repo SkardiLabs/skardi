@@ -128,7 +128,6 @@ fn validate_context_string(
 // off; a failed outcome write leaves the row `started` for startup reconcile)
 // is the ledger's, not `/query`'s, and it is shared with `pipeline_handlers`.
 
-/// Execute ad-hoc SQL endpoint - POST /query
 /// The ledger's `statement_kind` marker for an ad-hoc statement of the given
 /// kind.
 ///
@@ -144,6 +143,7 @@ fn adhoc_statement_kind(kind: StatementKind) -> &'static str {
     }
 }
 
+/// Execute ad-hoc SQL endpoint - POST /query
 pub async fn execute_query(
     State(app_state): State<AppState>,
     headers: axum::http::HeaderMap,

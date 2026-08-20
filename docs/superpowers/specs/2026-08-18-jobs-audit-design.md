@@ -46,8 +46,9 @@ jobs ledger remains the authority on the run.
 
 First actual schema change to the ledger. `--query-audit-db` remains
 unreleased, but dev databases exist, so `open()` gains an idempotent guarded
-migration: `ALTER TABLE query_audit ADD COLUMN run_id TEXT` when
-`pragma table_info` lacks it. `get()`/`list_by_session` include the column.
+migration: `ALTER TABLE query_audit ADD COLUMN job_run_id TEXT` when
+`pragma table_info` lacks it. (The column is `job_run_id`, not `run_id` —
+see *Rebase decisions* below for why the two names are not interchangeable.) `get()`/`list_by_session` include the column.
 Exact-correlation is the point: name + timestamp correlation is ambiguous
 under concurrent submissions of the same job.
 

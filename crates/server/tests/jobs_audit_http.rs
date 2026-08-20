@@ -312,6 +312,12 @@ async fn malformed_header_on_real_job_is_400_and_records_nothing() {
             .contains("x-skardi-session-id"),
         "expected the session-header reject, got {body}"
     );
+    // Same discriminator the pipeline path supplies. `error_type` is shared
+    // with genuine job-parameter rejections on this endpoint, so
+    // `details.header` is the only machine-readable way a client can tell a
+    // bad session header from a bad job parameter.
+    assert_eq!(body["error_type"], json!("parameter_validation_error"));
+    assert_eq!(body["details"]["header"], json!("x-skardi-session-id"));
     assert_eq!(store.count().await.unwrap(), 0);
 }
 

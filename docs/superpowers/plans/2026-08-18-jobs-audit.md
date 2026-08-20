@@ -2,6 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded in four places by the rebase onto #206 and review round 1.** This plan was
+> written before the ledger-crate extraction landed and records what was
+> planned, not what shipped. Where the two disagree, the authority is
+> `docs/superpowers/specs/2026-08-18-jobs-audit-design.md` under *Rebase
+> decisions*, and the code. The divergences, all of which recur throughout
+> the steps and snippets below:
+>
+> | this plan says | what shipped | why |
+> | --- | --- | --- |
+> | the bridge column is `run_id` | `job_run_id` | #206's identity envelope already claims `run_id`, meaning the *caller's* run — one column cannot carry two meanings |
+> | its own guarded `ALTER TABLE` migration | `ensure_added_columns` in `crates/query-audit` | #206 shipped the same mechanism for its five identity columns; sharing it spread the duplicate-column race fix across all six |
+> | `session_id_from_headers` moves to `query_audit` | `crates/server/src/session_header.rs` | it needs `axum::http::HeaderMap`, and `skardi-query-audit` depends on neither `axum` nor `skardi` — the point of the extraction |
+> | ad-hoc rows assert `statement_kind == "Query"` | `"query"` | review round 1: all four values share one casing |
+
 **Goal:** Record every job submission in the `query_audit` ledger with session attribution and a `run_id` bridge to the jobs ledger, so agent-submitted jobs join session mining.
 
 **Architecture:** `POST /jobs/:name/run` writes a `started` row (statement_kind=`job`, `name@version`, optional session header) before `executor.submit`, fail-closed like #213; the outcome stamp carries `run_id` on success or a fixed error kind on rejection. Run detail stays in `job_runs`. One new nullable ledger column (`run_id`) via a guarded migration. `session_id_from_headers` moves to `query_audit` (third consumer). CLI gains `skardi job run --session-id` with the validation extracted to a shared module.
