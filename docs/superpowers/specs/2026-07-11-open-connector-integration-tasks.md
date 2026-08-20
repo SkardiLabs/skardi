@@ -424,8 +424,7 @@ event carrying the scan identity and error.
       engine, 1 loader, 13 pack-scoped `… packs::discord` including
       per-table wire-declaration e2e for all three tables, UDTF parity, and
       empty-page schema stability), 868 full library suite.
-- [ ] 5.6 Later waves per the design rollout (Google Workspace, HubSpot, Jira, …) through the source-pack admission gate
-- [ ] 5.7 Outlook pack (OAuth user token, cursor pagination over Graph
+- [x] 5.7 Outlook pack (OAuth user token, cursor pagination over Graph
       `@odata.nextLink`, raw-passthrough rows): messages, mail_folders. Open
       Connector has no `microsoft365` service; it splits Graph into `outlook`
       (mail only — no calendar or contacts), `one_drive` and `excel`, with one

@@ -55,8 +55,10 @@ spec:
 ```
 
 ```sql
--- The 20 newest messages. Graph returns newest-first and a bare LIMIT
--- stops pagination early, so this reads one page, not the mailbox.
+-- A bounded first page: a bare LIMIT stops pagination early, so this
+-- reads one page, not the mailbox. Graph returned newest-first in the
+-- live pass, but nothing enforces that order — add ORDER BY when the
+-- ordering matters, and accept the whole-table cost below.
 SELECT from_address, subject, received_date_time
 FROM saas.m365.messages
 LIMIT 20;
@@ -65,7 +67,9 @@ LIMIT 20;
 -- nothing pushes down (see "No filter pushdown" below), the sort turns
 -- LIMIT into a top-k above the scan, and at the default bounds the
 -- scan fails past 10 000 messages. Scope it with a mailFolderId
--- binding before running it against a real mailbox.
+-- binding before running it against a real mailbox (folder-scoped
+-- continuation needs a gateway with the open-connector#372 fix; see
+-- the upstream-defect note under Pagination).
 SELECT from_address, subject, received_date_time
 FROM saas.m365.messages
 WHERE is_read = false
@@ -93,8 +97,8 @@ GROUP BY f.display_name;
 unbound, one folder's listing when the binding pins `mailFolderId`
 (Graph swaps `/me/messages` for `/me/mailFolders/{id}/messages`).
 Columns: identity (`id`, `web_link`, `internet_message_id`), envelope
-(`subject`, `from_address`/`from_name`, `sender_address`/`sender_name`,
-recipient lists as opaque JSON), state (`is_read`, `is_draft`,
+(`subject`, `body_preview`, `from_address`/`from_name`,
+`sender_address`/`sender_name`, recipient lists as opaque JSON), state (`is_read`, `is_draft`,
 `importance`, `flag` as JSON, `categories`), threading
 (`conversation_id`, `parent_folder_id`, `has_attachments`) and the four
 Graph timestamps (`received_date_time`, `sent_date_time`,
@@ -109,6 +113,12 @@ misspelled column path into a loud Graph 400 instead of a silently
 always-NULL column. Consequence: **`body` is not a column**, by design;
 full message content belongs behind a future content-oriented surface,
 exactly as on the Gmail pack.
+
+**`body_preview` is body content**: Graph's ~255-character excerpt of
+every message's body text, in the select pin and on every row of every
+`SELECT *`. The "no bodies" shape above is `body`'s posture, not the
+pack's — size content/PII exposure with this column included (the same
+call-out the Gmail guide makes for `threads.snippet`).
 
 **`mail_folders`** is the **complete root-level folder set**: the pack
 pins `includeHiddenFolders: true` (Graph hides hidden folders by
@@ -128,7 +138,8 @@ display names in the account's language (a real MSA mailbox says
 `(input_field, literal)` mapping cannot compose; OneDrive-style list
 actions carry none at all. Every predicate runs in DataFusion after the
 bounded fetch; `LIMIT` stops pagination early; the practical scoping
-tools are the `mailFolderId` resource and `LIMIT`. The default safety
+tools are the `mailFolderId` resource and `LIMIT` (for `mailFolderId`
+past one page, see the upstream-defect note under Pagination). The default safety
 bounds fail (never truncate) an unfiltered scan past `max_pages` ×
 page-size rows — at the defaults, 100 pages × 100 rows = **10 000
 messages per scan** (`max_rows`' 100 000 never binds first here).
