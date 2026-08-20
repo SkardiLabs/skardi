@@ -12,8 +12,9 @@
 //! template lives on disk; parameter values are never recorded — the version
 //! is what keeps "what ran" answerable after the promotion loop edits a
 //! template, since rows are kept forever by default). Ad-hoc rows carry
-//! `statement_kind` values from `StatementKind`'s `Debug` form — `Query` /
-//! `Other` — not SQL verbs like `select`.
+//! `statement_kind` values naming the server's statement *classification* —
+//! `query` / `other` (see [`QUERY_STATEMENT_KIND`]) — not SQL verbs like
+//! `select`.
 //!
 //! Design notes:
 //!
@@ -61,13 +62,16 @@ use tokio_rusqlite::{Connection, params, rusqlite};
 pub(crate) const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum length of a session id, in characters — shared by `/query`'s
-/// `ai_context.session_id` and the pipeline execute endpoint's
-/// `x-skardi-session-id` header (see `query_handlers::validate_ai_context`
-/// and `pipeline_handlers::session_id_from_headers`), so the two paths can't
-/// drift apart. It is an opaque grouping key, not a payload.
+/// `ai_context.session_id` and the `x-skardi-session-id` header consumed by
+/// both the pipeline execute endpoint and the jobs submit endpoint (see
+/// `query_handlers::validate_ai_context` and
+/// `session_header::session_id_from_headers` in the server crate),
+/// so all three paths can't drift apart. It is an opaque grouping key, not a
+/// payload.
 ///
-/// `skardi-cli` restates this cap under the same name (`run.rs`) because the
-/// CLI crate does not depend on this one; keep them in sync.
+/// `skardi-cli` restates this cap under the same name
+/// (`crates/cli/src/session.rs`) because the CLI crate does not depend on this
+/// one; keep them in sync.
 /// `pub` because the handlers that enforce this bound now live in a
 /// different crate: `pub(crate)` was the right scope while this module was
 /// inside the server, and the extraction is what widened it.
@@ -171,7 +175,8 @@ const INIT_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS query_audit (
     org_id         TEXT,
     workspace_id   TEXT,
     user_id        TEXT,
-    run_id         TEXT
+    run_id         TEXT,
+    job_run_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_audit_session_created
     ON query_audit (session_id, created_at DESC);
@@ -183,24 +188,111 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_statement_kind
     ON query_audit (statement_kind);";
 
 /// The five identity columns, in order. `CREATE TABLE IF NOT EXISTS` cannot
-/// retrofit an existing table, so [`ensure_identity_columns`] reconciles the
+/// retrofit an existing table, so [`ensure_added_columns`] reconciles the
 /// live schema on every open — additive, idempotent, and a no-op on fresh
 /// databases.
 const IDENTITY_COLUMNS: [&str; 5] = ["request_id", "org_id", "workspace_id", "user_id", "run_id"];
 
-fn ensure_identity_columns(conn: &rusqlite::Connection) -> SqlResult<()> {
+/// Columns bridging a ledger row to another ledger's record of the same work.
+/// Reconciled by the same mechanism as [`IDENTITY_COLUMNS`], but kept a
+/// separate list because they answer a different question: identity is *who
+/// asked*, a bridge is *what the work became*.
+///
+/// `job_run_id` holds `job_runs.id` for `statement_kind = 'job'` rows.
+/// Deliberately not the identity envelope's `run_id`, which names the caller's
+/// own run — one column, one meaning.
+const BRIDGE_COLUMNS: [&str; 1] = ["job_run_id"];
+
+/// Index over the `job_run_id` bridge, applied after [`ensure_added_columns`]
+/// has guaranteed the column exists — so it cannot live in
+/// [`INIT_SCHEMA_SQL`], which also runs against pre-column databases, where
+/// indexing a missing column would fail.
+///
+/// The forward direction — session to its rows — is served by
+/// `idx_query_audit_session_created`. This covers the reverse: given a run id
+/// from `GET /jobs/runs`, which session submitted it. Partial, because
+/// `job_run_id` is NULL on every non-job row, so the index stays proportional
+/// to job submissions rather than to a ledger that is append-only and has
+/// retention off by default.
+const JOB_RUN_ID_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_query_audit_job_run_id
+    ON query_audit (job_run_id) WHERE job_run_id IS NOT NULL;";
+
+/// True for the `duplicate column name` error SQLite raises when an
+/// `ALTER TABLE ... ADD COLUMN` loses a race with another connection that
+/// already added it.
+///
+/// Matched on message text because `rusqlite` surfaces it as a generic
+/// `SqliteFailure` with `SQLITE_ERROR`, carrying no distinguishing code.
+fn is_duplicate_column(e: &rusqlite::Error) -> bool {
+    e.to_string().contains("duplicate column name")
+}
+
+/// Add any of `columns` the live table is missing, as nullable `TEXT`.
+fn ensure_added_columns(conn: &rusqlite::Connection, columns: &[&str]) -> SqlResult<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(query_audit)")?;
     let existing: std::collections::HashSet<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<_, _>>()?;
-    for col in IDENTITY_COLUMNS {
-        if !existing.contains(col) {
-            conn.execute(
+    for col in columns {
+        if !existing.contains(*col) {
+            // The read above is not atomic with this ALTER: two processes
+            // opening the same file concurrently (a rolling restart, an
+            // operator tool, a second server pointed at the same path) can
+            // both observe the column missing and both issue it. The loser
+            // gets `duplicate column name` — which is exactly the
+            // post-condition this step wanted, so it counts as success rather
+            // than aborting startup over a benign race.
+            match conn.execute(
                 &format!("ALTER TABLE query_audit ADD COLUMN {col} TEXT"),
                 [],
-            )?;
+            ) {
+                Ok(_) => {}
+                Err(e) if is_duplicate_column(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
+    Ok(())
+}
+
+/// Normalise the pre-#219 `statement_kind` casing on rows already on disk.
+///
+/// Ad-hoc rows used to record the `Debug` form of `StatementKind` — `Query`
+/// and `Other`. They now record [`QUERY_STATEMENT_KIND`] /
+/// [`OTHER_STATEMENT_KIND`], so without this a ledger written before the
+/// change holds both casings for one concept: `WHERE statement_kind =
+/// 'query'` (the filter `docs/server.md` documents) silently returns only
+/// post-upgrade rows, and `= 'Query'` silently loses everything after.
+/// `idx_query_audit_statement_kind` makes both look fast, so the only symptom
+/// is wrong counts. The ledger is append-only with retention off by default,
+/// so those rows never age out on their own.
+///
+/// Idempotent and a no-op on fresh databases, like the column reconcile it
+/// sits beside. `statement_kind` carries no `COLLATE NOCASE`, so the match is
+/// case-sensitive and normalised rows cannot be rewritten again. `pipeline`
+/// and `job` were lowercase from the start and are untouched.
+fn normalise_statement_kind_casing(conn: &rusqlite::Connection) -> SqlResult<()> {
+    for (legacy, current) in [
+        ("Query", QUERY_STATEMENT_KIND),
+        ("Other", OTHER_STATEMENT_KIND),
+    ] {
+        conn.execute(
+            "UPDATE query_audit SET statement_kind = ?1 WHERE statement_kind = ?2",
+            params![current, legacy],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every column added to `query_audit` after its original DDL, the indexes
+/// that can only be built once those columns exist, and the one-shot data
+/// normalisations that keep an existing file consistent with what the current
+/// code writes.
+fn ensure_schema_additions(conn: &rusqlite::Connection) -> SqlResult<()> {
+    ensure_added_columns(conn, &IDENTITY_COLUMNS)?;
+    ensure_added_columns(conn, &BRIDGE_COLUMNS)?;
+    conn.execute_batch(JOB_RUN_ID_INDEX_SQL)?;
+    normalise_statement_kind_casing(conn)?;
     Ok(())
 }
 
@@ -291,8 +383,22 @@ impl QueryAuditStore {
             // engine.
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "FULL")?;
+            // SQLite installs no busy handler by default: a write that finds
+            // the lock held returns `SQLITE_BUSY` immediately. Two servers
+            // pointed at one `--query-audit-db` — the case
+            // `ensure_added_columns` and the `started`-only guard are written
+            // for — would then fail on the lock before ever reaching the
+            // races being guarded: B's `ALTER TABLE` during A's INSERT aborts
+            // B's startup with `database is locked`, and an audited request
+            // that loses the lock 503s under a fail-closed policy that was
+            // meant for real write failures. Bounded by the same
+            // `AUDIT_WRITE_TIMEOUT` the callers already wait out, so waiting
+            // for the lock cannot outlast the request bound. Matches the
+            // sqlite source provider, which defaults `busy_timeout_ms` to
+            // 5000 rather than taking SQLite's default.
+            conn.busy_timeout(AUDIT_WRITE_TIMEOUT)?;
             conn.execute_batch(INIT_SCHEMA_SQL)?;
-            ensure_identity_columns(conn)?;
+            ensure_schema_additions(conn)?;
             Ok(())
         })
         .await
@@ -324,7 +430,7 @@ impl QueryAuditStore {
             .context("Failed to open in-memory query-audit db")?;
         conn.call(|conn| -> SqlResult<()> {
             conn.execute_batch(INIT_SCHEMA_SQL)?;
-            ensure_identity_columns(conn)?;
+            ensure_schema_additions(conn)?;
             Ok(())
         })
         .await
@@ -494,7 +600,124 @@ impl QueryAuditStore {
         }
     }
 
+    /// Insert a `started` row for a job *submission*.
+    ///
+    /// The row's lifecycle is the submission's, not the run's: `succeeded`
+    /// means "accepted and enqueued" (stamped with the `job_run_id` that
+    /// bridges to the jobs ledger, the authority on the run itself), `failed` means
+    /// the executor rejected it. Stores `name@version`; parameter values are
+    /// never recorded here — `job_runs.parameters` is a separate concern.
+    pub async fn record_job_submitted(
+        &self,
+        job_name: &str,
+        version: &str,
+        session_id: Option<&str>,
+    ) -> Result<String> {
+        let id = new_id();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let name_at_version = format!("{job_name}@{version}");
+        let session_id = session_id.map(str::to_string);
+        let row_id = id.clone();
+
+        match bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
+                conn.execute(
+                    "INSERT INTO query_audit
+                        (id, created_at, sql, ai_context, session_id, max_rows,
+                         statement_kind, status)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                    params![
+                        row_id,
+                        created_at,
+                        name_at_version,
+                        session_id,
+                        PIPELINE_MAX_ROWS_SENTINEL,
+                        JOB_STATEMENT_KIND,
+                        QueryAuditStatus::Started.as_str(),
+                    ],
+                )?;
+                Ok(())
+            }),
+            "Failed to write pre-execution job-audit record",
+            self.write_timeout,
+        )
+        .await
+        {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                // Same reasoning as `record_pipeline_started`: this is a
+                // pre-execution write, so a timeout means the caller has
+                // already been told "503, the job was not submitted" — a
+                // fact worth recording precisely instead of letting startup
+                // reconcile the abandoned row to the ambiguous `unknown`.
+                if e.is_timeout() {
+                    self.spawn_timeout_correction(id);
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Update a job-submission record with its terminal outcome, stamping the
+    /// `job_run_id` that bridges this row to the jobs ledger's authoritative
+    /// record of the run itself. `job_run_id` is `None` when the submission was
+    /// rejected before a run was ever created.
+    ///
+    /// Distinct from the identity envelope's `run_id` ([`QueryIdentity`]),
+    /// which names the *caller's* run rather than the job run this submission
+    /// produced. One column, one meaning.
+    ///
+    /// Only applies to a row still in `started`, the same guard (and the same
+    /// reasoning) as [`Self::spawn_timeout_correction`]: the write is
+    /// monotonic, so a row that already reached a terminal state stays there.
+    /// Within one process the transition is unreachable — the 503 path returns
+    /// before any outcome stamp — but the ledger is a *file*, and nothing stops
+    /// two servers being pointed at one `--query-audit-db`. In that
+    /// configuration server B's startup [`Self::reconcile_orphaned`] can stamp
+    /// A's in-flight submission `unknown` before A's outcome write lands;
+    /// without this guard that late write would resurrect a terminal row and
+    /// defeat reconciliation. 0 rows updated is therefore not an error: it
+    /// means something else already settled the row.
+    pub async fn record_job_outcome(
+        &self,
+        id: &str,
+        job_run_id: Option<&str>,
+        status: QueryAuditStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let status = status.as_str();
+        let job_run_id = job_run_id.map(str::to_string);
+        let error = error.map(str::to_string);
+        bounded(
+            self.conn.call(move |conn| -> SqlResult<()> {
+                conn.execute(
+                    "UPDATE query_audit
+                        SET status = ?2, finished_at = ?3, job_run_id = ?4, error = ?5
+                      WHERE id = ?1 AND status = ?6",
+                    params![
+                        id,
+                        status,
+                        finished_at,
+                        job_run_id,
+                        error,
+                        QueryAuditStatus::Started.as_str(),
+                    ],
+                )?;
+                Ok(())
+            }),
+            "Failed to update job-audit record",
+            self.write_timeout,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Update a record with its terminal outcome.
+    ///
+    /// Shares [`Self::record_job_outcome`]'s `started`-only guard, for the
+    /// same reason.
     pub async fn record_outcome(
         &self,
         id: &str,
@@ -513,8 +736,15 @@ impl QueryAuditStore {
                 conn.execute(
                     "UPDATE query_audit
                         SET status = ?2, finished_at = ?3, row_count = ?4, error = ?5
-                      WHERE id = ?1",
-                    params![id, status, finished_at, row_count, error],
+                      WHERE id = ?1 AND status = ?6",
+                    params![
+                        id,
+                        status,
+                        finished_at,
+                        row_count,
+                        error,
+                        QueryAuditStatus::Started.as_str(),
+                    ],
                 )?;
                 Ok(())
             }),
@@ -668,7 +898,8 @@ impl QueryAuditStore {
                 let mut stmt = conn.prepare(
                     "SELECT id, created_at, finished_at, sql, ai_context, session_id,
                             max_rows, statement_kind, status, row_count, error,
-                            request_id, org_id, workspace_id, user_id, run_id
+                            request_id, org_id, workspace_id, user_id, run_id,
+                            job_run_id
                        FROM query_audit WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -691,6 +922,7 @@ impl QueryAuditStore {
                             "workspace_id": row.get::<_, Option<String>>(13)?,
                             "user_id": row.get::<_, Option<String>>(14)?,
                             "run_id": row.get::<_, Option<String>>(15)?,
+                            "job_run_id": row.get::<_, Option<String>>(16)?,
                         }))
                     })
                     .ok();
@@ -793,8 +1025,32 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 /// Statement-kind marker distinguishing pipeline rows from ad-hoc SQL rows.
 const PIPELINE_STATEMENT_KIND: &str = "pipeline";
 
+/// Statement-kind markers for the two ad-hoc row kinds.
+///
+/// `pub` and named rather than derived from the server's statement-classifier
+/// `Debug` form. The ledger's `statement_kind` vocabulary is a consumer-facing
+/// contract ("consumers filtering the ledger must match these exact strings"),
+/// and leaking `Debug` both bound that contract to a type in another crate
+/// whose variant names could be renamed freely, and mixed `PascalCase` ad-hoc
+/// values with the `lowercase` `pipeline` / `job` markers. All four values now
+/// live here, in one casing.
+///
+/// The classifier itself stays in the server — this crate deliberately does
+/// not depend on `skardi` (#206) — so the mapping from its variants onto these
+/// constants lives in `server::query_handlers::adhoc_statement_kind`. The
+/// vocabulary is owned here; only the translation is over there.
+pub const QUERY_STATEMENT_KIND: &str = "query";
+/// See [`QUERY_STATEMENT_KIND`].
+pub const OTHER_STATEMENT_KIND: &str = "other";
+
+/// Statement-kind marker for job-submission rows. Nothing outside this
+/// module reads it directly (Task 2 goes through `record_job_submitted`),
+/// so it stays private, mirroring `PIPELINE_STATEMENT_KIND`'s narrowing.
+const JOB_STATEMENT_KIND: &str = "job";
+
 /// `max_rows` does not apply to pipeline executions, but the column is NOT
-/// NULL; pipeline rows store this sentinel.
+/// NULL; pipeline rows store this sentinel. Job-submission rows share it for
+/// the same reason — `max_rows` has no meaning for a job run either.
 ///
 /// The sentinel is unambiguous only because `/query` rejects
 /// `max_rows: Some(0)` up front (the `Some(0)` arm in
@@ -915,7 +1171,7 @@ mod tests {
                 "SELECT * FROM t WHERE ssn = '123-45-6789'",
                 Some(&ctx),
                 100,
-                "Query",
+                "query",
             )
             .await
             .unwrap();
@@ -928,7 +1184,7 @@ mod tests {
         assert_eq!(record["ai_context"]["purpose"], json!("kyc"));
         assert_eq!(record["session_id"], json!("sess-1"));
         assert_eq!(record["max_rows"], json!(100));
-        assert_eq!(record["statement_kind"], json!("Query"));
+        assert_eq!(record["statement_kind"], json!("query"));
         assert_eq!(record["status"], json!("started"));
         assert!(record["finished_at"].is_null());
 
@@ -946,7 +1202,7 @@ mod tests {
     async fn failed_outcome_carries_the_error() {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         let id = store
-            .record_started("SELECT 1", None, 1, "Query")
+            .record_started("SELECT 1", None, 1, "query")
             .await
             .unwrap();
         store
@@ -964,15 +1220,15 @@ mod tests {
         let ctx = json!({"purpose": "audit", "session_id": "sess-42"});
         let other = json!({"purpose": "audit", "session_id": "sess-other"});
         store
-            .record_started("SELECT 1", Some(&ctx), 1, "Query")
+            .record_started("SELECT 1", Some(&ctx), 1, "query")
             .await
             .unwrap();
         store
-            .record_started("SELECT 2", Some(&other), 1, "Query")
+            .record_started("SELECT 2", Some(&other), 1, "query")
             .await
             .unwrap();
         store
-            .record_started("SELECT 3", Some(&ctx), 1, "Query")
+            .record_started("SELECT 3", Some(&ctx), 1, "query")
             .await
             .unwrap();
 
@@ -986,11 +1242,11 @@ mod tests {
     async fn reconcile_marks_orphans_unknown() {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         let orphan = store
-            .record_started("SELECT 1", None, 1, "Query")
+            .record_started("SELECT 1", None, 1, "query")
             .await
             .unwrap();
         let done = store
-            .record_started("SELECT 2", None, 1, "Query")
+            .record_started("SELECT 2", None, 1, "query")
             .await
             .unwrap();
         store
@@ -1016,7 +1272,7 @@ mod tests {
     async fn prune_deletes_only_older_records() {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         store
-            .record_started("SELECT 1", None, 1, "Query")
+            .record_started("SELECT 1", None, 1, "query")
             .await
             .unwrap();
         assert_eq!(store.count().await.unwrap(), 1);
@@ -1045,7 +1301,7 @@ mod tests {
         let total_rows = (PRUNE_BATCH_SIZE * 2) + 500;
         for _ in 0..total_rows {
             store
-                .record_started("SELECT 1", None, 1, "Query")
+                .record_started("SELECT 1", None, 1, "query")
                 .await
                 .unwrap();
         }
@@ -1155,7 +1411,7 @@ mod tests {
         let path = dir.path().join("nested").join("audit.db");
         let store = QueryAuditStore::open(&path).await.unwrap();
         store
-            .record_started("SELECT 1", None, 1, "Query")
+            .record_started("SELECT 1", None, 1, "query")
             .await
             .unwrap();
 
@@ -1186,7 +1442,7 @@ mod tests {
         let id = {
             let store = QueryAuditStore::open(&path).await.unwrap();
             store
-                .record_started("SELECT 'durable'", None, 1, "Query")
+                .record_started("SELECT 'durable'", None, 1, "query")
                 .await
                 .unwrap()
         };
@@ -1232,7 +1488,7 @@ mod tests {
         let store = QueryAuditStore::open_in_memory().await.unwrap();
         let ctx = serde_json::json!({"purpose": "p", "session_id": "sess-mix"});
         store
-            .record_started("SELECT 1", Some(&ctx), 10, "Query")
+            .record_started("SELECT 1", Some(&ctx), 10, "query")
             .await
             .unwrap();
         store
@@ -1244,7 +1500,7 @@ mod tests {
         // The promised property is the *ordering* (insertion order via
         // created_at with id as tie-break), plus the sql-column overload —
         // a bare count passes with ORDER BY dropped or reversed.
-        assert_eq!(rows[0]["statement_kind"], json!("Query"));
+        assert_eq!(rows[0]["statement_kind"], json!("query"));
         assert_eq!(rows[0]["sql"], json!("SELECT 1"));
         assert_eq!(rows[1]["statement_kind"], json!("pipeline"));
         assert_eq!(rows[1]["sql"], json!("weekly-churn@1.0.0"));
@@ -1261,5 +1517,315 @@ mod tests {
         assert_eq!(n, 1);
         let row = store.get(&id).await.unwrap().unwrap();
         assert_eq!(row["status"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn job_row_round_trips_with_job_run_id() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", Some("sess-j"))
+            .await
+            .unwrap();
+        store
+            .record_job_outcome(&id, Some("run-abc123"), QueryAuditStatus::Succeeded, None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["sql"], json!("nightly-backfill@2.1.0"));
+        assert_eq!(row["statement_kind"], json!("job"));
+        assert_eq!(row["session_id"], json!("sess-j"));
+        assert_eq!(row["status"], json!("succeeded"));
+        assert_eq!(row["job_run_id"], json!("run-abc123"));
+        // The identity envelope's `run_id` is a different column with a
+        // different meaning and must stay untouched by the bridge stamp.
+        assert!(row["run_id"].is_null());
+        assert_eq!(row["max_rows"], json!(0));
+        assert!(row["ai_context"].is_null());
+        assert!(row["row_count"].is_null());
+    }
+
+    #[tokio::test]
+    async fn rejected_job_submission_records_fixed_kind_and_null_job_run_id() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", None)
+            .await
+            .unwrap();
+        store
+            .record_job_outcome(&id, None, QueryAuditStatus::Failed, Some("schema_mismatch"))
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("failed"));
+        assert_eq!(row["error"], json!("schema_mismatch"));
+        assert!(row["job_run_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_by_session_interleaves_all_three_kinds_in_order() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let ctx = serde_json::json!({"purpose": "p", "session_id": "sess-all"});
+        store
+            .record_started("SELECT 1", Some(&ctx), 10, "query")
+            .await
+            .unwrap();
+        store
+            .record_pipeline_started("weekly-churn", "1.0.0", Some("sess-all"))
+            .await
+            .unwrap();
+        store
+            .record_job_submitted("nightly-backfill", "2.1.0", Some("sess-all"))
+            .await
+            .unwrap();
+        let rows = store.list_by_session("sess-all").await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["statement_kind"], json!("query"));
+        assert_eq!(rows[1]["statement_kind"], json!("pipeline"));
+        assert_eq!(rows[2]["statement_kind"], json!("job"));
+        assert_eq!(rows[2]["sql"], json!("nightly-backfill@2.1.0"));
+    }
+
+    #[tokio::test]
+    async fn orphaned_job_rows_reconcile_to_unknown() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", None)
+            .await
+            .unwrap();
+        let n = store.reconcile_orphaned("test restart").await.unwrap();
+        assert_eq!(n, 1);
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn open_migrates_old_schema_without_job_run_id_column() {
+        // A database created before job_run_id existed must open and serve job
+        // rows after migration. Covers the bridge column specifically: #206's
+        // identity columns have their own old-schema fixture, and both are
+        // reconciled by the same `ensure_schema_additions` step.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("old.db");
+        {
+            // Original DDL: INIT_SCHEMA_SQL before either the identity
+            // columns or the bridge column existed.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE query_audit (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    finished_at TEXT, sql TEXT NOT NULL, ai_context TEXT,
+                    session_id TEXT, max_rows INTEGER NOT NULL,
+                    statement_kind TEXT NOT NULL, status TEXT NOT NULL,
+                    row_count INTEGER, error TEXT);",
+            )
+            .unwrap();
+        }
+        let store = QueryAuditStore::open(&path).await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["statement_kind"], json!("job"));
+        assert!(row["job_run_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn open_normalises_legacy_statement_kind_casing() {
+        // A ledger written before the casing change holds `Query` / `Other`
+        // (the leaked `Debug` form). After upgrading, the documented filter
+        // `WHERE statement_kind = 'query'` must see those rows too — otherwise
+        // every pre-upgrade ad-hoc statement is silently invisible to the
+        // intention-mining consumer the ledger exists for.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("legacy-casing.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE query_audit (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    finished_at TEXT, sql TEXT NOT NULL, ai_context TEXT,
+                    session_id TEXT, max_rows INTEGER NOT NULL,
+                    statement_kind TEXT NOT NULL, status TEXT NOT NULL,
+                    row_count INTEGER, error TEXT);",
+            )
+            .unwrap();
+            for (id, kind) in [
+                ("old-q", "Query"),
+                ("old-o", "Other"),
+                ("old-p", "pipeline"),
+            ] {
+                conn.execute(
+                    "INSERT INTO query_audit
+                        (id, created_at, sql, max_rows, statement_kind, status, session_id)
+                     VALUES (?1, '2026-08-01T00:00:00Z', 'SELECT 1', 10, ?2, 'succeeded', 'sess-legacy')",
+                    params![id, kind],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = QueryAuditStore::open(&path).await.unwrap();
+        store
+            .record_started(
+                "SELECT 2",
+                Some(&json!({ "session_id": "sess-legacy" })),
+                10,
+                QUERY_STATEMENT_KIND,
+            )
+            .await
+            .unwrap();
+
+        let rows = store.list_by_session("sess-legacy").await.unwrap();
+        let kinds: Vec<&str> = rows
+            .iter()
+            .map(|r| r["statement_kind"].as_str().unwrap())
+            .collect();
+        // Both pre-upgrade ad-hoc rows now answer to the documented filter,
+        // alongside the post-upgrade one. `pipeline` was already lowercase.
+        assert_eq!(kinds.iter().filter(|k| **k == "query").count(), 2);
+        assert_eq!(kinds.iter().filter(|k| **k == "other").count(), 1);
+        assert_eq!(kinds.iter().filter(|k| **k == "pipeline").count(), 1);
+        assert!(
+            !kinds.iter().any(|k| *k == "Query" || *k == "Other"),
+            "legacy casing survived the migration: {kinds:?}"
+        );
+
+        // Idempotent: a second open must not disturb the normalised rows.
+        drop(store);
+        let store = QueryAuditStore::open(&path).await.unwrap();
+        let rows = store.list_by_session("sess-legacy").await.unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter()
+                .all(|r| r["statement_kind"] != json!("Query")
+                    && r["statement_kind"] != json!("Other")),
+            "second open reintroduced legacy casing"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_creates_job_run_id_index_on_migrated_and_fresh_databases() {
+        // The index cannot live in INIT_SCHEMA_SQL — that batch also runs
+        // against pre-column databases, where indexing job_run_id would fail
+        // — so it is applied in `ensure_schema_additions`, after the column is
+        // guaranteed. Pin that it lands on both a fresh database and a
+        // migrated one.
+        async fn index_exists(store: &QueryAuditStore) -> bool {
+            store
+                .conn
+                .call(|conn| -> SqlResult<bool> {
+                    conn.prepare(
+                        "SELECT 1 FROM sqlite_master
+                          WHERE type = 'index' AND name = 'idx_query_audit_job_run_id'",
+                    )?
+                    .exists([])
+                })
+                .await
+                .unwrap()
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let fresh = QueryAuditStore::open(tmp.path().join("fresh.db"))
+            .await
+            .unwrap();
+        assert!(
+            index_exists(&fresh).await,
+            "fresh database is missing the job_run_id index"
+        );
+
+        let old_path = tmp.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&old_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE query_audit (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                    finished_at TEXT, sql TEXT NOT NULL, ai_context TEXT,
+                    session_id TEXT, max_rows INTEGER NOT NULL,
+                    statement_kind TEXT NOT NULL, status TEXT NOT NULL,
+                    row_count INTEGER, error TEXT);",
+            )
+            .unwrap();
+        }
+        let migrated = QueryAuditStore::open(&old_path).await.unwrap();
+        assert!(
+            index_exists(&migrated).await,
+            "migrated database is missing the job_run_id index"
+        );
+    }
+
+    #[test]
+    fn duplicate_column_error_is_recognised() {
+        // The migration's check-then-ALTER is not atomic, so a second process
+        // can win the race and leave this connection's ALTER failing with
+        // `duplicate column name`. That is the post-condition the step wanted,
+        // so `open()` treats it as success — but only if it can tell that
+        // error apart from a real one. rusqlite reports it as a generic
+        // SQLITE_ERROR with no distinguishing code, hence the text match;
+        // this test is what keeps the match honest against a rusqlite bump.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE query_audit (id TEXT PRIMARY KEY);")
+            .unwrap();
+        conn.execute("ALTER TABLE query_audit ADD COLUMN job_run_id TEXT", [])
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE query_audit ADD COLUMN job_run_id TEXT", [])
+            .expect_err("adding an existing column must fail");
+        assert!(is_duplicate_column(&err), "unrecognised: {err}");
+
+        // A genuinely different failure must not be swallowed.
+        let other = conn
+            .execute("ALTER TABLE nonexistent ADD COLUMN run_id TEXT", [])
+            .expect_err("altering a missing table must fail");
+        assert!(!is_duplicate_column(&other), "over-matched: {other}");
+    }
+
+    #[tokio::test]
+    async fn job_outcome_does_not_resurrect_a_reconciled_row() {
+        // Two servers sharing one --query-audit-db file: B's startup
+        // reconciliation settles A's in-flight submission to `unknown`, then
+        // A's outcome write lands. Without the started-only guard that late
+        // write would flip a terminal row back to `succeeded` and defeat
+        // reconciliation.
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly-backfill", "2.1.0", Some("sess-j"))
+            .await
+            .unwrap();
+        store.reconcile_orphaned("server B restart").await.unwrap();
+
+        // Not an error: 0 rows updated means something else already settled it.
+        store
+            .record_job_outcome(&id, Some("run-late"), QueryAuditStatus::Succeeded, None)
+            .await
+            .unwrap();
+
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
+        // `job_run_id`, not `run_id`: the bridge stamp is the only column
+        // `record_job_outcome` writes, so it is the only one whose absence
+        // proves the guard blocked the late write. `run_id` is #206's
+        // identity envelope — always NULL here regardless of the guard.
+        assert!(row["job_run_id"].is_null(), "terminal row was resurrected");
+    }
+
+    #[tokio::test]
+    async fn query_outcome_does_not_resurrect_a_reconciled_row() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_started("SELECT 1", None, 10, "query")
+            .await
+            .unwrap();
+        store.reconcile_orphaned("server B restart").await.unwrap();
+
+        store
+            .record_outcome(&id, QueryAuditStatus::Succeeded, Some(7), None)
+            .await
+            .unwrap();
+
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
+        assert!(row["row_count"].is_null(), "terminal row was resurrected");
     }
 }

@@ -575,7 +575,7 @@ async fn audit_records_raw_sql_ai_context_and_success() {
     );
     assert_eq!(record["ai_context"]["purpose"], json!("brand audit"));
     assert_eq!(record["session_id"], json!("sess-42"));
-    assert_eq!(record["statement_kind"], json!("Query"));
+    assert_eq!(record["statement_kind"], json!("query"));
     assert_eq!(record["status"], json!("succeeded"));
     assert_eq!(record["row_count"], json!(3));
     assert!(!record["finished_at"].is_null(), "{record:?}");

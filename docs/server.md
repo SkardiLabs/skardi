@@ -178,14 +178,19 @@ execution and updated with its outcome afterwards:
 | `sql` | raw statement text |
 | `ai_context` | the caller's object, verbatim JSON |
 | `session_id` | denormalised from `ai_context` for indexed session lookup |
-| `max_rows` | requested row cap (`0` on pipeline rows — not applicable) |
-| `statement_kind` | `Query` or `Other` for ad-hoc rows (the `Debug` form of the server's statement classifier — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows. Consumers filtering the ledger must match these exact strings. |
+| `max_rows` | requested row cap (`0` on pipeline and job rows — not applicable) |
+| `job_run_id` | `job_runs.id` bridge, job rows only. Distinct from the identity envelope's `run_id`, which names the *caller's* run — one column, one meaning. |
+| `request_id`, `org_id`, `workspace_id`, `user_id`, `run_id` | caller-identity envelope; all NULL on this server, filled by distributions that authenticate their callers |
+| `statement_kind` | `query` or `other` for ad-hoc rows (the server's statement *classification* — not SQL verbs like `select`/`dml`), `pipeline` for pipeline rows, `job` for job rows. Consumers filtering the ledger must match these exact strings. |
 | `status` | `started` → `succeeded` / `failed`, or `unknown` after a crash |
 | `row_count`, `error` | outcome detail |
 
 Indexed on `(session_id, created_at)`, `created_at`, `status` and
 `statement_kind`, so an agent session can be reconstructed — and a single row
-kind selected — with plain SQL.
+kind selected — with plain SQL. `job_run_id` carries its own partial index
+(`WHERE job_run_id IS NOT NULL`) so the reverse lookup — given a run id from
+`GET /jobs/runs`, which session submitted it — does not scan a table that is
+append-only and has retention off by default.
 
 What is **not** here: job runs. `POST /jobs/:name/run` executes its own SQL
 through the same engine but is recorded in the separate jobs run ledger (see
@@ -303,6 +308,64 @@ requires both halves, and today only `skardi run --session-id` exists —
 ([#218](https://github.com/SkardiLabs/skardi/issues/218)), so the ad-hoc
 half of a CLI session lands unattributed until then. Direct HTTP callers
 get the full interleaving today.
+
+#### Job submissions in the ledger
+
+`POST /jobs/:name/run` is audited as a *submission event*: the row's
+lifecycle is the submission's, not the run's. `statement_kind` is `job`,
+`sql` holds `name@version`, and on acceptance the row is stamped
+`succeeded` with the `job_run_id` that bridges to the jobs ledger — which
+remains the authority on the run itself (parameters, progress, outcome).
+A rejected submission is stamped `failed` with the executor's fixed error
+category, never its message text. Unlike pipelines, a job's parameter
+validation happens inside the executor — after the audit write — so a
+parameter rejection leaves a `failed` row rather than recording nothing.
+Record-before-submit and the fail-closed `503 query_audit_error` behave
+exactly as for pipelines: a job the ledger cannot account for is not
+submitted. The same `X-Skardi-Session-Id` header (same validation)
+attributes the submission, so `list_by_session` returns an agent session's
+ad-hoc queries, pipeline calls, and job submissions in one ordered read.
+
+Two properties of this seam an operator should know before relying on it:
+
+- **It is the ledger's only unauthenticated write path, and that costs
+  availability, not just attribution.** `/query` and
+  `POST /:pipeline/execute` both call `require_session` before writing
+  anything; the jobs handlers perform no auth check at all. Two distinct
+  consequences, the second the more serious:
+
+  1. *Forged attribution.* The header is self-reported on every endpoint — it
+     never attests to origin — but on the other two the caller is at least
+     authenticated. Here neither is true, so anyone who can reach
+     `POST /jobs/:name/run` can mint arbitrary `session_id` values into
+     `query_audit`, including ones belonging to real sessions. A forged row
+     lands inside a legitimate session's `list_by_session` read and is
+     indistinguishable from a real submission.
+
+  2. *Denial of service against the other two endpoints.* Every submission —
+     including ones the executor will reject — issues writes on the ledger's
+     **single serialized writer thread**, shared with every audited request.
+     `/query` and `POST /:pipeline/execute` are fail-closed on that thread:
+     when work on it exceeds the write timeout, they return `503` by design.
+     Before job auditing existed, `POST /jobs/:name/run` did not touch that
+     thread at all. It now does, unrate-limited and unauthenticated — so an
+     anonymous caller can stall writes that two *authenticated* endpoints
+     block on, plus grow a ledger whose retention is off by default.
+
+  Weigh the second one when deciding where to enable `--query-audit-db`: if
+  the deployment is behind auth, this seam is not gated and the exposure is
+  to the availability of the endpoints that are. Backfilling the check is
+  tracked separately.
+
+- **The `job_run_id` bridge is best-effort and one-directional.** It is
+  stamped after `executor.submit` returns, so if that write fails, times out,
+  or the process dies in the window, the run exists in `job_runs` but the row
+  keeps `job_run_id = NULL` (and reconciles to `unknown` on restart). `job_runs`
+  carries no `session_id` and no audit-row id, so there is no reverse pointer
+  to rebuild the correlation from — it is lost, not merely delayed. Exact
+  correlation is the column's purpose, so treat it as *usually* exact rather
+  than guaranteed; making it reconstructable needs a durable half in the
+  jobs ledger, which is out of scope here.
 
 ---
 

@@ -19,6 +19,7 @@ mod commands;
 mod config;
 mod output;
 mod params;
+mod session;
 
 /// Command-line interface for interacting with a skardi-server instance.
 #[derive(Parser, Debug)]
