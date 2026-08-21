@@ -27,7 +27,7 @@ use skardi_server::auth::layer::AuthLayer;
 use skardi_server::config::{CliArgs, ServerConfig};
 use skardi_server::query_audit::QueryAuditStore;
 use skardi_server::semantics::SemanticsRegistry;
-use skardi_server::server::{AppState, configure_routes};
+use skardi_server::server::{AppState, configure_routes, repair_lost_job_correlations};
 
 /// Name of the job registered by `make_app_state`. Bound as a `const` so
 /// assertions and the YAML fixture below stay in sync.
@@ -541,6 +541,123 @@ async fn correlation_survives_a_lost_forward_stamp() {
 }
 
 #[tokio::test]
+async fn the_startup_repair_pass_relinks_the_row_an_auditor_reads() {
+    // `correlation_survives_a_lost_forward_stamp` proves the linkage is still
+    // *on disk*. This proves something stronger and is the point of the whole
+    // change: the row an auditor actually reads gets fixed, without an operator
+    // holding both SQLite files open.
+    //
+    // `record_job_outcome` cannot do it — its `WHERE status = 'started'` guard
+    // means that once `reconcile_orphaned` has rewritten the row to `unknown`,
+    // no later well-behaved write can ever stamp it.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let executor = state.jobs.clone().unwrap();
+
+    let audit_id = store
+        .record_job_submitted(TEST_JOB_NAME, TEST_JOB_VERSION, Some("sess-repair"))
+        .await
+        .unwrap();
+    let run_id = executor
+        .submit(TEST_JOB_NAME, HashMap::new(), Some(&audit_id))
+        .await
+        .unwrap();
+
+    // The crash: no outcome recorded, then a restart reconciles the orphan.
+    store.reconcile_orphaned("simulated crash").await.unwrap();
+    let before = store.get(&audit_id).await.unwrap().unwrap();
+    assert_eq!(before["status"], json!("unknown"));
+    assert!(
+        before["job_run_id"].is_null(),
+        "precondition: the forward stamp must be missing"
+    );
+
+    // The next boot.
+    let repaired = repair_lost_job_correlations(&store, executor.store().as_ref())
+        .await
+        .unwrap();
+    assert_eq!(repaired, 1);
+
+    let after = store.get(&audit_id).await.unwrap().unwrap();
+    assert_eq!(
+        after["job_run_id"],
+        json!(run_id),
+        "the ledger row was not re-linked: {after}"
+    );
+    // The outcome genuinely was never observed, so `unknown` stays the truth;
+    // only the linkage is recovered.
+    assert_eq!(after["status"], json!("unknown"));
+    assert_eq!(after["session_id"], json!("sess-repair"));
+
+    // Idempotent: a second boot finds nothing left to do.
+    assert_eq!(
+        repair_lost_job_correlations(&store, executor.store().as_ref())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_repair_pass_leaves_a_submission_that_never_created_a_run_alone() {
+    // A candidate row with no matching run means `submit` failed before
+    // `create_run`. `job_runs` is never pruned, so the miss is positive
+    // evidence of "never ran" — a different fact from "ran, linkage lost", and
+    // the pass must not blur them.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let executor = state.jobs.clone().unwrap();
+
+    let audit_id = store
+        .record_job_submitted(TEST_JOB_NAME, TEST_JOB_VERSION, None)
+        .await
+        .unwrap();
+    store.reconcile_orphaned("simulated crash").await.unwrap();
+
+    assert_eq!(
+        repair_lost_job_correlations(&store, executor.store().as_ref())
+            .await
+            .unwrap(),
+        0
+    );
+    let row = store.get(&audit_id).await.unwrap().unwrap();
+    assert!(row["job_run_id"].is_null());
+    assert_eq!(row["status"], json!("unknown"));
+}
+
+#[tokio::test]
+async fn the_repair_pass_cannot_touch_a_submission_still_in_flight() {
+    // The pass runs at startup, but nothing stops an operator-triggered or
+    // future periodic call, so it must not race a live submission: a `started`
+    // row is `record_job_outcome`'s to settle, not the repair's.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let executor = state.jobs.clone().unwrap();
+
+    let audit_id = store
+        .record_job_submitted(TEST_JOB_NAME, TEST_JOB_VERSION, None)
+        .await
+        .unwrap();
+    executor
+        .submit(TEST_JOB_NAME, HashMap::new(), Some(&audit_id))
+        .await
+        .unwrap();
+
+    // No `reconcile_orphaned`: the row is still `started`.
+    assert_eq!(
+        repair_lost_job_correlations(&store, executor.store().as_ref())
+            .await
+            .unwrap(),
+        0,
+        "a live submission was treated as a lost one"
+    );
+    assert_eq!(
+        store.get(&audit_id).await.unwrap().unwrap()["status"],
+        json!("started")
+    );
+}
+
+#[tokio::test]
 async fn unaudited_server_leaves_submission_id_null() {
     // No ledger means no token to carry; the column must stay NULL rather
     // than pick up some stand-in that would collide in the reverse lookup.
@@ -555,10 +672,32 @@ async fn unaudited_server_leaves_submission_id_null() {
     assert!(run.submission_id.is_none());
 }
 
+/// GET `uri` and return the parsed body.
+async fn get_json(state: &AppState, uri: &str) -> Value {
+    let app = configure_routes(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+    body_to_json(resp).await
+}
+
 #[tokio::test]
-async fn run_detail_exposes_the_submission_id() {
-    // The reverse pointer is only useful to an operator if it is readable
-    // from the runs API, not just from the ledger file.
+async fn the_token_resolves_a_run_on_the_way_in_and_is_never_returned() {
+    // The reverse pointer has to be reachable over HTTP, or the operator
+    // procedure is "open the SQLite file". It is reachable as a filter, not as
+    // a field: `submission_id` is a `query_audit` primary key, and the ledger
+    // is a deliberately access-restricted artifact (0600 on its file), while
+    // `GET /jobs/runs` returns every run to any authenticated session — jobs
+    // auth is authentication, not authorization. Emitting the token would
+    // publish one caller's audit-row id to every other caller.
     let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
     let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
 
@@ -568,7 +707,82 @@ async fn run_detail_exposes_the_submission_id() {
         .unwrap()
         .to_string();
     let detail = wait_for_terminal(&state, &run_id).await;
+    let audit_id = store.list_by_session("sess-api").await.unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    let rows = store.list_by_session("sess-api").await.unwrap();
-    assert_eq!(detail["submission_id"], rows[0]["id"]);
+    // Not on the way out — neither from the detail route nor the list route.
+    assert!(
+        detail.get("submission_id").is_none(),
+        "run detail leaked the audit row id: {detail}"
+    );
+    let listed = get_json(&state, "/jobs/runs").await;
+    assert!(
+        listed["runs"][0].get("submission_id").is_none(),
+        "the runs list leaked the audit row id: {listed}"
+    );
+
+    // On the way in: an exact-token lookup resolving the one matching run.
+    let found = get_json(&state, &format!("/jobs/runs?submission_id={audit_id}")).await;
+    assert_eq!(found["count"], json!(1), "{found}");
+    assert_eq!(found["runs"][0]["run_id"], json!(run_id));
+}
+
+#[tokio::test]
+async fn an_unmatched_token_is_an_empty_result_not_an_error() {
+    // With no pruning on `job_runs`, a miss is positive evidence that `submit`
+    // never created a run — a fact worth returning cleanly rather than as a
+    // 404 an operator has to disambiguate from a bad route.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+
+    let found = get_json(&state, "/jobs/runs?submission_id=audit-never-existed").await;
+    assert_eq!(found["count"], json!(0));
+    assert_eq!(found["runs"], json!([]));
+    assert_eq!(found["success"], json!(true));
+}
+
+#[tokio::test]
+async fn the_token_lookup_finds_a_run_that_has_fallen_off_the_recent_window() {
+    // The case the filter exists for. `list_job_runs` clamps to 500 with no
+    // offset, so on a server busy enough for the concurrent-submission
+    // ambiguity `job_run_id` was introduced to remove, the run an operator
+    // needs during an incident is exactly the one no longer in the window.
+    let store = Arc::new(QueryAuditStore::open_in_memory().await.unwrap());
+    let (state, _tmp) = make_app_state(Some(Arc::clone(&store))).await;
+    let executor = state.jobs.clone().unwrap();
+    let jobs = executor.store();
+
+    let audit_id = store
+        .record_job_submitted(TEST_JOB_NAME, TEST_JOB_VERSION, None)
+        .await
+        .unwrap();
+    let wanted = executor
+        .submit(TEST_JOB_NAME, HashMap::new(), Some(&audit_id))
+        .await
+        .unwrap();
+
+    // Bury it under more runs than the list route will ever return.
+    for _ in 0..3 {
+        executor
+            .submit(TEST_JOB_NAME, HashMap::new(), None)
+            .await
+            .unwrap();
+    }
+    let listed = get_json(&state, "/jobs/runs?limit=2").await;
+    assert_eq!(listed["count"], json!(2), "precondition: a bounded window");
+
+    let found = get_json(&state, &format!("/jobs/runs?submission_id={audit_id}")).await;
+    assert_eq!(found["count"], json!(1));
+    assert_eq!(found["runs"][0]["run_id"], json!(wanted));
+    // `job` and `limit` cannot narrow a token lookup away — one token names at
+    // most one run.
+    let found = get_json(
+        &state,
+        &format!("/jobs/runs?submission_id={audit_id}&limit=1&job=nope"),
+    )
+    .await;
+    assert_eq!(found["runs"][0]["run_id"], json!(wanted));
+    drop(jobs);
 }

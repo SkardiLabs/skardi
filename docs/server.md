@@ -349,9 +349,52 @@ Two properties of this seam an operator should know before relying on it:
   Both directions are indexed.
 
   `submission_id` is NULL for runs submitted to a server with no
-  `--query-audit-db`, and is surfaced on `GET /jobs/runs` and
-  `GET /jobs/runs/:run_id`. The jobs subsystem stores it verbatim and never
+  `--query-audit-db`. The jobs subsystem stores it verbatim and never
   interprets it — it has no notion of the audit ledger.
+
+- **The repair happens on the next boot; you do not need the token by hand.**
+  At startup, once both ledgers are open and each has reconciled its own
+  orphans, the server passes over job rows left `unknown` with
+  `job_run_id IS NULL` and re-links each from `job_runs.submission_id`. The row
+  an auditor reads ends up carrying the run id, so "linkage lost" is a
+  condition that survives a crash but not a restart. `status` stays `unknown` —
+  the outcome genuinely was never observed; only the linkage is recovered. The
+  pass is idempotent, never overwrites a pointer that was written correctly,
+  and never touches a row still `started`. A failure is logged and does not
+  block startup.
+
+- **The token resolves through the runs API as a filter, not as a field.**
+  `GET /jobs/runs?submission_id=<audit row id>` returns the single matching run
+  (an empty list on a miss). It is deliberately *not* included in run payloads:
+  it is a `query_audit` primary key, that ledger is chmod 0600, and
+  `GET /jobs/runs` returns every run to any authenticated session — the
+  `/jobs/*` gate is authentication, not authorization — so emitting it would
+  publish one caller's audit-row id to every other caller. A filter on the way
+  in also serves the operator better: it resolves a run that has already
+  fallen off the 500-row list window, which during an incident is exactly the
+  run being looked for.
+
+- **The two halves expire on different clocks.** `query_audit` has retention
+  (`--query-audit-retention-days`, pruned at startup and hourly); `job_runs`
+  has no pruning at all. So under retention an old run keeps a `submission_id`
+  pointing at a row that has been deleted, indistinguishable from a token that
+  was never valid. The pointer stays durable; its target does not.
+
+  The asymmetry cuts the useful way too. Because `job_runs` is never pruned,
+  **no match for a token is positive evidence that `submit` never created a
+  run** — which is what separates "definitely submitted, linkage lost" from
+  "never ran" for an `unknown` job row. That inference is the operator
+  procedure for the ambiguity this bridge exists to remove, and it stops being
+  sound the moment anything starts pruning `job_runs`.
+
+- **`jobs.db` is protected on the same terms as the audit ledger.** It is
+  created owner-only (0600) and re-chmodded on every open, along with its
+  WAL sidecars, matching `--query-audit-db`. It has to be: `job_runs.parameters`
+  holds the raw submit-time parameter *values* the audit ledger deliberately
+  refuses to store, and since `submission_id` the file also links each run to a
+  protected audit row. Two halves of one audit record with one permission
+  decision — otherwise the weaker half sets the real posture. Off Unix the
+  chmod is a no-op, as with the audit ledger.
 
 ---
 

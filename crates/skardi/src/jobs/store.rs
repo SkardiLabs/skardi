@@ -12,8 +12,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_rusqlite::{Connection, Row, rusqlite};
 
 /// DDL for the run ledger. Idempotent — run on every `open` via
@@ -45,15 +47,135 @@ CREATE INDEX IF NOT EXISTS idx_job_runs_status
 /// Partial, because the column is NULL for every run not submitted through an
 /// audited server, and because the only query against it is an equality
 /// lookup for one submission.
-const SUBMISSION_ID_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_job_runs_submission_id
+///
+/// **Unique**, which is the difference between a duplicate token being caught
+/// and a duplicate token being hidden. `get_run_by_submission_id` resolves
+/// `ORDER BY created_at DESC LIMIT 1`, so without the constraint a second run
+/// carrying an existing token makes the lookup return a *confidently wrong*
+/// run — no error, no signal, the same shape as a correct answer, for a column
+/// whose entire purpose is saying which run a submission produced. The
+/// constraint moves that from a wrong answer during an incident to a
+/// `create_run` failure at the moment the mistake is made. It constrains
+/// nothing that exists today: the one production writer mints a fresh audit id
+/// per submission. NULLs stay unconstrained, so unattributed runs are
+/// unaffected.
+///
+/// The `DROP` is not vestigial. `CREATE UNIQUE INDEX IF NOT EXISTS` matches on
+/// *name*, so it would silently no-op against the non-unique index of the same
+/// name that earlier builds of this branch created — leaving a ledger that
+/// looks constrained and is not. Dropping first makes the outcome the same
+/// whichever build wrote the file.
+const SUBMISSION_ID_INDEX_SQL: &str = "DROP INDEX IF EXISTS idx_job_runs_submission_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_submission_id_unique
     ON job_runs (submission_id) WHERE submission_id IS NOT NULL;";
+
+/// Columns that `CREATE TABLE IF NOT EXISTS` cannot retrofit onto a ledger
+/// written before they existed, reconciled by [`ensure_added_columns`] on
+/// every open.
+const ADDED_COLUMNS: [&str; 1] = ["submission_id"];
+
+/// How long a write waits for another connection's lock before giving up.
+///
+/// SQLite installs no busy handler by default — a write that finds the lock
+/// held returns `SQLITE_BUSY` immediately. See the pragmas in
+/// [`SqliteJobStore::open`] for why that default is wrong here.
+const JOBS_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// True for the `duplicate column name` error SQLite raises when an
 /// `ALTER TABLE ... ADD COLUMN` loses a race with another connection that
 /// already added it. Matched on message text because `rusqlite` reports it as
 /// a generic `SqliteFailure` with no distinguishing code.
+///
+/// Byte-for-byte the predicate at `crates/query-audit/src/lib.rs`
+/// (`is_duplicate_column`), duplicated because `crates/skardi` must not depend
+/// on `skardi-query-audit` for a two-line string match. Kept in sync by hand:
+/// a future SQLite rewording of this message breaks both, silently, in
+/// different crates — so change them together.
 fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     e.to_string().contains("duplicate column name")
+}
+
+/// Add any of `columns` the live `job_runs` table is missing, as nullable
+/// `TEXT`. Idempotent and additive; a no-op on a fresh ledger, where
+/// [`INIT_SCHEMA_SQL`] already declared them.
+///
+/// Mirrors `ensure_added_columns` in `crates/query-audit/src/lib.rs`. Written
+/// as a loop over a column list rather than inline for the single column that
+/// needs it today, so the next column on `job_runs` is a list entry instead of
+/// a fourth copy of this block.
+fn ensure_added_columns(conn: &rusqlite::Connection, columns: &[&str]) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(job_runs)")?;
+    let existing: HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for col in columns {
+        if existing.contains(*col) {
+            continue;
+        }
+        // The read above is not atomic with this ALTER, so a second process
+        // opening the same file can win the race. Its `duplicate column name`
+        // is exactly the post-condition wanted here — treat it as success
+        // rather than failing startup over a benign race. The busy timeout set
+        // in `open` is what keeps the *other* interleaving (the winner still
+        // mid-write when this ALTER fires) from surfacing as `database is
+        // locked` instead of as this tolerated error.
+        match conn.execute(&format!("ALTER TABLE job_runs ADD COLUMN {col} TEXT"), []) {
+            Ok(_) => {}
+            Err(e) if is_duplicate_column(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Create `path` owner-only so it is never briefly world-readable: SQLite
+/// would otherwise create it through the process umask (typically 0644).
+///
+/// `jobs.db` holds `job_runs.parameters` — the raw submit-time parameter
+/// *values* that the query-audit ledger deliberately refuses to store — and
+/// since [`JobRun::submission_id`] it also links each run to a row in that
+/// ledger, which is chmod 0600. Mirrors `create_private_file` in
+/// `crates/query-audit/src/lib.rs`; duplicated for the same
+/// no-dependency reason as [`is_duplicate_column`].
+fn create_private_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        // Lost a race with another process; permissions get fixed below.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("Failed to create jobs.db file: {}", path.display()))
+        }
+    }
+}
+
+/// Force owner-only permissions on a ledger file. No-op off Unix, where the
+/// permission model does not map.
+fn restrict_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "Failed to restrict jobs.db file permissions: {}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Lifecycle status of a single job run.
@@ -190,14 +312,51 @@ impl SqliteJobStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create jobs.db parent dir: {parent:?}"))?;
         }
+        // Create the file ourselves so it is never briefly world-readable.
+        create_private_file(&path)?;
+
         let conn = Connection::open(&path)
             .await
             .with_context(|| format!("Failed to open jobs.db: {path:?}"))?;
+
+        conn.call(|conn| -> std::result::Result<(), rusqlite::Error> {
+            // WAL so a reader (a `GET /jobs/runs`, a CLI poll) does not block
+            // the background task's status writes.
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            // SQLite's default busy handler is "fail immediately". Without a
+            // timeout, two processes opening the same `jobs.db` — a rolling
+            // restart, an operator tool, a second server on the same path —
+            // turn the benign migration race `ensure_added_columns` tolerates
+            // into a startup failure: the loser's `ALTER TABLE` lands while the
+            // winner is still mid-write and gets `database is locked`, which is
+            // not a `duplicate column name` and so is not tolerated. Every
+            // other `job_runs` write is exposed to the same default. Matches
+            // the query-audit ledger, which sets both pragmas before its own
+            // column reconciliation for exactly this reason.
+            conn.busy_timeout(JOBS_BUSY_TIMEOUT)?;
+            Ok(())
+        })
+        .await
+        .with_context(|| format!("Failed to configure jobs.db: {}", path.display()))?;
+
         let store = Self {
             conn: Arc::new(conn),
             path,
         };
         store.ensure_schema().await?;
+
+        // WAL creates `-wal`/`-shm` sidecars on first write; they carry the
+        // same rows and need the same protection.
+        restrict_permissions(&store.path)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = store.path.clone().into_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                restrict_permissions(&sidecar)?;
+            }
+        }
+
         Ok(store)
     }
 
@@ -229,28 +388,11 @@ impl SqliteJobStore {
 
         // `CREATE TABLE IF NOT EXISTS` above no-ops on an existing ledger and
         // will not add columns, so ledgers written before `submission_id`
-        // need the column bolted on. Idempotent: re-checked against
-        // pragma table_info on every open.
+        // need it bolted on. Idempotent: reconciled against
+        // `pragma table_info` on every open.
         self.conn
             .call(|conn| -> std::result::Result<(), rusqlite::Error> {
-                let has_column = conn
-                    .prepare(
-                        "SELECT 1 FROM pragma_table_info('job_runs') \
-                         WHERE name = 'submission_id'",
-                    )?
-                    .exists([])?;
-                if !has_column {
-                    // The check is not atomic with the ALTER, so a second
-                    // process opening the same file can win the race. Its
-                    // `duplicate column name` is exactly the post-condition
-                    // wanted here — treat it as success rather than failing
-                    // startup over a benign race.
-                    match conn.execute("ALTER TABLE job_runs ADD COLUMN submission_id TEXT", []) {
-                        Ok(_) => {}
-                        Err(e) if is_duplicate_column(&e) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
+                ensure_added_columns(conn, &ADDED_COLUMNS)?;
                 conn.execute_batch(SUBMISSION_ID_INDEX_SQL)?;
                 Ok(())
             })
@@ -666,7 +808,7 @@ mod tests {
                 .submission_id
                 .is_none()
         );
-        assert!(s.list_runs(None, 10).await.unwrap().len() == 2);
+        assert_eq!(s.list_runs(None, 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -716,22 +858,183 @@ mod tests {
         );
 
         // The partial index is applied in the same guarded step as the ALTER,
-        // so a migrated ledger must not be left without it.
-        let has_index = s
+        // so a migrated ledger must not be left without it — and it must be
+        // the *unique* one, not a leftover of the same purpose under the old
+        // name.
+        let (has_unique, has_legacy) = s
             .conn
-            .call(|conn| -> std::result::Result<bool, rusqlite::Error> {
-                conn.prepare(
-                    "SELECT 1 FROM sqlite_master
-                      WHERE type = 'index' AND name = 'idx_job_runs_submission_id'",
-                )?
-                .exists([])
-            })
+            .call(
+                |conn| -> std::result::Result<(bool, bool), rusqlite::Error> {
+                    let unique = conn
+                        .prepare(
+                            "SELECT 1 FROM sqlite_master
+                              WHERE type = 'index'
+                                AND name = 'idx_job_runs_submission_id_unique'",
+                        )?
+                        .exists([])?;
+                    let legacy = conn
+                        .prepare(
+                            "SELECT 1 FROM sqlite_master
+                              WHERE type = 'index' AND name = 'idx_job_runs_submission_id'",
+                        )?
+                        .exists([])?;
+                    Ok((unique, legacy))
+                },
+            )
             .await
             .unwrap();
         assert!(
-            has_index,
-            "migrated ledger is missing the submission_id index"
+            has_unique,
+            "migrated ledger is missing the unique submission_id index"
         );
+        assert!(
+            !has_legacy,
+            "the pre-unique index survived the migration, so uniqueness is not enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_submission_id_is_rejected_rather_than_shadowing_a_run() {
+        // `get_run_by_submission_id` resolves `ORDER BY created_at DESC LIMIT
+        // 1`, so without the unique index a reused token would make it return a
+        // confidently wrong run — no error, same shape as a correct answer, for
+        // the one column whose job is saying which run a submission produced.
+        // The constraint turns that into a failure at the moment the mistake is
+        // made.
+        let s = SqliteJobStore::open_in_memory().await.unwrap();
+        s.create_run(&sample_run_with_submission("r1", "ingest", Some("audit-1")))
+            .await
+            .unwrap();
+
+        let err = s
+            .create_run(&sample_run_with_submission("r2", "ingest", Some("audit-1")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "expected a uniqueness failure, got {err}"
+        );
+
+        // The first run is still the answer, and is still the only one.
+        assert_eq!(
+            s.get_run_by_submission_id("audit-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "r1"
+        );
+    }
+
+    #[tokio::test]
+    async fn many_unattributed_runs_do_not_collide_under_the_unique_index() {
+        // The index is partial (`WHERE submission_id IS NOT NULL`), so runs
+        // submitted through an unaudited server — every run today — must still
+        // insert freely. Without the partial clause this is what would break.
+        let s = SqliteJobStore::open_in_memory().await.unwrap();
+        for i in 0..5 {
+            s.create_run(&sample_run_with_submission(
+                &format!("r{i}"),
+                "ingest",
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(s.list_runs(None, 10).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn open_is_idempotent_across_the_unique_index_rename() {
+        // A ledger written by an earlier build of this change carries the
+        // non-unique index under the old name. `CREATE UNIQUE INDEX IF NOT
+        // EXISTS` matches on name, so without the `DROP` it would no-op and
+        // leave the file looking constrained while accepting duplicates.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE job_runs (
+                    id TEXT PRIMARY KEY, job_name TEXT NOT NULL,
+                    parameters TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                    rows_written INTEGER, snapshot_id TEXT, error TEXT,
+                    submission_id TEXT);
+                 CREATE INDEX idx_job_runs_submission_id
+                    ON job_runs (submission_id) WHERE submission_id IS NOT NULL;",
+            )
+            .unwrap();
+        }
+
+        // Opening twice also pins that the DROP/CREATE pair is re-runnable.
+        for _ in 0..2 {
+            let s = SqliteJobStore::open(&path).await.unwrap();
+            drop(s);
+        }
+        let s = SqliteJobStore::open(&path).await.unwrap();
+        s.create_run(&sample_run_with_submission("r1", "ingest", Some("audit-1")))
+            .await
+            .unwrap();
+        let err = s
+            .create_run(&sample_run_with_submission("r2", "ingest", Some("audit-1")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "the rename left the ledger unconstrained: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_restricts_permissions_and_sets_the_concurrency_pragmas() {
+        // `jobs.db` holds `job_runs.parameters` — the raw parameter values the
+        // query-audit ledger refuses to store — and since `submission_id` it
+        // also links each run to a row in that 0600 ledger. The weaker of two
+        // halves of one audit record would otherwise set the real posture.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let s = SqliteJobStore::open(&path).await.unwrap();
+        // A write, so the WAL sidecars exist to be checked.
+        s.create_run(&sample_run("r1", "ingest")).await.unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "jobs.db is not owner-only: {mode:o}");
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.clone().into_os_string();
+                sidecar.push(suffix);
+                let sidecar = PathBuf::from(sidecar);
+                if sidecar.exists() {
+                    let mode = std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "{sidecar:?} is not owner-only: {mode:o}");
+                }
+            }
+        }
+
+        // WAL and a non-zero busy timeout are what make the migration's
+        // duplicate-column tolerance a complete story: without the timeout the
+        // losing process gets `database is locked` instead, which is not
+        // tolerated and takes startup down.
+        let (journal_mode, busy_timeout) = s
+            .conn
+            .call(
+                |conn| -> std::result::Result<(String, i64), rusqlite::Error> {
+                    let journal: String =
+                        conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                    let busy: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+                    Ok((journal, busy))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(busy_timeout, JOBS_BUSY_TIMEOUT.as_millis() as i64);
     }
 
     #[test]
