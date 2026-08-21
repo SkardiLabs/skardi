@@ -1590,8 +1590,12 @@ bindings:
             }
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
                 if req.path.ends_with("dropbox.list_folder_continue") {
+                    // `null`, not `{}`: an absent `inputSchema` is the arm
+                    // under test. An empty object is a schema that is
+                    // PRESENT and shapeless, which the gate refuses with a
+                    // different diagnostic (covered in `source_pack`).
                     return MockResponse::ok(&discovery_ok(
-                        "{}",
+                        "null",
                         include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
                         true,
                         None,
@@ -1834,9 +1838,10 @@ bindings:
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
                 if req.path.ends_with("dropbox.list_folder_continue") {
                     // Captured OUTPUT schema — so the fingerprint still
-                    // matches — with no input schema at all.
+                    // matches — with no input schema at all (`null`, not an
+                    // empty object; see the YAML twin).
                     return MockResponse::ok(&discovery_ok(
-                        "{}",
+                        "null",
                         include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
                         true,
                         None,
