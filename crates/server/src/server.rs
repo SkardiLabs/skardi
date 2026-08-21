@@ -289,6 +289,26 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         None => None,
     };
 
+    // Both ledgers are open and both have reconciled their own orphans, which
+    // is the only point in startup where the correlation between them can be
+    // rebuilt. Runs after the audit `reconcile_orphaned` above deliberately:
+    // that pass is what moves a lost row to `unknown`, so repairing first would
+    // miss the rows this crash just created.
+    if let (Some(audit), Some(jobs)) = (query_audit.as_ref(), jobs_bundle.as_ref()) {
+        match repair_lost_job_correlations(audit, jobs.store().as_ref()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::warn!(
+                "Recovered the audit correlation for {n} job submission(s) whose \
+                 job_run_id stamp was lost to a crash or a write failure",
+            ),
+            // A ledger that cannot be repaired is not a ledger that must not
+            // serve: the rows stay exactly as they were, recoverable by hand
+            // and by the next boot. Failing startup here would take a server
+            // down over history rather than over anything it is about to do.
+            Err(e) => tracing::error!("Job-correlation repair pass failed: {e}"),
+        }
+    }
+
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState::new(
         config,
@@ -305,6 +325,57 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     tracing::info!("Application state setup completed successfully");
 
     Ok(app_state)
+}
+
+/// Re-link job submissions whose forward pointer was lost, using the durable
+/// reverse one.
+///
+/// `query_audit.job_run_id` is stamped *after* `executor.submit` returns, so a
+/// crash or a write failure in that window leaves a row that is `unknown` with
+/// no run id — while the run itself exists and really did execute.
+/// `job_runs.submission_id` carries the audit row's id, written in the same
+/// INSERT that created the run, so the linkage is still on disk in the other
+/// file. This is the pass that puts it back into the row an auditor reads,
+/// rather than leaving it to an operator with `sqlite3`.
+///
+/// Idempotent and safely re-runnable: `backfill_job_run_id` only writes rows
+/// still `unknown` with a NULL pointer, so a repaired row is skipped on the
+/// next boot, and a row whose pointer was written correctly is never touched.
+/// A candidate with no matching run is left alone — with no pruning on
+/// `job_runs`, that is positive evidence `submit` never created a run, which is
+/// a different fact worth preserving rather than papering over.
+///
+/// Returns how many rows were re-linked.
+///
+/// `pub` so the acceptance suite can drive the same function startup calls,
+/// rather than a re-implementation of it.
+pub async fn repair_lost_job_correlations(
+    audit: &QueryAuditStore,
+    jobs: &dyn skardi::jobs::JobStore,
+) -> anyhow::Result<usize> {
+    let candidates = audit.job_rows_missing_run_id().await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    tracing::debug!(
+        "Job-correlation repair: {} audit row(s) with a lost job_run_id",
+        candidates.len()
+    );
+    let mut repaired = 0;
+    for audit_id in candidates {
+        match jobs.get_run_by_submission_id(&audit_id).await {
+            Ok(Some(run)) => {
+                if audit.backfill_job_run_id(&audit_id, &run.id).await? {
+                    repaired += 1;
+                }
+            }
+            // No run carries this token: the submission never got as far as
+            // creating one. The row's `unknown` is already the right answer.
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Job-correlation repair: lookup for {audit_id} failed: {e}"),
+        }
+    }
+    Ok(repaired)
 }
 
 /// Prune audit records older than `retention_days` now, then hourly for the

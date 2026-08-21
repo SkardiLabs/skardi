@@ -273,7 +273,14 @@ pub async fn submit_job_run(
         None => None,
     };
 
-    match executor.submit(&name, req.parameters).await {
+    // The audit row id doubles as the run's submission token, so the two
+    // ledgers point at each other. This half is durable at run-creation time;
+    // the `run_id` stamp below is best-effort, and if it is lost the
+    // correlation is still recoverable through `get_run_by_submission_id`.
+    match executor
+        .submit(&name, req.parameters, audit_id.as_deref())
+        .await
+    {
         Ok(run_id) => {
             finish_job_audit(
                 app_state.query_audit.as_deref(),
@@ -343,6 +350,13 @@ pub async fn get_job_run(
 pub struct ListRunsQuery {
     pub job: Option<String>,
     pub limit: Option<usize>,
+    /// Resolve the single run carrying this correlation token.
+    ///
+    /// The recovery direction of the audit bridge: an operator holding a
+    /// `query_audit` row id whose `job_run_id` was lost asks for it here. A
+    /// filter on the way in rather than the token on the way out — see
+    /// [`job_run_to_json`], which deliberately does not emit it.
+    pub submission_id: Option<String>,
 }
 
 /// `GET /jobs/runs?job=...&limit=...`
@@ -358,6 +372,27 @@ pub async fn list_job_runs(
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
+    // An exact-token lookup, not a filter over the recent window: the run an
+    // operator needs during an incident is the one that has already fallen off
+    // it, which is exactly when concurrent submissions made `job_run_id` worth
+    // having. `job` and `limit` are ignored — one token names at most one run.
+    if let Some(token) = q.submission_id.as_deref() {
+        return match executor.store().get_run_by_submission_id(token).await {
+            Ok(run) => {
+                let body: Vec<Value> = run.iter().map(job_run_to_json).collect();
+                Ok(Json(serde_json::json!({
+                    "success": true,
+                    "runs": body,
+                    "count": body.len(),
+                })))
+            }
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&e.to_string(), "internal_error", None),
+            )),
+        };
+    }
+
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     match executor.store().list_runs(q.job.as_deref(), limit).await {
         Ok(runs) => {

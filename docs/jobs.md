@@ -171,7 +171,7 @@ On startup the server:
 |----------|--------|-------------|
 | `/jobs` | GET | List every registered job with its destination |
 | `/jobs/:name/run` | POST | Submit a new run; body is the param map |
-| `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N` |
+| `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N` (max 500). `?submission_id=<token>` instead resolves the single run carrying that correlation token, ignoring `job`/`limit` |
 | `/jobs/runs/:run_id` | GET | Current state of one run |
 | `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation |
 
@@ -209,7 +209,11 @@ with `400 parameter_validation_error` — the header is always validated once
 the job exists, regardless of audit configuration. When `--query-audit-db`
 is configured, the submission is recorded as a `job` row with the session
 id and `name@version` in the ledger, with the submission's outcome
-(`succeeded` or `failed`) and the `job_run_id` bridge to the run. When the server has
+(`succeeded` or `failed`) and the `job_run_id` bridge to the run. That bridge
+has a second, durable half in the other direction — `job_runs.submission_id`
+holds the audit row's id, written with the run's INSERT — so a lost
+`job_run_id` stamp no longer loses the correlation, and the server re-links
+such rows on its next startup. When the server has
 auditing enabled, a `503` with `error_type: query_audit_error` means the
 job **was not submitted** and the call is safe to retry.
 
@@ -359,6 +363,14 @@ Row fields, matching the CLI `status` response:
 | `rows_written` | Set on `succeeded`; also set on post-commit cancels |
 | `snapshot_id` | For Lance: the version the commit landed on, as a string |
 | `error` | Non-null on failures / cancels; free-form message |
+
+The row carries one field the response does not: `submission_id`, the opaque
+correlation token the submitter supplied — for the server, the `query_audit`
+row id of the submission that created this run. It is withheld from run
+payloads on purpose (it is another ledger's primary key, and any authenticated
+session can list every run) and is reachable as a filter instead:
+`GET /jobs/runs?submission_id=<audit row id>`. See the ledger section of
+[`server.md`](server.md).
 
 ---
 

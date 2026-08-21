@@ -129,7 +129,10 @@ spec:
         "min_id".to_string(),
         serde_json::Value::Number(serde_json::Number::from(0)),
     );
-    let run_id = exec.submit("ingest-lake", params.clone()).await.unwrap();
+    let run_id = exec
+        .submit("ingest-lake", params.clone(), None)
+        .await
+        .unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(
         run.status,
@@ -141,7 +144,7 @@ spec:
     assert!(lance_dataset_exists(lake_path.to_str().unwrap()));
 
     // Submit #2 — append mode should double the row count.
-    let run_id = exec.submit("ingest-lake", params).await.unwrap();
+    let run_id = exec.submit("ingest-lake", params, None).await.unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(
         run.status,
@@ -263,7 +266,10 @@ spec:
         lake_path.to_str().unwrap(),
     )
     .await;
-    let err = exec.submit("mismatch", HashMap::new()).await.unwrap_err();
+    let err = exec
+        .submit("mismatch", HashMap::new(), None)
+        .await
+        .unwrap_err();
     let err_str = err.to_string();
     assert!(
         err_str.contains("schema mismatch") || err_str.contains("Destination schema mismatch"),
@@ -326,7 +332,10 @@ spec:
         HashMap::new(),
     );
 
-    let err = exec.submit("db-ingest", HashMap::new()).await.unwrap_err();
+    let err = exec
+        .submit("db-ingest", HashMap::new(), None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -371,7 +380,10 @@ spec:
 
     let exec =
         build_executor_for_lance(Arc::clone(&ctx), job, "lake", lake_path.to_str().unwrap()).await;
-    let err = exec.submit("strict", HashMap::new()).await.unwrap_err();
+    let err = exec
+        .submit("strict", HashMap::new(), None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -404,6 +416,7 @@ async fn restart_reconciles_orphaned_running_row_to_failed() {
             rows_written: None,
             snapshot_id: None,
             error: None,
+            submission_id: None,
         };
         store.create_run(&run).await.unwrap();
     }
@@ -474,7 +487,7 @@ spec:
         "min_id".to_string(),
         serde_json::Value::Number(serde_json::Number::from(2)),
     );
-    let run_id = exec.submit("db-ingest", params).await.unwrap();
+    let run_id = exec.submit("db-ingest", params, None).await.unwrap();
     let run = wait_for_terminal(&exec, &run_id).await;
     assert_eq!(
         run.status,
@@ -547,7 +560,10 @@ spec:
         HashMap::new(),
     );
 
-    let err = exec.submit("nontx", HashMap::new()).await.unwrap_err();
+    let err = exec
+        .submit("nontx", HashMap::new(), None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,

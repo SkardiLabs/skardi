@@ -845,6 +845,73 @@ impl QueryAuditStore {
         Ok(updated)
     }
 
+    /// Job rows whose forward pointer was lost: `status = unknown` with no
+    /// `job_run_id`. Returns their ids, oldest first.
+    ///
+    /// Exactly the rows [`Self::record_job_outcome`] can no longer repair — its
+    /// `WHERE status = 'started'` guard means once `reconcile_orphaned` has
+    /// rewritten a row to `unknown`, no later well-behaved write can ever stamp
+    /// it. Without a pass like this, "the correlation is recoverable" is only
+    /// true for an operator with `sqlite3` and both ledger files open; the row
+    /// an auditor actually reads still says `unknown, NULL`, which for a job
+    /// row means "definitely submitted, linkage lost" while reading identically
+    /// to a query row's "may have run after a crash".
+    ///
+    /// The repair itself lives in the server, which is the only layer holding
+    /// both ledgers: `job_runs.submission_id` carries this id, so each of these
+    /// resolves through `JobStore::get_run_by_submission_id`.
+    pub async fn job_rows_missing_run_id(&self) -> Result<Vec<String>> {
+        let ids = self
+            .conn
+            .call(move |conn| -> SqlResult<Vec<String>> {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM query_audit
+                      WHERE statement_kind = ?1
+                        AND status = ?2
+                        AND job_run_id IS NULL
+                      ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map(
+                    params![JOB_STATEMENT_KIND, QueryAuditStatus::Unknown.as_str()],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect()
+            })
+            .await
+            .context("Failed to list job rows missing job_run_id")?;
+        Ok(ids)
+    }
+
+    /// Stamp `job_run_id` onto a row whose forward pointer was lost. Returns
+    /// whether a row was updated.
+    ///
+    /// Deliberately not reusing [`Self::record_job_outcome`]: that guards on
+    /// `status = 'started'`, which is precisely the state these rows are no
+    /// longer in. The guard here is the mirror image — `unknown` with the
+    /// column still NULL — so a repair can neither overwrite a pointer that was
+    /// written correctly nor touch a row that is still live. `status` is left
+    /// as `unknown`, which stays the truth: the outcome was never observed, only
+    /// the linkage is recovered.
+    pub async fn backfill_job_run_id(&self, id: &str, job_run_id: &str) -> Result<bool> {
+        let id = id.to_string();
+        let job_run_id = job_run_id.to_string();
+        let updated = self
+            .conn
+            .call(move |conn| -> SqlResult<usize> {
+                conn.execute(
+                    "UPDATE query_audit
+                        SET job_run_id = ?2
+                      WHERE id = ?1
+                        AND job_run_id IS NULL
+                        AND status = ?3",
+                    params![id, job_run_id, QueryAuditStatus::Unknown.as_str()],
+                )
+            })
+            .await
+            .context("Failed to backfill job_run_id")?;
+        Ok(updated > 0)
+    }
+
     /// Delete records created before `cutoff` (RFC 3339). Returns the total
     /// row count deleted.
     ///
@@ -1516,6 +1583,105 @@ mod tests {
         let n = store.reconcile_orphaned("test restart").await.unwrap();
         assert_eq!(n, 1);
         let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn only_unknown_job_rows_with_a_null_pointer_are_repair_candidates() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+
+        // A row whose stamp was lost: reconciled to `unknown`, pointer NULL.
+        let lost = store
+            .record_job_submitted("nightly", "1.0.0", None)
+            .await
+            .unwrap();
+        // A row that recorded its outcome normally.
+        let stamped = store
+            .record_job_submitted("nightly", "1.0.0", None)
+            .await
+            .unwrap();
+        store
+            .record_job_outcome(&stamped, Some("run-ok"), QueryAuditStatus::Succeeded, None)
+            .await
+            .unwrap();
+        // A non-job row, also reconciled — must never be a candidate.
+        let query_row = store
+            .record_started("SELECT 1", None, 10, "Query")
+            .await
+            .unwrap();
+
+        store.reconcile_orphaned("crash").await.unwrap();
+
+        let candidates = store.job_rows_missing_run_id().await.unwrap();
+        assert_eq!(candidates, vec![lost.clone()]);
+        assert!(!candidates.contains(&stamped), "a stamped row is not lost");
+        assert!(!candidates.contains(&query_row), "query rows are not jobs");
+    }
+
+    #[tokio::test]
+    async fn backfill_restores_a_lost_pointer_and_refuses_every_other_row() {
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let lost = store
+            .record_job_submitted("nightly", "1.0.0", Some("sess-x"))
+            .await
+            .unwrap();
+        store.reconcile_orphaned("crash").await.unwrap();
+
+        assert!(
+            store.backfill_job_run_id(&lost, "run-found").await.unwrap(),
+            "a lost row must be repairable"
+        );
+        let row = store.get(&lost).await.unwrap().unwrap();
+        assert_eq!(row["job_run_id"], json!("run-found"));
+        // The outcome was never observed; only the linkage is recovered.
+        assert_eq!(row["status"], json!("unknown"));
+        assert_eq!(row["session_id"], json!("sess-x"));
+
+        // Idempotent: a second pass finds nothing to do and cannot overwrite.
+        assert!(
+            !store.backfill_job_run_id(&lost, "run-other").await.unwrap(),
+            "a repaired row must not be rewritten"
+        );
+        assert_eq!(
+            store.get(&lost).await.unwrap().unwrap()["job_run_id"],
+            json!("run-found")
+        );
+        assert!(store.job_rows_missing_run_id().await.unwrap().is_empty());
+
+        // A row still `started` is live, not lost — the guard must decline it,
+        // so a repair pass can never race a submission in flight.
+        let live = store
+            .record_job_submitted("nightly", "1.0.0", None)
+            .await
+            .unwrap();
+        assert!(
+            !store.backfill_job_run_id(&live, "run-live").await.unwrap(),
+            "a started row must be left to record_job_outcome"
+        );
+        assert!(store.get(&live).await.unwrap().unwrap()["job_run_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn record_job_outcome_cannot_repair_what_reconcile_already_touched() {
+        // The premise the repair pass exists for: once a row is `unknown`, the
+        // `status = 'started'` guard means no later well-behaved write can ever
+        // stamp it. If this ever stops being true, the pass is redundant.
+        let store = QueryAuditStore::open_in_memory().await.unwrap();
+        let id = store
+            .record_job_submitted("nightly", "1.0.0", None)
+            .await
+            .unwrap();
+        store.reconcile_orphaned("crash").await.unwrap();
+
+        store
+            .record_job_outcome(&id, Some("run-late"), QueryAuditStatus::Succeeded, None)
+            .await
+            .unwrap();
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert!(
+            row["job_run_id"].is_null(),
+            "record_job_outcome stamped a reconciled row; the repair pass is now dead code"
+        );
         assert_eq!(row["status"], json!("unknown"));
     }
 
