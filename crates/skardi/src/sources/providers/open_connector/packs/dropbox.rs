@@ -349,8 +349,10 @@ mod tests {
                 continuation.cursor_only,
                 "{short} declares `inputs: cursor_only`"
             );
-            let captured = continuation_input_contract(continuation.action_id)
-                .unwrap_or_else(|| panic!("{} has a committed input contract", continuation.action_id));
+            let captured =
+                continuation_input_contract(continuation.action_id).unwrap_or_else(|| {
+                    panic!("{} has a committed input contract", continuation.action_id)
+                });
             let schema: Value = serde_json::from_str(captured).expect("input contract parses");
             table
                 .check_continuation_inputs(Some(&schema))
