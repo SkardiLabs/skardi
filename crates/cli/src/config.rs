@@ -1,130 +1,444 @@
-//! Connection config resolution for the CLI: where the server URL and API
-//! token come from, and in what order they win.
+//! Connection config resolution for the CLI: which server the command talks
+//! to, with which credential, and — since contexts landed — which *context*
+//! supplies them.
 //!
-//! Precedence is per-field: `--server`/`--token` flag > `SKARDI_SERVER_URL`/
-//! `SKARDI_API_TOKEN` env var > `~/.skardi/config.yaml` > built-in default.
-//! Each field (server, token) is resolved independently, so e.g. the server
-//! can come from the environment while the token comes from the config file.
+//! Two file shapes are supported. The current one is a kubectl-shaped list of
+//! named contexts with a `current-context` pointer; the legacy one is a single
+//! `spec: {server, token}` block, which resolves as a lone context named
+//! `default` so existing installs keep working with no migration step.
+//!
+//! Precedence is per-field and differs by context mode, which is the one
+//! subtlety worth reading before changing anything here:
+//!
+//! ```text
+//! mode: server   server: --server > $SKARDI_SERVER_URL > context > default
+//!                token:  --token  > $SKARDI_API_TOKEN  > context > (none)
+//!
+//! mode: cloud    server: --server > context            (env is a hard error)
+//!                token:  --token  > context            (env is a hard error)
+//! ```
+//!
+//! A cloud context is authoritative because its `server` and `token` are a
+//! matched pair: the PAT is scoped to one workspace at one role, and the
+//! gateway that honours it is the one `login` wrote alongside it. A stray
+//! `SKARDI_SERVER_URL` left exported from the single-server era would send a
+//! workspace-scoped PAT to whatever listens there, so the conflict is refused
+//! by name rather than silently resolved. Flags still win: passing `--server`
+//! is a deliberate act at the point of use.
 
-use serde::Deserialize;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
-/// Server URL used when no flag, env var, or config file supplies one.
+/// Server URL used when no flag, env var, or context supplies one.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8080";
 
 const SERVER_URL_ENV: &str = "SKARDI_SERVER_URL";
 const API_TOKEN_ENV: &str = "SKARDI_API_TOKEN";
+const CONTEXT_ENV: &str = "SKARDI_CONTEXT";
 
-/// Resolved connection settings for talking to a skardi-server instance.
+/// The name a legacy `spec:`-only file resolves under, so that a file with no
+/// `contexts:` key still has a context to select and to print.
+pub const LEGACY_CONTEXT_NAME: &str = "default";
+
+/// How a context reaches its server, and therefore which capabilities it has.
+///
+/// `mode` never selects a URL — the gateway mounts skardi-server's own paths —
+/// and is consulted for exactly two things: pre-flight capability messages,
+/// and whether login/expiry logic applies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextMode {
+    /// A skardi-server, reached directly. The default, and the only mode with
+    /// the full command surface.
+    #[default]
+    Server,
+    /// A skardi-cloud gateway, reached with a workspace-scoped PAT.
+    Cloud,
+}
+
+impl ContextMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
+impl fmt::Display for ContextMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One named context. `server` is the only field every mode needs; the rest
+/// carry the cloud dimension `login` writes and `logout` needs.
+///
+/// `extra` preserves keys this binary does not model, so a newer CLI's fields
+/// survive an older CLI's `use-context` rewrite — the file is shared state
+/// between versions, and a rewrite that dropped unknown keys would quietly
+/// downgrade it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Context {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_mode")]
+    pub mode: ContextMode,
+    /// LOAD-BEARING in cloud mode: sent per request as `Skardi-Workspace`, and
+    /// a cloud context without one is refused at resolution rather than
+    /// producing an ambiguous request at the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The PAT's id, needed by `logout --revoke` — the token itself cannot
+    /// name itself to the revoke endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+fn is_default_mode(mode: &ContextMode) -> bool {
+    *mode == ContextMode::Server
+}
+
+/// The whole config file. `spec` is the legacy single-server block, kept for
+/// back-compat (§5.2); `extra` preserves unmodeled top-level keys for the same
+/// reason `Context::extra` does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ContextsFile {
+    /// Present so a rewrite keeps the manifest recognizable; not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Where `login` talks. Optional: only the cloud flow reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<Context>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<LegacySpec>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// The pre-contexts file shape: one server, one token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LegacySpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl ContextsFile {
+    /// Every context the file defines, with the legacy `spec:` block folded in
+    /// as `default` when there is no `contexts:` list.
+    ///
+    /// A file carrying BOTH prefers `contexts:` and warns once — silently
+    /// choosing either way would leave the operator guessing which credential
+    /// their commands used.
+    pub fn effective_contexts(&self) -> Vec<Context> {
+        if !self.contexts.is_empty() {
+            if self.spec.is_some() {
+                eprintln!(
+                    "warning: config has both 'contexts:' and a legacy 'spec:' block; \
+                     using 'contexts:' and ignoring 'spec:'"
+                );
+            }
+            return self.contexts.clone();
+        }
+        match &self.spec {
+            Some(spec) => vec![Context {
+                name: LEGACY_CONTEXT_NAME.to_string(),
+                server: spec.server.clone(),
+                token: spec.token.clone(),
+                ..Context::default()
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    pub fn find(&self, name: &str) -> Option<Context> {
+        self.effective_contexts()
+            .into_iter()
+            .find(|c| c.name == name)
+    }
+
+    pub fn context_names(&self) -> Vec<String> {
+        self.effective_contexts()
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+}
+
+/// Why a config could not be turned into a usable `{server, token}` pair.
+///
+/// Every variant is a HARD error by deliberate choice: each one describes a
+/// situation where guessing would send a credential somewhere the operator did
+/// not name. Read failures are the opposite — see [`load`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `--context` / `$SKARDI_CONTEXT` / `current-context` named something the
+    /// file does not define. Never falls through to the built-in default:
+    /// that is the one failure mode that would silently send a cloud query to
+    /// a local server.
+    UnknownContext {
+        name: String,
+        available: Vec<String>,
+    },
+    /// A cloud context with no `workspace` — the request would be ambiguous at
+    /// the gateway, which answers `workspace_required`.
+    CloudContextWithoutWorkspace { name: String },
+    /// An environment variable would override a cloud context's matched
+    /// `{server, token}` pair. Named rather than silently applied or silently
+    /// ignored (§5.1).
+    EnvConflictsWithCloudContext { name: String, variable: String },
+    /// A mutating command met a file it could not parse (§5.4).
+    UnparsableForMutation { path: PathBuf, error: String },
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownContext { name, available } => {
+                write!(f, "no context named '{name}' in the config")?;
+                if available.is_empty() {
+                    write!(f, " (the config defines no contexts)")
+                } else {
+                    write!(f, ". Available: {}", available.join(", "))
+                }
+            }
+            Self::CloudContextWithoutWorkspace { name } => write!(
+                f,
+                "context '{name}' is mode: cloud but names no workspace; \
+                 add one with 'skardi config set-context {name} --workspace SLUG' \
+                 or re-run 'skardi login'"
+            ),
+            Self::EnvConflictsWithCloudContext { name, variable } => write!(
+                f,
+                "${variable} is set, but context '{name}' is mode: cloud and is \
+                 authoritative for its server and token. Unset ${variable}, or pass \
+                 --server/--token to override deliberately"
+            ),
+            Self::UnparsableForMutation { path, error } => write!(
+                f,
+                "refusing to modify {}: it exists but does not parse ({error}). \
+                 Fix or move the file first — rewriting it would discard the \
+                 credentials it may still hold",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// The context a command resolved to, carried alongside the connection pair so
+/// callers can gate capabilities and render messages that name the context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedContext {
+    pub name: String,
+    pub mode: ContextMode,
+    /// Always `Some` for `ContextMode::Cloud` — resolution refuses otherwise.
+    pub workspace: Option<String>,
+    pub token_expires_at: Option<String>,
+}
+
+/// Resolved connection settings for talking to a skardi-server instance or a
+/// skardi-cloud gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     pub server: String,
     pub token: Option<String>,
+    /// `None` when no config file defined a context — the flags/env/default
+    /// path, which is every pre-contexts install and every CI one-liner.
+    pub context: Option<SelectedContext>,
 }
 
 impl ClientConfig {
-    /// Resolve the effective client config from CLI flags, environment
-    /// variables, and the user's `~/.skardi/config.yaml`, in that precedence
-    /// order (flag > env > file > default).
+    /// Resolve the effective client config from flags, environment, and the
+    /// user's `~/.skardi/config.yaml`.
     ///
-    /// Not unit-tested directly: it reads process-global environment
-    /// variables, which race under parallel test execution. All precedence
-    /// logic lives in `resolve_from`, which is tested exhaustively below.
-    pub fn resolve(flag_server: Option<String>, flag_token: Option<String>) -> ClientConfig {
-        let env_server = std::env::var(SERVER_URL_ENV).ok();
-        let env_token = std::env::var(API_TOKEN_ENV).ok();
-
-        let config_path = dirs::home_dir().map(|home| home.join(".skardi").join("config.yaml"));
-        let file_config = config_path.as_deref().and_then(load_file_config);
-
-        resolve_from(flag_server, flag_token, env_server, env_token, file_config)
+    /// Not unit-tested directly: it reads process-global environment variables,
+    /// which race under parallel test execution. All precedence and selection
+    /// logic lives in [`resolve_from`], which is tested exhaustively.
+    pub fn resolve(
+        flag_server: Option<String>,
+        flag_token: Option<String>,
+        flag_context: Option<String>,
+    ) -> Result<ClientConfig, ConfigError> {
+        let inputs = ResolveInputs {
+            flag_server,
+            flag_token,
+            flag_context,
+            env_server: std::env::var(SERVER_URL_ENV).ok(),
+            env_token: std::env::var(API_TOKEN_ENV).ok(),
+            env_context: std::env::var(CONTEXT_ENV).ok(),
+            file: default_config_path().as_deref().and_then(load),
+        };
+        resolve_from(inputs)
     }
 }
 
-/// `spec:` block of `~/.skardi/config.yaml`:
-///
-/// ```yaml
-/// kind: client
-/// metadata:
-///   name: default
-/// spec:
-///   server: http://127.0.0.1:8080
-///   token: optional-bearer-token
-/// ```
-///
-/// Both fields are optional so a partial `spec:` (or a manifest with no
-/// `spec:` at all) is a valid, if unhelpful, config file.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
-struct FileConfig {
-    #[serde(default)]
-    server: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
+/// Everything [`resolve_from`] needs, passed in rather than read, so the
+/// function is pure and the precedence matrix is testable without touching
+/// process-global state.
+#[derive(Debug, Default)]
+pub struct ResolveInputs {
+    pub flag_server: Option<String>,
+    pub flag_token: Option<String>,
+    pub flag_context: Option<String>,
+    pub env_server: Option<String>,
+    pub env_token: Option<String>,
+    pub env_context: Option<String>,
+    pub file: Option<ContextsFile>,
 }
 
-/// Top-level manifest envelope. Only `spec` is read here — `kind` and
-/// `metadata` exist in the on-disk format for consistency with the repo's
-/// other manifests but nothing at runtime needs them, so they are left
-/// unmodeled and simply ignored by serde.
-#[derive(Debug, Deserialize)]
-struct ConfigManifest {
-    #[serde(default)]
-    spec: Option<FileConfig>,
-}
-
-/// Pure per-field precedence resolution: flag > env > file > default.
-/// No I/O and no env reads — everything needed is passed in — so this is
-/// the unit-testable core of `ClientConfig::resolve`.
+/// Pure precedence + selection resolution. No I/O and no env reads.
 ///
-/// Empty strings count as unset at every level: an exported-but-empty
-/// `SKARDI_SERVER_URL=` (typical of wrapper scripts that export vars
-/// unconditionally) must fall through to the config file / default instead
-/// of producing an empty base URL, and an empty token must not become an
-/// empty `Authorization: Bearer` header.
-fn resolve_from(
-    flag_server: Option<String>,
-    flag_token: Option<String>,
-    env_server: Option<String>,
-    env_token: Option<String>,
-    file_config: Option<FileConfig>,
-) -> ClientConfig {
-    let (file_server, file_token) = match file_config {
-        Some(file) => (file.server, file.token),
-        None => (None, None),
+/// Empty and whitespace-only values count as unset at every level — an
+/// exported-but-empty `SKARDI_SERVER_URL=` (typical of wrapper scripts that
+/// export unconditionally) must fall through rather than produce an empty base
+/// URL — and kept values are trimmed.
+pub fn resolve_from(inputs: ResolveInputs) -> Result<ClientConfig, ConfigError> {
+    let ResolveInputs {
+        flag_server,
+        flag_token,
+        flag_context,
+        env_server,
+        env_token,
+        env_context,
+        file,
+    } = inputs;
+
+    let flag_server = non_empty(flag_server);
+    let flag_token = non_empty(flag_token);
+    let env_server = non_empty(env_server);
+    let env_token = non_empty(env_token);
+
+    // Selection: --context > $SKARDI_CONTEXT > current-context.
+    let requested = non_empty(flag_context).or(non_empty(env_context));
+    let file = file.unwrap_or_default();
+    let selected = match &requested {
+        Some(name) => Some(file.find(name).ok_or_else(|| ConfigError::UnknownContext {
+            name: name.clone(),
+            available: file.context_names(),
+        })?),
+        None => match non_empty(file.current_context.clone()) {
+            // An explicit current-context that does not resolve is as much a
+            // typo as an explicit --context, and gets the same hard error.
+            Some(current) => {
+                Some(
+                    file.find(&current)
+                        .ok_or_else(|| ConfigError::UnknownContext {
+                            name: current,
+                            available: file.context_names(),
+                        })?,
+                )
+            }
+            // No pointer: a single-context file (including a legacy `spec:`
+            // one) is unambiguous, so use it. Several contexts with no
+            // current-context means nothing is selected — flags, env, and the
+            // default still apply, which keeps `--server` working on a file
+            // the operator has not pointed anywhere yet.
+            None => {
+                let contexts = file.effective_contexts();
+                (contexts.len() == 1).then(|| contexts[0].clone())
+            }
+        },
     };
 
-    let server = non_empty(flag_server)
-        .or(non_empty(env_server))
-        .or(non_empty(file_server))
-        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
-    let token = non_empty(flag_token)
-        .or(non_empty(env_token))
-        .or(non_empty(file_token));
+    let Some(context) = selected else {
+        return Ok(ClientConfig {
+            server: flag_server
+                .or(env_server)
+                .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
+            token: flag_token.or(env_token),
+            context: None,
+        });
+    };
 
-    ClientConfig { server, token }
+    let mode = context.mode;
+    let workspace = non_empty(context.workspace.clone());
+    if mode == ContextMode::Cloud && workspace.is_none() {
+        return Err(ConfigError::CloudContextWithoutWorkspace {
+            name: context.name.clone(),
+        });
+    }
+
+    let (server, token) = if mode == ContextMode::Cloud {
+        // The env is refused rather than ranked: see the module doc.
+        for (value, variable) in [(&env_server, SERVER_URL_ENV), (&env_token, API_TOKEN_ENV)] {
+            if value.is_some() {
+                return Err(ConfigError::EnvConflictsWithCloudContext {
+                    name: context.name.clone(),
+                    variable: variable.to_string(),
+                });
+            }
+        }
+        (
+            flag_server.or_else(|| non_empty(context.server.clone())),
+            flag_token.or_else(|| non_empty(context.token.clone())),
+        )
+    } else {
+        (
+            flag_server
+                .or(env_server)
+                .or_else(|| non_empty(context.server.clone())),
+            flag_token
+                .or(env_token)
+                .or_else(|| non_empty(context.token.clone())),
+        )
+    };
+
+    Ok(ClientConfig {
+        server: server.unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
+        token,
+        context: Some(SelectedContext {
+            name: context.name,
+            mode,
+            workspace,
+            token_expires_at: non_empty(context.token_expires_at),
+        }),
+    })
 }
 
-/// Treat an empty (or whitespace-only) string as unset for precedence
-/// purposes, and trim the value that is kept — a padded
-/// `SKARDI_SERVER_URL=" http://x "` must not survive into request URLs.
+/// Treat an empty (or whitespace-only) string as unset, and trim what is kept
+/// — a padded `SKARDI_SERVER_URL=" http://x "` must not survive into request
+/// URLs.
 fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Load and parse `path` as a config manifest, returning its `spec` block.
-///
-/// - Missing file: resolves silently to `None` (this is the common case —
-///   most users never create `~/.skardi/config.yaml`).
-/// - Present but unparsable YAML: prints a `warning: ...` to stderr and
-///   resolves to `None`. Never fatal.
-/// - Present, valid YAML, but no `spec:` section: resolves to `None`.
-fn load_file_config(path: &Path) -> Option<FileConfig> {
-    let content = std::fs::read_to_string(path).ok()?;
+/// `~/.skardi/config.yaml`, or `None` when the home directory is unknowable.
+pub fn default_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".skardi").join("config.yaml"))
+}
 
-    match serde_yaml::from_str::<ConfigManifest>(&content) {
-        Ok(manifest) => manifest.spec,
+/// Load `path` for READING. Tolerant by design (§5.4): a missing file is
+/// `None`, and an unparsable one warns and resolves to `None` so that
+/// `--server`/`--token` still work while the operator fixes it. Never fatal.
+///
+/// Mutations use [`load_for_mutation`] instead, which refuses the same file.
+pub fn load(path: &Path) -> Option<ContextsFile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    match serde_yaml::from_str::<ContextsFile>(&content) {
+        Ok(file) => Some(file),
         Err(err) => {
             eprintln!(
                 "warning: ignoring malformed config file {}: {}",
@@ -136,172 +450,508 @@ fn load_file_config(path: &Path) -> Option<FileConfig> {
     }
 }
 
+/// Load `path` for WRITING, refusing a file that exists but does not parse.
+///
+/// The asymmetry with [`load`] is the whole point. A rewrite built from an
+/// empty parse tree would atomically replace a malformed-but-credential-bearing
+/// file: the rename is torn-write-safe, not data-loss-safe. Recovery is
+/// deliberately manual — no `--force` — because the file may hold the only copy
+/// of a PAT nobody can re-mint without re-authenticating.
+///
+/// A missing file yields an empty tree, which is how the first `login` or
+/// `set-context` creates one.
+pub fn load_for_mutation(path: &Path) -> Result<ContextsFile, ConfigError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        // Any read failure (absent, or unreadable) yields a fresh tree only
+        // when the file truly is absent; an unreadable-but-present file must
+        // not be clobbered either.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ContextsFile {
+                kind: Some("client".to_string()),
+                ..ContextsFile::default()
+            });
+        }
+        Err(err) => {
+            return Err(ConfigError::UnparsableForMutation {
+                path: path.to_path_buf(),
+                error: err.to_string(),
+            });
+        }
+    };
+    serde_yaml::from_str::<ContextsFile>(&content).map_err(|err| {
+        ConfigError::UnparsableForMutation {
+            path: path.to_path_buf(),
+            error: err.to_string(),
+        }
+    })
+}
+
+/// Write `file` to `path` atomically, owner-readable only.
+///
+/// Temp file in the SAME directory then rename: a cross-filesystem rename is
+/// not atomic, and `~/.skardi` is where the target lives. The temp file is
+/// created `0600` before any bytes are written, so a token never exists in a
+/// world-readable file even briefly.
+pub fn save(path: &Path, file: &ContextsFile) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create config directory {}", parent.display()))?;
+
+    // A pre-existing group- or world-readable config is a real exposure of a
+    // live credential, so it is reported rather than silently tightened —
+    // the operator may want to know their file has been readable.
+    warn_if_loose_permissions(path);
+
+    let yaml = serde_yaml::to_string(file).context("serialize config")?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "config.yaml".to_string()),
+        std::process::id()
+    ));
+
+    write_owner_only(&temp, yaml.as_bytes())
+        .with_context(|| format!("write {}", temp.display()))?;
+    if let Err(err) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(
+            anyhow::Error::new(err).context(format!("replace {} atomically", path.display()))
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut handle = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    handle.write_all(bytes)?;
+    handle.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // No mode bits to set: on Windows the file inherits the directory ACL.
+    std::fs::write(path, bytes)
+}
+
+#[cfg(unix)]
+fn warn_if_loose_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "warning: {} was mode {:o} (readable beyond its owner); \
+                 rewriting it as 0600",
+                path.display(),
+                mode
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_loose_permissions(_path: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+    use std::io::Write as _;
+    use tempfile::{NamedTempFile, TempDir};
 
-    fn file_config(server: &str, token: &str) -> FileConfig {
-        FileConfig {
-            server: Some(server.to_string()),
-            token: Some(token.to_string()),
+    /// A two-context file: one cloud, one local — the shape `login` writes.
+    fn file() -> ContextsFile {
+        ContextsFile {
+            kind: Some("client".to_string()),
+            current_context: Some("acme/prod".to_string()),
+            contexts: vec![
+                Context {
+                    name: "acme/prod".to_string(),
+                    server: Some("https://gw.skardi.ai".to_string()),
+                    mode: ContextMode::Cloud,
+                    workspace: Some("acme-prod".to_string()),
+                    token: Some("skardi_pat_live".to_string()),
+                    ..Context::default()
+                },
+                Context {
+                    name: "local".to_string(),
+                    server: Some("http://127.0.0.1:9999".to_string()),
+                    ..Context::default()
+                },
+            ],
+            ..ContextsFile::default()
         }
     }
 
-    fn write_manifest(contents: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(contents.as_bytes()).unwrap();
-        file
+    fn inputs(file: Option<ContextsFile>) -> ResolveInputs {
+        ResolveInputs {
+            file,
+            ..ResolveInputs::default()
+        }
+    }
+
+    fn write(contents: &str) -> NamedTempFile {
+        let mut handle = NamedTempFile::new().unwrap();
+        handle.write_all(contents.as_bytes()).unwrap();
+        handle
+    }
+
+    // ── selection ────────────────────────────────────────────────────────
+
+    #[test]
+    fn current_context_selects_when_no_flag_or_env_names_one() {
+        let resolved = resolve_from(inputs(Some(file()))).unwrap();
+
+        assert_eq!(resolved.server, "https://gw.skardi.ai");
+        assert_eq!(resolved.token.as_deref(), Some("skardi_pat_live"));
+        let context = resolved.context.unwrap();
+        assert_eq!(context.name, "acme/prod");
+        assert_eq!(context.mode, ContextMode::Cloud);
+        assert_eq!(context.workspace.as_deref(), Some("acme-prod"));
     }
 
     #[test]
-    fn resolve_from_nothing_set_uses_default_server_and_no_token() {
-        let resolved = resolve_from(None, None, None, None, None);
+    fn context_selection_prefers_flag_then_env_then_current() {
+        // --context wins over both.
+        let resolved = resolve_from(ResolveInputs {
+            flag_context: Some("local".to_string()),
+            env_context: Some("acme/prod".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.context.unwrap().name, "local");
 
-        assert_eq!(resolved.server, DEFAULT_SERVER_URL);
-        assert_eq!(resolved.token, None);
+        // $SKARDI_CONTEXT wins over current-context.
+        let resolved = resolve_from(ResolveInputs {
+            env_context: Some("local".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.context.unwrap().name, "local");
     }
 
     #[test]
-    fn resolve_from_file_only_uses_file_values() {
-        let resolved = resolve_from(
-            None,
-            None,
-            None,
-            None,
-            Some(file_config("http://file-server:9000", "file-token")),
-        );
+    fn an_unknown_context_is_a_hard_error_listing_what_exists() {
+        // The failure mode this guards: falling through to the built-in
+        // default would send a cloud query to a local server.
+        let err = resolve_from(ResolveInputs {
+            flag_context: Some("typo".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap_err();
 
-        assert_eq!(resolved.server, "http://file-server:9000");
-        assert_eq!(resolved.token, Some("file-token".to_string()));
+        let ConfigError::UnknownContext { name, available } = &err else {
+            panic!("expected UnknownContext, got {err:?}");
+        };
+        assert_eq!(name, "typo");
+        assert_eq!(available, &["acme/prod".to_string(), "local".to_string()]);
+        assert!(err.to_string().contains("Available: acme/prod, local"));
+
+        // A dangling current-context is the same typo, and gets the same
+        // error rather than silently resolving to the default.
+        let mut dangling = file();
+        dangling.current_context = Some("removed".to_string());
+        let err = resolve_from(inputs(Some(dangling))).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownContext { .. }));
     }
 
     #[test]
-    fn resolve_from_env_beats_file() {
-        let resolved = resolve_from(
-            None,
-            None,
-            Some("http://env-server:9000".to_string()),
-            Some("env-token".to_string()),
-            Some(file_config("http://file-server:9000", "file-token")),
-        );
-
-        assert_eq!(resolved.server, "http://env-server:9000");
-        assert_eq!(resolved.token, Some("env-token".to_string()));
-    }
-
-    #[test]
-    fn resolve_from_empty_strings_count_as_unset() {
-        // Exported-but-empty env vars (SKARDI_SERVER_URL=) fall through to
-        // the file value instead of yielding an empty base URL.
-        let resolved = resolve_from(
-            None,
-            None,
-            Some(String::new()),
-            Some("  ".to_string()),
-            Some(file_config("http://file-server:9000", "file-token")),
-        );
-        assert_eq!(resolved.server, "http://file-server:9000");
-        assert_eq!(resolved.token, Some("file-token".to_string()));
-
-        // Empty at every level → default server, no token (never an empty
-        // `Authorization: Bearer` header).
-        let resolved = resolve_from(
-            Some(String::new()),
-            Some(String::new()),
-            Some(String::new()),
-            None,
-            None,
-        );
-        assert_eq!(resolved.server, DEFAULT_SERVER_URL);
-        assert_eq!(resolved.token, None);
-    }
-
-    #[test]
-    fn resolve_from_trims_padded_values() {
-        // A padded value is kept but normalized — surrounding whitespace
-        // must not leak into request URLs or the Authorization header.
-        let resolved = resolve_from(
-            None,
-            None,
-            Some(" http://env-server:9000 ".to_string()),
-            Some("\tenv-token\n".to_string()),
-            None,
-        );
-        assert_eq!(resolved.server, "http://env-server:9000");
-        assert_eq!(resolved.token, Some("env-token".to_string()));
-    }
-
-    #[test]
-    fn resolve_from_flag_beats_env_and_file() {
-        let resolved = resolve_from(
-            Some("http://flag-server:9000".to_string()),
-            Some("flag-token".to_string()),
-            Some("http://env-server:9000".to_string()),
-            Some("env-token".to_string()),
-            Some(file_config("http://file-server:9000", "file-token")),
-        );
-
-        assert_eq!(resolved.server, "http://flag-server:9000");
-        assert_eq!(resolved.token, Some("flag-token".to_string()));
-    }
-
-    #[test]
-    fn resolve_from_per_field_independence_server_from_env_token_from_file() {
-        let resolved = resolve_from(
-            None,
-            None,
-            Some("http://env-server:9000".to_string()),
-            None,
-            Some(file_config("http://file-server:9000", "file-token")),
-        );
-
-        assert_eq!(resolved.server, "http://env-server:9000");
-        assert_eq!(resolved.token, Some("file-token".to_string()));
-    }
-
-    #[test]
-    fn load_file_config_valid_manifest_returns_spec_values() {
-        let file = write_manifest(
-            "kind: client\n\
-             metadata:\n  name: default\n\
-             spec:\n  server: http://127.0.0.1:8080\n  token: optional-bearer-token\n",
-        );
-
-        let loaded = load_file_config(file.path());
-
+    fn a_lone_context_needs_no_current_context_pointer_but_several_do() {
+        let mut lone = file();
+        lone.contexts.truncate(1);
+        lone.current_context = None;
         assert_eq!(
-            loaded,
-            Some(file_config(
-                "http://127.0.0.1:8080",
-                "optional-bearer-token"
-            ))
+            resolve_from(inputs(Some(lone)))
+                .unwrap()
+                .context
+                .unwrap()
+                .name,
+            "acme/prod"
+        );
+
+        // Several with no pointer: nothing is selected, and flags/env/default
+        // still apply — `--server` keeps working on an unpointed file.
+        let mut unpointed = file();
+        unpointed.current_context = None;
+        let resolved = resolve_from(inputs(Some(unpointed))).unwrap();
+        assert!(resolved.context.is_none());
+        assert_eq!(resolved.server, DEFAULT_SERVER_URL);
+    }
+
+    // ── the cloud-authoritative rule (§5.1) ──────────────────────────────
+
+    #[test]
+    fn env_vars_are_refused_while_a_cloud_context_is_selected() {
+        // The scenario: SKARDI_SERVER_URL left exported from the
+        // single-server era would send a workspace-scoped PAT to whatever
+        // listens there. Refused by name, and NO request is issued.
+        for variable in [SERVER_URL_ENV, API_TOKEN_ENV] {
+            let mut probe = inputs(Some(file()));
+            if variable == SERVER_URL_ENV {
+                probe.env_server = Some("http://evil:8080".to_string());
+            } else {
+                probe.env_token = Some("other-token".to_string());
+            }
+            let err = resolve_from(probe).unwrap_err();
+            let ConfigError::EnvConflictsWithCloudContext { name, variable: v } = &err else {
+                panic!("expected EnvConflictsWithCloudContext, got {err:?}");
+            };
+            assert_eq!(name, "acme/prod");
+            assert_eq!(v, variable);
+            assert!(err.to_string().contains(variable));
+        }
+    }
+
+    #[test]
+    fn flags_still_override_a_cloud_context_because_they_are_deliberate() {
+        let resolved = resolve_from(ResolveInputs {
+            flag_server: Some("https://staging.gw".to_string()),
+            flag_token: Some("flag-token".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
+
+        assert_eq!(resolved.server, "https://staging.gw");
+        assert_eq!(resolved.token.as_deref(), Some("flag-token"));
+        // Still the cloud context: the workspace it names is unaffected.
+        assert_eq!(
+            resolved.context.unwrap().workspace.as_deref(),
+            Some("acme-prod")
         );
     }
 
     #[test]
-    fn load_file_config_manifest_without_spec_is_absent() {
-        let file = write_manifest("kind: client\nmetadata:\n  name: default\n");
+    fn env_vars_still_beat_a_server_mode_context() {
+        let resolved = resolve_from(ResolveInputs {
+            env_server: Some("http://env:9000".to_string()),
+            env_context: Some("local".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
 
-        let loaded = load_file_config(file.path());
-
-        assert_eq!(loaded, None);
+        assert_eq!(resolved.server, "http://env:9000");
+        assert_eq!(resolved.context.unwrap().mode, ContextMode::Server);
     }
 
     #[test]
-    fn load_file_config_malformed_yaml_is_absent() {
-        let file = write_manifest("kind: client\n  this: [is not, valid yaml\n");
+    fn a_cloud_context_without_a_workspace_is_refused() {
+        let mut broken = file();
+        broken.contexts[0].workspace = None;
+        let err = resolve_from(inputs(Some(broken))).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::CloudContextWithoutWorkspace { .. }
+        ));
+        // The message names the repair, not just the problem.
+        assert!(err.to_string().contains("skardi config set-context"));
 
-        let loaded = load_file_config(file.path());
+        // Whitespace counts as unset here too.
+        let mut blank = file();
+        blank.contexts[0].workspace = Some("   ".to_string());
+        assert!(resolve_from(inputs(Some(blank))).is_err());
+    }
 
-        assert_eq!(loaded, None);
+    // ── per-field precedence, unchanged for server mode ──────────────────
+
+    #[test]
+    fn nothing_set_uses_the_default_server_and_no_token() {
+        let resolved = resolve_from(inputs(None)).unwrap();
+        assert_eq!(resolved.server, DEFAULT_SERVER_URL);
+        assert_eq!(resolved.token, None);
+        assert!(resolved.context.is_none());
     }
 
     #[test]
-    fn load_file_config_nonexistent_path_is_absent() {
-        let loaded = load_file_config(Path::new("/nonexistent/path/does/not/exist/config.yaml"));
+    fn empty_and_padded_values_are_unset_and_trimmed() {
+        let resolved = resolve_from(ResolveInputs {
+            flag_server: Some("  ".to_string()),
+            env_server: Some(String::new()),
+            env_token: Some("\tenv-token\n".to_string()),
+            env_context: Some("   ".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap_err();
+        // The empty --context/env-context fell through to current-context,
+        // which is cloud — so the non-empty env token is the conflict.
+        assert!(matches!(
+            resolved,
+            ConfigError::EnvConflictsWithCloudContext { .. }
+        ));
 
-        assert_eq!(loaded, None);
+        let resolved = resolve_from(ResolveInputs {
+            env_context: Some("local".to_string()),
+            env_server: Some(" http://env:9000 ".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.server, "http://env:9000");
+    }
+
+    // ── back-compat (§5.2) ───────────────────────────────────────────────
+
+    #[test]
+    fn a_legacy_spec_file_resolves_as_one_context_named_default() {
+        let legacy = ContextsFile {
+            spec: Some(LegacySpec {
+                server: Some("http://legacy:8080".to_string()),
+                token: Some("legacy-token".to_string()),
+            }),
+            ..ContextsFile::default()
+        };
+
+        let resolved = resolve_from(inputs(Some(legacy))).unwrap();
+        assert_eq!(resolved.server, "http://legacy:8080");
+        assert_eq!(resolved.token.as_deref(), Some("legacy-token"));
+        let context = resolved.context.unwrap();
+        assert_eq!(context.name, LEGACY_CONTEXT_NAME);
+        assert_eq!(context.mode, ContextMode::Server);
+    }
+
+    #[test]
+    fn contexts_win_over_a_legacy_spec_present_in_the_same_file() {
+        let mut both = file();
+        both.spec = Some(LegacySpec {
+            server: Some("http://legacy:8080".to_string()),
+            token: None,
+        });
+        let resolved = resolve_from(inputs(Some(both))).unwrap();
+        assert_eq!(resolved.server, "https://gw.skardi.ai");
+    }
+
+    // ── the file surface ─────────────────────────────────────────────────
+
+    #[test]
+    fn load_parses_the_documented_file_shape_including_unknown_keys() {
+        let handle = write(
+            "kind: client\n\
+             control-plane: https://api.skardi.ai\n\
+             current-context: acme/prod\n\
+             future-top-level: kept\n\
+             contexts:\n\
+             \x20 - name: acme/prod\n\
+             \x20   server: https://gw.skardi.ai\n\
+             \x20   mode: cloud\n\
+             \x20   workspace: acme-prod\n\
+             \x20   user: xin@skardi.ai\n\
+             \x20   token: skardi_pat_x\n\
+             \x20   token-id: 4f1c\n\
+             \x20   token-expires-at: 2026-11-18T00:00:00Z\n\
+             \x20   future-per-context: kept\n",
+        );
+
+        let loaded = load(handle.path()).expect("parses");
+        assert_eq!(
+            loaded.control_plane.as_deref(),
+            Some("https://api.skardi.ai")
+        );
+        let context = &loaded.contexts[0];
+        assert_eq!(context.mode, ContextMode::Cloud);
+        assert_eq!(context.token_id.as_deref(), Some("4f1c"));
+        assert_eq!(
+            context.token_expires_at.as_deref(),
+            Some("2026-11-18T00:00:00Z")
+        );
+        // Unknown keys survive a parse → serialize round trip, so an older
+        // CLI's `use-context` cannot downgrade a newer CLI's file.
+        assert!(loaded.extra.contains_key("future-top-level"));
+        assert!(context.extra.contains_key("future-per-context"));
+        let round_tripped = serde_yaml::to_string(&loaded).unwrap();
+        assert!(round_tripped.contains("future-top-level"));
+        assert!(round_tripped.contains("future-per-context"));
+    }
+
+    #[test]
+    fn reads_tolerate_a_broken_file_but_mutations_refuse_it() {
+        let handle = write("contexts: [this is: not, valid yaml\n");
+
+        // Read: warn, ignore, fall through (§5.4) — `--server` still works.
+        assert_eq!(load(handle.path()), None);
+
+        // Mutation: refuse, naming the file and the parse error. Rewriting
+        // from an empty tree would replace a credential-bearing file.
+        let err = load_for_mutation(handle.path()).unwrap_err();
+        let ConfigError::UnparsableForMutation { path, .. } = &err else {
+            panic!("expected UnparsableForMutation, got {err:?}");
+        };
+        assert_eq!(path, handle.path());
+        assert!(err.to_string().contains("refusing to modify"));
+    }
+
+    #[test]
+    fn load_for_mutation_on_a_missing_file_starts_a_fresh_tree() {
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("config.yaml");
+        let fresh = load_for_mutation(&absent).unwrap();
+        assert_eq!(fresh.kind.as_deref(), Some("client"));
+        assert!(fresh.contexts.is_empty());
+    }
+
+    #[test]
+    fn save_writes_atomically_owner_only_and_leaves_no_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("config.yaml");
+
+        save(&path, &file()).unwrap();
+
+        let reloaded = load(&path).expect("round trips");
+        assert_eq!(reloaded.contexts.len(), 2);
+        assert_eq!(reloaded.current_context.as_deref(), Some("acme/prod"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a file holding a PAT must be owner-only");
+        }
+
+        // The temp file is renamed, never left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "left {leftovers:?}");
+    }
+
+    #[test]
+    fn save_over_an_existing_file_keeps_it_owner_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "kind: client\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        save(&path, &file()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a loose file is rewritten tighter");
+        }
     }
 }

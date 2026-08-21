@@ -311,6 +311,7 @@ mod tests {
         ClientConfig {
             server: server.to_string(),
             token: token.map(|t| t.to_string()),
+            context: None,
         }
     }
 

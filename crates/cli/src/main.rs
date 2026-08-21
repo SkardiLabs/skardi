@@ -8,6 +8,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
+use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::pipeline::PipelineCmd;
 use config::ClientConfig;
@@ -33,6 +34,11 @@ struct Cli {
     #[arg(long, global = true, value_name = "TOKEN")]
     token: Option<String>,
 
+    /// select a context from ~/.skardi/config.yaml; overrides $SKARDI_CONTEXT
+    /// and the file's current-context
+    #[arg(long, global = true, value_name = "NAME")]
+    context: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -40,6 +46,12 @@ struct Cli {
 /// Subcommands supported by the CLI.
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Manage contexts in ~/.skardi/config.yaml (no network).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+
     /// Run ad-hoc SQL against the server and print the result.
     Query {
         /// inline SQL text
@@ -129,7 +141,26 @@ async fn main() -> ExitCode {
             }
         }
     };
-    let config = ClientConfig::resolve(cli.server, cli.token);
+    // `config` subcommands edit the file that resolution reads, so they must
+    // not be gated on that resolution succeeding — `set-context` is how an
+    // operator FIXES a config whose cloud context is missing its workspace.
+    if let Commands::Config { cmd } = cli.command {
+        return match commands::config::run(cmd) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let config = match ClientConfig::resolve(cli.server, cli.token, cli.context) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match dispatch(cli.command, &config).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -171,5 +202,9 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
         Commands::Schema => commands::schema::run(&client).await,
 
         Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
+
+        // Handled before resolution in `main`, so the file can be repaired
+        // even when resolving it would fail.
+        Commands::Config { .. } => unreachable!("config is dispatched before resolution"),
     }
 }
