@@ -120,6 +120,7 @@ impl AuthLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::test_env;
 
     fn unique_test_db_path() -> String {
         ":memory:".to_string()
@@ -142,6 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_better_auth_missing_secret_errors() {
+        let _env = test_env::lock().await;
         unsafe {
             std::env::remove_var("AUTH_SECRET");
             std::env::set_var("AUTH_DB_PATH", unique_test_db_path());
@@ -158,6 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_better_auth_success() {
+        let _env = test_env::lock().await;
         unsafe {
             std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
             std::env::set_var("AUTH_DB_PATH", unique_test_db_path());
@@ -179,6 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_better_auth_respects_auth_base_url() {
+        let _env = test_env::lock().await;
         unsafe {
             std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
             std::env::set_var("AUTH_DB_PATH", unique_test_db_path());
@@ -200,6 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn clone_better_auth_shares_arc() {
+        let _env = test_env::lock().await;
         unsafe {
             std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
             std::env::set_var("AUTH_DB_PATH", unique_test_db_path());

@@ -175,8 +175,30 @@ On startup the server:
 | `/jobs/runs/:run_id` | GET | Current state of one run |
 | `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation |
 
-When the server was started without `--jobs`, every endpoint above
-returns `503 Service Unavailable` with `error_type: jobs_disabled`.
+For an authenticated caller, a server started without `--jobs` returns
+`503 Service Unavailable` with `error_type: jobs_disabled` from every
+endpoint above. An unauthenticated caller sees the `401` below instead and
+never learns whether jobs are enabled.
+
+### Authentication
+
+Every `/jobs/*` route requires a valid session when the server is started
+with authentication configured. The check is the first thing each handler
+does, so it **precedes** both the `jobs_disabled` 503 and the unknown-job
+404 — deliberately, so an unauthenticated caller cannot read either fact off
+the status code. The rejection is `401 Unauthorized` with
+`error_type: unauthorized`, in the same error envelope as every other jobs
+response.
+
+Servers with no auth layer configured are unaffected: the check
+short-circuits, and all five endpoints behave exactly as before.
+
+Note this is separate from the `X-Skardi-Session-Id` header below.
+Authentication answers *may this caller use the endpoint at all*; the
+session header answers *which agent session should this submission be
+attributed to*, and stays self-reported. Passing the header does not
+authenticate a request, and authenticating does not make the header
+trustworthy.
 
 ### Session attribution
 
@@ -236,6 +258,14 @@ and falls back to a plain string otherwise.
 Jobs run **only inside the server** — there is no in-process fallback
 and no `--ctx` flag on the CLI-side job commands. If the server isn't
 running you'll get a connection-refused error.
+
+Against an auth-enabled server every `skardi job` subcommand needs a token,
+since all five endpoints are gated (see
+[Authentication](#authentication)). Supply it with `--token`,
+`$SKARDI_API_TOKEN`, or `~/.skardi/config.yaml`; the CLI attaches it as
+`Authorization: Bearer <token>` on every request. Without one the symptom is
+a `401 unauthorized` from a command that needed no token before the gate
+existed.
 
 ---
 

@@ -21,6 +21,7 @@ use serde_json::Value;
 use skardi::jobs::{JobRun, JobSubmitError};
 use std::collections::HashMap;
 
+use crate::auth::routes::require_session;
 use crate::query_audit::{QueryAuditStatus, QueryAuditStore};
 use crate::server::AppState;
 use crate::session_header::{SESSION_ID_HEADER, session_id_from_headers};
@@ -59,6 +60,31 @@ fn error_json(msg: &str, kind: &str, details: Option<Value>) -> Json<JobErrorRes
         details,
         timestamp: chrono::Utc::now().to_rfc3339(),
     })
+}
+
+/// Reject the request unless it carries a valid session.
+///
+/// `require_session` reports through the shared `ErrorResponse` shape; the
+/// jobs endpoints answer in `JobErrorResponse`. Rather than let one endpoint
+/// family answer in two shapes, the status is kept and the body re-rendered
+/// into this crate's envelope — so the only thing a client sees differ from
+/// `/query` is the wrapper it already expects from `/jobs/*`.
+///
+/// `error_type` is propagated rather than pinned to `unauthorized`, which is
+/// all `require_session` classifies today: `verify_session` already
+/// distinguishes "Authentication required" from "Invalid or expired session"
+/// internally, so a second classification growing upstream would otherwise
+/// change the message while silently leaving the type behind.
+///
+/// A no-auth server short-circuits inside `verify_session`, so this is a
+/// no-op for deployments that never configured auth.
+async fn require_job_session(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<JobErrorResponse>)> {
+    require_session(app_state, headers)
+        .await
+        .map_err(|(status, body)| (status, error_json(&body.error, &body.error_type, None)))
 }
 
 fn submit_error_status(err: &JobSubmitError) -> StatusCode {
@@ -124,6 +150,19 @@ pub async fn submit_job_run(
     Path(name): Path<String>,
     Json(req): Json<SubmitRunRequest>,
 ) -> Result<Json<SubmitRunResponse>, (StatusCode, Json<JobErrorResponse>)> {
+    // First statement in the handler, ahead of the jobs-disabled probe and the
+    // job-existence lookup, matching `execute_pipeline_by_name` and `/query`.
+    // Deliberately *outside* the status-precedence ladder those two checks
+    // establish, so an unauthenticated caller cannot read either off the
+    // status code.
+    //
+    // "First" is about the handler body: axum runs extractors ahead of it, so
+    // a malformed `Query`/`Json` still answers 400/422 pre-gate. That leak is
+    // schema-shaped rather than data-shaped, identical on `/query` and the
+    // pipeline endpoints, and does not reach the audit writes this gate exists
+    // to protect — those all live below.
+    require_job_session(&app_state, &headers).await?;
+
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -277,8 +316,10 @@ pub async fn submit_job_run(
 /// `GET /jobs/runs/:run_id`
 pub async fn get_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -307,8 +348,10 @@ pub struct ListRunsQuery {
 /// `GET /jobs/runs?job=...&limit=...`
 pub async fn list_job_runs(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -337,8 +380,10 @@ pub async fn list_job_runs(
 /// the executor.
 pub async fn cancel_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -362,7 +407,9 @@ pub async fn cancel_job_run(
 /// for CLI discovery.
 pub async fn list_jobs(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
