@@ -267,12 +267,13 @@ pub async fn register_open_connector_tables(
                 .continuation
                 .and_then(|c| registry.get(c.action_id))
                 .and_then(ActionMetadata::input_schema);
+            // One call, both spellings: `check_continuation_inputs`
+            // dispatches on `inputs:` internally, so `full` — the DEFAULT,
+            // and the shape a pack lands in by omission — cannot be the
+            // one this line forgets. (Its opener's inputs satisfying a
+            // DIFFERENT continue action is an assumption about two
+            // independently discovered schemas, not a fact.)
             table.check_continuation_inputs(continuation_input_schema)?;
-            // `inputs: full` — the DEFAULT — gets the same treatment when
-            // it names a different action: the opener's inputs satisfying
-            // the continue action is an assumption about two independently
-            // discovered schemas, not a fact, until it is checked.
-            table.check_full_continuation_inputs(continuation_input_schema)?;
 
             let provider = OpenConnectorTableProvider::new(
                 Arc::clone(&client),

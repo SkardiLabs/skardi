@@ -234,15 +234,13 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                     ),
                 }));
             }
-            // Same input-schema check the YAML path runs, on the same
-            // helper: `cursor_only` must not be admitted by one entry point
-            // and refused by the other.
+            // Same input-schema gate the YAML path runs, on the same
+            // helper and in one call: an `inputs:` claim must not be
+            // admitted by one entry point and refused by the other, in
+            // either of its two spellings.
             if table.continuation.is_some_and(|c| c.action_id == action_id) {
                 table
                     .check_continuation_inputs(meta.input_schema())
-                    .map_err(plan_error)?;
-                table
-                    .check_full_continuation_inputs(meta.input_schema())
                     .map_err(plan_error)?;
             }
         }

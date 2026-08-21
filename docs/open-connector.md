@@ -175,10 +175,15 @@ LIMIT 50;
 
 It compiles into exactly the scan the YAML-bound table uses: same stable
 Arrow schema, filter allowlist, pagination, safety bounds, and shared
-cache. The table's action must have been discovered when the gateway was
-registered — bind the table in YAML or add its action to
-`raw_action_allowlist`; otherwise planning fails with an error saying so
-(planning never contacts the gateway).
+cache. **Every** action the table executes must have been discovered when
+the gateway was registered — including a split-action continuation's, not
+just the opening action — so bind the table in YAML or add every one of
+its action ids to `raw_action_allowlist`; otherwise planning fails with an
+error saying so (planning never contacts the gateway). For a split-action
+table the allowlist route needs both ids: `dropbox.files` executes
+`dropbox.list_folder` on page one and `dropbox.list_folder_continue` on
+pages 2..N, and an allowlist naming only the opener fails planning on the
+continuation.
 
 ### 3. `open_connector_scan` — allowlisted raw read actions
 
@@ -354,7 +359,13 @@ Four authoring invariants are enforced by the loader:
   one would apply the predicate as an action input while pages 2..N could
   not, with no node left to re-apply it — silently returning rows the query
   excluded. Declare such a filter `Inexact` instead: the `Filter` node
-  survives, and the lost input makes pages 2..N merely wasteful.
+  survives, so DataFusion re-applies the predicate and the rows are
+  right. The waste is not free, though — pages 2..N fetch the *unfiltered*
+  collection, and `max_rows`/`max_pages` count what the gateway returned,
+  not what survived the filter. A selective `Inexact` filter paired with
+  `cursor_only` therefore needs bounds sized for the whole collection; a
+  query that works today can otherwise turn into a hard
+  `ScanBoundsExceeded` rather than a slower one.
 
 Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
@@ -375,9 +386,11 @@ otherwise report `RowPathNotFound` on an in-band error page.
 
 Each pack table pins the full relational contract and an expected
 action-contract fingerprint captured from a live gateway (a canonicalized
-BLAKE3 hash of the discovered output schema; every built-in pack is
+BLAKE3 hash of the discovered output schema; every *provider* pack is
 pinned, with the schemas committed next to each pack under
-`fixtures/<provider>/contracts/`, all captured from a live gateway).
+`fixtures/<provider>/contracts/`, all captured from a live gateway — the
+synthetic `mock` pack is the one built-in that pins nothing, having no
+upstream contract to drift against).
 Split-action
 tables pin BOTH the opening action and the continuation action; where the
 two publish the same output schema, the continuation pin guards the row

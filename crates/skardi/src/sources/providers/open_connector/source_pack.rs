@@ -162,6 +162,35 @@ impl SourcePackTable {
             )
     }
 
+    /// The ONE input-side gate a registration path calls: verify this
+    /// table's continuation declaration against the continuation action's
+    /// discovered INPUT schema. `Ok(())` for a table with no continuation.
+    ///
+    /// Deliberately a single entry point rather than two public checks the
+    /// caller picks between. `inputs:` has two spellings and each needs a
+    /// different argument, but "did we verify the continuation's inputs?"
+    /// is one question, and two call sites per entry point were two
+    /// independently droppable lines — a review round found both deletable
+    /// with the suite still green. Dispatching here means an entry point
+    /// either asks the question or visibly does not.
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::ActionContractMismatch`] naming the
+    /// continuation action and the specific disagreement.
+    pub fn check_continuation_inputs(
+        &self,
+        input_schema: Option<&Value>,
+    ) -> Result<(), OpenConnectorError> {
+        let Some(continuation) = self.continuation else {
+            return Ok(());
+        };
+        if continuation.cursor_only {
+            self.check_cursor_only_continuation_inputs(input_schema)
+        } else {
+            self.check_full_continuation_inputs(input_schema)
+        }
+    }
+
     /// Verify a `cursor_only` continuation against the continuation action's
     /// discovered INPUT schema. `Ok(())` for every table that declares no
     /// continuation, or whose continuation sends the full input.
@@ -194,7 +223,7 @@ impl SourcePackTable {
     /// # Errors
     /// [`OpenConnectorError::ActionContractMismatch`] naming the
     /// continuation action and the specific disagreement.
-    pub fn check_continuation_inputs(
+    fn check_cursor_only_continuation_inputs(
         &self,
         input_schema: Option<&Value>,
     ) -> Result<(), OpenConnectorError> {
@@ -218,14 +247,24 @@ impl SourcePackTable {
             table: self.id.to_string(),
             reason,
         };
-        let Some(properties) = input_schema
-            .and_then(|schema| schema.get("properties"))
-            .and_then(Value::as_object)
-        else {
+        // Two failures, two diagnostics: an action that publishes NOTHING
+        // and one that publishes a schema this gate cannot read from are
+        // both refused, but they live in different layers of the operator's
+        // gateway. Collapsing them sent someone hunting for a missing
+        // schema that was in fact present and shapeless.
+        let Some(schema) = input_schema else {
             return Err(mismatch(format!(
                 "action '{}' publishes no input schema, so `inputs: cursor_only` cannot be \
                  verified; a claim about inputs that the gateway will not confirm is refused \
                  rather than discovered as a 400 on page two",
+                continuation.action_id
+            )));
+        };
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Err(mismatch(format!(
+                "action '{}' publishes no input properties, so `inputs: cursor_only` cannot \
+                 be verified; a schema with no readable `properties` confirms nothing and is \
+                 refused rather than discovered as a 400 on page two",
                 continuation.action_id
             )));
         };
@@ -248,7 +287,7 @@ impl SourcePackTable {
         // input has not verified anything. Failing closed on one and open
         // on the other was the defect.
         let mut unsatisfiable =
-            required_beyond_cursor(input_schema, cursor_param).map_err(|reason| {
+            required_beyond_cursor(Some(schema), cursor_param).map_err(|reason| {
                 mismatch(format!(
                     "action '{}' publishes a `required` this gate cannot read ({reason}), so \
                      `inputs: cursor_only` cannot be verified; an unreadable schema is \
@@ -270,7 +309,15 @@ impl SourcePackTable {
 
     /// The pagination inputs this table's strategy injects. Sent on every
     /// request the strategy applies to, so they count as guaranteed.
-    fn pagination_input_keys(&self) -> Vec<&'static str> {
+    ///
+    /// `pub(super)` because `packs::loader::validate_table` needs the SAME
+    /// mapping for its input-namespace collision gates. It used to carry
+    /// its own copy of this match, and the two had already drifted once —
+    /// `Keyset` and `SinglePage` landed with the Discord pack and only one
+    /// side was widened. One definition, so a fifth strategy (or a new
+    /// page-size field on an existing one) cannot weaken one consumer
+    /// silently.
+    pub(super) fn pagination_input_keys(&self) -> Vec<&'static str> {
         match self.pagination {
             PaginationStrategy::Cursor {
                 cursor_param,
@@ -293,10 +340,20 @@ impl SourcePackTable {
         }
     }
 
-    /// Keys the pack sends on EVERY request: the complete-collection pins,
-    /// the resources a binding MUST supply, and the pagination inputs.
-    /// Optional resources and pushed filters are excluded — a binding may
-    /// omit them, so they cannot satisfy an action's `required`.
+    /// Keys the pack sends on every request the CONTINUATION gates govern:
+    /// the complete-collection pins, the resources a binding MUST supply,
+    /// and the pagination inputs. Optional resources and pushed filters are
+    /// excluded — a binding may omit them, so they cannot satisfy an
+    /// action's `required`.
+    ///
+    /// Scoped to continuation requests deliberately: the pagination half
+    /// includes the cursor, which `Pagination::apply` inserts only once
+    /// `next_token` is `Some` — never on page one. On a continuation page
+    /// the cursor genuinely is always present, which is what makes it
+    /// guaranteed here. A future gate checking the OPENING action's
+    /// `required` must NOT reuse this set: it would report a mandatory
+    /// cursor as satisfied on page one, which is exactly the hard 400
+    /// these gates exist to prevent.
     fn guaranteed_input_keys(&self) -> Vec<&'static str> {
         let mut keys: Vec<&'static str> = self
             .fixed_inputs
@@ -351,7 +408,7 @@ impl SourcePackTable {
     /// # Errors
     /// [`OpenConnectorError::ActionContractMismatch`] naming the
     /// continuation action and the specific disagreement.
-    pub fn check_full_continuation_inputs(
+    fn check_full_continuation_inputs(
         &self,
         input_schema: Option<&Value>,
     ) -> Result<(), OpenConnectorError> {
@@ -894,10 +951,12 @@ mod tests {
                 })),
                 "requires input(s) [path]",
             ),
-            // Unverifiable: default-deny rather than trust.
+            // Unverifiable: default-deny rather than trust — and the two
+            // ways it can be unverifiable get different diagnostics, so a
+            // present-but-shapeless schema is not reported as absent.
             (
                 Some(serde_json::json!({"type": "object"})),
-                "no input schema",
+                "no input properties",
             ),
             (None, "no input schema"),
         ] {
@@ -939,18 +998,37 @@ mod tests {
     }
 
     #[test]
-    fn tables_without_a_cursor_only_continuation_are_never_gated_on_inputs() {
-        // Every pre-existing pack: no continuation at all.
+    fn a_table_without_a_continuation_is_never_gated_on_inputs() {
+        // Every pre-existing pack: no continuation at all, so the single
+        // gate short-circuits before either arm.
         leaked_table("t.plain")
             .check_continuation_inputs(None)
             .expect("no continuation, nothing to check");
-        // A `full`-input continuation sends the assembled input, so the
-        // CURSOR-ONLY reasoning does not apply to it. It is not ungated —
-        // `check_full_continuation_inputs` covers it; this only pins that
-        // the two gates do not overlap.
-        let full = full_continuation_table();
-        full.check_continuation_inputs(None)
-            .expect("inputs: full is not an input-shape claim");
+    }
+
+    #[test]
+    fn the_single_gate_routes_each_inputs_spelling_to_its_own_arm() {
+        // What the dispatcher must NOT do is apply the cursor-only
+        // reasoning to `inputs: full` or vice versa. Same argument
+        // (`None`), two different verdicts, which is only possible if the
+        // routing is real:
+        //   - cursor_only refuses an unverifiable claim about inputs;
+        //   - full to a DIFFERENT action refuses it too, but for its own
+        //     reason and with its own wording.
+        let cursor_only = cursor_only_table()
+            .check_continuation_inputs(None)
+            .expect_err("cursor_only cannot be verified against no schema");
+        assert!(
+            cursor_only.to_string().contains("`inputs: cursor_only`"),
+            "the cursor-only arm answered: {cursor_only}"
+        );
+        let full = full_continuation_table()
+            .check_continuation_inputs(None)
+            .expect_err("a full continuation to another action needs its schema");
+        assert!(
+            full.to_string().contains("full-input continuation"),
+            "the full arm answered: {full}"
+        );
     }
 
     #[test]

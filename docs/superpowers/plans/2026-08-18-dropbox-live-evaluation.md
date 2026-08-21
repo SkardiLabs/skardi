@@ -324,28 +324,41 @@ q() { curl -s -X POST http://localhost:8087/query -H 'content-type: application/
 (If your ctx enables auth, `POST /query` needs a session header; the
 simplest evaluation ctx leaves auth off.)
 
-**Registration will fail first, and that is the expected first result.**
-The pins on this branch are placeholders, so you should see
+**Registration should PASS, and on the 2026-08-18 pass it did — first
+try, no re-pinning.** Every `fingerprint:` in `dropbox.yaml` is a hash of
+a live capture committed under `fixtures/dropbox/contracts/`, so the
+contract gate is satisfied by a gateway serving today's Dropbox executors.
+An earlier draft of this runbook told you to expect
 `action 'dropbox.list_folder' fingerprint mismatch (expected 87502bce…,
-discovered <hash>)`. That is the fingerprint gate doing its job. Fix it
-properly rather than by pasting the discovered hash blind:
+discovered <hash>)` from placeholder pins; that instruction is obsolete
+and the pins are no longer placeholders. If you *do* see a mismatch it is
+a finding, not a step: either the gateway is on a different executor
+release than commit `a3efa99`, or Dropbox's schema moved.
+
+The re-pin loop below is therefore the remediation path for that finding,
+and the recipe the next pack's live pass should copy — not something this
+pack still needs run:
 
 ```bash
 # 1. Capture the five contracts independently — do NOT copy an opener's file
-#    onto its continuation, which is how the current fixtures got identical.
+#    onto its continuation. (The two pairs came back byte-identical here;
+#    that is a fact about the wire, confirmed by capturing them separately.)
 for a in list_folder list_folder_continue list_shared_links search_files search_files_continue; do
   curl -s -H "Authorization: Bearer $OPEN_CONNECTOR_TOKEN" "$GATEWAY/v1/actions/dropbox.$a" \
     | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["data"]["outputSchema"],indent=2))' \
     > crates/skardi/src/sources/providers/open_connector/packs/fixtures/dropbox/contracts/$a.json
-  # keep the INPUT schema too — it is what proves `inputs: cursor_only`
+done
+# The two continue actions' INPUT schemas are what prove `inputs: cursor_only`,
+# so they are committed too — next to the output captures, not in /tmp.
+for a in list_folder_continue search_files_continue; do
   curl -s -H "Authorization: Bearer $OPEN_CONNECTOR_TOKEN" "$GATEWAY/v1/actions/dropbox.$a" \
     | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["data"]["inputSchema"],indent=2))' \
-    > /tmp/dropbox-probe/input-schema-$a.json
+    > crates/skardi/src/sources/providers/open_connector/packs/fixtures/dropbox/contracts/$a.input.json
 done
-diff crates/.../contracts/list_folder.json crates/.../contracts/list_folder_continue.json  # now a FACT either way
+diff crates/.../contracts/list_folder.json crates/.../contracts/list_folder_continue.json  # a FACT either way
 
 # 2. Re-pin from the captures. The sync test prints `pinned X, actual Y`.
-cargo test -p skardi --lib packs::dropbox::tests::pinned_fingerprints_match_the_captured_contracts
+cargo test -p skardi --lib packs::dropbox::tests::pinned_fingerprints_match_the_committed_contracts
 # paste each `actual` into dropbox.yaml: 3 table `fingerprint:` + 2 `continuation.fingerprint:`
 ```
 

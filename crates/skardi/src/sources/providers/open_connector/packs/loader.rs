@@ -271,26 +271,13 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     // predicate DataFusion never reapplies. Filter-vs-fixed-input overlap
     // is the one DELIBERATE collision (a pushed predicate overrides the
     // complete-collection pin) and stays legal.
-    let pagination_params: Vec<&str> = match table.pagination {
-        PaginationStrategy::PageNumber {
-            page_param,
-            per_page_param,
-            ..
-        } => vec![page_param, per_page_param],
-        PaginationStrategy::Cursor {
-            cursor_param,
-            page_size_param,
-            ..
-        } => std::iter::once(cursor_param)
-            .chain(page_size_param)
-            .collect(),
-        PaginationStrategy::Keyset {
-            cursor_param,
-            page_size_param,
-            ..
-        } => vec![cursor_param, page_size_param],
-        PaginationStrategy::SinglePage { .. } => Vec::new(),
-    };
+    //
+    // The strategy -> params mapping lives on `SourcePackTable` so this
+    // gate and the continuation input gates read the same list: this
+    // function used to carry its own copy of the match, and the two had
+    // already drifted once (`Keyset`/`single_page` arrived with the
+    // Discord pack and only one side was widened).
+    let pagination_params: Vec<&str> = table.pagination_input_keys();
     // An empty param name — under ANY strategy — would survive to scan
     // time as a literal `""` input key: a strict gateway's 400 blamed on
     // the request, or a lax gateway's page-1 refetch misdiagnosed as a
@@ -454,7 +441,15 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         // re-apply it. That returns rows the query excluded, silently:
         // the same failure class as a pushdown leak, and refused the same
         // way. `Inexact` stays legal — the `Filter` node survives, so
-        // pages 2..N are merely wasteful, never wrong.
+        // DataFusion re-applies the predicate and the ROWS are right. The
+        // waste is not free, though: pages 2..N fetch the unfiltered
+        // collection, and the scan bounds count what the gateway returned,
+        // not what survived the filter (`exec.rs` raises
+        // `ScanBoundsExceeded` off `rows_emitted`/page count pre-filter).
+        // So a selective `Inexact` filter moves the effective volume from
+        // the filtered subset to the whole collection, and wants
+        // `max_rows`/`max_pages` headroom sized for it — otherwise a query
+        // that works today becomes a hard scan failure, not a slower one.
         if continuation.cursor_only
             && let Some(filter) = table
                 .filters

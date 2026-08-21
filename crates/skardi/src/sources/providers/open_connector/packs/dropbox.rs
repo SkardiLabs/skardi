@@ -331,6 +331,40 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_only_claim_holds_against_the_committed_input_contracts() {
+        // The fingerprint gate hashes the OUTPUT schema, so nothing in the
+        // pin machinery covers the input half — and the input half is the
+        // one a wrong claim turns into a hard 400 on page two. This is the
+        // gmail/outlook pattern: both sides committed artifacts, so an
+        // upstream release that grows a second `required` key on a continue
+        // action fails HERE on re-capture rather than at an operator's
+        // registration. (Catching it LIVE needs a registration-time input
+        // fingerprint, which remains tracked engine work.)
+        for short in ["files", "file_search"] {
+            let table = table(short);
+            let continuation = table
+                .continuation
+                .unwrap_or_else(|| panic!("{short} is a split-action table"));
+            assert!(
+                continuation.cursor_only,
+                "{short} declares `inputs: cursor_only`"
+            );
+            let captured = continuation_input_contract(continuation.action_id)
+                .unwrap_or_else(|| panic!("{} has a committed input contract", continuation.action_id));
+            let schema: Value = serde_json::from_str(captured).expect("input contract parses");
+            table
+                .check_continuation_inputs(Some(&schema))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{short}: the committed input contract for {} no longer satisfies \
+                         `inputs: cursor_only`: {e}",
+                        continuation.action_id
+                    )
+                });
+        }
+    }
+
+    #[test]
     fn every_mapped_column_is_inside_the_fingerprint_gate() {
         // Dropbox's row schemas are strict with all keys required, so
         // unlike the passthrough packs NO column rides
@@ -723,39 +757,49 @@ mod tests {
 
     // ── Integration: the pack against a mock gateway, end to end. ───────
 
-    /// Discovery serving the committed contracts (source-DERIVED, not
-    /// captured — see the module doc's provenance banner), so every mock
-    /// registration exercises the fingerprint gate's PASS side — for the
-    /// continuation actions too.
-    /// The continue actions' INPUT schema, as `additionalProperties:
-    /// false` with `cursor` its only property. Serving this — rather than
-    /// the `{}` a lazier mock would send — is what makes every
-    /// registration below exercise the PASS side of the `cursor_only`
-    /// input gate. Derived from the v1.3.5 executor source, like everything
-    /// else in this pack; the live pass replaces it with the real
-    /// `data.inputSchema`.
-    const CURSOR_ONLY_INPUT_SCHEMA: &str = r#"{
-        "type": "object",
-        "properties": { "cursor": { "type": "string" } },
-        "required": ["cursor"],
-        "additionalProperties": false
-    }"#;
+    /// Discovery serving the committed contracts — live CAPTURES, per the
+    /// module doc's provenance banner and `fixtures/dropbox/README.md` —
+    /// so every mock registration exercises the fingerprint gate's PASS
+    /// side, for the continuation actions too.
+    /// The continue actions' INPUT schemas, `contracts/inputs/`, committed
+    /// next to the output captures on the gmail/outlook convention.
+    /// Serving these — rather than the `{}` a lazier mock would send — is
+    /// what makes every registration below exercise the PASS side of the
+    /// `cursor_only` input gate, and
+    /// `the_cursor_only_claim_holds_against_the_committed_input_contracts`
+    /// is what makes a re-capture that grows a second `required` key fail
+    /// CI instead of an operator's registration.
+    ///
+    /// Provenance, stated because it differs from `contracts/*.json`:
+    /// these record the SHAPE the 2026-08-18 pass observed (`cursor` the
+    /// only property, `required`, `additionalProperties: false`) — the
+    /// probe wrote `data.inputSchema` to `/tmp` and only the shape was
+    /// carried into the repo, so they are transcriptions, not byte-exact
+    /// captures. `fixtures/dropbox/README.md` says the same.
+    fn continuation_input_contract(action: &str) -> Option<&'static str> {
+        match action {
+            "dropbox.list_folder_continue" => Some(include_str!(
+                "fixtures/dropbox/contracts/inputs/list_folder_continue.json"
+            )),
+            "dropbox.search_files_continue" => Some(include_str!(
+                "fixtures/dropbox/contracts/inputs/search_files_continue.json"
+            )),
+            _ => None,
+        }
+    }
 
     fn dropbox_discovery(path: &str) -> MockResponse {
-        // Each action reads its OWN contract file even though the two
-        // continue files are byte-identical to their openers today: they
-        // were DERIVED that way, so keeping the files separate is what
-        // lets the live capture split them without touching this helper.
+        // Each action reads its OWN contract file. The two continue files
+        // being byte-identical to their openers is a fact about the wire —
+        // the live pass captured all four independently and they came back
+        // the same — NOT an artifact of derivation. Keeping the files
+        // separate is what lets a future upstream split them without
+        // touching this helper.
         let action = path.rsplit('/').next().unwrap_or_default();
         // Only the continue actions carry a declared input schema here:
         // the openers' inputs are not gated, and leaving them `{}` keeps
         // the difference visible.
-        let input_schema = match action {
-            "dropbox.list_folder_continue" | "dropbox.search_files_continue" => {
-                CURSOR_ONLY_INPUT_SCHEMA
-            }
-            _ => "{}",
-        };
+        let input_schema = continuation_input_contract(action).unwrap_or("{}");
         let output_schema = match action {
             "dropbox.list_folder" => include_str!("fixtures/dropbox/contracts/list_folder.json"),
             "dropbox.list_folder_continue" => {
@@ -1579,7 +1623,13 @@ bindings:
     }
 
     #[tokio::test]
-    async fn udtf_parity_for_files() {
+    async fn udtf_parity_for_files_crosses_the_split_action_boundary() {
+        // Page one answered `hasMore: false` here for a long time, which
+        // meant the UDTF path never issued a continuation request: the
+        // `ScanTarget::from_pack_table` continuation was unpinned through
+        // this entry point, and so were both input gates below it. Two
+        // pages, so `dropbox.list_folder_continue` is genuinely executed
+        // through `open_connector_query`.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -1587,16 +1637,27 @@ bindings:
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
                 return dropbox_discovery(&req.path);
             }
-            if req.path == "/v1/actions/dropbox.list_folder" {
-                return MockResponse::ok(&envelope_ok(
-                    &json!({"entries": [entry("via-udtf")], "cursor": "c", "hasMore": false})
+            match req.path.as_str() {
+                "/v1/actions/dropbox.list_folder" => MockResponse::ok(&envelope_ok(
+                    &json!({"entries": [entry("via-udtf")], "cursor": "c-2", "hasMore": true})
                         .to_string(),
-                ));
+                )),
+                "/v1/actions/dropbox.list_folder_continue" => {
+                    let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    match body["input"].get("cursor").and_then(Value::as_str) {
+                        Some("c-2") => MockResponse::ok(&envelope_ok(
+                            &json!({"entries": [entry("via-udtf-page-2")],
+                                    "cursor": null, "hasMore": false})
+                            .to_string(),
+                        )),
+                        other => MockResponse::new(400, format!("bad cursor {other:?}")),
+                    }
+                }
+                _ => MockResponse::new(404, "{}"),
             }
-            MockResponse::new(404, "{}")
         })
         .await;
-        let (_gateway, ctx) =
+        let (gateway, ctx) =
             setup_with_gateway(gateway, "SKARDI_TEST_OC_DROPBOX_UDTF", "files").await;
 
         let batches = collect(
@@ -1604,6 +1665,204 @@ bindings:
             "SELECT name FROM open_connector_query('saas', 'dropbox.files', '{}')",
         )
         .await;
-        assert_eq!(names_of(&batches), vec!["via-udtf"]);
+        assert_eq!(names_of(&batches), vec!["via-udtf", "via-udtf-page-2"]);
+        // `cursor_only` holds on this path too: page two carries the cursor
+        // and nothing else — not the `recursive` pin, not `path`.
+        let calls = execute_calls(&gateway);
+        let (path, input) = calls
+            .iter()
+            .find(|(path, _)| path.ends_with("dropbox.list_folder_continue"))
+            .expect("the UDTF path issued a continuation request");
+        assert!(path.ends_with("dropbox.list_folder_continue"));
+        assert_eq!(*input, json!({"cursor": "c-2"}), "cursor only, on page two");
+    }
+
+    /// A config whose BINDINGS do not cover `files`, plus a raw-action
+    /// allowlist: the shape a UDTF-only operator has, and the one the
+    /// `open_connector_query` docs describe. Registration gates only the
+    /// bound table, so `dropbox.files` meets the discovery, fingerprint and
+    /// input gates for the first time during UDTF planning — which is
+    /// exactly the path under test.
+    fn dropbox_allowlist_config(token_env: &str, allowlist: &[&str]) -> OpenConnectorConfig {
+        let allowlist = allowlist.join(", ");
+        serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+raw_action_allowlist: [{allowlist}]
+bindings:
+  - name: ws
+    source_pack: dropbox
+    tables: [shared_links]
+"#
+        ))
+        .expect("config parses")
+    }
+
+    async fn allowlist_only_ctx(
+        gateway: &MockGateway,
+        token_env: &'static str,
+        allowlist: &[&str],
+    ) -> SessionContext {
+        let _token = EnvVarGuard::set(token_env, "test-token");
+        let gateways = OpenConnectorGateways::default();
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&dropbox_allowlist_config(token_env, allowlist)),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("registration gates only the BOUND table, so it succeeds");
+        register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
+        ctx
+    }
+
+    /// The error a UDTF raises, whether it comes out of planning or the
+    /// first poll — the gates under test all fire during planning, but the
+    /// assertion should not depend on that.
+    async fn udtf_error(ctx: &SessionContext, sql: &str) -> String {
+        match ctx.sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => df
+                .collect()
+                .await
+                .expect_err("the query must not succeed")
+                .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn allowlisting_only_the_opening_action_fails_udtf_planning() {
+        // `open_connector_query` discovers EVERY action the table executes,
+        // so a split-action table needs both ids allowlisted. Pinning the
+        // behavior change: an allowlist naming only the opener used to be
+        // enough and now is not, which is what `docs/open-connector.md`
+        // says under `open_connector_query`.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return dropbox_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = allowlist_only_ctx(
+            &gateway,
+            "SKARDI_TEST_OC_DROPBOX_UDTF_ALLOWLIST",
+            &["dropbox.list_folder"],
+        )
+        .await;
+        let rendered = udtf_error(
+            &ctx,
+            "SELECT name FROM open_connector_query('saas', 'dropbox.files', '{}')",
+        )
+        .await;
+        assert!(
+            rendered.contains("was not discovered"),
+            "the undiscovered-action diagnostic: {rendered}"
+        );
+        assert!(
+            rendered.contains("dropbox.list_folder_continue"),
+            "names the CONTINUATION action, not the opener: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drifted_continuation_contract_fails_udtf_planning() {
+        // The YAML twin is `a_drifted_continuation_contract_fails_registration`.
+        // Both entry points run the same fingerprint gate over the same
+        // `actions()` pairs; without this test the UDTF half of that claim
+        // reverted clean, because no UDTF test reached a continue action.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                if req.path.ends_with("dropbox.list_folder_continue") {
+                    return MockResponse::ok(&discovery_ok(
+                        "{}",
+                        r#"{"type":"object","properties":{"entries":{"type":"array"}}}"#,
+                        true,
+                        None,
+                    ));
+                }
+                return dropbox_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = allowlist_only_ctx(
+            &gateway,
+            "SKARDI_TEST_OC_DROPBOX_UDTF_DRIFT",
+            &["dropbox.list_folder", "dropbox.list_folder_continue"],
+        )
+        .await;
+        let rendered = udtf_error(
+            &ctx,
+            "SELECT name FROM open_connector_query('saas', 'dropbox.files', '{}')",
+        )
+        .await;
+        assert!(
+            rendered.contains("fingerprint mismatch"),
+            "the contract gate refused it: {rendered}"
+        );
+        assert!(
+            rendered.contains("dropbox.list_folder_continue"),
+            "names the CONTINUATION action, not the opener: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unverifiable_cursor_only_claim_fails_udtf_planning() {
+        // The YAML twin is `a_continue_action_without_an_input_schema_is_refused`.
+        // This is what holds the UDTF path's input-gate call site in place:
+        // the fingerprint gate above passes here (the drifting is on the
+        // INPUT side, which no fingerprint covers), so only the input gate
+        // can refuse this query.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                if req.path.ends_with("dropbox.list_folder_continue") {
+                    // Captured OUTPUT schema — so the fingerprint still
+                    // matches — with no input schema at all.
+                    return MockResponse::ok(&discovery_ok(
+                        "{}",
+                        include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
+                        true,
+                        None,
+                    ));
+                }
+                return dropbox_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let ctx = allowlist_only_ctx(
+            &gateway,
+            "SKARDI_TEST_OC_DROPBOX_UDTF_INPUTS",
+            &["dropbox.list_folder", "dropbox.list_folder_continue"],
+        )
+        .await;
+        let rendered = udtf_error(
+            &ctx,
+            "SELECT name FROM open_connector_query('saas', 'dropbox.files', '{}')",
+        )
+        .await;
+        assert!(
+            rendered.contains("no input schema"),
+            "the input gate said why it cannot be verified: {rendered}"
+        );
+        assert!(
+            rendered.contains("dropbox.list_folder_continue"),
+            "names the continuation action: {rendered}"
+        );
     }
 }

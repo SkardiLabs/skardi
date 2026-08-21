@@ -364,10 +364,17 @@ idempotent and do retry 5xx.) Retries are also bounded by the scan
 deadline, so a long `Retry-After` cannot outlast the scan.
 
 The practical consequence: sustained Dropbox throttling exhausts the
-retry budget and the scan fails with a retry-exhausted error. The remedy
-is to re-run the query — completed scans are cached, so a retry does not
-re-fetch what already succeeded — or to narrow the scan per
-[Bounding the cost of a scan](#bounding-the-cost-of-a-scan).
+retry budget and the scan fails with a retry-exhausted error. **A failed
+scan caches nothing** — the scan cache is written only when the scan
+completes (LIMIT satisfied, or pagination exhausted), so a retry-exhausted
+429, a `ScanBoundsExceeded`, a deadline timeout, or contract drift on page
+N all leave the cache untouched. Re-running restarts at page one and
+repays the full cost, which on `files` is a second recursive walk of the
+whole account into the same throttle. The remedy is therefore to narrow
+the scan per
+[Bounding the cost of a scan](#bounding-the-cost-of-a-scan), not to
+re-run it unchanged. (A scan that *succeeded* is cached, and repeating
+that query is free — see below.)
 
 Scans fetch pages on demand and stop early under `LIMIT`; completed scans
 are cached per the scan cache's usual keying (binding, table, pushed

@@ -3,7 +3,7 @@
 Two directories, two provenances. Read this before citing any file here
 as evidence of what Dropbox puts on the wire.
 
-## `contracts/*.json` — CAPTURED
+## `contracts/*.json` — CAPTURED (output schemas only)
 
 Five real captures from `GET /v1/actions/<id>` on a self-hosted Open
 Connector gateway at commit `a3efa99`, taken during the 2026-08-18 live
@@ -15,6 +15,34 @@ wire, not an artifact of derivation.
 
 These are the files `pinned_fingerprints_match_the_committed_contracts`
 hashes, so drift in either the schema or the pin fails the suite.
+
+Note the scope: every file here is an **output** schema, which is all the
+`fingerprint:` pins cover (`fingerprint_schema` hashes the output schema
+and nothing else). The input half lives one directory down.
+
+## `contracts/inputs/*.json` — TRANSCRIBED shape, not a byte-exact capture
+
+`list_folder_continue.json` and `search_files_continue.json`: the input
+schemas of the two continue actions, on the same
+`contracts/inputs/` convention the gmail and outlook packs use. They are
+what `inputs: cursor_only` claims about the wire — `cursor` the only
+property, `required`, `additionalProperties: false` — and the mock
+gateway's discovery serves them, so every registration test in
+`packs/dropbox.rs` exercises the PASS side of the `cursor_only` input gate
+against a committed artifact rather than an inline constant.
+
+Provenance differs from the output captures above, and the difference
+matters: the 2026-08-18 probe wrote `data.inputSchema` to
+`/tmp/dropbox-probe/` and only the **shape** was carried into the repo, so
+these two files are transcriptions of what the pass observed, not saved
+captures. Re-capture them byte-for-byte on the next live pass (the runbook
+now writes them straight into this directory).
+
+`the_cursor_only_claim_holds_against_the_committed_input_contracts` checks
+each one against the table that declares it, so a re-capture that grows a
+second `required` key, or drops `cursor`, fails CI. That catches drift **on
+re-capture, not live** — a registration-time input fingerprint is tracked
+engine work, exactly as documented for gmail and outlook.
 
 ## `*.json` (this directory) — AUTHORED, not captured
 
