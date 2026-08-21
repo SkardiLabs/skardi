@@ -1,105 +1,124 @@
 {
   "items": [
     {
-      "id": "01SYNTHETICSEARCHHITAAAAAAAAAAAAAA",
-      "name": "budget-2026.xlsx",
-      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/Finance/budget-2026.xlsx",
-      "description": "Search hit in a nested folder",
-      "size": 71680,
-      "eTag": "\"{44444444-4444-4444-4444-444444444444},5\"",
-      "cTag": "\"c:{44444444-4444-4444-4444-444444444444},4\"",
-      "createdDateTime": "2026-02-20T13:00:00Z",
-      "lastModifiedDateTime": "2026-08-15T10:11:00Z",
+      "createdDateTime": "2023-03-10T15:42:00Z",
+      "id": "FAB1234CD567890!158",
+      "lastModifiedDateTime": "2023-03-10T15:07:00Z",
+      "name": "WeChat Files",
+      "size": 0,
+      "webUrl": "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/Documents/\u6587\u6863/WeChat Files",
+      "commentSettings": {
+        "commentingDisabled": {
+          "isDisabled": false
+        }
+      },
       "createdBy": {
         "user": {
-          "id": "aaaaaaaa-1111-2222-3333-444444444444",
-          "displayName": "Person One"
+          "displayName": "\u793a\u4f8b \u7528\u6237"
         }
       },
       "lastModifiedBy": {
         "user": {
-          "id": "bbbbbbbb-1111-2222-3333-444444444444",
-          "displayName": "Person Two"
+          "displayName": "\u793a\u4f8b \u7528\u6237"
         }
       },
       "parentReference": {
-        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "id": "01SYNTHETICFINANCEAAAAAAAAAAAAAAAA",
-        "name": "Finance",
-        "path": "/drive/root:/Documents/Finance",
-        "driveType": "personal"
+        "driveId": "fab1234cd567890",
+        "driveType": "personal",
+        "id": "FAB1234CD567890!103",
+        "name": "\u6587\u6863",
+        "path": "/drive/root:/\u6587\u6863"
       },
-      "file": {
-        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      "fileSystemInfo": {
+        "createdDateTime": "2023-03-10T15:42:00Z",
+        "lastModifiedDateTime": "2023-03-10T15:07:00Z"
       },
-      "searchResult": {
-        "onClickTelemetryUrl": "https://example.invalid/telemetry/synthetic"
-      }
+      "folder": {
+        "childCount": 4
+      },
+      "searchResult": {}
     },
     {
-      "id": "01SYNTHETICSEARCHDEEPAAAAAAAAAAAAA",
-      "name": "budget-notes.docx",
-      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/Finance/2026/budget-notes.docx",
-      "size": 15360,
-      "eTag": "\"{55555555-5555-5555-5555-555555555555},2\"",
-      "cTag": "\"c:{55555555-5555-5555-5555-555555555555},2\"",
-      "createdDateTime": "2026-03-05T08:45:00Z",
-      "lastModifiedDateTime": "2026-07-30T17:00:00Z",
+      "createdDateTime": "2026-03-16T08:20:00Z",
+      "id": "FAB1234CD567890!s88888888888888888888888888888888",
+      "lastModifiedDateTime": "2026-03-16T08:19:00Z",
+      "name": "\u56fe\u72471.png",
+      "size": 5901,
+      "webUrl": "https://onedrive.live.com/?id=88888888-8888-8888-8888-888888888888&cid=0fab1234cd567890",
+      "commentSettings": {
+        "commentingDisabled": {
+          "isDisabled": false
+        }
+      },
       "createdBy": {
         "user": {
-          "id": "bbbbbbbb-1111-2222-3333-444444444444",
-          "displayName": "Person Two"
+          "displayName": "\u793a\u4f8b \u7528\u6237"
         }
       },
       "lastModifiedBy": {
         "user": {
-          "id": "bbbbbbbb-1111-2222-3333-444444444444",
-          "displayName": "Person Two"
+          "displayName": "\u793a\u4f8b \u7528\u6237"
         }
       },
       "parentReference": {
-        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "id": "01SYNTHETIC2026AAAAAAAAAAAAAAAAAAA",
-        "name": "2026",
-        "path": "/drive/root:/Documents/Finance/2026",
-        "driveType": "personal"
+        "driveId": "fab1234cd567890",
+        "driveType": "personal",
+        "id": "FAB1234CD567890!105",
+        "name": "\u684c\u9762",
+        "path": "/drive/root:/%E6%A1%8C%E9%9D%A2"
+      },
+      "file": {
+        "mimeType": "image/png"
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2026-03-16T08:20:00Z",
+        "lastModifiedDateTime": "2026-03-16T08:19:00Z"
+      },
+      "image": {
+        "height": 84,
+        "width": 133
+      },
+      "photo": {},
+      "searchResult": {}
+    },
+    {
+      "createdDateTime": "2026-07-08T03:41:00Z",
+      "id": "FAB1234CD567890!s99999999999999999999999999999999",
+      "lastModifiedDateTime": "2026-07-08T02:39:00Z",
+      "name": "\u793a\u4f8b\u62a5\u544a.docx",
+      "size": 2070000,
+      "webUrl": "https://onedrive.live.com/personal/0fab1234cd567890/_layouts/15/doc.aspx?resid=99999999-9999-9999-9999-999999999999&cid=0fab1234cd567890",
+      "commentSettings": {
+        "commentingDisabled": {
+          "isDisabled": false
+        }
+      },
+      "createdBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "parentReference": {
+        "driveId": "fab1234cd567890",
+        "driveType": "personal",
+        "id": "FAB1234CD567890!105",
+        "name": "\u684c\u9762",
+        "path": "/drive/root:/%E6%A1%8C%E9%9D%A2"
       },
       "file": {
         "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
       },
-      "searchResult": {}
-    },
-    {
-      "id": "01SYNTHETICSEARCHFOLDERAAAAAAAAAAA",
-      "name": "Budget archive",
-      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/Budget%20archive",
-      "size": 524288,
-      "createdDateTime": "2025-11-11T06:00:00Z",
-      "lastModifiedDateTime": "2026-04-02T12:30:00Z",
-      "createdBy": {
-        "user": {
-          "id": "aaaaaaaa-1111-2222-3333-444444444444",
-          "displayName": "Person One"
-        }
-      },
-      "lastModifiedBy": {
-        "user": {
-          "id": "aaaaaaaa-1111-2222-3333-444444444444",
-          "displayName": "Person One"
-        }
-      },
-      "parentReference": {
-        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "id": "01SYNTHETICROOTAAAAAAAAAAAAAAAAAAAA",
-        "name": "Documents",
-        "path": "/drive/root:/Documents",
-        "driveType": "personal"
-      },
-      "folder": {
-        "childCount": 3
+      "fileSystemInfo": {
+        "createdDateTime": "2026-07-08T03:41:00Z",
+        "lastModifiedDateTime": "2026-07-08T02:39:00Z"
       },
       "searchResult": {}
     }
   ],
-  "nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/search(q='budget')?%24top=999&%24skiptoken=SyntheticSearchPage2"
+  "nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/search(q='docx')?$top=999&$skiptoken=Mg"
 }

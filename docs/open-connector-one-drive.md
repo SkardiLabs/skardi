@@ -17,14 +17,14 @@ emit a `nextLink` continuation but accept no `nextLink` input, so their
 pagination cannot be completed — a table over such an action would
 present page one as the whole collection).
 
-> **Status: implementation complete, live verification pending.** The
-> wire contract below is reconciled against a live gateway (v1.3.4,
-> open-connector at `2410fbe`) — action inventory, both discovery
-> schemas, the full input surface and the `top` bounds were all probed
-> live on 2026-08-19 — but **no real drive has been scanned yet**,
-> because `one_drive` needs its own OAuth grant. Until that pass runs the
-> pack's row fixtures are synthetic rather than redacted live captures,
-> and the column set should not be read as live-confirmed. See
+> **Status: live-verified.** The wire contract below is reconciled
+> against a live gateway (v1.3.4, open-connector at `2410fbe`; probed
+> 2026-08-19), and the live-data pass ran on 2026-08-21 against a real
+> personal (MSA) drive — raw probes plus end-to-end skardi-server scans
+> of every table through the live fingerprint gate. The pass changed the
+> pack once: **`drive_item_search` dropped `e_tag`/`c_tag`** (real
+> search rows never carry them), leaving 16 columns on `drive_items`
+> and 14 on the search table. Full findings in
 > [Live verification](#live-verification).
 
 **The wire contract is Open Connector's, not Microsoft Graph's**: the
@@ -89,8 +89,11 @@ ORDER BY last_modified_date_time DESC;
 
 ## Tables
 
-Both tables carry the **same sixteen columns** — they read the same Graph
-`driveItem` shape — and differ only in which collection they name.
+The two tables read the same *declared* Graph `driveItem` shape, but the
+real wire differs: search rows are a reduced projection (served by a
+different backend, see below), so `drive_items` carries the **sixteen
+columns** in the table and `drive_item_search` carries **fourteen** —
+the same set minus `e_tag`/`c_tag`.
 
 | column | wire path | type |
 |---|---|---|
@@ -99,8 +102,8 @@ Both tables carry the **same sixteen columns** — they read the same Graph
 | `web_url` | `webUrl` | utf8 |
 | `description` | `description` | utf8 |
 | `size` | `size` | int64 |
-| `e_tag` | `eTag` | utf8 |
-| `c_tag` | `cTag` | utf8 |
+| `e_tag` | `eTag` | utf8 — `drive_items` only |
+| `c_tag` | `cTag` | utf8 — `drive_items` only |
 | `created_date_time` | `createdDateTime` | timestamp(ms, UTC) |
 | `last_modified_date_time` | `lastModifiedDateTime` | timestamp(ms, UTC) |
 | `created_by_display_name` | `createdBy.user.displayName` | utf8 |
@@ -115,18 +118,33 @@ Both tables carry the **same sixteen columns** — they read the same Graph
 which facet is present, so those last two columns are the discriminator:
 a non-null `file_mime_type` means file, a non-null `folder_child_count`
 means folder (`0` for an empty one — distinct from NULL, which means "not
-a folder"). `e_tag` changes on any change, `c_tag` only on a *content*
-change, so the pair separates a rename from a real edit.
+a folder"). The discriminator has one live-witnessed gap: a `remoteItem`
+stub (OneDrive's Personal Vault appears as one) carries **neither facet
+and no `webUrl`**, so such a row is NULL in all three columns. `e_tag`
+changes on any change, `c_tag` only on a *content* change, so the pair
+separates a rename from a real edit — children rows carry both on every
+live row; search rows never do, which is why the search table drops them.
+
+`description` is declared upstream and stays mapped (so drift stays
+loud), but **2800+ live rows never carried it** — an all-NULL
+`description` on a personal drive is the expected shape, not the
+always-NULL bug the live pass exists to catch. Drives that set
+descriptions will populate it.
 
 Both display-name columns read only Graph's **user** identity arm: a row
 created by an application or device is NULL there by design, not by
-accident.
+accident. (System rows like Personal Vault show as `System Account`.)
 
 Unmapped on purpose: `root`, `deleted`, `shared`, `specialFolder`,
 `remoteItem`, `searchResult` and `fileSystemInfo` are all declared
 upstream as bare open objects and carry presence-as-signal rather than
 data. Graph's directory IDs under the identity sets are omitted too —
-they are opaque without a directory join this pack cannot perform.
+they are opaque without a directory join this pack cannot perform. Real
+rows also carry **undeclared passthrough extras** the pack deliberately
+ignores: `isAuthoritative`, `@microsoft.graph.downloadUrl` (a short-lived
+bearer-token URL — mapping it would put a credential in query results)
+and `file.hashes` on children rows; `commentSettings`, `image` and
+`photo` on search rows.
 
 ### `drive_items`
 
@@ -135,8 +153,10 @@ Action `one_drive.list_folder_children`. Optional resources: `driveId`
 no resource at all, the table is the **drive root's children**.
 
 `folderItemId` and `folderPath` are alternatives — set one, not both
-(both are declared upstream, so a binding *can* carry both, and which
-one wins is not yet established). A `folderPath` is a path from the drive
+(both are declared upstream, so a binding *can* carry both; the executor
+then **silently prefers `folderItemId`** — verified live, and structural
+in the executor source, which checks id → path → root in that order — so
+the path becomes dead configuration). A `folderPath` is a path from the drive
 root and must start with `/`, e.g. `folderPath: "/Documents/Finance"`;
 upstream enforces only "non-empty", so a slash-less path is accepted at
 validation and then fails.
@@ -156,6 +176,29 @@ items matching this binding's query" — the same shape as Notion's
 everything", so there is no complete-drive-listing table; bind one search
 per term you care about.
 
+Search is served by a different Microsoft backend (Substrate Search)
+than folder listings, and the live pass pinned four consequences:
+
+- **Reduced rows.** Search hits never carry `eTag`/`cTag` (hence the
+  14-column schema) or identity emails — `created_by_display_name` /
+  `last_modified_by_display_name` still populate, but from the search
+  profile, which was occasionally observed mangled (a stray
+  semicolon-joined value) where the same user's children rows were clean.
+- **Content matching, not just names.** The query matches file *content*
+  as well as filenames, so a query can return files whose names do not
+  contain the term. Recall is also not exhaustive — a term that names an
+  existing file was observed returning zero hits — so treat the table as
+  a search, not an inventory.
+- **A join caveat.** Search rows spell `parent_drive_id` **lowercase
+  without the leading zero** (`fab1234cd567890`-style) while children
+  rows carry the `0FAB…` form of the same drive — a naive
+  `drive_items ⋈ drive_item_search` on that column misses. Join on
+  `parent_id`/`id` instead, which agree. `parent_path` spelling also
+  varies row to row (raw vs percent-encoded non-ASCII), passed through
+  verbatim.
+- **Continuations can fail upstream on personal drives** — see
+  [Pagination](#pagination).
+
 ## Pagination
 
 Cursor pagination over Graph's `@odata.nextLink`, which the gateway
@@ -165,22 +208,35 @@ credentials while the executor additionally pins the host and an
 allowlisted path set. Consequences worth knowing:
 
 - The two tables' cursors are **not interchangeable** — each action's
-  executor allowlists its own paths, so a folder-listing cursor handed to
-  the search action is rejected upstream, and vice versa. Skardi never
-  crosses them, and no Skardi-side test can hold an upstream property;
-  live verification is what confirms it.
-- Page size is `top: 999`, the declared ceiling. It bounds **requests,
-  not bytes**: a `LIMIT` smaller than a page costs exactly one request
-  instead of draining the folder, but `top` is never narrowed to the
-  `LIMIT`, so `LIMIT 10` still transfers up to 999 items and the rows are
-  discarded locally.
+  executor allowlists its own paths. Confirmed live in both directions:
+  a children cursor handed to `search_items` (and vice versa) is a 400
+  `invalid_input` naming the allowlist ("nextLink must target OneDrive
+  search/children pagination endpoints"). Skardi never crosses them.
+- Page size is `top: 999`, the declared ceiling **and a confirmed wire
+  bound** (a real `top=999` request answers a full 200 page). It bounds
+  **requests, not bytes**: a `LIMIT` smaller than a page costs exactly
+  one request instead of draining the folder, but `top` is never narrowed
+  to the `LIMIT`, so `LIMIT 10` still transfers up to 999 items and the
+  rows are discarded locally.
 - The scan ends when `nextLink` comes back null. Both actions declare it
   a **required** output key, so it is always present; Graph publishes no
   separate has-more flag, which means a null cursor is the *only*
-  end-of-collection signal. The corollary is the one truncation risk worth
-  naming: if the gateway ever answered a link its own allowlist rejects by
-  returning null rather than an error, a partial scan would look complete.
-  Confirming it errors instead is part of live verification.
+  end-of-collection signal. The corollary was the one truncation risk
+  worth naming — a gateway that answered a link its own allowlist rejects
+  with null instead of an error would make a partial scan look complete —
+  and the live pass confirmed it **errors** (the 400 above), never nulls.
+  Real terminal pages return an explicit null on both actions.
+- **Children pagination is fully live-verified** (root, `folderItemId`
+  and `driveId` forms, small `top` forcing real multi-page walks, rows
+  identical to the unpaged listing). **Search continuations currently
+  fail server-side on personal (MSA) drives**: following a real search
+  cursor answers Graph's own "Error Calling Substrate Search" —
+  deterministic across retries and across the `/me/drive` and
+  `/drives/{id}` forms, with the gateway forwarding the cursor
+  byte-identically, so it is an upstream Microsoft limitation, not a
+  gateway or pack defect. The scan **fails loudly** through the failure
+  envelope rather than truncating; a query whose hits fit one page
+  (≤ `top`, i.e. up to 999 hits) terminates on a clean null and succeeds.
 
 No filter is pushed down, and that is structural rather than an omission:
 **neither action exposes a filter input at all.** Predicates run locally
@@ -218,7 +274,7 @@ same `driveItem` collection schema for a folder listing and for a search,
 so the two captures are byte-identical. That is an upstream fact, not a
 copy-paste slip.
 
-Because all sixteen columns resolve inside the declared schema, the
+Because every mapped column resolves inside the declared schema, the
 fingerprint gate covers the whole table — this pack has no
 outside-the-gate passthrough surface, and therefore no `select` pin (the
 lever the `outlook` pack needs for its undeclared columns). Two different
@@ -243,8 +299,10 @@ registration, as output already is, remains engine work.
 
 ## Live verification
 
-**Not yet run.** Phase 4 needs your own Microsoft account and Azure app
-registration — Skardi never handles the credential:
+**Ran 2026-08-21** against a real personal (MSA) OneDrive through the
+same gateway build the contract was reconciled on. Reproducing it needs
+your own Microsoft account and Azure app registration — Skardi never
+handles the credential:
 
 1. Register an Entra app with `http://localhost:3000/oauth/callback` as a
    redirect URI.
@@ -252,16 +310,30 @@ registration — Skardi never handles the credential:
    `clientId`/`clientSecret`.
 3. Authorize `one_drive` in a browser (separately from `outlook`).
 
-What that pass must settle, and until then remains unconfirmed: whether
-`top: 999` is a wire bound as well as a declared one; whether the real
-final page returns a genuinely null `nextLink`; whether a real search
-cursor survives the executor's path allowlist (the analogous
-parenthesized OData form is exactly what breaks `outlook`'s
-folder-scoped pagination upstream) **and errors rather than nulling the
-cursor** when it does not, since a null cursor is the only
-end-of-collection signal here; whether every mapped column carries a
-real non-NULL value somewhere; whether a real `folderItemId`,
-`folderPath` or `query` returns rows rather than merely HTTP 200, and
-what happens when the two folder resources are set together; and
-re-deriving both row fixtures as redacted live captures. The design
-record's numbered list is the authoritative version.
+What the pass covered and settled:
+
+- **End-to-end scans through skardi-server**: registration passed the
+  fingerprint gate against *live* discovery; both tables scanned under
+  real bindings (root drive, `folderItemId`-scoped, two search terms);
+  `LIMIT` stopped pagination after one request.
+- **Every `drive_items` column extracted a real non-NULL value**
+  somewhere except `description` (never witnessed on 2800+ rows — kept,
+  caveat recorded above). Every `drive_item_search` column extracted a
+  real value after the `e_tag`/`c_tag` drop — which is itself the pass's
+  headline catch: the declared contract said sixteen columns, the wire
+  said fourteen, and the wire wins.
+- **Pagination**: `top` bounds (999 ok, 1000/0 both 400), real
+  multi-page children walks in all three path forms, explicit null on
+  real terminal pages, allowlist rejections erroring (never nulling),
+  cursor non-interchangeability in both directions, and the upstream
+  search-continuation failure — all as documented under
+  [Pagination](#pagination).
+- **Resources**: real `folderItemId`, `folderPath` and `query` values
+  returned real rows (not just HTTP 200); both folder resources set
+  together proved `folderItemId` wins silently.
+- **Fixtures**: both row fixtures are now redacted live captures —
+  every row mirrors a real wire row key-for-key with deterministic
+  synthetic identities, enforced by a default-deny per-key audit test.
+
+Provider API version: Microsoft Graph `v1.0` (the executors pin it in
+every URL, including the cursors Graph hands back).

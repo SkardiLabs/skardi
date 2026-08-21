@@ -516,8 +516,8 @@ event carrying the scan identity and error.
       cursors everywhere; `page_size: 999` (the declared ceiling — live probes
       confirm 999 passes while 1000 and 0 both 400); zero filter mappings
       because neither action exposes a filter input AT ALL (structural, not an
-      omission); zero fixed inputs — notably **no `select` pin**, because all
-      16 columns of both tables resolve inside the declared item schema, so
+      omission); zero fixed inputs — notably **no `select` pin**, because
+      every mapped column resolves inside the declared item schema, so
       the coverage-gap pin is EMPTY and drift is already loud at registration
       (the sharpest contrast with outlook's thirteen uncovered `messages`
       columns, which is exactly what its `select` pin exists to protect).
@@ -533,23 +533,30 @@ event carrying the scan identity and error.
       is the item-type discriminator (`file_mime_type` / `folder_child_count`,
       the latter keeping 0 distinct from NULL). Docs:
       `docs/open-connector-one-drive.md` + the status note in
-      `docs/open-connector.md`. **Phase 4 (live real-row verification) NOT
-      done** — `one_drive` needs its own OAuth grant (the outlook
-      authorization does not cover it; valid inputs answer `403 "Connect
-      one_drive with OAuth first."`), so the row fixtures are still SYNTHETIC
-      and the design record's seven-item list stays open — including the real
-      `top` wire bound, a genuinely null terminal `nextLink`, non-NULL
-      coverage of every mapped column, whether a real `folderItemId`/
-      `folderPath`/`query` actually returns rows (not just HTTP 200), and
-      whether setting `folderItemId` and `folderPath` together silently
-      prefers one. The sharpest of them is whether a real search cursor
-      survives the executor's path allowlist — the analogous parenthesized
-      OData form is what breaks outlook's folder-scoped pagination upstream —
-      and specifically whether a rejected link ERRORS rather than coming back
-      as `nextLink: null`, since a null cursor is this pack's only
-      end-of-collection signal and the two are indistinguishable to the
-      engine. That is the one path from this design to silent truncation, so
-      it is the live pass's first job. Following gmail (5.5), both halves of each
+      `docs/open-connector.md`. **Phase 4 (live real-row verification) DONE
+      2026-08-21** against a real personal MSA drive under a fresh
+      `one_drive` OAuth grant (the outlook authorization does not cover it),
+      raw probes plus end-to-end skardi-server scans through the live
+      fingerprint gate; the design record's seven-item list is answered item
+      by item in its "Phase 4 results" section. Highlights: the pass CHANGED
+      the pack once — real search rows are a reduced Substrate projection
+      that never carries `eTag`/`cTag` (zero across 1800+ hits), so
+      `drive_item_search` dropped both columns (16 → 14; the wire wins over
+      the declared contract, exactly the always-NULL defect class the pass
+      exists to catch). The pre-identified silent-truncation risk is
+      CLOSED: allowlist-rejected cursors ERROR (400 `invalid_input`, probed
+      in both cross-action directions), never null. The search cursor's
+      parenthesized form passes the gateway allowlist but Graph itself
+      fails real search continuations server-side on personal drives
+      ("Error Calling Substrate Search", deterministic) — loud through the
+      failure envelope, not a truncation; one-page searches terminate on a
+      clean null. Also settled: `top: 999` is a wire bound; real terminal
+      pages null explicitly; children paginate in all three path forms;
+      every mapped column witnessed non-NULL except `description` (0 of
+      2800+ rows — kept, caveat recorded); `folderItemId` beats
+      `folderPath` silently when both are set; both row fixtures re-derived
+      as redacted live captures under a renamed default-deny redaction
+      audit. Following gmail (5.5), both halves of each
       action's contract are committed — `contracts/inputs/` alongside the
       output captures, re-fetched live 2026-08-19 — and a test locks every
       key the pack can send against them, so the output-only fingerprint
@@ -568,8 +575,11 @@ event carrying the scan identity and error.
       narrowed, resource forwarding/withholding, a search binding with no
       `query` refused before any HTTP, a contract-legal item with no `id`
       failing the page, no-pushdown row identity, UDTF parity, drift-refusal
-      at registration, and a key-scoped default-deny fixture audit with
-      self-trip probes); full-suite counts pending CI.
+      at registration, and a key-scoped default-deny redaction audit whose
+      self-trip probes are the leak classes the real captures actually
+      contained); conversion tests run against the redacted live captures
+      (5 children rows, 3 search rows, both real-page composites);
+      full-suite counts pending CI.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -585,8 +595,10 @@ bounded safety defaults, null/empty/nested fixtures, docs.
   second Microsoft 365 pack over raw Graph passthrough rows, with zero
   engine changes — the pack-shaping decisions are the empty coverage gap
   (no `select` pin needed, unlike outlook) and the shared driveItem
-  fingerprint across both tables. Live verification (phase 4) has NOT
-  run yet — it needs a separate `one_drive` OAuth grant.
+  fingerprint across both tables. Live verification (phase 4) ran
+  2026-08-21 against a real MSA drive; its one pack-changing finding is
+  the search table's 14-column reduction (search rows never carry
+  `eTag`/`cTag` on the real wire).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

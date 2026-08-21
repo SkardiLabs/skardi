@@ -5,28 +5,34 @@
 //! `docs/superpowers/specs/2026-08-19-open-connector-one-drive-pack-design.md`;
 //! user documentation: `docs/open-connector-one-drive.md`.
 //!
-//! **Status: phases 1–3 complete; phase 4 (live verification) NOT done.**
-//! The contract reconciliation below is live — action inventory, both
-//! discovery schemas (byte-identical to the committed captures), the
-//! whole input surface of both tables, and the `top` bounds were all
-//! probed against a running gateway on 2026-08-19 — but no real drive
-//! has been scanned yet, because `one_drive` needs its own OAuth grant
-//! (the sibling `outlook` authorization does not cover it; the live
-//! probe answers `403 "Connect one_drive with OAuth first."`). Until
-//! that pass runs, the fixtures here are SYNTHETIC rather than redacted
-//! live captures, and what only real rows can settle stays open: whether
-//! `top: 999` is a wire bound as well as a declared one, whether the
-//! real terminal page returns a genuinely null `nextLink`, whether a
-//! real cursor round-trips the executor's host/path allowlist, whether
-//! every mapped column carries a non-NULL value somewhere, and
-//! re-deriving the fixtures as redacted live captures. Do not read the
-//! column set as live-confirmed. The design record's "what phase 4 must
-//! settle" list is the authoritative version.
+//! **Status: phases 1–4 complete.** The contract reconciliation is live
+//! (action inventory, both discovery schemas byte-identical to the
+//! committed captures, the whole input surface, the `top` bounds —
+//! probed 2026-08-19), and the live-data pass ran on 2026-08-21 against
+//! a real personal (MSA) drive through both raw probes and end-to-end
+//! skardi-server scans. What it settled: `top: 999` is a wire bound as
+//! well as a declared one (a real 999 request answers a full 200 page);
+//! the real terminal page returns a genuinely null `nextLink`; a real
+//! children cursor round-trips the executor's host/path allowlist in
+//! all three path forms (root, `folderItemId`, `driveId`); every
+//! `drive_items` column except `description` carried a real non-NULL
+//! value somewhere (2800+ rows never carried `description` — kept, with
+//! the caveat recorded in the yaml); and the fixtures below are now
+//! REDACTED LIVE CAPTURES. Two findings changed the pack: search rows
+//! are a reduced Substrate projection that never carries
+//! `eTag`/`cTag`/`isAuthoritative`, so `drive_item_search` dropped
+//! those two columns (16 → 14); and following a search continuation
+//! cursor fails SERVER-SIDE on a personal drive ("Error Calling
+//! Substrate Search", deterministic, cursor forwarded byte-identically)
+//! — a loud provider_error through the failure envelope, never a silent
+//! truncation. Details in the yaml header and
+//! `docs/open-connector-one-drive.md`.
 //!
 //! Design decisions and their rationale. Most are held by a named test
 //! below; the two that are upstream properties no Skardi-side test can
 //! hold — cursor non-interchangeability and the executor's own input
-//! validation — say so where they appear, and fall to phase 4:
+//! validation — say so where they appear, and were confirmed live in
+//! phase 4:
 //!
 //! - **Its own pack, not part of a `microsoft365` one.** There is no
 //!   `microsoft365` service upstream: Graph is split into `outlook`,
@@ -40,8 +46,9 @@
 //!   re-wraps each element of `payload.value`; no renaming, no
 //!   rebuilding) and the row object declares `additionalProperties:
 //!   true` — but unlike the sibling `outlook` pack, this costs nothing
-//!   here: all 16 columns of both tables resolve INSIDE the declared
-//!   item schema, so the fingerprint gate covers every one of them and
+//!   here: every mapped column (16 on `drive_items`, 14 on
+//!   `drive_item_search`) resolves INSIDE the declared item schema, so
+//!   the fingerprint gate covers every one of them and
 //!   the coverage-gap pin is EMPTY
 //!   (`no_column_escapes_the_fingerprint_gate`). Two distinct mechanisms
 //!   follow from that, and they are worth keeping apart: if UPSTREAM
@@ -85,8 +92,10 @@
 //!   the two tables' cursors are NOT interchangeable, because each
 //!   executor pins its own allowlisted path set upstream — that one is
 //!   an upstream property no Skardi-side test can hold, so the two
-//!   cursor constants below simply use their own action's path and
-//!   phase 4 confirms it. The engine sends `top` on continuation
+//!   cursor constants below simply use their own action's path, and
+//!   phase 4 confirmed it live in BOTH directions (400 `invalid_input`,
+//!   "nextLink must target OneDrive search/children pagination
+//!   endpoints"). The engine sends `top` on continuation
 //!   requests too; the executors ignore it there because the cursor URL
 //!   embeds its own `$top`.
 //! - **`query` is a required resource on `drive_item_search`,** and the
@@ -131,11 +140,18 @@
 //!   driveItem's kind by which facet is present, so `file_mime_type`
 //!   and `folder_child_count` double as the discriminator: non-null
 //!   means file / means folder. Mapping one scalar out of each facet
-//!   keeps that queryable without a JSON column. The seven other
-//!   facets (`root`, `deleted`, `shared`, `specialFolder`,
-//!   `remoteItem`, `searchResult`, `fileSystemInfo`) are declared as
-//!   bare open objects and stay unmapped: presence-as-signal, not data,
-//!   and any child path under them would be passthrough anyway.
+//!   keeps that queryable without a JSON column. The discriminator has
+//!   one live-witnessed gap: a `remoteItem` stub (the Personal Vault
+//!   row) carries NEITHER facet — and no `webUrl` — so both columns are
+//!   NULL there. The seven other facets (`root`, `deleted`, `shared`,
+//!   `specialFolder`, `remoteItem`, `searchResult`, `fileSystemInfo`)
+//!   are declared as bare open objects and stay unmapped:
+//!   presence-as-signal, not data, and any child path under them would
+//!   be passthrough anyway. Real rows also carry undeclared passthrough
+//!   extras the conversion must simply ignore (`isAuthoritative`,
+//!   `@microsoft.graph.downloadUrl`, `file.hashes` on children rows;
+//!   `commentSettings`, `image`, `photo` on search rows) — the redacted
+//!   captures keep them so that stays exercised.
 
 use std::sync::OnceLock;
 
@@ -179,7 +195,9 @@ mod tests {
     /// allowlisted path set — an opaque token would sail through these
     /// mocks and 400 live. The two constants use their own action's path
     /// because the allowlists are per-action: a children cursor handed
-    /// to `search_items` is rejected upstream, and vice versa.
+    /// to `search_items` is rejected upstream and vice versa — phase 4
+    /// confirmed both directions live (400 `invalid_input`, "nextLink
+    /// must target OneDrive search/children pagination endpoints").
     const CHILDREN_PAGE2_URI: &str = "https://graph.microsoft.com/v1.0/me/drive/root/children?%24top=999&%24skiptoken=SyntheticChildren2";
     const SEARCH_PAGE2_URI: &str = "https://graph.microsoft.com/v1.0/me/drive/root/search(q='budget')?%24top=999&%24skiptoken=SyntheticSearch2";
 
@@ -208,14 +226,24 @@ mod tests {
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
     }
 
-    // ── Contract tests. UNLIKE the sibling outlook pack's, the row
-    // fixtures here are SYNTHETIC: phase 4 has not run, because
-    // `one_drive` needs its own OAuth grant and the live gateway answers
-    // `403 "Connect one_drive with OAuth first."`. They encode the
-    // DECLARED schema (all 16 columns resolve inside it) plus Graph's
-    // documented facet/identitySet shapes — not observed rows. Phase 4
-    // must re-derive them as redacted live captures and re-check every
-    // assertion below against real data. ─────────────────────────────
+    // ── Contract tests. The row fixtures are REDACTED LIVE CAPTURES
+    // (phase 4, 2026-08-21, personal MSA drive): every row mirrors one
+    // real wire row key-for-key, with identities substituted
+    // deterministically — cid → `0FAB1234CD567890` (and its lowercase /
+    // leading-zero-stripped forms, preserving the real case asymmetry
+    // between children and search rows), item GUIDs → per-row repeated
+    // digits carried consistently through `id`/`eTag`/`cTag`/URLs,
+    // display name → a placeholder that keeps the real CJK-ness, email
+    // → `user@example.com`, tempauth → `v1e.SYNTHETIC.SYNTHETIC`.
+    // Structural constants (`System Account`, `copilotUploads`,
+    // `Microsoft Office for MSA`, mime types, `driveType`, view enums)
+    // stay verbatim. `drive_items.json` is a composite of two captured
+    // pages (the root listing plus one folder's children) so both the
+    // folder shapes and the file shapes appear; `drive_item_search.json`
+    // mirrors real search hits including the real cursor shape. CJK
+    // travels as `\u` escapes so the files stay ASCII (see the audit).
+    // `drive_items_type_mismatch.json` remains synthetic on purpose —
+    // it encodes a contract VIOLATION no live capture can produce. ────
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -261,103 +289,146 @@ mod tests {
     }
 
     #[test]
-    fn drive_items_fixture_converts_every_designed_row_shape() {
+    fn drive_items_fixture_converts_every_captured_row_shape() {
         let batch = convert_fixture(
             table("drive_items"),
             include_str!("fixtures/one_drive/drive_items.json"),
         );
-        assert_eq!(batch.num_rows(), 7);
+        assert_eq!(batch.num_rows(), 5);
 
-        // Row 0 — a fully-populated file, including both concurrency
-        // tags and both nested identity/reference paths. It also carries
-        // an undeclared `@odata.etag`, which must simply be ignored
-        // rather than break conversion (passthrough rows always may).
-        assert_eq!(utf8(&batch, "name").value(0), "quarterly-report.xlsx");
-        assert_eq!(int64(&batch, "size").value(0), 48213);
-        assert!(utf8(&batch, "e_tag").value(0).contains("11111111"));
-        assert!(utf8(&batch, "c_tag").value(0).starts_with("\"c:"));
+        // Row 0 — the Copilot special folder: an EMPTY folder whose
+        // `childCount: 0` must survive as 0, not collapse into NULL, or
+        // "empty folder" becomes indistinguishable from "not a folder".
+        // Its identitySet carries BOTH an application arm and a user arm;
+        // only the user arm is mapped, and it wins.
+        assert_eq!(
+            utf8(&batch, "name").value(0),
+            "Microsoft Copilot Chat 文件",
+            "CJK survives the fixture's \\u escapes and the conversion"
+        );
+        assert_eq!(int64(&batch, "folder_child_count").value(0), 0);
+        assert!(utf8(&batch, "file_mime_type").is_null(0));
         assert_eq!(
             utf8(&batch, "created_by_display_name").value(0),
-            "Person One"
+            "示例 用户"
         );
-        assert_eq!(
-            utf8(&batch, "last_modified_by_display_name").value(0),
-            "Person Two"
-        );
-        assert_eq!(
-            utf8(&batch, "parent_path").value(0),
-            "/drive/root:/Documents"
-        );
-        assert!(utf8(&batch, "parent_drive_id").value(0).starts_with("b!"));
+        assert_eq!(utf8(&batch, "parent_path").value(0), "/drive/root:");
+        assert_eq!(utf8(&batch, "parent_drive_id").value(0), "0FAB1234CD567890");
+        assert!(utf8(&batch, "e_tag").value(0).contains("11111111"));
+        assert!(utf8(&batch, "c_tag").value(0).starts_with("\"c:"));
+        assert!(utf8(&batch, "web_url").is_valid(0));
+        assert_eq!(int64(&batch, "size").value(0), 0, "size 0 is 0, not NULL");
         assert!(timestamp(&batch, "created_date_time").is_valid(0));
         assert!(timestamp(&batch, "last_modified_date_time").is_valid(0));
 
-        // Rows 0/1 — facet presence IS the type discriminator, which is
-        // the whole reason these two columns are mapped: the file has a
-        // mime type and no child count, the folder the reverse.
-        assert!(utf8(&batch, "file_mime_type").is_valid(0));
-        assert!(int64(&batch, "folder_child_count").is_null(0));
+        // Row 1 — the Personal Vault `remoteItem` stub, the row that
+        // makes three nullability claims real rather than defensive: it
+        // carries NO `webUrl` and NEITHER type facet, so the facet
+        // discriminator has a live-witnessed gap (a row that is neither
+        // "file" nor "folder" by column test). Its identities are the
+        // displayName-only "System Account" arm — no email, no id — and
+        // the whole `remoteItem` facet is passthrough to ignore.
+        assert_eq!(utf8(&batch, "name").value(1), "Personal Vault");
+        assert!(utf8(&batch, "web_url").is_null(1));
         assert!(utf8(&batch, "file_mime_type").is_null(1));
-        assert_eq!(int64(&batch, "folder_child_count").value(1), 7);
+        assert!(int64(&batch, "folder_child_count").is_null(1));
+        assert_eq!(
+            utf8(&batch, "created_by_display_name").value(1),
+            "System Account"
+        );
+        assert!(utf8(&batch, "id").is_valid(1));
 
-        // Row 2 — an empty folder. `childCount: 0` must survive as 0,
-        // not collapse into NULL, or "empty folder" becomes
-        // indistinguishable from "not a folder".
-        assert_eq!(int64(&batch, "folder_child_count").value(2), 0);
-        // Absent optional keys become SQL NULL.
-        assert!(utf8(&batch, "description").is_null(2));
-        assert!(utf8(&batch, "e_tag").is_null(2));
-        assert!(utf8(&batch, "created_by_display_name").is_null(2));
+        // Every live row lacked `description` — 2800+ rows, zero
+        // occurrences. The column stays mapped (declared in-schema, so
+        // drift stays loud) and all-NULL is the EXPECTED live shape.
+        for row in 0..batch.num_rows() {
+            assert!(utf8(&batch, "description").is_null(row), "row {row}");
+        }
 
-        // Row 3 — explicit nulls, including nulls PART WAY down a mapped
-        // path (`createdBy.user` null, `parentReference` null,
-        // `file.mimeType` null). Every one must land as SQL NULL rather
-        // than fail the page.
-        assert!(utf8(&batch, "description").is_null(3));
-        assert!(int64(&batch, "size").is_null(3));
-        assert!(timestamp(&batch, "created_date_time").is_null(3));
-        assert!(utf8(&batch, "created_by_display_name").is_null(3));
-        assert!(utf8(&batch, "last_modified_by_display_name").is_null(3));
-        assert!(utf8(&batch, "parent_drive_id").is_null(3));
-        assert!(utf8(&batch, "parent_path").is_null(3));
-        assert!(utf8(&batch, "file_mime_type").is_null(3));
+        // Row 2 — an ordinal-id folder (`!103`, not a `!s<hex32>` id)
+        // with a CJK name; a special folder still reads as an ordinary
+        // folder row, `specialFolder` itself deliberately unmapped.
+        assert_eq!(utf8(&batch, "name").value(2), "文档");
+        assert_eq!(utf8(&batch, "id").value(2), "FAB1234CD567890!103");
+        assert_eq!(int64(&batch, "folder_child_count").value(2), 21);
+
+        // Row 3 — a fully-populated file: both concurrency tags, the
+        // facet discriminator pointing the other way, a CJK parent path,
+        // and the join key back to row 2's folder. The undeclared
+        // passthrough extras (`@microsoft.graph.downloadUrl`,
+        // `isAuthoritative`, `file.hashes`) must simply be ignored.
+        assert_eq!(utf8(&batch, "name").value(3), "Document1.docx");
+        assert!(utf8(&batch, "file_mime_type").value(3).contains("word"));
         assert!(int64(&batch, "folder_child_count").is_null(3));
-        // …but identity is non-nullable and still present.
-        assert!(utf8(&batch, "id").is_valid(3));
+        assert_eq!(int64(&batch, "size").value(3), 23348);
+        assert!(utf8(&batch, "e_tag").value(3).contains("33333333"));
+        assert!(utf8(&batch, "c_tag").value(3).starts_with("\"c:"));
+        assert_eq!(utf8(&batch, "parent_path").value(3), "/drive/root:/文档");
+        assert_eq!(
+            utf8(&batch, "parent_id").value(3),
+            utf8(&batch, "id").value(2),
+            "a child row's parent_id joins back to its folder's id"
+        );
 
-        // Row 4 — the empty-string arm, distinct from NULL at every
-        // level including through the nested paths.
-        assert_eq!(utf8(&batch, "name").value(4), "");
-        assert_eq!(utf8(&batch, "description").value(4), "");
-        assert_eq!(utf8(&batch, "created_by_display_name").value(4), "");
-        assert_eq!(utf8(&batch, "parent_path").value(4), "");
-        assert!(utf8(&batch, "description").is_valid(4), "empty is not null");
+        // Row 4 — a second file whose created-by and modified-by
+        // APPLICATION arms differ (sync client vs Office); the mapped
+        // user arm is the same person on both, which is exactly the
+        // "who touched this" answer the yaml maps the user arm for.
+        assert_eq!(utf8(&batch, "name").value(4), "工作簿1.xlsx");
+        assert_eq!(
+            utf8(&batch, "created_by_display_name").value(4),
+            "示例 用户"
+        );
+        assert_eq!(
+            utf8(&batch, "last_modified_by_display_name").value(4),
+            "示例 用户"
+        );
+        assert!(
+            utf8(&batch, "file_mime_type")
+                .value(4)
+                .contains("spreadsheet")
+        );
 
-        // Row 6 — a special folder still reads as an ordinary folder
-        // row; `specialFolder` itself is deliberately unmapped.
-        assert_eq!(utf8(&batch, "name").value(6), "Photos");
-        assert_eq!(int64(&batch, "folder_child_count").value(6), 128);
-        assert_eq!(utf8(&batch, "parent_path").value(6), "/drive/root:");
-        assert!(batch.column_by_name("special_folder").is_none());
+        // Unmapped wire keys never become columns.
+        for absent in ["special_folder", "remote_item", "is_authoritative"] {
+            assert!(batch.column_by_name(absent).is_none(), "{absent}");
+        }
     }
 
     #[test]
     fn identity_arms_other_than_user_leave_the_display_name_null() {
         // Graph's identitySet has user/application/device arms and this
-        // pack maps ONLY the user arm (see the yaml rationale). Row 5 was
-        // created by an application, so both display-name columns must be
-        // NULL — mapping the whole identitySet would have hidden this
+        // pack maps ONLY the user arm (see the yaml rationale). An
+        // application-only identity is CONTRACT-LEGAL (the arms are all
+        // optional) but was never witnessed on the live MSA drive —
+        // every real children row carried a user arm — so this shape is
+        // pinned with an inline synthetic page rather than smuggled into
+        // the captured fixture. Both display-name columns must be NULL;
+        // mapping the whole identitySet would have hidden the
         // distinction behind a JSON blob.
-        let batch = convert_fixture(
-            table("drive_items"),
-            include_str!("fixtures/one_drive/drive_items.json"),
-        );
-        assert_eq!(utf8(&batch, "name").value(5), "sync-log.json");
-        assert!(utf8(&batch, "created_by_display_name").is_null(5));
-        assert!(utf8(&batch, "last_modified_by_display_name").is_null(5));
+        let page = json!({
+            "items": [{
+                "id": "FAB1234CD567890!s55555555555555555555555555555555",
+                "name": "sync-log.json",
+                "size": 902,
+                "createdBy": {
+                    "application": {"id": "66666666-6666-6666-6666-666666666666",
+                                    "displayName": "Synthetic Sync App"}
+                },
+                "lastModifiedBy": {
+                    "application": {"id": "66666666-6666-6666-6666-666666666666",
+                                    "displayName": "Synthetic Sync App"}
+                },
+                "file": {"mimeType": "application/json"}
+            }],
+            "nextLink": null
+        });
+        let batch = convert_page(table("drive_items"), &page);
+        assert!(utf8(&batch, "created_by_display_name").is_null(0));
+        assert!(utf8(&batch, "last_modified_by_display_name").is_null(0));
         // The row is otherwise intact — a null identity is not a broken row.
-        assert_eq!(utf8(&batch, "file_mime_type").value(5), "application/json");
-        assert_eq!(int64(&batch, "size").value(5), 902);
+        assert_eq!(utf8(&batch, "file_mime_type").value(0), "application/json");
+        assert_eq!(int64(&batch, "size").value(0), 902);
     }
 
     #[test]
@@ -366,116 +437,198 @@ mod tests {
         let fixture = include_str!("fixtures/one_drive/drive_item_search.json");
         let batch = convert_fixture(t, fixture);
         assert_eq!(batch.num_rows(), 3);
-
-        // Search spans folder levels — that is the point of the table,
-        // since `list_folder_children` is non-recursive. The three rows
-        // sit at three different depths.
         assert_eq!(
-            utf8(&batch, "parent_path").value(0),
-            "/drive/root:/Documents/Finance"
+            batch.num_columns(),
+            14,
+            "search rows never carry eTag/cTag, so the table maps 14 columns"
         );
+        for dropped in ["e_tag", "c_tag"] {
+            assert!(batch.column_by_name(dropped).is_none(), "{dropped}");
+        }
+
+        // Search spans folder levels — the point of the table, since
+        // `list_folder_children` is non-recursive — and folders come
+        // back discriminated the same way (row 0 is a folder hit).
+        assert_eq!(int64(&batch, "folder_child_count").value(0), 4);
+        assert!(utf8(&batch, "file_mime_type").is_null(0));
+        assert_eq!(utf8(&batch, "file_mime_type").value(1), "image/png");
+        assert!(int64(&batch, "folder_child_count").is_null(1));
+
+        // The live wire mixes path spellings BETWEEN ROWS of one page:
+        // row 0 came back with the CJK folder name verbatim, rows 1-2
+        // percent-encoded. Both spellings pass through UNTOUCHED — the
+        // converter must not normalize either way, so equality on the
+        // same drive location is not guaranteed across rows.
+        assert_eq!(utf8(&batch, "parent_path").value(0), "/drive/root:/文档");
         assert_eq!(
             utf8(&batch, "parent_path").value(1),
-            "/drive/root:/Documents/Finance/2026"
+            "/drive/root:/%E6%A1%8C%E9%9D%A2"
         );
-        assert_eq!(
-            utf8(&batch, "parent_path").value(2),
-            "/drive/root:/Documents"
-        );
-        // Folders come back from search too, discriminated the same way.
-        assert!(utf8(&batch, "file_mime_type").is_valid(0));
-        assert_eq!(int64(&batch, "folder_child_count").value(2), 3);
-        // `searchResult` is present on the wire and deliberately unmapped.
-        assert!(batch.column_by_name("search_result").is_none());
 
-        // The declared cursor path finds a URI-shaped cursor.
-        let page: Value = serde_json::from_str(fixture).expect("fixture parses");
-        assert!(
-            page["nextLink"]
-                .as_str()
-                .expect("cursor present")
-                .starts_with("https://graph.microsoft.com/"),
-            "fixture cursors must be URI-shaped like the real wire"
+        // The join caveat, pinned from real rows: search rows spell
+        // `parentReference.driveId` LOWERCASE WITHOUT the leading zero,
+        // while children rows carry `0FAB…`-style — so a naive
+        // drive_items ⋈ drive_item_search on parent_drive_id misses.
+        assert_eq!(utf8(&batch, "parent_drive_id").value(0), "fab1234cd567890");
+        assert_ne!(
+            utf8(&batch, "parent_drive_id").value(0),
+            "0FAB1234CD567890",
+            "the two tables' driveId spellings differ on the real wire"
         );
+
+        // Search identities are displayName-only (no email/id — a
+        // reduced Substrate projection, like the missing tags).
+        assert_eq!(
+            utf8(&batch, "created_by_display_name").value(2),
+            "示例 用户"
+        );
+
+        // `searchResult`, `commentSettings`, `image`, `photo` are on
+        // the wire and deliberately unmapped.
+        for absent in ["search_result", "comment_settings", "image", "photo"] {
+            assert!(batch.column_by_name(absent).is_none(), "{absent}");
+        }
+
+        // The declared cursor path finds the real cursor shape: a
+        // complete Graph URL that re-embeds the query and `$top`.
+        let page: Value = serde_json::from_str(fixture).expect("fixture parses");
+        let cursor = page["nextLink"].as_str().expect("cursor present");
+        assert!(cursor.starts_with("https://graph.microsoft.com/"));
+        assert!(cursor.contains("search(q=") && cursor.contains("$skiptoken="));
     }
 
     #[test]
-    fn fixtures_stay_synthetic_under_a_default_deny_audit() {
-        // These fixtures are SYNTHETIC, not redacted captures (phase 4
-        // pending) — but the audit that guards them has to be able to fail,
-        // or it guards nothing. So: every string leaf must satisfy an
-        // allowlist FOR ITS KEY, default-deny. Key scoping is what makes
-        // that enforce anything, because shape alone proves nothing here —
-        // a real drive item's `name` is an ordinary filename and a real
-        // `webUrl` is an ordinary https URL, so both would coast through a
-        // shape check. When phase 4 re-derives these from live captures
-        // this test TIGHTENS (new arms per key) rather than being rewritten.
+    fn fixtures_are_redacted_captures_under_a_default_deny_audit() {
+        // The row fixtures are REDACTED LIVE CAPTURES, and this audit is
+        // the redaction's enforcement: every string leaf must satisfy an
+        // allowlist FOR ITS KEY, default-deny, or the test fails. Key
+        // scoping is what makes that enforce anything — a real drive
+        // item's `name` is an ordinary filename and a real `webUrl` is an
+        // ordinary https URL, so both would coast through a shape check.
+        // The redaction scheme it pins: one synthetic cid
+        // (`0FAB1234CD567890`, lowercase and leading-zero-stripped forms
+        // included — the real wire's case asymmetry is data, see the
+        // search conversion test), per-row repeated-digit GUIDs carried
+        // consistently through id/eTag/cTag/URLs, placeholder identities,
+        // and `v1e.SYNTHETIC` tempauth tokens. Structural constants
+        // (product names, mime types, enums) stay verbatim. CJK values
+        // travel as `\u` escapes so the files themselves stay ASCII and
+        // the redaction stays auditable by eye.
         fn audit(name: &str, key: &str, value: &Value) {
-            // A synthetic GUID here is a repeated hex digit
-            // (`{22222222-2222-…}`); a real one is not.
-            fn repeated_hex_guid(s: &str) -> bool {
-                s.as_bytes()
-                    .windows(8)
-                    .any(|w| w.iter().all(|b| *b == w[0] && b.is_ascii_hexdigit()))
+            // A synthetic GUID is ONE repeated hex digit in canonical
+            // 8-4-4-4-12 form. Checking the whole GUID matters: real
+            // ordinal-row tags contain long zero RUNS (and embed the real
+            // cid), so a "has a repeated window" check would wave real
+            // tags through.
+            fn repeated_digit_guid(s: &str) -> bool {
+                let b = s.as_bytes();
+                b.len() == 36
+                    && [8, 13, 18, 23].iter().all(|&i| b[i] == b'-')
+                    && b[0].is_ascii_hexdigit()
+                    && b.iter()
+                        .enumerate()
+                        .all(|(i, c)| *c == b'-' || (*c == b[0] && ![8, 13, 18, 23].contains(&i)))
             }
+            // eTag/cTag shape: `"{GUID},N"` / `"c:{GUID},N"` with a
+            // synthetic GUID inside the braces.
+            fn synthetic_tag(s: &str) -> bool {
+                match (s.find('{'), s.find('}')) {
+                    (Some(open), Some(close)) if open < close => {
+                        repeated_digit_guid(&s[open + 1..close])
+                    }
+                    _ => false,
+                }
+            }
+            const SYNTHETIC_CID: &str = "fab1234cd567890";
             match value {
                 Value::String(s) => {
                     let allowed = match key {
-                        // driveItem ids carry the synthetic prefix; the
-                        // identitySet ids under createdBy/lastModifiedBy
-                        // arrive under this same key and use a placeholder
-                        // UUID. The empty arm is the empty-string row.
+                        // One key, several id families: driveItem ids
+                        // (`FAB…!103`, `FAB…!s<hex32>`), the user id (the
+                        // cid), application ids (repeated-digit GUIDs plus
+                        // Office's well-known first-party constant), the
+                        // remoteItem's business-shaped id, and the
+                        // type-mismatch fixture's marked synthetic ids.
                         "id" => {
-                            s.is_empty()
+                            s.starts_with("FAB1234CD567890!")
+                                || s == "0FAB1234CD567890"
+                                || repeated_digit_guid(s)
+                                || s == "00000000-0000-0000-0000-0000480728c5"
+                                || (s.len() == 34
+                                    && s.starts_with("01")
+                                    && s[2..].bytes().all(|b| b == b'A'))
                                 || s.starts_with("01SYNTHETIC")
-                                || s.ends_with("-1111-2222-3333-444444444444")
                         }
                         // No shape can vouch for a filename, so the set is
-                        // explicit — a real one fails.
+                        // explicit — a real one fails. Product constants
+                        // and OS-default folder/file names stay verbatim;
+                        // `copilotUploads`/`documents` arrive under this
+                        // same key via `specialFolder.name`.
                         "name" => [
-                            "",
-                            "2026",
-                            "Archive",
-                            "Budget archive",
+                            "Microsoft Copilot Chat 文件",
+                            "Personal Vault",
                             "Documents",
-                            "Finance",
-                            "Photos",
-                            "Projects",
-                            "budget-2026.xlsx",
-                            "budget-notes.docx",
-                            "photos",
-                            "quarterly-report.xlsx",
-                            "sync-log.json",
-                            "untitled.txt",
+                            "文档",
+                            "桌面",
+                            "Document1.docx",
+                            "工作簿1.xlsx",
+                            "WeChat Files",
+                            "图片1.png",
+                            "示例报告.docx",
+                            "copilotUploads",
+                            "documents",
                             "wrong-types.bin",
                         ]
                         .contains(&s.as_str()),
-                        "description" => [
-                            "",
-                            "Numbers for the quarterly review",
-                            "Search hit in a nested folder",
-                        ]
-                        .contains(&s.as_str()),
-                        // The one place a real tenant name would hide.
+                        // The places a real cid or tenant would hide: known
+                        // host shapes AND the synthetic cid in the URL.
                         "webUrl" => {
-                            s.is_empty()
+                            ((s.starts_with("https://onedrive.live.com")
+                                || s.starts_with(
+                                    "https://my.microsoftpersonalcontent.com/personal/",
+                                ))
+                                && s.to_ascii_lowercase().contains(SYNTHETIC_CID))
                                 || s.starts_with("https://example-my.sharepoint.com/personal/user/")
                         }
-                        "displayName" => ["", "Person One", "Person Two", "Synthetic Sync App"]
-                            .contains(&s.as_str()),
-                        "driveId" => s.is_empty() || s.starts_with("b!Synthetic"),
-                        "path" => s.is_empty() || s.starts_with("/drive/root:"),
-                        "eTag" | "cTag" | "@odata.etag" => s.is_empty() || repeated_hex_guid(s),
-                        // A cursor must be URI-shaped AND visibly synthetic.
-                        "nextLink" => {
-                            s.starts_with("https://graph.microsoft.com/") && s.contains("Synthetic")
+                        "@microsoft.graph.downloadUrl" => {
+                            s.starts_with(
+                                "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx",
+                            ) && s.contains("tempauth=v1e.SYNTHETIC")
                         }
-                        "quickXorHash" => s.starts_with("Synthetic"),
-                        "onClickTelemetryUrl" => s.starts_with("https://example.invalid/"),
+                        "siteUrl" => {
+                            s == "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890"
+                        }
+                        "displayName" => [
+                            "示例 用户",
+                            "System Account",
+                            "M365Chat",
+                            "Microsoft Office for MSA",
+                            "Microsoft OneDrive desktop sync client",
+                        ]
+                        .contains(&s.as_str()),
+                        "email" => s == "user@example.com",
+                        "driveId" => {
+                            s == "0FAB1234CD567890"
+                                || s == SYNTHETIC_CID
+                                || s.starts_with("b!Synthetic")
+                        }
+                        "path" => s.starts_with("/drive/root:"),
+                        "eTag" | "cTag" => synthetic_tag(s),
+                        "siteId" | "listId" | "listItemUniqueId" | "webId" => {
+                            repeated_digit_guid(s)
+                        }
+                        // The captured cursor, byte-exact: URI-shaped like
+                        // the real wire but with the trivial first
+                        // skiptoken (`Mg`), never a real continuation.
+                        "nextLink" => {
+                            s == "https://graph.microsoft.com/v1.0/me/drive/root/search(q='docx')?$top=999&$skiptoken=Mg"
+                        }
+                        "quickXorHash" => s.starts_with("SyntheticQuickXorHash"),
+                        "sha1Hash" => s.len() == 40 && s.bytes().all(|b| b == s.as_bytes()[0]),
+                        "sha256Hash" => s.len() == 64 && s.bytes().all(|b| b == s.as_bytes()[0]),
                         // Public platform constants and enums.
-                        "mimeType" => s.is_empty() || s.contains('/'),
+                        "mimeType" => s.contains('/'),
                         "driveType" => s == "personal",
-                        "scope" => s == "users",
                         "sortBy" => s == "name",
                         "sortOrder" => s == "ascending",
                         "viewType" => s == "thumbnails",
@@ -515,27 +668,38 @@ mod tests {
         ] {
             assert!(
                 fixture.is_ascii(),
-                "{name}: fixtures stay ASCII so redaction is auditable by eye"
+                "{name}: fixtures stay ASCII so redaction is auditable by eye \
+                 (CJK travels as \\u escapes)"
             );
             let root: Value = serde_json::from_str(fixture).expect("fixture parses");
             audit(name, "$", &root);
         }
 
-        // The tripwire must TRIP. Each probe is a leak class a phase-4
-        // re-capture could plausibly reintroduce.
+        // The tripwire must TRIP. Each probe is a leak class the real
+        // captures actually contained before redaction.
         for (key, leak) in [
-            // A real tenant host instead of the example one.
+            // The real cid in a URL on an allowed host.
             (
                 "webUrl",
-                "https://contoso-my.sharepoint.com/personal/real.person/Documents/x.xlsx",
+                "https://onedrive.live.com?cid=0D3428DBDC23AC23&id=D3428DBDC23AC23!103",
             ),
             ("displayName", "Real Person"), // identity off the list
             ("name", "Acme Q3 headcount.xlsx"), // a real filename shape
-            ("id", "01BYZ5EMFAKEREALLOOKINGITEMID"), // id without the prefix
+            ("id", "D3428DBDC23AC23!103"),  // a real cid-prefixed item id
+            // A real ordinal-row tag: its zero RUNS would pass a naive
+            // repeated-window check, and its head embeds the real cid.
+            ("eTag", "\"{DC23AC23-28DB-2034-800D-680000000000},3\""),
+            // URI-shaped, right host, but a real continuation token.
             (
                 "nextLink",
-                "https://graph.microsoft.com/v1.0/me/drive/root/children?%24skiptoken=REAL",
-            ), // URI-shaped but not synthetic
+                "https://graph.microsoft.com/v1.0/me/drive/root/search(q='docx')?$top=999&$skiptoken=UkVBTA",
+            ),
+            // A real tempauth bearer token in a download URL.
+            (
+                "@microsoft.graph.downloadUrl",
+                "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx?tempauth=v1e.eyJzaXRlaWQi.real",
+            ),
+            ("email", "3268892259@example.net"), // a real-shaped address
             ("ownerEmail", "person@example.com"), // a key the allowlist never saw
         ] {
             let probe = json!({ key: leak });
@@ -548,13 +712,19 @@ mod tests {
 
     #[test]
     fn empty_page_keeps_schema_stable() {
-        // An empty drive folder must still produce the full 16-column
-        // schema, or a first-page-empty scan would change shape.
-        for short in ["drive_items", "drive_item_search"] {
+        // An empty drive folder must still produce the full declared
+        // schema, or a first-page-empty scan would change shape. The two
+        // tables' widths differ on purpose: search rows never carry the
+        // concurrency tags (phase 4), so drive_item_search maps 14.
+        for (short, columns) in [("drive_items", 16), ("drive_item_search", 14)] {
             let t = table(short);
             let batch = convert_page(t, &json!({"items": [], "nextLink": null}));
             assert_eq!(batch.num_rows(), 0, "{short}");
-            assert_eq!(batch.num_columns(), 16, "{short} keeps its declared schema");
+            assert_eq!(
+                batch.num_columns(),
+                columns,
+                "{short} keeps its declared schema"
+            );
             assert!(batch.column_by_name("id").is_some(), "{short}");
         }
     }
@@ -735,15 +905,16 @@ mod tests {
                     assert_eq!(cursor_param, "nextLink", "{short}");
                     assert_eq!(next_cursor_path, "$.nextLink", "{short}");
                     assert_eq!(page_size_param, Some("top"), "{short}");
-                    // The declared ceiling; 1000 and 0 both 400 live.
-                    // Phase 4 must confirm 999 is a WIRE bound too
-                    // (feishu declared 100 and hard-failed above 50).
+                    // The declared ceiling; 1000 and 0 both 400 live, and
+                    // phase 4 confirmed 999 is a WIRE bound too — a real
+                    // top=999 request answered a full 200 page (feishu
+                    // declared 100 and hard-failed above 50).
                     assert_eq!(page_size, 999, "{short}");
                     // Termination is the cursor going null — Graph has no
                     // has-more flag, so the feishu-style override that
-                    // rescues a non-empty terminal cursor is not declared,
-                    // and phase 4 must confirm the real final page really
-                    // does return null here.
+                    // rescues a non-empty terminal cursor is not declared.
+                    // Phase 4 confirmed real terminal pages return an
+                    // explicit null on both actions.
                     assert!(has_more_path.is_none(), "{short}");
                 }
                 other => panic!("{short} must paginate by cursor, got {other:?}"),
@@ -1094,7 +1265,11 @@ bindings:
     async fn search_scan_forwards_its_required_query_and_terminates_on_a_null_cursor() {
         // The search table's own wire pin: `query` from the binding on
         // every request including continuations, and termination on the
-        // spelling this action really emits. Both captured output
+        // spelling this action really emits. The cursor mechanics here
+        // are engine-real even though live MSA search continuations
+        // currently fail server-side upstream (see the yaml header) —
+        // queries whose hits fit one page terminate on a clean null,
+        // which is the live-witnessed passing path. Both captured output
         // contracts declare `required: ["items", "nextLink"]` with
         // `additionalProperties: false`, so the key is ALWAYS present and
         // an absent-`nextLink` page is a shape the gateway cannot produce
@@ -1410,9 +1585,11 @@ bindings:
     #[tokio::test]
     async fn provider_errors_surface_through_the_gateway_failure_envelope() {
         // Graph's in-band errors are consumed by the executor, so the
-        // pack sees them as a failure envelope — including the scope
-        // failure a read-only pack hits when the OAuth grant is missing
-        // (exactly what phase 4 is still blocked on).
+        // pack sees them as a failure envelope — the same surface phase 4
+        // witnessed live twice: this exact 403 before the OAuth grant
+        // existed, and the server-side "Error Calling Substrate Search"
+        // failure on real search continuations (loud, never a silent
+        // truncation).
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");

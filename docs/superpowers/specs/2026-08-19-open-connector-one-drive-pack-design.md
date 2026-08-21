@@ -8,10 +8,9 @@ is no `microsoft365` service upstream: Graph is split into `outlook`
 (mail only), `one_drive` (files) and `excel`, each with its own OAuth
 connection, and a Skardi binding carries exactly one `connection_alias`.
 A cross-service pack would silently span two OAuth grants and fail half
-its tables at scan time. `outlook` went first as milestone 5.7, on its own
-branch in PR #212 — **not merged into this base**, so neither its pack nor
-its 5.7 entry nor its document exists here; this document covers
-`one_drive`, which is independent of it. The phase-1/2 material was
+its tables at scan time. `outlook` went first as milestone 5.7 (PR #212,
+merged into main and now in this base after a rebase); this document
+covers `one_drive`, which is independent of it. The phase-1/2 material was
 originally reconciled alongside outlook's on 2026-08-14 (commit
 `c488ef1`), narrowed out of that branch in `0a76447` so PR #212 reviewed
 as exactly one pack, and restored here — then **re-verified against the
@@ -23,7 +22,7 @@ below has not drifted.
 
 | service | actions | completely-paginating list actions | verdict |
 |---|---|---|---|
-| `outlook` | 21 | `list_messages`, `list_mail_folders` | 5.7, in PR #212 (unmerged) |
+| `outlook` | 21 | `list_messages`, `list_mail_folders` | 5.7, merged (PR #212) |
 | `one_drive` | 13 | `list_folder_children`, `search_items` | this pack |
 | `excel` | 31 | none | deferred at the gate |
 
@@ -220,12 +219,13 @@ Graph enforces per-drive throttling with HTTP 429 plus `Retry-After`.
 
 ## What phase 4 must settle
 
-Live verification is not a formality here, and it has **not run** — it
-needs the user's own Microsoft account and Azure app (an Entra app
-registration with `http://localhost:3000/oauth/callback` as a redirect
-URI, `PUT /api/oauth/configs/one_drive` with their
-`clientId`/`clientSecret`, and a browser authorization). Credentials stay
-entirely on the user's side.
+Live verification is not a formality here. The list below is the plan as
+written before the pass; it **ran on 2026-08-21** — results follow it,
+item by item. It needed the user's own Microsoft account and Azure app
+(an Entra app registration with `http://localhost:3000/oauth/callback`
+as a redirect URI, `PUT /api/oauth/configs/one_drive` with their
+`clientId`/`clientSecret`, and a browser authorization). Credentials
+stayed entirely on the user's side.
 
 1. Whether `top: 999` is a wire bound as well as a declared one.
 2. Whether the real final page returns a genuinely null `nextLink`, so
@@ -259,3 +259,64 @@ entirely on the user's side.
    configuration: both are declared and optional, so a binding can carry
    both, and which one the executor honours is unprobed. If it silently
    prefers one, that binding scans a folder the operator did not name.
+
+## Phase 4 results (2026-08-21, real personal MSA drive)
+
+Raw probes through the live gateway plus end-to-end skardi-server scans
+(registration through the live fingerprint gate, real bindings for the
+root drive, a `folderItemId` scope and two search terms). Item by item:
+
+1. **Wire bound confirmed.** A real `top=999` request answered a full
+   200 page; 1000 and 0 both 400 (already known from phase 1).
+2. **Explicit null confirmed** on real terminal pages of both actions —
+   no refetch, no loop-guard trip.
+3. **Split verdict, both halves loud.** Children cursors round-trip the
+   allowlist in all three path forms (root, `folderItemId`, `driveId`)
+   with real multi-page walks. The search cursor's `/search(q='…')`
+   parenthesized form PASSES the gateway's allowlist and is forwarded
+   byte-identically — but Graph itself then fails the continuation
+   server-side on a personal drive ("Error Calling Substrate Search",
+   deterministic across retries and across `/me/drive` and
+   `/drives/{id}` forms): an upstream Microsoft limitation, surfaced as
+   a loud provider_error through the failure envelope, NOT a silent
+   truncation. Searches whose hits fit one page (≤ `top` = 999)
+   terminate on a clean null and succeed. The dangerous failure mode —
+   a rejected link nulled into "end of collection" — does not exist:
+   cross-action cursors were probed in both directions and answer 400
+   `invalid_input` naming the allowlist ("nextLink must target OneDrive
+   search/children pagination endpoints").
+4. **All but one column witnessed non-NULL, and one table changed.**
+   Every `drive_items` column extracted a real value somewhere except
+   `description` (zero occurrences across 2800+ rows; kept, since it is
+   declared in-schema and drift stays loud — the caveat is recorded in
+   the yaml and pack doc). Search rows are a reduced Substrate
+   projection that NEVER carries `eTag`/`cTag`/`isAuthoritative` (zero
+   across 1800+ hits), so `drive_item_search` dropped `e_tag`/`c_tag`
+   (16 → 14 columns) — the wire wins over the declared contract, and
+   this is exactly the always-NULL defect class phase 4 exists to catch.
+   Also witnessed: a `remoteItem` stub row (Personal Vault) with neither
+   type facet and no `webUrl`; search identities are displayName-only;
+   search `parent_drive_id` is lowercase without the leading zero while
+   children rows carry the `0…` form (join caveat, in the pack doc);
+   `parent_path` spelling varies row-to-row (raw vs percent-encoded).
+5. **Confirmed.** Real `folderItemId` and `folderPath` values forwarded
+   verbatim and returned real rows; real queries returned real rows
+   (with two search quirks recorded in the pack doc: content matching
+   beyond filenames, and non-exhaustive recall).
+6. **Done.** Both row fixtures are redacted live captures now — each row
+   mirrors a real wire row key-for-key under a deterministic redaction
+   map, enforced by the renamed
+   `fixtures_are_redacted_captures_under_a_default_deny_audit`
+   (per-key arms tightened to the captured keys; tripwire probes are
+   the leak classes the real captures actually contained, including a
+   real ordinal-row `eTag` whose zero runs defeat naive repeated-window
+   checks and a `tempauth` bearer URL). The type-mismatch fixture stays
+   synthetic on purpose — it encodes a contract violation no capture
+   can produce.
+7. **`folderItemId` wins silently.** Both set together scans the id's
+   folder and the path is dead configuration — verified live and
+   structural in the executor (`buildListFolderChildrenPath` checks
+   id → path → root). Recorded in the yaml and pack doc.
+
+Provider API version: Microsoft Graph `v1.0`, pinned by the executors in
+every URL including the cursors Graph hands back.
