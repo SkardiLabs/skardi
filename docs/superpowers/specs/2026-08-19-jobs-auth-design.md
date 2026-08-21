@@ -31,24 +31,42 @@ the operator has admitted.
 
 ## What
 
-`require_session` on all five `/jobs/*` handlers, not only the write path:
-`GET /jobs` exposes job definitions and parameter names, and
-`GET /jobs/runs` returns `job_runs.parameters` — raw parameter *values*,
-which is exactly what `query_audit` refuses to store. Gating submissions
-while leaving those readable would close the smaller hole.
+`require_session` on all five `/jobs/*` handlers, not only the write path.
+The load-bearing reason is the run history: `GET /jobs/runs` and
+`GET /jobs/runs/:run_id` return `job_runs.parameters` — raw parameter
+*values*, which is exactly what `query_audit` refuses to store, and which
+nothing else on the server exposes. Gating submissions while leaving those
+readable would close the smaller hole.
+
+`GET /jobs` is gated for consistency across the family rather than for
+confidentiality: job names, versions, destinations, parameter names and
+example request bodies are all rendered by the ungated dashboard at `GET /`
+(`gui.rs::render_job_card`), so gating this route alone does not make them
+non-public. See the non-goals.
 
 **Placement: first statement, ahead of the jobs-disabled 503 and the
 job-existence 404.** #219 established a precedence ladder among those
-checks; the auth gate deliberately sits outside it rather than inside. An
-unauthenticated caller learns neither whether jobs are enabled on this
-server nor which job names exist — both are otherwise readable straight off
-the status code.
+checks; the auth gate deliberately sits outside it rather than inside, so
+neither "jobs are enabled here" nor "this job name exists" is readable off
+the status code — both otherwise are.
+
+"First statement" is about the handler body. Axum runs extractors ahead of
+it, so a malformed `?limit=` or a non-object JSON body still answers
+400/422 before the gate is reached. The residue is schema-shaped rather
+than data-shaped, is identical on `/query` and `POST /:pipeline/execute`,
+and is bounded by axum's 2 MB default body cap; the audit writes this gate
+exists to protect all sit below it. Making the invariant hold literally
+would mean a middleware gate on the `/jobs` subtree — out of scope here.
 
 **Response shape.** `require_session` reports through the shared
 `ErrorResponse`; the jobs endpoints answer in `JobErrorResponse`. A thin
 `require_job_session` adapter keeps the status and re-renders the body, so
-one endpoint family does not answer in two envelopes. `unauthorized` is
-already the crate's `error_type` for the condition.
+one endpoint family does not answer in two envelopes. Both `error` and
+`error_type` are propagated rather than the type being pinned to
+`unauthorized` — the only classification `require_session` produces today,
+but `verify_session` already distinguishes "Authentication required" from
+"Invalid or expired session" internally, and a constant would let the
+message diverge from the type if that ever surfaced.
 
 **No behaviour change without auth.** `verify_session` returns `Ok` when
 `auth_layer.as_better_auth()` is `None`, so servers that never configured
@@ -64,6 +82,12 @@ auth are unaffected — pinned by a test rather than left to inspection.
 - `job_runs.parameters` storing raw parameter values. Gating the read
   narrows the exposure but does not resolve the threat-model question #219
   flagged alongside #217.
+- Gating the dashboard at `GET /`. It renders every job's name, version,
+  destination, parameter list and an example request body, so job names are
+  effectively public whatever this change does. Gating it is a UX decision
+  about the dashboard, not a ledger-integrity one, and deserves its own
+  change; the write-attribution and audit-thread fixes here do not depend on
+  it.
 
 ## Testing
 

@@ -136,7 +136,24 @@ spec:
     (state, tmp)
 }
 
+/// Serializes the `AUTH_*` mutations below.
+///
+/// Environment variables are process-global and libtest runs this binary's
+/// tests on parallel threads, so concurrent `set_var` calls are a data race —
+/// which is why edition 2024 makes `set_var` `unsafe`. Identical values do not
+/// rescue it, and the file would become order-dependently flaky the moment one
+/// test wanted a different `AUTH_DB_PATH`.
+///
+/// A `tokio::sync::Mutex` rather than `std::sync::Mutex` because the guard has
+/// to be held across `AuthLayer::build(..).await`: `build` is what reads these
+/// variables, so releasing after the mutation would still let another test
+/// overwrite them before the read. Mirrors `auth::test_env::lock`, which
+/// cannot be reused here — it is `#[cfg(test)]` on the lib and so invisible to
+/// an integration-test binary.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn better_auth_layer() -> AuthLayer {
+    let _env = ENV_LOCK.lock().await;
     unsafe {
         std::env::set_var("AUTH_SECRET", "test-secret-that-is-at-least-32-characters!");
         std::env::set_var("AUTH_DB_PATH", ":memory:");
