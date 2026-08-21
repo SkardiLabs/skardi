@@ -235,7 +235,7 @@ We're building in public. If the thesis above resonates — or if it doesn't —
 - **[GitHub issues](https://github.com/SkardiLabs/skardi/issues)** — file against any unchecked roadmap item; we'll pair on design and review.
 - **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — a growing library of ready-to-use Skardi setups.
 
-The full public roadmap (with live `[x]` / `[ ]` checkboxes for what's shipped vs. open) lives in the [main README](../README.md#roadmap). The rest of this doc tree walks the concrete pieces:
+The full public roadmap (with live `[x]` / `[ ]` checkboxes for what's shipped vs. open) lives in [docs/roadmap.md](roadmap.md). The rest of this doc tree walks the concrete pieces:
 
 - [Server](server.md) — the HTTP process that hosts both peer surfaces.
 - [Pipelines](pipelines.md) — online serving (parameterized SQL as REST).

@@ -7,7 +7,7 @@
 
 Point it at your data and your agent can ask anything of it in SQL — declaring *why* it asks. Skardi records every ask, finds the intentions that keep coming back, and turns them into named tools and standing routines. The thing that improves is the agent's **context** — what it can do on your data without rediscovering it — not model weights, serving latency, or your infra bill. The agent you ship on Monday is better at your data by Friday, and you never wrote another integration.
 
-**Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines, installed for you
+**Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines — *automation in flight*
 
 <a href="#the-loop">How the loop works</a> •
 <a href="#install">Install</a> •
@@ -53,18 +53,18 @@ tools it ends up with are the ones it demonstrably reached for.
      │                                                          │
      ▼                                                          │
  ① OBSERVE                                                      │
-   the agent asks anything, in SQL, and declares why             │
-   POST /query + ai_context ──▶ durable audit ledger             │
+   the agent asks anything, in SQL, and declares why            │
+   POST /query + ai_context ──▶ durable audit ledger            │
      │                                                          │
      ▼                                                          │
  ② LEARN                                                        │
-   read the ledger, group by session and purpose,                │
-   find the intentions that keep coming back                     │
+   read the ledger, group by session and purpose,               │
+   find the intentions that keep coming back                    │
      │                                                          │
      ▼                                                          │
  ③ ACT                                                          │
-   recurring queries become named pipelines; recurring           │
-   intentions become routines that run before they're asked      │
+   recurring queries become named pipelines; recurring          │
+   intentions become routines that run before they're asked     │
      │                                                          │
      └──────────────────────────────────────────────────────────┘
                     the toolset grew itself
@@ -74,8 +74,20 @@ tools it ends up with are the ones it demonstrably reached for.
 ([full reference](docs/server.md)); `--query-audit-db` turns on the durable
 record that makes the rest of the loop possible.
 
+```yaml
+kind: context
+metadata: { name: acme }
+spec:
+  data_sources:
+    - name: warehouse            # step 2 queries warehouse.public.subs
+      type: postgres
+      hierarchy_level: catalog   # register every table in the database
+      connection_string: postgres://localhost:5432/acme
+```
+
 ```bash
-# from a source checkout — or run the Docker image with the same flags
+# from a source checkout — Docker once --query-audit-db ships in a tagged release
+git clone https://github.com/SkardiLabs/skardi.git && cd skardi
 cargo run --release --bin skardi-server -- \
   --ctx ctx.yaml --query-audit-db ./audit.db --port 8080
 ```
@@ -107,7 +119,7 @@ metadata: { name: weekly-churn }
 spec:
   query: |                                   # the varying window, parameterized
     SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs
-    WHERE cancelled_at > now() - ({days} * interval '1 day')
+    WHERE cancelled_at > to_timestamp(to_unixtime(now()) - {days} * 86400)
     GROUP BY plan ORDER BY cancels DESC
 ```
 
@@ -161,24 +173,24 @@ Then back to ①, with one fewer thing your agent has to figure out from scratch
 
 ## Install
 
-**Claude Code** — the fastest path. Skills that stand the whole thing up for
+**Claude Code** — the fastest path. A skill that stands the whole thing up for
 you:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
-/plugin install skardi-deploy-and-patterns@skardi-skills
-/plugin install auto-knowledge-base@skardi-skills
-/plugin install auto-rag@skardi-skills
+/plugin install auto-context@skardi-skills
 ```
 
-[`auto_rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_rag)
-stands up hybrid search (vector + FTS + RRF) over a store you already control;
-[`auto_knowledge_base`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_knowledge_base)
-turns a directory of documents into a citable local KB, zero infra. For Cursor
-and other [Agent Skills](https://agentskills.io/)-compatible hosts, see the
+[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context)
+turns a folder of documents — or a datastore you already run — into governed,
+searchable context served over HTTP by `skardi-server`: hybrid search (vector +
+FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
+pointed at Postgres + pgvector, MongoDB, or Lance. For Cursor and other
+[Agent Skills](https://agentskills.io/)-compatible hosts, see the
 [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
-**CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon:
+**CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
+build from source — the one-liner below has no published artifact there):
 
 ```bash
 curl -fSL "https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | sed 's/Linux/unknown-linux-gnu/' | sed 's/Darwin/apple-darwin/').tar.gz" | tar xz
@@ -231,7 +243,7 @@ agents; deploy it next to your data, behind your usual auth.
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
-| CSV / Parquet / JSON | Read | No | Local or remote files | [docs](docs/server.md) |
+| CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
 | SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
 | Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
@@ -294,7 +306,8 @@ ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
 [ONNX](docs/onnx_predict.md) · [LLM extraction](docs/llm_extract.md) ·
 [JSON packing](docs/json_pack.md) · [auth](docs/auth/) ·
 [observability](docs/observability.md) ·
-[design background](docs/agent_data_plane.md).
+[roadmap](docs/roadmap.md) ·
+[design background](docs/agent_data_plane.md) *(predates the current framing)*.
 
 </details>
 

@@ -41,7 +41,7 @@ Use `UNNEST(chunk(...))` to expand the list into one row per chunk.
 
 Both modes count length in characters (Unicode scalar values), not bytes or tokens.
 
-> Token-based and code-aware splitters are planned follow-ups. See the [roadmap](../README.md#roadmap).
+> Token-based and code-aware splitters are planned follow-ups. See the [roadmap](roadmap.md).
 
 ## Examples
 
