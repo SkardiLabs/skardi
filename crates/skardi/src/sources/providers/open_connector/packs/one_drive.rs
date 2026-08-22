@@ -681,14 +681,14 @@ mod tests {
             // The real cid in a URL on an allowed host.
             (
                 "webUrl",
-                "https://onedrive.live.com?cid=0D3428DBDC23AC23&id=D3428DBDC23AC23!103",
+                "https://onedrive.live.com?cid=0BADC0FFEE123456&id=BADC0FFEE123456!103",
             ),
             ("displayName", "Real Person"), // identity off the list
             ("name", "Acme Q3 headcount.xlsx"), // a real filename shape
-            ("id", "D3428DBDC23AC23!103"),  // a real cid-prefixed item id
+            ("id", "BADC0FFEE123456!103"),  // a cid-prefixed id off the synthetic cid
             // A real ordinal-row tag: its zero RUNS would pass a naive
             // repeated-window check, and its head embeds the real cid.
-            ("eTag", "\"{DC23AC23-28DB-2034-800D-680000000000},3\""),
+            ("eTag", "\"{AB12CD34-28DB-2034-800D-680000000000},3\""),
             // URI-shaped, right host, but a real continuation token.
             (
                 "nextLink",
@@ -697,9 +697,9 @@ mod tests {
             // A real tempauth bearer token in a download URL.
             (
                 "@microsoft.graph.downloadUrl",
-                "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx?tempauth=v1e.eyJzaXRlaWQi.real",
+                "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx?tempauth=v1e.eyJGYWtlIjoxfQ.real",
             ),
-            ("email", "3268892259@example.net"), // a real-shaped address
+            ("email", "1234567890@example.net"), // a real-shaped address
             ("ownerEmail", "person@example.com"), // a key the allowlist never saw
         ] {
             let probe = json!({ key: leak });
