@@ -108,7 +108,10 @@ skardi config use-context acme/prod
 # Create or update one (only the fields you name are touched)
 skardi config set-context local --server http://127.0.0.1:8080 --current
 skardi config set-context acme/prod --mode cloud --workspace acme-prod \
-  --server https://gateway.skardi.ai --token skardi_pat_…
+  --server https://gateway.skardi.ai --token-stdin < token.txt
+
+# --token also works, but puts the credential on the command line, where
+# /proc (on Linux) and your shell history can see it. Prefer --token-stdin.
 
 # Remove one. Does not revoke its credential.
 skardi config delete-context acme/prod

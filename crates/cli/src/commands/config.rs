@@ -12,6 +12,7 @@
 use crate::config::{self, Context, ContextMode, ContextsFile};
 use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
+use std::collections::BTreeMap;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -47,8 +48,14 @@ pub enum ConfigCmd {
         #[arg(long, value_name = "SLUG")]
         workspace: Option<String>,
 
-        #[arg(long, value_name = "TOKEN")]
+        /// PAT or bearer token. Prefer --token-stdin: an argv value is
+        /// world-readable via /proc on Linux and lands in shell history
+        #[arg(long, value_name = "TOKEN", conflicts_with = "token_stdin")]
         token: Option<String>,
+
+        /// read the token from stdin (the first line), keeping it off argv
+        #[arg(long)]
+        token_stdin: bool,
 
         #[arg(long, value_name = "EMAIL")]
         user: Option<String>,
@@ -75,13 +82,16 @@ pub enum ConfigCmd {
 }
 
 /// Dispatch one `skardi config` subcommand.
-pub fn run(cmd: ConfigCmd) -> Result<()> {
+///
+/// `flag_context` is the global `--context`, threaded in so the commands that
+/// REPORT the selection honour the same inputs the ones that USE it do.
+pub fn run(cmd: ConfigCmd, flag_context: Option<String>) -> Result<()> {
     let path = config::default_config_path()
         .context("cannot determine the home directory for ~/.skardi/config.yaml")?;
 
     match cmd {
-        ConfigCmd::GetContexts => get_contexts(&path),
-        ConfigCmd::CurrentContext => current_context(&path),
+        ConfigCmd::GetContexts => get_contexts(&path, flag_context.as_deref()),
+        ConfigCmd::CurrentContext => current_context(&path, flag_context.as_deref()),
         ConfigCmd::UseContext { name } => use_context(&path, &name),
         ConfigCmd::SetContext {
             name,
@@ -89,22 +99,57 @@ pub fn run(cmd: ConfigCmd) -> Result<()> {
             mode,
             workspace,
             token,
+            token_stdin,
             user,
             current,
-        } => set_context(&path, &name, server, mode, workspace, token, user, current),
+        } => {
+            // Read here rather than inside `set_context`, so that function
+            // stays a pure file edit and remains testable without stdin.
+            let token = if token_stdin {
+                Some(read_token_from_stdin()?)
+            } else {
+                token
+            };
+            set_context(&path, &name, server, mode, workspace, token, user, current)
+        }
         ConfigCmd::DeleteContext { name } => delete_context(&path, &name),
         ConfigCmd::View { show_tokens } => view(&path, show_tokens),
     }
 }
 
-fn get_contexts(path: &Path) -> Result<()> {
+/// Read one line from stdin as a token.
+///
+/// The `docker login --password-stdin` / `gh auth login --with-token` shape.
+/// A trailing newline from `echo` is stripped; an empty read is an error
+/// rather than a context written with an empty credential.
+fn read_token_from_stdin() -> Result<String> {
+    use std::io::Read as _;
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .context("read token from stdin")?;
+    let token = buffer.lines().next().unwrap_or("").trim().to_string();
+    if token.is_empty() {
+        bail!("--token-stdin was given but stdin held no token");
+    }
+    Ok(token)
+}
+
+fn get_contexts(path: &Path, flag_context: Option<&str>) -> Result<()> {
     let file = config::load(path).unwrap_or_default();
     let contexts = file.effective_contexts();
     if contexts.is_empty() {
         println!("no contexts configured ({})", path.display());
         return Ok(());
     }
-    let current = file.current_context.as_deref().unwrap_or("");
+    // From resolution's own chain, not from the raw field: otherwise a legacy
+    // `spec:` install shows no marker at all while every command is using
+    // `default`, a padded pointer matches nothing, and --context/$SKARDI_CONTEXT
+    // are ignored by the very command asked which context is in effect.
+    // A selection error (an unknown name) is not fatal HERE — listing is how
+    // an operator discovers the right name — so it degrades to no marker.
+    let selected = selected_name(&file, flag_context).unwrap_or_default();
+    let current = selected.as_deref().unwrap_or("");
     println!(
         "{:<2} {:<24} {:<8} {:<20} SERVER",
         "", "NAME", "MODE", "WORKSPACE"
@@ -122,17 +167,33 @@ fn get_contexts(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn current_context(path: &Path) -> Result<()> {
+fn current_context(path: &Path, flag_context: Option<&str>) -> Result<()> {
     let file = config::load(path).unwrap_or_default();
-    match file.current_context.as_deref().map(str::trim) {
-        Some(name) if !name.is_empty() => {
+    // Resolution's answer, so `ctx=$(skardi config current-context)` names the
+    // context the next command will actually talk to — including the
+    // lone-context case and $SKARDI_CONTEXT.
+    match selected_name(&file, flag_context)? {
+        Some(name) => {
             println!("{name}");
             Ok(())
         }
         // Exit non-zero: a script asking "which context" and getting silence
         // plus success would proceed against the wrong one.
-        _ => bail!("no current context is set ({})", path.display()),
+        None => bail!("no context is selected ({})", path.display()),
     }
+}
+
+/// The context resolution would select for this file, honouring `--context`
+/// and `$SKARDI_CONTEXT` exactly as a real command does.
+fn selected_name(file: &ContextsFile, flag_context: Option<&str>) -> Result<Option<String>> {
+    let env_context = std::env::var("SKARDI_CONTEXT").ok();
+    Ok(config::select_context(
+        &file.effective_contexts(),
+        file.current_context.as_deref(),
+        flag_context,
+        env_context.as_deref(),
+    )?
+    .map(|c| c.name))
 }
 
 fn use_context(path: &Path, name: &str) -> Result<()> {
@@ -189,10 +250,7 @@ fn set_context(
     let mut file = config::load_for_mutation(path)?;
     // A legacy `spec:`-only file gains its `default` context on first edit,
     // so the mutation does not silently drop the credential it holds.
-    if file.contexts.is_empty() {
-        file.contexts = file.effective_contexts();
-        file.spec = None;
-    }
+    file.promote_legacy_spec();
 
     let existing = file.contexts.iter().position(|c| c.name == name);
     let created = existing.is_none();
@@ -240,6 +298,13 @@ fn set_context(
                  server — that would send its token there)"
             );
         }
+        // NOT required: --token. The "writing a dud" rationale above is about
+        // requests going somewhere unintended, and a tokenless cloud context
+        // simply gets a 401 from the right gateway — it misdirects nothing.
+        // It is also a legitimate intermediate state: M2's `login` writes the
+        // server and workspace, then fills the token in once minting
+        // succeeds, and `set-context --server`/`--workspace` is the documented
+        // repair path for a context whose token was revoked.
     }
 
     if current {
@@ -256,10 +321,7 @@ fn set_context(
 
 fn delete_context(path: &Path, name: &str) -> Result<()> {
     let mut file = config::load_for_mutation(path)?;
-    if file.contexts.is_empty() {
-        file.contexts = file.effective_contexts();
-        file.spec = None;
-    }
+    file.promote_legacy_spec();
     let before = file.contexts.len();
     file.contexts.retain(|c| c.name != name);
     if file.contexts.len() == before {
@@ -310,11 +372,36 @@ fn render_view(path: &Path, show_tokens: bool) -> Result<String> {
                 context.token = Some(redact(token));
             }
         }
-        if let Some(spec) = file.spec.as_mut().filter(|s| s.token.is_some()) {
+        if let Some(spec) = file.spec.as_mut() {
+            // No `filter`: `map` already leaves `None` alone.
             spec.token = spec.token.as_deref().map(redact);
+        }
+        // The model is deliberately OPEN, so redaction cannot be an allowlist
+        // over modeled fields alone: a newer CLI's `refresh-token:` or
+        // `client-secret:` under a context is preserved by `save` (the point
+        // of `extra`) and would then be printed verbatim by an older CLI's
+        // `view` — two lines below a `(redacted)` that makes the output read
+        // as safe.
+        redact_sensitive_extras(&mut file.extra);
+        for context in &mut file.contexts {
+            redact_sensitive_extras(&mut context.extra);
         }
     }
     serde_yaml::to_string(&file).context("serialize config")
+}
+
+/// Redact any unmodeled key whose NAME suggests it holds a credential.
+///
+/// Name-based because the value is opaque by definition here — `extra` exists
+/// precisely for fields this binary does not understand.
+fn redact_sensitive_extras(extra: &mut BTreeMap<String, serde_yaml::Value>) {
+    const SENSITIVE: [&str; 4] = ["token", "secret", "password", "credential"];
+    for (key, value) in extra.iter_mut() {
+        let lowered = key.to_ascii_lowercase();
+        if SENSITIVE.iter().any(|needle| lowered.contains(needle)) {
+            *value = serde_yaml::Value::String("(redacted)".to_string());
+        }
+    }
 }
 
 /// Replace a token entirely. No prefix survives, deliberately.
@@ -532,8 +619,57 @@ mod tests {
     fn use_context_on_an_empty_file_says_there_are_none() {
         let (_dir, path) = temp();
         let err = use_context(&path, "any").unwrap_err();
-        // The "(none)" arm of `available` — a listing with nothing to list.
+        // The "(none)" arm — a listing with nothing to list.
         assert!(err.to_string().contains("Available: (none)"), "{err}");
+    }
+
+    #[test]
+    fn view_redacts_credential_shaped_keys_the_model_does_not_know() {
+        let (_dir, path) = temp();
+        // A newer CLI's fields: preserved by `save` (that is what `extra` is
+        // for) and, before this, printed verbatim by an older CLI's `view` —
+        // two lines under a `(redacted)` that made the output read as safe.
+        write(
+            &path,
+            "kind: client\ncontexts:\n\
+             \x20 - name: c\n    server: https://gw\n\
+             \x20   refresh-token: rt_live_value\n\
+             \x20   client-secret: cs_live_value\n\
+             \x20   note: not-a-credential\n",
+        );
+
+        let body = render_view(&path, false).unwrap();
+        assert!(!body.contains("rt_live_value"), "{body}");
+        assert!(!body.contains("cs_live_value"), "{body}");
+        // A non-credential unknown key still shows, so `view` stays useful.
+        assert!(body.contains("not-a-credential"), "{body}");
+
+        // …and --show-tokens remains the escape hatch for all of it.
+        let shown = render_view(&path, true).unwrap();
+        assert!(shown.contains("rt_live_value"), "{shown}");
+    }
+
+    #[test]
+    fn a_token_arrives_from_stdin_without_touching_argv() {
+        // Only the parsing half is unit-testable (stdin is process-global), but
+        // that is where the sharp edges are: a trailing newline from `echo`,
+        // and an empty read that must not write an empty credential.
+        let (_dir, path) = temp();
+        set_context(
+            &path,
+            "c",
+            Some("https://gw".to_string()),
+            Some("cloud".to_string()),
+            Some("w".to_string()),
+            Some("skardi_pat_from_stdin".to_string()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            reload(&path).contexts[0].token.as_deref(),
+            Some("skardi_pat_from_stdin")
+        );
     }
 
     #[test]
@@ -582,9 +718,9 @@ mod tests {
         let (_dir, path) = temp();
 
         // Empty file: both are informative rather than crashing.
-        get_contexts(&path).unwrap();
+        get_contexts(&path, None).unwrap();
         assert!(
-            current_context(&path).is_err(),
+            current_context(&path, None).is_err(),
             "no pointer is an error exit"
         );
 
@@ -601,14 +737,47 @@ mod tests {
         .unwrap();
         // Exercises the row renderer, including the `*` marker and the
         // `-` fallbacks for absent fields.
-        get_contexts(&path).unwrap();
-        current_context(&path).unwrap();
+        get_contexts(&path, None).unwrap();
+        current_context(&path, None).unwrap();
 
-        // A whitespace-only pointer counts as unset.
+        // A whitespace-only pointer counts as unset — and with exactly ONE
+        // context the lone-context step then selects it, which is the whole
+        // point of routing this through resolution: the answer matches what
+        // the next real command will use.
         let mut file = reload(&path);
         file.current_context = Some("   ".to_string());
         config::save(&path, &file).unwrap();
-        assert!(current_context(&path).is_err());
+        current_context(&path, None).expect("the lone context is selected");
+        assert_eq!(
+            selected_name(&reload(&path), None).unwrap().as_deref(),
+            Some("acme/prod")
+        );
+
+        // With SEVERAL contexts and no usable pointer, nothing is selected
+        // and the command says so rather than guessing.
+        set_context(
+            &path,
+            "second",
+            Some("http://b:2".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut file = reload(&path);
+        file.current_context = None;
+        config::save(&path, &file).unwrap();
+        assert!(current_context(&path, None).is_err());
+
+        // --context is honoured by the command that reports the selection.
+        assert_eq!(
+            selected_name(&reload(&path), Some("second"))
+                .unwrap()
+                .as_deref(),
+            Some("second")
+        );
     }
 
     #[test]
@@ -671,6 +840,7 @@ mod tests {
             spec: Some(LegacySpec {
                 server: Some("http://x:1".to_string()),
                 token: None,
+                ..LegacySpec::default()
             }),
             ..ContextsFile::default()
         };

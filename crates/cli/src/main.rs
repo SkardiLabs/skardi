@@ -164,7 +164,7 @@ async fn main() -> ExitCode {
 /// one dispatch point and leaves no structurally unreachable arm behind.
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     if let Commands::Config { cmd } = cli.command {
-        return commands::config::run(cmd);
+        return commands::config::run(cmd, cli.context);
     }
 
     let config = ClientConfig::resolve(cli.server, cli.token, cli.context)?;

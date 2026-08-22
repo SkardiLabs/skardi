@@ -47,6 +47,10 @@ const SERVER_URL_ENV: &str = "SKARDI_SERVER_URL";
 const API_TOKEN_ENV: &str = "SKARDI_API_TOKEN";
 const CONTEXT_ENV: &str = "SKARDI_CONTEXT";
 
+/// How old a temp file must be before the sweep treats it as abandoned
+/// rather than as a concurrent writer's work in progress.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The name a legacy `spec:`-only file resolves under, so that a file with no
 /// `contexts:` key still has a context to select and to print.
 pub const LEGACY_CONTEXT_NAME: &str = "default";
@@ -146,29 +150,37 @@ pub struct ContextsFile {
 }
 
 /// The pre-contexts file shape: one server, one token.
+///
+/// `extra` for the same reason the other two structs have it: `use-context`
+/// re-serializes `spec:` WITHOUT promoting it, so anything unmodeled inside
+/// the block would be dropped by a command that never meant to touch it.
+/// The documented legacy shape only ever had `server`/`token`, so this is
+/// insurance rather than a live case — but it was the one place the
+/// "unknown keys survive an older CLI" promise did not hold.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LegacySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl ContextsFile {
     /// Every context the file defines, with the legacy `spec:` block folded in
-    /// as `default` when there is no `contexts:` list.
+    /// as `default` when there is no `contexts:` list. A file carrying BOTH
+    /// prefers `contexts:`.
     ///
-    /// A file carrying BOTH prefers `contexts:` and warns once — silently
-    /// choosing either way would leave the operator guessing which credential
-    /// their commands used.
+    /// PURE and idempotent, deliberately. This used to `eprintln!` the
+    /// both-shapes warning, which made "warns once" a rule every caller had
+    /// to obey — and two callers didn't, printing it twice on the
+    /// unknown-context path and again in `use_context`. Both were patched at
+    /// the call site, which is the fragile kind of fix. The warning now fires
+    /// where the file is READ (see `warn_about_file`), because carrying both
+    /// shapes is a property of the file rather than of each access.
     pub fn effective_contexts(&self) -> Vec<Context> {
         if !self.contexts.is_empty() {
-            if self.spec.is_some() {
-                eprintln!(
-                    "warning: config has both 'contexts:' and a legacy 'spec:' block; \
-                     using 'contexts:' and ignoring 'spec:'"
-                );
-            }
             return self.contexts.clone();
         }
         match &self.spec {
@@ -179,6 +191,20 @@ impl ContextsFile {
                 ..Context::default()
             }],
             None => Vec::new(),
+        }
+    }
+
+    /// Fold a legacy `spec:` block into `contexts:` so a mutation cannot drop
+    /// the credential it holds. No-op once `contexts:` is populated.
+    ///
+    /// The ordering matters and is why this is one function rather than two
+    /// lines at each call site: promote FIRST, then clear `spec`. It was
+    /// duplicated verbatim in `set-context` and `delete-context`, and M2's
+    /// `login` needs it too.
+    pub fn promote_legacy_spec(&mut self) {
+        if self.contexts.is_empty() {
+            self.contexts = self.effective_contexts();
+            self.spec = None;
         }
     }
 
@@ -221,6 +247,11 @@ pub enum ConfigError {
     EnvConflictsWithCloudContext { name: String, variable: String },
     /// A mutating command met a file it could not parse (§5.4).
     UnparsableForMutation { path: PathBuf, error: String },
+    /// A mutating command met a file it could not READ. Distinct from the
+    /// parse case because the advice is the same but the diagnosis is not:
+    /// reporting "does not parse (Permission denied)" sends the operator
+    /// hunting for a YAML error that is not there.
+    UnreadableForMutation { path: PathBuf, error: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -259,6 +290,13 @@ impl fmt::Display for ConfigError {
                 "refusing to modify {}: it exists but does not parse ({error}). \
                  Fix or move the file first — rewriting it would discard the \
                  credentials it may still hold",
+                path.display()
+            ),
+            Self::UnreadableForMutation { path, error } => write!(
+                f,
+                "refusing to modify {}: it exists but cannot be read ({error}). \
+                 Fix the permissions or move the file first — rewriting it would \
+                 discard the credentials it may still hold",
                 path.display()
             ),
         }
@@ -334,6 +372,51 @@ pub struct ResolveInputs {
     pub file: Option<ContextsFile>,
 }
 
+/// The context-selection chain: `--context` > `$SKARDI_CONTEXT` >
+/// `current-context` > a lone context.
+///
+/// Extracted so the commands that REPORT the selection use the same code that
+/// makes it. `get-contexts`'s `*` marker and `current-context` previously
+/// compared the raw `current-context` field, which disagreed with resolution
+/// in three ways: no lone-context step (so a legacy `spec:` install showed no
+/// marker while every command happily used `default`), no trimming, and no
+/// awareness of `--context`/`$SKARDI_CONTEXT`.
+pub fn select_context(
+    contexts: &[Context],
+    current_context: Option<&str>,
+    flag_context: Option<&str>,
+    env_context: Option<&str>,
+) -> Result<Option<Context>, ConfigError> {
+    let names = || contexts.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    let lookup = |name: &str| contexts.iter().find(|c| c.name == name).cloned();
+
+    let requested =
+        non_empty(flag_context.map(str::to_string)).or(non_empty(env_context.map(str::to_string)));
+    if let Some(name) = requested {
+        return lookup(&name)
+            .ok_or(ConfigError::UnknownContext {
+                name,
+                available: names(),
+            })
+            .map(Some);
+    }
+    if let Some(current) = non_empty(current_context.map(str::to_string)) {
+        // An explicit current-context that does not resolve is as much a typo
+        // as an explicit --context, and gets the same hard error.
+        return lookup(&current)
+            .ok_or(ConfigError::UnknownContext {
+                name: current,
+                available: names(),
+            })
+            .map(Some);
+    }
+    // No pointer: a single-context file (including a legacy `spec:` one) is
+    // unambiguous, so use it — §5.2's back-compat depends on this step.
+    // Several with no pointer selects NOTHING, so flags, env, and the default
+    // still apply.
+    Ok((contexts.len() == 1).then(|| contexts[0].clone()))
+}
+
 /// Pure precedence + selection resolution. No I/O and no env reads.
 ///
 /// Empty and whitespace-only values count as unset at every level — an
@@ -357,34 +440,13 @@ pub fn resolve_from(inputs: ResolveInputs) -> Result<ClientConfig, ConfigError> 
     let env_token = non_empty(env_token);
 
     // Selection: --context > $SKARDI_CONTEXT > current-context.
-    let requested = non_empty(flag_context).or(non_empty(env_context));
     let file = file.unwrap_or_default();
-    // ONCE per resolution: `effective_contexts` emits the both-shapes warning
-    // (§5.2), and calling it for the lookup and again for the name list
-    // printed that "warns once" twice on every unknown-context error.
-    let contexts = file.effective_contexts();
-    let lookup = |name: &str| contexts.iter().find(|c| c.name == name).cloned();
-    let names = || contexts.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
-    let selected = match &requested {
-        Some(name) => Some(lookup(name).ok_or_else(|| ConfigError::UnknownContext {
-            name: name.clone(),
-            available: names(),
-        })?),
-        None => match non_empty(file.current_context.clone()) {
-            // An explicit current-context that does not resolve is as much a
-            // typo as an explicit --context, and gets the same hard error.
-            Some(current) => Some(lookup(&current).ok_or_else(|| ConfigError::UnknownContext {
-                name: current,
-                available: names(),
-            })?),
-            // No pointer: a single-context file (including a legacy `spec:`
-            // one) is unambiguous, so use it. Several contexts with no
-            // current-context means nothing is selected — flags, env, and the
-            // default still apply, which keeps `--server` working on a file
-            // the operator has not pointed anywhere yet.
-            None => (contexts.len() == 1).then(|| contexts[0].clone()),
-        },
-    };
+    let selected = select_context(
+        &file.effective_contexts(),
+        file.current_context.as_deref(),
+        flag_context.as_deref(),
+        env_context.as_deref(),
+    )?;
 
     let Some(context) = selected else {
         return Ok(ClientConfig {
@@ -472,6 +534,51 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".skardi").join("config.yaml"))
 }
 
+/// The per-context keys this binary reads. Used only to spot a typo in
+/// [`warn_about_file`]; `Context::extra` still preserves whatever it is given.
+const KNOWN_CONTEXT_KEYS: [&str; 8] = [
+    "name",
+    "server",
+    "mode",
+    "workspace",
+    "user",
+    "token",
+    "token-id",
+    "token-expires-at",
+];
+
+/// Warn about a freshly-read file's shape. Called once per read, which is what
+/// makes "warns once" structural rather than a rule callers must remember.
+fn warn_about_file(file: &ContextsFile) {
+    if !file.contexts.is_empty() && file.spec.is_some() {
+        eprintln!(
+            "warning: config has both 'contexts:' and a legacy 'spec:' block; \
+             using 'contexts:' and ignoring 'spec:'"
+        );
+    }
+    // A key that differs from a real one only in case (or by a stray
+    // character) is preserved faithfully by `extra` and then IGNORED — and
+    // for `mode` that fails in the UNSAFE direction: `Mode: cloud` leaves the
+    // context at its `server` default, so the cloud-authoritative rule stops
+    // applying and $SKARDI_SERVER_URL can redirect a workspace PAT again.
+    // Preservation is still the right default for forward compatibility, so
+    // this makes the typo visible instead of refusing the key.
+    for context in &file.contexts {
+        for key in context.extra.keys() {
+            if let Some(known) = KNOWN_CONTEXT_KEYS
+                .iter()
+                .find(|k| k.eq_ignore_ascii_case(key))
+            {
+                eprintln!(
+                    "warning: context '{}' has key '{key}', which differs only in case \
+                     from '{known}'; it is being preserved but NOT read",
+                    context.name
+                );
+            }
+        }
+    }
+}
+
 /// Describe a YAML parse failure by POSITION, never by content.
 ///
 /// `serde_yaml`'s own Display quotes the offending scalar, so a file whose
@@ -497,9 +604,30 @@ pub fn describe_parse_error(err: &serde_yaml::Error) -> String {
 ///
 /// Mutations use [`load_for_mutation`] instead, which refuses the same file.
 pub fn load(path: &Path) -> Option<ContextsFile> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        // Absence is the common case and says nothing.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        // Anything else is a file the operator believes is in effect. Falling
+        // through in silence is how a root-owned config (a `sudo` run, a
+        // restored backup, a container volume with another uid) ends up
+        // resolving to http://127.0.0.1:8080 while they think they are
+        // talking to their gateway — the same failure the unknown-context and
+        // CloudContextWithoutServer guards exist to prevent, by a route
+        // nobody was watching. Still non-fatal per §5.4.
+        Err(err) => {
+            eprintln!(
+                "warning: ignoring unreadable config file {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
     match serde_yaml::from_str::<ContextsFile>(&content) {
-        Ok(file) => Some(file),
+        Ok(file) => {
+            warn_about_file(&file);
+            Some(file)
+        }
         Err(err) => {
             eprintln!(
                 "warning: ignoring malformed config file {}: {}",
@@ -534,18 +662,20 @@ pub fn load_for_mutation(path: &Path) -> Result<ContextsFile, ConfigError> {
             });
         }
         Err(err) => {
-            return Err(ConfigError::UnparsableForMutation {
+            return Err(ConfigError::UnreadableForMutation {
                 path: path.to_path_buf(),
                 error: err.to_string(),
             });
         }
     };
-    serde_yaml::from_str::<ContextsFile>(&content).map_err(|err| {
+    let file = serde_yaml::from_str::<ContextsFile>(&content).map_err(|err| {
         ConfigError::UnparsableForMutation {
             path: path.to_path_buf(),
             error: describe_parse_error(&err),
         }
-    })
+    })?;
+    warn_about_file(&file);
+    Ok(file)
 }
 
 /// Write `file` to `path` atomically, owner-readable only.
@@ -566,7 +696,7 @@ pub fn save(path: &Path, file: &ContextsFile) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    create_config_dir(parent)
         .with_context(|| format!("create config directory {}", parent.display()))?;
 
     // A pre-existing group- or world-readable config is a real exposure of a
@@ -611,6 +741,28 @@ pub fn save(path: &Path, file: &ContextsFile) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create the config directory owner-only.
+///
+/// `create_dir_all` applies the process umask, so a first `set-context` on a
+/// typical `umask 022` box left `~/.skardi` world-listable — the directory
+/// whose whole purpose is holding credentials. `~/.ssh` and `~/.gnupg` are
+/// 0700 for the same reason. `mode` applies only to directories this call
+/// CREATES, so a pre-existing loose one is untouched, mirroring
+/// [`warn_if_loose_permissions`]'s asymmetry for the file.
+#[cfg(unix)]
+fn create_config_dir(parent: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+}
+
+#[cfg(not(unix))]
+fn create_config_dir(parent: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(parent)
+}
+
 /// Delete leftover temp files for `stem` in `parent`.
 ///
 /// Only names matching the shape this module writes, only regular files, and
@@ -630,7 +782,24 @@ fn remove_stale_temp_files(parent: &Path, stem: &str, target: &Path) {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(&prefix));
-        if matches_shape && std::fs::remove_file(&candidate).is_err() {
+        if !matches_shape {
+            continue;
+        }
+        // Only what no live writer could still own. Without this the sweep
+        // deletes a CONCURRENT process's temp file between its create and its
+        // rename, turning the documented lost-edit race into that process
+        // failing with "replace … atomically: No such file or directory" —
+        // an error pointing at entirely the wrong thing.
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_TEMP_AGE);
+        if !stale {
+            continue;
+        }
+        if std::fs::remove_file(&candidate).is_err() {
             eprintln!(
                 "warning: could not remove leftover {} — it may hold a copy of a token",
                 candidate.display()
@@ -999,6 +1168,75 @@ mod tests {
         assert!(resolve_from(inputs(Some(blank))).is_err());
     }
 
+    #[test]
+    fn a_key_that_differs_only_in_case_is_preserved_but_not_read() {
+        // `Mode: cloud` lands in `extra`, `mode` takes its Server default, and
+        // the cloud-authoritative rule stops applying — so $SKARDI_SERVER_URL
+        // can redirect a workspace PAT again, one capital letter from correct.
+        // Preservation stays (forward compat); the typo becomes visible.
+        let handle = write(
+            "kind: client\ncontexts:\n\
+             \x20 - name: c\n    Mode: cloud\n    server: https://gw\n    token: t\n",
+        );
+        let loaded = load(handle.path()).expect("parses");
+        assert!(loaded.contexts[0].extra.contains_key("Mode"));
+        assert_eq!(loaded.contexts[0].mode, ContextMode::Server);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_not_mistaken_for_an_absent_one() {
+        // A root-owned or wrong-uid config used to fall through in total
+        // silence, so the operator talked to :8080 believing it was their
+        // gateway. Still non-fatal per §5.4, but no longer invisible. A
+        // directory stands in for any unreadable path, no privileges needed.
+        let dir = TempDir::new().unwrap();
+        assert_eq!(load(dir.path()), None);
+        assert_eq!(load(&dir.path().join("absent.yaml")), None);
+    }
+
+    #[test]
+    fn selection_is_shared_by_resolution_and_by_the_commands_that_report_it() {
+        let contexts = file().effective_contexts();
+        // The lone-context step, which the reporting commands used to miss.
+        assert_eq!(
+            select_context(&contexts[..1], None, None, None)
+                .unwrap()
+                .map(|c| c.name),
+            Some("acme/prod".to_string())
+        );
+        // A padded name resolves, where a raw-field comparison did not.
+        assert_eq!(
+            select_context(&contexts, Some("  local  "), None, None)
+                .unwrap()
+                .map(|c| c.name),
+            Some("local".to_string())
+        );
+        // The env var is honoured, and the flag outranks it.
+        assert_eq!(
+            select_context(&contexts, None, None, Some("local"))
+                .unwrap()
+                .map(|c| c.name),
+            Some("local".to_string())
+        );
+        assert_eq!(
+            select_context(&contexts, None, Some("acme/prod"), Some("local"))
+                .unwrap()
+                .map(|c| c.name),
+            Some("acme/prod".to_string())
+        );
+        // Several with no pointer selects nothing.
+        assert!(
+            select_context(&contexts, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        // An unknown name is the same hard error resolution raises.
+        assert!(matches!(
+            select_context(&contexts, None, Some("typo"), None).unwrap_err(),
+            ConfigError::UnknownContext { .. }
+        ));
+    }
+
     // ── per-field precedence, unchanged for server mode ──────────────────
 
     #[test]
@@ -1045,6 +1283,7 @@ mod tests {
             spec: Some(LegacySpec {
                 server: Some("http://legacy:8080".to_string()),
                 token: Some("legacy-token".to_string()),
+                ..LegacySpec::default()
             }),
             ..ContextsFile::default()
         };
@@ -1063,6 +1302,7 @@ mod tests {
         both.spec = Some(LegacySpec {
             server: Some("http://legacy:8080".to_string()),
             token: None,
+            ..LegacySpec::default()
         });
         let resolved = resolve_from(inputs(Some(both))).unwrap();
         assert_eq!(resolved.server, "https://gw.skardi.ai");
@@ -1173,6 +1413,16 @@ mod tests {
         // holds a full copy of every token. Nothing else ever removed them.
         let stale = dir.path().join(".config.yaml.tmp-99999-1");
         std::fs::write(&stale, "token: skardi_pat_from_a_crashed_run\n").unwrap();
+        // Backdated past the staleness threshold: the sweep deliberately
+        // leaves recent temp files alone, because one may belong to a
+        // concurrent writer between its create and its rename.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
         // World-readable, to prove the new file does not inherit the mode: the
         // old `create`+`truncate` path kept an existing file's bits and then
         // renamed it over the config.
@@ -1196,6 +1446,15 @@ mod tests {
         assert!(!stale.exists(), "the leftover token copy must be removed");
         assert!(decoy_dir.is_dir(), "a matching DIRECTORY must survive");
         assert!(unrelated.is_file(), "a non-temp sibling must survive");
+
+        // A FRESH temp file is left alone — it may be a live writer's, and
+        // deleting it would make that process fail its rename with a message
+        // pointing at the wrong thing entirely.
+        let live = dir.path().join(".config.yaml.tmp-424242-7");
+        std::fs::write(&live, b"in flight").unwrap();
+        save(&path, &file()).unwrap();
+        assert!(live.is_file(), "a recent temp file must not be swept");
+        std::fs::remove_file(&live).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1264,10 +1523,14 @@ mod tests {
         // without depending on the test user's privileges.
         let dir = TempDir::new().unwrap();
         let err = load_for_mutation(dir.path()).unwrap_err();
+        // Reported as UNREADABLE, not unparsable: "does not parse (Is a
+        // directory)" sent the operator hunting for a YAML error.
         assert!(
-            matches!(&err, ConfigError::UnparsableForMutation { path, .. } if path == dir.path()),
+            matches!(&err, ConfigError::UnreadableForMutation { path, .. } if path == dir.path()),
             "{err:?}"
         );
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        assert!(!err.to_string().contains("does not parse"), "{err}");
     }
 
     #[test]

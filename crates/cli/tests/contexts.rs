@@ -147,8 +147,31 @@ fn config_subcommands_create_list_switch_and_delete_contexts() {
         "{}",
         stdout(&out)
     );
+    // The POINTER is cleared, but `local` is now the only context left, so
+    // resolution's lone-context step selects it — and `current-context`
+    // reports that, because it answers with what the next command will
+    // actually use rather than with the raw field.
     let out = skardi(home, &["config", "current-context"]);
-    assert!(!out.status.success(), "no current context is an error exit");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "local");
+
+    // With a SECOND context and no pointer, nothing is selected and the
+    // command says so instead of guessing.
+    let out = skardi(
+        home,
+        &["config", "set-context", "third", "--server", "http://c:3"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = skardi(home, &["config", "current-context"]);
+    assert!(
+        !out.status.success(),
+        "ambiguous selection is an error exit"
+    );
+    // …and `--context` answers it, since that is what a real command honours.
+    let out = skardi(home, &["--context", "third", "config", "current-context"]);
+    assert_eq!(stdout(&out).trim(), "third");
+    let out = skardi(home, &["config", "delete-context", "third"]);
+    assert!(out.status.success(), "{}", stderr(&out));
 
     // And it is really gone.
     let out = skardi(home, &["config", "delete-context", "acme/prod"]);
