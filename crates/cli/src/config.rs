@@ -1182,9 +1182,20 @@ mod tests {
             std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
 
+        // A DIRECTORY whose name matches the temp shape must be left alone:
+        // the sweep deletes files, and a blind remove would either fail the
+        // save or destroy something it does not own.
+        let decoy_dir = dir.path().join(".config.yaml.tmp-dir");
+        std::fs::create_dir(&decoy_dir).unwrap();
+        // So must an unrelated dotfile that merely shares the prefix's start.
+        let unrelated = dir.path().join(".config.yaml.bak");
+        std::fs::write(&unrelated, b"keep me").unwrap();
+
         save(&path, &file()).unwrap();
 
         assert!(!stale.exists(), "the leftover token copy must be removed");
+        assert!(decoy_dir.is_dir(), "a matching DIRECTORY must survive");
+        assert!(unrelated.is_file(), "a non-temp sibling must survive");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1193,13 +1204,20 @@ mod tests {
         }
         // Two saves in one process must not collide on the temp name.
         save(&path, &file()).unwrap();
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        let leftovers = leftover_temp_files(dir.path());
+        assert!(leftovers.is_empty(), "left {leftovers:?}");
+    }
+
+    /// Collect leftover temp FILES (a directory that happens to match the
+    /// name is not a leftover — see the decoy in the sweep test).
+    fn leftover_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains(".tmp-"))
-            .collect();
-        assert!(leftovers.is_empty(), "left {leftovers:?}");
+            .collect()
     }
 
     #[test]
