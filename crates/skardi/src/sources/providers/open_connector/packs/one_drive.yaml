@@ -176,8 +176,17 @@ tables:
     # query and a whitespace-only query both pass validation and are
     # rejected by the executor's own trim check
     # (`ProviderRequestError(400, "query is required")`) — all three
-    # verified live. Declaring it a required resource is what keeps
-    # Skardi from ever generating those two executor-layer failures.
+    # verified live. Declaring it a required resource closes exactly ONE
+    # of those three: a binding with no `query` at all is refused at
+    # registration. The other two are NOT closed here, and the boundary
+    # is worth stating because it is easy to over-read: resource
+    # validation checks presence and non-null only (`mod.rs`'s
+    # `contains_key`, plus the config layer's null check), so
+    # `query: ""` and `query: "   "` both register cleanly and fail at
+    # SCAN time with the upstream 400s above. Loud either way — never a
+    # silent empty table — but a scan-time failure, not a config-time
+    # one. Trimming resource values would be an engine-wide policy
+    # change, not a pack decision.
     #
     # Notion's empty-query trick therefore does not transfer: there is no
     # spelling of "search everything", which is why the query is a

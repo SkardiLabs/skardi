@@ -105,7 +105,12 @@
 //!   MISSING query and a whitespace-only query both pass validation and
 //!   die in the executor's own trim check (`ProviderRequestError(400,
 //!   "query is required")`) — all three verified live. Declaring it
-//!   required is what keeps Skardi from ever generating the latter two.
+//!   required closes exactly one of the three: a binding with no
+//!   `query` is refused at REGISTRATION. It does not close the other
+//!   two, because resource validation is presence-and-non-null only, so
+//!   `query: ""` and `query: "   "` register cleanly and fail at SCAN
+//!   time on the upstream 400s. Loud either way, but config-time only
+//!   for the missing case.
 //!   Notion's empty-query trick does not transfer: there is no spelling
 //!   of "search the whole drive", which is why the term is a resource
 //!   (the binding pins it; the table is "the items matching this
@@ -931,10 +936,14 @@ mod tests {
         // `drive_items` is well-defined with no resource at all (the
         // executor lists the drive root's children), so every resource
         // is optional. `drive_item_search` cannot be: there is no
-        // spelling of "search everything", and a missing or
-        // whitespace-only query dies in the executor's own trim check
-        // rather than as `invalid_input` — declaring it required is what
-        // stops Skardi ever generating that call.
+        // spelling of "search everything", and a missing query dies in
+        // the executor's own trim check rather than as `invalid_input`
+        // — declaring it required is what stops Skardi ever generating
+        // that call. It stops only that one: a whitespace-only value
+        // passes resource validation (presence and non-null only) and
+        // fails at scan time instead
+        // (`a_search_binding_without_a_query_fails_before_any_http`
+        // covers the closed arm).
         let children = table("drive_items");
         assert!(children.required_resources.is_empty());
         assert_eq!(
@@ -1087,16 +1096,25 @@ mod tests {
         // with `minLength: 1` (so an EMPTY string is a schema-layer
         // `invalid_input` 400) but absent from any `required` array (so a
         // MISSING or whitespace-only query passes validation and dies in
-        // the executor's own trim check). Declaring it a required RESOURCE
-        // is what stops Skardi ever generating those two.
+        // the executor's own trim check). Declaring it a required
+        // RESOURCE stops Skardi generating the MISSING one; the
+        // whitespace-only one still reaches the wire, because resource
+        // validation checks presence and non-null, not emptiness.
         let search: Value = serde_json::from_str(include_str!(
             "fixtures/one_drive/contracts/inputs/search_items.json"
         ))
         .expect("input contract fixture parses");
         assert_eq!(search["properties"]["query"]["minLength"], json!(1));
+        // This pins an upstream DEFECT, so read a failure here the right
+        // way round: if a re-captured contract grows `required:
+        // ["query"]`, upstream has FIXED the gap and this assertion is
+        // what should change — the resource-level requirement below can
+        // then lean on schema validation instead of standing alone.
         assert!(
             search["required"].is_null(),
-            "the action does not require `query` itself: {}",
+            "upstream now declares a `required` array ({}) — if it contains \
+             `query`, the executor-layer gap this pack works around is fixed; \
+             update this assertion and the `query` rationale in the yaml",
             search["required"]
         );
         assert_eq!(table("drive_item_search").required_resources, &["query"]);

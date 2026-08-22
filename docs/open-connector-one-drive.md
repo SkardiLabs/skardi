@@ -176,6 +176,16 @@ items matching this binding's query" — the same shape as Notion's
 everything", so there is no complete-drive-listing table; bind one search
 per term you care about.
 
+**A blank `query` fails at scan time, not at startup.** Omitting the key
+entirely (or setting it to `~`) is refused at registration, naming the
+binding. But resource values are checked for presence, not for content,
+so `query: ""` and `query: "   "` both start up cleanly and then fail
+every scan with the gateway's own 400 (`invalid_input` for the empty
+string, `query is required` for whitespace — upstream validates the
+length but the executor trims). The failure is loud either way, never an
+empty table, but a typo'd blank query surfaces later than you would
+expect.
+
 Search is served by a different Microsoft backend (Substrate Search)
 than folder listings, and the live pass pinned four consequences:
 

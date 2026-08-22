@@ -149,8 +149,15 @@ splits into three live-verified behaviours:
 | `{"top": 200}` — omitted | passes validation, dies in the executor: `ProviderRequestError(400, "query is required")` |
 | `{"query": "   ", "top": 200}` | passes validation (length 1+), dies in the same executor trim check |
 
-Declaring `query` a required resource is what stops Skardi ever
-generating the latter two. Notion's empty-query trick does not transfer:
+Declaring `query` a required resource stops Skardi ever generating the
+OMITTED row — that binding is refused at registration. It does not stop
+the other two: resource validation checks presence and non-null only
+(`mod.rs` `contains_key` plus the config layer's null check), so
+`query: ""` and `query: "   "` register cleanly and fail at scan time on
+the upstream 400s above. Loud either way, but only the omitted case is
+caught at config time. Trimming resource values would be an engine-wide
+policy change (it would affect every pack), so it is deliberately not a
+pack-level decision. Notion's empty-query trick does not transfer:
 there is no spelling of "search the whole drive", so the term is a
 resource (the binding pins it; the table is "the drive items matching
 this binding's query" — the same semantics as `notion.block_children`
