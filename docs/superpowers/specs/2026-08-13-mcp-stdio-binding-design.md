@@ -19,9 +19,14 @@ Skardi gains its third agent-facing binding: an MCP (Model Context Protocol)
 server. v1 ships as a new CLI subcommand — `skardi mcp` — that speaks MCP over
 **stdio** to a local host (Claude Desktop, Cursor, any MCP client) and proxies
 every operation to a running `skardi-server` over REST, using the CLI's
-existing `ApiClient`. The server's *execution* path is untouched — no
-pipeline runs, no query executes, any differently than it does today. But
-this design does require one small, additive, **decided** server-side
+existing `ApiClient`. The host spawns `skardi mcp` as a long-lived child
+process from its own MCP config (see "Architecture") — the agent never
+invokes a CLI command; all it ever sees is the MCP tool surface. v1
+deliberately adds **no MCP transport to skardi-server itself**: no `/mcp`
+route, no new port, no OAuth. That is what makes it the cheapest, fastest
+path to a working MCP binding. The server's *execution* path is untouched
+— no pipeline runs, no query executes, any differently than it does today.
+But this design does require one small, additive, **decided** server-side
 change: `GET /pipelines` gains `description` and `parameters` fields it
 doesn't return today (Option A — see "Server-side change"). That change is
 a prerequisite for the bridge, not an optional enhancement — without it,
@@ -440,7 +445,10 @@ here needs `#[ignore]`, as all tests are self-contained.
 - **Streamable HTTP transport** (`/mcp` route in skardi-server) — the
   follow-up milestone; shares this projection logic. Where the shared code
   eventually lives (extracted crate vs. duplicated module) is decided then,
-  not pre-abstracted now.
+  not pre-abstracted now. Landing it will not retire the stdio bridge:
+  local hosts still have uneven support for remote MCP servers and their
+  auth flow, and pointing `--server` at a remote deployment already makes
+  `skardi mcp` a local gateway to it.
 - **Jobs tools** — MCP tool calls are synchronous; the submit/poll/cancel
   shape needs its own design if demand appears.
 - **OAuth / MCP authorization spec** — irrelevant to stdio; the Bearer
