@@ -141,28 +141,7 @@ async fn main() -> ExitCode {
             }
         }
     };
-    // `config` subcommands edit the file that resolution reads, so they must
-    // not be gated on that resolution succeeding — `set-context` is how an
-    // operator FIXES a config whose cloud context is missing its workspace.
-    if let Commands::Config { cmd } = cli.command {
-        return match commands::config::run(cmd) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
-    let config = match ClientConfig::resolve(cli.server, cli.token, cli.context) {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match dispatch(cli.command, &config).await {
+    match dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -174,12 +153,24 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Construct one `ApiClient` from `config` and dispatch `command` to its
+/// Resolve the connection config and dispatch `cli.command` to its
 /// implementation.
-async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()> {
-    let client = ApiClient::new(config)?;
+///
+/// Resolution is deliberately LAZY — inside this function, after the `config`
+/// arm — because `skardi config` edits the very file resolution reads.
+/// `set-context` is how an operator repairs a config whose cloud context is
+/// missing its workspace, so it must not be gated on that resolution
+/// succeeding. Handling it here rather than short-circuiting in `main` keeps
+/// one dispatch point and leaves no structurally unreachable arm behind.
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    if let Commands::Config { cmd } = cli.command {
+        return commands::config::run(cmd);
+    }
 
-    match command {
+    let config = ClientConfig::resolve(cli.server, cli.token, cli.context)?;
+    let client = ApiClient::new(&config)?;
+
+    match cli.command {
         Commands::Query {
             sql,
             file,
@@ -203,8 +194,7 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
 
         Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
 
-        // Handled before resolution in `main`, so the file can be repaired
-        // even when resolving it would fail.
-        Commands::Config { .. } => unreachable!("config is dispatched before resolution"),
+        // Returned above, before resolution.
+        Commands::Config { .. } => Ok(()),
     }
 }

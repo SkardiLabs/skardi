@@ -69,7 +69,10 @@ impl ContextMode {
 
 impl fmt::Display for ContextMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // `pad`, not `write_str`: a Display that writes directly ignores the
+        // formatter's width, so `{:<8}` silently did nothing and
+        // `get-contexts` printed ragged columns.
+        f.pad(self.as_str())
     }
 }
 
@@ -656,11 +659,14 @@ mod tests {
         })
         .unwrap_err();
 
-        let ConfigError::UnknownContext { name, available } = &err else {
-            panic!("expected UnknownContext, got {err:?}");
-        };
-        assert_eq!(name, "typo");
-        assert_eq!(available, &["acme/prod".to_string(), "local".to_string()]);
+        assert_eq!(
+            err,
+            ConfigError::UnknownContext {
+                name: "typo".to_string(),
+                available: vec!["acme/prod".to_string(), "local".to_string()],
+            }
+        );
+        assert!(err.to_string().contains("no context named 'typo'"));
         assert!(err.to_string().contains("Available: acme/prod, local"));
 
         // A dangling current-context is the same typo, and gets the same
@@ -708,13 +714,13 @@ mod tests {
             } else {
                 probe.env_token = Some("other-token".to_string());
             }
-            let err = resolve_from(probe).unwrap_err();
-            let ConfigError::EnvConflictsWithCloudContext { name, variable: v } = &err else {
-                panic!("expected EnvConflictsWithCloudContext, got {err:?}");
-            };
-            assert_eq!(name, "acme/prod");
-            assert_eq!(v, variable);
-            assert!(err.to_string().contains(variable));
+            assert_eq!(
+                resolve_from(probe).unwrap_err(),
+                ConfigError::EnvConflictsWithCloudContext {
+                    name: "acme/prod".to_string(),
+                    variable: variable.to_string(),
+                }
+            );
         }
     }
 
@@ -890,10 +896,10 @@ mod tests {
         // Mutation: refuse, naming the file and the parse error. Rewriting
         // from an empty tree would replace a credential-bearing file.
         let err = load_for_mutation(handle.path()).unwrap_err();
-        let ConfigError::UnparsableForMutation { path, .. } = &err else {
-            panic!("expected UnparsableForMutation, got {err:?}");
-        };
-        assert_eq!(path, handle.path());
+        assert!(
+            matches!(&err, ConfigError::UnparsableForMutation { path, .. } if path == handle.path()),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("refusing to modify"));
     }
 
@@ -953,5 +959,68 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "a loose file is rewritten tighter");
         }
+    }
+
+    #[test]
+    fn an_unknown_context_on_a_file_with_none_says_so_instead_of_listing_nothing() {
+        // The empty-`available` arm: "Available: " with a bare comma-join
+        // would read as a truncated message.
+        let err = resolve_from(ResolveInputs {
+            flag_context: Some("anything".to_string()),
+            file: Some(ContextsFile::default()),
+            ..ResolveInputs::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("the config defines no contexts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_for_mutation_refuses_a_path_it_cannot_read_at_all() {
+        // Present but unreadable is NOT the same as absent: only absence may
+        // yield a fresh tree. A directory stands in for any unreadable path
+        // without depending on the test user's privileges.
+        let dir = TempDir::new().unwrap();
+        let err = load_for_mutation(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::UnparsableForMutation { path, .. } if path == dir.path()),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn save_reports_a_failed_rename_and_cleans_up_its_temp_file() {
+        // Renaming a file over a non-empty DIRECTORY fails, which is the one
+        // portable way to reach the cleanup branch. The temp file must not be
+        // left behind for the next run to trip over.
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("config.yaml");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("occupant"), b"x").unwrap();
+
+        let err = save(&target, &file()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("atomically"),
+            "the failure names what it was doing: {err:#}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn context_mode_renders_padded_so_listings_line_up() {
+        assert_eq!(ContextMode::Server.as_str(), "server");
+        assert_eq!(ContextMode::Cloud.as_str(), "cloud");
+        // The column `get-contexts` prints. A Display that writes directly
+        // would ignore the width and return "cloud" here.
+        assert_eq!(format!("[{:<8}]", ContextMode::Cloud), "[cloud   ]");
+        assert_eq!(format!("{}", ContextMode::Server), "server");
     }
 }

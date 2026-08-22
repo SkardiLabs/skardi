@@ -13,6 +13,8 @@ use crate::config::{self, Context, ContextMode, ContextsFile};
 use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
@@ -281,5 +283,276 @@ fn available(file: &ContextsFile) -> String {
         "(none)".to_string()
     } else {
         names.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ContextsFile, LegacySpec};
+    use tempfile::TempDir;
+
+    /// Each subcommand takes the config path, so every one is testable
+    /// IN-PROCESS against a temp file. That matters beyond speed: the
+    /// integration suite drives these same paths through the real binary, and
+    /// a spawned child's coverage is not instrumented by the coverage run, so
+    /// without these the whole module reads as untested.
+    fn temp() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        (dir, path)
+    }
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn reload(path: &Path) -> ContextsFile {
+        config::load(path).expect("parses")
+    }
+
+    #[test]
+    fn set_context_creates_updates_and_touches_only_named_fields() {
+        let (_dir, path) = temp();
+
+        set_context(
+            &path,
+            "local",
+            Some("http://127.0.0.1:9999".to_string()),
+            None,
+            None,
+            Some("keep-me".to_string()),
+            None,
+            true,
+        )
+        .unwrap();
+        let file = reload(&path);
+        assert_eq!(file.current_context.as_deref(), Some("local"));
+        assert_eq!(file.contexts[0].token.as_deref(), Some("keep-me"));
+
+        // A later --server must NOT clear the token the context already holds.
+        set_context(
+            &path,
+            "local",
+            Some("http://127.0.0.1:1234".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let file = reload(&path);
+        assert_eq!(file.contexts.len(), 1, "updated, not duplicated");
+        assert_eq!(
+            file.contexts[0].server.as_deref(),
+            Some("http://127.0.0.1:1234")
+        );
+        assert_eq!(file.contexts[0].token.as_deref(), Some("keep-me"));
+    }
+
+    #[test]
+    fn set_context_rejects_an_unknown_mode_and_a_workspaceless_cloud_context() {
+        let (_dir, path) = temp();
+
+        let err = set_context(
+            &path,
+            "x",
+            None,
+            Some("kloud".to_string()),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be 'server' or 'cloud'"),
+            "{err}"
+        );
+        assert!(!path.exists(), "a rejected mode must not create the file");
+
+        // Refused at write time rather than left to fail at the next command.
+        let err = set_context(
+            &path,
+            "c",
+            None,
+            Some("cloud".to_string()),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a workspace"), "{err}");
+    }
+
+    #[test]
+    fn use_context_switches_and_refuses_an_unknown_name() {
+        let (_dir, path) = temp();
+        set_context(
+            &path,
+            "a",
+            Some("http://a:1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        set_context(
+            &path,
+            "b",
+            Some("http://b:2".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        use_context(&path, "b").unwrap();
+        assert_eq!(reload(&path).current_context.as_deref(), Some("b"));
+
+        let err = use_context(&path, "nope").unwrap_err();
+        assert!(err.to_string().contains("no context named 'nope'"), "{err}");
+        assert!(err.to_string().contains("Available: a, b"), "{err}");
+        assert_eq!(
+            reload(&path).current_context.as_deref(),
+            Some("b"),
+            "a refused switch leaves the pointer alone"
+        );
+    }
+
+    #[test]
+    fn use_context_on_an_empty_file_says_there_are_none() {
+        let (_dir, path) = temp();
+        let err = use_context(&path, "any").unwrap_err();
+        // The "(none)" arm of `available` — a listing with nothing to list.
+        assert!(err.to_string().contains("Available: (none)"), "{err}");
+    }
+
+    #[test]
+    fn delete_context_clears_a_dangling_current_pointer() {
+        let (_dir, path) = temp();
+        set_context(
+            &path,
+            "a",
+            Some("http://a:1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        delete_context(&path, "a").unwrap();
+        let file = reload(&path);
+        assert!(file.contexts.is_empty());
+        // Left set, every later command would be a hard unknown-context error.
+        assert_eq!(file.current_context, None);
+
+        let err = delete_context(&path, "a").unwrap_err();
+        assert!(err.to_string().contains("no context named 'a'"), "{err}");
+    }
+
+    #[test]
+    fn delete_context_promotes_a_legacy_spec_before_removing_from_it() {
+        let (_dir, path) = temp();
+        write(
+            &path,
+            "kind: client\nspec:\n  server: http://legacy:8080\n  token: legacy-token\n",
+        );
+
+        // The legacy block has no `contexts:`, so the delete has to promote it
+        // first — otherwise `default` is invisible and the delete is a no-op.
+        delete_context(&path, config::LEGACY_CONTEXT_NAME).unwrap();
+        let file = reload(&path);
+        assert!(file.contexts.is_empty());
+        assert!(file.spec.is_none(), "the promoted block is not left behind");
+    }
+
+    #[test]
+    fn get_contexts_and_current_context_report_what_the_file_holds() {
+        let (_dir, path) = temp();
+
+        // Empty file: both are informative rather than crashing.
+        get_contexts(&path).unwrap();
+        assert!(
+            current_context(&path).is_err(),
+            "no pointer is an error exit"
+        );
+
+        set_context(
+            &path,
+            "acme/prod",
+            Some("https://gw".to_string()),
+            Some("cloud".to_string()),
+            Some("acme-prod".to_string()),
+            None,
+            Some("xin@skardi.ai".to_string()),
+            true,
+        )
+        .unwrap();
+        // Exercises the row renderer, including the `*` marker and the
+        // `-` fallbacks for absent fields.
+        get_contexts(&path).unwrap();
+        current_context(&path).unwrap();
+
+        // A whitespace-only pointer counts as unset.
+        let mut file = reload(&path);
+        file.current_context = Some("   ".to_string());
+        config::save(&path, &file).unwrap();
+        assert!(current_context(&path).is_err());
+    }
+
+    #[test]
+    fn view_redacts_both_context_and_legacy_tokens_and_reports_a_missing_file() {
+        let (_dir, path) = temp();
+
+        // Missing file: `view` names it rather than printing nothing.
+        let err = view(&path, false).unwrap_err();
+        assert!(err.to_string().contains("cannot read"), "{err}");
+
+        // A legacy `spec:` token is redacted too — it is just as live as a
+        // context's, and only this path reaches it.
+        write(
+            &path,
+            "kind: client\nspec:\n  server: http://legacy:8080\n  token: legacy-secret\n",
+        );
+        view(&path, false).unwrap();
+        view(&path, true).unwrap();
+
+        // And an unparsable file is the one case `view` exists to diagnose.
+        write(&path, "contexts: [broken\n");
+        let err = view(&path, false).unwrap_err();
+        assert!(err.to_string().contains("does not parse"), "{err}");
+    }
+
+    #[test]
+    fn redaction_keeps_a_recognizable_prefix_without_a_usable_secret() {
+        let token = "skardi_pat_0123456789abcdef";
+        let redacted = redact(token);
+        assert!(redacted.starts_with("skardi_pat_0"), "{redacted}");
+        assert!(redacted.ends_with("(redacted)"), "{redacted}");
+        assert!(!redacted.contains("9abcdef"), "the tail must not survive");
+    }
+
+    #[test]
+    fn available_lists_names_or_says_none() {
+        let empty = ContextsFile::default();
+        assert_eq!(available(&empty), "(none)");
+
+        let legacy = ContextsFile {
+            spec: Some(LegacySpec {
+                server: Some("http://x:1".to_string()),
+                token: None,
+            }),
+            ..ContextsFile::default()
+        };
+        assert_eq!(available(&legacy), config::LEGACY_CONTEXT_NAME);
     }
 }
