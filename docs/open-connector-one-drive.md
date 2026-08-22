@@ -22,8 +22,8 @@ present page one as the whole collection).
 > 2026-08-19), and the live-data pass ran on 2026-08-21 against a real
 > personal (MSA) drive — raw probes plus end-to-end skardi-server scans
 > of every table through the live fingerprint gate. The pass changed the
-> pack once: **`drive_item_search` dropped `e_tag`/`c_tag`** (real
-> search rows never carry them), leaving 16 columns on `drive_items`
+> pack once: **`drive_item_search` dropped `e_tag`/`c_tag`** (no search
+> hit on that drive carried them), leaving 16 columns on `drive_items`
 > and 14 on the search table. Full findings in
 > [Live verification](#live-verification).
 
@@ -81,9 +81,10 @@ FROM saas.drive.drive_items
 WHERE folder_child_count IS NOT NULL
 ORDER BY folder_child_count DESC;
 
--- Search spans the whole drive, unlike a folder listing:
+-- Search spans the whole drive, unlike a folder listing. The schema is
+-- the BINDING name, so this reads the `drive_budget` binding above:
 SELECT name, parent_path, last_modified_date_time
-FROM saas.drive.drive_budget
+FROM saas.drive_budget.drive_item_search
 ORDER BY last_modified_date_time DESC;
 ```
 
@@ -122,8 +123,10 @@ a folder"). The discriminator has one live-witnessed gap: a `remoteItem`
 stub (OneDrive's Personal Vault appears as one) carries **neither facet
 and no `webUrl`**, so such a row is NULL in all three columns. `e_tag`
 changes on any change, `c_tag` only on a *content* change, so the pair
-separates a rename from a real edit — children rows carry both on every
-live row; search rows never do, which is why the search table drops them.
+separates a rename from a real edit — children rows carried both on every
+live row, while search hits on the same drive carried neither, which is
+why the search table drops them (scope and caveat under
+[`drive_item_search`](#drive_item_search)).
 
 `description` is declared upstream and stays mapped (so drift stays
 loud), but **2800+ live rows never carried it** — an all-NULL
@@ -165,7 +168,9 @@ validation and then fails.
 one folder level; `folder_child_count` reveals that subfolders have
 contents without enumerating them. This is a documented limitation of the
 table, not a defect: the collection it claims to be does terminate
-completely. To see a whole drive, use `drive_item_search`.
+completely — upstream, that is; the deployment's own scan bounds still
+apply, see [Pagination](#pagination). To see a whole drive, use
+`drive_item_search`.
 
 ### `drive_item_search`
 
@@ -189,11 +194,17 @@ expect.
 Search is served by a different Microsoft backend (Substrate Search)
 than folder listings, and the live pass pinned four consequences:
 
-- **Reduced rows.** Search hits never carry `eTag`/`cTag` (hence the
-  14-column schema) or identity emails — `created_by_display_name` /
-  `last_modified_by_display_name` still populate, but from the search
-  profile, which was occasionally observed mangled (a stray
-  semicolon-joined value) where the same user's children rows were clean.
+- **Reduced rows.** On the personal (MSA) drive the pass covered, search
+  hits carried no `eTag`/`cTag` at all — zero occurrences across 1800+
+  hits, files and folders alike — which is why the search table maps 14
+  columns. The declared schema does list both, and a
+  business/SharePoint-backed drive is unprobed, so read this as a strong
+  observation about the Substrate projection rather than a contract
+  guarantee. Search hits carry no identity emails either;
+  `created_by_display_name` / `last_modified_by_display_name` still
+  populate, but from the search profile, which was occasionally observed
+  mangled (a stray semicolon-joined value) where the same user's
+  children rows were clean.
 - **Content matching, not just names.** The query matches file *content*
   as well as filenames, so a query can return files whose names do not
   contain the term. Recall is also not exhaustive — a term that names an
@@ -247,6 +258,17 @@ allowlisted path set. Consequences worth knowing:
   gateway or pack defect. The scan **fails loudly** through the failure
   envelope rather than truncating; a query whose hits fit one page
   (≤ `top`, i.e. up to 999 hits) terminates on a clean null and succeeds.
+
+The default safety bounds fail (never truncate) an unfiltered scan past
+`max_pages` × page-size rows. At the defaults that is 100 pages × 999
+rows = **99 900 items per scan**, failing with `ScanBoundsExceeded` — so
+`max_pages` binds first here by barely a hundred rows, closer than in any
+sibling pack, because this pack's large page size brings the two ceilings
+almost exactly together (`max_rows` defaults to 100 000). A drive big
+enough to matter will hit that before it finishes; raise
+`max_pages`/`max_rows` in the `open_connector:` block or narrow with
+`LIMIT` — see
+[the integration guide](open-connector.md#bounds-retries-and-errors).
 
 No filter is pushed down, and that is structural rather than an omission:
 **neither action exposes a filter input at all.** Predicates run locally
@@ -326,10 +348,12 @@ What the pass covered and settled:
   fingerprint gate against *live* discovery; both tables scanned under
   real bindings (root drive, `folderItemId`-scoped, two search terms);
   `LIMIT` stopped pagination after one request.
-- **Every `drive_items` column extracted a real non-NULL value**
-  somewhere except `description` (never witnessed on 2800+ rows — kept,
-  caveat recorded above). Every `drive_item_search` column extracted a
-  real value after the `e_tag`/`c_tag` drop — which is itself the pass's
+- **Every column extracted a real non-NULL value somewhere, on both
+  tables, with the same single exception: `description`.** It was never
+  witnessed on either — 2800+ children rows carried none, and neither
+  did the search hits (kept, caveat recorded above) — so the pass
+  witnessed 15 of `drive_items`' 16 columns and 13 of
+  `drive_item_search`'s 14. That second denominator is the pass's
   headline catch: the declared contract said sixteen columns, the wire
   said fourteen, and the wire wins.
 - **Pagination**: `top` bounds (999 ok, 1000/0 both 400), real

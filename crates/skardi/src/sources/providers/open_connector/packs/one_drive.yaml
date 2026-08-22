@@ -117,8 +117,9 @@ tables:
       # Graph's two concurrency tags are both mapped: `eTag` changes on
       # any item change, `cTag` only on CONTENT change, so the pair
       # distinguishes a metadata rename from a real edit. Children rows
-      # carry both on every live row; search rows never do (which is why
-      # drive_item_search drops them).
+      # carried both on every live row; search hits on the same drive
+      # carried neither (which is why drive_item_search drops them —
+      # scope and caveat in the module doc's phase-4 note).
       - { name: e_tag, path: eTag, type: utf8, nullable: true }
       - { name: c_tag, path: cTag, type: utf8, nullable: true }
       # ISO 8601 strings on the wire; `timestamp_ms_utc` names the Arrow

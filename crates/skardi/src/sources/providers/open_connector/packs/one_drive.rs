@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(
             batch.num_columns(),
             14,
-            "search rows never carry eTag/cTag, so the table maps 14 columns"
+            "no live search hit carried eTag/cTag, so the table maps 14 columns"
         );
         for dropped in ["e_tag", "c_tag"] {
             assert!(batch.column_by_name(dropped).is_none(), "{dropped}");
@@ -952,8 +952,8 @@ mod tests {
     fn empty_page_keeps_schema_stable() {
         // An empty drive folder must still produce the full declared
         // schema, or a first-page-empty scan would change shape. The two
-        // tables' widths differ on purpose: search rows never carry the
-        // concurrency tags (phase 4), so drive_item_search maps 14.
+        // tables' widths differ on purpose: no live search hit carried
+        // the concurrency tags (phase 4), so drive_item_search maps 14.
         for (short, columns) in [("drive_items", 16), ("drive_item_search", 14)] {
             let t = table(short);
             let batch = convert_page(t, &json!({"items": [], "nextLink": null}));
