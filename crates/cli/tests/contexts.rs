@@ -191,8 +191,9 @@ fn view_redacts_tokens_unless_asked() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!body.contains(secret), "the token leaked:\n{body}");
     assert!(body.contains("(redacted)"), "{body}");
-    // Enough of it survives to tell WHICH credential this is.
-    assert!(body.contains("skardi_pat_d"), "{body}");
+    // NO prefix survives. An earlier version kept twelve characters, which
+    // printed a short legacy token in full while labelling it redacted.
+    assert!(!body.contains("skardi_pat_d"), "a prefix leaked:\n{body}");
 
     let out = skardi(home, &["config", "view", "--show-tokens"]);
     assert!(stdout(&out).contains(secret), "--show-tokens prints it");
@@ -310,6 +311,70 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
         "{}",
         stderr(&out)
     );
+}
+
+/// A cloud context with no `server` must never reach the built-in local
+/// default, because its token is a workspace-scoped PAT. Driven through the
+/// binary because that is how the bug was found: the unit layer resolved the
+/// same config without complaint and `skardi query` really did POST to
+/// http://127.0.0.1:8080.
+#[test]
+fn a_cloud_context_without_a_server_never_falls_back_to_the_local_default() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let path = config_path(home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "kind: client\n\
+         current-context: acme/prod\n\
+         contexts:\n\
+         \x20 - name: acme/prod\n\
+         \x20   mode: cloud\n\
+         \x20   workspace: acme-prod\n\
+         \x20   token: skardi_pat_workspace_scoped\n",
+    )
+    .unwrap();
+
+    let out = skardi(home, &["query", "-e", "select 1"]);
+    // Exit 1, not the connect code 2: nothing was dialled.
+    assert_eq!(out.status.code(), Some(1), "stderr was: {}", stderr(&out));
+    let complaint = stderr(&out);
+    assert!(complaint.contains("names no server"), "{complaint}");
+    assert!(
+        complaint.contains("127.0.0.1:8080"),
+        "the message names the default it refused to use: {complaint}"
+    );
+    assert!(
+        !complaint.contains("skardi_pat_workspace_scoped"),
+        "the refusal must not echo the token: {complaint}"
+    );
+
+    // `--server` is a deliberate act and satisfies it; .invalid guarantees
+    // the failure is the DIAL (exit 2), proving resolution let it through.
+    let out = skardi(
+        home,
+        &["--server", "https://gw.invalid", "query", "-e", "select 1"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr was: {}", stderr(&out));
+
+    // The write path refuses the same shape, so it cannot be created this way.
+    let out = skardi(
+        home,
+        &[
+            "config",
+            "set-context",
+            "b",
+            "--mode",
+            "cloud",
+            "--workspace",
+            "w",
+            "--token",
+            "skardi_pat_y",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("needs a server"), "{}", stderr(&out));
 }
 
 /// A legacy single-server file keeps working, and its first edit promotes it

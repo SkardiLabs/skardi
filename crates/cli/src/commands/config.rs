@@ -199,13 +199,24 @@ fn set_context(
         context.user = Some(user);
     }
 
-    // Refused here rather than at the next command: a cloud context with no
-    // workspace cannot issue a request, so writing one is writing a dud.
-    if context.mode == ContextMode::Cloud && context.workspace.is_none() {
-        bail!(
-            "context '{name}' is mode: cloud, so it needs a workspace: pass \
-             --workspace SLUG"
-        );
+    // Refused here rather than at the next command: a cloud context missing
+    // either field cannot issue a request, so writing one is writing a dud.
+    // The server matters as much as the workspace — without it resolution
+    // would default to a LOCAL server while still sending the workspace PAT.
+    if context.mode == ContextMode::Cloud {
+        if context.workspace.is_none() {
+            bail!(
+                "context '{name}' is mode: cloud, so it needs a workspace: pass \
+                 --workspace SLUG"
+            );
+        }
+        if context.server.is_none() {
+            bail!(
+                "context '{name}' is mode: cloud, so it needs a server: pass \
+                 --server URL (a cloud context is never defaulted to a local \
+                 server — that would send its token there)"
+            );
+        }
     }
 
     if current {
@@ -270,11 +281,18 @@ fn view(path: &Path, show_tokens: bool) -> Result<()> {
     Ok(())
 }
 
-/// Keep enough of a token to recognize WHICH credential it is, without
-/// printing anything usable — the same reason `git` shows short hashes.
-fn redact(token: &str) -> String {
-    let visible: String = token.chars().take(12).collect();
-    format!("{visible}…(redacted)")
+/// Replace a token entirely. No prefix survives, deliberately.
+///
+/// An earlier version kept the first twelve characters so a reader could tell
+/// WHICH credential a context held. That is safe for a
+/// `skardi_pat_<random>` token and unsafe for anything shorter: a legacy
+/// `spec:` token is an arbitrary user string predating that format, so a
+/// six-character one printed in full — labelled `(redacted)`, which is worse
+/// than printing it plainly. The context NAME already identifies the
+/// credential, `--show-tokens` prints it when that is what you want, and
+/// `config view` is the command people run while screen-sharing.
+fn redact(_token: &str) -> String {
+    "(redacted)".to_string()
 }
 
 fn available(file: &ContextsFile) -> String {
@@ -385,6 +403,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("needs a workspace"), "{err}");
+
+        // And the server, for the same reason: without it resolution would
+        // default to a LOCAL server while still sending the workspace PAT.
+        let err = set_context(
+            &path,
+            "c",
+            None,
+            Some("cloud".to_string()),
+            Some("ws".to_string()),
+            Some("skardi_pat_x".to_string()),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a server"), "{err}");
+        assert!(
+            !path.exists(),
+            "a rejected cloud context must not be written"
+        );
+
+        // With both it lands.
+        set_context(
+            &path,
+            "c",
+            Some("https://gw".to_string()),
+            Some("cloud".to_string()),
+            Some("ws".to_string()),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -533,12 +583,16 @@ mod tests {
     }
 
     #[test]
-    fn redaction_keeps_a_recognizable_prefix_without_a_usable_secret() {
-        let token = "skardi_pat_0123456789abcdef";
-        let redacted = redact(token);
-        assert!(redacted.starts_with("skardi_pat_0"), "{redacted}");
-        assert!(redacted.ends_with("(redacted)"), "{redacted}");
-        assert!(!redacted.contains("9abcdef"), "the tail must not survive");
+    fn redaction_never_reveals_any_of_the_token_however_short_it_is() {
+        // The regression: a prefix-preserving redactor printed a SHORT token
+        // in full and labelled it `(redacted)`. Legacy `spec:` tokens are
+        // arbitrary user strings predating the `skardi_pat_` format, so short
+        // ones are ordinary — and `config view` is the screen-sharing command.
+        for token in ["abc123", "x", "skardi_pat_0123456789abcdef", "hunter2"] {
+            let redacted = redact(token);
+            assert_eq!(redacted, "(redacted)", "input {token}");
+            assert!(!redacted.contains(token), "token survived: {redacted}");
+        }
     }
 
     #[test]

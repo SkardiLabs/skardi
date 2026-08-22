@@ -7,6 +7,15 @@
 //! `spec: {server, token}` block, which resolves as a lone context named
 //! `default` so existing installs keep working with no migration step.
 //!
+//! Context SELECTION is `--context` > `$SKARDI_CONTEXT` > `current-context`,
+//! and then one step the design's §5.1 chain does not list: a file with
+//! exactly ONE context and no pointer selects it. That step is not a
+//! convenience — §5.2's legacy back-compat depends on it. A pre-contexts
+//! `spec:` file has no `current-context` to write, so without auto-selection
+//! its server and token would never be consulted and every existing install
+//! would silently start talking to the built-in default. Several contexts and
+//! no pointer selects NOTHING, so flags, env, and the default still apply.
+//!
 //! Precedence is per-field and differs by context mode, which is the one
 //! subtlety worth reading before changing anything here:
 //!
@@ -205,6 +214,13 @@ pub enum ConfigError {
     /// A cloud context with no `workspace` — the request would be ambiguous at
     /// the gateway, which answers `workspace_required`.
     CloudContextWithoutWorkspace { name: String },
+    /// A cloud context with no `server`. Without this the resolved server
+    /// falls through to [`DEFAULT_SERVER_URL`] while the token stays the
+    /// workspace-scoped PAT — the exact "quietly send a cloud query to a
+    /// local server" failure the unknown-context guard exists to prevent,
+    /// reached by a different route (found in review, reproduced against the
+    /// real binary).
+    CloudContextWithoutServer { name: String },
     /// An environment variable would override a cloud context's matched
     /// `{server, token}` pair. Named rather than silently applied or silently
     /// ignored (§5.1).
@@ -229,6 +245,14 @@ impl fmt::Display for ConfigError {
                 "context '{name}' is mode: cloud but names no workspace; \
                  add one with 'skardi config set-context {name} --workspace SLUG' \
                  or re-run 'skardi login'"
+            ),
+            Self::CloudContextWithoutServer { name } => write!(
+                f,
+                "context '{name}' is mode: cloud but names no server, and a cloud \
+                 context is never defaulted to {DEFAULT_SERVER_URL} — that would send \
+                 its workspace-scoped token to a local server. Set one with 'skardi \
+                 config set-context {name} --server URL', pass --server, or re-run \
+                 'skardi login'"
             ),
             Self::EnvConflictsWithCloudContext { name, variable } => write!(
                 f,
@@ -392,8 +416,17 @@ pub fn resolve_from(inputs: ResolveInputs) -> Result<ClientConfig, ConfigError> 
                 });
             }
         }
+        let server = flag_server.or_else(|| non_empty(context.server.clone()));
+        // Refused HERE, not left to the `unwrap_or_else` below: that default
+        // is correct for a server-mode context and catastrophic for a cloud
+        // one, which carries a workspace-scoped PAT.
+        if server.is_none() {
+            return Err(ConfigError::CloudContextWithoutServer {
+                name: context.name.clone(),
+            });
+        }
         (
-            flag_server.or_else(|| non_empty(context.server.clone())),
+            server,
             flag_token.or_else(|| non_empty(context.token.clone())),
         )
     } else {
@@ -755,6 +788,51 @@ mod tests {
 
         assert_eq!(resolved.server, "http://env:9000");
         assert_eq!(resolved.context.unwrap().mode, ContextMode::Server);
+    }
+
+    #[test]
+    fn a_cloud_context_without_a_server_is_refused_never_defaulted() {
+        // The regression this exists for: `server: None` fell through to the
+        // built-in default while `token` stayed the workspace PAT, so
+        // `skardi query` really did POST a cloud credential to
+        // http://127.0.0.1:8080. Reproduced against the real binary in review.
+        let mut serverless = file();
+        serverless.contexts[0].server = None;
+        let err = resolve_from(inputs(Some(serverless.clone()))).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::CloudContextWithoutServer {
+                name: "acme/prod".to_string()
+            }
+        );
+        assert!(err.to_string().contains(DEFAULT_SERVER_URL), "{err}");
+
+        // Whitespace counts as unset here as everywhere else.
+        let mut blank = file();
+        blank.contexts[0].server = Some("  ".to_string());
+        assert!(matches!(
+            resolve_from(inputs(Some(blank))).unwrap_err(),
+            ConfigError::CloudContextWithoutServer { .. }
+        ));
+
+        // --server satisfies it: a flag is a deliberate act at the point of
+        // use, and the resolved server is the flag's.
+        let resolved = resolve_from(ResolveInputs {
+            flag_server: Some("https://gw.example".to_string()),
+            file: Some(serverless),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.server, "https://gw.example");
+
+        // A SERVER-mode context with no server still defaults, as it always
+        // has — the default is only catastrophic for a cloud credential.
+        let mut local_only = file();
+        local_only.contexts[1].server = None;
+        local_only.current_context = Some("local".to_string());
+        let resolved = resolve_from(inputs(Some(local_only))).unwrap();
+        assert_eq!(resolved.server, DEFAULT_SERVER_URL);
+        assert_eq!(resolved.token, None);
     }
 
     #[test]
