@@ -137,7 +137,13 @@ level. That is what makes `drive_item_search` worth shipping.
 ### `one_drive.drive_item_search`
 
 Action `search_items`; **required resource `query`**, optional `driveId`.
-Same sixteen columns.
+Fourteen columns: `drive_items`' sixteen minus `e_tag`/`c_tag`. The
+declared schema is shared with `list_folder_children`, but phase 4 found
+real search rows are a reduced Substrate projection that never carries
+the concurrency tags (zero occurrences across 1800+ live hits, files and
+folders alike), so mapping them here would ship two always-NULL columns.
+See **Phase 4 results** below; the pairwise relation is pinned by
+`search_columns_are_drive_items_minus_the_two_concurrency_tags`.
 
 The requirement is real but not where it looks. The input schema's
 `required` array is EMPTY and `query` is merely `minLength: 1`, which
@@ -165,8 +171,9 @@ requiring a `blockId`) rather than a fixed input.
 
 ## Two decisions where this pack diverges from `outlook`
 
-**No `select` pin, and the reason is coverage.** All 16 columns of both
-tables resolve INSIDE the declared item schema — including the nested
+**No `select` pin, and the reason is coverage.** Every mapped column of
+both tables (16 on `drive_items`, 14 on `drive_item_search`) resolves
+INSIDE the declared item schema — including the nested
 `createdBy.user.displayName`, `parentReference.path`, `file.mimeType` and
 `folder.childCount` paths — so the fingerprint gate covers every one of
 them and the coverage-gap pin is EMPTY. Loudness then comes from two

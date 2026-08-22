@@ -495,7 +495,7 @@ event carrying the scan identity and error.
       helper quartet into `testutil` — seven-way duplication across the
       packs, so it belongs in its own cross-pack PR rather than a
       half-migration here.
-- [ ] 5.8 OneDrive pack (OAuth user token, cursor pagination over Graph
+- [x] 5.8 OneDrive pack (OAuth user token, cursor pagination over Graph
       `@odata.nextLink`, raw-passthrough rows): `drive_items`,
       `drive_item_search`. The second Microsoft 365 pack — Open Connector has
       no `microsoft365` service, so M365 ships one pack per service (`outlook`
@@ -528,8 +528,10 @@ event carrying the scan identity and error.
       mechanism is subtler than it looks: the input schema's `required` array
       is empty and `query` is only `minLength: 1`, so an EMPTY string 400s as
       `invalid_input` while a MISSING or whitespace-only query passes
-      validation and dies in the executor's own trim check — declaring it
-      required is what stops Skardi generating the latter two. Facet presence
+      validation and dies in the executor's own trim check. Declaring it
+      required closes only the MISSING case — the check is presence plus
+      non-null, so `query: " "` still registers cleanly and fails at scan
+      time on the gateway's own 400. Facet presence
       is the item-type discriminator (`file_mime_type` / `folder_child_count`,
       the latter keeping 0 distinct from NULL). Docs:
       `docs/open-connector-one-drive.md` + the status note in
@@ -566,9 +568,9 @@ event carrying the scan identity and error.
       pinned 999, `nextLink` is declared `format: uri`, `query` carries
       `minLength: 1` while no `required` array exists, and
       `filter`/`orderby`/`skip`/`page`/`perPage` are absent from the input
-      surface entirely. Verification: 25 new pack-scoped tests
+      surface entirely. Verification: 27 new pack-scoped tests
       (`cargo test -p skardi --lib sources::providers::open_connector::packs::one_drive`
-      — 14 contract/conversion plus 11 e2e: per-table wire-declaration scans
+      — 16 contract/conversion plus 11 e2e: per-table wire-declaration scans
       with exact key sets, null-cursor termination (the only spelling either
       action can emit, both declaring `nextLink` required), pagination-loop
       and failure-envelope arms, LIMIT early-stop proving `top` is NOT
