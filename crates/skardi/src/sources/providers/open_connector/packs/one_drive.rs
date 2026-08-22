@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
-    use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::json_to_arrow::{FieldType, RowConverter};
     use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
@@ -401,6 +401,92 @@ mod tests {
     }
 
     #[test]
+    fn wire_nulls_and_empty_strings_convert_without_failing_the_page() {
+        // INLINE synthetic, deliberately, and the two halves are here for
+        // different reasons. The live captures cannot carry a wire null
+        // in a mapped position (2800+ real rows simply had none), and the
+        // redaction audit's allowlists bar `""` from re-entering through
+        // a fixture at all — but a fixture is also a claim about what the
+        // wire looked like, and inventing rows inside one would make that
+        // claim false. So the shapes the pre-live fixtures used to pin
+        // live here instead.
+        //
+        // Both are distinct code paths from the ABSENT key every live row
+        // exercises. A present null must reach SQL as NULL rather than
+        // failing the page; the sharp one is the nested null
+        // (`parentReference: null` under the mapped path
+        // `$.parentReference.driveId`), which traverses THROUGH a null
+        // instead of reading one. And `""` must survive as `""`, or an
+        // empty display name and a missing one stop being distinguishable.
+        let page = json!({
+            "items": [
+                {
+                    "id": "FAB1234CD567890!900",
+                    "name": null,
+                    "webUrl": null,
+                    "description": null,
+                    "size": null,
+                    "eTag": null,
+                    "cTag": null,
+                    "createdDateTime": null,
+                    "lastModifiedDateTime": null,
+                    "createdBy": { "user": null },
+                    "lastModifiedBy": null,
+                    "parentReference": null,
+                    "file": { "mimeType": null },
+                    "folder": null
+                },
+                {
+                    "id": "FAB1234CD567890!901",
+                    "name": "",
+                    "webUrl": "",
+                    "description": "",
+                    "eTag": "",
+                    "cTag": "",
+                    "createdBy": { "user": { "displayName": "" } },
+                    "lastModifiedBy": { "user": { "displayName": "" } },
+                    "parentReference": { "driveId": "", "id": "", "path": "" },
+                    "file": { "mimeType": "" }
+                }
+            ],
+            "nextLink": null
+        });
+        let batch = convert_page(table("drive_items"), &page);
+        assert_eq!(batch.num_rows(), 2);
+
+        // Every nullable column, whatever its arrow type, and whether the
+        // null is the leaf itself or an ancestor of it.
+        const TEXT_COLUMNS: [&str; 11] = [
+            "name",
+            "web_url",
+            "description",
+            "e_tag",
+            "c_tag",
+            "created_by_display_name",
+            "last_modified_by_display_name",
+            "parent_drive_id",
+            "parent_id",
+            "parent_path",
+            "file_mime_type",
+        ];
+        assert_eq!(utf8(&batch, "id").value(0), "FAB1234CD567890!900");
+        for column in TEXT_COLUMNS {
+            assert!(utf8(&batch, column).is_null(0), "{column} must be NULL");
+        }
+        assert!(int64(&batch, "size").is_null(0));
+        assert!(int64(&batch, "folder_child_count").is_null(0));
+        assert!(timestamp(&batch, "created_date_time").is_null(0));
+        assert!(timestamp(&batch, "last_modified_date_time").is_null(0));
+
+        // Empty is NOT null — at the leaf and through a nest alike.
+        for column in TEXT_COLUMNS {
+            let values = utf8(&batch, column);
+            assert!(values.is_valid(1), "{column}: empty is not null");
+            assert_eq!(values.value(1), "", "{column}");
+        }
+    }
+
+    #[test]
     fn identity_arms_other_than_user_leave_the_display_name_null() {
         // Graph's identitySet has user/application/device arms and this
         // pack maps ONLY the user arm (see the yaml rationale). An
@@ -545,6 +631,109 @@ mod tests {
                 }
             }
             const SYNTHETIC_CID: &str = "fab1234cd567890";
+            // No shape can vouch for a name, so the set is explicit — a
+            // real one fails. Shared by every place a name can travel:
+            // the `name` key, a `path` segment, and a `webUrl` segment.
+            // Product constants and OS-default folder/file names stay
+            // verbatim; `copilotUploads`/`documents` arrive via
+            // `specialFolder.name`.
+            const REDACTED_NAMES: &[&str] = &[
+                "Microsoft Copilot Chat 文件",
+                "Personal Vault",
+                "Documents",
+                "文档",
+                "桌面",
+                "Document1.docx",
+                "工作簿1.xlsx",
+                "WeChat Files",
+                "图片1.png",
+                "示例报告.docx",
+                "copilotUploads",
+                "documents",
+                "wrong-types.bin",
+            ];
+            // Search rows percent-encode CJK path segments where children
+            // rows send them literally, so one allowlist covers both
+            // spellings only after decoding. Invalid UTF-8 decodes to the
+            // empty string, which is on no allowlist — default-deny holds.
+            fn percent_decode(seg: &str) -> String {
+                let b = seg.as_bytes();
+                let mut out = Vec::with_capacity(b.len());
+                let mut i = 0;
+                while i < b.len() {
+                    match (b[i], b.get(i + 1), b.get(i + 2)) {
+                        (b'%', Some(hi), Some(lo)) => {
+                            match (char::from(*hi).to_digit(16), char::from(*lo).to_digit(16)) {
+                                (Some(hi), Some(lo)) => {
+                                    out.push((hi * 16 + lo) as u8);
+                                    i += 3;
+                                }
+                                _ => {
+                                    out.push(b[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        _ => {
+                            out.push(b[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                String::from_utf8(out).unwrap_or_default()
+            }
+            // A URL is only as redacted as its PARTS. The host and the cid
+            // are what the arms below pin, but the per-item ids and the
+            // human-readable segments ride in the same string and vary per
+            // ROW — which is exactly what a partial re-redaction leaves
+            // behind (scrub the one global cid, miss the per-row `resid`).
+            // So every path segment and every query value is default-deny
+            // here too, on the same doctrine as the keys.
+            fn url_parts_are_redacted(s: &str) -> bool {
+                // Route, not identity: these carry no per-tenant data.
+                const STRUCTURAL_SEGMENTS: &[&str] = &[
+                    "personal",
+                    "user",
+                    "_layouts",
+                    "15",
+                    "doc.aspx",
+                    "download.aspx",
+                ];
+                let (path, query) = s.split_once('?').unwrap_or((s, ""));
+                let path_ok = path
+                    .split('/')
+                    // scheme, the empty authority slot, host — the arms
+                    // below pin the host itself.
+                    .skip(3)
+                    .filter(|seg| !seg.is_empty())
+                    .all(|seg| {
+                        let seg = percent_decode(seg);
+                        STRUCTURAL_SEGMENTS.contains(&seg.as_str())
+                            || REDACTED_NAMES.contains(&seg.as_str())
+                            || seg
+                                .trim_start_matches('0')
+                                .eq_ignore_ascii_case(SYNTHETIC_CID)
+                    });
+                let query_ok = query
+                    .split('&')
+                    .filter(|pair| !pair.is_empty())
+                    .all(|pair| match pair.split_once('=') {
+                        Some(("cid", v)) => v
+                            .trim_start_matches('0')
+                            .eq_ignore_ascii_case(SYNTHETIC_CID),
+                        // The two live id families, same as the `id` arm.
+                        Some(("id", v)) => {
+                            v.starts_with("FAB1234CD567890!") || repeated_digit_guid(v)
+                        }
+                        Some(("resid" | "UniqueId", v)) => repeated_digit_guid(v),
+                        Some(("tempauth", v)) => v.starts_with("v1e.SYNTHETIC"),
+                        // Non-identifying request knobs Graph appends.
+                        Some(("Translate", v)) => v == "false",
+                        Some(("ApiVersion", v)) => v == "2.0",
+                        _ => false,
+                    });
+                path_ok && query_ok
+            }
             match value {
                 Value::String(s) => {
                     let allowed = match key {
@@ -564,41 +753,26 @@ mod tests {
                                     && s[2..].bytes().all(|b| b == b'A'))
                                 || s.starts_with("01SYNTHETIC")
                         }
-                        // No shape can vouch for a filename, so the set is
-                        // explicit — a real one fails. Product constants
-                        // and OS-default folder/file names stay verbatim;
-                        // `copilotUploads`/`documents` arrive under this
-                        // same key via `specialFolder.name`.
-                        "name" => [
-                            "Microsoft Copilot Chat 文件",
-                            "Personal Vault",
-                            "Documents",
-                            "文档",
-                            "桌面",
-                            "Document1.docx",
-                            "工作簿1.xlsx",
-                            "WeChat Files",
-                            "图片1.png",
-                            "示例报告.docx",
-                            "copilotUploads",
-                            "documents",
-                            "wrong-types.bin",
-                        ]
-                        .contains(&s.as_str()),
+                        "name" => REDACTED_NAMES.contains(&s.as_str()),
                         // The places a real cid or tenant would hide: known
-                        // host shapes AND the synthetic cid in the URL.
+                        // host shapes AND the synthetic cid in the URL —
+                        // plus every remaining part, because the host and
+                        // the cid being right says nothing about the
+                        // per-row `resid` or a filename segment.
                         "webUrl" => {
-                            ((s.starts_with("https://onedrive.live.com")
+                            (((s.starts_with("https://onedrive.live.com")
                                 || s.starts_with(
                                     "https://my.microsoftpersonalcontent.com/personal/",
                                 ))
                                 && s.to_ascii_lowercase().contains(SYNTHETIC_CID))
-                                || s.starts_with("https://example-my.sharepoint.com/personal/user/")
+                                || s.starts_with("https://example-my.sharepoint.com/personal/user/"))
+                                && url_parts_are_redacted(s)
                         }
                         "@microsoft.graph.downloadUrl" => {
                             s.starts_with(
                                 "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx",
                             ) && s.contains("tempauth=v1e.SYNTHETIC")
+                                && url_parts_are_redacted(s)
                         }
                         "siteUrl" => {
                             s == "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890"
@@ -617,7 +791,19 @@ mod tests {
                                 || s == SYNTHETIC_CID
                                 || s.starts_with("b!Synthetic")
                         }
-                        "path" => s.starts_with("/drive/root:"),
+                        // Ancestor folder names live ONLY here — a nested
+                        // path is the sole carrier of its intermediate
+                        // segments, so nothing else in the row would catch
+                        // one. A prefix check is the shape check this
+                        // audit exists to reject, so the segments get the
+                        // same explicit treatment as `name`.
+                        "path" => s.strip_prefix("/drive/root:").is_some_and(|rest| {
+                            rest.split('/')
+                                .filter(|seg| !seg.is_empty())
+                                .all(|seg| {
+                                    REDACTED_NAMES.contains(&percent_decode(seg).as_str())
+                                })
+                        }),
                         "eTag" | "cTag" => synthetic_tag(s),
                         "siteId" | "listId" | "listItemUniqueId" | "webId" => {
                             repeated_digit_guid(s)
@@ -657,28 +843,51 @@ mod tests {
             }
         }
 
-        for (name, fixture) in [
-            (
-                "drive_items",
-                include_str!("fixtures/one_drive/drive_items.json"),
-            ),
-            (
-                "drive_item_search",
-                include_str!("fixtures/one_drive/drive_item_search.json"),
-            ),
-            (
-                "drive_items_type_mismatch",
-                include_str!("fixtures/one_drive/drive_items_type_mismatch.json"),
-            ),
-        ] {
+        // ENUMERATED, not listed. A hand-written roster audits whatever
+        // someone remembered to add to it, and this repo has already paid
+        // for that once — `loader.rs`'s builtin-asset test records
+        // discord.yaml shipping unlisted for a full milestone. Reading the
+        // directory means a fixture added later is audited by existing
+        // code, or fails loudly here.
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/sources/providers/open_connector/packs/fixtures/one_drive"
+        );
+        // `contracts/` holds declared JSON Schemas, not captured rows —
+        // the only subtree outside this audit, asserted rather than
+        // assumed so a future data-bearing subdirectory cannot hide.
+        let mut audited = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("the fixtures directory exists") {
+            let entry = entry.expect("readable directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().expect("file type").is_dir() {
+                assert_eq!(
+                    name, "contracts",
+                    "an un-audited subdirectory appeared under fixtures/one_drive"
+                );
+                continue;
+            }
+            let fixture = std::fs::read_to_string(entry.path()).expect("fixture is readable");
             assert!(
                 fixture.is_ascii(),
                 "{name}: fixtures stay ASCII so redaction is auditable by eye \
                  (CJK travels as \\u escapes)"
             );
-            let root: Value = serde_json::from_str(fixture).expect("fixture parses");
-            audit(name, "$", &root);
+            let root: Value = serde_json::from_str(&fixture).expect("fixture parses");
+            audit(&name, "$", &root);
+            audited.push(name);
         }
+        // Without this the whole audit passes vacuously on a bad path.
+        audited.sort();
+        assert_eq!(
+            audited,
+            [
+                "drive_item_search.json",
+                "drive_items.json",
+                "drive_items_type_mismatch.json"
+            ],
+            "every committed row fixture must be audited"
+        );
 
         // The tripwire must TRIP. Each probe is a leak class the real
         // captures actually contained before redaction.
@@ -706,6 +915,30 @@ mod tests {
             ),
             ("email", "1234567890@example.net"), // a real-shaped address
             ("ownerEmail", "person@example.com"), // a key the allowlist never saw
+            // PARTIAL redaction — the class every probe above misses,
+            // because each of those is wrong all the way through. These
+            // are correct exactly where the old arms looked and real
+            // everywhere else, which is what a re-capture actually
+            // produces: the one global cid gets scrubbed, the per-row
+            // identifiers and the folder names do not.
+            //
+            // An ancestor folder name, reachable through no other key.
+            ("path", "/drive/root:/Acme Merger"),
+            // Right host, synthetic cid — real per-row `resid`.
+            (
+                "webUrl",
+                "https://onedrive.live.com/personal/0fab1234cd567890/_layouts/15/doc.aspx?resid=AB12CD34-28DB-2034-800D-680000000000&cid=0fab1234cd567890",
+            ),
+            // Right host, synthetic cid — real filename in the path.
+            (
+                "webUrl",
+                "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/Documents/Acme Q3 headcount.xlsx",
+            ),
+            // Synthetic tempauth — real `UniqueId` beside it.
+            (
+                "@microsoft.graph.downloadUrl",
+                "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx?UniqueId=AB12CD34-28DB-2034-800D-680000000000&Translate=false&tempauth=v1e.SYNTHETIC.SYNTHETIC&ApiVersion=2.0",
+            ),
         ] {
             let probe = json!({ key: leak });
             assert!(
@@ -893,6 +1126,38 @@ mod tests {
                 "{short}: every column must stay inside the fingerprint gate"
             );
         }
+    }
+
+    #[test]
+    fn search_columns_are_drive_items_minus_the_two_concurrency_tags() {
+        // The yaml derives `drive_item_search`'s column list from
+        // `drive_items`' in prose ("MINUS the two concurrency tags"), and
+        // phase 4 made that literally true: same names, paths, types,
+        // nullability, same order. Prose cannot hold it. The width pins in
+        // `empty_page_keeps_schema_stable` catch an added or dropped
+        // column and the coverage gate above catches a path that leaves
+        // the declared schema, but a retype, a rename, a re-path to
+        // another declared key, or a reorder applied to ONE table slips
+        // past both and quietly turns that comment into a lie. Pin the
+        // pairwise relation itself, so any such edit must either land on
+        // both tables or consciously rewrite this test — and with it the
+        // claim it guards.
+        fn shape(t: &SourcePackTable) -> Vec<(&'static str, &'static str, FieldType, bool)> {
+            t.fields
+                .iter()
+                .map(|f| (f.name, f.path, f.field_type, f.nullable))
+                .collect()
+        }
+        const DROPPED: [&str; 2] = ["e_tag", "c_tag"];
+        let expected: Vec<_> = shape(table("drive_items"))
+            .into_iter()
+            .filter(|(name, ..)| !DROPPED.contains(name))
+            .collect();
+        assert_eq!(
+            shape(table("drive_item_search")),
+            expected,
+            "drive_item_search must be drive_items minus exactly {DROPPED:?}"
+        );
     }
 
     #[test]
