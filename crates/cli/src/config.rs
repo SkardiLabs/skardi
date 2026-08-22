@@ -407,9 +407,17 @@ pub fn resolve_from(inputs: ResolveInputs) -> Result<ClientConfig, ConfigError> 
     }
 
     let (server, token) = if mode == ContextMode::Cloud {
-        // The env is refused rather than ranked: see the module doc.
-        for (value, variable) in [(&env_server, SERVER_URL_ENV), (&env_token, API_TOKEN_ENV)] {
-            if value.is_some() {
+        // The env is refused rather than ranked (see the module doc), but
+        // only per field and only where it would actually WIN. A flag for
+        // the same field is a deliberate act at the point of use and takes
+        // precedence per §5.1 — erroring anyway made this error's own advice
+        // ("pass --server/--token to override") impossible to follow, which
+        // review caught by trying it.
+        for (env, flag, variable) in [
+            (&env_server, &flag_server, SERVER_URL_ENV),
+            (&env_token, &flag_token, API_TOKEN_ENV),
+        ] {
+            if env.is_some() && flag.is_none() {
                 return Err(ConfigError::EnvConflictsWithCloudContext {
                     name: context.name.clone(),
                     variable: variable.to_string(),
@@ -466,6 +474,25 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".skardi").join("config.yaml"))
 }
 
+/// Describe a YAML parse failure by POSITION, never by content.
+///
+/// `serde_yaml`'s own Display quotes the offending scalar, so a file whose
+/// broken line holds a credential prints it — and the read-side warning below
+/// fires on EVERY command for as long as the file stays broken, which is
+/// exactly the state these paths exist to survive. Line and column are what
+/// an operator needs in order to fix it; the value is already in the file in
+/// front of them.
+pub fn describe_parse_error(err: &serde_yaml::Error) -> String {
+    match err.location() {
+        Some(location) => format!(
+            "invalid YAML at line {}, column {}",
+            location.line(),
+            location.column()
+        ),
+        None => "invalid YAML".to_string(),
+    }
+}
+
 /// Load `path` for READING. Tolerant by design (§5.4): a missing file is
 /// `None`, and an unparsable one warns and resolves to `None` so that
 /// `--server`/`--token` still work while the operator fixes it. Never fatal.
@@ -479,7 +506,7 @@ pub fn load(path: &Path) -> Option<ContextsFile> {
             eprintln!(
                 "warning: ignoring malformed config file {}: {}",
                 path.display(),
-                err
+                describe_parse_error(&err)
             );
             None
         }
@@ -518,7 +545,7 @@ pub fn load_for_mutation(path: &Path) -> Result<ContextsFile, ConfigError> {
     serde_yaml::from_str::<ContextsFile>(&content).map_err(|err| {
         ConfigError::UnparsableForMutation {
             path: path.to_path_buf(),
-            error: err.to_string(),
+            error: describe_parse_error(&err),
         }
     })
 }
@@ -755,6 +782,62 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_flag_defuses_the_env_conflict_for_its_own_field_only() {
+        // The error told the operator to "pass --server/--token to override",
+        // and the check ran before flags were considered — so following that
+        // advice produced the same error. Per field, and only where the env
+        // would actually win.
+        let resolved = resolve_from(ResolveInputs {
+            flag_server: Some("https://explicit".to_string()),
+            env_server: Some("http://stale:1".to_string()),
+            file: Some(file()),
+            ..ResolveInputs::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.server, "https://explicit");
+
+        // The OTHER field is still refused: --server says nothing about
+        // $SKARDI_API_TOKEN.
+        assert_eq!(
+            resolve_from(ResolveInputs {
+                flag_server: Some("https://explicit".to_string()),
+                env_token: Some("stale-token".to_string()),
+                file: Some(file()),
+                ..ResolveInputs::default()
+            })
+            .unwrap_err(),
+            ConfigError::EnvConflictsWithCloudContext {
+                name: "acme/prod".to_string(),
+                variable: API_TOKEN_ENV.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_parse_complaint_names_a_position_never_the_offending_value() {
+        // The read-side warning fires on EVERY command while the file stays
+        // broken, and serde_yaml's Display quotes the offending scalar — so a
+        // token on the broken line was printed to stderr repeatedly.
+        let err =
+            serde_yaml::from_str::<ContextsFile>("kind: client\ncontexts: skardi_pat_leakme123\n")
+                .expect_err("this does not parse");
+        let complaint = describe_parse_error(&err);
+        assert!(
+            !complaint.contains("skardi_pat_leakme123"),
+            "the value leaked: {complaint}"
+        );
+        assert!(complaint.contains("line 2"), "{complaint}");
+
+        // And through the loader, which is what commands actually hit.
+        let handle = write("kind: client\ncontexts: skardi_pat_leakme123\n");
+        let err = load_for_mutation(handle.path()).unwrap_err();
+        assert!(
+            !err.to_string().contains("skardi_pat_leakme123"),
+            "the value leaked: {err}"
+        );
     }
 
     #[test]

@@ -260,9 +260,14 @@ fn view(path: &Path, show_tokens: bool) -> Result<()> {
     };
     let mut file: ContextsFile = match serde_yaml::from_str(&content) {
         Ok(file) => file,
-        // `view` is the diagnostic for a broken file, so it prints the parse
-        // error and the path rather than the tolerant loader's warning.
-        Err(err) => bail!("{} does not parse: {err}", path.display()),
+        // `view` is the diagnostic for a broken file — position and path, not
+        // the raw serde message, which quotes the offending scalar and would
+        // print a token from the very command that promises to redact them.
+        Err(err) => bail!(
+            "{} does not parse ({}). Open it to see the offending line",
+            path.display(),
+            config::describe_parse_error(&err)
+        ),
     };
     if !show_tokens {
         for context in &mut file.contexts {
