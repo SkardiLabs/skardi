@@ -286,6 +286,41 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
         "{complaint}"
     );
 
+    // An unknown $SKARDI_CONTEXT, not just an unknown --context: the env
+    // path had only unit coverage, and it is the one an agent harness sets.
+    let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
+        .env("HOME", home)
+        .env("SKARDI_CONTEXT", "also-typo")
+        .env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_API_TOKEN")
+        .args(["query", "-e", "select 1"])
+        .output()
+        .expect("spawn skardi");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no context named 'also-typo'"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the TOKEN half of the env conflict, which had no binary-level
+    // assertion at all — only the server half did.
+    let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
+        .env("HOME", home)
+        .env("SKARDI_API_TOKEN", "stale-token")
+        .env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_CONTEXT")
+        .args(["query", "-e", "select 1"])
+        .output()
+        .expect("spawn skardi");
+    assert_eq!(out.status.code(), Some(1));
+    let complaint = String::from_utf8_lossy(&out.stderr);
+    assert!(complaint.contains("SKARDI_API_TOKEN"), "{complaint}");
+    assert!(
+        !complaint.contains("stale-token"),
+        "the refusal must not echo the value: {complaint}"
+    );
+
     // A cloud context that lost its workspace (hand-edited) is refused with
     // the repair named.
     let path = config_path(home);
@@ -440,6 +475,14 @@ fn unknown_keys_survive_a_mutation() {
     assert!(out.status.success(), "{}", stderr(&out));
 
     let rewritten = std::fs::read_to_string(&path).unwrap();
-    assert!(rewritten.contains("future-top-level"), "{rewritten}");
-    assert!(rewritten.contains("future-per-context"), "{rewritten}");
+    // Key AND value: a rewrite that kept the key but dropped or blanked the
+    // value would still pass a name-only assertion while losing the setting.
+    assert!(
+        rewritten.contains("future-top-level: keep-me"),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains("future-per-context: keep-me-too"),
+        "{rewritten}"
+    );
 }

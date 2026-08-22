@@ -182,12 +182,6 @@ impl ContextsFile {
         }
     }
 
-    pub fn find(&self, name: &str) -> Option<Context> {
-        self.effective_contexts()
-            .into_iter()
-            .find(|c| c.name == name)
-    }
-
     pub fn context_names(&self) -> Vec<String> {
         self.effective_contexts()
             .into_iter()
@@ -275,6 +269,12 @@ impl std::error::Error for ConfigError {}
 
 /// The context a command resolved to, carried alongside the connection pair so
 /// callers can gate capabilities and render messages that name the context.
+///
+/// `token_expires_at` is populated but not yet read — M2's expiry check is its
+/// only consumer. That is a different case from the `workspace()` accessor
+/// removed from this milestone: a method with no callers is dead code, whereas
+/// this is a value resolution already computed while validating the context,
+/// so dropping it would mean re-deriving it in M2 for nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedContext {
     pub name: String,
@@ -359,32 +359,30 @@ pub fn resolve_from(inputs: ResolveInputs) -> Result<ClientConfig, ConfigError> 
     // Selection: --context > $SKARDI_CONTEXT > current-context.
     let requested = non_empty(flag_context).or(non_empty(env_context));
     let file = file.unwrap_or_default();
+    // ONCE per resolution: `effective_contexts` emits the both-shapes warning
+    // (§5.2), and calling it for the lookup and again for the name list
+    // printed that "warns once" twice on every unknown-context error.
+    let contexts = file.effective_contexts();
+    let lookup = |name: &str| contexts.iter().find(|c| c.name == name).cloned();
+    let names = || contexts.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
     let selected = match &requested {
-        Some(name) => Some(file.find(name).ok_or_else(|| ConfigError::UnknownContext {
+        Some(name) => Some(lookup(name).ok_or_else(|| ConfigError::UnknownContext {
             name: name.clone(),
-            available: file.context_names(),
+            available: names(),
         })?),
         None => match non_empty(file.current_context.clone()) {
             // An explicit current-context that does not resolve is as much a
             // typo as an explicit --context, and gets the same hard error.
-            Some(current) => {
-                Some(
-                    file.find(&current)
-                        .ok_or_else(|| ConfigError::UnknownContext {
-                            name: current,
-                            available: file.context_names(),
-                        })?,
-                )
-            }
+            Some(current) => Some(lookup(&current).ok_or_else(|| ConfigError::UnknownContext {
+                name: current,
+                available: names(),
+            })?),
             // No pointer: a single-context file (including a legacy `spec:`
             // one) is unambiguous, so use it. Several contexts with no
             // current-context means nothing is selected — flags, env, and the
             // default still apply, which keeps `--server` working on a file
             // the operator has not pointed anywhere yet.
-            None => {
-                let contexts = file.effective_contexts();
-                (contexts.len() == 1).then(|| contexts[0].clone())
-            }
+            None => (contexts.len() == 1).then(|| contexts[0].clone()),
         },
     };
 
@@ -552,6 +550,14 @@ pub fn load_for_mutation(path: &Path) -> Result<ContextsFile, ConfigError> {
 
 /// Write `file` to `path` atomically, owner-readable only.
 ///
+/// NOT serialized against a concurrent writer. Two `skardi config` processes
+/// racing on the same file both read, both build a tree, and the later rename
+/// wins, so one edit is silently lost. Each individual write stays atomic and
+/// mode-correct, which is what §5.3 promises; whole-operation exclusion needs
+/// file locking and is deliberately not added here — it would be this crate's
+/// first locking dependency, and `login` is where the race actually matters.
+/// Recorded so the gap is visible rather than assumed absent.
+///
 /// Temp file in the SAME directory then rename: a cross-filesystem rename is
 /// not atomic, and `~/.skardi` is where the target lives. The temp file is
 /// created `0600` before any bytes are written, so a token never exists in a
@@ -569,13 +575,23 @@ pub fn save(path: &Path, file: &ContextsFile) -> anyhow::Result<()> {
     warn_if_loose_permissions(path);
 
     let yaml = serde_yaml::to_string(file).context("serialize config")?;
-    let temp = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "config.yaml".to_string()),
-        std::process::id()
-    ));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.yaml".to_string());
+    // A crash between create and rename leaves a temp file holding a full copy
+    // of every token, and nothing else ever removed it. Sweep the strays we
+    // can see before adding another.
+    remove_stale_temp_files(parent, &stem, path);
+    // pid alone is both predictable and REUSABLE — two saves in one process
+    // collided on the same name — so the nanosecond disambiguates, and
+    // `create_new` below refuses an existing file rather than inheriting its
+    // mode.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let temp = parent.join(format!(".{stem}.tmp-{}-{unique}", std::process::id()));
 
     write_owner_only(&temp, yaml.as_bytes())
         .with_context(|| format!("write {}", temp.display()))?;
@@ -585,7 +601,42 @@ pub fn save(path: &Path, file: &ContextsFile) -> anyhow::Result<()> {
             anyhow::Error::new(err).context(format!("replace {} atomically", path.display()))
         );
     }
+    // The rename is durable only once the DIRECTORY entry is; without this a
+    // crash can leave neither the old file nor the new one. Best-effort: some
+    // filesystems refuse to open a directory for sync, and a config write must
+    // not fail for that.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
+}
+
+/// Delete leftover temp files for `stem` in `parent`.
+///
+/// Only names matching the shape this module writes, only regular files, and
+/// never the target itself. Best-effort: a stray we cannot remove must not
+/// fail the save, but it IS reported, because the file holds a token.
+fn remove_stale_temp_files(parent: &Path, stem: &str, target: &Path) {
+    let prefix = format!(".{stem}.tmp-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if candidate == target || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let matches_shape = candidate
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&prefix));
+        if matches_shape && std::fs::remove_file(&candidate).is_err() {
+            eprintln!(
+                "warning: could not remove leftover {} — it may hold a copy of a token",
+                candidate.display()
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -593,10 +644,13 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
+    // `create_new`, not `create` + `truncate`: `mode` applies only when the
+    // file is CREATED, so truncating a pre-existing group-readable temp file
+    // kept its mode and then renamed it over the config. Failing on an
+    // existing name is the safe direction, and the caller's name is unique.
     let mut handle = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     handle.write_all(bytes)?;
@@ -1106,6 +1160,44 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "left {leftovers:?}");
+    }
+
+    #[test]
+    fn save_sweeps_stale_temp_files_and_never_inherits_their_permissions() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        // A crash between create and rename leaves one of these behind, and it
+        // holds a full copy of every token. Nothing else ever removed them.
+        let stale = dir.path().join(".config.yaml.tmp-99999-1");
+        std::fs::write(&stale, "token: skardi_pat_from_a_crashed_run\n").unwrap();
+        // World-readable, to prove the new file does not inherit the mode: the
+        // old `create`+`truncate` path kept an existing file's bits and then
+        // renamed it over the config.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        save(&path, &file()).unwrap();
+
+        assert!(!stale.exists(), "the leftover token copy must be removed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Two saves in one process must not collide on the temp name.
+        save(&path, &file()).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "left {leftovers:?}");
     }

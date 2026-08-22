@@ -58,8 +58,9 @@ pub enum ConfigCmd {
         current: bool,
     },
 
-    /// Delete one context. Does not revoke its credential — see `skardi logout
-    /// --revoke` for that.
+    /// Delete one context. Does NOT revoke its credential: a PAT stays valid
+    /// until it is revoked in the console (or by a future `skardi logout
+    /// --revoke`, which does not exist yet).
     DeleteContext {
         /// context name
         name: String,
@@ -136,8 +137,14 @@ fn current_context(path: &Path) -> Result<()> {
 
 fn use_context(path: &Path, name: &str) -> Result<()> {
     let mut file = config::load_for_mutation(path)?;
-    if file.find(name).is_none() {
-        bail!("no context named '{name}'. Available: {}", available(&file));
+    // One call: `effective_contexts` warns when the file carries both shapes,
+    // and asking twice printed that "warns once" twice.
+    let names = file.context_names();
+    if !names.iter().any(|n| n == name) {
+        bail!(
+            "no context named '{name}'. Available: {}",
+            render_names(&names)
+        );
     }
     file.current_context = Some(name.to_string());
     config::save(path, &file)?;
@@ -162,6 +169,22 @@ fn set_context(
         Some("cloud") => Some(ContextMode::Cloud),
         Some(other) => bail!("--mode must be 'server' or 'cloud', not '{other}'"),
     };
+
+    // Trim, and treat whitespace-only as unset — exactly as resolution does.
+    // Without this `--workspace "  "` passed the cloud guard below and wrote
+    // the dud the guard exists to prevent: resolution then refused it, so the
+    // context could be created but never used.
+    let trimmed = |value: Option<String>| -> Option<String> {
+        value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let (server, workspace, token, user) = (
+        trimmed(server),
+        trimmed(workspace),
+        trimmed(token),
+        trimmed(user),
+    );
 
     let mut file = config::load_for_mutation(path)?;
     // A legacy `spec:`-only file gains its `default` context on first edit,
@@ -240,7 +263,11 @@ fn delete_context(path: &Path, name: &str) -> Result<()> {
     let before = file.contexts.len();
     file.contexts.retain(|c| c.name != name);
     if file.contexts.len() == before {
-        bail!("no context named '{name}'. Available: {}", available(&file));
+        let names: Vec<String> = file.contexts.iter().map(|c| c.name.clone()).collect();
+        bail!(
+            "no context named '{name}'. Available: {}",
+            render_names(&names)
+        );
     }
     // A dangling current-context would make every later command a hard error
     // (§5.1's unknown-context rule), so clear the pointer with the context.
@@ -254,6 +281,14 @@ fn delete_context(path: &Path, name: &str) -> Result<()> {
 }
 
 fn view(path: &Path, show_tokens: bool) -> Result<()> {
+    print!("{}", render_view(path, show_tokens)?);
+    Ok(())
+}
+
+/// Render what `view` prints. Separate from the printing so tests can assert
+/// the TEXT — the earlier test only checked that `view` returned `Ok`, which
+/// is why it did not notice that short tokens were being printed in full.
+fn render_view(path: &Path, show_tokens: bool) -> Result<String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => bail!("cannot read {}: {err}", path.display()),
@@ -279,11 +314,7 @@ fn view(path: &Path, show_tokens: bool) -> Result<()> {
             spec.token = spec.token.as_deref().map(redact);
         }
     }
-    print!(
-        "{}",
-        serde_yaml::to_string(&file).context("serialize config")?
-    );
-    Ok(())
+    serde_yaml::to_string(&file).context("serialize config")
 }
 
 /// Replace a token entirely. No prefix survives, deliberately.
@@ -300,8 +331,7 @@ fn redact(_token: &str) -> String {
     "(redacted)".to_string()
 }
 
-fn available(file: &ContextsFile) -> String {
-    let names = file.context_names();
+fn render_names(names: &[String]) -> String {
     if names.is_empty() {
         "(none)".to_string()
     } else {
@@ -427,6 +457,23 @@ mod tests {
             !path.exists(),
             "a rejected cloud context must not be written"
         );
+
+        // Whitespace is unset on the WRITE path too, as it is at resolution.
+        // Otherwise `--workspace "  "` passed this guard and wrote the dud the
+        // guard exists to prevent — creatable, then unusable.
+        let err = set_context(
+            &path,
+            "c",
+            Some("https://gw".to_string()),
+            Some("cloud".to_string()),
+            Some("   ".to_string()),
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a workspace"), "{err}");
+        assert!(!path.exists());
 
         // With both it lands.
         set_context(
@@ -573,13 +620,25 @@ mod tests {
         assert!(err.to_string().contains("cannot read"), "{err}");
 
         // A legacy `spec:` token is redacted too — it is just as live as a
-        // context's, and only this path reaches it.
+        // context's, and only this path reaches it. Asserted on the RENDERED
+        // text: the earlier version of this test only checked that `view`
+        // returned Ok, which is why it did not notice short tokens being
+        // printed in full.
         write(
             &path,
             "kind: client\nspec:\n  server: http://legacy:8080\n  token: legacy-secret\n",
         );
-        view(&path, false).unwrap();
-        view(&path, true).unwrap();
+        let redacted = render_view(&path, false).unwrap();
+        assert!(
+            !redacted.contains("legacy-secret"),
+            "the legacy token leaked:\n{redacted}"
+        );
+        assert!(redacted.contains("(redacted)"), "{redacted}");
+        // The rest of the file still renders, so `view` stays useful.
+        assert!(redacted.contains("http://legacy:8080"), "{redacted}");
+
+        let shown = render_view(&path, true).unwrap();
+        assert!(shown.contains("legacy-secret"), "--show-tokens prints it");
 
         // And an unparsable file is the one case `view` exists to diagnose.
         write(&path, "contexts: [broken\n");
@@ -601,10 +660,13 @@ mod tests {
     }
 
     #[test]
-    fn available_lists_names_or_says_none() {
-        let empty = ContextsFile::default();
-        assert_eq!(available(&empty), "(none)");
+    fn render_names_lists_names_or_says_none() {
+        assert_eq!(render_names(&[]), "(none)");
+        assert_eq!(render_names(&["a".to_string()]), "a");
+        assert_eq!(render_names(&["a".to_string(), "b".to_string()]), "a, b");
 
+        // A legacy `spec:` file reports its promoted name, so the listing in
+        // an error message is never empty just because `contexts:` is.
         let legacy = ContextsFile {
             spec: Some(LegacySpec {
                 server: Some("http://x:1".to_string()),
@@ -612,6 +674,9 @@ mod tests {
             }),
             ..ContextsFile::default()
         };
-        assert_eq!(available(&legacy), config::LEGACY_CONTEXT_NAME);
+        assert_eq!(
+            render_names(&legacy.context_names()),
+            config::LEGACY_CONTEXT_NAME
+        );
     }
 }
