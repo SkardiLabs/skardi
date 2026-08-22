@@ -817,6 +817,15 @@ mod tests {
     }
 
     #[test]
+    fn a_parse_complaint_without_a_position_still_says_something_useful() {
+        // Not every serde error carries a location — a `custom` one (which
+        // `Deserialize` impls raise) has none — and the fallback must not
+        // render an empty or misleading position.
+        let err = <serde_yaml::Error as serde::de::Error>::custom("no location here");
+        assert_eq!(describe_parse_error(&err), "invalid YAML");
+    }
+
+    #[test]
     fn a_parse_complaint_names_a_position_never_the_offending_value() {
         // The read-side warning fires on EVERY command while the file stays
         // broken, and serde_yaml's Display quotes the offending scalar — so a
