@@ -119,7 +119,7 @@ metadata: { name: weekly-churn }
 spec:
   query: |                                   # the varying window, parameterized
     SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs
-    WHERE cancelled_at > to_timestamp(to_unixtime(now()) - {days} * 86400)
+    WHERE cancelled_at > now() - CAST(concat({days}, ' days') AS INTERVAL)
     GROUP BY plan ORDER BY cancels DESC
 ```
 
