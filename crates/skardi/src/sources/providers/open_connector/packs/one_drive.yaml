@@ -42,10 +42,11 @@
 # Phase 4 (real rows, personal MSA drive, 2026-08-21) sharpened two
 # facts the declared contract could not show. First, the two actions
 # declare the same schema but do NOT return the same wire shape: search
-# rows are a reduced Substrate projection that never carries
-# `eTag`/`cTag`/`isAuthoritative` (zero occurrences across 1800+ rows,
-# file and folder hits alike), which is why drive_item_search maps
-# fourteen columns to drive_items' sixteen. Second, following a search
+# rows are a reduced Substrate projection that carried no
+# `eTag`/`cTag`/`isAuthoritative` on the personal drive probed (zero
+# occurrences across 1800+ rows, file and folder hits alike), which is
+# why drive_item_search maps fourteen columns to drive_items' sixteen; a
+# business/SharePoint drive is unprobed (design record R1). Second, following a search
 # continuation cursor fails SERVER-SIDE on a personal drive ("Error
 # Calling Substrate Search", deterministic, both `/me/drive` and
 # `/drives/{id}` forms, cursor forwarded byte-identically) — the scan
@@ -206,10 +207,12 @@ tables:
       optional: [driveId]
     # drive_items' column set MINUS the two concurrency tags: the
     # declared schema is shared, but real search rows are a reduced
-    # Substrate projection that never carries `eTag`/`cTag` (phase 4:
-    # zero occurrences across 1800+ live hits, files and folders alike),
-    # so mapping them here would ship two always-NULL columns — the
-    # exact defect the live pass exists to catch. The declared-but-
+    # Substrate projection that carried no `eTag`/`cTag` on the personal
+    # drive probed (phase 4: zero occurrences across 1800+ live hits,
+    # files and folders alike), so mapping them here would ship two
+    # always-NULL columns — the exact defect the live pass exists to
+    # catch. A business/SharePoint drive is unprobed: if it returns the
+    # tags, this table widens back to sixteen (design record R1). The declared-but-
     # unmapped list therefore grows by those two keys on this table.
     # `searchResult`, the one facet unique to this action's rows
     # (present on every live hit), stays unmapped: it is an opaque

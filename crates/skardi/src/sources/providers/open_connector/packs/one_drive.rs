@@ -19,9 +19,10 @@
 //! value somewhere (2800+ rows never carried `description` — kept, with
 //! the caveat recorded in the yaml); and the fixtures below are now
 //! REDACTED LIVE CAPTURES. Two findings changed the pack: search rows
-//! are a reduced Substrate projection that never carries
-//! `eTag`/`cTag`/`isAuthoritative`, so `drive_item_search` dropped
-//! those two columns (16 → 14); and following a search continuation
+//! are a reduced Substrate projection that carried no
+//! `eTag`/`cTag`/`isAuthoritative` on the personal drive probed, so
+//! `drive_item_search` dropped those two columns (16 → 14; a
+//! business/SharePoint drive is unprobed — design record R1); and following a search continuation
 //! cursor fails SERVER-SIDE on a personal drive ("Error Calling
 //! Substrate Search", deterministic, cursor forwarded byte-identically)
 //! — a loud provider_error through the failure envelope, never a silent

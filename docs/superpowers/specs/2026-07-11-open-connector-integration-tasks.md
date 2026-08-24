@@ -542,10 +542,18 @@ event carrying the scan identity and error.
       fingerprint gate; the design record's seven-item list is answered item
       by item in its "Phase 4 results" section. Highlights: the pass CHANGED
       the pack once — real search rows are a reduced Substrate projection
-      that never carries `eTag`/`cTag` (zero across 1800+ hits), so
-      `drive_item_search` dropped both columns (16 → 14; the wire wins over
-      the declared contract, exactly the always-NULL defect class the pass
-      exists to catch). The pre-identified silent-truncation risk is
+      that carried no `eTag`/`cTag` at all on the personal (MSA) drive
+      probed (zero across 1800+ hits), so `drive_item_search` dropped both
+      columns (16 → 14; the wire wins over the declared contract, exactly
+      the always-NULL defect class the pass exists to catch). ONE RESIDUAL
+      (design record R1): that reduction rests on a single personal drive
+      and a business/SharePoint-backed drive is unprobed. Being wrong is
+      asymmetric and silent — the tags are in the shared declared schema,
+      so neither the fingerprint gate nor the coverage gap would flag a
+      business drive that does return them — so re-probe `search_items`
+      there; if it carries the tags, widening the table back to 16 is the
+      expected outcome (additive for consumers, bump the pack version),
+      not a contract break. The pre-identified silent-truncation risk is
       CLOSED: allowlist-rejected cursors ERROR (400 `invalid_input`, probed
       in both cross-action directions), never null. The search cursor's
       parenthesized form passes the gateway allowlist but Graph itself
@@ -609,8 +617,9 @@ bounded safety defaults, null/empty/nested fixtures, docs.
   (no `select` pin needed, unlike outlook) and the shared driveItem
   fingerprint across both tables. Live verification (phase 4) ran
   2026-08-21 against a real MSA drive; its one pack-changing finding is
-  the search table's 14-column reduction (search rows never carry
-  `eTag`/`cTag` on the real wire).
+  the search table's 14-column reduction (search rows carried no
+  `eTag`/`cTag` on the MSA drive probed; a business/SharePoint drive is
+  unprobed — design record R1).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

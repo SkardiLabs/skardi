@@ -143,10 +143,11 @@ level. That is what makes `drive_item_search` worth shipping.
 Action `search_items`; **required resource `query`**, optional `driveId`.
 Fourteen columns: `drive_items`' sixteen minus `e_tag`/`c_tag`. The
 declared schema is shared with `list_folder_children`, but phase 4 found
-real search rows are a reduced Substrate projection that never carries
-the concurrency tags (zero occurrences across 1800+ live hits, files and
-folders alike), so mapping them here would ship two always-NULL columns.
-See **Phase 4 results** below; the pairwise relation is pinned by
+real search rows are a reduced Substrate projection that carried no
+concurrency tags on the personal drive probed (zero occurrences across
+1800+ live hits, files and folders alike), so mapping them here would
+ship two always-NULL columns. A business/SharePoint drive is unprobed —
+see **Phase 4 results** and residual **R1** below; the pairwise relation is pinned by
 `search_columns_are_drive_items_minus_the_two_concurrency_tags`.
 
 The requirement is real but not where it looks. The input schema's
@@ -308,10 +309,15 @@ root drive, a `folderItemId` scope and two search terms). Item by item:
    `description` (zero occurrences across 2800+ rows; kept, since it is
    declared in-schema and drift stays loud — the caveat is recorded in
    the yaml and pack doc). Search rows are a reduced Substrate
-   projection that NEVER carries `eTag`/`cTag`/`isAuthoritative` (zero
-   across 1800+ hits), so `drive_item_search` dropped `e_tag`/`c_tag`
-   (16 → 14 columns) — the wire wins over the declared contract, and
-   this is exactly the always-NULL defect class phase 4 exists to catch.
+   projection: on the personal (MSA) drive the pass covered they carried
+   NO `eTag`/`cTag`/`isAuthoritative` at all (zero across 1800+ hits,
+   files and folders alike), so `drive_item_search` dropped
+   `e_tag`/`c_tag` (16 → 14 columns) — the wire wins over the declared
+   contract, and this is exactly the always-NULL defect class phase 4
+   exists to catch. Read that as a strong observation about the Substrate
+   projection, not a contract guarantee: the declared schema does list
+   both keys and a business/SharePoint-backed drive is unprobed — see
+   residual item R1.
    Also witnessed: a `remoteItem` stub row (Personal Vault) with neither
    type facet and no `webUrl`; search identities are displayName-only;
    search `parent_drive_id` is lowercase without the leading zero while
@@ -346,6 +352,26 @@ root drive, a `folderItemId` scope and two search terms). Item by item:
    the right answer when the operator stated two scopes. Generalised
    rather than special-cased — alternative scoping resources (id-or-path,
    id-or-name) recur across providers.
+
+### Residual items
+
+**R1 — re-probe `search_items` on a business/SharePoint-backed drive.**
+The 16 → 14 reduction rests on ONE personal (MSA) drive. If a business
+drive does return the concurrency tags, this pack silently discards data
+it declared it could not get, and nothing here would say so: the tags sit
+in the shared declared schema, so the fingerprint gate is unaffected; an
+unmapped DECLARED key is not a coverage gap, so
+`no_column_escapes_the_fingerprint_gate` stays empty; and every fixture
+came from the one drive that was probed. The asymmetry is why this is
+tracked rather than left as a caveat in user-facing prose.
+
+If the tags are witnessed there, **widening `drive_item_search` back to
+16 is the expected outcome, not a contract break** — adding columns is
+additive for SQL consumers (`SELECT *` gains two, explicit column lists
+are unaffected). It does change the pack's stable schema, so bump
+`one_drive`'s pack version with the change, and
+`search_columns_are_drive_items_minus_the_two_concurrency_tags` becomes
+the test to delete rather than to work around.
 
 Provider API version: Microsoft Graph `v1.0`, pinned by the executors in
 every URL including the cursors Graph hands back.
