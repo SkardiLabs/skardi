@@ -193,7 +193,9 @@ plane is recorded in the config file and later runs need no flag for it.
 What it does, in order:
 
 1. Resolves the control plane, as above. With none of the three sources, it
-   stops and says so rather than guessing a host.
+   stops and says so rather than guessing a host. A plain-`http://`
+   non-loopback control plane is warned about here, before the browser opens:
+   this leg carries the sign-in assertion up and the minted credential back.
 2. Opens a browser against the identity provider, with PKCE (S256) and a
    `state` nonce, redirecting to a single-use listener on `127.0.0.1:<random
    port>`. It waits 120 seconds, then gives up and releases the port. A
@@ -257,7 +259,7 @@ available in v1: `login` prints the organizations and the way round it
 ### Signing out
 
 ```bash
-# Clear the current context's credential
+# Clear the current context's credential (cloud contexts only)
 skardi logout
 
 # Clear every cloud context's credential
@@ -272,6 +274,11 @@ Plain `logout` is a local edit: the credential leaves this machine but stays
 itself, so `--revoke` signs in again to call the control plane. The context
 itself (server, workspace, mode) is kept either way, so a later `login`
 refills it; removing the context entirely is `skardi config delete-context`.
+
+`logout` only touches **cloud** contexts — the ones `login` can mint again. A
+server-mode context's token was configured by hand and nothing can restore it,
+so clearing it is refused, with a pointer at `config delete-context` (or
+editing the file); `--all` skips those for the same reason.
 
 The local delete happens first, so an unreachable control plane still gets the
 credential off the machine. That means the token id — which lives only in the
