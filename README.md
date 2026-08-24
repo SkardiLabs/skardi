@@ -121,7 +121,7 @@ curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"days": 7}'
 ```
 
-Promotion is the first rung of ③, not the whole of it. The same ledger supports
+Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
 acting on *intentions*: when every weekday morning ends with the same GitHub +
 Slack queries, each declaring `purpose: "daily standup"`, the pattern isn't a
 pipeline — it's a routine, and any harness that can run an agent on a schedule
@@ -133,7 +133,8 @@ top of the ledger, like
 [`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) —
 no server changes required.
 
-Then back to ①, with one fewer thing your agent has to figure out from scratch.
+Then back to **Observe**, with one fewer thing your agent has to figure out from
+scratch.
 
 ---
 
