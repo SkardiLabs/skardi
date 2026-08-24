@@ -48,27 +48,12 @@ the agent will need, wrap each one by hand, and find out in production what you
 guessed wrong. Skardi inverts that. The agent gets one general way in, and the
 tools it ends up with are the ones it demonstrably reached for.
 
-```text
-     ┌──────────────────────────────────────────────────────────┐
-     │                                                          │
-     ▼                                                          │
- ① OBSERVE                                                      │
-   the agent asks anything, in SQL, and declares why            │
-   POST /query + ai_context ──▶ durable audit ledger            │
-     │                                                          │
-     ▼                                                          │
- ② LEARN                                                        │
-   read the ledger, group by session and purpose,               │
-   find the intentions that keep coming back                    │
-     │                                                          │
-     ▼                                                          │
- ③ ACT                                                          │
-   recurring queries become named pipelines; recurring          │
-   intentions become routines that run before they're asked     │
-     │                                                          │
-     └──────────────────────────────────────────────────────────┘
-                    the toolset grew itself
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="asset/loop-dark.svg">
+    <img src="asset/loop-light.svg" width="100%" alt="The loop — ① Observe: the agent asks anything, in SQL, and declares why (POST /query + ai_context → audit ledger). ② Learn: read the ledger, group by session and purpose, find the intentions that keep coming back. ③ Act: recurring queries become named pipelines; recurring intentions become routines that run before they're asked. The toolset grew itself.">
+  </picture>
+</p>
 
 **1 — Serve your data, with the ledger on.** One `ctx.yaml` names your sources
 ([full reference](docs/server.md)); `--query-audit-db` turns on the durable
@@ -306,9 +291,7 @@ ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
 [embeddings](docs/embeddings/) · [chunking](docs/chunk.md) ·
 [ONNX](docs/onnx_predict.md) · [LLM extraction](docs/llm_extract.md) ·
 [JSON packing](docs/json_pack.md) · [auth](docs/auth/) ·
-[observability](docs/observability.md) ·
-[roadmap](docs/roadmap.md) ·
-[design background](docs/agent_data_plane.md) *(predates the current framing)*.
+[observability](docs/observability.md).
 
 </details>
 
@@ -316,15 +299,35 @@ ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
 
 ## Community
 
-Building an agent on Skardi, or want to shape what lands next? Join us on
-[Discord](https://discord.gg/S5YQQPEV2m), file an issue, or open a PR. We read
-everything — and a ⭐️ helps other agent builders find the project.
+Pick the channel that fits:
+
+- [Discord](https://discord.gg/S5YQQPEV2m) — real-time chat, POC co-design,
+  and shaping what lands next.
+- [GitHub issues](https://github.com/SkardiLabs/skardi/issues) — bug reports
+  and feature requests; we'll pair with you on design and review.
+- [Security](#security) — vulnerabilities go to a private channel, never a
+  public issue.
+
+We read everything — and a ⭐️ helps other agent builders find the project.
 
 <p align="center">
   <a href="https://github.com/SkardiLabs/skardi">
     <img src="asset/skardi-star.gif" alt="Star Skardi" width="700">
   </a>
 </p>
+
+### Contributors
+
+<a href="https://github.com/SkardiLabs/skardi/graphs/contributors">
+  <img alt="Skardi contributors" src="https://contrib.rocks/image?repo=SkardiLabs/skardi" />
+</a>
+
+## Security
+
+Skardi sits between your agents and your data, so we treat reports seriously.
+Please don't post vulnerabilities as public issues — report them privately via
+[GitHub security advisories](https://github.com/SkardiLabs/skardi/security/advisories/new)
+and we'll follow up with you there.
 
 ## License
 
