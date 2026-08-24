@@ -193,6 +193,7 @@ mod tests {
     use arrow::array::{Array, Int64Array, StringArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
+    use percent_encoding::percent_decode_str;
     use serde_json::{Value, json};
 
     /// Every cursor here is URI-shaped on purpose: the gateway validates
@@ -678,30 +679,10 @@ mod tests {
             // spellings only after decoding. Invalid UTF-8 decodes to the
             // empty string, which is on no allowlist — default-deny holds.
             fn percent_decode(seg: &str) -> String {
-                let b = seg.as_bytes();
-                let mut out = Vec::with_capacity(b.len());
-                let mut i = 0;
-                while i < b.len() {
-                    match (b[i], b.get(i + 1), b.get(i + 2)) {
-                        (b'%', Some(hi), Some(lo)) => {
-                            match (char::from(*hi).to_digit(16), char::from(*lo).to_digit(16)) {
-                                (Some(hi), Some(lo)) => {
-                                    out.push((hi * 16 + lo) as u8);
-                                    i += 3;
-                                }
-                                _ => {
-                                    out.push(b[i]);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        _ => {
-                            out.push(b[i]);
-                            i += 1;
-                        }
-                    }
-                }
-                String::from_utf8(out).unwrap_or_default()
+                percent_decode_str(seg)
+                    .decode_utf8()
+                    .unwrap_or_default()
+                    .into_owned()
             }
             // A URL is only as redacted as its PARTS. The host and the cid
             // are what the arms below pin, but the per-item ids and the
