@@ -17,6 +17,31 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
+use std::time::Duration;
+
+/// Per-request ceiling on control-plane calls.
+///
+/// Bounded because of the ROLLBACK, not the happy path: a revoke that hangs
+/// forever leaves the operator watching a silent terminal while a live
+/// credential goes unreported, which is precisely the outcome §6.5 exists to
+/// prevent. Generous enough that a cold control plane still answers.
+pub const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client every control-plane conversation uses — `login`'s and
+/// `logout --revoke`'s alike.
+///
+/// One builder, so a caller cannot acquire an UNBOUNDED client by accident:
+/// `logout --revoke` did exactly that, and a stalled `DELETE` would have hung
+/// the command after the local credential was already gone. `timeout` is a
+/// parameter only so a test can prove the bound bites without waiting
+/// [`CONTROL_PLANE_TIMEOUT`] for it.
+pub fn client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .context("build the HTTP client for the control plane")
+}
 
 /// Cap on a control-plane response body. Memberships and one PAT are a few
 /// hundred bytes; this is the "something is very wrong" bound, and small

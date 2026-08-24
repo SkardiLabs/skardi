@@ -10,10 +10,11 @@
 
 use super::login::LogoutArgs;
 use crate::config::{self, ContextMode, ContextsFile};
-use crate::login::control_plane::ControlPlane;
+use crate::login::control_plane::{self, ControlPlane};
 use crate::login::oauth;
 use anyhow::{Context as _, Result, bail};
 use std::path::Path;
+use std::time::Duration;
 
 /// One context's credential, as it was before this command cleared it.
 struct Cleared {
@@ -24,29 +25,30 @@ struct Cleared {
 pub async fn run(args: LogoutArgs, flag_context: Option<String>) -> Result<()> {
     let path = config::default_config_path()
         .context("cannot determine the home directory for ~/.skardi/config.yaml")?;
-    run_at(
-        &path,
-        args,
-        flag_context.as_deref(),
-        std::env::var("SKARDI_CONTEXT").ok().as_deref(),
-        std::env::var("SKARDI_CONTROL_PLANE_URL").ok().as_deref(),
-    )
-    .await
+    let env = LogoutEnv {
+        flag_context: flag_context.as_deref(),
+        env_context: std::env::var("SKARDI_CONTEXT").ok(),
+        env_control_plane: std::env::var("SKARDI_CONTROL_PLANE_URL").ok(),
+        request_timeout: control_plane::CONTROL_PLANE_TIMEOUT,
+    };
+    run_at(path.as_path(), args, &env).await
 }
 
-/// The command with every ambient input passed in, so the whole thing —
-/// including `--revoke` — is testable in-process against a mock control plane.
-pub(crate) async fn run_at(
-    path: &Path,
-    args: LogoutArgs,
-    flag_context: Option<&str>,
-    env_context: Option<&str>,
-    env_control_plane: Option<&str>,
-) -> Result<()> {
+/// Everything `logout` reads from outside its own arguments, grouped so the
+/// command — `--revoke` included — is testable in-process against a mock
+/// control plane, and so the timeout is one value a caller cannot forget.
+pub(crate) struct LogoutEnv<'a> {
+    pub flag_context: Option<&'a str>,
+    pub env_context: Option<String>,
+    pub env_control_plane: Option<String>,
+    pub request_timeout: Duration,
+}
+
+pub(crate) async fn run_at(path: &Path, args: LogoutArgs, env: &LogoutEnv<'_>) -> Result<()> {
     // Read the ids BEFORE clearing them: after the write they are gone, and
     // --revoke needs them. The revoke runs after the local edit so a control
     // plane that cannot be reached still leaves the credential off this disk.
-    let cleared = clear_credentials(path, &args, flag_context, env_context)?;
+    let cleared = clear_credentials(path, &args, env.flag_context, env.env_context.as_deref())?;
     if cleared.is_empty() {
         println!("no cloud context held a credential — nothing to do");
         return Ok(());
@@ -81,7 +83,14 @@ pub(crate) async fn run_at(
         );
     }
 
-    let cp = authenticate(&args, path, env_control_plane).await?;
+    // Any failure BEFORE the first revoke — no client id, a timed-out
+    // browser, an unreachable control plane — happens after the ids have left
+    // the disk, so it must carry them. Otherwise the PAT stays live, its id is
+    // unrecoverable, and a retry answers "nothing to do" (round-7 P1).
+    let cp = match authenticate(&args, path, env).await {
+        Ok(cp) => cp,
+        Err(err) => return Err(err.context(unrevoked_warning(&revocable))),
+    };
     let mut failures = Vec::new();
     for entry in revocable {
         let token_id = entry.token_id.as_deref().unwrap_or_default();
@@ -97,6 +106,30 @@ pub(crate) async fn run_at(
         );
     }
     Ok(())
+}
+
+/// The line a pre-revoke failure must carry: which credentials are still live,
+/// which context each came from, and what to do about it.
+///
+/// The ids are already gone from the config file by the time this is needed —
+/// that ordering is deliberate, so an unreachable control plane still gets the
+/// credential off this machine — which is exactly why the error has to name
+/// them. They appear nowhere else.
+fn unrevoked_warning(revocable: &[&Cleared]) -> String {
+    let listed = revocable
+        .iter()
+        .map(|entry| {
+            format!(
+                "  {} (from context {})",
+                entry.token_id.as_deref().unwrap_or("(no token id)"),
+                entry.context
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "could not authenticate to revoke, and these credentials are STILL LIVE with their ids no longer on this machine — revoke them in the console:\n{listed}"
+    )
 }
 
 /// Clear `token`/`token-id`/`token-expires-at` from the selected contexts,
@@ -160,13 +193,12 @@ fn clear_credentials(
 
 /// Re-authenticate for `--revoke`, reusing `login`'s acquirers so the dev path
 /// and its loopback guard behave identically here.
-async fn authenticate(
-    args: &LogoutArgs,
-    path: &Path,
-    env_control_plane: Option<&str>,
-) -> Result<ControlPlane> {
-    let http = reqwest::Client::builder().no_proxy().build()?;
-    let control_plane = super::login::control_plane_for_revoke(args, path, env_control_plane)?;
+async fn authenticate(args: &LogoutArgs, path: &Path, env: &LogoutEnv<'_>) -> Result<ControlPlane> {
+    // The SAME bounded builder `login` uses. Rolling a local client here is
+    // how this path ended up unbounded, so there is now one place to get one.
+    let http = control_plane::client(env.request_timeout)?;
+    let control_plane =
+        super::login::control_plane_for_revoke(args, path, env.env_control_plane.as_deref())?;
     let bearer = match &args.identity {
         Some(identity) => {
             crate::login::check_dev_identity(
@@ -201,7 +233,7 @@ async fn authenticate(
 
 #[cfg(test)]
 mod tests {
-    use super::{LogoutArgs, run_at};
+    use super::{Duration, LogoutArgs, LogoutEnv, run_at};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -216,6 +248,17 @@ mod tests {
             client_id: None,
             identity: Some("dev:alice".to_string()),
             i_know_this_is_dev_auth: false,
+        }
+    }
+
+    /// The ambient inputs, with a short timeout so a stalled control plane
+    /// fails inside a test rather than after the production 30 seconds.
+    fn env(flag_context: Option<&str>) -> LogoutEnv<'_> {
+        LogoutEnv {
+            flag_context,
+            env_context: None,
+            env_control_plane: None,
+            request_timeout: Duration::from_millis(200),
         }
     }
 
@@ -262,9 +305,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let path = seed(&home, "http://127.0.0.1:1");
 
-        run_at(&path, args(false, false), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(false, false), &env(None)).await.unwrap();
 
         let file = yaml(&path);
         let prod = &file["contexts"][0];
@@ -287,9 +328,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let path = seed(&home, "http://127.0.0.1:1");
 
-        run_at(&path, args(true, false), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(true, false), &env(None)).await.unwrap();
 
         let file = yaml(&path);
         assert!(file["contexts"][0].get("token").is_none());
@@ -313,9 +352,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let path = seed(&home, &cp.uri());
 
-        run_at(&path, args(true, true), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(true, true), &env(None)).await.unwrap();
 
         let mut revoked: Vec<String> = cp
             .received_requests()
@@ -348,7 +385,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let path = seed(&home, &cp.uri());
 
-        let err = run_at(&path, args(false, true), None, None, None)
+        let err = run_at(&path, args(false, true), &env(None))
             .await
             .unwrap_err()
             .to_string();
@@ -378,7 +415,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = run_at(&path, args(false, true), None, None, None)
+        let err = run_at(&path, args(false, true), &env(None))
             .await
             .unwrap_err()
             .to_string();
@@ -422,9 +459,7 @@ mod tests {
         )
         .unwrap();
 
-        run_at(&path, args(true, true), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(true, true), &env(None)).await.unwrap();
 
         // Both credentials left the disk; only one could be revoked.
         let file = yaml(&path);
@@ -440,6 +475,60 @@ mod tests {
         assert_eq!(revoked, ["tok-prod"]);
     }
 
+    /// A pre-revoke failure happens AFTER the ids have left the disk, so it
+    /// must name them — otherwise the PAT stays live, its id is unrecoverable,
+    /// and a retry answers "nothing to do" (round-7 P1).
+    #[tokio::test]
+    async fn a_failure_before_revoking_names_every_still_live_credential() {
+        let home = TempDir::new().unwrap();
+        let path = seed(&home, "http://127.0.0.1:1");
+        let mut args = args(true, true);
+        args.identity = None; // forces the browser path, which has no client id
+
+        let err = format!("{:#}", run_at(&path, args, &env(None)).await.unwrap_err());
+
+        // Both ids, both contexts, and the recovery action.
+        assert!(err.contains("STILL LIVE"), "{err}");
+        assert!(err.contains("tok-prod"), "{err}");
+        assert!(err.contains("tok-staging"), "{err}");
+        assert!(err.contains("from context acme/prod"), "{err}");
+        assert!(err.contains("revoke them in the console"), "{err}");
+        // The underlying cause survives the annotation.
+        assert!(err.contains("--client-id"), "{err}");
+        // And the ids really are gone from disk, which is why the error had to
+        // carry them.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("tok-prod"), "{written}");
+    }
+
+    /// A control plane that accepts the DELETE and never answers must fail
+    /// within the bound rather than hanging after the credential is already
+    /// gone locally (round-7 P1).
+    #[tokio::test]
+    async fn a_stalled_revocation_fails_within_the_timeout() {
+        let cp = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(30)))
+            .mount(&cp)
+            .await;
+
+        let home = TempDir::new().unwrap();
+        let path = seed(&home, &cp.uri());
+
+        let started = std::time::Instant::now();
+        let err = run_at(&path, args(false, true), &env(None))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the revoke must be bounded, not wait out the control plane"
+        );
+        assert!(err.contains("still live"), "{err}");
+        assert!(err.contains("tok-prod"), "{err}");
+    }
+
     #[tokio::test]
     async fn nothing_to_clear_is_reported_rather_than_failing() {
         let home = TempDir::new().unwrap();
@@ -452,9 +541,7 @@ mod tests {
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        run_at(&path, args(true, false), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(true, false), &env(None)).await.unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -487,7 +574,7 @@ mod tests {
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = run_at(&path, args(false, false), None, None, None)
+        let err = run_at(&path, args(false, false), &env(None))
             .await
             .unwrap_err()
             .to_string();
@@ -504,14 +591,10 @@ mod tests {
         let home = TempDir::new().unwrap();
         let path = seed(&home, "http://127.0.0.1:1");
 
-        run_at(&path, args(true, false), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(true, false), &env(None)).await.unwrap();
         let after_first = std::fs::read_to_string(&path).unwrap();
 
-        run_at(&path, args(true, false), None, None, None)
-            .await
-            .unwrap();
+        run_at(&path, args(true, false), &env(None)).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
     }
 
@@ -525,12 +608,13 @@ mod tests {
         let mut args = args(false, true);
         args.identity = None;
 
-        let err = run_at(&path, args, None, None, None)
-            .await
-            .unwrap_err()
-            .to_string();
+        // `{:#}` renders the whole chain: the annotation names the still-live
+        // credential, and the cause names what was missing.
+        let err = format!("{:#}", run_at(&path, args, &env(None)).await.unwrap_err());
         assert!(err.contains("--client-id"), "{err}");
         assert!(err.contains("--identity dev:<id>"), "{err}");
+        // The id is reported, because it is no longer anywhere else.
+        assert!(err.contains("tok-prod"), "{err}");
         // The local clear still happened: the credential is off this machine
         // whether or not the control plane can be reached.
         assert!(yaml(&path)["contexts"][0].get("token").is_none());
@@ -541,7 +625,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let path = seed(&home, "http://127.0.0.1:1");
 
-        run_at(&path, args(false, false), Some("acme/staging"), None, None)
+        run_at(&path, args(false, false), &env(Some("acme/staging")))
             .await
             .unwrap();
 

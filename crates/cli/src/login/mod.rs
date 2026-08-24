@@ -29,14 +29,6 @@ use chrono::{DateTime, Duration, Utc};
 use control_plane::{ControlPlane, CpError, Membership, Minted};
 use std::path::Path;
 
-/// Per-request ceiling on control-plane and token-endpoint calls.
-///
-/// Bounded because of the ROLLBACK, not the happy path: a revoke that hangs
-/// forever leaves the operator watching a silent terminal while a live
-/// credential goes unreported, which is precisely the outcome §6.5 exists to
-/// prevent. Generous enough that a cold control plane still answers.
-const CONTROL_PLANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Default PAT lifetime (§6.1 step 5), as `--expires` spells it. A string so
 /// clap's default and this documented value are the same token, parsed by the
 /// same function a user-supplied one goes through.
@@ -90,6 +82,8 @@ pub struct LoginOptions {
     /// browser path covered rather than argued.
     pub open_browser: fn(&str) -> std::io::Result<()>,
     pub callback_timeout: std::time::Duration,
+    /// Ceiling on the post-mint verification probe (§6.1 step 6).
+    pub verify_timeout: std::time::Duration,
     /// The PAT's name at the control plane, `cli@<hostname>`.
     pub token_name: String,
     /// Injected so the expiry a test asserts is not the wall clock.
@@ -135,10 +129,7 @@ struct MintedRef {
 /// Run the whole flow. `config_path` is a parameter so tests write to a temp
 /// directory instead of the developer's own config.
 pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
-    let http = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(CONTROL_PLANE_TIMEOUT)
-        .build()?;
+    let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
     let bearer = acquire_bearer(&http, &options).await?;
     let cp = ControlPlane::new(http.clone(), &options.control_plane, bearer);
 
@@ -202,7 +193,7 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
         });
 
         if !options.no_verify
-            && let Err(err) = verify(&server, &membership, &token).await
+            && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
         {
             return Err(rollback(&cp, minted, err).await);
         }
@@ -438,7 +429,12 @@ fn resolve_server(options: &LoginOptions, membership: &Membership) -> Result<Str
 /// travels the exact path a real query will — same client, same
 /// `Skardi-Workspace` header — because a login that reports success while its
 /// first query would 403 is the failure this step exists to remove.
-async fn verify(server: &str, membership: &Membership, token: &Minted) -> Result<()> {
+async fn verify(
+    server: &str,
+    membership: &Membership,
+    token: &Minted,
+    timeout: std::time::Duration,
+) -> Result<()> {
     let probe = config::ClientConfig {
         server: server.to_string(),
         token: Some(token.token.clone()),
@@ -450,16 +446,27 @@ async fn verify(server: &str, membership: &Membership, token: &Minted) -> Result
         }),
     };
     let client = ApiClient::new(&probe)?;
-    client
-        .post("/query", &serde_json::json!({"sql": "select 1"}))
-        .await
-        .map_err(|err| {
-            anyhow!(
-                "the new credential for workspace '{}' could not query {server}: {err} — the context was not written (pass --no-verify to skip this check)",
-                membership.tenant_slug
-            )
-        })?;
-    Ok(())
+    let statement = serde_json::json!({"sql": "select 1"});
+    let probe_request = client.post("/query", &statement);
+
+    // BOUNDED here rather than on `ApiClient` itself: the same client runs
+    // `skardi query`, where a statement legitimately takes minutes, so a
+    // client-wide total timeout would cap real work. A gateway that accepts
+    // the connection and then never answers must not hang the flow — this is
+    // the one point past which a PAT exists and no context does, so the saga
+    // has to be reachable (§6.5).
+    match tokio::time::timeout(timeout, probe_request).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(anyhow!(
+            "the new credential for workspace '{}' could not query {server}: {err} — the context was not written (pass --no-verify to skip this check)",
+            membership.tenant_slug
+        )),
+        Err(_) => Err(anyhow!(
+            "the new credential for workspace '{}' got no answer from {server} within {}s — the context was not written (pass --no-verify to skip this check)",
+            membership.tenant_slug,
+            timeout.as_secs()
+        )),
+    }
 }
 
 /// The context name for a membership: `--context` when given, else

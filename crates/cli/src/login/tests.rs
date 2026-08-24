@@ -119,6 +119,7 @@ fn options(control_plane: &str, server_override: Option<&str>) -> LoginOptions {
         env_gateway_url: None,
         endpoints: oauth::Endpoints::default(),
         open_browser: oauth::open_in_browser,
+        verify_timeout: std::time::Duration::from_millis(200),
         callback_timeout: std::time::Duration::from_millis(50),
         token_name: "cli@test-host".to_string(),
         now: at("2026-08-24T12:00:00Z"),
@@ -962,4 +963,53 @@ async fn an_oversized_control_plane_response_is_refused_rather_than_buffered() {
         format!("{err:#}").contains("refusing to buffer it"),
         "{err:#}"
     );
+}
+
+/// A gateway that accepts the connection and never answers must not hang the
+/// flow: the probe is the last point past which a PAT exists and no context
+/// does, so the saga has to stay reachable (round-7 P1).
+#[tokio::test]
+async fn a_gateway_that_never_answers_still_reaches_the_rollback() {
+    let stalled = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/query"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"success": true}))
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .mount(&stalled)
+        .await;
+
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&stalled.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-1").await;
+    revoke_answers(&cp, 204).await;
+
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    let started = std::time::Instant::now();
+    let err = login(options(&cp.uri(), None), &path)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the probe must be bounded, not wait out the gateway"
+    );
+    assert!(err.contains("got no answer from"), "{err}");
+    assert!(err.contains("--no-verify"), "{err}");
+    // The saga ran: the PAT this login minted is revoked, and no context was
+    // written to point at it.
+    assert_eq!(
+        revoked_ids(&cp.received_requests().await.unwrap()),
+        ["tok-1"]
+    );
+    assert!(!path.exists());
 }

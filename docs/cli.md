@@ -206,7 +206,9 @@ What it does, in order:
    role there — never an unscoped credential.
 6. Verifies each one with a `select 1` against the gateway it will actually
    use. A credential that cannot answer is **not written**, and it is revoked.
-   `--no-verify` skips this.
+   The probe is bounded (30s), so a gateway that accepts the connection and
+   then goes quiet cannot strand a freshly minted token. `--no-verify` skips
+   this.
 7. Writes one context per verified token, named `<org>/<workspace>`, points
    `current-context` at the first, and prints a summary with no token values
    in it.
@@ -249,6 +251,13 @@ Plain `logout` is a local edit: the credential leaves this machine but stays
 itself, so `--revoke` signs in again to call the control plane. The context
 itself (server, workspace, mode) is kept either way, so a later `login`
 refills it; removing the context entirely is `skardi config delete-context`.
+
+The local delete happens first, so an unreachable control plane still gets the
+credential off the machine. That means the token id — which lives only in the
+config file — is gone by the time a revocation can fail, so **every failure
+after that point prints the ids it could not revoke**, with the context each
+came from, for the console. A context written by `config set-context` has no
+recorded id at all, and `--revoke` names it rather than skipping it quietly.
 
 ### What a cloud context cannot do
 

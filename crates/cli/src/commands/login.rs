@@ -6,7 +6,7 @@
 //! options and remains testable without a process.
 
 use crate::config::{self, ContextsFile};
-use crate::login::{self, LoginOptions, LoginReport, Selection, oauth};
+use crate::login::{self, LoginOptions, LoginReport, Selection, control_plane, oauth};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use std::path::Path;
@@ -152,6 +152,7 @@ fn options_from(
         endpoints: oauth::Endpoints::default(),
         open_browser: oauth::open_in_browser,
         callback_timeout: oauth::CALLBACK_TIMEOUT,
+        verify_timeout: control_plane::CONTROL_PLANE_TIMEOUT,
         token_name: login::default_token_name(),
         now: chrono::Utc::now(),
     })
