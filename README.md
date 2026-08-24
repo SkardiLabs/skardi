@@ -7,7 +7,6 @@
 
 Let your agent query any of your data, declaring *why* it asks.
 Skardi turns the intentions that keep coming back into named tools and standing routines.
-What improves is the agent's **context** — not model weights — and you never write another integration.
 
 **Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines — *automation in flight*
 
