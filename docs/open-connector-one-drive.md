@@ -61,8 +61,14 @@ spec:
               folderItemId: "01ABCDEF..."      # scope drive_items to one folder
             tables: [drive_items]
 
-          # drive_item_search needs its own binding: `query` is required,
-          # and the binding is what pins the search term.
+          # One binding per search term: `query` is required and the
+          # binding is what pins it, so one binding = one search. A
+          # single binding CAN serve both tables — each table's request
+          # carries only the keys it declares, so drive_items would
+          # withhold `query` — separate bindings just read better in SQL.
+          # (Note `folderItemId`/`folderPath` exclusivity is per TABLE,
+          # not per binding: splitting tables across bindings is not how
+          # you avoid that conflict; setting only one of them is.)
           - name: drive_budget
             source_pack: one_drive
             connection_alias: my-msft-drive
