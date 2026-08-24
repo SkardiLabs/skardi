@@ -6,15 +6,27 @@
 //! request line and answer one page, because pulling a server framework into
 //! the CLI to serve a single GET would be the larger cost.
 //!
-//! "Single-use" is about the CALLBACK, not the connection: a browser also asks
-//! for `/favicon.ico`, may send a preflight, and may probe the port before
-//! following the redirect. Those get a 404 and the listener keeps waiting, up
-//! to [`MAX_UNRELATED_REQUESTS`], so a favicon cannot consume the one
-//! authorization response. The first request that IS a callback ends the wait.
+//! "Single-use" is about THIS sign-in's callback, not the connection: a browser
+//! also asks for `/favicon.ico`, may send a preflight, and may probe the port
+//! before following the redirect. Those get a 404 and the listener keeps
+//! waiting, up to [`MAX_UNRELATED_REQUESTS`], so a favicon cannot consume the
+//! one authorization response.
+//!
+//! `state` is what decides membership, and it is checked HERE rather than by
+//! the caller (§9.1: "a `state` checked on callback", unqualified). Anything on
+//! this machine can reach a loopback port, and a browser can be induced to
+//! fetch one cross-site — so a request carrying `?error=access_denied` with no
+//! `state`, or a planted `?code=…&state=guess`, must not be able to END an
+//! active login. Checking after the fact would only have changed which error
+//! the operator saw; ignoring it, and continuing to wait, is what makes the
+//! stray request harmless. The count of what was ignored is reported if the
+//! wait then runs out, so a genuinely mismatched provider is still diagnosable
+//! rather than silent.
 
 use anyhow::{Context, Result, bail};
 use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -72,21 +84,33 @@ impl Loopback {
         format!("http://127.0.0.1:{}{CALLBACK_PATH}", self.port)
     }
 
-    /// Wait for the redirect, or fail once `timeout` elapses.
+    /// Wait for THIS sign-in's redirect, or fail once `timeout` elapses.
+    ///
+    /// Only a callback whose `state` equals `expected_state` is returned;
+    /// anything else is answered and ignored (see the module docs).
     ///
     /// Consumes `self`, so the listener — and the port — is released when this
     /// returns, on the timeout path as much as on the success path.
-    pub async fn wait(self, timeout: Duration) -> Result<Callback> {
-        match tokio::time::timeout(timeout, self.accept_callback()).await {
+    pub async fn wait(self, timeout: Duration, expected_state: &str) -> Result<Callback> {
+        // Outside the timeout future, so a wait that runs out can still report
+        // what it ignored. Atomic rather than `Cell` only because the future
+        // must stay `Send` to be spawned.
+        let ignored = AtomicUsize::new(0);
+        match tokio::time::timeout(timeout, self.accept_callback(expected_state, &ignored)).await {
             Ok(result) => result,
             Err(_) => bail!(
-                "no authorization response within {}s — the login was not completed",
-                timeout.as_secs()
+                "no authorization response within {}s — the login was not completed{}",
+                timeout.as_secs(),
+                describe_ignored(ignored.load(Ordering::Relaxed))
             ),
         }
     }
 
-    async fn accept_callback(&self) -> Result<Callback> {
+    async fn accept_callback(
+        &self,
+        expected_state: &str,
+        ignored: &AtomicUsize,
+    ) -> Result<Callback> {
         for _ in 0..=MAX_UNRELATED_REQUESTS {
             let (mut stream, _peer) = self
                 .listener
@@ -119,6 +143,24 @@ impl Loopback {
                 respond(&mut stream, "400 Bad Request", "No authorization response.").await;
                 continue;
             }
+            // Membership in THIS sign-in, checked before either the code or
+            // the error is looked at. A mismatch is treated as one more
+            // unrelated request rather than as a failure, so nothing that can
+            // reach this port can end the login.
+            //
+            // `state` is required on an error response too — RFC 6749 §4.1.2.1
+            // requires it echoed whenever the request carried one — so a
+            // refusal that omits it did not come from the provider we asked.
+            if callback.state.as_deref() != Some(expected_state) {
+                ignored.fetch_add(1, Ordering::Relaxed);
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "This response does not belong to a sign-in started here.",
+                )
+                .await;
+                continue;
+            }
 
             // The page never echoes a query value: it is rendered in a browser
             // that just followed a redirect built by someone else, and nothing
@@ -131,8 +173,24 @@ impl Loopback {
             return Ok(callback);
         }
         bail!(
-            "the login redirect never arrived after {MAX_UNRELATED_REQUESTS} unrelated requests on the callback port"
+            "the login redirect never arrived after {MAX_UNRELATED_REQUESTS} unrelated requests on the callback port{}",
+            describe_ignored(ignored.load(Ordering::Relaxed))
         )
+    }
+}
+
+/// The clause naming callbacks that were refused for carrying the wrong
+/// `state`, so a mismatch is diagnosable instead of looking like silence.
+fn describe_ignored(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => {
+            " (one response arrived carrying a 'state' this sign-in did not issue, and was ignored)"
+                .to_string()
+        }
+        many => format!(
+            " ({many} responses arrived carrying a 'state' this sign-in did not issue, and were ignored)"
+        ),
     }
 }
 
@@ -238,7 +296,7 @@ mod tests {
         let port = port_of(&loopback.redirect_uri());
 
         let err = loopback
-            .wait(Duration::from_millis(50))
+            .wait(Duration::from_millis(50), "the-state")
             .await
             .unwrap_err()
             .to_string();
@@ -257,7 +315,8 @@ mod tests {
         let uri = loopback.redirect_uri();
         let base = uri.trim_end_matches("/callback").to_string();
 
-        let waiter = tokio::spawn(async move { loopback.wait(Duration::from_secs(5)).await });
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_secs(5), "the-state").await });
         let http = reqwest::Client::new();
         // Noise first, each fully awaited so the ordering is deterministic.
         let _ = http.get(format!("{base}/favicon.ico")).send().await;
@@ -292,7 +351,8 @@ mod tests {
             .trim_end_matches("/callback")
             .to_string();
 
-        let waiter = tokio::spawn(async move { loopback.wait(Duration::from_secs(5)).await });
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_secs(5), "the-state").await });
 
         // A POST to the right path: not a redirect, so not the callback.
         let _ = reqwest::Client::new()
@@ -307,12 +367,71 @@ mod tests {
         // A connection that opens and hangs up without sending anything.
         drop(tokio::net::TcpStream::connect(&addr).await.unwrap());
 
-        let callback = reqwest::get(format!("{uri}?code=real&state=s"))
+        let callback = reqwest::get(format!("{uri}?code=real&state=the-state"))
             .await
             .unwrap();
         assert!(callback.status().is_success());
         let received = waiter.await.unwrap().unwrap();
         assert_eq!(received.code.as_deref(), Some("real"));
+    }
+
+    /// The finding this exists for: anything on the machine can reach a
+    /// loopback port, and a browser can be induced to fetch one cross-site. A
+    /// planted `?error=` — or a planted code with a guessed state — must not be
+    /// able to END an active login.
+    #[tokio::test]
+    async fn a_response_from_another_sign_in_cannot_end_this_one() {
+        let loopback = Loopback::bind().await.unwrap();
+        let uri = loopback.redirect_uri();
+
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_secs(5), "the-state").await });
+        let http = reqwest::Client::new();
+
+        // An error with no state at all, an error with someone else's state,
+        // and a planted code — each answered, none accepted.
+        for planted in [
+            "?error=access_denied",
+            "?error=access_denied&state=someone-elses",
+            "?code=planted&state=someone-elses",
+            "?code=planted",
+        ] {
+            let response = http.get(format!("{uri}{planted}")).send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 400, "{planted}");
+            assert!(
+                response.text().await.unwrap().contains("does not belong"),
+                "{planted}"
+            );
+        }
+
+        // The real redirect still completes.
+        let _ = http
+            .get(format!("{uri}?code=the-real-code&state=the-state"))
+            .send()
+            .await;
+        let callback = waiter.await.unwrap().unwrap();
+        assert_eq!(callback.code.as_deref(), Some("the-real-code"));
+    }
+
+    /// A mismatch that never resolves is not silence: the wait runs out and
+    /// says what it refused, so a genuinely misconfigured provider is
+    /// diagnosable.
+    #[tokio::test]
+    async fn a_wait_that_only_saw_foreign_responses_says_so() {
+        let loopback = Loopback::bind().await.unwrap();
+        let uri = loopback.redirect_uri();
+
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_millis(300), "mine").await });
+        let _ = reqwest::get(format!("{uri}?code=c&state=not-mine")).await;
+
+        let err = waiter.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("no authorization response within"), "{err}");
+        assert!(
+            err.contains("did not issue"),
+            "the ignored response must be reported: {err}"
+        );
+        assert!(!err.contains("not-mine"), "no value is echoed: {err}");
     }
 
     /// Enough noise to exhaust the allowance ends the wait with a message
@@ -325,7 +444,8 @@ mod tests {
             .trim_end_matches("/callback")
             .to_string();
 
-        let waiter = tokio::spawn(async move { loopback.wait(Duration::from_secs(30)).await });
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_secs(30), "the-state").await });
         let http = reqwest::Client::new();
         for _ in 0..=super::MAX_UNRELATED_REQUESTS {
             let _ = http.get(format!("{base}/favicon.ico")).send().await;
@@ -340,9 +460,13 @@ mod tests {
         let loopback = Loopback::bind().await.unwrap();
         let uri = loopback.redirect_uri();
 
-        let waiter = tokio::spawn(async move { loopback.wait(Duration::from_secs(5)).await });
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_secs(5), "the-state").await });
+        // The provider echoes `state` on an error response too (RFC 6749
+        // §4.1.2.1), so a genuine refusal carries it — and only that reaches
+        // the caller.
         let response = reqwest::get(format!(
-            "{uri}?error=access_denied&error_description=user%20refused"
+            "{uri}?error=access_denied&error_description=user%20refused&state=the-state"
         ))
         .await
         .unwrap();

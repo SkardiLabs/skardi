@@ -50,8 +50,14 @@ impl Default for Endpoints {
 
 /// Run the browser flow and return the ID token.
 ///
-/// `no_browser` prints the URL instead of opening it, for a remote shell or a
-/// machine with no browser at all.
+/// `no_browser` prints the URL instead of opening it, for a host with no
+/// browser of its own or none this process can launch.
+///
+/// It does NOT by itself make a remote shell work. The redirect target is
+/// `127.0.0.1:<port>` on THIS host, so whatever opens the URL must be able to
+/// reach that port here — over SSH that means forwarding it (`ssh -L`), and
+/// the port is fresh per run. A headless flow that needs no local listener is
+/// the device-code grant, which the design defers (§12).
 ///
 /// `open` is a parameter, not a call to [`open_in_browser`], for one reason:
 /// it makes the composition below — bind, build, wait, exchange — testable end
@@ -126,14 +132,19 @@ pub fn authorization_url(
     )
 }
 
-/// Wait for the redirect and return the authorization code, refusing anything
-/// that does not match `expected_state`.
+/// Wait for the redirect and return the authorization code.
+///
+/// `state` is enforced by the listener, which surfaces only a callback that
+/// carries `expected_state` (§9.1) — so everything below is known to belong to
+/// this sign-in request, and a refusal reported here really is the provider's.
+/// That ordering matters: were the error read first, any request that reached
+/// the port could end the login with a bare `?error=…`.
 pub async fn await_code(
     loopback: Loopback,
     expected_state: &str,
     timeout: Duration,
 ) -> Result<String> {
-    let callback = loopback.wait(timeout).await?;
+    let callback = loopback.wait(timeout, expected_state).await?;
 
     if let Some(error) = callback.error {
         let detail = callback
@@ -141,15 +152,6 @@ pub async fn await_code(
             .map(|d| format!(": {d}"))
             .unwrap_or_default();
         bail!("the identity provider refused the sign-in ({error}{detail})");
-    }
-    // Checked before the code is even read: a callback whose `state` does not
-    // match was not produced by this process's authorization request, and
-    // redeeming its code would be redeeming someone else's (§9.1).
-    match callback.state.as_deref() {
-        Some(state) if state == expected_state => {}
-        _ => bail!(
-            "the login callback carried the wrong 'state' value — it did not come from this sign-in request, so it was ignored"
-        ),
     }
     callback
         .code
@@ -294,25 +296,42 @@ mod tests {
         assert!(!url.contains("access_type=offline"), "{url}");
     }
 
-    /// §9.1's `state` check: a callback that did not come from this request is
-    /// refused BEFORE its code is read, so a code planted by anything else is
-    /// never redeemed.
+    /// §9.1's `state` check, from the caller's side: a planted code is never
+    /// returned to be redeemed, and the failure echoes neither it nor the
+    /// state that was guessed.
     #[tokio::test]
-    async fn a_state_mismatch_refuses_the_callback() {
+    async fn a_planted_callback_never_yields_a_code() {
+        let loopback = Loopback::bind().await.unwrap();
+        let uri = loopback.redirect_uri();
+
+        let waiter = tokio::spawn(async move {
+            await_code(loopback, "the-real-state", Duration::from_millis(300)).await
+        });
+        let _ = reqwest::get(format!("{uri}?code=planted&state=someone-elses")).await;
+
+        let err = waiter.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("did not issue"), "{err}");
+        assert!(
+            !err.contains("planted"),
+            "the code must not be echoed: {err}"
+        );
+        assert!(!err.contains("someone-elses"), "{err}");
+    }
+
+    /// A refusal carrying no `state` cannot masquerade as the provider's: it is
+    /// ignored, so the login is still there to complete.
+    #[tokio::test]
+    async fn a_stateless_error_is_not_reported_as_a_provider_refusal() {
         let loopback = Loopback::bind().await.unwrap();
         let uri = loopback.redirect_uri();
 
         let waiter = tokio::spawn(async move {
             await_code(loopback, "the-real-state", Duration::from_secs(5)).await
         });
-        let _ = reqwest::get(format!("{uri}?code=planted&state=someone-elses")).await;
+        let _ = reqwest::get(format!("{uri}?error=access_denied")).await;
+        let _ = reqwest::get(format!("{uri}?code=good&state=the-real-state")).await;
 
-        let err = waiter.await.unwrap().unwrap_err().to_string();
-        assert!(err.contains("wrong 'state' value"), "{err}");
-        assert!(
-            !err.contains("planted"),
-            "the code must not be echoed: {err}"
-        );
+        assert_eq!(waiter.await.unwrap().unwrap(), "good");
     }
 
     #[tokio::test]
@@ -336,7 +355,12 @@ mod tests {
         let waiter = tokio::spawn(async move {
             await_code(loopback, "the-real-state", Duration::from_secs(5)).await
         });
-        let _ = reqwest::get(format!("{uri}?error=access_denied&error_description=nope")).await;
+        // With the correct state, as a real provider echoes it (RFC 6749
+        // §4.1.2.1), so this is the provider's refusal and not a stray request.
+        let _ = reqwest::get(format!(
+            "{uri}?error=access_denied&error_description=nope&state=the-real-state"
+        ))
+        .await;
 
         let err = waiter.await.unwrap().unwrap_err().to_string();
         assert!(err.contains("access_denied"), "{err}");

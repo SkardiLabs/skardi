@@ -175,7 +175,7 @@ skardi login
 skardi login --workspace acme-prod
 skardi login --all-workspaces
 
-# Print the sign-in URL instead of opening a browser (remote shells)
+# Print the sign-in URL instead of opening a browser
 skardi login --no-browser
 
 # Shorter-lived credential (default: 90d; `12h` also works)
@@ -196,7 +196,10 @@ What it does, in order:
    stops and says so rather than guessing a host.
 2. Opens a browser against the identity provider, with PKCE (S256) and a
    `state` nonce, redirecting to a single-use listener on `127.0.0.1:<random
-   port>`. It waits 120 seconds, then gives up and releases the port.
+   port>`. It waits 120 seconds, then gives up and releases the port. A
+   response carrying a `state` this run did not issue is answered and ignored
+   rather than ending the wait, so nothing else that can reach the port can
+   interrupt a sign-in.
 3. Exchanges the code for an ID token that is **held in memory only**. No
    refresh token is requested, and nothing the provider returns is written to
    disk.
@@ -212,6 +215,24 @@ What it does, in order:
 7. Writes one context per verified token, named `<org>/<workspace>`, points
    `current-context` at the first, and prints a summary with no token values
    in it.
+
+### `--no-browser` and remote shells
+
+`--no-browser` prints the URL instead of launching a browser, for a host that
+has none or none the CLI can start. It does **not** on its own make `login`
+work over SSH: the redirect goes to `127.0.0.1:<port>` on the machine running
+`skardi`, so opening that URL on your laptop sends the callback to your
+laptop's port, where nothing is listening.
+
+To sign in against a remote host, the browser must reach that host's loopback
+port. Either run a browser there, or forward the port the printed URL names —
+it is fresh per run, so with OpenSSH add the forward mid-session (`~C` then
+`-L <port>:127.0.0.1:<port>`), or use `ssh -L` on a connection opened after
+the URL is shown. A headless flow needing no local listener is the device-code
+grant, which is deliberately out of scope for this milestone.
+
+For a loopback control plane (a local or compose stack), `--identity` skips the
+browser entirely — see [Working against a local stack](#working-against-a-local-stack).
 
 The gateway URL comes from `--server` > `$SKARDI_GATEWAY_URL` > the control
 plane's answer for that org. There is deliberately no built-in default and no
