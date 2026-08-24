@@ -45,15 +45,15 @@
 # rows are a reduced Substrate projection that carried no
 # `eTag`/`cTag`/`isAuthoritative` on the personal drive probed (zero
 # occurrences across 1800+ rows, file and folder hits alike), which is
-# why drive_item_search maps fourteen columns to drive_items' sixteen; a
-# business/SharePoint drive is unprobed (design record R1). Second, following a search
-# continuation cursor fails SERVER-SIDE on a personal drive ("Error
-# Calling Substrate Search", deterministic, both `/me/drive` and
-# `/drives/{id}` forms, cursor forwarded byte-identically) — the scan
-# fails loudly through the failure envelope rather than truncating,
-# and queries whose hits fit one page (≤ `top`) terminate on a clean
-# null. Children continuations paginate correctly in all three
-# allowlisted path forms.
+# why drive_item_search maps fourteen columns to drive_items' sixteen;
+# a business/SharePoint drive is unprobed (design record R1). Second,
+# following a search continuation cursor fails SERVER-SIDE on a
+# personal drive ("Error Calling Substrate Search", deterministic,
+# both `/me/drive` and `/drives/{id}` forms, cursor forwarded byte-
+# identically) — the scan fails loudly through the failure envelope
+# rather than truncating, and queries whose hits fit one page (≤
+# `top`) terminate on a clean null. Children continuations paginate
+# correctly in all three allowlisted path forms.
 kind: pack
 pack: one_drive
 version: 1
@@ -70,7 +70,16 @@ tables:
       page_size_input: top
       # The declared ceiling (`top`: 1–999; 1000 and 0 both 400 against
       # the live gateway). driveItem rows are metadata-only, so a full
-      # page stays orders of magnitude under the 16 MiB response cap.
+      # page stays under the client's 16 MiB response cap
+      # (DEFAULT_MAX_RESPONSE_BYTES) — by about ONE order of magnitude,
+      # not several, which is worth stating as a number rather than a
+      # hand-wave. Measured from the committed captures: 1.0-1.7 KiB per
+      # children row, so 999 rows at the heavy end (files, which carry
+      # `file.hashes` and a download URL) is ~1.6 MiB, ~10% of the cap;
+      # search rows are lighter at ~0.8 KiB. Treat that as a FLOOR —
+      # redaction shortened each download URL's bearer token to a
+      # placeholder, so real file rows are larger. The 999 pin is
+      # unaffected; an operator watching payload sizes is not.
       # It bounds REQUESTS, not bytes: `top` is sent verbatim and is
       # never narrowed to the SQL LIMIT, so `LIMIT 10` costs exactly one
       # request but still transfers up to 999 items. A declared
@@ -212,7 +221,8 @@ tables:
     # files and folders alike), so mapping them here would ship two
     # always-NULL columns — the exact defect the live pass exists to
     # catch. A business/SharePoint drive is unprobed: if it returns the
-    # tags, this table widens back to sixteen (design record R1). The declared-but-
+    # tags, this table widens back to sixteen (design record R1). The
+    # declared-but-
     # unmapped list therefore grows by those two keys on this table.
     # `searchResult`, the one facet unique to this action's rows
     # (present on every live hit), stays unmapped: it is an opaque

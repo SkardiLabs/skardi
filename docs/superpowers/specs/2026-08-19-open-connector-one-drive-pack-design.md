@@ -110,8 +110,16 @@ no `has_more_path` override is declared.
 
 Both tables read `row_path: "$.items"`, paginate by cursor over
 `nextLink`, and pin `page_size: 999` (the declared ceiling; driveItem
-rows are metadata-only, so a full page stays orders of magnitude under
-the client's 16 MiB response cap). It bounds REQUESTS rather than bytes:
+rows are metadata-only, so a full page stays under the client's 16 MiB
+response cap — by about ONE order of magnitude, not several. Measured
+from the committed captures: 1.0–1.7 KiB per children row, so 999 rows
+at the heavy end, files carrying `file.hashes` and a download URL, is
+≈1.6 MiB or ≈10% of `DEFAULT_MAX_RESPONSE_BYTES`; search rows are
+lighter at ≈0.8 KiB. That figure is a FLOOR, since redaction shortened
+each download URL's bearer token to a placeholder. The 999 pin is
+unaffected either way, but ~10× headroom is a number an operator might
+act on, where "orders of magnitude" reads as "never think about this").
+It bounds REQUESTS rather than bytes:
 `Pagination::apply` inserts `page_size` verbatim and never narrows it to
 the SQL LIMIT, so a `LIMIT 10` costs exactly one request but still
 transfers a full page — asserted explicitly by
