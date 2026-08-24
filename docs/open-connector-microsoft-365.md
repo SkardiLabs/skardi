@@ -1,4 +1,4 @@
-# Microsoft 365 Source Packs (Outlook)
+# Microsoft 365 Source Packs
 
 Microsoft 365 reaches Skardi as **one source pack per Open Connector
 service**. There is no `microsoft365` service upstream: the gateway
@@ -9,8 +9,11 @@ cross-service pack would silently span two OAuth grants and fail half
 its tables at scan time when only one service is connected.
 
 This document covers the built-in **`outlook` pack** — `messages` and
-`mail_folders` over a mailbox. The `one_drive` pack ships separately;
-the **whole `excel` service is deferred** at the source-pack admission
+`mail_folders` over a mailbox. The `one_drive` pack has its own guide:
+**[OneDrive source pack](open-connector-one-drive.md)** (`drive_items`,
+`drive_item_search`). Both are Microsoft 365, but each needs its own
+OAuth connection and each guide is long enough to stand alone. The
+**whole `excel` service is deferred** at the source-pack admission
 gate (its list actions emit a `nextLink` continuation but accept no
 `nextLink` input, so their pagination cannot be completed — a table
 over such an action would present page one as the whole collection).

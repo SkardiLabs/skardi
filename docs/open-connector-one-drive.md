@@ -8,6 +8,10 @@ a Skardi binding carries exactly one connection alias, so a
 cross-service pack would silently span two OAuth grants and fail half
 its tables at scan time when only one service is connected.
 
+This document covers the built-in **`one_drive` pack**. The `outlook`
+pack (mail) and the `excel` deferral are in
+**[Microsoft 365 source packs](open-connector-microsoft-365.md)**.
+
 This document covers the built-in **`one_drive` pack** — `drive_items`
 and `drive_item_search` over a drive. The `outlook` pack ships as its own
 milestone, pack and document, and **authorizing one does not authorize
