@@ -16,6 +16,17 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  markdown-links:
+    name: Markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check relative markdown links and anchors
+        # Removed sections and files have repeatedly orphaned inbound
+        # `[text](path.md#anchor)` links (rustdoc only covers Rust docs).
+        # The script checks git-tracked *.md relative links + fragments.
+        run: python3 scripts/check_markdown_links.py
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
