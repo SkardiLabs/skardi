@@ -191,6 +191,21 @@ pub async fn register_open_connector_tables(
                     .into());
                 }
             }
+            // Alternatives are checked per TABLE, not per binding: the
+            // group belongs to one action's input schema, and a binding
+            // may legitimately serve another table that declares neither
+            // key.
+            if let Some((first, second)) =
+                table.conflicting_resources(|key| binding.resource.contains_key(key))
+            {
+                return Err(OpenConnectorError::ConflictingResourceInputs {
+                    binding: binding.name.clone(),
+                    table: table.id.to_string(),
+                    first: first.to_string(),
+                    second: second.to_string(),
+                }
+                .into());
+            }
             tables.push(table);
         }
         // Every supplied resource key must be declared by at least one bound

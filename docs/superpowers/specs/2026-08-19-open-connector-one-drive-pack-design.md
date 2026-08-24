@@ -123,7 +123,11 @@ Action `list_folder_children`; optional resources `driveId`,
 `folderItemId`, `folderPath`. Every combination names a
 completely-terminating collection — with no resource the executor lists
 the drive root's children (`buildListFolderChildrenPath` →
-`/root/children`) — so all three are optional.
+`/root/children`) — so all three are optional. `folderItemId` and
+`folderPath` are additionally declared as an EXCLUSIVE group: they are
+two ways to name one folder, so a binding setting both is refused at
+registration rather than resolved by the executor's precedence (open
+item 7).
 
 Sixteen columns: `id`, `name`, `web_url`, `description`, `size`, `e_tag`,
 `c_tag`, `created_date_time`, `last_modified_date_time`,
@@ -327,10 +331,21 @@ root drive, a `folderItemId` scope and two search terms). Item by item:
    checks and a `tempauth` bearer URL). The type-mismatch fixture stays
    synthetic on purpose — it encodes a contract violation no capture
    can produce.
-7. **`folderItemId` wins silently.** Both set together scans the id's
-   folder and the path is dead configuration — verified live and
-   structural in the executor (`buildListFolderChildrenPath` checks
-   id → path → root). Recorded in the yaml and pack doc.
+7. **`folderItemId` wins silently — and the pack now refuses to inherit
+   that.** Both set together scans the id's folder and the path is dead
+   configuration — verified live and structural in the executor
+   (`buildListFolderChildrenPath` checks id → path → root). Prose was the
+   first response and the weakest one: the binding still scanned a folder
+   the operator did not name, with a green status and no diagnostic. It is
+   now a registration failure. `SourcePackTable` gained
+   `exclusive_resources` (groups of resources that are alternatives),
+   the loader validates the declaration, and registration rejects a
+   binding supplying two members of a group by name. This is the one
+   place the pack is deliberately STRICTER than the gateway: a successful
+   scan of an unnamed scope is worse than a refusal, and no precedence is
+   the right answer when the operator stated two scopes. Generalised
+   rather than special-cased — alternative scoping resources (id-or-path,
+   id-or-name) recur across providers.
 
 Provider API version: Microsoft Graph `v1.0`, pinned by the executors in
 every URL including the cursors Graph hands back.

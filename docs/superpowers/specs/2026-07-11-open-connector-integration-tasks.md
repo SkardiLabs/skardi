@@ -568,14 +568,24 @@ event carrying the scan identity and error.
       pinned 999, `nextLink` is declared `format: uri`, `query` carries
       `minLength: 1` while no `required` array exists, and
       `filter`/`orderby`/`skip`/`page`/`perPage` are absent from the input
-      surface entirely. Verification: 27 new pack-scoped tests
+      surface entirely. Engine addition: `exclusive_resources` on
+      `SourcePackTable` — groups of resources that are ALTERNATIVES, so a
+      binding supplying two members is refused at registration by name
+      instead of being resolved by the upstream executor's precedence
+      (`folderItemId` beats `folderPath`, silently scanning a folder the
+      operator did not name). Additive and defaulted empty; the loader
+      rejects a group that cannot conflict, names an undeclared resource,
+      contains a required key, or overlaps another group. Verification: 30
+      new pack-scoped tests
       (`cargo test -p skardi --lib sources::providers::open_connector::packs::one_drive`
-      — 16 contract/conversion plus 11 e2e: per-table wire-declaration scans
+      — 17 contract/conversion plus 13 e2e: per-table wire-declaration scans
       with exact key sets, null-cursor termination (the only spelling either
       action can emit, both declaring `nextLink` required), pagination-loop
       and failure-envelope arms, LIMIT early-stop proving `top` is NOT
       narrowed, resource forwarding/withholding, a search binding with no
-      `query` refused before any HTTP, a contract-legal item with no `id`
+      `query` refused before any HTTP, a binding naming both folder scopes
+      refused before any HTTP (and one naming a single scope plus a
+      `driveId` accepted), a contract-legal item with no `id`
       failing the page, no-pushdown row identity, UDTF parity, drift-refusal
       at registration, and a key-scoped default-deny redaction audit whose
       self-trip probes are the leak classes the real captures actually

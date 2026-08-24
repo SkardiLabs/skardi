@@ -204,6 +204,7 @@ mod tests {
             pagination,
             required_resources: &[],
             optional_resources: &[],
+            exclusive_resources: &[],
             fixed_inputs: &[],
             filters: &[FilterMapping {
                 column: "id",

@@ -78,6 +78,17 @@ pub struct SourcePackTable {
     /// false`), so one binding can serve tables with different resource
     /// needs — each table receives exactly the keys it declares.
     pub optional_resources: &'static [&'static str],
+    /// Resource inputs that are ALTERNATIVES: at most one member of each
+    /// group may reach a request. Each member names a complete collection
+    /// on its own (OneDrive's `folderItemId` and `folderPath` each scope
+    /// `list_folder_children` to one folder), so both are legitimately
+    /// optional — but the upstream executor resolves a binding carrying
+    /// both by its own precedence, and the loser becomes dead
+    /// configuration. That is the one misconfiguration shape that yields
+    /// confidently wrong rows rather than an error: the scan succeeds
+    /// against a scope the operator did not name. Registration refuses the
+    /// ambiguity instead of picking a side.
+    pub exclusive_resources: &'static [&'static [&'static str]],
     /// Fixed action inputs sent with every request, e.g. `state=all` where
     /// a provider endpoint defaults to a filtered listing (GitHub issues
     /// default to open ones). A pushed-down filter targeting the same input
@@ -102,6 +113,23 @@ impl SourcePackTable {
     /// Open Connector's strict action schemas reject them.
     pub fn declares_resource(&self, key: &str) -> bool {
         self.required_resources.contains(&key) || self.optional_resources.contains(&key)
+    }
+
+    /// The first two members of a declared alternative group that `has`
+    /// reports as both supplied, in declaration order. `None` when every
+    /// group has at most one member — the only configuration whose scope
+    /// is unambiguous.
+    pub fn conflicting_resources(
+        &self,
+        has: impl Fn(&str) -> bool,
+    ) -> Option<(&'static str, &'static str)> {
+        for group in self.exclusive_resources {
+            let mut supplied = group.iter().copied().filter(|key| has(key));
+            if let (Some(first), Some(second)) = (supplied.next(), supplied.next()) {
+                return Some((first, second));
+            }
+        }
+        None
     }
 }
 
@@ -435,6 +463,7 @@ mod tests {
             },
             required_resources: &[],
             optional_resources: &[],
+            exclusive_resources: &[],
             fixed_inputs: &[],
             filters: &[],
             error_path: None,

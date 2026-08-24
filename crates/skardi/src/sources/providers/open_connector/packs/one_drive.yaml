@@ -83,22 +83,27 @@ tables:
     # (`buildListFolderChildrenPath` → `/root/children`), `folderItemId`
     # or `folderPath` scope it to one folder, and `driveId` selects a
     # non-default drive. `folderItemId` and `folderPath` are ALTERNATIVES
-    # — both are declared, so a binding may set both, and the executor
-    # then silently prefers `folderItemId` (verified live, and structural:
+    # and declared as such (`exclusive` below). Upstream, a binding
+    # carrying both is NOT an error: the executor silently prefers
+    # `folderItemId` (verified live, and structural:
     # `buildListFolderChildrenPath` checks id → path → root in that
-    # order), so a binding carrying both scans the id's folder and the
-    # path is dead configuration. Note also that
-    # `folderPath` is declared "Path from the drive root, starting with
-    # /" but enforced only as `minLength: 1`, so a slash-less path passes
-    # validation and fails in the executor.
-    # `select`/`expand`/`orderBy` are deliberately
-    # never sent (negative-space guarded): `orderBy` would only reorder a
+    # order), so the scan would succeed against the id's folder while the
+    # operator's path became dead configuration — the one
+    # misconfiguration in this pack that yields confidently wrong rows
+    # instead of a failure. Skardi refuses the ambiguous binding at
+    # registration rather than inheriting a precedence: neither key
+    # winning is right, because the operator named two different scopes.
+    # Note also that `folderPath` is declared "Path from the drive root,
+    # starting with /" but enforced only as `minLength: 1`, so a
+    # slash-less path passes validation and fails in the executor.
+    # `select`/`expand`/`orderBy` are deliberately never sent (negative-space guarded): `orderBy` would only reorder a
     # set the scan reads in full, and `select` would narrow rows the
     # declared coverage above already protects. Note the camelCase — the
     # live gateway 400s lower-case `orderby`, which is the spelling the
     # sibling `outlook` service uses.
     resources:
       optional: [driveId, folderItemId, folderPath]
+      exclusive: [[folderItemId, folderPath]]
     columns:
       # Identity non-null, the rest nullable — the convention every pack
       # follows (rationale recorded in gmail.yaml's messages table).

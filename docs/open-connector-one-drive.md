@@ -155,11 +155,17 @@ Action `one_drive.list_folder_children`. Optional resources: `driveId`
 (a non-default drive), `folderItemId` or `folderPath` (one folder). With
 no resource at all, the table is the **drive root's children**.
 
-`folderItemId` and `folderPath` are alternatives — set one, not both
-(both are declared upstream, so a binding *can* carry both; the executor
-then **silently prefers `folderItemId`** — verified live, and structural
-in the executor source, which checks id → path → root in that order — so
-the path becomes dead configuration). A `folderPath` is a path from the drive
+`folderItemId` and `folderPath` are alternatives, and **Skardi refuses a
+binding that sets both** — the error names the table and both keys, and
+it fires at registration, before any request. Upstream would accept such
+a binding and **silently prefer `folderItemId`** (verified live, and
+structural in the executor source, which checks id → path → root in that
+order), scanning the id's folder while the path became dead
+configuration: a successful scan of a folder you did not name. Skardi is
+deliberately stricter here rather than inheriting a precedence, because
+neither key winning is right — a binding carrying both has stated two
+different scopes. Set exactly one. `driveId` is not part of the choice
+and composes with either. A `folderPath` is a path from the drive
 root and must start with `/`, e.g. `folderPath: "/Documents/Finance"`;
 upstream enforces only "non-empty", so a slash-less path is accepted at
 validation and then fails.

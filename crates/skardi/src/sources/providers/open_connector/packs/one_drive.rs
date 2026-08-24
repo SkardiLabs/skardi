@@ -1224,6 +1224,38 @@ mod tests {
     }
 
     #[test]
+    fn the_two_folder_scopes_are_declared_as_alternatives() {
+        // `folderItemId` and `folderPath` each name one folder, so both are
+        // optional — but upstream resolves a binding carrying both by
+        // precedence (id wins), which would scan a folder the operator did
+        // not name and leave the path as dead configuration. Declaring the
+        // group is what turns that into a registration failure; without it
+        // the pack inherits a silent precedence. `driveId` is NOT in the
+        // group: it selects the drive, and composes with either scope.
+        let t = table("drive_items");
+        let groups: Vec<Vec<&str>> = t
+            .exclusive_resources
+            .iter()
+            .map(|group| group.to_vec())
+            .collect();
+        assert_eq!(groups, vec![vec!["folderItemId", "folderPath"]]);
+        assert_eq!(
+            t.conflicting_resources(|key| ["folderItemId", "folderPath", "driveId"].contains(&key)),
+            Some(("folderItemId", "folderPath"))
+        );
+        for scope in ["folderItemId", "folderPath"] {
+            assert_eq!(
+                t.conflicting_resources(|key| key == scope || key == "driveId"),
+                None,
+                "{scope} alongside driveId is unambiguous"
+            );
+        }
+        // The search table takes no folder scope at all, so it must not
+        // acquire the group by copy-paste.
+        assert!(table("drive_item_search").exclusive_resources.is_empty());
+    }
+
+    #[test]
     fn query_is_required_on_search_and_nothing_is_required_on_children() {
         // `drive_items` is well-defined with no resource at all (the
         // executor lists the drive root's children), so every resource
@@ -1636,6 +1668,87 @@ bindings:
             assert_eq!(input["top"], 999, "declared ceiling: {input}");
             assert_eq!(input_keys(input), expected_keys, "page {} keys", page + 1);
         }
+    }
+
+    #[tokio::test]
+    async fn a_binding_naming_both_folder_scopes_fails_before_any_http() {
+        // The failing arm of the alternatives declaration. Upstream this
+        // binding is legal and returns rows — from the id's folder, with
+        // the operator's path ignored — so this is the one place the pack
+        // is STRICTER than the gateway, deliberately: a successful scan of
+        // an unnamed scope is worse than a refusal. Refused before
+        // discovery, so the gateway sees only the health probe.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return one_drive_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_ONEDRIVE_BOTH_SCOPES", "test-token");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&one_drive_config(
+                "SKARDI_TEST_OC_ONEDRIVE_BOTH_SCOPES",
+                "drive_items",
+                "{ folderItemId: \"FAB1234CD567890!103\", folderPath: \"/Documents\" }",
+            )),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("a binding setting both folder scopes must fail registration");
+        let text = err.to_string();
+        for key in ["folderItemId", "folderPath", "drive_items"] {
+            assert!(text.contains(key), "the error names {key}: {text}");
+        }
+        assert!(
+            gateway.requests().iter().all(|r| r.path == "/v1/health"),
+            "the ambiguity is caught before discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binding_naming_one_folder_scope_registers() {
+        // The passing arm: the group must not make a legitimate single
+        // scope unusable. `driveId` alongside it stays legal — it selects
+        // the drive, not the folder.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return one_drive_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_ONEDRIVE_ONE_SCOPE", "test-token");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&one_drive_config(
+                "SKARDI_TEST_OC_ONEDRIVE_ONE_SCOPE",
+                "drive_items",
+                "{ folderPath: \"/Documents\", driveId: \"0FAB1234CD567890\" }",
+            )),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("one folder scope plus a driveId is unambiguous");
     }
 
     #[tokio::test]
