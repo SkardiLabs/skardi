@@ -620,6 +620,26 @@ mod tests {
                         .enumerate()
                         .all(|(i, c)| *c == b'-' || (*c == b[0] && ![8, 13, 18, 23].contains(&i)))
             }
+            // A personal-drive driveItem id: `<cid>!<ordinal>` or
+            // `<cid>!s<hex32>`. The SUFFIX is the per-item half and varies
+            // per row, so a prefix check alone admits exactly the
+            // partial-redaction class the URL arms default-deny on
+            // `resid`/`UniqueId`: the one global cid scrubbed, the per-row
+            // identifier still real. Both suffix families are pinned WHOLE
+            // — every committed id is an ordinal or a run of one repeated
+            // hex digit, so this costs nothing and closes the shape.
+            fn synthetic_item_id(s: &str) -> bool {
+                let Some(rest) = s.strip_prefix("FAB1234CD567890!") else {
+                    return false;
+                };
+                let b = rest.as_bytes();
+                let ordinal = !b.is_empty() && b.iter().all(|c| c.is_ascii_digit());
+                let session = b.len() == 33
+                    && b[0] == b's'
+                    && b[1].is_ascii_hexdigit()
+                    && b[1..].iter().all(|c| *c == b[1]);
+                ordinal || session
+            }
             // eTag/cTag shape: `"{GUID},N"` / `"c:{GUID},N"` with a
             // synthetic GUID inside the braces.
             fn synthetic_tag(s: &str) -> bool {
@@ -722,9 +742,7 @@ mod tests {
                             .trim_start_matches('0')
                             .eq_ignore_ascii_case(SYNTHETIC_CID),
                         // The two live id families, same as the `id` arm.
-                        Some(("id", v)) => {
-                            v.starts_with("FAB1234CD567890!") || repeated_digit_guid(v)
-                        }
+                        Some(("id", v)) => synthetic_item_id(v) || repeated_digit_guid(v),
                         Some(("resid" | "UniqueId", v)) => repeated_digit_guid(v),
                         Some(("tempauth", v)) => v.starts_with("v1e.SYNTHETIC"),
                         // Non-identifying request knobs Graph appends.
@@ -744,7 +762,7 @@ mod tests {
                         // remoteItem's business-shaped id, and the
                         // type-mismatch fixture's marked synthetic ids.
                         "id" => {
-                            s.starts_with("FAB1234CD567890!")
+                            synthetic_item_id(s)
                                 || s == "0FAB1234CD567890"
                                 || repeated_digit_guid(s)
                                 || s == "00000000-0000-0000-0000-0000480728c5"
@@ -938,6 +956,15 @@ mod tests {
             (
                 "@microsoft.graph.downloadUrl",
                 "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/_layouts/15/download.aspx?UniqueId=AB12CD34-28DB-2034-800D-680000000000&Translate=false&tempauth=v1e.SYNTHETIC.SYNTHETIC&ApiVersion=2.0",
+            ),
+            // Synthetic cid — real per-item suffix. The `id` key carries
+            // the same per-row half as `resid`, so a prefix-only check
+            // would wave through the one leak shape this whole group is
+            // about. Both places the family travels get a probe.
+            ("id", "FAB1234CD567890!s1a2b3c4d5e6f708192a3b4c5d6e7f809"),
+            (
+                "webUrl",
+                "https://onedrive.live.com/?cid=0fab1234cd567890&id=FAB1234CD567890!s1a2b3c4d5e6f708192a3b4c5d6e7f809",
             ),
         ] {
             let probe = json!({ key: leak });
