@@ -45,15 +45,18 @@
 //! which never landed during the pass. Both columns stay mapped because
 //! both are structurally reachable.
 //!
-//! One gateway defect the pass uncovered, which is NOT specific to this
-//! pack: `GET /v1/actions/<id>` — the endpoint `discover_action` reads —
-//! does not serialize the `execution` block, so Skardi's default-deny
-//! action registry refuses every action from every pack against a
-//! stock gateway at that commit. Reproduced with the merged `github` pack,
-//! so it is not this pack's bug; filed upstream as
-//! oomol-lab/open-connector#358 (the gateway's catalog routes already
-//! compute the field). Skardi's default-deny gate is correct and is left
-//! untouched — no fallback reads the classification from another route.
+//! One gateway defect the pass uncovered, NOT specific to this pack and
+//! since resolved upstream: at the checkout the pass used (`a3efa99`,
+//! 2026-07-07) `GET /v1/actions/<id>` — the endpoint `discover_action`
+//! reads — did not serialize the `execution` block, so Skardi's
+//! default-deny action registry refuses every action from every pack
+//! against that checkout (reproduced with the merged `github` pack, so
+//! not this pack's bug). Filed as oomol-lab/open-connector#358, closed as
+//! completed: upstream `1607633` (#149, 2026-07-19) already serialized
+//! the block, so the checkout simply predated the fix and no
+//! prerequisite exists on a gateway at or after that commit. Skardi's
+//! default-deny gate is correct and is left untouched — no fallback
+//! reads the classification from another route.
 //!
 //! **Rows are NORMALIZED, not passed through.** Every list executor maps
 //! entries through `mapDropboxMetadata`, which rebuilds each one into a
@@ -1593,7 +1596,9 @@ bindings:
                     // `null`, not `{}`: an absent `inputSchema` is the arm
                     // under test. An empty object is a schema that is
                     // PRESENT and shapeless, which the gate refuses with a
-                    // different diagnostic (covered in `source_pack`).
+                    // different diagnostic (covered by the UDTF twin
+                    // `an_unverifiable_cursor_only_claim_fails_udtf_planning`
+                    // and by the unit tables in `source_pack`).
                     return MockResponse::ok(&discovery_ok(
                         "null",
                         include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
@@ -1830,7 +1835,9 @@ bindings:
         // This is what holds the UDTF path's input-gate call site in place:
         // the fingerprint gate above passes here (the drifting is on the
         // INPUT side, which no fingerprint covers), so only the input gate
-        // can refuse this query.
+        // can refuse this query. The twin serves an ABSENT `inputSchema`
+        // (`null`); this one serves a schema that is PRESENT and shapeless
+        // (`{}`) — one integration test per arm of the diagnostic split.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -1838,10 +1845,11 @@ bindings:
             if req.method == "GET" && req.path.starts_with("/v1/actions/") {
                 if req.path.ends_with("dropbox.list_folder_continue") {
                     // Captured OUTPUT schema — so the fingerprint still
-                    // matches — with no input schema at all (`null`, not an
-                    // empty object; see the YAML twin).
+                    // matches — with an input schema that is present but
+                    // declares no properties (`{}`, not `null`; the absent
+                    // case is the YAML twin's).
                     return MockResponse::ok(&discovery_ok(
-                        "null",
+                        "{}",
                         include_str!("fixtures/dropbox/contracts/list_folder_continue.json"),
                         true,
                         None,
@@ -1864,7 +1872,7 @@ bindings:
         )
         .await;
         assert!(
-            rendered.contains("no input schema"),
+            rendered.contains("no input properties"),
             "the input gate said why it cannot be verified: {rendered}"
         );
         assert!(

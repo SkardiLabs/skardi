@@ -50,11 +50,15 @@ refused `settings_error/not_authorized`), and
 `file_search.match_type = 'content'` needs Dropbox content indexing,
 which never landed during the pass.
 
-One gateway defect was found and filed rather than worked around:
-`GET /v1/actions/<id>` omits the `execution` block at commit `a3efa99`,
-so Skardi's default-deny action registry refuses every action from
-*every* pack — reproduced with the merged `github` pack, so not this
-pack's bug. Filed as oomol-lab/open-connector#358.
+One gateway defect was found and filed rather than worked around, and
+turned out to be already fixed upstream: `GET /v1/actions/<id>` omits
+the `execution` block at the checkout this pass used (`a3efa99`,
+2026-07-07), so Skardi's default-deny action registry refuses every
+action from *every* pack on that checkout — reproduced with the merged
+`github` pack, so not this pack's bug. Filed as
+oomol-lab/open-connector#358, closed as completed: upstream `1607633`
+(#149, 2026-07-19) had already added the block, so a gateway at or after
+that commit has no such defect.
 
 ## 1. Prerequisites
 

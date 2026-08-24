@@ -732,12 +732,16 @@ event carrying the scan identity and error.
       `file_search.match_type = 'content'` (content indexing did not land).
       Row fixtures remain authored shapes rather than redacted captures,
       because the verified account holds personal files.
-      **Gateway prerequisite, filed upstream, not worked around:** at commit
-      `a3efa99` the gateway's `GET /v1/actions/<id>` omits the `execution`
-      block, so Skardi's default-deny action registry refuses every action
-      from EVERY pack (reproduced with the merged `github` pack). Filed as
-      oomol-lab/open-connector#358. Skardi's gate is correct and was
-      deliberately left untouched — no compatibility fallback was added.
+      **Gateway defect, filed upstream, not worked around — resolved:** at
+      the checkout the pass used (`a3efa99`, 2026-07-07) the gateway's
+      `GET /v1/actions/<id>` omits the `execution` block, so Skardi's
+      default-deny action registry refuses every action from EVERY pack on
+      that checkout (reproduced with the merged `github` pack). Filed as
+      oomol-lab/open-connector#358, closed as completed — upstream `1607633`
+      (#149, 2026-07-19) already serialized the block, so no prerequisite
+      exists on a gateway at or after that commit. Skardi's gate is correct
+      and was deliberately left untouched — no compatibility fallback was
+      added.
       Engine extension (backward-compatible, opt-in, `None` for every
       pre-existing pack): `pagination.continuation` — pages 2..N may target a
       DIFFERENT action (`list_folder` → `list_folder_continue`) and, with

@@ -45,14 +45,16 @@ per-action field coverage.
 > which did not land during the pass. The row fixtures in-repo are still
 > authored shapes rather than redacted captures.
 >
-> **Known gateway blocker, not specific to this pack:** at commit
-> `a3efa99` the gateway's `GET /v1/actions/<id>` does not serialize the
-> `execution` block, so Skardi's default-deny action registry refuses
-> every action from *every* source pack (reproduced with the merged
-> `github` pack). Registration needs a gateway that publishes
-> `execution.locallyExecutable` on that route — filed upstream as
-> [oomol-lab/open-connector#358](https://github.com/oomol-lab/open-connector/issues/358).
-> Skardi's gate is correct and was deliberately left alone: no
+> **Gateway version note — resolved upstream, no prerequisite on a
+> current gateway:** the checkout used for this pass (`a3efa99`,
+> 2026-07-07) predates upstream `1607633` (#149, 2026-07-19), which added
+> the `execution` block to `GET /v1/actions/<id>`. On that older checkout
+> Skardi's default-deny action registry refuses every action from *every*
+> source pack (reproduced with the merged `github` pack), which is why
+> the pass ran against a locally patched gateway — filed as
+> [oomol-lab/open-connector#358](https://github.com/oomol-lab/open-connector/issues/358),
+> closed as completed. No prerequisite exists on a gateway at or after
+> `1607633`. Skardi's gate is correct and was deliberately left alone: no
 > compatibility fallback reads the classification from another route.
 
 ## Binding

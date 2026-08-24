@@ -511,8 +511,9 @@ real multi-page pagination ran through `list_folder_continue`, and the
 pass DROPPED four `shared_links` columns it found could never populate.
 Two claims stayed unobserved rather than confirmed
 (`shared_links.expires_at`, `file_search.match_type = 'content'`), and
-one gateway defect was filed upstream
-(oomol-lab/open-connector#358). What the step called for, as executed: a
+one gateway defect was filed upstream (oomol-lab/open-connector#358,
+since closed as completed — the `a3efa99` checkout predated the fix in
+upstream `1607633`). What the step called for, as executed: a
 free Dropbox
 account with an OAuth app carrying `files.metadata.read` +
 `sharing.read`, configured in the gateway (`PUT /api/connections/dropbox`
