@@ -1,0 +1,124 @@
+{
+  "items": [
+    {
+      "createdDateTime": "2023-03-10T15:42:00Z",
+      "id": "FAB1234CD567890!158",
+      "lastModifiedDateTime": "2023-03-10T15:07:00Z",
+      "name": "WeChat Files",
+      "size": 0,
+      "webUrl": "https://my.microsoftpersonalcontent.com/personal/0fab1234cd567890/Documents/\u6587\u6863/WeChat Files",
+      "commentSettings": {
+        "commentingDisabled": {
+          "isDisabled": false
+        }
+      },
+      "createdBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "parentReference": {
+        "driveId": "fab1234cd567890",
+        "driveType": "personal",
+        "id": "FAB1234CD567890!103",
+        "name": "\u6587\u6863",
+        "path": "/drive/root:/\u6587\u6863"
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2023-03-10T15:42:00Z",
+        "lastModifiedDateTime": "2023-03-10T15:07:00Z"
+      },
+      "folder": {
+        "childCount": 4
+      },
+      "searchResult": {}
+    },
+    {
+      "createdDateTime": "2026-03-16T08:20:00Z",
+      "id": "FAB1234CD567890!s88888888888888888888888888888888",
+      "lastModifiedDateTime": "2026-03-16T08:19:00Z",
+      "name": "\u56fe\u72471.png",
+      "size": 5901,
+      "webUrl": "https://onedrive.live.com/?id=88888888-8888-8888-8888-888888888888&cid=0fab1234cd567890",
+      "commentSettings": {
+        "commentingDisabled": {
+          "isDisabled": false
+        }
+      },
+      "createdBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "parentReference": {
+        "driveId": "fab1234cd567890",
+        "driveType": "personal",
+        "id": "FAB1234CD567890!105",
+        "name": "\u684c\u9762",
+        "path": "/drive/root:/%E6%A1%8C%E9%9D%A2"
+      },
+      "file": {
+        "mimeType": "image/png"
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2026-03-16T08:20:00Z",
+        "lastModifiedDateTime": "2026-03-16T08:19:00Z"
+      },
+      "image": {
+        "height": 84,
+        "width": 133
+      },
+      "photo": {},
+      "searchResult": {}
+    },
+    {
+      "createdDateTime": "2026-07-08T03:41:00Z",
+      "id": "FAB1234CD567890!s99999999999999999999999999999999",
+      "lastModifiedDateTime": "2026-07-08T02:39:00Z",
+      "name": "\u793a\u4f8b\u62a5\u544a.docx",
+      "size": 2070000,
+      "webUrl": "https://onedrive.live.com/personal/0fab1234cd567890/_layouts/15/doc.aspx?resid=99999999-9999-9999-9999-999999999999&cid=0fab1234cd567890",
+      "commentSettings": {
+        "commentingDisabled": {
+          "isDisabled": false
+        }
+      },
+      "createdBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "lastModifiedBy": {
+        "user": {
+          "displayName": "\u793a\u4f8b \u7528\u6237"
+        }
+      },
+      "parentReference": {
+        "driveId": "fab1234cd567890",
+        "driveType": "personal",
+        "id": "FAB1234CD567890!105",
+        "name": "\u684c\u9762",
+        "path": "/drive/root:/%E6%A1%8C%E9%9D%A2"
+      },
+      "file": {
+        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2026-07-08T03:41:00Z",
+        "lastModifiedDateTime": "2026-07-08T02:39:00Z"
+      },
+      "searchResult": {}
+    }
+  ],
+  "nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/search(q='docx')?$top=999&$skiptoken=Mg"
+}

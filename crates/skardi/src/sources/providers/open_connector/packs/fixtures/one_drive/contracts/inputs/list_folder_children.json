@@ -1,0 +1,58 @@
+{
+  "type": "object",
+  "properties": {
+    "driveId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional drive ID. Omit it to use the authenticated user's default OneDrive."
+    },
+    "folderItemId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "OneDrive drive item ID."
+    },
+    "folderPath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path from the drive root, starting with /."
+    },
+    "top": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 999,
+      "description": "Maximum number of items to return."
+    },
+    "select": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A Microsoft Graph field name."
+      },
+      "description": "Optional Microsoft Graph fields to include in the response.",
+      "minItems": 1
+    },
+    "expand": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A Microsoft Graph field name."
+      },
+      "description": "Optional Microsoft Graph relationships to expand in the response.",
+      "minItems": 1
+    },
+    "orderBy": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional Microsoft Graph order-by expression."
+    },
+    "nextLink": {
+      "type": "string",
+      "description": "Opaque Microsoft Graph nextLink returned by a previous OneDrive response.",
+      "format": "uri"
+    }
+  },
+  "additionalProperties": false,
+  "description": "OneDrive action input."
+}

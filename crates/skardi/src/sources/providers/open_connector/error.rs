@@ -377,6 +377,23 @@ pub enum OpenConnectorError {
     )]
     UnknownResourceKey { binding: String, key: String },
 
+    /// A binding supplied two resource inputs a bound table declares as
+    /// alternatives. The upstream executor resolves them by precedence, so
+    /// one would silently win and the other become dead configuration —
+    /// the scan would then succeed against a scope the operator did not
+    /// name, which is worse than failing.
+    #[error(
+        "Open Connector binding '{binding}' supplies both '{first}' and '{second}' for \
+         source-pack table '{table}', which declares them as alternative ways to scope the \
+         same collection; set exactly one"
+    )]
+    ConflictingResourceInputs {
+        binding: String,
+        table: String,
+        first: String,
+        second: String,
+    },
+
     /// The discovered action contract does not match the source pack's
     /// expected fingerprint — the upstream action changed incompatibly.
     #[error("Open Connector source-pack table '{table}' failed its compatibility check: {reason}")]

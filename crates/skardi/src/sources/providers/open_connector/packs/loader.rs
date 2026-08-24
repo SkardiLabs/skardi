@@ -141,6 +141,7 @@ fn convert_table(
         pagination: doc.pagination.into_strategy(),
         required_resources: leak_str_slice(doc.resources.required),
         optional_resources: leak_str_slice(doc.resources.optional),
+        exclusive_resources: leak_str_groups(doc.resources.exclusive),
         fixed_inputs: leak_slice(fixed_inputs),
         filters: leak_slice(filters),
         error_path: doc.error_path.map(leak_str),
@@ -221,6 +222,42 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
             return Err(format!(
                 "{id}: resource '{required}' is declared both required and optional"
             ));
+        }
+    }
+    // Alternative groups. Each rule below is a way the declaration could
+    // be self-defeating rather than protective: a group that cannot
+    // conflict, one that names a key no request carries, one that puts a
+    // key in two groups (making the reported pair arbitrary), and one
+    // containing a REQUIRED key — that key is always present, so every
+    // other member becomes unusable and the group silently forbids
+    // configuration the pack still advertises.
+    let mut grouped: Vec<&str> = Vec::new();
+    for group in table.exclusive_resources {
+        if group.len() < 2 {
+            return Err(format!(
+                "{id}: exclusive resource group {group:?} needs at least two members to be a \
+                 choice"
+            ));
+        }
+        for key in *group {
+            if !table.declares_resource(key) {
+                return Err(format!(
+                    "{id}: exclusive resource group names '{key}', which the table does not \
+                     declare as a resource"
+                ));
+            }
+            if table.required_resources.contains(key) {
+                return Err(format!(
+                    "{id}: resource '{key}' is required, so it cannot be one of a group of \
+                     alternatives — every other member would be unreachable"
+                ));
+            }
+            if grouped.contains(key) {
+                return Err(format!(
+                    "{id}: resource '{key}' appears in more than one exclusive group"
+                ));
+            }
+            grouped.push(key);
         }
     }
     // The request-input namespace is shared by resources, fixed inputs,
@@ -440,6 +477,10 @@ fn leak_str_slice(v: Vec<String>) -> &'static [&'static str] {
     leak_slice(v.into_iter().map(leak_str).collect())
 }
 
+fn leak_str_groups(v: Vec<Vec<String>>) -> &'static [&'static [&'static str]] {
+    leak_slice(v.into_iter().map(leak_str_slice).collect())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackDoc {
@@ -484,6 +525,11 @@ struct ResourcesDoc {
     required: Vec<String>,
     #[serde(default)]
     optional: Vec<String>,
+    /// Groups of declared resources that are ALTERNATIVES: a binding may
+    /// set at most one member of each group. See
+    /// `SourcePackTable::exclusive_resources`.
+    #[serde(default)]
+    exclusive: Vec<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1046,6 +1092,63 @@ tables:
     }
 
     #[test]
+    fn a_valid_exclusive_group_survives_the_round_trip() {
+        // The positive arm: the four rejections above are only protective
+        // if the shape they guard actually loads and reaches the runtime
+        // object registration reads.
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [byId, byPath], exclusive: [[byId, byPath]] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+        )
+        .expect("two declared optional resources are a valid group");
+        let table = &pack.tables[0];
+        let groups: Vec<Vec<&str>> = table
+            .exclusive_resources
+            .iter()
+            .map(|group| group.to_vec())
+            .collect();
+        assert_eq!(groups, vec![vec!["byId", "byPath"]]);
+        assert_eq!(
+            table.conflicting_resources(|key| ["byId", "byPath"].contains(&key)),
+            Some(("byId", "byPath")),
+            "both supplied is the ambiguity"
+        );
+        for one in ["byId", "byPath"] {
+            assert_eq!(
+                table.conflicting_resources(|key| key == one),
+                None,
+                "{one} alone names one scope"
+            );
+        }
+        assert_eq!(
+            table.conflicting_resources(|_| false),
+            None,
+            "neither supplied is the unscoped default"
+        );
+    }
+
+    #[test]
+    fn tables_without_an_exclusive_group_declare_none() {
+        // The field is additive: every other pack omits it, and a table
+        // that does must never report a conflict.
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [byId, byPath] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+        )
+        .expect("omitting the group stays valid");
+        assert!(pack.tables[0].exclusive_resources.is_empty());
+        assert_eq!(pack.tables[0].conflicting_resources(|_| true), None);
+    }
+
+    #[test]
     fn dotted_table_keys_are_rejected() {
         let err = parse_pack(
             r#"
@@ -1122,6 +1225,46 @@ tables:
     columns:
       - { name: id, path: id, type: uint64, nullable: false }"#,
                 "both required and optional",
+            ),
+            // Four ways an `exclusive` group defeats itself instead of
+            // protecting anything. All four would otherwise load as a
+            // check that never fires, or one that forbids configuration
+            // the pack still advertises.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [byId], exclusive: [[byId]] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "at least two members",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [byId], exclusive: [[byId, byPath]] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "does not declare as a resource",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { required: [byId], optional: [byPath], exclusive: [[byId, byPath]] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "every other member would be unreachable",
+            ),
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    resources: { optional: [byId, byPath, byName], exclusive: [[byId, byPath], [byPath, byName]] }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "more than one exclusive group",
             ),
             (
                 r#"    action: demo.list

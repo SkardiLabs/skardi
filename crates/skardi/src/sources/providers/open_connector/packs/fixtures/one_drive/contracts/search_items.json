@@ -1,0 +1,273 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Drive item ID."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Drive item name."
+          },
+          "webUrl": {
+            "type": "string",
+            "description": "Web URL for the drive item."
+          },
+          "description": {
+            "type": "string",
+            "description": "User-visible description for the drive item."
+          },
+          "cTag": {
+            "type": "string",
+            "description": "Content tag for the drive item."
+          },
+          "eTag": {
+            "type": "string",
+            "description": "Entity tag for the drive item."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Size of the drive item in bytes."
+          },
+          "createdDateTime": {
+            "type": "string",
+            "description": "Creation timestamp for the drive item."
+          },
+          "lastModifiedDateTime": {
+            "type": "string",
+            "description": "Last modification timestamp for the drive item."
+          },
+          "createdBy": {
+            "type": "object",
+            "properties": {
+              "user": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the identity."
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "Display name for the identity."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Identity information returned by Microsoft Graph."
+              },
+              "application": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the identity."
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "Display name for the identity."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Identity information returned by Microsoft Graph."
+              },
+              "device": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the identity."
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "Display name for the identity."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Identity information returned by Microsoft Graph."
+              }
+            },
+            "additionalProperties": true,
+            "description": "Identity set returned by Microsoft Graph."
+          },
+          "lastModifiedBy": {
+            "type": "object",
+            "properties": {
+              "user": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the identity."
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "Display name for the identity."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Identity information returned by Microsoft Graph."
+              },
+              "application": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the identity."
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "Display name for the identity."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Identity information returned by Microsoft Graph."
+              },
+              "device": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Unique identifier for the identity."
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "Display name for the identity."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Identity information returned by Microsoft Graph."
+              }
+            },
+            "additionalProperties": true,
+            "description": "Identity set returned by Microsoft Graph."
+          },
+          "parentReference": {
+            "type": "object",
+            "properties": {
+              "driveId": {
+                "type": "string",
+                "description": "Drive ID of the referenced item."
+              },
+              "id": {
+                "type": "string",
+                "description": "Drive item ID of the referenced item."
+              },
+              "name": {
+                "type": "string",
+                "description": "Name of the referenced item."
+              },
+              "path": {
+                "type": "string",
+                "description": "Percent-encoded path of the referenced item."
+              },
+              "driveType": {
+                "type": "string",
+                "description": "Drive type of the referenced item."
+              },
+              "siteId": {
+                "type": "string",
+                "description": "Site ID of the referenced item."
+              }
+            },
+            "additionalProperties": true,
+            "description": "Reference to another drive item."
+          },
+          "file": {
+            "type": "object",
+            "properties": {
+              "mimeType": {
+                "type": "string",
+                "description": "Detected MIME type for the file."
+              },
+              "hashes": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A generic JSON object returned by Microsoft Graph."
+              }
+            },
+            "additionalProperties": true,
+            "description": "File facet for a drive item."
+          },
+          "folder": {
+            "type": "object",
+            "properties": {
+              "childCount": {
+                "type": "integer",
+                "description": "Number of direct child items."
+              },
+              "view": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A generic JSON object returned by Microsoft Graph."
+              }
+            },
+            "additionalProperties": true,
+            "description": "Folder facet for a drive item."
+          },
+          "root": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "deleted": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "fileSystemInfo": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "remoteItem": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "shared": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "specialFolder": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "searchResult": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          }
+        },
+        "additionalProperties": true,
+        "description": "OneDrive drive item resource."
+      },
+      "description": "Drive items returned by Microsoft Graph."
+    },
+    "nextLink": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Opaque nextLink for fetching the next page, if any."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "items",
+    "nextLink"
+  ],
+  "description": "OneDrive list response."
+}

@@ -8,5 +8,6 @@ pub mod github;
 pub mod gmail;
 pub mod mock;
 pub mod notion;
+pub mod one_drive;
 pub mod outlook;
 pub mod slack;
