@@ -8,6 +8,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
+use cloud::Capability;
 use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::pipeline::PipelineCmd;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod client;
+mod cloud;
 mod commands;
 mod config;
 mod output;
@@ -168,9 +170,21 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 
     let config = ClientConfig::resolve(cli.server, cli.token, cli.context)?;
+    let capability = match capability_of(&cli.command) {
+        Some(capability) => capability,
+        // Unreachable: `Config` is the only capability-less command and it
+        // returned above. Refusing beats defaulting — a remote command added
+        // without an entry must fail loudly rather than quietly skip the
+        // cloud gating in `cloud::ensure_available`.
+        None => anyhow::bail!("internal error: command has no capability entry"),
+    };
+    // Both checks precede `ApiClient::new`, so a gated command and an expired
+    // credential issue no request at all (§8).
+    cloud::ensure_available(capability, &config)?;
+    cloud::ensure_credential_fresh(&config, chrono::Utc::now())?;
     let client = ApiClient::new(&config)?;
 
-    match cli.command {
+    let outcome = match cli.command {
         Commands::Query {
             sql,
             file,
@@ -196,5 +210,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
         // Returned above, before resolution.
         Commands::Config { .. } => Ok(()),
+    };
+
+    outcome.map_err(|err| cloud::diagnose(err, capability, &config))
+}
+
+/// The [`Capability`] a command exercises, or `None` for the purely local
+/// `config` command. Kept as one table so gating and the route-specific error
+/// mapping cannot disagree about what a command is.
+fn capability_of(command: &Commands) -> Option<Capability> {
+    match command {
+        Commands::Query { .. } => Some(Capability::Query),
+        Commands::Schema => Some(Capability::Schema),
+        Commands::Run { .. } => Some(Capability::Run),
+        Commands::Pipeline { .. } => Some(Capability::Pipeline),
+        Commands::Job { .. } => Some(Capability::Job),
+        Commands::Health { .. } => Some(Capability::Health),
+        Commands::Config { .. } => None,
     }
 }
