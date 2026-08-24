@@ -6,7 +6,7 @@
 **Skardi is an open-source self-improving context framework.**
 
 Let your agent query any of your data, declaring *why* it asks.
-Skardi turns the intentions that keep coming back into named tools and standing routines.
+Skardi records every ask, so the intentions that keep coming back can become named tools and standing routines.
 
 **Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines — *automation in flight*
 
@@ -128,7 +128,10 @@ pipeline — it's a routine, and any harness that can run an agent on a schedule
 (Claude Code routines, a cron-driven CLI run) can have the standup drafted
 before anyone asks. And because the ledger is one SQLite file, you can hand a
 window of it to an LLM and ask what keeps being needed that nobody turned into a
-tool — recurring intentions the user hasn't noticed yet. Both land as skills on
+tool — recurring intentions the user hasn't noticed yet. One boundary is yours
+to set: ledger rows carry raw SQL, literals included, so keep that analysis on a
+local model or redact first — sending a window to a hosted LLM should be a
+deliberate opt-in, not a default. Both land as skills on
 top of the ledger, like
 [`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) —
 no server changes required.
