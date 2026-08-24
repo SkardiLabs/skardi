@@ -197,45 +197,192 @@ pub(super) fn control_plane_for_revoke(
     )
 }
 
-/// Print what the run did. Tokens never appear — only the context that now
-/// holds one, and the id of anything revoked.
+/// Print what the run did.
+///
+/// The summary is rendered by [`render_report`] and only the warnings go to
+/// stderr, split the way `config`'s `render_view` is: the text a user reads is
+/// then asserted directly, instead of only through a subprocess's stdout.
 fn print_report(report: &LoginReport) {
-    for (name, state) in &report.skipped {
-        println!("skipped {name}: workspace is {state}, not active");
-    }
-    for context in &report.written {
-        let expiry = match &context.expires_at {
-            Some(at) => format!(", expires {at}"),
-            None => String::new(),
-        };
-        println!(
-            "wrote context {} → {} (workspace {}, role {}{expiry})",
-            context.name, context.server, context.workspace, context.role
-        );
-    }
-    if let Some(current) = &report.current_context {
-        println!("current context is now {current}");
-    }
-    for token_id in &report.replaced_revoked {
-        println!("revoked the credential this login replaced ({token_id})");
-    }
-    for token_id in &report.replaced_kept {
-        println!(
-            "kept the credential this login replaced ({token_id}) — it stays valid until it expires"
-        );
-    }
+    print!("{}", render_report(report));
     for (token_id, reason) in &report.revoke_failures {
-        // Not a failure of the login (§6.5): the new context is already good.
+        // Not a failure of the login (§6.5): the new context is already good,
+        // so this warns on stderr rather than joining the summary.
         eprintln!(
             "warning: could not revoke the replaced credential {token_id} ({reason}) — revoke it in the console"
         );
     }
 }
 
+/// The summary, one newline-terminated line per outcome. Token VALUES never
+/// appear — only the context that now holds one, and the id of anything
+/// revoked or kept.
+fn render_report(report: &LoginReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for (name, state) in &report.skipped {
+        let _ = writeln!(out, "skipped {name}: workspace is {state}, not active");
+    }
+    for context in &report.written {
+        let expiry = match &context.expires_at {
+            Some(at) => format!(", expires {at}"),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "wrote context {} → {} (workspace {}, role {}{expiry})",
+            context.name, context.server, context.workspace, context.role
+        );
+    }
+    if let Some(current) = &report.current_context {
+        let _ = writeln!(out, "current context is now {current}");
+    }
+    for token_id in &report.replaced_revoked {
+        let _ = writeln!(
+            out,
+            "revoked the credential this login replaced ({token_id})"
+        );
+    }
+    for token_id in &report.replaced_kept {
+        let _ = writeln!(
+            out,
+            "kept the credential this login replaced ({token_id}) — it stays valid until it expires"
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_control_plane;
+    use super::{LoginArgs, options_from, render_report, resolve_control_plane};
     use crate::config::ContextsFile;
+    use crate::login::{LoginReport, Selection, WrittenContext};
+    use chrono::Duration;
+    use std::path::Path;
+
+    fn login_args() -> LoginArgs {
+        LoginArgs {
+            control_plane: Some("http://127.0.0.1:18090".to_string()),
+            workspace: None,
+            all_workspaces: false,
+            expires: "90d".to_string(),
+            no_browser: false,
+            client_id: None,
+            identity: None,
+            i_know_this_is_dev_auth: false,
+            no_verify: false,
+            keep_old_token: false,
+        }
+    }
+
+    /// The flag → option mapping, including the two global flags that mean
+    /// something different under `login`: `--server` is the gateway URL to
+    /// write, and `--context` is the name to write it under.
+    #[test]
+    fn flags_map_onto_the_flows_options() {
+        let missing = Path::new("/nonexistent/skardi/config.yaml");
+
+        let mut args = login_args();
+        args.workspace = Some("acme-prod".to_string());
+        let options = options_from(
+            &args,
+            Some("named-by-hand".to_string()),
+            Some("https://gw.example".to_string()),
+            missing,
+        )
+        .unwrap();
+        assert_eq!(options.selection, Selection::Named("acme-prod".to_string()));
+        assert_eq!(options.context_name.as_deref(), Some("named-by-hand"));
+        assert_eq!(
+            options.server_override.as_deref(),
+            Some("https://gw.example")
+        );
+        assert_eq!(options.expires, Duration::try_days(90).unwrap());
+        assert_eq!(options.token_name, crate::login::default_token_name());
+
+        let mut args = login_args();
+        args.all_workspaces = true;
+        args.expires = "12h".to_string();
+        args.no_verify = true;
+        args.keep_old_token = true;
+        let options = options_from(&args, None, None, missing).unwrap();
+        assert_eq!(options.selection, Selection::All);
+        assert_eq!(options.expires, Duration::try_hours(12).unwrap());
+        assert!(options.no_verify && options.keep_old_token);
+
+        assert_eq!(
+            options_from(&login_args(), None, None, missing)
+                .unwrap()
+                .selection,
+            Selection::Auto
+        );
+    }
+
+    /// A bad `--expires` fails while the options are assembled — before the
+    /// browser opens, not after a credential exists.
+    #[test]
+    fn an_unparsable_expiry_fails_before_anything_happens() {
+        let mut args = login_args();
+        args.expires = "next tuesday".to_string();
+        // `unwrap_err` would require `LoginOptions: Debug`, which it
+        // deliberately does not derive (see its definition).
+        let err = match options_from(&args, None, None, Path::new("/nonexistent/c.yaml")) {
+            Ok(_) => panic!("'next tuesday' must not parse as a duration"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("--expires"), "{err}");
+    }
+
+    #[test]
+    fn the_summary_names_every_outcome_and_no_token_value() {
+        let report = LoginReport {
+            written: vec![WrittenContext {
+                name: "acme/acme-prod".to_string(),
+                server: "https://gw.example".to_string(),
+                workspace: "acme-prod".to_string(),
+                role: "admin".to_string(),
+                expires_at: Some("2026-11-22T12:00:00Z".to_string()),
+            }],
+            skipped: vec![("acme/staging".to_string(), "provisioning".to_string())],
+            current_context: Some("acme/acme-prod".to_string()),
+            replaced_revoked: vec!["tok-old".to_string()],
+            replaced_kept: vec!["tok-kept".to_string()],
+            revoke_failures: vec![("tok-stuck".to_string(), "HTTP 500".to_string())],
+        };
+
+        let rendered = render_report(&report);
+        assert_eq!(
+            rendered,
+            "skipped acme/staging: workspace is provisioning, not active\n\
+             wrote context acme/acme-prod → https://gw.example (workspace acme-prod, role admin, expires 2026-11-22T12:00:00Z)\n\
+             current context is now acme/acme-prod\n\
+             revoked the credential this login replaced (tok-old)\n\
+             kept the credential this login replaced (tok-kept) — it stays valid until it expires\n"
+        );
+        // A revocation failure warns on stderr and is deliberately NOT part of
+        // the summary: the login itself succeeded (§6.5).
+        assert!(!rendered.contains("tok-stuck"), "{rendered}");
+    }
+
+    /// A control plane that returned no expiry renders without a dangling
+    /// clause.
+    #[test]
+    fn a_context_without_an_expiry_renders_cleanly() {
+        let report = LoginReport {
+            written: vec![WrittenContext {
+                name: "acme/prod".to_string(),
+                server: "https://gw.example".to_string(),
+                workspace: "acme-prod".to_string(),
+                role: "viewer".to_string(),
+                expires_at: None,
+            }],
+            ..LoginReport::default()
+        };
+        assert_eq!(
+            render_report(&report),
+            "wrote context acme/prod → https://gw.example (workspace acme-prod, role viewer)\n"
+        );
+    }
 
     fn file_with(control_plane: Option<&str>) -> ContextsFile {
         ContextsFile {

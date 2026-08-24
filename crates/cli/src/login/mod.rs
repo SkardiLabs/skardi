@@ -54,6 +54,10 @@ pub enum Selection {
 }
 
 /// Everything `login` needs, with every network endpoint injectable.
+///
+/// No `Debug`, deliberately: it carries `identity` (a bearer presented to the
+/// control plane) and would be the natural place for a future field to hold
+/// something worse. Nothing needs to print it, so nothing can.
 pub struct LoginOptions {
     pub control_plane: String,
     /// The OAuth client id. Required for the browser path, unused with
