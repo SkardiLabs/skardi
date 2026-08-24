@@ -32,31 +32,120 @@ cargo run -p skardi-cli -- <command> [options]
 
 ## Connecting
 
-Every command accepts two global flags, `--server <URL>` and `--token
-<TOKEN>`. Each is resolved independently from four sources, in this
-precedence order (highest wins):
+Every command accepts three global flags: `--server <URL>`, `--token
+<TOKEN>`, and `--context <NAME>`.
+
+`~/.skardi/config.yaml` holds named **contexts** and a pointer at the
+current one, the shape `kubectl` uses:
+
+```yaml
+kind: client
+current-context: local
+contexts:
+  - name: local
+    server: http://127.0.0.1:8080
+    # mode defaults to `server`
+  - name: acme/prod
+    server: https://gateway.skardi.ai
+    mode: cloud
+    workspace: acme-prod       # required in cloud mode, sent per request
+    token: skardi_pat_…
+```
+
+Which context a command uses: `--context NAME` > `$SKARDI_CONTEXT` >
+`current-context` > the only context, if the file defines exactly one. With
+several contexts and no pointer, no context is selected and the flags, env
+vars, and default below apply on their own.
+
+A named context that does not exist is an error listing the ones that do —
+never a silent fall back to the default server.
+
+### Precedence, per field
+
+`mode: server` contexts (the default, and every pre-cloud install):
 
 | Precedence | Server URL | API token |
 |---|---|---|
 | 1 | `--server <URL>` flag | `--token <TOKEN>` flag |
 | 2 | `SKARDI_SERVER_URL` env var | `SKARDI_API_TOKEN` env var |
-| 3 | `server:` in `~/.skardi/config.yaml` | `token:` in `~/.skardi/config.yaml` |
+| 3 | the context's `server:` | the context's `token:` |
 | 4 | `http://127.0.0.1:8080` (default) | none |
 
-`~/.skardi/config.yaml` is a client manifest in the repo's manifest style:
+`mode: cloud` contexts are **authoritative** for both fields, and the
+environment is refused rather than ranked:
+
+| Precedence | Server URL | API token |
+|---|---|---|
+| 1 | `--server <URL>` flag | `--token <TOKEN>` flag |
+| 2 | the context's `server:` | the context's `token:` |
+| — | a set `SKARDI_SERVER_URL` is an **error** unless `--server` overrides it | same for `SKARDI_API_TOKEN` / `--token` |
+
+The reason for the asymmetry: a cloud context's server and token are a
+matched pair — the token is a workspace-scoped PAT and the gateway that
+honours it is the one `login` wrote beside it. A `SKARDI_SERVER_URL` left
+exported from the single-server era would otherwise send that credential to
+whatever listens there, so the conflict is named instead of resolved
+silently. A flag still wins, because passing one is deliberate at the point
+of use.
+
+A cloud context is never defaulted to `http://127.0.0.1:8080`: one with no
+`server` is an error, for the same reason.
+
+### Managing contexts — `skardi config`
+
+Pure file edits; none of these touch the network.
+
+```bash
+# List contexts; the current one is marked with *
+skardi config get-contexts
+
+# Print just the current context's name
+skardi config current-context
+
+# Switch
+skardi config use-context acme/prod
+
+# Create or update one (only the fields you name are touched)
+skardi config set-context local --server http://127.0.0.1:8080 --current
+skardi config set-context acme/prod --mode cloud --workspace acme-prod \
+  --server https://gateway.skardi.ai --token-stdin < token.txt
+
+# --token also works, but puts the credential on the command line, where
+# /proc (on Linux) and your shell history can see it. Prefer --token-stdin.
+
+# Remove one. Does not revoke its credential.
+skardi config delete-context acme/prod
+
+# Print the file with tokens redacted (--show-tokens prints them in full)
+skardi config view
+```
+
+The file is written atomically and `0600`, since it holds credentials; a
+looser existing file is reported and rewritten tighter. Keys this CLI does
+not recognize are preserved, so a newer CLI's fields survive an older one's
+edits.
+
+### Older config files
+
+A file with no `contexts:` key but the pre-contexts `spec:` block still
+works — it resolves as a single context named `default`, and the first
+`skardi config` edit promotes it into `contexts:` without losing its token:
 
 ```yaml
 kind: client
-metadata:
-  name: default
 spec:
   server: http://127.0.0.1:8080
   token: <optional bearer token>
 ```
 
-Both `spec.server` and `spec.token` are optional. A missing file is fine
-(defaults apply); a present-but-malformed file prints a `warning:` to
-stderr and falls back to defaults — never a silent ignore.
+A file with both prefers `contexts:` and warns once.
+
+A missing file is fine (defaults apply). A present-but-malformed one prints
+a `warning:` naming the line and column, and read-only commands carry on
+with flags and env vars — but any command that would *modify* the file
+refuses, because rewriting it would discard credentials it may still hold.
+Parse complaints never quote the file's contents, so a token on the broken
+line is not echoed.
 
 When a token is resolved (from any source), every request carries
 `Authorization: Bearer <token>`.

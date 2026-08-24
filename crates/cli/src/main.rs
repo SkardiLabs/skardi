@@ -8,6 +8,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
+use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::pipeline::PipelineCmd;
 use config::ClientConfig;
@@ -33,6 +34,11 @@ struct Cli {
     #[arg(long, global = true, value_name = "TOKEN")]
     token: Option<String>,
 
+    /// select a context from ~/.skardi/config.yaml; overrides $SKARDI_CONTEXT
+    /// and the file's current-context
+    #[arg(long, global = true, value_name = "NAME")]
+    context: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -40,6 +46,12 @@ struct Cli {
 /// Subcommands supported by the CLI.
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Manage contexts in ~/.skardi/config.yaml (no network).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+
     /// Run ad-hoc SQL against the server and print the result.
     Query {
         /// inline SQL text
@@ -129,9 +141,7 @@ async fn main() -> ExitCode {
             }
         }
     };
-    let config = ClientConfig::resolve(cli.server, cli.token);
-
-    match dispatch(cli.command, &config).await {
+    match dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -143,12 +153,24 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Construct one `ApiClient` from `config` and dispatch `command` to its
+/// Resolve the connection config and dispatch `cli.command` to its
 /// implementation.
-async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()> {
-    let client = ApiClient::new(config)?;
+///
+/// Resolution is deliberately LAZY — inside this function, after the `config`
+/// arm — because `skardi config` edits the very file resolution reads.
+/// `set-context` is how an operator repairs a config whose cloud context is
+/// missing its workspace, so it must not be gated on that resolution
+/// succeeding. Handling it here rather than short-circuiting in `main` keeps
+/// one dispatch point and leaves no structurally unreachable arm behind.
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    if let Commands::Config { cmd } = cli.command {
+        return commands::config::run(cmd, cli.context);
+    }
 
-    match command {
+    let config = ClientConfig::resolve(cli.server, cli.token, cli.context)?;
+    let client = ApiClient::new(&config)?;
+
+    match cli.command {
         Commands::Query {
             sql,
             file,
@@ -171,5 +193,8 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
         Commands::Schema => commands::schema::run(&client).await,
 
         Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
+
+        // Returned above, before resolution.
+        Commands::Config { .. } => Ok(()),
     }
 }

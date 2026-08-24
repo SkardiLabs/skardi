@@ -47,6 +47,7 @@ mod tests {
         ClientConfig {
             server: server.to_string(),
             token: None,
+            context: None,
         }
     }
 
