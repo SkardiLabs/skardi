@@ -150,6 +150,7 @@ fn options_from(
         server_override: flag_server,
         env_gateway_url: std::env::var(GATEWAY_URL_ENV).ok(),
         endpoints: oauth::Endpoints::default(),
+        open_browser: oauth::open_in_browser,
         callback_timeout: oauth::CALLBACK_TIMEOUT,
         token_name: login::default_token_name(),
         now: chrono::Utc::now(),
@@ -362,6 +363,25 @@ mod tests {
         // A revocation failure warns on stderr and is deliberately NOT part of
         // the summary: the login itself succeeded (§6.5).
         assert!(!rendered.contains("tok-stuck"), "{rendered}");
+    }
+
+    /// `print_report` writes the summary to stdout and only the revocation
+    /// warnings to stderr. Called for the warning path specifically, since
+    /// that is the branch `render_report` deliberately does not carry.
+    #[test]
+    fn print_report_emits_the_summary_and_warns_separately() {
+        let report = LoginReport {
+            written: vec![WrittenContext {
+                name: "acme/prod".to_string(),
+                server: "https://gw.example".to_string(),
+                workspace: "acme-prod".to_string(),
+                role: "admin".to_string(),
+                expires_at: None,
+            }],
+            revoke_failures: vec![("tok-stuck".to_string(), "HTTP 500".to_string())],
+            ..LoginReport::default()
+        };
+        super::print_report(&report);
     }
 
     /// A control plane that returned no expiry renders without a dangling

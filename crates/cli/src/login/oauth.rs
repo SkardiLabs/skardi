@@ -222,16 +222,27 @@ struct TokenError {
     error_description: Option<String>,
 }
 
-/// Hand the URL to the platform opener. `Command`, not a crate: this is one
-/// argv per platform, and the URL is one we just built.
-pub fn open_in_browser(url: &str) -> std::io::Result<()> {
-    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+/// The platform's URL opener, as argv. Split out from [`open_in_browser`] so
+/// the per-platform choice is a tested value rather than a branch nothing can
+/// reach without launching a real browser.
+///
+/// The empty string after `start` is load-bearing on Windows: `start` reads its
+/// first quoted argument as the new window's TITLE, so a URL passed without it
+/// becomes a title and no browser opens.
+fn browser_command() -> (&'static str, &'static [&'static str]) {
+    if cfg!(target_os = "macos") {
         ("open", &[])
     } else if cfg!(target_os = "windows") {
         ("cmd", &["/C", "start", ""])
     } else {
         ("xdg-open", &[])
-    };
+    }
+}
+
+/// Hand the URL to the platform opener. `Command`, not a crate: this is one
+/// argv per platform, and the URL is one we just built.
+pub fn open_in_browser(url: &str) -> std::io::Result<()> {
+    let (program, args) = browser_command();
     let status = std::process::Command::new(program)
         .args(args)
         .arg(url)
@@ -398,6 +409,76 @@ mod tests {
 
         assert!(err.contains("invalid_grant"), "{err}");
         assert!(err.contains("Code was already redeemed."), "{err}");
+    }
+
+    /// An error body that is not the provider's JSON — a proxy page, an empty
+    /// 500 — still names the status instead of rendering an empty reason.
+    #[tokio::test]
+    async fn a_non_json_error_body_falls_back_to_the_status() {
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string("<html>upstream-detail-abc123</html>"),
+            )
+            .mount(&provider)
+            .await;
+
+        let err = exchange_code(
+            &reqwest::Client::new(),
+            &format!("{}/token", provider.uri()),
+            "client-123",
+            "the-code",
+            "the-verifier",
+            "http://127.0.0.1:1/callback",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        // The status, including its reason phrase, and nothing from the body:
+        // a token-endpoint response can carry the code that was redeemed.
+        assert!(err.contains("HTTP 502"), "{err}");
+        assert!(!err.contains("upstream-detail-abc123"), "{err}");
+    }
+
+    /// An error body with a code and no description reads as just the code.
+    #[tokio::test]
+    async fn an_error_without_a_description_names_the_code_alone() {
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_client"})),
+            )
+            .mount(&provider)
+            .await;
+
+        let err = exchange_code(
+            &reqwest::Client::new(),
+            &format!("{}/token", provider.uri()),
+            "client-123",
+            "the-code",
+            "the-verifier",
+            "http://127.0.0.1:1/callback",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("(invalid_client)"), "{err}");
+    }
+
+    /// The opener's argv per platform. `open_in_browser` itself cannot be
+    /// tested without launching a browser; this is the part that can be wrong.
+    #[test]
+    fn the_browser_command_is_the_platforms_own_opener() {
+        let (program, args) = super::browser_command();
+        if cfg!(target_os = "macos") {
+            assert_eq!((program, args), ("open", &[] as &[&str]));
+        } else if cfg!(target_os = "windows") {
+            // The empty title argument must survive: without it `start` reads
+            // the URL as the window title and opens nothing.
+            assert_eq!((program, args), ("cmd", &["/C", "start", ""] as &[&str]));
+        } else {
+            assert_eq!((program, args), ("xdg-open", &[] as &[&str]));
+        }
     }
 
     /// A non-OIDC client id gets an access token and no `id_token`. Failing

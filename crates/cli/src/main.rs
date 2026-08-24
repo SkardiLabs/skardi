@@ -288,3 +288,99 @@ fn capability_of(command: &Commands) -> Option<Capability> {
         Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Capability, Commands, capability_of};
+    use clap::Parser as _;
+
+    /// The table gating and the route-specific error mapping both read. A
+    /// remote command with no entry would silently skip cloud gating, so the
+    /// pairing is asserted rather than assumed.
+    #[test]
+    fn every_remote_command_names_its_capability() {
+        let cases: Vec<(&[&str], Capability)> = vec![
+            (&["skardi", "query", "-e", "select 1"], Capability::Query),
+            (&["skardi", "schema"], Capability::Schema),
+            (&["skardi", "run", "a-pipeline"], Capability::Run),
+            (&["skardi", "pipeline", "list"], Capability::Pipeline),
+            (&["skardi", "job", "list"], Capability::Job),
+            (&["skardi", "health"], Capability::Health),
+        ];
+        for (argv, expected) in cases {
+            let cli = super::Cli::try_parse_from(argv).expect("parses");
+            assert_eq!(
+                capability_of(&cli.command),
+                Some(expected),
+                "argv: {argv:?}"
+            );
+        }
+    }
+
+    /// The three local commands have no capability: they are answered before
+    /// resolution, so there is nothing to gate.
+    #[test]
+    fn the_local_commands_have_no_capability() {
+        for argv in [
+            vec!["skardi", "config", "get-contexts"],
+            vec!["skardi", "login"],
+            vec!["skardi", "logout"],
+        ] {
+            let cli = super::Cli::try_parse_from(&argv).expect("parses");
+            assert_eq!(capability_of(&cli.command), None, "argv: {argv:?}");
+        }
+    }
+
+    /// `--help` and `--version` exit 0 through `main`'s own arm; a usage error
+    /// must exit 1, because 2 is reserved for "cannot reach the server".
+    #[test]
+    fn clap_failures_are_classified_by_kind() {
+        use clap::error::ErrorKind;
+        assert_eq!(
+            super::Cli::try_parse_from(["skardi", "--help"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            super::Cli::try_parse_from(["skardi", "--version"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayVersion
+        );
+        assert!(super::Cli::try_parse_from(["skardi", "not-a-command"]).is_err());
+        // Mutually exclusive selection flags are refused by clap, not by the
+        // flow, so a wrong pair never reaches a mint.
+        assert!(
+            super::Cli::try_parse_from([
+                "skardi",
+                "login",
+                "--workspace",
+                "one",
+                "--all-workspaces"
+            ])
+            .is_err()
+        );
+    }
+
+    /// `Commands` is matched exhaustively in two places; this fails to compile
+    /// if a variant is added without visiting both.
+    #[test]
+    fn the_command_set_is_covered_exhaustively() {
+        fn assert_total(command: &Commands) -> bool {
+            match command {
+                Commands::Config { .. }
+                | Commands::Login(_)
+                | Commands::Logout(_)
+                | Commands::Query { .. }
+                | Commands::Run { .. }
+                | Commands::Pipeline { .. }
+                | Commands::Job { .. }
+                | Commands::Schema
+                | Commands::Health { .. } => true,
+            }
+        }
+        let cli = super::Cli::try_parse_from(["skardi", "schema"]).unwrap();
+        assert!(assert_total(&cli.command));
+    }
+}

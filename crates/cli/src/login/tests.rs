@@ -7,7 +7,9 @@
 //! plane records every request, so "the first PAT was revoked" is an
 //! assertion rather than an inference.
 
-use super::{LoginOptions, Selection, login, oauth, parse_expires};
+use super::{
+    LoginOptions, Selection, login, oauth, parse_expires, render_workspace_menu, select_memberships,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -116,6 +118,7 @@ fn options(control_plane: &str, server_override: Option<&str>) -> LoginOptions {
         server_override: server_override.map(str::to_string),
         env_gateway_url: None,
         endpoints: oauth::Endpoints::default(),
+        open_browser: oauth::open_in_browser,
         callback_timeout: std::time::Duration::from_millis(50),
         token_name: "cli@test-host".to_string(),
         now: at("2026-08-24T12:00:00Z"),
@@ -703,4 +706,260 @@ fn expires_accepts_days_and_hours_and_refuses_the_rest() {
     for bad in ["0d", "-5d", "abc", "", "90m", "90 days"] {
         assert!(parse_expires(bad).is_err(), "'{bad}' must be refused");
     }
+}
+
+/// One membership, deserialized through the same path the flow uses, so these
+/// tests cannot drift from the wire shape.
+fn parsed(org: &str, workspace: &str, display: Option<&str>) -> super::control_plane::Membership {
+    let mut value = membership(org, workspace, "active", None);
+    match display {
+        Some(name) => value["display_name"] = json!(name),
+        None => {
+            value.as_object_mut().unwrap().remove("display_name");
+        }
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+/// §6.1 step 5: "a lone membership is used automatically; several trigger a
+/// picker". The picker reads its answer from a parameter, so all three of its
+/// outcomes are exercised here rather than by hand.
+#[test]
+fn the_picker_resolves_a_valid_choice() {
+    let active = vec![parsed("acme", "one", None), parsed("acme", "two", None)];
+    let chosen = select_memberships(&Selection::Auto, active, &[], &mut &b"2\n"[..]).unwrap();
+    assert_eq!(chosen.len(), 1);
+    assert_eq!(chosen[0].tenant_slug, "two");
+}
+
+/// EOF is a non-interactive run — a pipe, a CI job, `< /dev/null`. Looping on
+/// an answer that will never come would hang the command, so it names the
+/// flags that do the same job.
+#[test]
+fn the_picker_treats_eof_as_non_interactive_and_names_the_flags() {
+    let active = vec![parsed("acme", "one", None), parsed("acme", "two", None)];
+    let err = select_memberships(&Selection::Auto, active, &[], &mut &b""[..])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--workspace <slug>"), "{err}");
+    assert!(err.contains("--all-workspaces"), "{err}");
+}
+
+#[test]
+fn the_picker_refuses_an_answer_outside_the_range() {
+    let active = vec![parsed("acme", "one", None), parsed("acme", "two", None)];
+    for answer in ["0\n", "3\n", "two\n", "\n"] {
+        let err = select_memberships(
+            &Selection::Auto,
+            active.clone(),
+            &[],
+            &mut answer.as_bytes(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is not one of 1-2"), "{answer:?}: {err}");
+    }
+}
+
+/// A lone membership never reaches the picker, so a non-interactive `login`
+/// with one workspace works with stdin closed.
+#[test]
+fn a_lone_membership_skips_the_picker_entirely() {
+    let chosen = select_memberships(
+        &Selection::Auto,
+        vec![parsed("acme", "only", None)],
+        &[],
+        &mut &b""[..],
+    )
+    .unwrap();
+    assert_eq!(chosen[0].tenant_slug, "only");
+}
+
+/// The menu names the workspace, the role, and the control plane's
+/// `display_name` when it sent one — and reads cleanly when it did not.
+#[test]
+fn the_menu_names_each_workspace_with_its_role() {
+    let menu = render_workspace_menu(&[
+        parsed("acme", "one", Some("Production")),
+        parsed("acme", "two", None),
+        parsed("acme", "three", Some("")),
+    ]);
+    assert_eq!(
+        menu,
+        "this identity has 3 active workspaces:\n\
+         \x20 1) acme/one — Production (role: admin)\n\
+         \x20 2) acme/two (role: admin)\n\
+         \x20 3) acme/three (role: admin)\n\
+         select one [1-3]: "
+    );
+}
+
+/// The browser path through the WHOLE flow, with a `fn` playing the user
+/// agent: it reads the authorization URL as a browser would and follows the
+/// redirect. What this pins beyond the oauth-level test is the handoff — the
+/// control plane is presented the **ID token**, never a PAT.
+#[tokio::test]
+async fn the_browser_path_presents_the_id_token_to_the_control_plane() {
+    let gw = gateway(200).await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-1").await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id_token": "the-id-token"})))
+        .mount(&cp)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    let mut options = options(&cp.uri(), None);
+    options.identity = None;
+    options.client_id = Some("client-123.apps.googleusercontent.com".to_string());
+    options.endpoints = oauth::Endpoints {
+        authorization_url: format!("{}/auth", cp.uri()),
+        token_url: format!("{}/token", cp.uri()),
+    };
+    options.callback_timeout = std::time::Duration::from_secs(5);
+    // The shared helper sets `no_browser`, which prints the URL instead of
+    // opening it; this test is specifically about the opening path.
+    options.no_browser = false;
+    // Stands in for the browser: no captures needed, which is why the field is
+    // a plain `fn`.
+    options.open_browser = |url: &str| {
+        let query = url.split_once('?').expect("a query").1;
+        let value = |key: &str| {
+            let raw = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+                .unwrap_or_default();
+            percent_encoding::percent_decode_str(raw)
+                .decode_utf8_lossy()
+                .to_string()
+        };
+        let (redirect, state) = (value("redirect_uri"), value("state"));
+        tokio::spawn(async move {
+            let _ = reqwest::get(format!("{redirect}?code=browser-code&state={state}")).await;
+        });
+        Ok(())
+    };
+
+    let report = login(options, &path).await.unwrap();
+    assert_eq!(report.written.len(), 1);
+
+    let requests = cp.received_requests().await.unwrap();
+    let discovery = requests
+        .iter()
+        .find(|r| r.url.path() == "/v1/me/workspaces")
+        .expect("discovery happened");
+    assert_eq!(
+        discovery.headers.get("Authorization").unwrap(),
+        "Bearer the-id-token",
+        "the control plane is presented the ID token, not a PAT"
+    );
+    // And the ID token never reaches disk (§9.1).
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("the-id-token"), "{written}");
+    assert!(written.contains("skardi_pat_tok-1"), "{written}");
+}
+
+#[test]
+fn an_identity_with_no_memberships_at_all_says_so() {
+    let err = select_memberships(&Selection::Auto, vec![], &[], &mut &b""[..])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no workspace memberships"), "{err}");
+}
+
+/// §6.5: "A revocation failure during replacement is reported but does not
+/// fail the login — the new context is already good."
+#[tokio::test]
+async fn a_replacement_whose_old_token_cannot_be_revoked_still_succeeds() {
+    let gw = gateway(200).await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-new").await;
+    revoke_answers(&cp, 500).await;
+
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "contexts:\n\
+         \x20 - name: acme/acme-prod\n\
+         \x20   mode: cloud\n\
+         \x20   server: http://old.example\n\
+         \x20   workspace: acme-prod\n\
+         \x20   token: skardi_pat_old\n\
+         \x20   token-id: tok-old\n",
+    )
+    .unwrap();
+
+    let report = login(options(&cp.uri(), None), &path).await.unwrap();
+
+    assert_eq!(report.written.len(), 1, "the login itself succeeded");
+    assert!(report.replaced_revoked.is_empty());
+    assert_eq!(report.revoke_failures.len(), 1);
+    assert_eq!(report.revoke_failures[0].0, "tok-old");
+    assert_eq!(read_yaml(&path)["contexts"][0]["token-id"], "tok-new");
+}
+
+/// `org_ambiguous` without the org list still explains itself rather than
+/// rendering an empty parenthesis.
+#[tokio::test]
+async fn a_multi_org_failure_without_the_list_still_explains_itself() {
+    let gw = gateway(200).await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_fails(
+        &cp,
+        "acme-prod",
+        400,
+        json!({"error": {"code": "org_ambiguous", "message": "several orgs"}}),
+    )
+    .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(options(&cp.uri(), None), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("no org list"), "{rendered}");
+    assert!(rendered.contains("config set-context"), "{rendered}");
+}
+
+/// The control-plane body cap is defence-in-depth: a runaway endpoint must
+/// fail cleanly rather than being buffered.
+#[tokio::test]
+async fn an_oversized_control_plane_response_is_refused_rather_than_buffered() {
+    let cp = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/me/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(1_100_000)))
+        .mount(&cp)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(options(&cp.uri(), None), &config_in(&home))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("refusing to buffer it"),
+        "{err:#}"
+    );
 }

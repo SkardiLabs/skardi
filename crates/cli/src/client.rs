@@ -665,8 +665,57 @@ mod tests {
 }
 
 #[cfg(test)]
+mod retry_after_tests {
+    use super::{ApiClient, ApiError};
+    use crate::config::ClientConfig;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Delta-seconds is parsed; an HTTP-date and any other unparsable value
+    /// read as ABSENT, so §8 falls back to the plain error instead of printing
+    /// a guessed retry interval.
+    #[tokio::test]
+    async fn only_delta_seconds_are_read_as_a_retry_interval() {
+        for (header, expected) in [
+            ("7", Some(7)),
+            (" 7 ", Some(7)),
+            ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+            ("soon", None),
+            ("-1", None),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .insert_header("Retry-After", header)
+                        .set_body_string("unavailable"),
+                )
+                .mount(&server)
+                .await;
+
+            let config = ClientConfig {
+                server: server.uri(),
+                token: None,
+                context: None,
+            };
+            let err = ApiClient::new(&config)
+                .unwrap()
+                .get("/x")
+                .await
+                .unwrap_err();
+            match err {
+                ApiError::Http { retry_after, .. } => {
+                    assert_eq!(retry_after, expected, "Retry-After: {header:?}")
+                }
+                other => panic!("expected Http, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod workspace_selector_tests {
-    use super::{ApiClient, WORKSPACE_HEADER};
+    use super::{ApiClient, ApiError, WORKSPACE_HEADER};
     use crate::config::{ClientConfig, ContextMode, SelectedContext};
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
@@ -724,6 +773,108 @@ mod workspace_selector_tests {
             requests[0].headers.get(WORKSPACE_HEADER).is_none(),
             "a server-mode context must not send the gateway's workspace selector"
         );
+    }
+
+    /// Both header values are built at construction, so a value that cannot
+    /// be sent is one clear config error instead of a failure at every
+    /// request — and neither message may echo the value.
+    #[test]
+    fn a_credential_that_cannot_be_sent_as_a_header_fails_at_construction() {
+        let mut config = cloud_config("https://gw.example", Some("acme-prod"), ContextMode::Cloud);
+        config.token = Some("secret-with-a\nnewline".to_string());
+        let err = construction_error(&config);
+        assert!(err.contains("cannot be sent in an HTTP header"), "{err}");
+        assert!(
+            !err.contains("secret-with-a"),
+            "the token must not be echoed: {err}"
+        );
+
+        let config = cloud_config(
+            "https://gw.example",
+            Some("bad\nworkspace"),
+            ContextMode::Cloud,
+        );
+        assert!(construction_error(&config).contains(WORKSPACE_HEADER));
+    }
+
+    /// Sending a bearer over cleartext to a non-loopback host is warned about
+    /// once, at construction — the token still goes, because refusing would
+    /// break a deployment behind a TLS-terminating proxy, but silence would
+    /// hide it.
+    #[test]
+    fn a_cleartext_remote_server_warns_when_a_token_is_configured() {
+        let mut config = cloud_config("http://gateway.example", None, ContextMode::Server);
+        config.token = Some("a-token".to_string());
+        assert!(ApiClient::new(&config).is_ok());
+    }
+
+    /// A server URL that is not a URL surfaces as `Connect` — so `main` exits
+    /// 2 and the message names the flags, rather than panicking somewhere
+    /// inside reqwest.
+    #[tokio::test]
+    async fn an_unusable_server_url_is_a_connect_failure() {
+        let config = ClientConfig {
+            server: "not even a url".to_string(),
+            token: None,
+            context: None,
+        };
+        let err = ApiClient::new(&config)
+            .unwrap()
+            .get("/status")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Connect { .. }),
+            "expected Connect, got {err:?}"
+        );
+        assert!(err.to_string().contains("--server"), "{err}");
+    }
+
+    /// A 200 whose body is not JSON is an `Http` error naming the parse
+    /// failure, not a panic and not a silent empty result.
+    #[tokio::test]
+    async fn a_success_status_with_an_unparsable_body_is_reported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+            .mount(&server)
+            .await;
+
+        let config = ClientConfig {
+            server: server.uri(),
+            token: None,
+            context: None,
+        };
+        let err = ApiClient::new(&config)
+            .unwrap()
+            .get("/status")
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Http {
+                status,
+                message,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 200);
+                assert!(
+                    message.contains("failed to parse response body"),
+                    "{message}"
+                );
+                assert_eq!(retry_after, None);
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    /// `unwrap_err` would require `ApiClient: Debug`, which it deliberately
+    /// does not derive — it holds the bearer header value.
+    fn construction_error(config: &ClientConfig) -> String {
+        match ApiClient::new(config) {
+            Ok(_) => panic!("expected ApiClient::new to refuse this config"),
+            Err(err) => err.to_string(),
+        }
     }
 
     #[tokio::test]

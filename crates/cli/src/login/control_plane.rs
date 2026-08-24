@@ -282,3 +282,81 @@ fn parse_error(status: u16, text: &str) -> CpError {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Membership, Minted, parse_error};
+
+    /// The raw token must not reach a log line, a panic message, or an
+    /// `{err:?}` rendering through this type — so `Debug` is hand-written, and
+    /// that is worth pinning rather than trusting.
+    #[test]
+    fn a_minted_tokens_debug_output_redacts_the_secret() {
+        let minted = Minted {
+            token: "skardi_pat_the_real_secret".to_string(),
+            token_id: "tok-1".to_string(),
+            expires_at: Some("2026-11-22T12:00:00Z".to_string()),
+        };
+        let rendered = format!("{minted:?}");
+        assert!(!rendered.contains("the_real_secret"), "{rendered}");
+        assert!(rendered.contains("(redacted)"), "{rendered}");
+        // The id and expiry are what a caller legitimately needs to see.
+        assert!(rendered.contains("tok-1"), "{rendered}");
+        assert!(rendered.contains("2026-11-22"), "{rendered}");
+    }
+
+    #[test]
+    fn a_membership_names_its_context_and_knows_when_it_is_usable() {
+        let active: Membership = serde_json::from_value(serde_json::json!({
+            "org_slug": "acme",
+            "tenant_slug": "acme-prod",
+            "role": "admin",
+            "provisioning_state": "active",
+        }))
+        .unwrap();
+        assert_eq!(active.context_name(), "acme/acme-prod");
+        assert!(active.is_active());
+        // `display_name` and `gateway_url` are absent on today's wire (§7.1 is
+        // M4), which must deserialize rather than fail.
+        assert_eq!(active.display_name, None);
+        assert_eq!(active.gateway_url, None);
+
+        let provisioning: Membership = serde_json::from_value(serde_json::json!({
+            "org_slug": "acme",
+            "tenant_slug": "acme-new",
+            "role": "admin",
+            "provisioning_state": "provisioning",
+        }))
+        .unwrap();
+        assert!(!provisioning.is_active());
+    }
+
+    /// The nested envelope, and the fallbacks for a body that is not one — a
+    /// proxy's HTML error page, or an empty 502.
+    #[test]
+    fn error_bodies_map_to_a_typed_failure_or_their_first_line() {
+        let typed = parse_error(
+            400,
+            r#"{"error": {"code": "org_ambiguous", "message": "several orgs",
+                "orgs": [{"org_slug": "acme"}, {"display_name": "no slug here"}]}}"#,
+        );
+        assert_eq!(typed.code.as_deref(), Some("org_ambiguous"));
+        assert_eq!(typed.message, "several orgs");
+        // An entry with no `org_slug` is dropped rather than rendered as an
+        // empty name.
+        assert_eq!(typed.orgs, ["acme"]);
+        assert_eq!(typed.to_string(), "[org_ambiguous] several orgs (HTTP 400)");
+
+        let html = parse_error(502, "<html><body>Bad Gateway</body></html>\nmore");
+        assert_eq!(html.code, None);
+        assert_eq!(html.message, "<html><body>Bad Gateway</body></html>");
+        assert_eq!(
+            html.to_string(),
+            "<html><body>Bad Gateway</body></html> (HTTP 502)"
+        );
+
+        // A well-formed envelope with no message still says something.
+        let bare = parse_error(500, r#"{"error": {"code": "internal"}}"#);
+        assert_eq!(bare.message, "no message");
+    }
+}

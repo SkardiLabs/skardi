@@ -278,6 +278,63 @@ mod tests {
         assert_eq!(callback.state.as_deref(), Some("the-state"));
     }
 
+    /// The noise a real port sees: a POST, a request line that is not HTTP at
+    /// all, and a connection that opens and closes. None may consume the
+    /// single callback, and each is answered rather than left hanging.
+    #[tokio::test]
+    async fn malformed_and_non_get_requests_are_answered_and_ignored() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let loopback = Loopback::bind().await.unwrap();
+        let uri = loopback.redirect_uri();
+        let addr = uri
+            .trim_start_matches("http://")
+            .trim_end_matches("/callback")
+            .to_string();
+
+        let waiter = tokio::spawn(async move { loopback.wait(Duration::from_secs(5)).await });
+
+        // A POST to the right path: not a redirect, so not the callback.
+        let _ = reqwest::Client::new()
+            .post(&uri)
+            .body("code=nope")
+            .send()
+            .await;
+        // A request line that is not a request line.
+        let mut raw = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        raw.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
+        drop(raw);
+        // A connection that opens and hangs up without sending anything.
+        drop(tokio::net::TcpStream::connect(&addr).await.unwrap());
+
+        let callback = reqwest::get(format!("{uri}?code=real&state=s"))
+            .await
+            .unwrap();
+        assert!(callback.status().is_success());
+        let received = waiter.await.unwrap().unwrap();
+        assert_eq!(received.code.as_deref(), Some("real"));
+    }
+
+    /// Enough noise to exhaust the allowance ends the wait with a message
+    /// naming why, instead of holding the port until the timeout.
+    #[tokio::test]
+    async fn too_much_noise_gives_up_rather_than_waiting_out_the_timeout() {
+        let loopback = Loopback::bind().await.unwrap();
+        let base = loopback
+            .redirect_uri()
+            .trim_end_matches("/callback")
+            .to_string();
+
+        let waiter = tokio::spawn(async move { loopback.wait(Duration::from_secs(30)).await });
+        let http = reqwest::Client::new();
+        for _ in 0..=super::MAX_UNRELATED_REQUESTS {
+            let _ = http.get(format!("{base}/favicon.ico")).send().await;
+        }
+
+        let err = waiter.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("unrelated requests"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_provider_error_is_returned_rather_than_waited_out() {
         let loopback = Loopback::bind().await.unwrap();

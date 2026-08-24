@@ -82,6 +82,13 @@ pub struct LoginOptions {
     /// `$SKARDI_GATEWAY_URL`, the second step.
     pub env_gateway_url: Option<String>,
     pub endpoints: oauth::Endpoints,
+    /// How the authorization URL reaches a browser.
+    ///
+    /// A plain `fn` pointer rather than a closure: nothing here needs to
+    /// capture state, so this keeps `LoginOptions` free of type parameters
+    /// while letting a test play the user agent — which is what makes the
+    /// browser path covered rather than argued.
+    pub open_browser: fn(&str) -> std::io::Result<()>,
     pub callback_timeout: std::time::Duration,
     /// The PAT's name at the control plane, `cli@<hostname>`.
     pub token_name: String,
@@ -148,7 +155,12 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
         }
     }
 
-    let selected = select_memberships(&options.selection, active, &report.skipped)?;
+    let selected = select_memberships(
+        &options.selection,
+        active,
+        &report.skipped,
+        &mut std::io::stdin().lock(),
+    )?;
     if options.context_name.is_some() && selected.len() > 1 {
         bail!(
             "--context names ONE context, but {} workspaces were selected — drop it, or select a single workspace with --workspace",
@@ -243,7 +255,7 @@ async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Resul
         client_id,
         options.no_browser,
         options.callback_timeout,
-        &oauth::open_in_browser,
+        &options.open_browser,
     )
     .await
 }
@@ -297,6 +309,9 @@ fn select_memberships(
     selection: &Selection,
     active: Vec<Membership>,
     skipped: &[(String, String)],
+    // Where the picker reads its answer. A parameter, not `stdin`, so the
+    // interactive branch is exercised by tests rather than only by hand.
+    input: &mut dyn std::io::BufRead,
 ) -> Result<Vec<Membership>> {
     if active.is_empty() {
         // The skip list is the explanation when it is the reason.
@@ -335,7 +350,7 @@ fn select_memberships(
         }
         Selection::Auto if active.len() == 1 => Ok(active),
         Selection::Auto => {
-            let chosen = prompt_for_workspace(&active)?;
+            let chosen = prompt_for_workspace(&active, input)?;
             Ok(vec![chosen])
         }
     }
@@ -344,29 +359,17 @@ fn select_memberships(
 /// Ask which workspace to use. On EOF — a pipe, a CI job, a `< /dev/null` —
 /// this is a non-interactive run, so it names the flags that do the same job
 /// rather than looping on an input that will never come.
-fn prompt_for_workspace(active: &[Membership]) -> Result<Membership> {
+fn prompt_for_workspace(
+    active: &[Membership],
+    input: &mut dyn std::io::BufRead,
+) -> Result<Membership> {
     use std::io::Write as _;
 
-    eprintln!("this identity has {} active workspaces:", active.len());
-    for (index, membership) in active.iter().enumerate() {
-        let display = membership
-            .display_name
-            .as_deref()
-            .filter(|name| !name.is_empty())
-            .map(|name| format!(" — {name}"))
-            .unwrap_or_default();
-        eprintln!(
-            "  {}) {}{display} (role: {})",
-            index + 1,
-            membership.context_name(),
-            membership.role
-        );
-    }
-    eprint!("select one [1-{}]: ", active.len());
+    eprint!("{}", render_workspace_menu(active));
     let _ = std::io::stderr().flush();
 
     let mut line = String::new();
-    let read = std::io::stdin()
+    let read = input
         .read_line(&mut line)
         .context("read the workspace selection")?;
     if read == 0 {
@@ -381,6 +384,32 @@ fn prompt_for_workspace(active: &[Membership]) -> Result<Membership> {
         .filter(|n| (1..=active.len()).contains(n))
         .ok_or_else(|| anyhow!("'{}' is not one of 1-{}", line.trim(), active.len()))?;
     Ok(active[choice - 1].clone())
+}
+
+/// The picker's menu, as its own function so the text — including the
+/// `display_name` a control plane may or may not send — is asserted rather
+/// than eyeballed.
+fn render_workspace_menu(active: &[Membership]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!("this identity has {} active workspaces:\n", active.len());
+    for (index, membership) in active.iter().enumerate() {
+        let display = membership
+            .display_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(|name| format!(" — {name}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  {}) {}{display} (role: {})",
+            index + 1,
+            membership.context_name(),
+            membership.role
+        );
+    }
+    let _ = write!(out, "select one [1-{}]: ", active.len());
+    out
 }
 
 /// §6.2: `--server` > `$SKARDI_GATEWAY_URL` > the membership's `gateway_url` >

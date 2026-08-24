@@ -463,6 +463,79 @@ mod tests {
         );
     }
 
+    /// Several contexts and no pointer selects nothing (§5.1), so `logout`
+    /// with no `--context` and no `--all` says which flags resolve it.
+    #[tokio::test]
+    async fn no_selectable_context_names_the_flags_that_would_pick_one() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".skardi").join("config.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "contexts:\n\
+             \x20 - name: one\n\
+             \x20   mode: cloud\n\
+             \x20   server: http://gw.example\n\
+             \x20   workspace: w-one\n\
+             \x20   token: t1\n\
+             \x20 - name: two\n\
+             \x20   mode: cloud\n\
+             \x20   server: http://gw.example\n\
+             \x20   workspace: w-two\n\
+             \x20   token: t2\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = run_at(&path, args(false, false), None, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("--context <NAME>"), "{err}");
+        assert!(err.contains("--all"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// A cloud context that holds no credential is skipped by `--all` rather
+    /// than rewritten, so a repeated `logout --all` is a no-op.
+    #[tokio::test]
+    async fn logout_all_is_idempotent() {
+        let home = TempDir::new().unwrap();
+        let path = seed(&home, "http://127.0.0.1:1");
+
+        run_at(&path, args(true, false), None, None, None)
+            .await
+            .unwrap();
+        let after_first = std::fs::read_to_string(&path).unwrap();
+
+        run_at(&path, args(true, false), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+    }
+
+    /// `--revoke` without `--identity` re-authenticates through the browser,
+    /// which needs a client id — named, rather than surfacing as an opaque
+    /// failure once the credential is already gone locally.
+    #[tokio::test]
+    async fn revoke_without_an_identity_or_a_client_id_says_which_is_missing() {
+        let home = TempDir::new().unwrap();
+        let path = seed(&home, "http://127.0.0.1:1");
+        let mut args = args(false, true);
+        args.identity = None;
+
+        let err = run_at(&path, args, None, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--client-id"), "{err}");
+        assert!(err.contains("--identity dev:<id>"), "{err}");
+        // The local clear still happened: the credential is off this machine
+        // whether or not the control plane can be reached.
+        assert!(yaml(&path)["contexts"][0].get("token").is_none());
+    }
+
     #[tokio::test]
     async fn an_explicit_context_flag_wins_over_the_current_one() {
         let home = TempDir::new().unwrap();
