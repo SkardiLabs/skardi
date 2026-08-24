@@ -1,0 +1,118 @@
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Message ID."
+          },
+          "subject": {
+            "type": "string",
+            "description": "Message subject."
+          },
+          "bodyPreview": {
+            "type": "string",
+            "description": "Preview snippet of the message body."
+          },
+          "importance": {
+            "type": "string",
+            "description": "Message importance."
+          },
+          "isRead": {
+            "type": "boolean",
+            "description": "Whether the message is marked as read."
+          },
+          "isDraft": {
+            "type": "boolean",
+            "description": "Whether the message is a draft."
+          },
+          "webLink": {
+            "type": "string",
+            "description": "Web URL for the message in Outlook."
+          },
+          "body": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "sender": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "from": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          },
+          "toRecipients": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "A generic JSON object returned by Microsoft Graph."
+            },
+            "description": "Primary recipients."
+          },
+          "ccRecipients": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "A generic JSON object returned by Microsoft Graph."
+            },
+            "description": "Cc recipients."
+          },
+          "bccRecipients": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "A generic JSON object returned by Microsoft Graph."
+            },
+            "description": "Bcc recipients."
+          },
+          "replyTo": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "A generic JSON object returned by Microsoft Graph."
+            },
+            "description": "Reply-to recipients."
+          },
+          "flag": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "A generic JSON object returned by Microsoft Graph."
+          }
+        },
+        "additionalProperties": true,
+        "description": "Outlook message resource."
+      },
+      "description": "Messages returned by Outlook."
+    },
+    "nextLink": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Pagination URL for the next page, or null when there is no next page."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "messages",
+    "nextLink"
+  ],
+  "description": "Outlook message list response."
+}

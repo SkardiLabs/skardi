@@ -45,6 +45,7 @@ fn influx_source(name: &str, measurement: &str) -> DataSource {
         description: None,
         open_connector: None,
         rss: None,
+        graph: None,
     }
 }
 

@@ -388,7 +388,15 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState::new(config, engine, session_ctx, AuthLayer::None, None, None)
+        AppState::new(
+            config,
+            engine,
+            session_ctx,
+            AuthLayer::None,
+            None,
+            None,
+            Default::default(),
+        )
     }
 
     #[tokio::test]
@@ -399,6 +407,10 @@ mod tests {
     }
 
     async fn make_better_auth_state() -> AppState {
+        // Held only across the env mutation + `build` below: once the layer
+        // exists it no longer reads the environment, so callers need not
+        // keep the guard.
+        let _env = crate::auth::test_env::lock().await;
         use crate::auth::layer::AuthLayer;
         use crate::config::{CliArgs, ServerConfig};
         use crate::semantics::SemanticsRegistry;
@@ -436,7 +448,15 @@ mod tests {
         };
         let session_ctx = Arc::new(SessionContext::new());
         let engine = Arc::new(DataFusionEngine::new_with_arc(session_ctx.clone()));
-        AppState::new(config, engine, session_ctx, layer, None, None)
+        AppState::new(
+            config,
+            engine,
+            session_ctx,
+            layer,
+            None,
+            None,
+            Default::default(),
+        )
     }
 
     #[tokio::test]

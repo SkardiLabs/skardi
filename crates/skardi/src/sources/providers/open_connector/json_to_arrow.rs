@@ -551,16 +551,8 @@ fn parse_timestamp(value: &Value) -> Option<i64> {
     value.as_i64()
 }
 /// Short human-readable kind of a JSON value, for error messages.
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
+// The shared repo-wide kind vocabulary (article-prefixed: "a boolean").
+use crate::util::json::json_kind;
 
 #[cfg(test)]
 mod tests {
@@ -780,11 +772,11 @@ mod tests {
             ),
             (
                 serde_json::json!({"labels": [{"name": 42}]}),
-                "array element whose 'name' is number",
+                "array element whose 'name' is a number",
             ),
             (
                 serde_json::json!({"labels": ["bug"]}),
-                "string array element",
+                "a string array element",
             ),
         ] {
             let err = converter.convert(&[bad], 1).unwrap_err();
@@ -886,7 +878,7 @@ mod tests {
         match err {
             OpenConnectorError::ConversionFailed { found, column, .. } => {
                 assert_eq!(column, "id");
-                assert_eq!(found, "string");
+                assert_eq!(found, "a string");
                 assert!(!found.contains("not-a-number"), "error must not echo data");
             }
             other => panic!("expected ConversionFailed, got {other}"),
@@ -956,10 +948,10 @@ mod tests {
         assert!(created.is_null(2), "absent key stays NULL");
 
         for (bad, found) in [
-            (serde_json::json!({"created": 1735689600.5}), "number"),
+            (serde_json::json!({"created": 1735689600.5}), "a number"),
             (
                 serde_json::json!({"created": "2025-01-01T00:00:00Z"}),
-                "string",
+                "a string",
             ),
             // Overflow is its own diagnosis — "found: number" would
             // contradict the expected type, which is also a number.
@@ -1031,7 +1023,7 @@ mod tests {
             // would blur the two variants' contracts.
             (
                 serde_json::json!({"create_time": 1735689600000_i64}),
-                "number",
+                "a number",
                 "epoch-millis digit string",
             ),
             (

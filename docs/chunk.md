@@ -24,7 +24,7 @@ chunk(mode, text, size [, overlap]) -> List<Utf8>
 | Argument | Type | Description |
 |----------|------|-------------|
 | `mode` | string literal | Splitter to use. Supported: `'character'`, `'markdown'`. |
-| `text` | `Utf8` | The text to split. May be a literal, a scalar subquery, or a column reference. `NULL` rows pass through unchanged. |
+| `text` | string (`Utf8`, `LargeUtf8`, or `Utf8View`) | The text to split. May be a literal, a scalar subquery, or a column reference — any Arrow string layout. `NULL` rows pass through unchanged. |
 | `size` | integer literal | Target maximum chunk length in characters. Must be `> 0`. |
 | `overlap` | integer literal | Optional. Characters of overlap between adjacent chunks. Must be strictly less than `size`. Defaults to `0`. |
 

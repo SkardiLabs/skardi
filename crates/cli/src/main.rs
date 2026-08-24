@@ -19,6 +19,7 @@ mod commands;
 mod config;
 mod output;
 mod params;
+mod session;
 
 /// Command-line interface for interacting with a skardi-server instance.
 #[derive(Parser, Debug)]
@@ -76,6 +77,11 @@ enum Commands {
         /// render results as a table instead of JSON
         #[arg(long)]
         table: bool,
+
+        /// Session id recorded with this execution in the server's audit
+        /// ledger (sent as the X-Skardi-Session-Id header).
+        #[arg(long)]
+        session_id: Option<String>,
     },
 
     /// List pipelines, or show one pipeline's definition.
@@ -155,7 +161,8 @@ async fn dispatch(command: Commands, config: &ClientConfig) -> anyhow::Result<()
             data,
             params,
             table,
-        } => commands::run::run(&client, &name, data.as_deref(), &params, table).await,
+            session_id,
+        } => commands::run::run(&client, &name, data.as_deref(), &params, table, session_id).await,
 
         Commands::Pipeline { cmd } => commands::pipeline::run(&client, cmd).await,
 

@@ -4,11 +4,16 @@
 use crate::client::{ApiClient, ApiError, encode_component};
 use crate::output::print_result;
 use crate::params::build_body;
+use crate::session::validate_session_id;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 /// Run `skardi run <name>`: build the request body from `-d`/`-p`, `POST` it
 /// to `/{name}/execute`, and hand the response envelope to [`print_result`].
+///
+/// When `session_id` is set, it's sent as the `x-skardi-session-id` header
+/// so the server records this execution against that session in its audit
+/// ledger; when `None`, no such header is sent.
 ///
 /// A 404 response is remapped to a friendly "pipeline not found" error
 /// naming `name`; every other `ApiError` passes through unchanged (so, e.g.,
@@ -20,11 +25,25 @@ pub async fn run(
     data: Option<&str>,
     param_flags: &[String],
     table: bool,
+    session_id: Option<String>,
 ) -> Result<()> {
+    if let Some(sid) = &session_id {
+        validate_session_id(sid)?;
+    }
+
     let body = build_body(data, param_flags)?;
     let path = format!("/{}/execute", encode_component(name));
 
-    match client.post(&path, &Value::Object(body)).await {
+    let response = match &session_id {
+        Some(sid) => {
+            client
+                .post_with_headers(&path, &Value::Object(body), &[("x-skardi-session-id", sid)])
+                .await
+        }
+        None => client.post(&path, &Value::Object(body)).await,
+    };
+
+    match response {
         Ok(response) => {
             print_result(&response, table);
             Ok(())
@@ -39,10 +58,10 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::run;
-    use crate::client::ApiClient;
+    use crate::client::{ApiClient, ApiError};
     use crate::config::ClientConfig;
     use serde_json::json;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_config(server: &str) -> ClientConfig {
@@ -81,6 +100,7 @@ mod tests {
             Some(r#"{"user_id":1,"category":"basic"}"#),
             &["category=premium".to_string()],
             false,
+            None,
         )
         .await;
 
@@ -101,7 +121,7 @@ mod tests {
             .await;
 
         let client = ApiClient::new(&test_config(&server.uri())).unwrap();
-        let result = run(&client, "daily_report", None, &[], false).await;
+        let result = run(&client, "daily_report", None, &[], false, None).await;
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
@@ -124,7 +144,9 @@ mod tests {
             .await;
 
         let client = ApiClient::new(&test_config(&server.uri())).unwrap();
-        let err = run(&client, "ghost", None, &[], false).await.unwrap_err();
+        let err = run(&client, "ghost", None, &[], false, None)
+            .await
+            .unwrap_err();
 
         let message = err.to_string();
         assert!(
@@ -154,6 +176,94 @@ mod tests {
             .await;
 
         let client = ApiClient::new(&test_config(&server.uri())).unwrap();
-        run(&client, "a/b c", None, &[], false).await.unwrap();
+        run(&client, "a/b c", None, &[], false, None).await.unwrap();
+    }
+
+    // -- 5. --session-id sends X-Skardi-Session-Id header ----------------
+
+    #[tokio::test]
+    async fn run_with_session_id_sets_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/my-pipe/execute"))
+            .and(header("x-skardi-session-id", "sess-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_envelope()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let result = run(
+            &client,
+            "my-pipe",
+            None,
+            &[],
+            false,
+            Some("sess-9".to_string()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    // -- 5b. invalid --session-id fails fast, before any request ----------
+
+    #[tokio::test]
+    async fn run_with_invalid_session_id_errors_without_contacting_server() {
+        let server = MockServer::start().await;
+        // expect(0): the whole point is that no request is ever sent — a
+        // deferred header error would surface as ApiError::Connect and be
+        // misread as "server unreachable".
+        Mock::given(method("POST"))
+            .and(path("/my-pipe/execute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_envelope()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        for bad in [
+            "",
+            &"x".repeat(201),
+            "sesión-1",
+            "line\nbreak",
+            "tab\there",
+            "sess-1, sess-2", // proxy-merged duplicate shape
+            "   ",            // spaces-only
+            "sess 1",         // interior space
+        ] {
+            let result = run(&client, "my-pipe", None, &[], false, Some(bad.to_string())).await;
+            let err = result.expect_err("expected validation error");
+            assert!(
+                err.to_string().contains("--session-id"),
+                "expected a --session-id validation message, got: {err}"
+            );
+            assert!(
+                err.downcast_ref::<ApiError>().is_none(),
+                "must not be an ApiError (would map to a connection exit code)"
+            );
+        }
+    }
+
+    // -- 6. no --session-id sends no header -------------------------------
+
+    #[tokio::test]
+    async fn run_without_session_id_sends_no_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/my-pipe/execute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_envelope()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let result = run(&client, "my-pipe", None, &[], false, None).await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].headers.contains_key("x-skardi-session-id"));
     }
 }

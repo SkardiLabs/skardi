@@ -7,7 +7,8 @@ We're **building in public**. `[x]` means shipped today, `[ ]` means open for co
 `1` Federated SQL engine
    - [x] One SQL engine ([DataFusion](https://datafusion.apache.org/), in-process) over CSV, Parquet, S3 / GCS / Azure, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, SeekDB — all joinable in one query
    - [x] Register either one specific table, or point Skardi at a database (Postgres / MySQL / SQLite) and let it auto-discover all tables — one config line either way
-   - [ ] Graph database sources (Neo4j / Kuzu) — to unlock graphRAG patterns alongside vector / full-text retrieval
+   - [x] Graph sources (Apache AGE — read-only Cypher over Postgres as SQL tables, YAML views + `cypher_query`; [docs](graph.md))
+   - [ ] Graph sources beyond AGE (Neo4j / Kuzu) — to unlock graphRAG patterns alongside vector / full-text retrieval
 
 `2` Retrieval primitives
    - [x] Vector search (KNN) — `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), Lance KNN, SeekDB HNSW

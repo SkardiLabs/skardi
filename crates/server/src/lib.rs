@@ -7,11 +7,15 @@ pub mod logging;
 pub mod metrics;
 pub mod optimizer_registry;
 pub mod pipeline_handlers;
-pub mod query_audit;
+// Extracted to its own crate so downstream distributions (the cloud engine)
+// can adopt the SAME ledger — file format, flags, semantics — without
+// depending on this whole server crate. The old path keeps working.
+pub use skardi_query_audit as query_audit;
 pub mod query_handlers;
 pub mod remote_storage;
 pub mod response;
 pub mod server;
+pub mod session_header;
 pub mod telemetry;
 
 // Re-export `skardi::semantics` so server code can use `crate::semantics::...`.

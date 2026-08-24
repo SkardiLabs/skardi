@@ -135,7 +135,9 @@ CREATE TABLE IF NOT EXISTS job_runs (
     finished_at   TEXT,
     rows_written  INTEGER,             -- set on succeeded; also on post-commit cancels
     snapshot_id   TEXT,                -- Lance: the version the commit landed on
-    error         TEXT                 -- non-null on failed/cancelled
+    error         TEXT,                -- non-null on failed/cancelled
+    submission_id TEXT                 -- opaque correlation token from the submitter;
+                                       -- the server stores its query-audit row id here
 );
 ```
 

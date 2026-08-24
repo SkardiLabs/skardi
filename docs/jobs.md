@@ -171,12 +171,51 @@ On startup the server:
 |----------|--------|-------------|
 | `/jobs` | GET | List every registered job with its destination |
 | `/jobs/:name/run` | POST | Submit a new run; body is the param map |
-| `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N` |
+| `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N` (max 500). `?submission_id=<token>` instead resolves the single run carrying that correlation token, ignoring `job`/`limit` |
 | `/jobs/runs/:run_id` | GET | Current state of one run |
 | `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation |
 
-When the server was started without `--jobs`, every endpoint above
-returns `503 Service Unavailable` with `error_type: jobs_disabled`.
+For an authenticated caller, a server started without `--jobs` returns
+`503 Service Unavailable` with `error_type: jobs_disabled` from every
+endpoint above. An unauthenticated caller sees the `401` below instead and
+never learns whether jobs are enabled.
+
+### Authentication
+
+Every `/jobs/*` route requires a valid session when the server is started
+with authentication configured. The check is the first thing each handler
+does, so it **precedes** both the `jobs_disabled` 503 and the unknown-job
+404 — deliberately, so an unauthenticated caller cannot read either fact off
+the status code. The rejection is `401 Unauthorized` with
+`error_type: unauthorized`, in the same error envelope as every other jobs
+response.
+
+Servers with no auth layer configured are unaffected: the check
+short-circuits, and all five endpoints behave exactly as before.
+
+Note this is separate from the `X-Skardi-Session-Id` header below.
+Authentication answers *may this caller use the endpoint at all*; the
+session header answers *which agent session should this submission be
+attributed to*, and stays self-reported. Passing the header does not
+authenticate a request, and authenticating does not make the header
+trustworthy.
+
+### Session attribution
+
+`POST /jobs/:name/run` accepts an optional `X-Skardi-Session-Id` request
+header (non-empty, ≤ 200 characters) that attributes the submission to an
+agent session in the query audit ledger. A malformed header is rejected
+with `400 parameter_validation_error` — the header is always validated once
+the job exists, regardless of audit configuration. When `--query-audit-db`
+is configured, the submission is recorded as a `job` row with the session
+id and `name@version` in the ledger, with the submission's outcome
+(`succeeded` or `failed`) and the `job_run_id` bridge to the run. That bridge
+has a second, durable half in the other direction — `job_runs.submission_id`
+holds the audit row's id, written with the run's INSERT — so a lost
+`job_run_id` stamp no longer loses the correlation, and the server re-links
+such rows on its next startup. When the server has
+auditing enabled, a `503` with `error_type: query_audit_error` means the
+job **was not submitted** and the call is safe to retry.
 
 ---
 
@@ -223,6 +262,14 @@ and falls back to a plain string otherwise.
 Jobs run **only inside the server** — there is no in-process fallback
 and no `--ctx` flag on the CLI-side job commands. If the server isn't
 running you'll get a connection-refused error.
+
+Against an auth-enabled server every `skardi job` subcommand needs a token,
+since all five endpoints are gated (see
+[Authentication](#authentication)). Supply it with `--token`,
+`$SKARDI_API_TOKEN`, or `~/.skardi/config.yaml`; the CLI attaches it as
+`Authorization: Bearer <token>` on every request. Without one the symptom is
+a `401 unauthorized` from a command that needed no token before the gate
+existed.
 
 ---
 
@@ -316,6 +363,14 @@ Row fields, matching the CLI `status` response:
 | `rows_written` | Set on `succeeded`; also set on post-commit cancels |
 | `snapshot_id` | For Lance: the version the commit landed on, as a string |
 | `error` | Non-null on failures / cancels; free-form message |
+
+The row carries one field the response does not: `submission_id`, the opaque
+correlation token the submitter supplied — for the server, the `query_audit`
+row id of the submission that created this run. It is withheld from run
+payloads on purpose (it is another ledger's primary key, and any authenticated
+session can list every run) and is reachable as a filter instead:
+`GET /jobs/runs?submission_id=<audit row id>`. See the ledger section of
+[`server.md`](server.md).
 
 ---
 

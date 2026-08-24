@@ -82,11 +82,13 @@ tracing = { workspace = true }
 # pipeline
 log = { workspace = true }
 regex = { workspace = true }
-# preserve_order is LOAD-BEARING: json_pack's argument-order-is-object-order
-# contract (and the etl golden bundles' byte determinism) rides on
-# serde_json::Map preserving insertion order. Without the explicit feature
-# it held only through transitive unification (bson enables it) — a dep
-# change away from silently becoming lexicographic.
+# preserve_order is LOAD-BEARING for TWO consumers: json_pack's
+# argument-order-is-object-order contract (and the etl golden bundles'
+# byte determinism), and the graph module's declared-columns JSON — whose
+# object order IS the positional binding to the Cypher RETURN clause
+# (trimming this feature would silently re-sort declared columns
+# lexicographically and mis-map same-typed columns). Without the explicit
+# feature it held only through transitive unification (bson enables it).
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
 # model
@@ -162,6 +164,12 @@ thiserror = "2.0"
 tokio-rusqlite = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+# The design's NAMED dependency for graph `properties` extraction
+# (graph-engine-bypass §Schema handling): ecosystem json_get family
+# instead of a homegrown twin. Registered by the server session (its
+# register_all also installs ->/->>/? operator rewrites session-wide, so
+# it must not hide behind graph::register_graph_udtfs).
+datafusion-functions-json = "0.52"
 
 [dev-dependencies]
 tokio-test = "0.4"

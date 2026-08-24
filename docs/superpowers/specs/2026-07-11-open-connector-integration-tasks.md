@@ -305,7 +305,196 @@ event carrying the scan identity and error.
       tests (`cargo test -p skardi --lib sources::providers::open_connector`,
       post-merge with 5.3), 17 pack-scoped (`… packs::feishu`), 842 full
       library suite.
-- [ ] 5.5 Later waves per the design rollout (Google Workspace, Discord, HubSpot, Jira, …) through the source-pack admission gate
+- [x] 5.5 Gmail pack (Google OAuth, page-token cursor pagination): `threads`,
+      `messages`, `drafts`, `labels`, `filters` as stable tables
+      (`packs/gmail.yaml`) — the first Google Workspace pack. The wire
+      contract is Open Connector's normalized rebuild of the Gmail API
+      (Slack-style: camelCase identity, headers flattened into
+      `subject`/`sender`/`to`, `internalDate` re-emitted as RFC 3339
+      `messageTimestamp`; `labels`/`filters` pass provider objects through
+      raw), reconciled against a live gateway v1.3.4 and the OC executor
+      source. Cursor termination is the executor's explicit
+      `nextPageToken: null` (absent and `""` also terminate — one e2e per
+      spelling across the tables). `messages` pins `detail: summary` (ids
+      too thin, full unbounded) with page size 100 — the executor hydrates
+      each listed message (N+1 Gmail calls per page), so the page size
+      bounds the burst; `threads`/`drafts` use Gmail's 500 ceiling and
+      never send `verbose`. `labels`/`filters` take no pagination inputs at
+      all, which required the one engine extension this milestone adds:
+      the loader's **`single_page` strategy spelling** (the engine's
+      `SinglePage` existed but was unreachable from YAML; braced variant so
+      `deny_unknown_fields` still rejects stray keys) plus its optional
+      `next_cursor_path`, which turns the strategy's "one request is the
+      whole collection" premise into a checked assertion — a live
+      continuation fails as `SinglePageIncomplete` rather than returning a
+      prefix as a complete table, closing the engine's one silent
+      truncation. Raw scans (`open_connector_scan`) declare no path and
+      keep the historic one-request behaviour. **No filter pushdown
+      anywhere** (Gmail's `q` is a free-text language, `labelIds` an
+      AND-semantics array — neither maps to a scalar `column op literal`
+      faithfully); `query`/`labelIds`/`includeSpamTrash` are optional
+      resources instead, and the default listing is documented as Gmail's
+      own (excludes SPAM/TRASH; not pinned away because `list_threads`
+      offers no such input — pinning it on `messages` alone would make the
+      two tables describe different mailboxes). `to` is mapped as
+      `to_addresses` (TO is a reserved SQL keyword); header-derived
+      absents stay `""`, never NULL. Excluded, with rationale in the
+      module doc: `search_threads` (strict subset), `list_history`
+      (checkpoint API), `list_forwarding_addresses` (no output schema to
+      fingerprint), `get_profile` (scalar), message bodies (future
+      content surface). `error_path: None` everywhere (executors consume
+      provider errors; failure envelope pinned by e2e). Fingerprints
+      pinned from live capture (`fixtures/gmail/contracts/`, gateway
+      v1.3.4) over the whole declared schema, `anyOf` branches included —
+      a renamed field inside `fetch_emails`' items moves the hash and
+      fails registration. Unlike the other packs' pins, gmail's records a
+      limit of the static walker, not a gap in the gate: the `messages`
+      paths ARE declared, inside `anyOf` branches the helper cannot
+      follow. Input schemas are pinned too (`contracts/inputs/`), since
+      the gate is output-only. **Live-verified end to end
+      against a real mailbox (2026-08-05, gateway v1.3.4 + Google OAuth
+      through the gateway)**: registration passed the fingerprint gate
+      against live discovery for all five actions; every mapped column
+      of every table extracted a real non-NULL value through
+      skardi-server; real multi-page cursor chaining (`maxResults: 1`,
+      three pages) and real final-page null-token termination observed;
+      `query`/`labelIds`/`includeSpamTrash` resources observed narrowing
+      real listings; input bounds `[1,500]` and the `detail` enum
+      enforced by the real gateway. The live pass settled two synthetic
+      guesses (which system labels omit visibility fields; a fresh
+      draft's threadId equals its messageId) and caught one upstream
+      bug: a zero-filter mailbox fails `list_filters` with
+      `internal_error` (Gmail returns an empty body the executor's
+      `response.json()` does not tolerate) — documented in the pack doc,
+      fix belongs upstream. Fixtures are redacted live captures from
+      that pass (mechanically audited against an allowlist); executor
+      absent-spellings the capture lacked are pinned by an inline
+      converter test.
+      **Verification**: 284 open_connector tests (counted by `cargo test
+      -p skardi --lib sources::providers::open_connector`, confirmed
+      against the PR's CI run; 23 new) — five
+      fixture contract suites plus the schema-mismatch and null-parent
+      pins, fingerprint sync + coverage pins, drift-refusal e2e, loader
+      single_page pass/refusal, registry pin, and per-declaration e2e
+      (threads/messages/drafts two-page cursor scans each pinning its own
+      exact wire keys and a distinct termination spelling, single-page
+      one-request pins for labels/filters, optional-resource forwarding
+      with type fidelity and per-table withholding, no-pushdown guard
+      with row identity, LIMIT early-stop, pagination-loop refusal,
+      gateway failure-envelope surfacing, UDTF parity).
+- [ ] 5.6 Later waves per the design rollout (Google Calendar, Google Drive, Discord, HubSpot, Jira, …) through the source-pack admission gate
+- [x] 5.6 Discord pack (OAuth user-identity surface, raw passthrough rows, no
+      pagination envelope): guilds, connections, sticker_packs. The provider is
+      @me-only (its own get_user rejects any other id), so channels/messages/
+      members are out of scope by provider surface, not deferral; entitlements
+      is deferred because the upstream executor exposes no pagination inputs
+      (first-page-only). Engine extensions: `PaginationStrategy::Keyset`
+      (cursor = a field of the previous page's LAST ROW, `after`-style; ONLY an
+      empty page terminates — short pages continue, so a silent page-size clamp
+      of the kind the Feishu live pass observed cannot read as completion;
+      missing or non-string cursor on a non-empty page is typed drift, not a
+      quiet stop; a repeated cursor fails with identity only, never quoting the
+      row value) and an explicit `single_page` YAML spelling. Live contract
+      reconciliation 2026-08-07: action IDs + executor passthrough confirmed in
+      source, strict inputs validated to the credential wall via the 403-vs-400
+      probe, three output schemas captured and fingerprint-pinned, then all
+      three tables verified against a REAL account end to end through
+      skardi-server (registration through LIVE discovery; guilds 6 rows and
+      sticker_packs 14 rows with every mapped column non-NULL on real rows;
+      connections 1 real linked-account row — all nine wire keys mapped, the
+      connection_type rename extracting, `revoked` genuinely absent on a
+      non-revoked row with its non-NULL arm on a synthetic fixture row, since
+      capturing it live would revoke a real account link). The real keyset
+      walk (limit 2) covered 3 full pages
+      plus the empty terminator, no duplicate/boundary drop, ascending-
+      snowflake ordering confirmed. The live pass caught one contract defect no
+      mock could: the gateway calls the UNVERSIONED discord.com/api, where
+      `permissions` is a truncated NUMBER and the full bitfield string lives in
+      `permissions_new` — the column now maps `permissions_new`, and the
+      version-coupled risk (a future /api/v10 pin removes that key) is
+      documented in the pack doc with an upstream ask to pin the version.
+      guilds/sticker_packs fixtures are redacted live captures with a
+      mechanical allowlist tripwire test on every person-linked fixture.
+      Operational: Discord 429s rapid probes; the gateway surfaces them loudly.
+      Keyset failures carry precise, value-free diagnostics
+      (`PaginationKeysetCursorInvalid` with per-case reasons,
+      `PaginationKeysetLoop` withholding the repeated row value), pinned by
+      full rendered-message assertions. Verification: 311 tests (`cargo test
+      -p skardi --lib sources::providers::open_connector`; 23 new — 9 keyset
+      engine, 1 loader, 13 pack-scoped `… packs::discord` including
+      per-table wire-declaration e2e for all three tables, UDTF parity, and
+      empty-page schema stability), 868 full library suite.
+- [x] 5.7 Outlook pack (OAuth user token, cursor pagination over Graph
+      `@odata.nextLink`, raw-passthrough rows): messages, mail_folders. Open
+      Connector has no `microsoft365` service; it splits Graph into `outlook`
+      (mail only — no calendar or contacts), `one_drive` and `excel`, with one
+      OAuth connection each, so Microsoft 365 ships one pack per service:
+      `one_drive` follows as its own milestone and PR, and the whole `excel`
+      service is deferred at the gate — its list actions emit `nextLink` but
+      accept no `nextLink` input, so their pagination cannot be completed.
+      Phases 1–2 (live contract reconciliation against gateway v1.3.4, table
+      design) are recorded in
+      `docs/superpowers/specs/2026-08-14-open-connector-m365-packs-design.md`.
+      Phase 3 implemented: `packs/outlook.yaml` + `packs/outlook.rs`, both
+      tables cursor-over-`nextLink` (URI-shaped cursors everywhere — the
+      gateway pins format/host/path), `messages` pins `select` to exactly the
+      mapped fields (bounds responses away from the 16 MiB cap and turns a
+      misspelled passthrough column into a loud Graph 400; a test locks the
+      pin to the column set) with `page_size: 100`, `mail_folders` pins
+      `includeHiddenFolders: true` (complete root-level set, `is_hidden`
+      queryable); zero filter mappings (OData `$filter` expressions cannot be
+      composed by a scalar mapping — Notion precedent); input schemas captured
+      from the pinned gateway (`contracts/inputs/`) with the gmail-style
+      acceptance test; fingerprint sync + coverage-gap pins (mail_folders one
+      column, `well_known_name`; messages' thirteen passthrough/nested columns
+      an explicit set); redacted live-capture fixtures (nine messages, nine
+      root folders) re-audited every run by `fixtures_stay_redacted`, with the
+      shapes the live wire cannot produce (explicit nulls, a hidden folder, the
+      type-mismatch page) kept inline-synthetic; per-table cursor e2e with exact
+      key-set wire pins, termination on the executor's one spelling (explicit
+      `null` — the engine's tolerance for absent/empty is pinned in
+      `pagination.rs`, not re-mocked here), loop/invalid-cursor
+      failure arms, LIMIT early-stop, resource forwarding/withholding,
+      no-pushdown row identity, gateway failure-envelope surfacing, UDTF
+      parity, drift-refusal at registration. Note `outlook.list_messages`
+      declares no timestamp field at all, so `receivedDateTime` and every
+      other date ride `additionalProperties` passthrough outside the
+      fingerprint gate. Phase 4 (live real-row verification) ran
+      2026-08-19 against a real MSA mailbox through the pinned gateway:
+      every mapped column carried non-NULL values through a skardi-server
+      SQL scan, live discovery was byte-identical to the committed
+      contracts (both actions, both halves), a forced top=2 walk hit a
+      genuinely-null terminal cursor, top=1000 is the real wire bound
+      (1001 → schema 400), select misspellings 400 loudly, `mailFolderId`
+      forwards verbatim, and the fixtures were re-derived as redacted
+      live captures with a `fixtures_stay_redacted` CI tripwire.
+      Findings: folder-scoped continuation uses Graph's parenthesized
+      `mailFolders('{id}')/messages` form, which the executor's own
+      allowlist rejected — scoped scans past one page 400ed until the
+      upstream fix (open-connector#372, merged 2026-08-19; tagged
+      releases through v1.3.5 predate it); the live mailbox had no
+      hidden folders,
+      so the `includeHiddenFolders` pin's effect was unobservable
+      (recorded as caveat); wire extras `@odata.etag` and `sizeInBytes`
+      remain deliberately unmapped, while `wellKnownName` was promoted
+      to a `well_known_name` column post-pass (Owen-approved
+      2026-08-19: live display names were all CJK, so cross-account
+      folder semantics need Graph's locale-independent discriminator;
+      mail_folders' coverage gap goes empty → one pinned column). Test
+      counts from CI on `ef5125f` (`cargo llvm-cov nextest
+      --all-features`: 1864 tests plus the 237-test ignored suite, all
+      green): 368 `sources::providers::open_connector` tests, 24 of them
+      pack-scoped `…::packs::outlook`, inside a 1716-test skardi library
+      binary. Phase 5 (self-review) ran 2026-08-19 — sixteen findings,
+      fifteen fixed: vacuous test defenses (cardinality assertions arrow
+      satisfies with `""` on null slots, mapped columns with no positive
+      witness), a redaction audit that admitted an as-captured cursor or
+      `webLink` on a host-prefix match alone, doc claims the pack's own
+      fixtures contradict, and two hardcoded builtin-asset rosters
+      lagging two shipped packs. Deferred: consolidating the pack-test
+      helper quartet into `testutil` — seven-way duplication across the
+      packs, so it belongs in its own cross-pack PR rather than a
+      half-migration here.
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -315,12 +504,14 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.2 (Slack pack — conversations, users, files).
-  Milestones 1–4 and 5.1 (GitHub pack) are merged; this PR adds the second
-  real source pack against Open Connector's normalized Slack contract
-  (reconciled live), plus the engine extensions it required
-  (`total_pages_path` on PageNumber, per-mapping `ValueFormat`,
-  `FieldType::TimestampSecondsUtc`, `FixedValue::StrList`).
+- **Current PR**: milestone 5.7 (Outlook pack — messages, mail_folders).
+  Milestones 1–4 and 5.1–5.6 (GitHub, Slack, Notion, Feishu, Gmail,
+  Discord packs) are merged; this PR adds the first Microsoft 365 pack
+  over raw Graph passthrough rows (reconciled live and verified end to
+  end against a real MSA mailbox), with zero engine changes — the
+  pack-shaping decisions are the messages `select` pin and the
+  one-pack-per-OC-service split (`one_drive` follows as its own
+  milestone; the whole `excel` service is deferred at the gate).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

@@ -16,7 +16,10 @@ use skardi::sources::sql_validator::{SqlValidationError, StatementKind, validate
 use std::time::Instant;
 
 use crate::auth::routes::require_session;
-use crate::query_audit::QueryAuditStatus;
+use crate::query_audit::{
+    MAX_SESSION_ID_CHARS, OTHER_STATEMENT_KIND, QUERY_STATEMENT_KIND, QueryAuditStatus,
+    finish_audit,
+};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
 };
@@ -32,9 +35,9 @@ const QUERY_METRICS_LABEL: &str = "query";
 /// intent, not payloads; the cap keeps a runaway string out of the logs.
 const MAX_PURPOSE_CHARS: usize = 2000;
 
-/// Upper bound on the `session_id` field length (characters). It is an opaque
-/// grouping key, not a payload.
-const MAX_SESSION_ID_CHARS: usize = 200;
+// The session-id length cap (`MAX_SESSION_ID_CHARS`) lives in `query_audit`,
+// shared with the pipeline endpoint's header check so audited paths can't
+// drift apart.
 
 /// Upper bound on the serialized size of the whole `ai_context` object (bytes).
 /// The object is free-form beyond its two required fields; the cap keeps a
@@ -121,23 +124,22 @@ fn validate_context_string(
     }
 }
 
-/// Stamp the terminal outcome onto an audit record.
+// `finish_audit` lives in `query_audit`: its contract (no-op when auditing is
+// off; a failed outcome write leaves the row `started` for startup reconcile)
+// is the ledger's, not `/query`'s, and it is shared with `pipeline_handlers`.
+
+/// The ledger's `statement_kind` marker for an ad-hoc statement of the given
+/// kind.
 ///
-/// Unlike the pre-execution write, a failure here cannot un-run the query, so
-/// it is logged rather than surfaced: the row simply stays `started` and the
-/// next startup reconciles it to `unknown`. No-op when auditing is off.
-async fn finish_audit(
-    app_state: &AppState,
-    audit_id: Option<&str>,
-    status: QueryAuditStatus,
-    row_count: Option<usize>,
-    error: Option<&str>,
-) {
-    let (Some(store), Some(id)) = (&app_state.query_audit, audit_id) else {
-        return;
-    };
-    if let Err(e) = store.record_outcome(id, status, row_count, error).await {
-        tracing::error!("Failed to record query-audit outcome for {id}: {e}");
+/// Lives here rather than in `skardi-query-audit` because [`StatementKind`]
+/// comes from `skardi`, which that crate deliberately does not depend on
+/// (#206). The marker *strings* are still owned by the ledger — this only
+/// translates the classifier onto them, so the two cannot drift into two
+/// vocabularies.
+fn adhoc_statement_kind(kind: StatementKind) -> &'static str {
+    match kind {
+        StatementKind::Query => QUERY_STATEMENT_KIND,
+        StatementKind::Other => OTHER_STATEMENT_KIND,
     }
 }
 
@@ -248,9 +250,9 @@ pub async fn execute_query(
     // anything it cannot account for.
     let audit_id = match &app_state.query_audit {
         Some(store) => {
-            let kind = format!("{statement_kind:?}");
+            let kind = adhoc_statement_kind(statement_kind);
             match store
-                .record_started(&request.sql, request.ai_context.as_ref(), max_rows, &kind)
+                .record_started(&request.sql, request.ai_context.as_ref(), max_rows, kind)
                 .await
             {
                 Ok(id) => Some(id),
@@ -310,7 +312,7 @@ pub async fn execute_query(
             // logged here — it lives only in the opt-in audit ledger.
             tracing::error!("Ad-hoc query execution failed: {}", e);
             finish_audit(
-                &app_state,
+                app_state.query_audit.as_deref(),
                 audit_id.as_deref(),
                 QueryAuditStatus::Failed,
                 None,
@@ -359,7 +361,7 @@ pub async fn execute_query(
                 record_batch.num_rows()
             );
             finish_audit(
-                &app_state,
+                app_state.query_audit.as_deref(),
                 audit_id.as_deref(),
                 QueryAuditStatus::Failed,
                 Some(record_batch.num_rows()),
@@ -389,7 +391,7 @@ pub async fn execute_query(
     let row_count = record_batch.num_rows();
 
     finish_audit(
-        &app_state,
+        app_state.query_audit.as_deref(),
         audit_id.as_deref(),
         QueryAuditStatus::Succeeded,
         Some(row_count),

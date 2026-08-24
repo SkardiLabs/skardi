@@ -20,6 +20,7 @@ pub enum DataSourceType {
     Documents,
     Dynamodb,
     Rss,
+    Graph,
     // Explicit rename: the `lowercase` rule would produce `openconnector`,
     // but the public YAML spelling (and the design spec) is `open_connector`.
     #[serde(rename = "open_connector")]
@@ -44,6 +45,7 @@ impl DataSourceType {
             Self::Documents => "documents",
             Self::Dynamodb => "dynamodb",
             Self::Rss => "rss",
+            Self::Graph => "graph",
             Self::OpenConnector => "open_connector",
         }
     }
@@ -92,5 +94,12 @@ mod tests {
         let t: DataSourceType = serde_yaml::from_str("open_connector").unwrap();
         assert_eq!(t, DataSourceType::OpenConnector);
         assert_eq!(t.as_str(), "open_connector");
+    }
+
+    #[test]
+    fn graph_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("graph").unwrap();
+        assert_eq!(t, DataSourceType::Graph);
+        assert_eq!(t.as_str(), "graph");
     }
 }

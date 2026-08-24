@@ -1,0 +1,123 @@
+# Discord source pack. Wire contract is Open Connector's: every list
+# executor passes Discord's API objects through RAW (GitHub-style —
+# `.then((guilds) => ({guilds}))` in the gateway's executors.ts) under a
+# snake_case envelope key, and emits NO pagination envelope at all —
+# `/users/@me/guilds` is Discord-native snowflake KEYSET (`after` = the
+# last row's id), the reason the engine's keyset strategy exists.
+# Inputs are strict (`additionalProperties: false`): validated live via
+# the no-credential 403-vs-400 probe on 2026-08-07 (`limit: 200` and
+# `after`+`with_counts` pass schema; a stray key, `limit: 300`, or an
+# empty-string snowflake are hard 400s).
+#
+# SCOPE OF THE PROVIDER, not of this pack: Discord's OAuth user-identity
+# provider can only read @me (its own get_user rejects any other id) —
+# channels, messages, and guild members are bot-token surface that this
+# provider does not carry, so no such tables can exist here.
+#
+# COLUMN STATUS: item schemas are declared LOOSE by the gateway (empty
+# properties + additionalProperties: true), so every column below rides
+# passthrough and none is protected by the fingerprint gate — real rows
+# are the only column truth. Live-verified against a real account on
+# 2026-08-07 (all three tables end to end through skardi-server); the
+# per-column annotations below record what the live pass settled and
+# what stays doc-derived.
+kind: pack
+pack: discord
+version: 1
+
+tables:
+  guilds:
+    action: discord.list_my_guilds
+    row_path: "$.guilds"
+    fingerprint: 04ff174011522d95adaf7399d2a53ed0a6351bacee0ea880386b35bc05c13853
+    # Keyset: cursor = last row's id; ONLY an empty page terminates
+    # (short pages continue, so a silent page-size clamp cannot read as
+    # completion). A single page at the 200 cap would ALSO cover today's
+    # account limit (200 joined guilds with Nitro), but that equality is
+    # coincidence, not contract — keyset keeps the scan complete if
+    # either cap moves.
+    pagination:
+      strategy: keyset
+      cursor_input: after
+      row_cursor_field: id
+      page_size_input: limit
+      page_size: 200
+    # with_counts pinned: the approximate_* columns exist only when the
+    # request asks for them, and a column that is sometimes-absent by
+    # REQUEST shape (not data shape) would be a per-scan schema coin flip.
+    fixed_inputs:
+      with_counts: true
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: false }
+      - { name: icon, path: icon, type: utf8, nullable: true }
+      - { name: banner, path: banner, type: utf8, nullable: true }
+      - { name: owner, path: owner, type: boolean, nullable: true }
+      # LIVE-PASS CORRECTION: this endpoint serves TWO permission fields —
+      # legacy `permissions` is a NUMBER (truncated to the bits that fit),
+      # and `permissions_new` is the full bitfield as a decimal string
+      # (it exceeds JSON's safe-integer range). The draft mapped
+      # `permissions` as utf8, which fails conversion on every real row.
+      # The column maps the authoritative string; the legacy number is
+      # deliberately unmapped. Decoding bits stays query-side work.
+      # NON-nullable on purpose: the legacy API attaches permissions_new
+      # to every guild object (6/6 live rows), and this mapping is the
+      # pack's one version-coupled drift — if the gateway ever pins
+      # /api/v10 (no permissions_new), the loose item schemas mean no
+      # fingerprint can see the move, so the converter's missing-key
+      # failure (with column/page/row identity) is the ONLY tripwire.
+      - { name: permissions, path: permissions_new, type: utf8, nullable: false }
+      - { name: features, path: features, type: utf8_list, nullable: true }
+      - { name: approximate_member_count, path: approximate_member_count, type: uint64, nullable: true }
+      - { name: approximate_presence_count, path: approximate_presence_count, type: uint64, nullable: true }
+
+  connections:
+    action: discord.list_my_connections
+    row_path: "$.connections"
+    fingerprint: d24f06b69b599db3ed56fe06250d11246892e6727be7cfc5bd8845ac66de4e6b
+    # No pagination on the API at all: Discord returns the current
+    # user's complete connection list in one response (it is bounded by
+    # the small, fixed set of connectable platforms).
+    pagination:
+      strategy: single_page
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      # `connection_type`, not `type`: the wire key collides with a SQL
+      # keyword and would force quoting into every query.
+      - { name: connection_type, path: type, type: utf8, nullable: false }
+      - { name: verified, path: verified, type: boolean, nullable: true }
+      - { name: friend_sync, path: friend_sync, type: boolean, nullable: true }
+      - { name: show_activity, path: show_activity, type: boolean, nullable: true }
+      - { name: two_way_link, path: two_way_link, type: boolean, nullable: true }
+      - { name: visibility, path: visibility, type: uint64, nullable: true }
+      # Present only on revoked connections (absent = live), so nullable.
+      - { name: revoked, path: revoked, type: boolean, nullable: true }
+      - { name: metadata_visibility, path: metadata_visibility, type: uint64, nullable: true }
+
+  sticker_packs:
+    action: discord.list_sticker_packs
+    row_path: "$.sticker_packs"
+    fingerprint: 488f2cecc0381a965ae58e318188f493fac5edd0fb418f289e56d4a683c5db4d
+    # Public Nitro catalog, one response for the whole (small) set. The
+    # declared output schema is COMPLETELY loose (a bare raw object), so
+    # even the row_path rests on the wire, not the contract — the live
+    # pass is what pins it.
+    pagination:
+      strategy: single_page
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      # Nullability of the four optional catalog fields is DOC-DERIVED:
+      # every row of the live catalog (14 packs, 2026-08-07) carries all
+      # of them non-null, so the live pass could not exercise the null
+      # arms — Discord documents cover_sticker_id and banner_asset_id as
+      # optional, and nullable-true only risks accepting a null, never
+      # rejecting a value.
+      - { name: sku_id, path: sku_id, type: utf8, nullable: true }
+      - { name: name, path: name, type: utf8, nullable: false }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: cover_sticker_id, path: cover_sticker_id, type: utf8, nullable: true }
+      - { name: banner_asset_id, path: banner_asset_id, type: utf8, nullable: true }
+      # Sticker objects kept opaque: their schema is a Discord resource
+      # of its own; the pack exposes the pack-level catalog columns.
+      - { name: stickers, path: stickers, type: json, nullable: true }

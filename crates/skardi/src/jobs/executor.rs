@@ -189,10 +189,18 @@ impl JobExecutor {
 
     /// Submit a run. Validates params + destination up front, persists a
     /// `pending` row, and spawns the background task. Returns the run id.
+    ///
+    /// `submission_id` is an opaque token stored verbatim on the run and
+    /// never interpreted here — see [`JobRun::submission_id`]. The server
+    /// passes its query-audit row id so the two ledgers point at each other;
+    /// callers with no such ledger pass `None`. It is a required argument
+    /// rather than a defaulted one precisely because it is an attribution
+    /// seam: a new call site has to decide, not inherit a silent `None`.
     pub async fn submit(
         &self,
         job_name: &str,
         params: HashMap<String, Value>,
+        submission_id: Option<&str>,
     ) -> Result<String, JobSubmitError> {
         let job = {
             let jobs = self.jobs.read().await;
@@ -260,6 +268,10 @@ impl JobExecutor {
             rows_written: None,
             snapshot_id: None,
             error: None,
+            // Written in the same INSERT that creates the run: the reverse
+            // pointer is durable the moment the run exists, so it survives
+            // the submitter failing to record its own forward pointer.
+            submission_id: submission_id.map(str::to_string),
         };
         self.store
             .create_run(&run)
@@ -363,6 +375,9 @@ impl JobExecutor {
             ))),
             Some(DataSourceType::Rss) => Err(JobSubmitError::Internal(anyhow::anyhow!(
                 "rss sources are read-only and cannot be used as a job destination"
+            ))),
+            Some(DataSourceType::Graph) => Err(JobSubmitError::Internal(anyhow::anyhow!(
+                "graph sources are read-only and cannot be used as a job destination"
             ))),
             None => {
                 // A dotted identifier whose root is not a known source is
@@ -786,7 +801,7 @@ spec:
     async fn submit_unknown_job_rejected() {
         let (exec, _tmp) = setup_executor_with_memtable_dest().await;
         let err = exec
-            .submit("does-not-exist", HashMap::new())
+            .submit("does-not-exist", HashMap::new(), None)
             .await
             .unwrap_err();
         assert!(matches!(err, JobSubmitError::UnknownJob(_)));
@@ -795,7 +810,10 @@ spec:
     #[tokio::test]
     async fn submit_missing_param_rejected() {
         let (exec, _tmp) = setup_executor_with_memtable_dest().await;
-        let err = exec.submit("ingest", HashMap::new()).await.unwrap_err();
+        let err = exec
+            .submit("ingest", HashMap::new(), None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, JobSubmitError::MissingParameters(_)),
             "got {err}"
@@ -810,7 +828,7 @@ spec:
             "min_id".to_string(),
             Value::Number(serde_json::Number::from(1)),
         );
-        let run_id = exec.submit("ingest", params).await.unwrap();
+        let run_id = exec.submit("ingest", params, None).await.unwrap();
 
         // Spin until terminal. `submit` returns synchronously after
         // spawning, so the row exists but the task may still be running.
@@ -869,7 +887,10 @@ spec:
         let exec = JobExecutor::new(map, store, ctx, HashMap::new(), HashMap::new());
 
         // A non-Lance destination that doesn't exist should be rejected.
-        let err = exec.submit("ingest", HashMap::new()).await.unwrap_err();
+        let err = exec
+            .submit("ingest", HashMap::new(), None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, JobSubmitError::DbDestinationMissing { .. }),
             "got {err}"
@@ -920,7 +941,10 @@ spec:
         types.insert("cpu".to_string(), source_type);
         let exec = JobExecutor::new(map, store, ctx, types, HashMap::new());
 
-        let err = exec.submit("ingest", HashMap::new()).await.unwrap_err();
+        let err = exec
+            .submit("ingest", HashMap::new(), None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, JobSubmitError::NonTransactionalDestination { .. }),
             "got {err}"

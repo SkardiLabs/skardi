@@ -14,14 +14,17 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::jobs::{JobRun, JobSubmitError};
 use std::collections::HashMap;
 
+use crate::auth::routes::require_session;
+use crate::query_audit::{QueryAuditStatus, QueryAuditStore};
 use crate::server::AppState;
+use crate::session_header::{SESSION_ID_HEADER, session_id_from_headers};
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitRunRequest {
@@ -59,6 +62,31 @@ fn error_json(msg: &str, kind: &str, details: Option<Value>) -> Json<JobErrorRes
     })
 }
 
+/// Reject the request unless it carries a valid session.
+///
+/// `require_session` reports through the shared `ErrorResponse` shape; the
+/// jobs endpoints answer in `JobErrorResponse`. Rather than let one endpoint
+/// family answer in two shapes, the status is kept and the body re-rendered
+/// into this crate's envelope — so the only thing a client sees differ from
+/// `/query` is the wrapper it already expects from `/jobs/*`.
+///
+/// `error_type` is propagated rather than pinned to `unauthorized`, which is
+/// all `require_session` classifies today: `verify_session` already
+/// distinguishes "Authentication required" from "Invalid or expired session"
+/// internally, so a second classification growing upstream would otherwise
+/// change the message while silently leaving the type behind.
+///
+/// A no-auth server short-circuits inside `verify_session`, so this is a
+/// no-op for deployments that never configured auth.
+async fn require_job_session(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<JobErrorResponse>)> {
+    require_session(app_state, headers)
+        .await
+        .map_err(|(status, body)| (status, error_json(&body.error, &body.error_type, None)))
+}
+
 fn submit_error_status(err: &JobSubmitError) -> StatusCode {
     match err {
         JobSubmitError::UnknownJob(_) => StatusCode::NOT_FOUND,
@@ -71,6 +99,32 @@ fn submit_error_status(err: &JobSubmitError) -> StatusCode {
         | JobSubmitError::DestinationResolutionFailed { .. }
         | JobSubmitError::NonTransactionalDestination { .. } => StatusCode::BAD_REQUEST,
         JobSubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Stamp the terminal outcome onto a job-submission audit record.
+///
+/// Mirrors `query_audit::finish_audit`'s policy: a failure (or timeout) here
+/// cannot un-submit a job that already reached the executor, so it is logged
+/// rather than surfaced — the row simply stays `started` and the next
+/// startup reconciles it to `unknown`. No-op when auditing is off or when
+/// the pre-submit write itself failed (no `audit_id`, which fails the
+/// request closed before this point is ever reached).
+async fn finish_job_audit(
+    store: Option<&QueryAuditStore>,
+    audit_id: Option<&str>,
+    job_run_id: Option<&str>,
+    status: QueryAuditStatus,
+    error: Option<&str>,
+) {
+    let (Some(store), Some(id)) = (store, audit_id) else {
+        return;
+    };
+    if let Err(e) = store
+        .record_job_outcome(id, job_run_id, status, error)
+        .await
+    {
+        tracing::error!("Failed to record job-audit outcome for {id}: {e}");
     }
 }
 
@@ -92,9 +146,23 @@ fn job_run_to_json(run: &JobRun) -> Value {
 /// `POST /jobs/:name/run`
 pub async fn submit_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(req): Json<SubmitRunRequest>,
 ) -> Result<Json<SubmitRunResponse>, (StatusCode, Json<JobErrorResponse>)> {
+    // First statement in the handler, ahead of the jobs-disabled probe and the
+    // job-existence lookup, matching `execute_pipeline_by_name` and `/query`.
+    // Deliberately *outside* the status-precedence ladder those two checks
+    // establish, so an unauthenticated caller cannot read either off the
+    // status code.
+    //
+    // "First" is about the handler body: axum runs extractors ahead of it, so
+    // a malformed `Query`/`Json` still answers 400/422 pre-gate. That leak is
+    // schema-shaped rather than data-shaped, identical on `/query` and the
+    // pipeline endpoints, and does not reach the audit writes this gate exists
+    // to protect — those all live below.
+    require_job_session(&app_state, &headers).await?;
+
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -106,11 +174,127 @@ pub async fn submit_job_run(
         ));
     };
 
-    match executor.submit(&name, req.parameters).await {
-        Ok(run_id) => Ok(Json(SubmitRunResponse {
-            run_id,
-            status: "pending".to_string(),
-        })),
+    // Existence + version pre-check, ahead of header validation: the reject
+    // below would otherwise label a metric/log line with an arbitrary
+    // caller-supplied URL segment (the metric-cardinality / status-precedence
+    // lesson from #213 round 3, mirrored from `execute_pipeline_by_name`).
+    // Post-lookup, `name` is bounded to configured jobs, and an unknown job
+    // correctly 404s regardless of header shape. This check and
+    // `executor.submit`'s own name resolution a few lines down read two
+    // *different* maps: this one is `app_state.config` (a
+    // `std::sync::RwLock<ServerConfig>`), the executor's is its own
+    // `Arc<tokio::sync::RwLock<HashMap<String, JobDefinition>>>` built from
+    // `config.jobs.clone()` at construction (see
+    // `crates/skardi/src/jobs/executor.rs`). Both are startup snapshots of
+    // the same job set, and today nothing writes to either map after
+    // startup, so the two lookups can never actually disagree. If a future
+    // hot-reload updates one map without the other, this pre-check and
+    // `executor.submit` could resolve different versions of the same job —
+    // the ledger might record a version the run didn't use, or this could
+    // 404 a job the executor would still accept (or vice versa). That
+    // divergence is that future feature's problem to solve, not something
+    // this handler guards against today.
+    let version = {
+        // Recover from poisoning rather than 500, per the repo's error-handling
+        // policy for `std::sync` locks. `execute_pipeline_by_name` maps the
+        // same lock's poison to `500 internal_error`
+        // (`pipeline_handlers.rs`); the divergence is deliberate, not an
+        // oversight. `ServerConfig` is a startup snapshot that nothing mutates
+        // in production (the only `config.write()` in the tree is test-only),
+        // so a poisoned guard carries no torn state and the read below is
+        // still sound — failing the request would trade a correct answer for
+        // an outage.
+        let config = app_state.config.read().unwrap_or_else(|p| p.into_inner());
+        match config.jobs.get(&name) {
+            Some(def) => def.version().to_string(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    error_json(
+                        &format!("Job '{name}' not found"),
+                        "unknown_job",
+                        Some(serde_json::json!({ "job": name })),
+                    ),
+                ));
+            }
+        }
+    };
+
+    let session_id = session_id_from_headers(&headers).map_err(|msg| {
+        (
+            StatusCode::BAD_REQUEST,
+            // `details.header` matches what `execute_pipeline_by_name` returns
+            // for the identical rejection. `error_type` alone cannot
+            // discriminate here: this endpoint also returns
+            // `parameter_validation_error` for genuine job-parameter
+            // rejections, so the header field is the only machine-readable
+            // way for a client to tell the two apart.
+            error_json(
+                &msg,
+                "parameter_validation_error",
+                Some(serde_json::json!({ "header": SESSION_ID_HEADER })),
+            ),
+        )
+    })?;
+
+    // Recorded as an `Option`, not `unwrap_or_default()`: the empty string is
+    // the one value `session_id_from_headers` rejects outright, so rendering
+    // "absent" as `""` would collide with a shape the validator calls
+    // malformed. `None` keeps "no header sent" distinguishable in log-based
+    // analysis — the same distinction NULL-vs-value preserves in the ledger.
+    tracing::info!(
+        session_id = ?session_id,
+        "Received submit request for job '{}'",
+        name
+    );
+
+    // Record-before-submit, fail-closed: a write failure here means the job
+    // is never handed to the executor. An audited server must not run
+    // anything it cannot account for.
+    let audit_id = match &app_state.query_audit {
+        Some(store) => match store
+            .record_job_submitted(&name, &version, session_id.as_deref())
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!("Job audit write failed; refusing to submit: {e}");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_json(
+                        "Query auditing is enabled but the audit record could not be \
+                         written; the job was not submitted",
+                        "query_audit_error",
+                        None,
+                    ),
+                ));
+            }
+        },
+        None => None,
+    };
+
+    // The audit row id doubles as the run's submission token, so the two
+    // ledgers point at each other. This half is durable at run-creation time;
+    // the `run_id` stamp below is best-effort, and if it is lost the
+    // correlation is still recoverable through `get_run_by_submission_id`.
+    match executor
+        .submit(&name, req.parameters, audit_id.as_deref())
+        .await
+    {
+        Ok(run_id) => {
+            finish_job_audit(
+                app_state.query_audit.as_deref(),
+                audit_id.as_deref(),
+                Some(&run_id),
+                QueryAuditStatus::Succeeded,
+                None,
+            )
+            .await;
+            Ok(Json(SubmitRunResponse {
+                run_id,
+                status: "pending".to_string(),
+            }))
+        }
         Err(err) => {
             let status = submit_error_status(&err);
             let kind = err.category().to_string();
@@ -123,6 +307,14 @@ pub async fn submit_job_run(
                 JobSubmitError::UnknownJob(job) => Some(serde_json::json!({ "job": job })),
                 _ => None,
             };
+            finish_job_audit(
+                app_state.query_audit.as_deref(),
+                audit_id.as_deref(),
+                None,
+                QueryAuditStatus::Failed,
+                Some(&kind),
+            )
+            .await;
             Err((status, error_json(&msg, &kind, details)))
         }
     }
@@ -131,8 +323,10 @@ pub async fn submit_job_run(
 /// `GET /jobs/runs/:run_id`
 pub async fn get_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -156,19 +350,49 @@ pub async fn get_job_run(
 pub struct ListRunsQuery {
     pub job: Option<String>,
     pub limit: Option<usize>,
+    /// Resolve the single run carrying this correlation token.
+    ///
+    /// The recovery direction of the audit bridge: an operator holding a
+    /// `query_audit` row id whose `job_run_id` was lost asks for it here. A
+    /// filter on the way in rather than the token on the way out — see
+    /// [`job_run_to_json`], which deliberately does not emit it.
+    pub submission_id: Option<String>,
 }
 
 /// `GET /jobs/runs?job=...&limit=...`
 pub async fn list_job_runs(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             error_json("Jobs subsystem is not enabled", "jobs_disabled", None),
         ));
     };
+    // An exact-token lookup, not a filter over the recent window: the run an
+    // operator needs during an incident is the one that has already fallen off
+    // it, which is exactly when concurrent submissions made `job_run_id` worth
+    // having. `job` and `limit` are ignored — one token names at most one run.
+    if let Some(token) = q.submission_id.as_deref() {
+        return match executor.store().get_run_by_submission_id(token).await {
+            Ok(run) => {
+                let body: Vec<Value> = run.iter().map(job_run_to_json).collect();
+                Ok(Json(serde_json::json!({
+                    "success": true,
+                    "runs": body,
+                    "count": body.len(),
+                })))
+            }
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&e.to_string(), "internal_error", None),
+            )),
+        };
+    }
+
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     match executor.store().list_runs(q.job.as_deref(), limit).await {
         Ok(runs) => {
@@ -191,8 +415,10 @@ pub async fn list_job_runs(
 /// the executor.
 pub async fn cancel_job_run(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -216,7 +442,9 @@ pub async fn cancel_job_run(
 /// for CLI discovery.
 pub async fn list_jobs(
     State(app_state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<JobErrorResponse>)> {
+    require_job_session(&app_state, &headers).await?;
     let Some(executor) = app_state.jobs.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,

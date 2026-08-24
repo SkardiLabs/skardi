@@ -63,6 +63,7 @@ base64 = "0.22"
 thiserror = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-rusqlite = { workspace = true }
+skardi-query-audit = { path = "../query-audit" }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
 tracing = { workspace = true }

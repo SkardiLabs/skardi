@@ -60,6 +60,7 @@ fn data_source(name: &str, access_mode: AccessMode) -> DataSource {
         description: None,
         open_connector: None,
         rss: None,
+        graph: None,
     }
 }
 
@@ -94,7 +95,15 @@ fn make_state_with_audit(query_audit: Option<Arc<QueryAuditStore>>) -> AppState 
             query_audit_retention_days: None,
         },
     };
-    AppState::new(config, engine, ctx, AuthLayer::None, None, query_audit)
+    AppState::new(
+        config,
+        engine,
+        ctx,
+        AuthLayer::None,
+        None,
+        query_audit,
+        Default::default(),
+    )
 }
 
 async fn post_query(state: AppState, body: Value) -> axum::response::Response {
@@ -566,7 +575,7 @@ async fn audit_records_raw_sql_ai_context_and_success() {
     );
     assert_eq!(record["ai_context"]["purpose"], json!("brand audit"));
     assert_eq!(record["session_id"], json!("sess-42"));
-    assert_eq!(record["statement_kind"], json!("Query"));
+    assert_eq!(record["statement_kind"], json!("query"));
     assert_eq!(record["status"], json!("succeeded"));
     assert_eq!(record["row_count"], json!(3));
     assert!(!record["finished_at"].is_null(), "{record:?}");

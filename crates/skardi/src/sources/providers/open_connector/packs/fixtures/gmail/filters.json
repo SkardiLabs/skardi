@@ -1,0 +1,15 @@
+{
+  "filters": [
+    {
+      "id": "ANe1Bmg0000000000000000000000000000001",
+      "criteria": {
+        "from": "alerts@example.com"
+      },
+      "action": {
+        "addLabelIds": [
+          "Label_1"
+        ]
+      }
+    }
+  ]
+}

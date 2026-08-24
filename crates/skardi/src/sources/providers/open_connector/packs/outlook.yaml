@@ -1,0 +1,183 @@
+# Outlook (Microsoft 365) source pack. Wire contract reconciled against
+# a live Open Connector gateway (v1.3.4, open-connector at 2410fbe): the
+# outlook executors pass Microsoft Graph's objects through RAW
+# (GitHub-style; `payload.value` becomes the row array untouched), so
+# the declared item schemas under-declare heavily — `list_messages`
+# declares no date field at all, and every timestamp/threading column
+# below rides `additionalProperties` passthrough OUTSIDE the fingerprint
+# gate. Every passthrough spelling was verified against real rows in
+# the phase-4 live pass (2026-08-19, MSA mailbox; findings in the
+# module doc of packs/outlook.rs, where the full design rationale
+# lives).
+#
+# Pagination is Graph's `@odata.nextLink`, re-exposed by the gateway as
+# a `nextLink` input/output pair: the cursor is a COMPLETE URL
+# (`format: uri`, enforced before credentials; the executor pins host
+# graph.microsoft.com and an allowlisted path set), null on the final
+# page. Every mock/fixture cursor must therefore be URI-shaped.
+# Inputs are camelCase strict (`additionalProperties: false` — a wrong
+# key is a hard 400).
+kind: pack
+pack: outlook
+version: 1
+
+tables:
+  messages:
+    action: outlook.list_messages
+    row_path: "$.messages"
+    fingerprint: ff5dea4c5da1a4b7d5ebf8099bdae8434ed06fe4cbf0018781f6b9d61c403453
+    pagination:
+      strategy: cursor
+      cursor_input: nextLink
+      next_cursor_path: "$.nextLink"
+      page_size_input: top
+      # 100, not the schema's 1000 ceiling. The original margin was
+      # body.content, which the select pin below removed; what remains
+      # unbounded per row is the recipient lists (to/cc/bcc ride as
+      # JSON), so 100 keeps even a mass-mail page trivially inside the
+      # client's 16 MiB cap. The cost is reach, not throughput: with the
+      # engine's default max_pages 100 this sets the 10 000-row scan
+      # ceiling the pack doc names out loud. `top` also rides
+      # continuation requests (the engine sends the page size on every
+      # request); the executor ignores it there because the nextLink URL
+      # embeds its own $top.
+      page_size: 100
+    # The select pin: Graph's default representation carries
+    # `body.content` (full HTML mail) on every row. Pinning `select` to
+    # exactly the mapped fields shrinks payloads by orders of magnitude,
+    # makes rows deterministic, and turns a misspelled passthrough
+    # column into a loud Graph 400 instead of a silently NULL column.
+    # This list MUST mirror the mapped columns' top-level wire keys —
+    # `select_pin_mirrors_the_mapped_columns` enforces that mechanically.
+    fixed_inputs:
+      select:
+        - id
+        - subject
+        - bodyPreview
+        - importance
+        - isRead
+        - isDraft
+        - webLink
+        - flag
+        - from
+        - sender
+        - toRecipients
+        - ccRecipients
+        - bccRecipients
+        - receivedDateTime
+        - sentDateTime
+        - createdDateTime
+        - lastModifiedDateTime
+        - hasAttachments
+        - conversationId
+        - parentFolderId
+        - categories
+        - internetMessageId
+    # `mailFolderId` scopes the table to one folder (the executor swaps
+    # /me/messages for /me/mailFolders/{id}/messages); omitted, the
+    # table is the whole mailbox — both collections are well-defined,
+    # hence optional. Live caveat (phase 4): Graph's scoped
+    # continuation URL uses the OData parenthesized form
+    # mailFolders('{id}')/messages, which the gateway's own allowlist
+    # rejected — fixed upstream in open-connector#372 (merged
+    # 2026-08-19); releases through v1.3.5 predate the fix and still
+    # 400 scoped scans past one page.
+    # `filter`/`orderby` are raw OData EXPRESSIONS no
+    # (input_field, literal) mapping can compose, and `bodyContentType`
+    # shapes a field this pack deliberately does not map — none of the
+    # three ever reaches the wire (negative-space guarded in tests).
+    resources:
+      optional: [mailFolderId]
+    columns:
+      # Identity non-null, the rest nullable — the convention every
+      # pack follows (rationale recorded in gmail.yaml's messages
+      # table). Declared-schema columns first:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: subject, path: subject, type: utf8, nullable: true }
+      - { name: body_preview, path: bodyPreview, type: utf8, nullable: true }
+      - { name: importance, path: importance, type: utf8, nullable: true }
+      - { name: is_read, path: isRead, type: boolean, nullable: true }
+      - { name: is_draft, path: isDraft, type: boolean, nullable: true }
+      - { name: web_link, path: webLink, type: utf8, nullable: true }
+      # Graph's follow-up flag object (flagStatus, due dates) — sparse
+      # and open-ended, kept as opaque JSON.
+      - { name: flag, path: flag, type: json, nullable: true }
+      # `from`/`sender` are declared only as loose objects; the
+      # emailAddress nesting below them is Graph's real row shape
+      # (executor passthrough), so these paths sit outside the
+      # fingerprint gate despite their declared parents.
+      - { name: from_address, path: from.emailAddress.address, type: utf8, nullable: true }
+      - { name: from_name, path: from.emailAddress.name, type: utf8, nullable: true }
+      - { name: sender_address, path: sender.emailAddress.address, type: utf8, nullable: true }
+      - { name: sender_name, path: sender.emailAddress.name, type: utf8, nullable: true }
+      # Recipient lists are [{emailAddress: {address, name}}] — one key
+      # level deeper than utf8_list_from_object_key can pluck. Extending
+      # the plucker to nested paths was considered and rejected (an
+      # engine surface for one column shape); json loses only ergonomics.
+      - { name: to_recipients, path: toRecipients, type: json, nullable: true }
+      - { name: cc_recipients, path: ccRecipients, type: json, nullable: true }
+      - { name: bcc_recipients, path: bccRecipients, type: json, nullable: true }
+      # ── Passthrough columns: undeclared upstream; every spelling
+      # live-verified in phase 4 (non-NULL on real rows). The select
+      # pin above turns a misspelling here into a loud Graph 400
+      # rather than an always-NULL column — confirmed live. ──
+      - { name: received_date_time, path: receivedDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: sent_date_time, path: sentDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: created_date_time, path: createdDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: last_modified_date_time, path: lastModifiedDateTime, type: timestamp_ms_utc, nullable: true }
+      - { name: has_attachments, path: hasAttachments, type: boolean, nullable: true }
+      - { name: conversation_id, path: conversationId, type: utf8, nullable: true }
+      - { name: parent_folder_id, path: parentFolderId, type: utf8, nullable: true }
+      - { name: categories, path: categories, type: utf8_list, nullable: true }
+      - { name: internet_message_id, path: internetMessageId, type: utf8, nullable: true }
+      # `body` is deliberately NOT mapped: full (usually HTML) message
+      # content belongs behind an explicit content surface, not in every
+      # SELECT * — and excluding it from the select pin is what keeps
+      # response sizes bounded.
+      # `replyTo` is the other declared-but-unmapped property: it is
+      # empty on ordinary mail (populated mostly by newsletter/bulk
+      # senders) and its content duplicates the recipient-list JSON
+      # shape — excluded for want of a query that needs it, not by
+      # accident. Mapping it later is a pure additive change (it is
+      # declared upstream, so the column would sit INSIDE the
+      # fingerprint gate — add it to the select pin alongside).
+
+  mail_folders:
+    action: outlook.list_mail_folders
+    row_path: "$.mailFolders"
+    fingerprint: c67baab75ea0098b468dda7db65900df8c43c037259c59955917c7e9fa8eef0b
+    pagination:
+      strategy: cursor
+      cursor_input: nextLink
+      next_cursor_path: "$.nextLink"
+      page_size_input: top
+      # Root-level folder sets are small; the declared ceiling is the
+      # right LIMIT-pushdown bound and folder rows carry no body-sized
+      # payloads, so no select pin is needed here.
+      page_size: 1000
+    # The state=all move: Graph hides hidden folders by default, so the
+    # pin makes this table the COMPLETE root-level folder set while the
+    # is_hidden column keeps the distinction queryable. Root-level only:
+    # the executor calls me/mailFolders without recursion — nested
+    # folders are revealed by child_folder_count, not enumerated. That
+    # collection terminates completely, so it passes the gate as what it
+    # honestly claims to be.
+    fixed_inputs:
+      includeHiddenFolders: true
+    columns:
+      # Seven columns are declared upstream; well_known_name is the one
+      # passthrough exception (undeclared, live-verified 2026-08-19),
+      # added because display_name is locale-dependent — a real MSA
+      # mailbox renders it in the account language ("收件箱"), so
+      # cross-account folder semantics need Graph's stable
+      # discriminator (inbox/sentitems/…; explicit null on custom
+      # folders). The fingerprint coverage gap is pinned to exactly
+      # this column.
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: display_name, path: displayName, type: utf8, nullable: true }
+      - { name: well_known_name, path: wellKnownName, type: utf8, nullable: true }
+      - { name: parent_folder_id, path: parentFolderId, type: utf8, nullable: true }
+      - { name: child_folder_count, path: childFolderCount, type: int64, nullable: true }
+      - { name: unread_item_count, path: unreadItemCount, type: int64, nullable: true }
+      - { name: total_item_count, path: totalItemCount, type: int64, nullable: true }
+      - { name: is_hidden, path: isHidden, type: boolean, nullable: true }
