@@ -5,9 +5,9 @@
 
 **Skardi is an open-source self-improving context framework.**
 
-Your agent asks anything of your data, in SQL — declaring *why* it asks.
-What keeps coming back becomes a named tool or a standing routine.
-The thing that improves is the agent's **context**, not model weights — and you never write another integration.
+Let your agent query any of your data, declaring *why* it asks.
+Skardi turns the intentions that keep coming back into named tools and standing routines.
+What improves is the agent's **context** — not model weights — and you never write another integration.
 
 **Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines — *automation in flight*
 
