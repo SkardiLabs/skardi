@@ -29,6 +29,8 @@ pub async fn run(args: LogoutArgs, flag_context: Option<String>) -> Result<()> {
         flag_context: flag_context.as_deref(),
         env_context: std::env::var("SKARDI_CONTEXT").ok(),
         env_control_plane: std::env::var("SKARDI_CONTROL_PLANE_URL").ok(),
+        env_dev_identity: std::env::var("SKARDI_DEV_IDENTITY").ok(),
+        env_client_id: std::env::var("SKARDI_OAUTH_CLIENT_ID").ok(),
         request_timeout: control_plane::CONTROL_PLANE_TIMEOUT,
     };
     run_at(path.as_path(), args, &env).await
@@ -41,6 +43,12 @@ pub(crate) struct LogoutEnv<'a> {
     pub flag_context: Option<&'a str>,
     pub env_context: Option<String>,
     pub env_control_plane: Option<String>,
+    /// `$SKARDI_DEV_IDENTITY`, the same env step `login` honours for
+    /// `--identity`. Read off the struct rather than inline so `--revoke` is
+    /// testable, which is what the struct is for.
+    pub env_dev_identity: Option<String>,
+    /// `$SKARDI_OAUTH_CLIENT_ID`, likewise.
+    pub env_client_id: Option<String>,
     pub request_timeout: Duration,
 }
 
@@ -161,6 +169,17 @@ fn clear_credentials(
             env_context,
         );
         match selected? {
+            // The SAME rule `--all` applies, and for the same stated reason: a
+            // server-mode token was configured by hand and no `login` can put
+            // it back. Applying it only under `--all` meant a bare `skardi
+            // logout` against a plain skardi-server — the default shape for
+            // this CLI — deleted the only copy of that token and then printed
+            // advice about a control plane that is not in play.
+            Some(context) if context.mode != ContextMode::Cloud => bail!(
+                "context '{}' is a server context, and its token was configured by hand — 'logout' only clears credentials that 'login' can mint again. To remove it, edit ~/.skardi/config.yaml, or drop the context with 'skardi config delete-context {}'",
+                context.name,
+                context.name
+            ),
             Some(context) => vec![context.name],
             None => bail!(
                 "no context selected: pass --context <NAME>, set a current-context, or use --all"
@@ -199,7 +218,16 @@ async fn authenticate(args: &LogoutArgs, path: &Path, env: &LogoutEnv<'_>) -> Re
     let http = control_plane::client(env.request_timeout)?;
     let control_plane =
         super::login::control_plane_for_revoke(args, path, env.env_control_plane.as_deref())?;
-    let bearer = match &args.identity {
+    // Flag then env, exactly as `login` resolves it: a dev shell where
+    // `$SKARDI_DEV_IDENTITY` makes `skardi login` work must not send
+    // `logout --revoke` down the browser branch to fail for a "missing" input
+    // it was given — after the token ids have already left the disk.
+    let identity = args
+        .identity
+        .clone()
+        .or_else(|| env.env_dev_identity.clone())
+        .filter(|id| !id.trim().is_empty());
+    let bearer = match &identity {
         Some(identity) => {
             crate::login::check_dev_identity(
                 identity,
@@ -212,7 +240,7 @@ async fn authenticate(args: &LogoutArgs, path: &Path, env: &LogoutEnv<'_>) -> Re
             let client_id = args
                 .client_id
                 .clone()
-                .or_else(|| std::env::var("SKARDI_OAUTH_CLIENT_ID").ok())
+                .or_else(|| env.env_client_id.clone())
                 .filter(|id| !id.trim().is_empty())
                 .context(
                     "--revoke re-authenticates, which needs --client-id (or $SKARDI_OAUTH_CLIENT_ID), or --identity dev:<id> against a loopback control plane",
@@ -258,6 +286,8 @@ mod tests {
             flag_context,
             env_context: None,
             env_control_plane: None,
+            env_dev_identity: None,
+            env_client_id: None,
             request_timeout: Duration::from_millis(200),
         }
     }
@@ -527,6 +557,90 @@ mod tests {
         );
         assert!(err.contains("still live"), "{err}");
         assert!(err.contains("tok-prod"), "{err}");
+    }
+
+    /// The rule `--all` applies must apply to a `current-context` selection
+    /// too: a server-mode token was pasted in by hand and no `login` can mint
+    /// it again, so clearing it silently destroyed the only copy — and then
+    /// printed advice about a control plane that was never in play.
+    #[tokio::test]
+    async fn logout_refuses_a_server_mode_context_rather_than_destroying_its_token() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".skardi").join("config.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "current-context: local\n\
+             contexts:\n\
+             \x20 - name: local\n\
+             \x20   server: http://127.0.0.1:8080\n\
+             \x20   token: a-hand-configured-token\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = run_at(&path, args(false, false), &env(None))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is a server context"), "{err}");
+        assert!(err.contains("config delete-context local"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the token must survive the refusal"
+        );
+    }
+
+    /// Naming it explicitly is refused for the same reason — the token is
+    /// equally unrecoverable either way.
+    #[tokio::test]
+    async fn naming_a_server_mode_context_is_refused_too() {
+        let home = TempDir::new().unwrap();
+        let path = seed(&home, "http://127.0.0.1:1");
+
+        let err = run_at(&path, args(false, false), &env(Some("local")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a server context"), "{err}");
+        assert_eq!(
+            yaml(&path)["contexts"][2]["token"],
+            "a-hand-configured-token"
+        );
+    }
+
+    /// `--revoke` must honour `$SKARDI_DEV_IDENTITY`, as `login` does: a dev
+    /// shell where plain `skardi login` works must not send this down the
+    /// browser branch to fail for a "missing" input it was given.
+    #[tokio::test]
+    async fn revoke_honours_the_dev_identity_environment_variable() {
+        let cp = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/v1/me/tokens/.+$"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&cp)
+            .await;
+
+        let home = TempDir::new().unwrap();
+        let path = seed(&home, &cp.uri());
+        let mut args = args(false, true);
+        args.identity = None;
+        let mut env = env(None);
+        env.env_dev_identity = Some("dev:alice".to_string());
+
+        run_at(&path, args, &env).await.unwrap();
+
+        let revoked: Vec<String> = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(revoked, ["tok-prod"]);
     }
 
     #[tokio::test]

@@ -182,6 +182,46 @@ fn the_dev_identity_path_refuses_a_remote_control_plane() {
     assert!(!config_path(home.path()).exists());
 }
 
+/// The control-plane leg carries the ID token up and the raw PAT back, so a
+/// plain-http non-loopback control plane is warned about — before the browser
+/// opens, and on `logout --revoke` too. A warning rather than a refusal, as
+/// with `ApiClient`: TLS may terminate at a proxy the CLI cannot see.
+#[test]
+fn a_cleartext_control_plane_is_warned_about_before_anything_is_sent() {
+    let home = TempDir::new().unwrap();
+    // `--identity` against a non-loopback host is refused, which is what makes
+    // this fast: the warning is printed during resolution, before the refusal.
+    let output = skardi(
+        home.path(),
+        &[
+            "login",
+            "--control-plane",
+            "http://global.example.com",
+            "--identity",
+            "dev:alice",
+        ],
+    );
+    let stderr = err(&output);
+
+    assert!(
+        stderr.contains("plain http to a non-loopback host"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("in the clear"), "stderr was: {stderr}");
+    // Loopback and https are silent.
+    for quiet in ["http://127.0.0.1:1", "https://global.example.com"] {
+        let output = skardi(
+            home.path(),
+            &["login", "--control-plane", quiet, "--identity", "dev:alice"],
+        );
+        assert!(
+            !err(&output).contains("plain http"),
+            "{quiet} should not warn: {}",
+            err(&output)
+        );
+    }
+}
+
 /// With no `--control-plane`, no environment, and no `control-plane:` in the
 /// file, the failure names all three rather than dialing a guess.
 #[test]

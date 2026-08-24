@@ -161,7 +161,16 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
 
     // §6.5: mint, then verify, retaining every id. Any failure past the first
     // mint rolls the whole run back before reporting.
-    let expires_at = (options.now + options.expires).to_rfc3339();
+    // `DateTime + TimeDelta` PANICS on overflow, and `parse_expires` cannot
+    // catch every case: it bounds the value by `TimeDelta`'s range (~1.07e11
+    // days) while `DateTime`'s is far smaller (year 262143, ~9.5e7 days), so
+    // `--expires 100000000d` parses and then aborts. The real ceiling is a
+    // function of `now`, so it is enforced here, where `now` is known.
+    let expires_at = options
+        .now
+        .checked_add_signed(options.expires)
+        .ok_or_else(|| anyhow!("--expires is longer than any usable credential"))?
+        .to_rfc3339();
     let mut minted: Vec<MintedRef> = Vec::new();
     let mut pending: Vec<(Membership, Minted, String)> = Vec::new();
     for membership in selected {
@@ -408,13 +417,21 @@ fn render_workspace_menu(active: &[Membership]) -> String {
 /// `http://127.0.0.1:8080` — writing a context that points at a local port
 /// would fail later and further from the cause.
 fn resolve_server(options: &LoginOptions, membership: &Membership) -> Result<String> {
-    let candidate = options
-        .server_override
-        .as_deref()
-        .or(options.env_gateway_url.as_deref())
-        .or(membership.gateway_url.as_deref())
-        .map(str::trim)
-        .filter(|url| !url.is_empty());
+    // Flatten-then-find, NOT `or`: `Option::or` short-circuits on the first
+    // `Some` and the trim would then apply only to that winner, so an
+    // exported-empty `SKARDI_GATEWAY_URL` (or `--server ""`) would SHADOW the
+    // control plane's answer and produce an error blaming the control plane
+    // for a silence that came from the variable the message names.
+    // `resolve_control_plane` has always had this shape; this one did not.
+    let candidate = [
+        options.server_override.as_deref(),
+        options.env_gateway_url.as_deref(),
+        membership.gateway_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|url| !url.is_empty());
     let Some(server) = candidate else {
         bail!(
             "the control plane did not say which gateway serves workspace '{}' — pass --server <URL>, set $SKARDI_GATEWAY_URL, or configure gateway_url for the org",
@@ -457,10 +474,20 @@ async fn verify(
     // has to be reachable (§6.5).
     match tokio::time::timeout(timeout, probe_request).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(anyhow!(
-            "the new credential for workspace '{}' could not query {server}: {err} — the context was not written (pass --no-verify to skip this check)",
-            membership.tenant_slug
-        )),
+        Ok(Err(err)) => {
+            // Through §8's translation, not raw: `ApiError`'s own 401 message
+            // says "set SKARDI_API_TOKEN or 'token' in ~/.skardi/config.yaml",
+            // which resolution REFUSES for a cloud context — and it is more
+            // wrong here than at query time, since the credential was minted
+            // seconds ago and no context exists to point `skardi login` at.
+            // `probe` is already a full cloud config, so the mapping is free.
+            let diagnosed =
+                crate::cloud::diagnose(err.into(), crate::cloud::Capability::Query, &probe);
+            Err(anyhow!(
+                "the new credential for workspace '{}' could not query {server}: {diagnosed:#} — the context was not written (pass --no-verify to skip this check)",
+                membership.tenant_slug
+            ))
+        }
         Err(_) => Err(anyhow!(
             "the new credential for workspace '{}' got no answer from {server} within {}s — the context was not written (pass --no-verify to skip this check)",
             membership.tenant_slug,

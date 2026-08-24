@@ -28,7 +28,7 @@ use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 /// The path the authorization server is told to redirect to.
@@ -36,7 +36,17 @@ pub const CALLBACK_PATH: &str = "/callback";
 
 /// Cap on request-line bytes read from one connection. A callback URL carries
 /// a code and a state; anything approaching this is not one.
-const MAX_REQUEST_BYTES: usize = 8 * 1024;
+const MAX_REQUEST_BYTES: u64 = 8 * 1024;
+
+/// How long one connection gets to produce its request line.
+///
+/// The accept loop is sequential, so without this a socket that connects and
+/// sends NOTHING holds the loop until the 120-second callback timeout — with
+/// the real redirect already completed in the accept backlog, unread. That is
+/// reachable adversarially (one idle `nc` to a loopback port denies the
+/// sign-in) and accidentally (browsers open speculative preconnect sockets to
+/// a navigation target and hold them idle).
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many non-callback requests are answered and ignored before giving up.
 /// Bounded so a chatty client cannot keep the wait alive indefinitely — the
@@ -47,6 +57,9 @@ const MAX_UNRELATED_REQUESTS: usize = 8;
 pub struct Loopback {
     listener: TcpListener,
     port: u16,
+    /// [`REQUEST_READ_TIMEOUT`] in production; shortened by tests so the
+    /// silent-connection case does not cost five seconds per run.
+    read_timeout: Duration,
 }
 
 /// What the authorization server sent back.
@@ -74,7 +87,19 @@ impl Loopback {
             .local_addr()
             .context("read the loopback listener's port")?
             .port();
-        Ok(Loopback { listener, port })
+        Ok(Loopback {
+            listener,
+            port,
+            read_timeout: REQUEST_READ_TIMEOUT,
+        })
+    }
+
+    /// Shorten the per-connection read deadline, so a test can exercise the
+    /// silent-connection path without waiting out the production value.
+    #[cfg(test)]
+    fn with_read_timeout(mut self, read_timeout: Duration) -> Loopback {
+        self.read_timeout = read_timeout;
+        self
     }
 
     /// The `redirect_uri` to register with the authorization request. Literal
@@ -118,10 +143,19 @@ impl Loopback {
                 .await
                 .context("accept the login redirect")?;
 
-            let Some(target) = read_request_target(&mut stream).await? else {
-                respond(&mut stream, "400 Bad Request", "Malformed request.").await;
-                continue;
-            };
+            // A connection that goes quiet is noise, not this sign-in's
+            // response: answer it and move on rather than letting it hold the
+            // loop.
+            let target =
+                match tokio::time::timeout(self.read_timeout, read_request_target(&mut stream))
+                    .await
+                {
+                    Ok(Ok(Some(target))) => target,
+                    _ => {
+                        respond(&mut stream, "400 Bad Request", "Malformed request.").await;
+                        continue;
+                    }
+                };
             let (path, query) = match target.split_once('?') {
                 Some((path, query)) => (path, query),
                 None => (target.as_str(), ""),
@@ -196,22 +230,16 @@ fn describe_ignored(count: usize) -> String {
 
 /// Read the request target out of the first line, bounded. `None` when the
 /// line is not a parseable `GET <target> HTTP/1.x`.
+///
+/// `read_until` under a `take`, rather than a byte at a time: the same
+/// [`MAX_REQUEST_BYTES`] bound in one call instead of up to 8192 awaits.
 async fn read_request_target(stream: &mut TcpStream) -> Result<Option<String>> {
     let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    while buf.len() < MAX_REQUEST_BYTES {
-        match stream.read(&mut byte).await {
-            Ok(0) => break,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                buf.push(byte[0]);
-            }
-            // A client that hangs up mid-line is noise, not a failure of the
-            // wait: report it as an unparseable line and keep listening.
-            Err(_) => return Ok(None),
-        }
+    let mut reader = BufReader::new(stream).take(MAX_REQUEST_BYTES);
+    // A client that hangs up mid-line is noise, not a failure of the wait:
+    // report it as an unparseable line and keep listening.
+    if reader.read_until(b'\n', &mut buf).await.is_err() {
+        return Ok(None);
     }
     let line = String::from_utf8_lossy(&buf).trim().to_string();
     let mut parts = line.split_whitespace();
@@ -432,6 +460,45 @@ mod tests {
             "the ignored response must be reported: {err}"
         );
         assert!(!err.contains("not-mine"), "no value is echoed: {err}");
+    }
+
+    /// A connection that opens and SENDS NOTHING must not hold the sequential
+    /// accept loop: without a per-connection deadline it blocks until the
+    /// 120-second callback timeout, with the real redirect already completed in
+    /// the accept backlog and unread. One idle `nc` to a loopback port would
+    /// otherwise deny the sign-in.
+    #[tokio::test]
+    async fn a_silent_connection_does_not_hold_the_callback_behind_it() {
+        let loopback = Loopback::bind()
+            .await
+            .unwrap()
+            .with_read_timeout(Duration::from_millis(150));
+        let uri = loopback.redirect_uri();
+        let addr = uri
+            .trim_start_matches("http://")
+            .trim_end_matches("/callback")
+            .to_string();
+
+        // Accepted first, and never says anything — but deliberately kept
+        // OPEN, which is what distinguishes this from the hang-up case.
+        let idle = tokio::net::TcpStream::connect(&addr).await.unwrap();
+
+        let waiter =
+            tokio::spawn(async move { loopback.wait(Duration::from_secs(5), "the-state").await });
+        // Let the loop accept the idle socket before the real redirect
+        // arrives, so the ordering under test is the failing one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let _ = reqwest::get(format!("{uri}?code=behind-the-idle&state=the-state")).await;
+
+        let callback = waiter.await.unwrap().unwrap();
+        assert_eq!(callback.code.as_deref(), Some("behind-the-idle"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the callback waited behind the idle socket: {:?}",
+            started.elapsed()
+        );
+        drop(idle);
     }
 
     /// Enough noise to exhaust the allowance ends the wait with a message

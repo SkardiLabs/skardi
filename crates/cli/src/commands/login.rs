@@ -182,6 +182,19 @@ fn resolve_control_plane(
             "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add 'control-plane:' to ~/.skardi/config.yaml"
         )
     };
+    // This is the leg carrying the most sensitive traffic in the flow — the ID
+    // token goes up on every call and `POST /v1/me/tokens` returns the RAW PAT
+    // — and it had no scheme check at all, while `ApiClient` warns for a mere
+    // bearer. Said HERE, at resolution, so it lands before the browser opens
+    // rather than after a completed sign-in, and covers `logout --revoke` too.
+    //
+    // A warning, not a refusal, for the same reason `ApiClient`'s is: a
+    // deployment may terminate TLS at a proxy the CLI cannot see.
+    if crate::client::is_cleartext_remote(&url) {
+        eprintln!(
+            "warning: {url} is plain http to a non-loopback host — the sign-in assertion and the minted credential would cross the network in the clear; prefer an https:// control plane"
+        );
+    }
     Ok(url)
 }
 

@@ -180,8 +180,9 @@ pub fn diagnose(
         // and `Retry-After` is what separates it from a gateway that is simply
         // down. Scoped to `schema` because that is the only route that
         // bounds concurrency this way.
-        503 if capability == Capability::Schema && retry_after.is_some() => {
-            let seconds = retry_after.unwrap_or_default();
+        503 if capability == Capability::Schema
+            && let Some(seconds) = *retry_after =>
+        {
             anyhow!("the gateway is at its schema-read limit; retry in {seconds}s")
         }
         _ => err,

@@ -357,7 +357,7 @@ impl ApiClient {
 /// True when `base_url` is plain `http://` to a host other than loopback
 /// (`localhost`, `127.0.0.0/8`, or `::1`) — the case where a configured
 /// bearer token would travel in cleartext across a real network.
-fn is_cleartext_remote(base_url: &str) -> bool {
+pub(crate) fn is_cleartext_remote(base_url: &str) -> bool {
     let Some(rest) = base_url.strip_prefix("http://") else {
         return false;
     };

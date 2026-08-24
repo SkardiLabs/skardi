@@ -1013,3 +1013,119 @@ async fn a_gateway_that_never_answers_still_reaches_the_rollback() {
     );
     assert!(!path.exists());
 }
+
+/// A blank value must FALL THROUGH, not shadow: `Option::or` picks the first
+/// `Some` and would trim only the winner, so an exported-empty
+/// `SKARDI_GATEWAY_URL` blamed the control plane for a silence it did not
+/// cause. `resolve_control_plane` has always had the right shape; this side
+/// only ever saw populated values.
+#[tokio::test]
+async fn a_blank_flag_or_env_does_not_shadow_the_control_planes_gateway_url() {
+    for (server_override, env) in [
+        (Some(String::new()), None),
+        (Some("   ".to_string()), None),
+        (None, Some(String::new())),
+        (Some(String::new()), Some("  ".to_string())),
+    ] {
+        let gw = gateway(200).await;
+        let cp = control_plane_with(vec![membership(
+            "acme",
+            "acme-prod",
+            "active",
+            Some(&gw.uri()),
+        )])
+        .await;
+        mint_ok(&cp, "acme-prod", "tok-1").await;
+
+        let home = TempDir::new().unwrap();
+        let path = config_in(&home);
+        let mut options = options(&cp.uri(), server_override.as_deref());
+        options.env_gateway_url = env.clone();
+        login(options, &path).await.unwrap();
+
+        assert_eq!(
+            read_yaml(&path)["contexts"][0]["server"].as_str().unwrap(),
+            gw.uri(),
+            "blank override {server_override:?}/{env:?} shadowed the membership"
+        );
+    }
+}
+
+/// `--expires` bounded by `TimeDelta`'s range still overflowed `DateTime`'s,
+/// and `DateTime + TimeDelta` PANICS. The refusal must be typed, and must land
+/// before anything is minted.
+#[tokio::test]
+async fn an_expiry_past_the_end_of_time_is_refused_not_a_panic() {
+    let gw = gateway(200).await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-1").await;
+
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    let mut options = options(&cp.uri(), None);
+    // Accepted by `parse_expires` (TimeDelta's range is ~1.07e11 days) and far
+    // past `NaiveDate::MAX` (~9.5e7 days from now).
+    options.expires = parse_expires("100000000d").unwrap();
+
+    let err = login(options, &path).await.unwrap_err().to_string();
+
+    assert!(err.contains("longer than any usable credential"), "{err}");
+    assert!(!path.exists());
+    assert!(
+        mint_bodies(&cp.received_requests().await.unwrap()).is_empty(),
+        "the refusal must precede the mint"
+    );
+}
+
+/// The probe's failure goes through §8's translation: `ApiError`'s own 401
+/// tells the caller to set `SKARDI_API_TOKEN`, which resolution REFUSES for a
+/// cloud context — and it is worse advice here than at query time, since there
+/// is not yet a context for `skardi login` to point at.
+#[tokio::test]
+async fn a_rejected_probe_does_not_advise_the_env_var_it_refuses() {
+    let gw = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/query"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "success": false,
+            "error": "invalid token",
+            "error_type": "unauthorized",
+        })))
+        .mount(&gw)
+        .await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-1").await;
+    revoke_answers(&cp, 204).await;
+
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    let err = login(options(&cp.uri(), None), &path)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("could not query"), "{err}");
+    assert!(!err.contains("SKARDI_API_TOKEN"), "{err}");
+    assert!(
+        err.contains("skardi login"),
+        "the actionable half survives: {err}"
+    );
+    // Still the saga: revoked, and nothing written.
+    assert_eq!(
+        revoked_ids(&cp.received_requests().await.unwrap()),
+        ["tok-1"]
+    );
+    assert!(!path.exists());
+}
