@@ -163,7 +163,13 @@ workspace and writes a context for each, so nothing is copied by hand:
 
 ```bash
 # Sign in; a lone workspace is used automatically, several prompt
-skardi login --control-plane https://global.skardi.ai
+skardi login --control-plane https://global.skardi.ai \
+  --client-id <your-deployment's-oauth-client-id>
+
+# With both pinned in the environment, the flags go away
+export SKARDI_CONTROL_PLANE_URL=https://global.skardi.ai
+export SKARDI_OAUTH_CLIENT_ID=<client-id>
+skardi login
 
 # Non-interactive selection
 skardi login --workspace acme-prod
@@ -176,11 +182,18 @@ skardi login --no-browser
 skardi login --expires 30d
 ```
 
+Two inputs have no built-in default, and both fail by name rather than
+guessing: the **control plane** (`--control-plane` >
+`$SKARDI_CONTROL_PLANE_URL` > `control-plane:` in the config file) and the
+**OAuth client id** (`--client-id` > `$SKARDI_OAUTH_CLIENT_ID`). The client id
+is per deployment — it is the same value the deployment gives its console — so
+there is nothing correct to hardcode. Once a `login` succeeds, the control
+plane is recorded in the config file and later runs need no flag for it.
+
 What it does, in order:
 
-1. Resolves the control plane: `--control-plane` >
-   `$SKARDI_CONTROL_PLANE_URL` > `control-plane:` in the config file. With
-   none of the three, it stops and says so rather than guessing a host.
+1. Resolves the control plane, as above. With none of the three sources, it
+   stops and says so rather than guessing a host.
 2. Opens a browser against the identity provider, with PKCE (S256) and a
    `state` nonce, redirecting to a single-use listener on `127.0.0.1:<random
    port>`. It waits 120 seconds, then gives up and releases the port.

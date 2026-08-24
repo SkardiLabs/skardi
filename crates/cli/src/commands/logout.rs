@@ -63,7 +63,18 @@ pub(crate) async fn run_at(
         return Ok(());
     }
 
-    let revocable: Vec<&Cleared> = cleared.iter().filter(|c| c.token_id.is_some()).collect();
+    let (revocable, unrevocable): (Vec<&Cleared>, Vec<&Cleared>) =
+        cleared.iter().partition(|c| c.token_id.is_some());
+    // Named individually, not skipped: a context written by `config
+    // set-context` has no `token-id`, and a PAT cannot name itself to the
+    // revoke endpoint. Clearing it locally while saying nothing would read as
+    // a revocation that happened.
+    for entry in &unrevocable {
+        println!(
+            "cannot revoke the credential from context {}: it has no token-id, so only the console can revoke it",
+            entry.context
+        );
+    }
     if revocable.is_empty() {
         bail!(
             "--revoke needs the credential's token id, and no cleared context recorded one (a context written by 'config set-context' has no token-id). Revoke it in the console"
@@ -373,6 +384,60 @@ mod tests {
             .to_string();
         assert!(err.contains("token id"), "{err}");
         assert!(err.contains("console"), "{err}");
+    }
+
+    /// A mix: one context has a `token-id`, one does not. The revocable one is
+    /// revoked and the other is NAMED, because clearing it locally while
+    /// saying nothing reads as a revocation that happened.
+    #[tokio::test]
+    async fn revoke_names_the_contexts_it_cannot_revoke() {
+        let cp = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&cp)
+            .await;
+
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".skardi").join("config.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "control-plane: {}\n\
+                 contexts:\n\
+                 \x20 - name: acme/prod\n\
+                 \x20   mode: cloud\n\
+                 \x20   server: http://gw.example\n\
+                 \x20   workspace: acme-prod\n\
+                 \x20   token: skardi_pat_prod\n\
+                 \x20   token-id: tok-prod\n\
+                 \x20 - name: acme/hand-made\n\
+                 \x20   mode: cloud\n\
+                 \x20   server: http://gw.example\n\
+                 \x20   workspace: acme-other\n\
+                 \x20   token: hand-written\n",
+                cp.uri()
+            ),
+        )
+        .unwrap();
+
+        run_at(&path, args(true, true), None, None, None)
+            .await
+            .unwrap();
+
+        // Both credentials left the disk; only one could be revoked.
+        let file = yaml(&path);
+        assert!(file["contexts"][0].get("token").is_none());
+        assert!(file["contexts"][1].get("token").is_none());
+        let revoked: Vec<String> = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(revoked, ["tok-prod"]);
     }
 
     #[tokio::test]

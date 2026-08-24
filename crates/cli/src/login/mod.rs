@@ -29,6 +29,14 @@ use chrono::{DateTime, Duration, Utc};
 use control_plane::{ControlPlane, CpError, Membership, Minted};
 use std::path::Path;
 
+/// Per-request ceiling on control-plane and token-endpoint calls.
+///
+/// Bounded because of the ROLLBACK, not the happy path: a revoke that hangs
+/// forever leaves the operator watching a silent terminal while a live
+/// credential goes unreported, which is precisely the outcome §6.5 exists to
+/// prevent. Generous enough that a cold control plane still answers.
+const CONTROL_PLANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Default PAT lifetime (§6.1 step 5), as `--expires` spells it. A string so
 /// clap's default and this documented value are the same token, parsed by the
 /// same function a user-supplied one goes through.
@@ -116,7 +124,10 @@ struct MintedRef {
 /// Run the whole flow. `config_path` is a parameter so tests write to a temp
 /// directory instead of the developer's own config.
 pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
-    let http = reqwest::Client::builder().no_proxy().build()?;
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(CONTROL_PLANE_TIMEOUT)
+        .build()?;
     let bearer = acquire_bearer(&http, &options).await?;
     let cp = ControlPlane::new(http.clone(), &options.control_plane, bearer);
 
