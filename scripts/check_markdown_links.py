@@ -15,6 +15,7 @@ Scope is deliberately narrow so the check stays deterministic:
 Exit code 1 with one line per broken link; 0 when everything resolves.
 """
 
+import posixpath
 import re
 import subprocess
 import sys
@@ -32,11 +33,31 @@ HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)\s*#*\s*$", re.M)
 HTML_ANCHOR_RE = re.compile(r"(?:name|id)=\"([^\"]+)\"")
 
 
-def tracked_markdown_files():
+def tracked_files():
+    """All git-tracked paths. Links are validated against this set, not the
+    working tree: a target that exists on disk but is untracked (gitignored,
+    generated) is still broken for everyone cloning the repo — exactly the
+    local-pass/CI-fail divergence this check must not have."""
     out = subprocess.run(
-        ["git", "ls-files", "*.md"], capture_output=True, text=True, check=True
+        ["git", "ls-files"], capture_output=True, text=True, check=True
     ).stdout.splitlines()
-    return [Path(p) for p in out if not any(p.startswith(e) for e in EXCLUDE_PREFIXES)]
+    return set(out)
+
+
+def markdown_files(tracked):
+    return [
+        Path(p)
+        for p in tracked
+        if p.endswith(".md") and not any(p.startswith(e) for e in EXCLUDE_PREFIXES)
+    ]
+
+
+def exists_in_repo(relpath, tracked):
+    """True if `relpath` is a tracked file, or a directory containing one."""
+    if relpath in tracked:
+        return True
+    prefix = relpath.rstrip("/") + "/"
+    return any(t.startswith(prefix) for t in tracked)
 
 
 def strip_code(text):
@@ -85,20 +106,22 @@ def targets_in(text):
 
 
 def main():
+    tracked = tracked_files()
     errors = []
-    for md in tracked_markdown_files():
+    for md in markdown_files(tracked):
         text = md.read_text(encoding="utf-8", errors="replace")
         for raw in targets_in(text):
             if re.match(r"[a-z][a-z0-9+.-]*:", raw):  # http:, https:, mailto:, …
                 continue
             target, _, fragment = raw.partition("#")
             if target:
-                resolved = (md.parent / target).resolve()
-                if not resolved.exists():
+                rel = posixpath.normpath(posixpath.join(md.parent.as_posix(), target))
+                if rel.startswith("..") or not exists_in_repo(rel, tracked):
                     errors.append(f"{md}: broken link -> {raw}")
                     continue
+                resolved = Path(rel)
             else:
-                resolved = md.resolve()
+                resolved = md
             if fragment and resolved.suffix == ".md" and resolved.is_file():
                 known = {clean_fragment(a) for a in anchors_of(resolved)}
                 if clean_fragment(fragment) not in known:

@@ -2,7 +2,10 @@
 .DS_Store
 ./*/.DS_Store
 .cursor/
-.claude/
+# Ignore .claude/ except the checked-in project instructions AGENTS.md
+# points at (a `dir/` pattern would stop git descending, so `dir/*` + `!`).
+.claude/*
+!.claude/CLAUDE.md
 .venv/
 .vscode/
 **/generated/
