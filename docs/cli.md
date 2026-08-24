@@ -150,6 +150,125 @@ line is not echoed.
 When a token is resolved (from any source), every request carries
 `Authorization: Bearer <token>`.
 
+A `mode: cloud` context also sends `Skardi-Workspace: <workspace>` on every
+request. The gateway needs the workspace per request to resolve the
+credential, and the header sits deliberately outside the reserved
+`x-skardi-*` namespace, which the gateway strips from client-supplied
+headers before forwarding upstream.
+
+## Signing in to skardi-cloud — `login` / `logout`
+
+`skardi login` turns a browser sign-in into one workspace-scoped token per
+workspace and writes a context for each, so nothing is copied by hand:
+
+```bash
+# Sign in; a lone workspace is used automatically, several prompt
+skardi login --control-plane https://global.skardi.ai
+
+# Non-interactive selection
+skardi login --workspace acme-prod
+skardi login --all-workspaces
+
+# Print the sign-in URL instead of opening a browser (remote shells)
+skardi login --no-browser
+
+# Shorter-lived credential (default: 90d; `12h` also works)
+skardi login --expires 30d
+```
+
+What it does, in order:
+
+1. Resolves the control plane: `--control-plane` >
+   `$SKARDI_CONTROL_PLANE_URL` > `control-plane:` in the config file. With
+   none of the three, it stops and says so rather than guessing a host.
+2. Opens a browser against the identity provider, with PKCE (S256) and a
+   `state` nonce, redirecting to a single-use listener on `127.0.0.1:<random
+   port>`. It waits 120 seconds, then gives up and releases the port.
+3. Exchanges the code for an ID token that is **held in memory only**. No
+   refresh token is requested, and nothing the provider returns is written to
+   disk.
+4. Reads your workspaces from the control plane. Anything not yet `active` is
+   listed and skipped, with its state named.
+5. Mints one token per selected workspace, scoped to that workspace at your
+   role there — never an unscoped credential.
+6. Verifies each one with a `select 1` against the gateway it will actually
+   use. A credential that cannot answer is **not written**, and it is revoked.
+   `--no-verify` skips this.
+7. Writes one context per verified token, named `<org>/<workspace>`, points
+   `current-context` at the first, and prints a summary with no token values
+   in it.
+
+The gateway URL comes from `--server` > `$SKARDI_GATEWAY_URL` > the control
+plane's answer for that org. There is deliberately no built-in default and no
+fall back to `http://127.0.0.1:8080`: a context pointing at a local port
+would fail later and further from the cause.
+
+Minting is a **saga**. Each token commits independently at the control plane,
+so if a later mint fails — or the config write fails — every token this run
+created is revoked before the original failure is reported, and no context is
+written. If a rollback cannot complete, the surviving token ids are printed
+with a non-zero exit, because a live credential nobody knows about is worse
+than a loud failure.
+
+Running `login` again over an existing context replaces it and revokes the
+token it replaced. `--keep-old-token` retains the old one — for an agent
+that is mid-task — and says so.
+
+If your identity belongs to more than one organization, minting is not
+available in v1: `login` prints the organizations and the way round it
+(mint in the console, then `skardi config set-context … --token-stdin`).
+
+### Signing out
+
+```bash
+# Clear the current context's credential
+skardi logout
+
+# Clear every cloud context's credential
+skardi logout --all
+
+# Also revoke it at the control plane (re-authenticates first)
+skardi logout --revoke
+```
+
+Plain `logout` is a local edit: the credential leaves this machine but stays
+**valid until it expires**, and the output says so. A token cannot revoke
+itself, so `--revoke` signs in again to call the control plane. The context
+itself (server, workspace, mode) is kept either way, so a later `login`
+refills it; removing the context entirely is `skardi config delete-context`.
+
+### What a cloud context cannot do
+
+A skardi-cloud gateway serves `query` and `schema`. `run`, `pipeline`, `job`,
+and `health` are engine-local surfaces it does not mount, so they fail
+immediately, naming the context, with no request issued:
+
+```
+error: 'job' is not available in a cloud context (acme/acme-prod). Available: query, schema.
+```
+
+Two credential failures are reported in the context's own terms rather than
+the transport's: a rejected token points at `skardi login` (not at
+`SKARDI_API_TOKEN`, which a cloud context refuses anyway), and a
+`token-expires-at` already in the past is reported without spending a round
+trip.
+
+### Working against a local stack
+
+A control plane in dev mode accepts an unverified identity claim instead of a
+signed sign-in, which is how the flow is tested without a browser:
+
+```bash
+skardi login --control-plane http://localhost:18090 --identity dev:alice
+```
+
+This is refused unless the control plane is a **loopback** address — not
+"loopback or private", because a shared internal staging cluster lives on an
+RFC1918 address and a `dev:` bearer there is impersonation. A remote dev box
+needs `--i-know-this-is-dev-auth`, so the decision is visible in the command
+that made it. Every run prints a warning naming what it authenticated
+against.
+
 ## Ad-hoc SQL — `query`
 
 `skardi query` sends one SQL statement to `POST /query` on the server and

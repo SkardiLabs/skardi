@@ -11,6 +11,7 @@ use client::{ApiClient, ApiError};
 use cloud::Capability;
 use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
+use commands::login::{LoginArgs, LogoutArgs};
 use commands::pipeline::PipelineCmd;
 use config::ClientConfig;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ mod client;
 mod cloud;
 mod commands;
 mod config;
+mod login;
 mod output;
 mod params;
 mod session;
@@ -45,6 +47,30 @@ struct Cli {
     command: Commands,
 }
 
+/// `login`'s long help. Two GLOBAL flags mean something different under it, and
+/// a third is refused, so the subcommand has to say so where the user looks.
+const LOGIN_LONG_ABOUT: &str = "\
+Sign in to skardi-cloud and write a context per workspace.
+
+Two of the global flags mean something different here:
+
+  --server <URL>    the GATEWAY url written into every context this run creates,
+                    ahead of $SKARDI_GATEWAY_URL and the control plane's answer
+  --context <NAME>  the NAME to write instead of <org>/<workspace>; only valid
+                    when a single workspace is selected
+
+--token is not accepted: login mints the credential. To store one by hand, use
+'skardi config set-context <name> --token-stdin'.";
+
+/// `logout`'s long help, for the same reason.
+const LOGOUT_LONG_ABOUT: &str = "\
+Drop the local credential, and optionally revoke it at the control plane.
+
+  --context <NAME>  which context to clear (default: the current one)
+
+--server and --token are not accepted: logout reads the credential it removes
+from ~/.skardi/config.yaml.";
+
 /// Subcommands supported by the CLI.
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -53,6 +79,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+
+    /// Sign in to skardi-cloud and write a context per workspace.
+    #[command(long_about = LOGIN_LONG_ABOUT)]
+    Login(LoginArgs),
+
+    /// Drop the local credential, and optionally revoke it at the control
+    /// plane.
+    #[command(long_about = LOGOUT_LONG_ABOUT)]
+    Logout(LogoutArgs),
 
     /// Run ad-hoc SQL against the server and print the result.
     Query {
@@ -165,8 +200,31 @@ async fn main() -> ExitCode {
 /// succeeding. Handling it here rather than short-circuiting in `main` keeps
 /// one dispatch point and leaves no structurally unreachable arm behind.
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    if let Commands::Config { cmd } = cli.command {
-        return commands::config::run(cmd, cli.context);
+    // These three edit the very file resolution reads, so they run BEFORE it:
+    // `login` writes a context that does not exist yet, and `logout` must work
+    // on a context whose credential has already expired.
+    match cli.command {
+        Commands::Config { cmd } => return commands::config::run(cmd, cli.context),
+        Commands::Login(args) => {
+            // Refused rather than ignored: `login` mints the credential, so a
+            // `--token` here is a misunderstanding worth naming, and silently
+            // dropping a flag someone typed is how they conclude it worked.
+            if cli.token.is_some() {
+                anyhow::bail!(
+                    "--token is not accepted by 'login': login mints the credential. To store one by hand, use 'skardi config set-context <name> --token-stdin'"
+                );
+            }
+            return commands::login::run(args, cli.context, cli.server).await;
+        }
+        Commands::Logout(args) => {
+            if cli.token.is_some() || cli.server.is_some() {
+                anyhow::bail!(
+                    "--server and --token are not accepted by 'logout': it reads the credential it removes from ~/.skardi/config.yaml"
+                );
+            }
+            return commands::logout::run(args, cli.context).await;
+        }
+        _ => {}
     }
 
     let config = ClientConfig::resolve(cli.server, cli.token, cli.context)?;
@@ -209,7 +267,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
 
         // Returned above, before resolution.
-        Commands::Config { .. } => Ok(()),
+        Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => Ok(()),
     };
 
     outcome.map_err(|err| cloud::diagnose(err, capability, &config))
@@ -226,6 +284,7 @@ fn capability_of(command: &Commands) -> Option<Capability> {
         Commands::Pipeline { .. } => Some(Capability::Pipeline),
         Commands::Job { .. } => Some(Capability::Job),
         Commands::Health { .. } => Some(Capability::Health),
-        Commands::Config { .. } => None,
+        // Local, and returned before resolution: no capability to gate.
+        Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => None,
     }
 }
