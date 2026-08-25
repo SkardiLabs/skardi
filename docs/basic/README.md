@@ -469,11 +469,11 @@ Use `Ctrl+C` to gracefully shutdown the server.
 
 ## Other Data Source Guides
 
-- [Authentication](auth/README.md) - Enable auth, sign up/sign in, and protect pipelines with session tokens
-- [Lance Vector Search](lance/README.md) - KNN similarity search with Lance
-- [ONNX Predict](onnx_predict/README.md) - ONNX model inference in SQL (requires `--features onnx`)
-- [PostgreSQL](postgres/README.md) - CRUD operations and federated queries
-- [MySQL](mysql/README.md) - CRUD operations and federated queries
-- [MongoDB](mongo/README.md) - Document CRUD and federated queries
-- [Apache Iceberg](iceberg/README.md) - Iceberg table queries
-- [S3 Remote Files](S3_USAGE.md) - S3 data source configuration
+- [Authentication](../auth/README.md) - Enable auth, sign up/sign in, and protect pipelines with session tokens
+- [Lance Vector Search](../lance/README.md) - KNN similarity search with Lance
+- [ONNX Predict](../onnx_predict.md) - ONNX model inference in SQL (requires `--features onnx`)
+- [PostgreSQL](../postgres/README.md) - CRUD operations and federated queries
+- [MySQL](../mysql/README.md) - CRUD operations and federated queries
+- [MongoDB](../mongo/README.md) - Document CRUD and federated queries
+- [Apache Iceberg](../iceberg/README.md) - Iceberg table queries
+- [S3 Remote Files](../S3_USAGE.md) - S3 data source configuration

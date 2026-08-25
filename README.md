@@ -3,12 +3,16 @@
 
 <img src="asset/logo.png" alt="Skardi Logo" width="700">
 
-**Skardi is an open-source agent data plane** — parameterized SQL templates served as REST endpoints (and shell verbs) your agent calls as tools, turning *data autonomy* (letting the agent decide what to query and write) into a default you can govern.
+**Skardi is an open-source self-improving context framework.**
 
-**Federated** · one engine over every source &nbsp;·&nbsp; **Governed** · semantic overlay, lineage, branching &nbsp;·&nbsp; **Agent-native** · REST + shell + MCP-soon
+Let your agent query any of your data, declaring *why* it asks.
+Skardi records every ask, so the intentions that keep coming back can become named tools and standing routines.
 
+**Observe** · every query, with intent &nbsp;·&nbsp; **Learn** · what recurs across sessions &nbsp;·&nbsp; **Act** · new tools and routines — *automation in flight*
+
+<a href="#the-loop">How the loop works</a> •
+<a href="#install">Install</a> •
 <a href="https://skardilabs.github.io/skardi-docs/">Documentation</a> •
-<a href="#roadmap">Roadmap</a> •
 <a href="https://discord.gg/S5YQQPEV2m">Discord</a>
 
 [License]: https://opensource.org/licenses/Apache-2.0
@@ -38,35 +42,278 @@
 
 <hr />
 
-## Why Skardi?
+## The loop
 
-**The most agent-friendly backend for builders shipping their first AI agent.** The painful part of agent-building isn't the prompt — it's the data plumbing: a vector DB to stand up, an embedding pipeline to maintain, a chunker to debug, a tool-call wrapper to write for every query. Skardi auto-bootstraps the primitives every agent needs so you ship in hours, not weeks:
+Most agent stacks freeze their data tools at ship time: you guess which queries
+the agent will need, wrap each one by hand, and find out in production what you
+guessed wrong. Skardi inverts that. The agent gets one general way in, and the
+tools it ends up with are the ones it demonstrably reached for.
 
-- **[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context) — governed, searchable context in one command.** Point it at a folder of documents and you have a queryable, citable knowledge base a command later — zero infra by default (SQLite + local embeddings). Point it at a datastore you already control (Postgres + pgvector, MongoDB, or Lance) and you get the same hybrid search (vector + full-text + RRF) served over REST by `skardi-server`. Chunking, embedding, indexing and query are rendered for you; your agent calls the result as a tool. No Python orchestration layer, no glue code.
-- **Zero bootstrap** — `ctx.yaml`, pipelines, schema, server, all rendered for you by **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)**. Install once and your agent has a working data tool the same hour.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="asset/loop-dark.svg">
+    <img src="asset/loop-light.svg" width="100%" alt="The loop — ① Observe: the agent asks anything, in SQL, and declares why (POST /query + ai_context → audit ledger). ② Learn: read the ledger, group by session and purpose, find the intentions that keep coming back. ③ Act: recurring queries become named pipelines; recurring intentions become routines that run before they're asked. The toolset grew itself.">
+  </picture>
+</p>
 
-You build the agent. Skardi handles the data plane.
+**1 — Serve your data, with the ledger on.** One `ctx.yaml` names your sources
+([full reference](docs/server.md)); `--query-audit-db` turns on the durable
+record that makes the rest of the loop possible.
+
+```yaml
+kind: context
+metadata: { name: acme }
+spec:
+  data_sources:
+    - name: warehouse            # step 2 queries warehouse.public.subs
+      type: postgres
+      hierarchy_level: catalog   # register every table in the database
+      connection_string: postgres://localhost:5432/acme
+```
+
+```bash
+# from a source checkout — Docker once --query-audit-db ships in a tagged release
+git clone https://github.com/SkardiLabs/skardi.git && cd skardi
+cargo run --release --bin skardi-server -- \
+  --ctx ctx.yaml --query-audit-db ./audit.db --port 8080
+```
+
+**2 — Your agent explores freely, declaring intent.** Any SQL over any
+registered source, federated in one statement. `ai_context` is how the agent
+says *why* — `purpose` and `session_id` are recorded, never executed.
+
+```bash
+curl -X POST localhost:8080/query -H 'Content-Type: application/json' -d @- <<'JSON'
+{ "sql": "SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs WHERE cancelled_at > now() - interval '7 days' GROUP BY plan",
+  "ai_context": { "purpose": "weekly churn check, by plan", "session_id": "sess-1a2b" } }
+JSON
+```
+
+**3 — Promote what recurs.** &nbsp;`in flight` — the
+[`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) skill
+reads the ledger, writes the pipeline, reloads the server, health-checks it, and
+rolls back if the install fails. Held until `--query-audit-db` lands in a tagged
+release; today you can read the ledger yourself with plain SQL — it is a SQLite
+file indexed on `(session_id, created_at)`.
+
+```yaml
+# /skardi-query-log --db ./audit.db --dir pipelines/ --port 8080 --restart-cmd '...'
+#   → 4 sessions asked the same churn question with different windows
+#   → wrote pipelines/weekly-churn.yaml, reloaded, /health/weekly-churn ok
+kind: pipeline
+metadata: { name: weekly-churn, version: "1.0.0" }
+spec:
+  query: |                                   # the varying window, parameterized
+    SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs
+    WHERE cancelled_at > now() - CAST({window} AS INTERVAL)
+    GROUP BY plan ORDER BY cancels DESC
+```
+
+**4 — The agent has a new tool.** One definition, both bindings — so the same
+promoted pipeline works in Claude Code, Cursor, your own loop, or any HTTP host,
+with no wrapper code to maintain.
+
+```bash
+# shell verb — any agent with a Bash tool, no MCP config
+skardi run weekly-churn -p window='7 days'
+# same pipeline, served as REST
+curl -X POST localhost:8080/weekly-churn/execute \
+  -H 'Content-Type: application/json' -d '{"window": "7 days"}'
+```
+
+Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
+acting on *intentions*: when every weekday morning ends with the same GitHub +
+Slack queries, each declaring `purpose: "daily standup"`, the pattern isn't a
+pipeline — it's a routine, and any harness that can run an agent on a schedule
+(Claude Code routines, a cron-driven CLI run) can have the standup drafted
+before anyone asks. And because the ledger is one SQLite file, you can hand a
+window of it to an LLM and ask what keeps being needed that nobody turned into a
+tool — recurring intentions the user hasn't noticed yet. One boundary is yours
+to set: ledger rows carry raw SQL, literals included, so keep that analysis on a
+local model or redact first — sending a window to a hosted LLM should be a
+deliberate opt-in, not a default. Both land as skills on
+top of the ledger, like
+[`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) —
+no server changes required.
+
+Then back to **Observe**, with one fewer thing your agent has to figure out from
+scratch.
 
 ---
 
-## Get started in 60 seconds — install on Claude Code
+## Why it compounds
 
-Open any Claude Code session and run:
+- **Intent is recorded, not inferred.** The ledger stores *why* each query ran,
+  not just what ran. Two statements with different SQL and the same purpose are
+  the same question — which is the difference between mining patterns and
+  grepping strings.
+- **One chokepoint means one memory.** Every source sits behind one engine, so a
+  recurring need spanning Postgres, Parquet on S3 and a SaaS API is visible as
+  *one* pattern. Across N SDKs it is N unrelated log files.
+- **Promotion is reviewable.** What the loop produces is pipeline YAML you read,
+  diff, edit and revert — not a learned weight you have to trust. Writes stay
+  governed on the way in too: `access_mode` gates DML per source, DDL is always
+  rejected, and literals never reach your logs or OTLP stream
+  ([why](docs/server.md#query-confidentiality)).
+
+> **Beta.** Skardi is under active development and APIs may move. Hit us on
+> [Discord](https://discord.gg/S5YQQPEV2m) if you want to co-design a POC.
+
+---
+
+## Install
+
+**Claude Code** — the fastest path. A skill that stands the whole thing up for
+you:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
 /plugin install auto-context@skardi-skills
 ```
 
-That's it — the skills are now available across all your projects, and `/plugin marketplace update skardi-skills` pulls future versions. For Cursor and other [Agent Skills](https://agentskills.io/)-compatible tools, plus a manual-copy fallback, see the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context)
+turns a folder of documents — or a datastore you already run — into governed,
+searchable context served over HTTP by `skardi-server`: hybrid search (vector +
+FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
+pointed at Postgres + pgvector, MongoDB, or Lance. For Cursor and other
+[Agent Skills](https://agentskills.io/)-compatible hosts, see the
+[skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
-Curious why a uniform plane matters? Read on.
+**CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
+build from source — the one-liner below has no published artifact there):
+
+```bash
+curl -fSL "https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | sed 's/Linux/unknown-linux-gnu/' | sed 's/Darwin/apple-darwin/').tar.gz" | tar xz
+sudo mv skardi /usr/local/bin/
+```
+
+**Server** — a Docker image, or a source build (no pre-built binary yet):
+
+```bash
+git clone https://github.com/SkardiLabs/skardi.git && cd skardi
+cargo build --release -p skardi-server     # add --features rag for embedding + chunk UDFs
+cargo install --locked --path crates/cli   # the CLI, from the same checkout
+```
 
 ---
 
-## ⭐️ Star the Repository
+## What's underneath
 
-If **skardi-skills** lands well in your agentic stack — searchable context up in a minute, a knowledge base your agent actually grounds in — drop a ⭐️ on this repo. It helps other agent builders discover Skardi, makes onboarding their first agent that much shorter, and signals which directions are worth pushing on.
+One Rust process ([DataFusion](https://datafusion.apache.org/) in-process) plus
+a small SQLite file for the ledger and optional auth. One server serves many
+agents; deploy it next to your data, behind your usual auth.
+
+- **Federated SQL** — one statement across every registered source, no
+  application-side joins. [docs/federated-queries.md](docs/federated-queries.md)
+- **Pipelines** — a YAML file with parameterized SQL becomes a REST endpoint
+  (schema inferred) *and* a `skardi run` verb. This is what the loop promotes
+  into. [docs/pipelines.md](docs/pipelines.md)
+- **Semantic overlay** — plain-English descriptions of tables and columns served
+  on `GET /data_source`, so the agent reads what data *means* before querying
+  instead of guessing from a schema dump. [docs/semantics.md](docs/semantics.md)
+- **Offline jobs** — async batch writes with atomic commit, crash recovery and a
+  run ledger you can list and inspect. [docs/jobs.md](docs/jobs.md)
+- **Retrieval built in** — KNN, FTS and hybrid RRF in SQL; `candle()` embeddings,
+  `chunk()`, `onnx_predict()` and `llm_extract()` as UDFs, so content and vector
+  land on the same row atomically. [docs/embeddings/](docs/embeddings/)
+
+### Supported data sources
+
+| Type | CRUD | Catalog | Notes | Docs |
+|------|------|---------|-------|------|
+| PostgreSQL | Full | Yes | pgvector KNN, FTS | [docs](docs/postgres/) |
+| MySQL | Full | Yes | Table or catalog registration | [docs](docs/mysql/) |
+| SQLite | Full | Yes | sqlite-vec KNN, FTS | [docs](docs/sqlite/) |
+| MongoDB | Full | No | Collections with point lookups | [docs](docs/mongo/) |
+| Redis | Full | No | Hashes mapped to SQL rows | [docs](docs/redis/) |
+| DynamoDB | Full | Yes | Scan + filter pushdown | [docs](docs/dynamodb/) |
+| SeekDB | Full | Yes | MySQL-wire CRUD, FULLTEXT, HNSW | [docs](docs/seekdb/) |
+| ClickHouse | Read | Yes | Columnar OLAP, filter/limit pushdown | [docs](docs/clickhouse/) |
+| Lance | Read + job-write | No | KNN, BM25 FTS; job destination | [docs](docs/lance/) |
+| Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs](docs/iceberg/) |
+| InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
+| S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
+| CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
+| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
+| Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images | [docs](docs/documents.md) |
+| RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
+| Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres; YAML views as catalog tables, `cypher_query` UDTF | [docs](docs/graph.md) |
+
+---
+
+## More
+
+<details>
+<summary><strong>Architecture diagram</strong></summary>
+
+<p align="center">
+  <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">
+    <img src="asset/architecture-open-source.svg" alt="Skardi architecture — between any AI agent and your data sources" width="100%"/>
+  </a>
+  <br>
+  <sub><a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
+</p>
+
+Most sources read a store that already holds rows. **RSS/Atom** is the one that
+reaches out over the open web at query time — one DataFusion partition per feed
+so a dead feed degrades alone, and, because feed URLs are agent-authored input,
+a fetch deliberately left un-sandboxed in OSS for operators to gate at the
+infrastructure layer. See [docs/rss.md](docs/rss.md).
+
+</details>
+
+<details>
+<summary><strong>Docker & cloud</strong></summary>
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v /path/to/ctx.yaml:/config/ctx.yaml \
+  -v /path/to/pipelines:/config/pipelines \
+  ghcr.io/skardilabs/skardi/skardi-server:latest \
+  --ctx /config/ctx.yaml --pipeline /config/pipelines --port 8080
+```
+
+Use the `skardi-server-rag` tag for the embedding + chunk UDFs, or build locally
+with `docker build -t skardi .` (`--build-arg FEATURES=rag`). The fastest cloud
+path is the [Sealos](https://sealos.io/products/app-store/skardi/) template.
+
+</details>
+
+<details>
+<summary><strong>Worked examples & docs index</strong></summary>
+
+Each demo ships a self-contained `ctx.yaml` plus pipelines, so reading the YAML
+shows the shape in practice: [llm_wiki](demo/llm_wiki/) (agent-native wiki —
+hybrid search, inline embeddings), [rag](demo/rag/),
+[simple_backend](demo/simple_backend/) (REST on SQLite + auth),
+[movie_recommendation](demo/movie_recommendation/) (ONNX NCF model).
+Source-specific demos are linked from the table above.
+
+Reference: [server](docs/server.md) (ad-hoc queries, `ai_context`, the audit
+ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
+[jobs](docs/jobs.md) · [semantics](docs/semantics.md) ·
+[federated queries](docs/federated-queries.md) ·
+[embeddings](docs/embeddings/) · [chunking](docs/chunk.md) ·
+[ONNX](docs/onnx_predict.md) · [LLM extraction](docs/llm_extract.md) ·
+[JSON packing](docs/json_pack.md) · [auth](docs/auth/) ·
+[observability](docs/observability.md).
+
+</details>
+
+---
+
+## Community
+
+Pick the channel that fits:
+
+- [Discord](https://discord.gg/S5YQQPEV2m) — real-time chat, POC co-design,
+  and shaping what lands next.
+- [GitHub issues](https://github.com/SkardiLabs/skardi/issues) — bug reports
+  and feature requests; we'll pair with you on design and review.
+- [Security](#security) — vulnerabilities go to a private channel, never a
+  public issue.
+
+We read everything — and a ⭐️ helps other agent builders find the project.
 
 <p align="center">
   <a href="https://github.com/SkardiLabs/skardi">
@@ -74,412 +321,18 @@ If **skardi-skills** lands well in your agentic stack — searchable context up 
   </a>
 </p>
 
----
+### Contributors
 
-## What is an "agent data plane"?
+<a href="https://github.com/SkardiLabs/skardi/graphs/contributors">
+  <img alt="Skardi contributors" src="https://contrib.rocks/image?repo=SkardiLabs/skardi" />
+</a>
 
-Borrowing the phrase from cloud infra: your AI agent has two layers. The **control plane** is the reasoning loop — prompts, tool selection, your orchestration code. The **data plane** is where every byte of context comes from and goes to: vector DB hits, SQL queries, file reads, writes back, audit trails.
+## Security
 
-Skardi is a uniform plane for that data layer. A single open-source server (and CLI) that exposes your data — Postgres, SQLite, MongoDB, S3 files, data lakes, vector stores — as parameterized SQL pipelines declared in YAML. Each pipeline is callable as both a REST endpoint and a `skardi` shell verb, so the same definition works in Claude Code, Cursor, your own agent loop, or any HTTP-aware host. One JOIN can span every registered source. Latency typically sits in tens of milliseconds, dominated by your data source's own.
-
-```yaml
-# pipelines/wiki-search-hybrid.yaml — your agent's hybrid-search tool, declared once
-kind: pipeline
-metadata: { name: wiki-search-hybrid }
-spec:
-  query: |
-    SELECT slug, title FROM sqlite_knn('wiki', candle('bge-small', {query}), {limit})
-    -- (full vector + FTS + RRF version in Quick Start below)
-```
-
-```bash
-$ skardi run wiki-search-hybrid -p query="turing machines" -p limit=10  # shell tool, any Bash-tool agent
-$ curl -X POST :8080/wiki-search-hybrid/execute -d '{...}'              # same pipeline, served as REST
-```
-
-That uniformity is also what makes the *durable* reason to put a plane in front possible: **governance**. Once every read and write goes through one engine, three primitives compose on top of it instead of fragmenting across N SDKs:
-
-1. **Semantic overlay.** Plain-English descriptions of every table, column, and pipeline, served on `GET /data_source` as the agent's discovery surface. The agent reads *what each table is for* before querying, instead of guessing from a schema dump. Reading agents already cash this win — the catalog endpoint *is* the agent's prompt. ([docs/semantics.md](docs/semantics.md), shipped today)
-2. **Lineage.** Every write tagged with `agent_id`, `session_id`, `tool_call_id`, and `timestamp`, queryable from metadata. The async-job ledger already records every batch write today (parameters, status, run id); inline-write lineage on the synchronous path is in progress — see [Roadmap](#roadmap).
-3. **Snapshot-as-branch.** Iceberg / Lance-backed branches with `git checkout`-like semantics — an agent writes into a branch, you review, you merge or roll back. If the agent updated 1,000 rows you don't like, undoing it is one call, not an incident. (in progress — see [Roadmap](#roadmap))
-
-Without these, "let the agent touch the database" is reckless and the right answer is "don't"; with them, *data autonomy* — letting the agent decide what to query and write — becomes a default you can actually grant. Federation, declarative SQL pipelines, REST + shell bindings — those are how the plane is built. Governance is what the plane is *for*.
-
-For the longer technical read — each primitive's shipped vs. in-progress status, the run-ledger schema, the chokepoint argument unpacked — see [docs/agent_data_plane.md](docs/agent_data_plane.md).
-
-```text
-   your agent  ──▶  skardi  ──┬─▶  Postgres / MySQL / SQLite / MongoDB / Redis
-   (Claude / GPT /     │              ├─▶  S3 / GCS / Azure (CSV, Parquet, Lance)
-    Cursor / your      │              ├─▶  Apache Iceberg, Lance datasets
-    own loop)          │              └─▶  pgvector, sqlite-vec, Lance KNN, SeekDB HNSW
-                       │
-                  parameterized SQL  ──▶  one JOIN can span all of the above
-                  (YAML pipelines)
-```
-
-- **`skardi` CLI** — a thin HTTP client: send ad-hoc SQL or call any pipeline against a running `skardi-server`, right from a shell. Drop it into Claude Code, Cursor, or any agent with a Bash tool and it's wired with no MCP config.
-- **`skardi-server`** — same engine over HTTP, with two surfaces: **online serving** (a YAML pipeline becomes a parameterized REST endpoint with an inferred request/response schema) and **offline jobs** (async batch writes into Lance or any read-write DB; if a job fails halfway you don't get a corrupted dataset, and every run is logged in a SQLite ledger you can list and inspect).
-- **Skardi-server is stateful but lightweight** — a single Rust process, plus a small SQLite file for the run ledger and (optional) auth. One server can serve many agents; deploy it next to your data, behind your usual auth.
-
-> **Beta.** Skardi is under active development. APIs may move. Hit us on [Discord](https://discord.gg/S5YQQPEV2m) if you want to co-design a POC.
-
-<p align="center">
-  <a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">
-    <picture>
-      <img src="asset/architecture-open-source.svg" alt="Skardi open source architecture — between any AI agent and your data sources" width="100%"/>
-    </picture>
-  </a>
-  <br>
-  <sub><a href="https://htmlpreview.github.io/?https://github.com/SkardiLabs/skardi/blob/main/asset/architecture-open-source.html">View interactive diagram →</a></sub>
-</p>
-
----
-
-## When does a uniform data plane earn its keep?
-
-Direct SDKs work fine for a single read-only RAG bot — you can wire one to Postgres + a vector DB and ship in an afternoon. The plane earns its keep cumulatively: every property below is true on day one for the simplest agent, and the last three become load-bearing once the agent starts writing, you add a second agent, or "what did the agent do yesterday?" stops being a rhetorical question.
-
-1. **Discovery — the agent reads what data *means*, not just shapes.** A semantic overlay attaches plain-English descriptions to every table, column, and pipeline; the catalog endpoint serves them so the agent picks the right verb before querying instead of guessing from a schema dump. (shipped — [docs/semantics.md](docs/semantics.md))
-2. **Federation — one JOIN over every source.** Federated SQL across Postgres / SQLite / MongoDB / S3 / Iceberg / Lance / vector stores, so the agent's "give me X about Y" doesn't need application-side joins.
-3. **Bindings — one pipeline, every host.** The same YAML serves as REST endpoint, `skardi` shell verb, and (soon) MCP tool — works in Claude Code, Cursor, your own loop, or a hosted agent with no extra glue.
-4. **Audit — one trail across every write.** Every write tagged with `agent_id` / `session_id` / `tool_call_id` / `timestamp`, queryable from one place. With direct SDKs you get distributed log files; through a plane you get one ledger. (the existing async-job ledger already records every batch write today; inline-write lineage in progress)
-5. **Rollback — branch the data, not your incident channel.** Iceberg / Lance-backed branches with `git checkout`-like semantics: agent writes into a branch, you review, you merge or revert. With direct DB writes a bad agent run is an incident; through the plane it's one call. (in progress)
-
-If your agent only ever reads from one source, direct SDKs are simpler. If it reads from many, or writes back, or you want to govern what it does — the plane is what makes data autonomy a responsible default rather than a gamble.
-
-Full breakdown of the three primitives — semantic-overlay YAML, the verbatim run-ledger schema, and why each primitive requires a chokepoint — in [docs/agent_data_plane.md](docs/agent_data_plane.md).
-
----
-## Quick Start
-
-### Install the CLI
-
-```bash
-# From source (recommended during beta)
-git clone https://github.com/SkardiLabs/skardi.git
-cd skardi
-cargo install --locked --path crates/cli
-```
-
-Or grab a pre-built binary:
-
-```bash
-curl -fSL "https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | sed 's/Linux/unknown-linux-gnu/' | sed 's/Darwin/apple-darwin/').tar.gz" | tar xz
-sudo mv skardi /usr/local/bin/
-```
-
-| Platform | Target |
-|----------|--------|
-| Linux x86_64 | `skardi-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `skardi-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS ARM64 (Apple Silicon) | `skardi-aarch64-apple-darwin.tar.gz` |
-
-> macOS Intel binaries are not published. [Build from source](#building-from-source) if you need one.
-
-### First-time agent loop (two minutes)
-
-The CLI is a thin HTTP client — every command below talks to a running
-`skardi-server`, so step 1 is always starting one. See
-[docs/cli.md](docs/cli.md) for the full command reference.
-
-**Step 1 — register named sources in a `ctx.yaml`, and start the server.** Five example lines:
-
-```yaml
-# ctx.yaml — describes where your data lives. Each entry gets a name you use in SQL.
-kind: context
-spec:
-  data_sources:
-    - name: products            # referenceable as `products` in SQL
-      type: sqlite
-      path: ./shop.db
-      access_mode: read_write
-      options: { table: products }       # register one specific table…
-    - name: warehouse
-      type: postgres
-      connection_string: "postgresql://localhost:5432/warehouse"
-      hierarchy_level: catalog           # …or auto-discover every table in the DB.
-                                         # Reference catalog tables in SQL as
-                                         # `warehouse.<schema>.<table>` (3-part name).
-```
-
-```bash
-cargo run --bin skardi-server -- --ctx ./ctx.yaml --port 8080
-```
-
-**Step 2 — ad-hoc SQL against the running server.** The CLI prints the
-response's `data` array as pretty-printed JSON to stdout by default (pass
-`--table` for an ASCII table) — see [docs/cli.md](docs/cli.md).
-
-```bash
-skardi query -e "SELECT * FROM products LIMIT 10"
-skardi query -e "SELECT * FROM products LIMIT 10" --table
-```
-
-**Step 3 — turn a parameterized SQL into an agent-callable pipeline.** One
-YAML from [`demo/llm_wiki/cli/`](demo/llm_wiki/cli/) — the actual file, not
-pseudo-code:
-
-> ⚠️ Unlike Steps 1–2 (zero-dependency), this hybrid-search pipeline also needs a local embedding model at `models/…` + the `sqlite-vec` extension (`SQLITE_VEC_PATH`) and a seeded DB — so it is **not runnable by copy-paste alone**. The [`auto_context` skill](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context) sets all of this up for you; use it if you just want the pipeline working.
-
-```yaml
-# pipelines/search_hybrid.yaml — declares the SQL once; Skardi infers the params
-kind: pipeline
-metadata: { name: wiki-search-hybrid }
-spec:
-  query: |
-    WITH vec AS (
-      SELECT id, ROW_NUMBER() OVER (ORDER BY _score ASC) AS rk
-      FROM sqlite_knn('wiki.main.wiki_pages_vec', 'embedding',
-           (SELECT candle('models/bge-small-en-v1.5', {query})), 80)
-    ),
-    fts AS (
-      SELECT id, slug, title, ROW_NUMBER() OVER (ORDER BY _score DESC) AS rk
-      FROM sqlite_fts('wiki.main.wiki_pages_fts', 'content', {text_query}, 60)
-    )
-    SELECT COALESCE(f.slug, p.slug) AS slug, COALESCE(f.title, p.title) AS title,
-           COALESCE({vector_weight}/(60.0 + v.rk), 0)
-         + COALESCE({text_weight} /(60.0 + f.rk), 0) AS rrf_score
-    FROM vec v FULL OUTER JOIN fts f USING (id)
-    LEFT JOIN wiki.main.wiki_pages p ON p.id = COALESCE(v.id, f.id)
-    ORDER BY rrf_score DESC LIMIT {limit}
-```
-
-Restart the server with `--pipeline pipelines/` so it loads this file (see
-[Skardi Server](#skardi-server--online-serving--offline-jobs) below), and
-any agent with a shell can call it by name — no separate alias file, no
-alias-management step:
-
-```bash
-skardi run wiki-search-hybrid \
-  -p query="turing machine computation" \
-  -p text_query="turing machine computation" \
-  -p vector_weight=0.5 -p text_weight=0.5 -p limit=10
-```
-
-The same pipeline is mounted at `POST /wiki-search-hybrid/execute` — the
-request body is a JSON object whose keys match the `{...}` placeholders in
-the SQL (Skardi infers this schema and serves it on `GET /data_source` so
-the agent can read it). One full cycle:
-
-```bash
-curl -X POST http://localhost:8080/wiki-search-hybrid/execute \
-  -H "Content-Type: application/json" \
-  -d '{"query": "turing machine computation",
-       "text_query": "turing machine computation",
-       "vector_weight": 0.5, "text_weight": 0.5, "limit": 10}'
-```
-
-```json
-{ "success": true,
-  "data": [ { "slug": "concept/turing-machine", "title": "Turing machine", "rrf_score": 0.0312 }, ... ],
-  "rows": 10, "execution_time_ms": 23 }
-```
-
-Drop `skardi` into a Claude Code or Cursor session and the agent can already use any pipeline you've declared as a tool via its Bash integration, as long as a `skardi-server` is reachable — no MCP config needed.
-
-### Skardi Server — online serving + offline jobs
-
-```bash
-cargo run --bin skardi-server -- \
-  --ctx ctx.yaml \
-  --pipeline pipelines/ \
-  --jobs jobs/ \
-  --port 8080
-```
-
-```bash
-# Pipelines: synchronous answer
-curl -X POST http://localhost:8080/product-search-demo/execute \
-  -H "Content-Type: application/json" \
-  -d '{"brand": null, "max_price": 100.0, "limit": 5}'
-
-# Jobs: submit an async write-to-destination
-skardi job run backfill-to-lake --param from_date='2026-01-01'
-skardi job status <run_id>
-```
-
-Full reference:
-- **CLI** — [docs/cli.md](docs/cli.md)
-- **Server** — [docs/server.md](docs/server.md)
-- **Pipelines (online serving)** — [docs/pipelines.md](docs/pipelines.md)
-- **Jobs (offline batch)** — [docs/jobs.md](docs/jobs.md)
-- **Table descriptions for agent discovery** — [docs/semantics.md](docs/semantics.md)
-- **Background — design intent** — [docs/agent_data_plane.md](docs/agent_data_plane.md)
-
----
-
-## Worked examples
-
-For end-to-end walkthroughs — RAG, recommendations, an agent-native wiki, a simple REST backend — see the [`demo/`](demo/) directory. Each demo ships as a self-contained `ctx.yaml` plus pipelines (and sometimes jobs), so reading the YAML shows the Skardi shape in practice. Full list in [Demo & Examples](#demo--examples) below.
-
----
-
-## Supported Data Sources
-
-| Type | CRUD | Catalog mode | Description | Docs |
-|------|------|--------------|-------------|------|
-| PostgreSQL | Full | Yes | Table or catalog registration, pgvector KNN | [docs/postgres/](docs/postgres/) |
-| MySQL | Full | Yes | Table or catalog registration | [docs/mysql/](docs/mysql/) |
-| SQLite | Full | Yes | Table or catalog registration, sqlite-vec KNN, FTS | [docs/sqlite/](docs/sqlite/) |
-| MongoDB | Full | No | Collections with point lookups | [docs/mongo/](docs/mongo/) |
-| Redis | Full | No | Hashes mapped to SQL rows | [docs/redis/](docs/redis/) |
-| DynamoDB | Full | Yes | Items mapped to SQL rows, table or catalog registration, scan + filter pushdown | [docs/dynamodb/](docs/dynamodb/) |
-| SeekDB | Full | Yes | MySQL-wire CRUD, native FULLTEXT FTS, HNSW VECTOR KNN | [docs/seekdb/](docs/seekdb/) |
-| ClickHouse | Read | Yes | Columnar OLAP over HTTP, filter/limit pushdown, table or catalog registration | [docs/clickhouse/](docs/clickhouse/) |
-| Lance | Read (job-write) | No | KNN vector search, BM25 FTS; job destination | [docs/lance/](docs/lance/) |
-| CSV | Read | No | Local or remote CSV files | [docs/server.md](docs/server.md) |
-| Parquet | Read | No | Local or remote Parquet files | [docs/server.md](docs/server.md) |
-| JSON / NDJSON | Read | No | Local or remote JSON files | [docs/cli.md](docs/cli.md) |
-| S3 / GCS / Azure | Read | No | CSV, Parquet, Lance from object stores | [docs/S3_USAGE.md](docs/S3_USAGE.md) |
-| Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs/iceberg/](docs/iceberg/) |
-| InfluxDB 3 | Read | No | Time-series measurements over Arrow Flight SQL | [docs/influxdb/](docs/influxdb/) |
-| Open Connector | Read | Yes | SaaS resources as stable SQL tables via a self-hosted [Open Connector](https://github.com/oomol-lab/open-connector) gateway; GitHub pack (repos, issues, PRs, reviews, commits, workflow runs, releases — [guide](docs/open-connector-github.md)), Slack pack (conversations, users, files — [guide](docs/open-connector-slack.md)), Notion pack (users, pages, data sources, block children — [guide](docs/open-connector-notion.md)), Feishu pack (chats, messages, chat members, tasks, wiki spaces and nodes — [guide](docs/open-connector-feishu.md)), Gmail pack (threads, messages, drafts, labels, filters — [guide](docs/open-connector-gmail.md)), Discord pack (guilds, connections, sticker packs — [guide](docs/open-connector-discord.md)), Outlook pack (messages, mail folders — [guide](docs/open-connector-microsoft-365.md)), OneDrive pack (drive items, drive item search — [guide](docs/open-connector-one-drive.md)), `open_connector_query` / `open_connector_scan` UDTFs, filter + limit pushdown, bounded TTL cache (more provider packs rolling out) | [docs/open-connector.md](docs/open-connector.md), [demo](docs/open-connector/) |
-| Documents | Read | No | PDF/Office/ODF/image -> per-page markdown, tables, images (local directories or S3 prefixes; `documents` feature) | [docs/documents.md](docs/documents.md) |
-| RSS / Atom | Read | Yes | RSS 0.9x/1.0/2.0, Atom, JSON Feed subscriptions as `feeds` (health) + `items` (live window); content stored as Markdown, per-feed TTL cache with conditional GETs, per-feed fault isolation, un-sandboxed fetch egress — operator/Cloud-owned SSRF control (`rss` feature) | [docs/rss.md](docs/rss.md) |
-| Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres as SQL tables: YAML-declared views as `kg.main.<view>` catalog tables, `cypher_query` / `graph_schema` UDTFs, backend-enforced read-only, degraded registration with first-scan revalidation (Neo4j / Kuzu next) | [docs/graph.md](docs/graph.md) |
-
----
-
-## Additional Features
-
-- **Federated queries** — JOIN across different source types in one SQL query (CSV vs Postgres vs Lance, etc). See [docs/federated-queries.md](docs/federated-queries.md).
-- **Table descriptions for agents** — write natural-language descriptions of each table and column in YAML; Skardi serves them on `GET /data_source` so the agent can read what each table is for before it queries. See [docs/semantics.md](docs/semantics.md).
-- **Authentication** — session-based via better-auth + SQLite. See [docs/auth/](docs/auth/).
-- **ONNX inference** — inline model predictions in SQL via an `onnx_predict` UDF. See [docs/onnx_predict.md](docs/onnx_predict.md).
-- **Embedding inference** — call embedding models from inside SQL via the `candle()` UDF (local GGUF / Candle models, or remote OpenAI-style APIs). See [docs/embeddings/](docs/embeddings/).
-- **Observability** — OpenTelemetry traces / metrics / logs with a pre-configured Grafana stack. See [docs/observability.md](docs/observability.md).
-
----
-
-## Architecture
-
-<details>
-<summary>Click to expand Skardi's architecture diagram</summary>
-
-<p align="center">
-  <img src="asset/architecture.png" alt="Skardi Architecture" width="800">
-</p>
-
-</details>
-
-Most sources read a store that already holds rows. The **RSS/Atom** source is the one that reaches out over the open web at query time: it fetches each subscription through a per-feed TTL cache with conditional GETs, runs one DataFusion partition per feed so a dead feed degrades alone instead of failing the scan, and — because feed URLs are agent-authored input — the fetch is deliberately un-sandboxed in OSS: Skardi does not restrict where a feed may point, and operators impose egress control at the infrastructure layer (managed egress is a Skardi Cloud feature). See [docs/rss.md](docs/rss.md).
-
----
-
-## Docker
-
-```bash
-# Build
-docker build -t skardi .
-docker build -t skardi --build-arg FEATURES=rag .   # adds embedding + chunk UDFs
-
-# Or pull pre-built
-docker pull ghcr.io/skardilabs/skardi/skardi-server:latest
-docker pull ghcr.io/skardilabs/skardi/skardi-server-rag:latest   # embedding + chunk UDFs
-
-# Run
-docker run --rm \
-  -v /path/to/your/ctx.yaml:/config/ctx.yaml \
-  -v /path/to/your/pipelines:/config/pipelines \
-  -p 8080:8080 \
-  skardi \
-  --ctx /config/ctx.yaml \
-  --pipeline /config/pipelines \
-  --port 8080
-```
-
-## Cloud (Sealos)
-
-The fastest cloud path is the [Sealos](https://sealos.io) template in **[skardi-skills](https://github.com/SkardiLabs/skardi-skills)** — our growing library of ready-to-use Skardi setups. One-click launch, no local setup.
-
-## Building from Source
-
-```bash
-git clone https://github.com/SkardiLabs/skardi.git
-cd skardi
-
-cargo build --release -p skardi-cli
-cargo build --release -p skardi-server
-
-# With the full RAG kit (embedding UDFs + chunk UDF)
-cargo build --release -p skardi-server --features rag
-
-# Or just the embedding UDFs (ONNX, GGUF, Candle, remote embed) without chunking
-cargo build --release -p skardi-server --features embedding
-```
-
----
-
-## Demo & Examples
-
-| Directory | Description |
-|-----------|-------------|
-| [demo/llm_wiki/](demo/llm_wiki/) | Agent-native wiki (server + CLI flavors) — hybrid search, inline embeddings, agent verbs |
-| [demo/simple_backend/](demo/simple_backend/) | REST backend with SQLite and optional auth |
-| [demo/rag/](demo/rag/) | Retrieval-augmented generation pipeline |
-| [demo/movie_recommendation/](demo/movie_recommendation/) | Movie recommendations with ONNX NCF model |
-
-For data-source-specific demos, see the entries in [Supported Data Sources](#supported-data-sources).
-
----
-
-## Roadmap
-
-**Coming soon (not yet shipped)**: a skills generator that emits Claude Code skill files per pipeline, an MCP binding for non-Claude hosts, a first-class memory primitive (one YAML block giving an agent a memory store with keyword + semantic recall, automatic expiration, and per-session provenance), lineage capture, and snapshot-as-branch checkpoints (roll back a destructive agent write — e.g. an agent that updated 1,000 rows you don't like — in one call).
-
-We're **building in public**. `[x]` means shipped today, `[ ]` means open for contribution. Open an issue or hop into [Discord](https://discord.gg/S5YQQPEV2m) on anything unchecked.
-
-`1` Federated SQL engine
-   - [x] One SQL engine ([DataFusion](https://datafusion.apache.org/), in-process) over CSV, Parquet, JSON, S3 / GCS / Azure, Postgres, MySQL, SQLite, MongoDB, Redis, Iceberg, Lance, SeekDB — all joinable in one query
-   - [x] Register either one specific table, or point Skardi at a database (Postgres / MySQL / SQLite) and let it auto-discover all tables — one config line either way
-   - [x] Graph sources (Apache AGE — read-only Cypher over Postgres as SQL tables, YAML views + `cypher_query`; [docs](docs/graph.md))
-   - [ ] Graph sources beyond AGE (Neo4j / Kuzu) — to unlock graphRAG patterns alongside vector / full-text retrieval
-
-`2` Retrieval primitives
-   - [x] Vector search (KNN) — `pg_knn` (pgvector), `sqlite_knn` (sqlite-vec), Lance KNN, SeekDB HNSW
-   - [x] Full-text search (FTS) — `pg_fts`, `sqlite_fts`, Lance BM25 inverted indexes, SeekDB FULLTEXT
-   - [x] Hybrid search — combine keyword and semantic search results in one SQL query (RRF merge), no Python re-ranking layer
-   - [x] Inline embeddings — `candle()` UDF (local GGUF / Candle models, or remote embedding APIs) called inside SQL, so content + vector stay on the same row atomically
-   - [x] ONNX inference — `onnx_predict` UDF for inline model predictions in SQL
-   - [x] Chunking UDFs — `chunk()` and index-carrying `chunk_parts()` with character / markdown splitters (via [`text-splitter`](https://crates.io/crates/text-splitter)) so ingestion can chunk inline in SQL ([docs](docs/chunk.md)); token / code splitters next
-   - [x] JSON encoding UDF — `json_pack()` builds JSON objects in SQL through `serde_json` (deterministic key order, no injection path) ([docs](docs/json_pack.md))
-   - [ ] Memory primitive — give your agent a memory store (keyword + semantic recall, TTL/expiration, per-session provenance) defined in one YAML block
-
-`3` Online serving (pipelines)
-   - [x] Declarative YAML → parameterized REST endpoint with inferred request / response schema
-   - [x] Built-in pipeline dashboard
-   - [x] CLI pipeline binding — `skardi run <pipeline> -p name=value` calls any named, server-loaded pipeline directly ([#90](https://github.com/SkardiLabs/skardi/pull/90))
-   - [x] CLI as a thin HTTP client — `skardi query` / `skardi run` send ad-hoc SQL and pipeline calls to a running `skardi-server` over the network; federation across sources happens server-side (see [docs/cli.md](docs/cli.md))
-
-`4` Offline jobs
-   - [x] Async batch execution with submit / poll / cancel ([#98](https://github.com/SkardiLabs/skardi/pull/98))
-   - [x] Lance dataset destinations with atomic commit + crash recovery
-   - [x] SQL-DML destinations (Postgres / MySQL / SQLite)
-   - [x] SQLite-backed run ledger with submit-time schema diff
-
-`5` Agent-facing bindings
-   - [x] REST — every pipeline served as a parameterized HTTP endpoint
-   - [x] Shell — every pipeline runnable as a `skardi` command; works in Claude Code, Cursor, and any agent with a Bash tool
-   - [ ] Skills generator — `skardi skills generate --server <URL> --out .claude/skills/` emits a skill Markdown per pipeline for Claude Code / Desktop auto-discovery
-   - [ ] MCP binding — same pipeline YAML projected to MCP tools for non-Claude hosts
-
-`6` Governance & lineage
-   - [x] Plain-English table descriptions — a `kind: semantics` YAML overlay attaching natural-language descriptions to tables / columns (supports both bare source names and fully-qualified `catalog.schema.table` paths); served on `GET /data_source` so agents can discover what each table is for before querying
-   - [ ] Agent-callable `describe` verb — CLI / pipeline form on top of the discovery endpoint
-   - [ ] Lineage capture — `agent_id`, `session_id`, `tool_call_id`, `timestamp` on writes; queryable from metadata tables
-   - [ ] Agent identity passthrough — any binding injects client identity into a SQL context var pipelines can read
-   - [ ] Snapshot-as-branch / agent checkpoints — Iceberg / Lance-backed `git checkout`-like semantics: if your agent updates 1,000 rows and you don't like the result, roll back in one call
-
-`7` Ops
-   - [x] Session auth — drop-in user auth via [better-auth](https://www.better-auth.com/) backed by SQLite
-   - [x] Observability — OpenTelemetry traces / metrics / logs with a pre-configured Grafana stack
-   - [x] Docker + pre-built binaries — Linux x86_64 / ARM64, macOS ARM64
-
----
-
-## Community
-
-Building an agent on top of Skardi, or want to influence the roadmap above? Join us on [Discord](https://discord.gg/S5YQQPEV2m), file an issue, or open a PR. We read everything.
+Skardi sits between your agents and your data, so we treat reports seriously.
+Please don't post vulnerabilities as public issues — report them privately via
+[GitHub security advisories](https://github.com/SkardiLabs/skardi/security/advisories/new)
+and we'll follow up with you there.
 
 ## License
 

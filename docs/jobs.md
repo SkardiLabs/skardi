@@ -11,10 +11,6 @@ polled by run id (the write path agents use to commit durable results).
 **In one sentence:** a pipeline answers a query; a job commits the answer
 somewhere you can query again later.
 
-
-[docs/agent_data_plane.md § Trust the agent, but make writes safe](agent_data_plane.md#4-trust-the-agent-but-make-writes-safe)
-for the design rationale.
-
 ---
 
 ## When to use a job
