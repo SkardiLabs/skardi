@@ -20,13 +20,14 @@ use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use skardi::engine::Engine;
-use skardi::pipeline::pipeline::Pipeline;
+use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::graph::udtf::GraphSourceHealth;
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::auth::routes::require_session;
 use crate::config::{DataSourceType, HierarchyLevel};
+use crate::param_schema::param_json_schema;
 use crate::query_audit::{QueryAuditStatus, finish_audit};
 use crate::response::{
     ErrorResponse, create_error_response, create_success_response, record_batch_to_json,
@@ -378,6 +379,24 @@ pub async fn pipeline_health_check(
     })))
 }
 
+/// The enriched parameter list for one pipeline, sorted by name so the
+/// response is deterministic (RequestSchema.fields is a HashMap).
+fn enriched_parameters(pipeline: &StandardPipeline) -> Vec<Value> {
+    let sql = &pipeline.query_definition().sql;
+    let mut fields: Vec<_> = pipeline.request_schema().fields.iter().collect();
+    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+    fields
+        .into_iter()
+        .map(|(name, field)| {
+            serde_json::json!({
+                "name": name,
+                "data_type": format!("{:?}", field.field_type),
+                "json_schema": param_json_schema(&field.field_type, sql, name),
+            })
+        })
+        .collect()
+}
+
 /// List all pipelines endpoint - GET /pipelines
 pub async fn list_pipelines(State(app_state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let config = app_state
@@ -392,7 +411,9 @@ pub async fn list_pipelines(State(app_state): State<AppState>) -> Result<Json<Va
             serde_json::json!({
                 "name": name,
                 "version": pipeline.version(),
-                "endpoint": format!("/{}/execute", name)
+                "endpoint": format!("/{}/execute", name),
+                "description": pipeline.metadata.description,
+                "parameters": enriched_parameters(pipeline)
             })
         })
         .collect();
@@ -423,14 +444,20 @@ pub async fn get_pipelines_info(
     })?;
 
     if let Some(pipeline) = config.pipelines.get(&name) {
-        let request_schema = pipeline.request_schema();
-        let params: Vec<Value> = request_schema
-            .fields
-            .iter()
+        let sql = &pipeline.query_definition().sql;
+        let mut fields: Vec<_> = pipeline.request_schema().fields.iter().collect();
+        fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let params: Vec<Value> = fields
+            .into_iter()
             .map(|(param_name, field_type)| {
                 serde_json::json!({
                     "name": param_name,
-                    "type": format!("{:?}", field_type)
+                    // Legacy Debug dump of the whole InferredFieldType, kept
+                    // as-is; `data_type` and `json_schema` are the additive,
+                    // machine-consumable forms.
+                    "type": format!("{:?}", field_type),
+                    "data_type": format!("{:?}", field_type.field_type),
+                    "json_schema": param_json_schema(&field_type.field_type, sql, param_name)
                 })
             })
             .collect();
@@ -441,6 +468,7 @@ pub async fn get_pipelines_info(
                 "name": pipeline.name(),
                 "version": pipeline.version(),
                 "endpoint": format!("/{}/execute", name),
+                "description": pipeline.metadata.description,
                 "parameters": params,
                 "created_at": pipeline.metadata.created_at,
                 "updated_at": pipeline.metadata.updated_at
