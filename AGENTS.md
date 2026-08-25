@@ -4,7 +4,7 @@ This file gives AI agents and human contributors the minimum context needed to m
 
 Skardi is a federated SQL query engine and YAML-driven REST API server, written in Rust on top of Apache DataFusion. The CLI runs SQL against local files, object stores, databases, and lakehouse formats; the server turns SQL pipelines defined in YAML into parameterized HTTP endpoints — zero application code required.
 
-Project-specific Claude Code instructions also live in [.claude/CLAUDE.md](.claude/CLAUDE.md). When the two files disagree, CLAUDE.md wins.
+Project-specific Claude Code instructions also live in `.claude/CLAUDE.md` (local, untracked). When the two files disagree, CLAUDE.md wins.
 
 ## Repository Layout
 
