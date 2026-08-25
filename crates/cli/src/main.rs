@@ -8,16 +8,20 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
+use cloud::Capability;
 use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
+use commands::login::{LoginArgs, LogoutArgs};
 use commands::pipeline::PipelineCmd;
 use config::ClientConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod client;
+mod cloud;
 mod commands;
 mod config;
+mod login;
 mod output;
 mod params;
 mod session;
@@ -43,6 +47,30 @@ struct Cli {
     command: Commands,
 }
 
+/// `login`'s long help. Two GLOBAL flags mean something different under it, and
+/// a third is refused, so the subcommand has to say so where the user looks.
+const LOGIN_LONG_ABOUT: &str = "\
+Sign in to skardi-cloud and write a context per workspace.
+
+Two of the global flags mean something different here:
+
+  --server <URL>    the GATEWAY url written into every context this run creates,
+                    ahead of $SKARDI_GATEWAY_URL and the control plane's answer
+  --context <NAME>  the NAME to write instead of <org>/<workspace>; only valid
+                    when a single workspace is selected
+
+--token is not accepted: login mints the credential. To store one by hand, use
+'skardi config set-context <name> --token-stdin'.";
+
+/// `logout`'s long help, for the same reason.
+const LOGOUT_LONG_ABOUT: &str = "\
+Drop the local credential, and optionally revoke it at the control plane.
+
+  --context <NAME>  which context to clear (default: the current one)
+
+--server and --token are not accepted: logout reads the credential it removes
+from ~/.skardi/config.yaml.";
+
 /// Subcommands supported by the CLI.
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -51,6 +79,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+
+    /// Sign in to skardi-cloud and write a context per workspace.
+    #[command(long_about = LOGIN_LONG_ABOUT)]
+    Login(LoginArgs),
+
+    /// Drop the local credential, and optionally revoke it at the control
+    /// plane.
+    #[command(long_about = LOGOUT_LONG_ABOUT)]
+    Logout(LogoutArgs),
 
     /// Run ad-hoc SQL against the server and print the result.
     Query {
@@ -163,14 +200,49 @@ async fn main() -> ExitCode {
 /// succeeding. Handling it here rather than short-circuiting in `main` keeps
 /// one dispatch point and leaves no structurally unreachable arm behind.
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    if let Commands::Config { cmd } = cli.command {
-        return commands::config::run(cmd, cli.context);
+    // These three edit the very file resolution reads, so they run BEFORE it:
+    // `login` writes a context that does not exist yet, and `logout` must work
+    // on a context whose credential has already expired.
+    match cli.command {
+        Commands::Config { cmd } => return commands::config::run(cmd, cli.context),
+        Commands::Login(args) => {
+            // Refused rather than ignored: `login` mints the credential, so a
+            // `--token` here is a misunderstanding worth naming, and silently
+            // dropping a flag someone typed is how they conclude it worked.
+            if cli.token.is_some() {
+                anyhow::bail!(
+                    "--token is not accepted by 'login': login mints the credential. To store one by hand, use 'skardi config set-context <name> --token-stdin'"
+                );
+            }
+            return commands::login::run(args, cli.context, cli.server).await;
+        }
+        Commands::Logout(args) => {
+            if cli.token.is_some() || cli.server.is_some() {
+                anyhow::bail!(
+                    "--server and --token are not accepted by 'logout': it reads the credential it removes from ~/.skardi/config.yaml"
+                );
+            }
+            return commands::logout::run(args, cli.context).await;
+        }
+        _ => {}
     }
 
     let config = ClientConfig::resolve(cli.server, cli.token, cli.context)?;
+    let capability = match capability_of(&cli.command) {
+        Some(capability) => capability,
+        // Unreachable: `Config` is the only capability-less command and it
+        // returned above. Refusing beats defaulting — a remote command added
+        // without an entry must fail loudly rather than quietly skip the
+        // cloud gating in `cloud::ensure_available`.
+        None => anyhow::bail!("internal error: command has no capability entry"),
+    };
+    // Both checks precede `ApiClient::new`, so a gated command and an expired
+    // credential issue no request at all (§8).
+    cloud::ensure_available(capability, &config)?;
+    cloud::ensure_credential_fresh(&config, chrono::Utc::now())?;
     let client = ApiClient::new(&config)?;
 
-    match cli.command {
+    let outcome = match cli.command {
         Commands::Query {
             sql,
             file,
@@ -195,6 +267,120 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
 
         // Returned above, before resolution.
-        Commands::Config { .. } => Ok(()),
+        Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => Ok(()),
+    };
+
+    outcome.map_err(|err| cloud::diagnose(err, capability, &config))
+}
+
+/// The [`Capability`] a command exercises, or `None` for the purely local
+/// `config` command. Kept as one table so gating and the route-specific error
+/// mapping cannot disagree about what a command is.
+fn capability_of(command: &Commands) -> Option<Capability> {
+    match command {
+        Commands::Query { .. } => Some(Capability::Query),
+        Commands::Schema => Some(Capability::Schema),
+        Commands::Run { .. } => Some(Capability::Run),
+        Commands::Pipeline { .. } => Some(Capability::Pipeline),
+        Commands::Job { .. } => Some(Capability::Job),
+        Commands::Health { .. } => Some(Capability::Health),
+        // Local, and returned before resolution: no capability to gate.
+        Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Capability, Commands, capability_of};
+    use clap::Parser as _;
+
+    /// The table gating and the route-specific error mapping both read. A
+    /// remote command with no entry would silently skip cloud gating, so the
+    /// pairing is asserted rather than assumed.
+    #[test]
+    fn every_remote_command_names_its_capability() {
+        let cases: Vec<(&[&str], Capability)> = vec![
+            (&["skardi", "query", "-e", "select 1"], Capability::Query),
+            (&["skardi", "schema"], Capability::Schema),
+            (&["skardi", "run", "a-pipeline"], Capability::Run),
+            (&["skardi", "pipeline", "list"], Capability::Pipeline),
+            (&["skardi", "job", "list"], Capability::Job),
+            (&["skardi", "health"], Capability::Health),
+        ];
+        for (argv, expected) in cases {
+            let cli = super::Cli::try_parse_from(argv).expect("parses");
+            assert_eq!(
+                capability_of(&cli.command),
+                Some(expected),
+                "argv: {argv:?}"
+            );
+        }
+    }
+
+    /// The three local commands have no capability: they are answered before
+    /// resolution, so there is nothing to gate.
+    #[test]
+    fn the_local_commands_have_no_capability() {
+        for argv in [
+            vec!["skardi", "config", "get-contexts"],
+            vec!["skardi", "login"],
+            vec!["skardi", "logout"],
+        ] {
+            let cli = super::Cli::try_parse_from(&argv).expect("parses");
+            assert_eq!(capability_of(&cli.command), None, "argv: {argv:?}");
+        }
+    }
+
+    /// `--help` and `--version` exit 0 through `main`'s own arm; a usage error
+    /// must exit 1, because 2 is reserved for "cannot reach the server".
+    #[test]
+    fn clap_failures_are_classified_by_kind() {
+        use clap::error::ErrorKind;
+        assert_eq!(
+            super::Cli::try_parse_from(["skardi", "--help"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            super::Cli::try_parse_from(["skardi", "--version"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayVersion
+        );
+        assert!(super::Cli::try_parse_from(["skardi", "not-a-command"]).is_err());
+        // Mutually exclusive selection flags are refused by clap, not by the
+        // flow, so a wrong pair never reaches a mint.
+        assert!(
+            super::Cli::try_parse_from([
+                "skardi",
+                "login",
+                "--workspace",
+                "one",
+                "--all-workspaces"
+            ])
+            .is_err()
+        );
+    }
+
+    /// `Commands` is matched exhaustively in two places; this fails to compile
+    /// if a variant is added without visiting both.
+    #[test]
+    fn the_command_set_is_covered_exhaustively() {
+        fn assert_total(command: &Commands) -> bool {
+            match command {
+                Commands::Config { .. }
+                | Commands::Login(_)
+                | Commands::Logout(_)
+                | Commands::Query { .. }
+                | Commands::Run { .. }
+                | Commands::Pipeline { .. }
+                | Commands::Job { .. }
+                | Commands::Schema
+                | Commands::Health { .. } => true,
+            }
+        }
+        let cli = super::Cli::try_parse_from(["skardi", "schema"]).unwrap();
+        assert!(assert_total(&cli.command));
     }
 }

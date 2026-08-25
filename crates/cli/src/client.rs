@@ -1,9 +1,11 @@
 //! Thin HTTP client for talking to skardi-server: a small wrapper around
-//! `reqwest` that attaches Bearer auth when a token is configured and maps
-//! non-success responses (and transport failures) into a uniform `ApiError`.
+//! `reqwest` that attaches Bearer auth when a token is configured, names the
+//! workspace when a cloud context selected one, and maps non-success
+//! responses (and transport failures) into a uniform `ApiError`.
 
 use crate::config::ClientConfig;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
 use std::error::Error as StdError;
@@ -21,11 +23,40 @@ const URL_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
+/// [`WORKSPACE_HEADER`] lowercased, for `HeaderName::from_static` — which
+/// panics on any uppercase byte, and is the only constructor that cannot fail
+/// at runtime.
+const WORKSPACE_HEADER_LOWER: &str = "skardi-workspace";
+
+/// The workspace selector a `mode: cloud` context sends on every request
+/// (§7.3). Deliberately outside the reserved `x-skardi-*` prefix, which the
+/// gateway strips from client-supplied headers before forwarding upstream.
+pub const WORKSPACE_HEADER: &str = "Skardi-Workspace";
+
 /// Ceiling on buffered response-body size. The server's `max_rows` cap
 /// bounds honest responses far below this; the client-side cap is
 /// defense-in-depth so a runaway or misconfigured endpoint fails cleanly
 /// instead of exhausting memory.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Parse `Retry-After` in its delta-seconds form.
+///
+/// The header's other legal form is an HTTP-date, which is deliberately NOT
+/// parsed: rendering it as "retry in Ns" needs a clock and a date parser to
+/// produce a number the caller could read off the header themselves, and the
+/// route that emits it (§7.4.2's schema-read limiter) sends delta-seconds.
+/// An unparsable value reads as absent, so the caller falls back to the plain
+/// error rather than printing a guess.
+fn retry_after_seconds(response: &Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
 
 /// Percent-encode one URL path segment or query value (user-supplied
 /// pipeline/job names, run ids) so characters like `/`, `?`, `#`, `%`, and
@@ -42,7 +73,14 @@ pub fn encode_component(raw: &str) -> String {
 pub struct ApiClient {
     http: Client,
     base_url: String,
-    token: Option<String>,
+    /// `Authorization: Bearer <token>`, pre-built so an unsendable token fails
+    /// at construction with one clear message instead of at every request.
+    /// Marked sensitive, as `RequestBuilder::bearer_auth` does, so it stays
+    /// out of reqwest's own debug output.
+    auth: Option<HeaderValue>,
+    /// The `Skardi-Workspace` value, set only for a cloud context. See
+    /// [`ClientConfig::workspace`] for why it is not an `x-skardi-*` header.
+    workspace: Option<HeaderValue>,
     max_response_bytes: usize,
 }
 
@@ -62,6 +100,11 @@ pub enum ApiError {
         status: u16,
         error_type: Option<String>,
         message: String,
+        /// `Retry-After` in whole seconds, when the response carried one in
+        /// delta-seconds form. Kept because §8 turns a `503` WITH this value
+        /// into a load message and one without it into a plain failure — the
+        /// distinction is the header, so it has to survive this far.
+        retry_after: Option<u64>,
     },
 }
 
@@ -82,11 +125,13 @@ impl fmt::Display for ApiError {
                 status,
                 error_type: Some(error_type),
                 message,
+                ..
             } => write!(f, "[{error_type}] {message} (HTTP {status})"),
             ApiError::Http {
                 status,
                 error_type: None,
                 message,
+                ..
             } => write!(f, "server returned HTTP {status}: {message}"),
         }
     }
@@ -117,6 +162,31 @@ impl ApiClient {
         let http = Client::builder().no_proxy().build()?;
         let base_url = cfg.server.trim_end_matches('/').to_string();
 
+        // Built here, not per request: `HeaderValue` conversion is the only
+        // way a config value can be unsendable, and the caller deserves that
+        // as a config error rather than as a request failure. Neither message
+        // includes the value — `InvalidHeaderValue` does not carry it.
+        let auth = match &cfg.token {
+            Some(token) => {
+                let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                    anyhow::anyhow!(
+                        "the configured token cannot be sent in an HTTP header (it contains a control character or a non-ASCII byte)"
+                    )
+                })?;
+                value.set_sensitive(true);
+                Some(value)
+            }
+            None => None,
+        };
+        let workspace = match cfg.workspace() {
+            Some(workspace) => Some(HeaderValue::from_str(workspace).map_err(|_| {
+                anyhow::anyhow!(
+                    "context workspace '{workspace}' cannot be sent in the {WORKSPACE_HEADER} header"
+                )
+            })?),
+            None => None,
+        };
+
         if cfg.token.is_some() && is_cleartext_remote(&base_url) {
             eprintln!(
                 "warning: bearer token will be sent over cleartext http to a non-loopback host — prefer an https:// server URL"
@@ -126,7 +196,8 @@ impl ApiClient {
         Ok(ApiClient {
             http,
             base_url,
-            token: cfg.token.clone(),
+            auth,
+            workspace,
             max_response_bytes: MAX_RESPONSE_BYTES,
         })
     }
@@ -135,9 +206,7 @@ impl ApiClient {
     /// return the parsed JSON body, or an `ApiError` on failure.
     pub async fn get(&self, path: &str) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.http.get(&url);
-        request = self.with_auth(request);
-
+        let request = self.http.get(&url);
         self.send(request, url).await
     }
 
@@ -162,8 +231,6 @@ impl ApiClient {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        request = self.with_auth(request);
-
         self.send(request, url).await
     }
 
@@ -175,12 +242,25 @@ impl ApiClient {
         self
     }
 
-    /// Attach `Authorization: Bearer <token>` when a token is configured;
-    /// otherwise leave the request untouched (no auth header at all).
-    fn with_auth(&self, request: RequestBuilder) -> RequestBuilder {
-        match &self.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
+    /// Set the headers every request carries: `Authorization: Bearer <token>`
+    /// when a token is configured, and `Skardi-Workspace` when a cloud context
+    /// named one (§7.3).
+    ///
+    /// `insert`, on a built `Request`, rather than `RequestBuilder::header`:
+    /// the builder APPENDS, so a per-call header of the same name would
+    /// produce two values and leave which one the peer honours up to its
+    /// parser. For the workspace selector that is an authorization-relevant
+    /// difference, so these two names are set here and cannot be displaced.
+    fn set_reserved_headers(&self, request: &mut reqwest::Request) {
+        let headers = request.headers_mut();
+        if let Some(auth) = &self.auth {
+            headers.insert(AUTHORIZATION, auth.clone());
+        }
+        if let Some(workspace) = &self.workspace {
+            headers.insert(
+                HeaderName::from_static(WORKSPACE_HEADER_LOWER),
+                workspace.clone(),
+            );
         }
     }
 
@@ -188,23 +268,35 @@ impl ApiClient {
     /// responses to `ApiError`. `url` is the request URL, kept for
     /// `ApiError::Connect` messages.
     async fn send(&self, request: RequestBuilder, url: String) -> Result<Value, ApiError> {
-        let response = request.send().await.map_err(|err| ApiError::Connect {
+        let mut request = request.build().map_err(|err| ApiError::Connect {
             url: url.clone(),
             message: err.to_string(),
         })?;
+        self.set_reserved_headers(&mut request);
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|err| ApiError::Connect {
+                url: url.clone(),
+                message: err.to_string(),
+            })?;
 
         let status = response.status();
+        // Read before the body: `read_body_capped` consumes the response.
+        let retry_after = retry_after_seconds(&response);
         let body_bytes = Self::read_body_capped(response, self.max_response_bytes, &url).await?;
         let body_text = String::from_utf8_lossy(&body_bytes);
 
         if !status.is_success() {
-            return Err(Self::map_error_body(status, &body_text));
+            return Err(Self::map_error_body(status, &body_text, retry_after));
         }
 
         serde_json::from_str(&body_text).map_err(|err| ApiError::Http {
             status: status.as_u16(),
             error_type: None,
             message: format!("failed to parse response body as JSON: {err}"),
+            retry_after: None,
         })
     }
 
@@ -233,6 +325,7 @@ impl ApiClient {
                     message: format!(
                         "response body exceeded the client cap of {cap} bytes — refusing to buffer it"
                     ),
+                    retry_after: None,
                 });
             }
             buf.extend_from_slice(&chunk);
@@ -243,17 +336,19 @@ impl ApiClient {
     /// server's JSON error envelope first (a string `error` field, with an
     /// optional `error_type`); fall back to the first line of the raw body
     /// with no `error_type` when the body isn't that envelope.
-    fn map_error_body(status: StatusCode, body_text: &str) -> ApiError {
+    fn map_error_body(status: StatusCode, body_text: &str, retry_after: Option<u64>) -> ApiError {
         match serde_json::from_str::<ErrorEnvelope>(body_text) {
             Ok(envelope) => ApiError::Http {
                 status: status.as_u16(),
                 error_type: envelope.error_type,
                 message: envelope.error,
+                retry_after,
             },
             Err(_) => ApiError::Http {
                 status: status.as_u16(),
                 error_type: None,
                 message: body_text.lines().next().unwrap_or("").to_string(),
+                retry_after,
             },
         }
     }
@@ -262,7 +357,7 @@ impl ApiClient {
 /// True when `base_url` is plain `http://` to a host other than loopback
 /// (`localhost`, `127.0.0.0/8`, or `::1`) — the case where a configured
 /// bearer token would travel in cleartext across a real network.
-fn is_cleartext_remote(base_url: &str) -> bool {
+pub(crate) fn is_cleartext_remote(base_url: &str) -> bool {
     let Some(rest) = base_url.strip_prefix("http://") else {
         return false;
     };
@@ -393,10 +488,12 @@ mod tests {
                 status,
                 error_type,
                 message,
+                retry_after,
             } => {
                 assert_eq!(*status, 400);
                 assert_eq!(error_type.as_deref(), Some("sql_validation_error"));
                 assert_eq!(message, "column foo does not exist");
+                assert_eq!(*retry_after, None);
             }
             other => panic!("expected Http, got {other:?}"),
         }
@@ -428,10 +525,14 @@ mod tests {
                 status,
                 error_type,
                 message,
+                retry_after,
             } => {
                 assert_eq!(*status, 503);
                 assert_eq!(*error_type, None);
                 assert_eq!(message, "service unavailable");
+                // No `Retry-After` on the wire reads as absent, which is what
+                // keeps §8's schema-limit message off a plain outage.
+                assert_eq!(*retry_after, None);
             }
             other => panic!("expected Http, got {other:?}"),
         }
@@ -560,5 +661,253 @@ mod tests {
             .with_max_response_bytes(1024);
         let body = client.get("/status").await.unwrap();
         assert_eq!(body["ok"], true);
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::{ApiClient, ApiError};
+    use crate::config::ClientConfig;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Delta-seconds is parsed; an HTTP-date and any other unparsable value
+    /// read as ABSENT, so §8 falls back to the plain error instead of printing
+    /// a guessed retry interval.
+    #[tokio::test]
+    async fn only_delta_seconds_are_read_as_a_retry_interval() {
+        for (header, expected) in [
+            ("7", Some(7)),
+            (" 7 ", Some(7)),
+            ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+            ("soon", None),
+            ("-1", None),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .insert_header("Retry-After", header)
+                        .set_body_string("unavailable"),
+                )
+                .mount(&server)
+                .await;
+
+            let config = ClientConfig {
+                server: server.uri(),
+                token: None,
+                context: None,
+            };
+            let err = ApiClient::new(&config)
+                .unwrap()
+                .get("/x")
+                .await
+                .unwrap_err();
+            match err {
+                ApiError::Http { retry_after, .. } => {
+                    assert_eq!(retry_after, expected, "Retry-After: {header:?}")
+                }
+                other => panic!("expected Http, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_selector_tests {
+    use super::{ApiClient, ApiError, WORKSPACE_HEADER};
+    use crate::config::{ClientConfig, ContextMode, SelectedContext};
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn cloud_config(server: &str, workspace: Option<&str>, mode: ContextMode) -> ClientConfig {
+        ClientConfig {
+            server: server.to_string(),
+            token: Some("pat-value".to_string()),
+            context: Some(SelectedContext {
+                name: "acme/prod".to_string(),
+                mode,
+                workspace: workspace.map(str::to_string),
+                token_expires_at: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_context_names_its_workspace_on_every_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data_source"))
+            .and(header(WORKSPACE_HEADER, "acme-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = cloud_config(&server.uri(), Some("acme-prod"), ContextMode::Cloud);
+        let client = ApiClient::new(&config).unwrap();
+        client.get("/data_source").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_context_sends_no_workspace_selector() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        // A server-mode context with a workspace set anyway: the header is
+        // keyed off `mode`, not off the field being populated.
+        let config = cloud_config(&server.uri(), Some("acme-prod"), ContextMode::Server);
+        ApiClient::new(&config)
+            .unwrap()
+            .get("/status")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get(WORKSPACE_HEADER).is_none(),
+            "a server-mode context must not send the gateway's workspace selector"
+        );
+    }
+
+    /// Both header values are built at construction, so a value that cannot
+    /// be sent is one clear config error instead of a failure at every
+    /// request — and neither message may echo the value.
+    #[test]
+    fn a_credential_that_cannot_be_sent_as_a_header_fails_at_construction() {
+        let mut config = cloud_config("https://gw.example", Some("acme-prod"), ContextMode::Cloud);
+        config.token = Some("secret-with-a\nnewline".to_string());
+        let err = construction_error(&config);
+        assert!(err.contains("cannot be sent in an HTTP header"), "{err}");
+        assert!(
+            !err.contains("secret-with-a"),
+            "the token must not be echoed: {err}"
+        );
+
+        let config = cloud_config(
+            "https://gw.example",
+            Some("bad\nworkspace"),
+            ContextMode::Cloud,
+        );
+        assert!(construction_error(&config).contains(WORKSPACE_HEADER));
+    }
+
+    /// Sending a bearer over cleartext to a non-loopback host is warned about
+    /// once, at construction — the token still goes, because refusing would
+    /// break a deployment behind a TLS-terminating proxy, but silence would
+    /// hide it.
+    #[test]
+    fn a_cleartext_remote_server_warns_when_a_token_is_configured() {
+        let mut config = cloud_config("http://gateway.example", None, ContextMode::Server);
+        config.token = Some("a-token".to_string());
+        assert!(ApiClient::new(&config).is_ok());
+    }
+
+    /// A server URL that is not a URL surfaces as `Connect` — so `main` exits
+    /// 2 and the message names the flags, rather than panicking somewhere
+    /// inside reqwest.
+    #[tokio::test]
+    async fn an_unusable_server_url_is_a_connect_failure() {
+        let config = ClientConfig {
+            server: "not even a url".to_string(),
+            token: None,
+            context: None,
+        };
+        let err = ApiClient::new(&config)
+            .unwrap()
+            .get("/status")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Connect { .. }),
+            "expected Connect, got {err:?}"
+        );
+        assert!(err.to_string().contains("--server"), "{err}");
+    }
+
+    /// A 200 whose body is not JSON is an `Http` error naming the parse
+    /// failure, not a panic and not a silent empty result.
+    #[tokio::test]
+    async fn a_success_status_with_an_unparsable_body_is_reported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+            .mount(&server)
+            .await;
+
+        let config = ClientConfig {
+            server: server.uri(),
+            token: None,
+            context: None,
+        };
+        let err = ApiClient::new(&config)
+            .unwrap()
+            .get("/status")
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Http {
+                status,
+                message,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 200);
+                assert!(
+                    message.contains("failed to parse response body"),
+                    "{message}"
+                );
+                assert_eq!(retry_after, None);
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    /// `unwrap_err` would require `ApiClient: Debug`, which it deliberately
+    /// does not derive — it holds the bearer header value.
+    fn construction_error(config: &ClientConfig) -> String {
+        match ApiClient::new(config) {
+            Ok(_) => panic!("expected ApiClient::new to refuse this config"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_call_headers_cannot_displace_auth_or_the_selector() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let config = cloud_config(&server.uri(), Some("acme-prod"), ContextMode::Cloud);
+        ApiClient::new(&config)
+            .unwrap()
+            .post_with_headers(
+                "/query",
+                &json!({"sql": "select 1"}),
+                &[
+                    (WORKSPACE_HEADER, "someone-elses-workspace"),
+                    ("Authorization", "Bearer forged"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let headers = &requests[0].headers;
+        assert_eq!(
+            headers.get_all(WORKSPACE_HEADER).iter().count(),
+            1,
+            "selector must appear exactly once: {:?}",
+            headers.get_all(WORKSPACE_HEADER).iter().collect::<Vec<_>>()
+        );
+        assert_eq!(headers.get(WORKSPACE_HEADER).unwrap(), "acme-prod");
+        assert_eq!(headers.get("Authorization").unwrap(), "Bearer pat-value");
     }
 }

@@ -334,6 +334,29 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// The selected context when it is a CLOUD one — the single guard for
+    /// everything §8 changes (capability gating, credential expiry, the
+    /// gateway's typed errors). Server-mode and file-less resolutions answer
+    /// `None`, so those paths cannot accidentally inherit cloud behaviour.
+    pub fn cloud_context(&self) -> Option<&SelectedContext> {
+        self.context
+            .as_ref()
+            .filter(|c| c.mode == ContextMode::Cloud)
+    }
+
+    /// The workspace a cloud context names, sent per request as
+    /// `Skardi-Workspace` (§7.3).
+    ///
+    /// Deliberately OUTSIDE the reserved `x-skardi-*` prefix: the gateway
+    /// strips client-supplied headers in that namespace before forwarding to
+    /// the engine, so a selector wearing it would be silently dropped.
+    ///
+    /// Always `Some` for a cloud context — resolution refuses one without a
+    /// workspace — so this is `Some` exactly when the header applies.
+    pub fn workspace(&self) -> Option<&str> {
+        self.cloud_context()?.workspace.as_deref()
+    }
+
     /// Resolve the effective client config from flags, environment, and the
     /// user's `~/.skardi/config.yaml`.
     ///
