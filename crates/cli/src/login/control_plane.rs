@@ -373,7 +373,7 @@ mod tests {
     /// first `login`.
     #[test]
     fn the_control_planes_membership_projection_deserializes_verbatim() {
-        let body: super::MembershipsBody = serde_json::from_str(
+        let body: MembershipsBody = serde_json::from_str(
             r#"{"workspaces": [
                 {"org_slug": "acme", "tenant_slug": "acme-prod",
                  "display_name": "Prod", "role": "member",

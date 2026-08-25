@@ -292,6 +292,63 @@ async fn each_context_points_at_the_gateway_its_own_membership_names() {
     assert_eq!(second.received_requests().await.unwrap().len(), 1);
 }
 
+/// The shape the first control-plane release actually returns (skardi-cloud
+/// #355): one deployment-global URL copied onto every membership. §10 names it
+/// alongside the per-membership case, because it is the one production hits —
+/// several workspaces, one front door, and every context written pointing at it.
+///
+/// Same org deliberately: a multi-org identity cannot mint at all in v1
+/// (`org_ambiguous`, §6.4), so the realistic shared case is several workspaces
+/// within one org.
+#[tokio::test]
+async fn a_deployment_wide_gateway_url_is_used_by_every_context_it_names() {
+    let shared = gateway(200).await;
+    let cp = control_plane_with(vec![
+        membership("acme", "acme-prod", "active", Some(&shared.uri())),
+        membership("acme", "acme-staging", "active", Some(&shared.uri())),
+    ])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-prod").await;
+    mint_ok(&cp, "acme-staging", "tok-staging").await;
+
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    let mut options = options(&cp.uri(), None);
+    options.selection = Selection::All;
+    let report = login(options, &path).await.unwrap();
+
+    assert_eq!(report.written.len(), 2);
+    let file = read_yaml(&path);
+    let contexts = file["contexts"].as_sequence().unwrap();
+    assert_eq!(contexts.len(), 2);
+    for context in contexts {
+        assert_eq!(context["server"].as_str().unwrap(), shared.uri());
+        assert_eq!(context["mode"], "cloud");
+    }
+    // Distinct workspaces and distinct credentials on one host — the selector
+    // is what separates them, which is the whole premise of §7.3.
+    assert_eq!(contexts[0]["workspace"], "acme-prod");
+    assert_eq!(contexts[1]["workspace"], "acme-staging");
+    assert_eq!(contexts[0]["token-id"], "tok-prod");
+    assert_eq!(contexts[1]["token-id"], "tok-staging");
+    // Both probes went to the shared host, each naming its own workspace.
+    let probed: Vec<String> = shared
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.headers
+                .get("Skardi-Workspace")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(probed, ["acme-prod", "acme-staging"]);
+}
+
 /// §6.2's precedence, including the step that must NOT exist: no source at all
 /// is a typed error, never a fall-through to a local port.
 #[tokio::test]
