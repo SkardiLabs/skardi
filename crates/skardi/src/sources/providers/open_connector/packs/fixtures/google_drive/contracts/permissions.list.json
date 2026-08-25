@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The unique identifier of the permission."
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of the resource."
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The role granted by this permission (e.g. owner, writer, reader)."
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of grantee (user, group, domain, or anyone)."
+          },
+          "domain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The domain to which this permission refers."
+          },
+          "deleted": {
+            "type": "boolean",
+            "description": "Whether the account associated with this permission has been deleted."
+          },
+          "photoLink": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A link to the user's profile photo."
+          },
+          "displayName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The display name of the user or group granted this permission."
+          },
+          "emailAddress": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The email address of the user or group granted this permission."
+          },
+          "pendingOwner": {
+            "type": "boolean",
+            "description": "Whether the account associated with this permission is a pending owner."
+          },
+          "expirationTime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The time at which this permission will expire (RFC 3339 date-time)."
+          },
+          "allowFileDiscovery": {
+            "type": "boolean",
+            "description": "Whether the permission allows the file to be discovered through search."
+          },
+          "permissionDetails": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "role": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The primary role for this user."
+                },
+                "inherited": {
+                  "type": "boolean",
+                  "description": "Whether this permission is inherited from a parent folder."
+                },
+                "inheritedFrom": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The ID of the item from which this permission is inherited."
+                },
+                "permissionType": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The permission type for this user."
+                }
+              },
+              "required": [
+                "role",
+                "inheritedFrom",
+                "permissionType"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Details of whether the permission on the shared drive item is inherited or directly set."
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "role",
+          "type",
+          "domain",
+          "photoLink",
+          "displayName",
+          "emailAddress",
+          "expirationTime"
+        ],
+        "additionalProperties": false
+      },
+      "description": "The list of permissions for the file or shared drive."
+    },
+    "nextPageToken": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The page token for the next page of results, if any."
+    }
+  },
+  "required": [
+    "permissions",
+    "nextPageToken"
+  ],
+  "additionalProperties": false
+}

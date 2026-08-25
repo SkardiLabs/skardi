@@ -1,0 +1,72 @@
+{
+  "permissions": [
+    {
+      "id": "anyoneWithLink",
+      "kind": "drive#permission",
+      "role": "reader",
+      "type": "anyone",
+      "domain": null,
+      "photoLink": null,
+      "displayName": null,
+      "emailAddress": null,
+      "expirationTime": null,
+      "allowFileDiscovery": false,
+      "permissionDetails": [
+        {
+          "role": "reader",
+          "inherited": false,
+          "inheritedFrom": null,
+          "permissionType": "file"
+        }
+      ]
+    },
+    {
+      "id": "00000000000000000002",
+      "kind": "drive#permission",
+      "role": "reader",
+      "type": "domain",
+      "domain": "example.com",
+      "photoLink": null,
+      "displayName": "Example Org",
+      "emailAddress": null,
+      "expirationTime": null,
+      "allowFileDiscovery": true,
+      "permissionDetails": [
+        {
+          "role": "reader",
+          "inherited": false,
+          "inheritedFrom": null,
+          "permissionType": "file"
+        }
+      ]
+    },
+    {
+      "id": "00000000000000000001",
+      "kind": "drive#permission",
+      "role": "owner",
+      "type": "user",
+      "domain": null,
+      "deleted": false,
+      "photoLink": "https://lh3.googleusercontent.com/a/SYNTHETIC=s64",
+      "displayName": "Example User",
+      "emailAddress": "user@example.com",
+      "pendingOwner": false,
+      "expirationTime": null,
+      "permissionDetails": [
+        {
+          "role": "writer",
+          "inherited": true,
+          "inheritedFrom": null,
+          "permissionType": "file"
+        },
+        {
+          "role": "owner",
+          "inherited": false,
+          "inheritedFrom": null,
+          "permissionType": "file"
+        }
+      ]
+    }
+  ],
+  "nextPageToken": null
+}

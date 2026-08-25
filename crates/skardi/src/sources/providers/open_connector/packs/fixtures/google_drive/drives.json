@@ -1,0 +1,50 @@
+{
+  "drives": [
+    {
+      "id": "0ASyntheticDrivePVA",
+      "kind": "drive#drive",
+      "name": "example-shared-drive",
+      "hidden": false,
+      "colorRgb": "#e91e63",
+      "createdTime": "2026-08-25T12:37:02.745Z",
+      "orgUnitId": null,
+      "themeId": null,
+      "backgroundImageLink": "https://ssl.gstatic.com/team_drive_themes/clams_background.jpg",
+      "capabilities": {
+        "canAddChildren": true,
+        "canChangeCopyRequiresWriterPermissionRestriction": false,
+        "canChangeDomainUsersOnlyRestriction": false,
+        "canChangeDownloadRestriction": false,
+        "canChangeDriveBackground": true,
+        "canChangeDriveMembersOnlyRestriction": false,
+        "canChangeSharingFoldersRequiresOrganizerPermissionRestriction": false,
+        "canComment": true,
+        "canCopy": true,
+        "canDeleteChildren": true,
+        "canDeleteDrive": true,
+        "canDownload": true,
+        "canEdit": true,
+        "canListChildren": true,
+        "canManageMembers": true,
+        "canReadRevisions": true,
+        "canRename": true,
+        "canRenameDrive": true,
+        "canResetDriveRestrictions": true,
+        "canShare": true,
+        "canTrashChildren": true
+      },
+      "restrictions": {
+        "downloadRestriction": {
+          "restrictedForReaders": false,
+          "restrictedForWriters": false
+        },
+        "adminManagedRestrictions": false,
+        "copyRequiresWriterPermission": false,
+        "domainUsersOnly": false,
+        "driveMembersOnly": false,
+        "sharingFoldersRequiresOrganizerPermission": false
+      }
+    }
+  ],
+  "nextPageToken": null
+}

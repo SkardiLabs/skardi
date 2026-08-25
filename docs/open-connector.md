@@ -33,12 +33,16 @@ gateway **runtime token**.
 > folders — live-verified against a real MSA mailbox; message bodies
 > deferred as on Gmail; the whole `excel` service is deferred at the
 > admission gate over incomplete pagination per the pack doc),
-> and [OneDrive](open-connector-one-drive.md) (drive items, drive item
+> [OneDrive](open-connector-one-drive.md) (drive items, drive item
 > search — live-verified against a real MSA drive; search rows are a
 > reduced projection and search continuations currently fail upstream
-> on personal drives, loudly, per the pack doc).
-> Further provider packs (Google Calendar,
-> Google Drive, Jira, …) ship one pack per release per the
+> on personal drives, loudly, per the pack doc),
+> and [Google Drive](open-connector-google-drive.md) (files, drives,
+> file permissions — live-verified against a real Workspace account,
+> shared-drive rows included; three structurally unreachable columns
+> stay documented as residuals per the pack doc).
+> Further provider packs (Google Calendar, Jira, …) ship one pack per
+> release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
 > a source is advertised as supported only once its pack passes the
 > admission gate there.
