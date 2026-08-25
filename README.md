@@ -101,11 +101,11 @@ file indexed on `(session_id, created_at)`.
 #   → 4 sessions asked the same churn question with different windows
 #   → wrote pipelines/weekly-churn.yaml, reloaded, /health/weekly-churn ok
 kind: pipeline
-metadata: { name: weekly-churn }
+metadata: { name: weekly-churn, version: "1.0.0" }
 spec:
   query: |                                   # the varying window, parameterized
     SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs
-    WHERE cancelled_at > now() - CAST(concat({days}, ' days') AS INTERVAL)
+    WHERE cancelled_at > now() - CAST({window} AS INTERVAL)
     GROUP BY plan ORDER BY cancels DESC
 ```
 
@@ -115,10 +115,10 @@ with no wrapper code to maintain.
 
 ```bash
 # shell verb — any agent with a Bash tool, no MCP config
-skardi run weekly-churn -p days=7
+skardi run weekly-churn -p window='7 days'
 # same pipeline, served as REST
 curl -X POST localhost:8080/weekly-churn/execute \
-  -H 'Content-Type: application/json' -d '{"days": 7}'
+  -H 'Content-Type: application/json' -d '{"window": "7 days"}'
 ```
 
 Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
