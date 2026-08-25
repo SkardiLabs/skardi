@@ -27,6 +27,9 @@
 <path d="M 846 150 Q 1078 208 1058 420" fill="none" stroke="#9198a1" stroke-width="2.5" marker-end="url(#arr)"/>
 <path d="M 848 514 Q 640 562 436 514" fill="none" stroke="#9198a1" stroke-width="2.5" marker-end="url(#arr)"/>
 <path d="M 222 420 Q 202 208 432 152" fill="none" stroke="#9198a1" stroke-width="2.5" marker-end="url(#arr)"/>
-<g stroke="#e8a300" stroke-width="2.5" fill="none"><path d="M 621 316 A 22 22 0 1 1 640 349" marker-end="url(#arr2)"/></g>
+<text x="1105" y="296" text-anchor="middle" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="17" font-style="italic" fill="#9198a1">mine</text>
+<text x="640" y="590" text-anchor="middle" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="17" font-style="italic" fill="#9198a1">promote</text>
+<text x="168" y="296" text-anchor="middle" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="17" font-style="italic" fill="#9198a1">serve</text>
+<g stroke="#e8a300" stroke-width="2.5" fill="none"><path d="M 640 306 A 22 22 0 1 1 625.9 311.1" marker-end="url(#arr2)"/></g>
 <text x="640" y="396" text-anchor="middle" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="19" font-style="italic" fill="#e8a300">the toolset grew itself</text>
 </svg>

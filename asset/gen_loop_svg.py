@@ -135,10 +135,22 @@ def render(theme):
     # ACT (top edge) -> OBSERVE (left edge), closing the cycle
     parts.append(f'<path d="M 222 420 Q 202 208 432 152" {arrow_style}/>')
 
-    # centre: the payoff line, with a cycle glyph
+    # one verb per edge, set just outside its arc's midpoint
+    for vx, vy, verb in (
+        (1105, 296, "mine"),
+        (640, 590, "promote"),
+        (168, 296, "serve"),
+    ):
+        parts.append(
+            f'<text x="{vx}" y="{vy}" text-anchor="middle" font-family="{FONT}" '
+            f'font-size="17" font-style="italic" fill="{p["arrow"]}">{verb}</text>'
+        )
+
+    # centre: the payoff line, with a full-cycle glyph — a 320° arc whose
+    # only gap is capped by the arrowhead, so it reads as a closed loop
     parts.append(
         f'<g stroke="{p["center"]}" stroke-width="2.5" fill="none">'
-        f'<path d="M 621 316 A 22 22 0 1 1 640 349" marker-end="url(#arr2)"/></g>'
+        f'<path d="M 640 306 A 22 22 0 1 1 625.9 311.1" marker-end="url(#arr2)"/></g>'
     )
     parts.append(
         f'<text x="640" y="396" text-anchor="middle" font-family="{FONT}" '
