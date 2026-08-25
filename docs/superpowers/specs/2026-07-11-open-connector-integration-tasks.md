@@ -599,7 +599,10 @@ event carrying the scan identity and error.
       self-trip probes are the leak classes the real captures actually
       contained); conversion tests run against the redacted live captures
       (5 children rows, 3 search rows, both real-page composites);
-      full-suite counts pending CI.
+      CI green on that PR's head `e12ec9c` (run 32729437184): 1981
+      workspace tests passed (`cargo llvm-cov --no-report nextest
+      --all-features`), plus 237 `--ignored` integration tests and 37
+      doc tests.
 
 - [x] 5.9 Google Drive pack (OAuth user token, cursor pagination over
       `pageToken`/`nextPageToken`, NORMALIZED rows — the opposite of 5.8):
@@ -656,8 +659,15 @@ event carrying the scan identity and error.
       engine has no spelling for), comments/replies/revisions/labels/
       accessproposals (second wave; accessproposals also
       Workspace-approval-gated). Docs: `docs/open-connector-google-drive.md`
-      + the status note in `docs/open-connector.md`. Verification
-      (static counts; CI is the arbiter): 25 pack-module tests
+      + the status note in `docs/open-connector.md`. Verification — CI
+      green on `f763ce8` (run 32854955874): 2125 workspace tests passed
+      (`cargo llvm-cov --no-report nextest --all-features`), plus 237
+      `--ignored` integration tests and 37 doc tests. CI runs the whole
+      workspace through nextest, not the per-module filters, so the two
+      filtered figures are static counts of test functions in the tree
+      (none `#[ignore]`d): 428 under
+      `sources::providers::open_connector`, 402 of them before this pack
+      — the 26 new ones being 25 pack-module tests
       (`cargo test -p skardi --lib sources::providers::open_connector::packs::google_drive`
       — 13 contract/conversion: per-table fixture conversions across all
       six admission-gate shapes (explicit null vs absent key vs empty
