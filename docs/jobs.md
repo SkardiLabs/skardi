@@ -219,7 +219,10 @@ job **was not submitted** and the call is safe to retry.
 
 The CLI ships a matching `skardi job` subcommand that POSTs to the
 server. The server URL defaults to `http://127.0.0.1:8080`; override with
-`$SKARDI_SERVER_URL` or the `--server` flag.
+`$SKARDI_SERVER_URL` or the `--server` flag. Those are the `mode: server`
+rules — a context can also supply the URL, and a `mode: cloud` context is
+authoritative over the environment. See
+[cli.md — Connecting](cli.md#connecting) for the full precedence.
 
 ```bash
 # Submit — returns the run_id
@@ -262,7 +265,8 @@ running you'll get a connection-refused error.
 Against an auth-enabled server every `skardi job` subcommand needs a token,
 since all five endpoints are gated (see
 [Authentication](#authentication)). Supply it with `--token`,
-`$SKARDI_API_TOKEN`, or `~/.skardi/config.yaml`; the CLI attaches it as
+`$SKARDI_API_TOKEN`, or a context in `~/.skardi/config.yaml` (see
+[cli.md — Connecting](cli.md#connecting)); the CLI attaches it as
 `Authorization: Bearer <token>` on every request. Without one the symptom is
 a `401 unauthorized` from a command that needed no token before the gate
 existed.

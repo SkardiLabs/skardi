@@ -401,6 +401,17 @@ both packs — it ships covering `outlook` alone and gains the `one_drive`
 tables with that milestone — so the product-level story survives the
 split.
 
+**AMENDED at milestone 5.8:** `one_drive` shipped its own
+`docs/open-connector-one-drive.md` instead of joining this page. Each
+pack needs its own OAuth connection, and each guide grew long enough
+(the OneDrive one carries a full live-verification section) that one
+combined page would bury both. What the original decision was protecting
+— the product-level story surviving the split — is instead held by
+CROSS-LINKS: each guide points at the other in its opening, and the
+README lists both. If a third M365 pack lands (`excel`, once its
+pagination can be completed), it follows the same shape: its own guide,
+linked from the M365 page.
+
 **Recipients as `json` rather than extending
 `utf8_list_from_object_key` to nested key paths.** The extension is
 small and backward-compatible, but it is an engine surface added for one

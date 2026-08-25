@@ -1,0 +1,21 @@
+{
+  "items": [
+    {
+      "id": "01SYNTHETICMISMATCHAAAAAAAAAAAAAAA",
+      "name": "wrong-types.bin",
+      "webUrl": "https://example-my.sharepoint.com/personal/user/Documents/wrong-types.bin",
+      "size": "48213",
+      "createdDateTime": "2026-07-01T09:15:00Z",
+      "lastModifiedDateTime": "2026-08-14T16:42:00Z",
+      "parentReference": {
+        "driveId": "b!SyntheticDriveIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "id": "01SYNTHETICROOTAAAAAAAAAAAAAAAAAAAA",
+        "path": "/drive/root:/Documents"
+      },
+      "file": {
+        "mimeType": "application/octet-stream"
+      }
+    }
+  ],
+  "nextLink": null
+}
