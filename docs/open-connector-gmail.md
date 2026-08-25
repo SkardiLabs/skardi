@@ -5,6 +5,13 @@ messages, drafts, labels, and filters — as stable SQL tables through an
 [Open Connector gateway](open-connector.md). The Google OAuth credential
 lives in Open Connector; Skardi holds only the gateway runtime token.
 
+Google reaches Skardi as **one source pack per Open Connector service**:
+upstream splits Google into `gmail`, `googledrive` and others, each with
+its **own OAuth connection**, so authorizing Gmail does not authorize
+Drive. The Drive pack has its own guide: **[Google Drive source
+pack](open-connector-google-drive.md)** (`files`, `drives`,
+`file_permissions`).
+
 **The wire contract is Open Connector's, not the Gmail API's**: the
 gateway's gmail executors rebuild list rows the way the Slack ones do —
 camelCase identity (`threadId`/`messageId`), the `From`/`To`/`Subject`

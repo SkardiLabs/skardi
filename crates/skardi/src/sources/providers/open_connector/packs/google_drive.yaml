@@ -102,9 +102,11 @@ tables:
     # excludes a whole class of the account's files is the
     # confidently-wrong-rows failure mode; Google requires the pair
     # together for shared-drive items to appear, so both are pinned.
-    # Phase 4 must verify the pin directly: accepted on the wire,
-    # shared-drive rows actually present, no bad interaction with a
-    # bound `driveId` (Google's `corpora` inference).
+    # Phase 4 verified the pin directly: accepted on the wire, a
+    # seeded shared-drive file really present in a live scan (its
+    # `drive_id` carrying the real drive id), and no bad interaction
+    # with a bound `driveId` (Google's `corpora` inference) — the two
+    # compose live.
     fixed_inputs:
       supportsAllDrives: true
       includeItemsFromAllDrives: true
@@ -155,16 +157,20 @@ tables:
       # A normalization win worth naming: Google's REST API returns
       # `size` as a decimal STRING; the executor's `parseSizeBytes`
       # emits a real number (or null for anything without a byte size of
-      # its own — folders and every native Docs/Sheets/Slides file), so
-      # this column is a true int64. An all-NULL `size_bytes` on a
-      # Docs-only corpus is expected, not the always-NULL defect.
+      # its own), so this column is a true int64. Which files have none
+      # is a live finding, not a guess: FOLDERS came back null, while
+      # native Docs/Sheets/Slides reported real sizes (Workspace files
+      # count against storage quota since 2021). So an all-NULL
+      # `size_bytes` over real files is the always-NULL defect, not an
+      # expected shape.
       - { name: size_bytes, path: sizeBytes, type: int64, nullable: true }
       # Null on My Drive items; the join key to `drives.id` for
       # shared-drive items.
       - { name: drive_id, path: driveId, type: utf8, nullable: true }
-      # Conditionally spread upstream (absent when Google omits it, e.g.
-      # some shared-drive rows), else an array of parent folder IDs —
-      # in practice at most one since Drive dropped multi-parenting.
+      # Conditionally spread upstream, so NULL where Google omits it
+      # — though live it was present on every row, shared-drive ones
+      # included; otherwise an array of parent folder IDs, in practice
+      # at most one since Drive dropped multi-parenting.
       - { name: parents, path: parents, type: utf8_list, nullable: true }
       # Two columns from ONE `owners` array under different pluck keys:
       # the engine deliberately has no scalar array indexing, so these

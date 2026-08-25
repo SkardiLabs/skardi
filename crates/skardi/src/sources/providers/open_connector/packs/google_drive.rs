@@ -209,13 +209,15 @@ mod tests {
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
     }
 
-    // ── Contract tests. The row fixtures are SYNTHETIC (phase 3),
-    // provider-shaped key-for-key from the executors' normalizers: the
-    // always-present `?? null` keys appear in every row (null where no
-    // value), the conditionally-spread keys are genuinely absent where
-    // upstream would drop them, and identities/names are obviously
-    // synthetic. Phase 4 replaces them with redacted live captures and
-    // adds the default-deny redaction audit the one_drive pack carries. ──
+    // ── Contract tests. The row fixtures are REDACTED LIVE CAPTURES
+    // (phase 4, 2026-08-25), provider-shaped key-for-key: the
+    // always-present `?? null` keys carry explicit nulls, the
+    // conditionally-spread keys are absent exactly where upstream
+    // dropped them on the wire, and every identity, name and URL is
+    // synthetic — a property enforced by
+    // `fixtures_are_redacted_captures_under_a_default_deny_audit`
+    // rather than asserted by hand. The deliberately-broken
+    // mismatch fixture stays synthetic by design, and says so. ──
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -1766,7 +1768,8 @@ bindings:
         // an error. This is also the shape design record R1 warns about:
         // "empty and correct" and "empty because the account cannot see
         // shared drives at all" are indistinguishable from here, which
-        // is exactly why phase 4 needs an account that can see one.
+        // is exactly why phase 4 needed an account that could see one
+        // — R1, resolved: the phase-4 account created its own.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");

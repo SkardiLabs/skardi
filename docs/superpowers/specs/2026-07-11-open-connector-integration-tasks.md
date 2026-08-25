@@ -601,7 +601,7 @@ event carrying the scan identity and error.
       (5 children rows, 3 search rows, both real-page composites);
       full-suite counts pending CI.
 
-- [ ] 5.9 Google Drive pack (OAuth user token, cursor pagination over
+- [x] 5.9 Google Drive pack (OAuth user token, cursor pagination over
       `pageToken`/`nextPageToken`, NORMALIZED rows — the opposite of 5.8):
       `files`, `drives`, `file_permissions`. **Phases 1–4 done 2026-08-25.**
       Design record risk R1 (whether the test account can see a shared
@@ -706,9 +706,18 @@ bounded safety defaults, null/empty/nested fixtures, docs.
   (`googledrive.files.list`, verified engine-safe), the load-bearing
   all-drives fixed-input pair on `files`, and the five knowingly
   outside-the-gate `restrictions.*` columns on `drives`. Live
-  verification (phase 4) is PENDING, gated first on design record R1
-  (an account that can see a shared drive); the five restriction
-  columns are documentation-derived until it runs.
+  verification (phase 4) ran 2026-08-25 against a real Workspace
+  account and closed both load-bearing items: design record R1
+  resolved in its favor (zero shared drives at first, then the account
+  proved able to CREATE one, so `drives` was verified on real rows and
+  all five restriction spellings came back verbatim), and the pinned
+  all-drives pair really surfaced a shared-drive file through a live
+  scan. Its pack-changing findings were all fixture-level corrections
+  (native Docs DO report `sizeBytes`; every grant carries
+  `permissionDetails`; shared-drive rows drop exactly
+  `owners`+`shared`), plus three columns recorded as structural
+  residuals (`drives.org_unit_id`, `drives.theme_id`,
+  `file_permissions.expiration_time`).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

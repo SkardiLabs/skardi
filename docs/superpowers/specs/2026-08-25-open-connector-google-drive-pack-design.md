@@ -310,8 +310,11 @@ follows (rationale recorded in gmail.yaml's messages table).
 it into a number, rejecting anything that is not a safe non-negative
 integer. So the column is a real `int64` rather than a string that
 looks like one — but it is null for every file with no byte size of its
-own, which includes folders and every native Docs/Sheets/Slides file.
-An all-null `size_bytes` on a Docs-only drive is expected, not a bug.
+own. Phase 2 expected that set to include native Docs/Sheets/Slides;
+**phase 4 corrected it** (see the phase-4 notes below): only FOLDERS
+came back null, because Workspace files count against storage quota. So
+an all-null `size_bytes` over real files is a defect to chase, not an
+expected shape.
 
 Two columns come from the same `owners` array under different pluck
 keys. Drive files normally have exactly one owner (shared-drive items

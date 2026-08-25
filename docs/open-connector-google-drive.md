@@ -85,7 +85,7 @@ spec:
 ```
 
 ```sql
--- Largest real files (native Docs/Sheets/Slides have no byte size):
+-- Largest files by stored bytes (folders have no size of their own):
 SELECT name, mime_type, size_bytes, modified_time
 FROM saas.gdrive.files
 WHERE size_bytes IS NOT NULL
@@ -131,8 +131,10 @@ account can reach**. Fourteen columns:
 `application/vnd.google-apps.folder`, native Workspace files are
 `application/vnd.google-apps.*`, everything else is an ordinary MIME
 type. **`size_bytes` is null for anything without a byte size of its
-own** — folders and every native Docs/Sheets/Slides file — so an
-all-NULL `size_bytes` on a Docs-only corpus is expected, not a defect.
+own** — live, that means folders. Native Docs/Sheets/Slides *do* report
+a size (Workspace files count against storage quota), so an all-NULL
+`size_bytes` over real files is a defect to chase, not an expected
+shape.
 
 **Ownership doubles as a second discriminator.** My Drive files carry
 exactly one owner; **shared-drive items carry none** (the drive owns
@@ -274,7 +276,9 @@ connected, a scan fails with the gateway's own
 
 Google throttles per project and per user (403/429 with backoff); the
 gateway surfaces that as a failure envelope rather than silently
-truncating. Observed quota behaviour is a live-pass item.
+truncating. The live pass never approached a throttle — its seeded
+corpus is a handful of files — so behaviour under real quota pressure
+is unobserved rather than characterized here.
 
 ## Fingerprints and drift
 

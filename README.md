@@ -234,7 +234,7 @@ agents; deploy it next to your data, behind your usual auth.
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
 | CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
-| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
+| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive, Google Drive packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
 | Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
 | Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres; YAML views as catalog tables, `cypher_query` UDTF | [docs](docs/graph.md) |
