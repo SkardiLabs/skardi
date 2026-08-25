@@ -86,6 +86,40 @@ async fn a_gated_command_refuses_before_issuing_any_request() {
     );
 }
 
+/// `mcp` straddles gateway-served (`query`) and engine-local (pipeline
+/// execution, `/pipelines`) surfaces, so a cloud context refuses it whole
+/// before the bridge ever starts speaking MCP on stdout.
+#[tokio::test]
+async fn mcp_is_gated_in_a_cloud_context_before_serving() {
+    let gateway = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&gateway)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_cloud_context(home.path(), &gateway.uri(), None);
+
+    let out = skardi(home.path(), &["mcp"]);
+
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "'mcp' is not available in a cloud context (acme/prod). Available: query, schema."
+        ),
+        "stderr was: {}",
+        stderr(&out)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a refused mcp must write nothing to stdout (the would-be protocol channel)"
+    );
+    assert!(
+        gateway.received_requests().await.unwrap().is_empty(),
+        "a gated command must not reach the gateway"
+    );
+}
+
 #[tokio::test]
 async fn an_expired_credential_refuses_before_issuing_any_request() {
     let gateway = MockServer::start().await;
