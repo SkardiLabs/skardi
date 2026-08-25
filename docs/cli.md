@@ -237,7 +237,7 @@ For a loopback control plane (a local or compose stack), `--identity` skips the
 browser entirely — see [Working against a local stack](#working-against-a-local-stack).
 
 The gateway URL comes from `--server` > `$SKARDI_GATEWAY_URL` > the control
-plane's answer for that org. There is deliberately no built-in default and no
+`gateway_url` on that workspace's membership. There is deliberately no built-in default and no
 fall back to `http://127.0.0.1:8080`: a context pointing at a local port
 would fail later and further from the cause.
 

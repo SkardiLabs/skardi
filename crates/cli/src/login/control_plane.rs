@@ -50,9 +50,16 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// One membership as `/v1/me/workspaces` returns it (`MembershipView`).
 ///
-/// `gateway_url` is `Option` because it is M4's addition (§7.1): a control
-/// plane that predates it simply omits the key, and §6.2's precedence then
-/// decides — flag, env, or a typed error naming `--server`.
+/// `gateway_url` is `Option` PERMANENTLY, not just until the control plane
+/// grows it (§7.1): the field is omitted whenever the deployment has no gateway
+/// URL configured, and §6.2's precedence then decides — flag, env, or a typed
+/// error naming `--server`.
+///
+/// It is read per MEMBERSHIP, which is the unit that becomes a context. The
+/// first control-plane release projects one deployment-wide value onto every
+/// membership; a later one supplies each workspace runtime's own endpoint
+/// through the same field. Honouring whatever each membership says is what
+/// makes the CLI work unchanged across both.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Membership {
     pub org_slug: String,
@@ -310,7 +317,7 @@ fn parse_error(status: u16, text: &str) -> CpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Membership, Minted, parse_error};
+    use super::{Membership, MembershipsBody, Minted, parse_error};
 
     /// The raw token must not reach a log line, a panic message, or an
     /// `{err:?}` rendering through this type — so `Debug` is hand-written, and
@@ -354,6 +361,40 @@ mod tests {
         }))
         .unwrap();
         assert!(!provisioning.is_active());
+    }
+
+    /// The literal shape skardi-cloud's `/v1/me/workspaces` emits: five
+    /// `MembershipView` fields flattened alongside an optional `gateway_url`,
+    /// with the key OMITTED (not null, not empty) when the deployment has no
+    /// gateway URL configured.
+    ///
+    /// Pinned against the control plane's own projection rather than against
+    /// prose, so a change to that wire shape fails here instead of at a user's
+    /// first `login`.
+    #[test]
+    fn the_control_planes_membership_projection_deserializes_verbatim() {
+        let body: super::MembershipsBody = serde_json::from_str(
+            r#"{"workspaces": [
+                {"org_slug": "acme", "tenant_slug": "acme-prod",
+                 "display_name": "Prod", "role": "member",
+                 "provisioning_state": "active",
+                 "gateway_url": "https://gateway-test.skardi.ai"},
+                {"org_slug": "acme", "tenant_slug": "acme-staging",
+                 "display_name": "Staging", "role": "member",
+                 "provisioning_state": "active"}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(body.workspaces.len(), 2);
+        assert_eq!(
+            body.workspaces[0].gateway_url.as_deref(),
+            Some("https://gateway-test.skardi.ai")
+        );
+        assert_eq!(body.workspaces[0].display_name.as_deref(), Some("Prod"));
+        assert_eq!(body.workspaces[0].context_name(), "acme/acme-prod");
+        // Omitted, not null: §6.2's precedence takes over from here.
+        assert_eq!(body.workspaces[1].gateway_url, None);
     }
 
     /// The nested envelope, and the fallbacks for a body that is not one — a

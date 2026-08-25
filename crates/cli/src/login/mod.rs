@@ -434,7 +434,7 @@ fn resolve_server(options: &LoginOptions, membership: &Membership) -> Result<Str
     .find(|url| !url.is_empty());
     let Some(server) = candidate else {
         bail!(
-            "the control plane did not say which gateway serves workspace '{}' — pass --server <URL>, set $SKARDI_GATEWAY_URL, or configure gateway_url for the org",
+            "the control plane did not say which gateway serves workspace '{}' — pass --server <URL>, set $SKARDI_GATEWAY_URL, or set SKARDI_GLOBAL_GATEWAY_URL (helm: skardiGlobal.gatewayUrl) on the control plane",
             membership.tenant_slug
         )
     };

@@ -251,9 +251,16 @@ async fn every_membership_only_provisioning_is_a_typed_failure_naming_the_states
     assert!(!config_in(&home).exists(), "nothing may be written");
 }
 
-/// §7.1's per-org `gateway_url`: two orgs, two hosts, one login.
+/// §7.1's `gateway_url` is read per MEMBERSHIP, so two memberships naming
+/// different hosts produce two contexts pointing at them.
+///
+/// The first control-plane release projects ONE deployment-wide URL onto every
+/// membership, so this case does not arise there — which is exactly why it is
+/// pinned: when workspace runtimes start supplying their own endpoints through
+/// the same field, the CLI must already honour them rather than collapse them
+/// to the first one it saw.
 #[tokio::test]
-async fn each_context_points_at_its_own_orgs_gateway() {
+async fn each_context_points_at_the_gateway_its_own_membership_names() {
     let first = gateway(200).await;
     let second = gateway(200).await;
     let cp = control_plane_with(vec![
