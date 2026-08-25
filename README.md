@@ -175,9 +175,10 @@ you:
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
-pointed at Postgres + pgvector, MongoDB, or Lance. For Cursor and other
-[Agent Skills](https://agentskills.io/)-compatible hosts, see the
-[skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+pointed at Postgres + pgvector, MongoDB, or Lance. The same skill runs on Codex,
+Cursor, Pi, dsh, OpenClaw, and Hermes — anything that speaks the
+[Agent Skills](https://agentskills.io/) standard. Per-host install paths are in
+the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
 **CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
 build from source — the one-liner below has no published artifact there):
