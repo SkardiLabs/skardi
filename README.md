@@ -109,9 +109,9 @@ spec:
     GROUP BY plan ORDER BY cancels DESC
 ```
 
-**4 — The agent has a new tool.** One definition, both bindings — so the same
-promoted pipeline works in Claude Code, Cursor, your own loop, or any HTTP host,
-with no wrapper code to maintain.
+**4 — The agent has a new tool.** One definition, every binding — shell, REST,
+and MCP — so the same promoted pipeline works in Claude Code, Cursor, your own
+loop, or any HTTP host, with no wrapper code to maintain.
 
 ```bash
 # shell verb — any agent with a Bash tool, no MCP config
@@ -119,6 +119,8 @@ skardi run weekly-churn -p window='7 days'
 # same pipeline, served as REST
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
+# same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
+skardi mcp
 ```
 
 Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
