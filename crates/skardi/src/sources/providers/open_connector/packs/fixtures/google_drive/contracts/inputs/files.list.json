@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "corpora": {
+      "type": "string",
+      "description": "Bodies of items to which the query applies."
+    },
+    "corpus": {
+      "type": "string",
+      "description": "The source of files to list."
+    },
+    "driveId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "ID of the shared drive to search."
+    },
+    "includeItemsFromAllDrives": {
+      "type": "boolean",
+      "description": "Whether both My Drive and shared drive items should be included in results."
+    },
+    "includeLabels": {
+      "type": "string",
+      "description": "A comma-separated list of label IDs to include in labelInfo."
+    },
+    "includePermissionsForView": {
+      "type": "string",
+      "description": "Specifies which additional view's permissions to include in the response."
+    },
+    "orderBy": {
+      "type": "string",
+      "description": "A comma-separated list of sort keys."
+    },
+    "pageSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "description": "The maximum number of files to return per page."
+    },
+    "pageToken": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The token for continuing a previous list request."
+    },
+    "q": {
+      "type": "string",
+      "description": "A Google Drive query string for filtering files."
+    },
+    "spaces": {
+      "type": "string",
+      "description": "A comma-separated list of spaces to query."
+    },
+    "supportsAllDrives": {
+      "type": "boolean",
+      "description": "Whether the request supports both My Drives and shared drives."
+    },
+    "teamDriveId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deprecated Team Drive ID."
+    }
+  },
+  "additionalProperties": false
+}

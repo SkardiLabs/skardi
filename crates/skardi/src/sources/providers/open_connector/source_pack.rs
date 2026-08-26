@@ -170,6 +170,7 @@ impl SourcePackRegistry {
             super::packs::discord::pack()?,
             super::packs::outlook::pack()?,
             super::packs::one_drive::pack()?,
+            super::packs::google_drive::pack()?,
         ] {
             packs.insert(pack.name, pack);
         }
@@ -292,6 +293,7 @@ mod tests {
                 "feishu",
                 "github",
                 "gmail",
+                "google_drive",
                 "mock",
                 "notion",
                 "one_drive",
@@ -370,6 +372,25 @@ mod tests {
     }
 
     #[test]
+    fn builtin_google_drive_pack_is_registered() {
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let pack = registry.require("google_drive").unwrap();
+        assert_eq!(pack.name, "google_drive");
+        assert_eq!(pack.version, 1);
+        // BTreeMap order, not the yaml's authoring order: drives sorts
+        // ahead of the files table it exists to join against.
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "google_drive.drives",
+                "google_drive.file_permissions",
+                "google_drive.files",
+            ]
+        );
+    }
+
+    #[test]
     fn unknown_table_is_a_targeted_error() {
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();
@@ -433,6 +454,7 @@ mod tests {
             "discord",
             "outlook",
             "one_drive",
+            "google_drive",
         ] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();

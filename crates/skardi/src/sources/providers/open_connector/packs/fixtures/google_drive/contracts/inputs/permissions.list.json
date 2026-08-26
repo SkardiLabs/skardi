@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "fileId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The ID of the file."
+    },
+    "fields": {
+      "type": "string",
+      "description": "The fields to include in the response."
+    },
+    "pageSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "The maximum number of permissions to return per page (1–100)."
+    },
+    "pageToken": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The token for continuing a previous list request on the next page."
+    },
+    "supportsAllDrives": {
+      "type": "boolean",
+      "description": "Whether the request supports both My Drives and shared drives."
+    },
+    "useDomainAdminAccess": {
+      "type": "boolean",
+      "description": "Issue the request as a domain administrator."
+    },
+    "includePermissionsForView": {
+      "type": "string",
+      "const": "published",
+      "description": "Specifies which additional view's permissions to include in the response."
+    }
+  },
+  "additionalProperties": false
+}

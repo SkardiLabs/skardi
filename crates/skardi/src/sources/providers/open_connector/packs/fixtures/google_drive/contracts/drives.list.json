@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "drives": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The unique identifier of the shared drive."
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of the resource."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the shared drive."
+          },
+          "hidden": {
+            "type": "boolean",
+            "description": "Whether the shared drive is hidden from the default view."
+          },
+          "colorRgb": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The color of the shared drive as an RGB hex string."
+          },
+          "createdTime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The time at which the shared drive was created (RFC 3339 date-time)."
+          },
+          "orgUnitId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The organizational unit ID of the shared drive."
+          },
+          "themeId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The ID of the theme from which the background image and color are set."
+          },
+          "backgroundImageLink": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A short-lived link to this shared drive's background image."
+          },
+          "capabilities": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {},
+            "description": "Capabilities the current user has on this shared drive."
+          },
+          "restrictions": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {},
+            "description": "A set of restrictions that apply to this shared drive or items inside this shared drive."
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "name",
+          "colorRgb",
+          "createdTime",
+          "orgUnitId",
+          "themeId",
+          "backgroundImageLink"
+        ],
+        "additionalProperties": false
+      },
+      "description": "The list of shared drives."
+    },
+    "nextPageToken": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The page token for the next page of results, if any."
+    }
+  },
+  "required": [
+    "drives",
+    "nextPageToken"
+  ],
+  "additionalProperties": false
+}

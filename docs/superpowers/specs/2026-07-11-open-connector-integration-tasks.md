@@ -599,7 +599,106 @@ event carrying the scan identity and error.
       self-trip probes are the leak classes the real captures actually
       contained); conversion tests run against the redacted live captures
       (5 children rows, 3 search rows, both real-page composites);
-      full-suite counts pending CI.
+      CI green on that PR's head `e12ec9c` (run 32729437184): 1981
+      workspace tests passed (`cargo llvm-cov --no-report nextest
+      --all-features`), plus 237 `--ignored` integration tests and 37
+      doc tests.
+
+- [x] 5.9 Google Drive pack (OAuth user token, cursor pagination over
+      `pageToken`/`nextPageToken`, NORMALIZED rows — the opposite of 5.8):
+      `files`, `drives`, `file_permissions`. **Phases 1–4 done 2026-08-25.**
+      Design record risk R1 (whether the test account can see a shared
+      drive at all) resolved in phase 4's favor: the account started at
+      zero shared drives (that clean empty scan was itself witnessed),
+      then proved able to CREATE one, so `drives` was verified on real
+      rows instead of deferred. Recorded in
+      `docs/superpowers/specs/2026-08-25-open-connector-google-drive-pack-design.md`,
+      reconciled live 2026-08-25 against the same v1.3.4 / `2410fbe` pin as
+      5.7/5.8. The service is spelled `googledrive` upstream and its action
+      IDs carry TWO dots (`googledrive.files.list`) — verified engine-safe
+      end to end with no engine changes (this pack touches only `packs/`
+      plus the registration rosters). Rows are rebuilt by upstream
+      normalizers into closed key sets (`additionalProperties: false`) with
+      the executor pinning its own provider-side `fields` projection —
+      `files.list` does not even declare a `fields` input — so the declared
+      contract is column truth to an unusual degree: `files` (14 columns)
+      and `file_permissions` (11) sit entirely inside the fingerprint gate,
+      and `drives` (13) escapes it in exactly five columns — the
+      `restrictions.*` boolean flags under a bare-open-object declaration,
+      mapped KNOWINGLY (operator decision, phase 2): a coverage test pins
+      exactly those five as the pack's only uncovered columns, and phase
+      4 witnessed all five key spellings verbatim on a real drive row
+      (present `false`s, alongside an unmapped nested
+      `downloadRestriction`), closing the Notion `archived`/`is_archived`
+      defect class for today's upstream — the gate still cannot see
+      tomorrow's. The per-caller sibling
+      `capabilities` stays unmapped (its values change with the OAuth
+      identity doing the scan). One load-bearing fixed-input pair on
+      `files`: `supportsAllDrives` + `includeItemsFromAllDrives` pinned
+      true, because `files.list` forwards the former verbatim with NO
+      upstream default (unlike its siblings, which default it true via
+      `resolveSupportsAllDrives`) and an unpinned scan silently omits every
+      shared-drive file. `q` is an optional resource on `files`/`drives`
+      rather than a filter mapping, structurally: it is a whole query
+      language, and a column-op-value literal is never a legal `q`; the
+      deprecated `teamDriveId` alias is simply not exposed (avoiding the
+      silent-precedence trap 5.8 needed `exclusive_resources` for).
+      `fileId` is a required resource on `file_permissions` with the same
+      three-way enforcement boundary as 5.8's `query` (upstream declares NO
+      `required` array; missing → refused at registration, `""` →
+      schema-layer 400, whitespace → executor 400 at scan time). Page sizes
+      pinned at the declared ceilings (1000/100/100), confirmed live to be
+      WIRE bounds with real credentials, not just declared ones (each
+      ceiling 200; 1001/101/0 each 400). Both contract halves
+      committed for all three actions (`contracts/` + `contracts/inputs/`,
+      gmail-style) — these captures carry a `$schema` key the sibling
+      packs' do not, and the fingerprint hashes the whole schema. Trashed
+      files deliberately included (`trashed` is a column; filtering belongs
+      in SQL). Deferred with reasons in the design record: `changes.list`
+      (cursor bootstrapped by a second action — a pagination shape the
+      engine has no spelling for), comments/replies/revisions/labels/
+      accessproposals (second wave; accessproposals also
+      Workspace-approval-gated). Docs: `docs/open-connector-google-drive.md`
+      + the status note in `docs/open-connector.md`. Verification — CI
+      green on `f763ce8` (run 32854955874): 2125 workspace tests passed
+      (`cargo llvm-cov --no-report nextest --all-features`), plus 237
+      `--ignored` integration tests and 37 doc tests. CI runs the whole
+      workspace through nextest, not the per-module filters, so the two
+      filtered figures are static counts of test functions in the tree
+      (none `#[ignore]`d): 428 under
+      `sources::providers::open_connector`, 402 of them before this pack
+      — the 26 new ones being 25 pack-module tests
+      (`cargo test -p skardi --lib sources::providers::open_connector::packs::google_drive`
+      — 13 contract/conversion: per-table fixture conversions across all
+      six admission-gate shapes (explicit null vs absent key vs empty
+      string/list, partial `restrictions`, null owner list items,
+      `sizeBytes`-as-string type mismatch with row-scoped error identity,
+      id-less row failing the page), the default-deny redaction audit
+      over every fixture string leaf, fingerprint pins for all three
+      contracts, the five-column coverage-gap pin, pagination/resource/
+      fixed-input declarations, and the captured-input-contract test
+      locking every sendable key plus the declared-but-never-sent negative
+      space per action; 12 e2e through MockGateway: per-table
+      wire-declaration scans with exact key sets and the all-drives pins on
+      every page, opaque-cursor continuation and null termination, a
+      fileId-less permissions binding refused before any HTTP, no-pushdown
+      row identity, LIMIT early-stop, empty shared-drive scan (the R1
+      shape), pagination-loop refusal, failure-envelope surfacing with the
+      dotted action id named, UDTF parity, drift-refusal at registration)
+      plus 1 registry test asserting the BTreeMap table order; row fixtures
+      are REDACTED LIVE CAPTURES (phase 4, 2026-08-25) under the
+      default-deny audit. Phase-4 live evidence, in brief: three-table
+      end-to-end skardi-server scans registered against LIVE discovery;
+      every mapped column non-NULL somewhere except three structural
+      residuals (`drives.org_unit_id`, `drives.theme_id`,
+      `file_permissions.expiration_time` — keys present-and-null on real
+      rows, each with a documented reason); real `pageSize: 1` multi-page
+      walks with ~444-char cursors and terminal nulls; LIMIT stopping a
+      real three-page scan after two requests; `q` live both as direct
+      input and as a bound binding resource; live corrections folded into
+      the fixtures (native Docs DO report `sizeBytes`; every grant
+      carries `permissionDetails`; shared-drive rows drop exactly
+      `owners`+`shared`).
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -609,17 +708,26 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.8 (OneDrive pack — drive_items,
-  drive_item_search). Milestones 1–4 and 5.1–5.7 (GitHub, Slack, Notion,
-  Feishu, Gmail, Discord, Outlook packs) are merged; this PR adds the
-  second Microsoft 365 pack over raw Graph passthrough rows, with zero
-  engine changes — the pack-shaping decisions are the empty coverage gap
-  (no `select` pin needed, unlike outlook) and the shared driveItem
-  fingerprint across both tables. Live verification (phase 4) ran
-  2026-08-21 against a real MSA drive; its one pack-changing finding is
-  the search table's 14-column reduction (search rows carried no
-  `eTag`/`cTag` on the MSA drive probed; a business/SharePoint drive is
-  unprobed — design record R1).
+- **Current PR**: milestone 5.9 (Google Drive pack — files, drives,
+  file_permissions; PR #226). Milestones 1–4 and 5.1–5.8 (GitHub, Slack,
+  Notion, Feishu, Gmail, Discord, Outlook, OneDrive packs) are merged;
+  this PR adds the second Google pack over normalized rows, with zero
+  engine changes — the pack-shaping decisions are the two-dot action IDs
+  (`googledrive.files.list`, verified engine-safe), the load-bearing
+  all-drives fixed-input pair on `files`, and the five knowingly
+  outside-the-gate `restrictions.*` columns on `drives`. Live
+  verification (phase 4) ran 2026-08-25 against a real Workspace
+  account and closed both load-bearing items: design record R1
+  resolved in its favor (zero shared drives at first, then the account
+  proved able to CREATE one, so `drives` was verified on real rows and
+  all five restriction spellings came back verbatim), and the pinned
+  all-drives pair really surfaced a shared-drive file through a live
+  scan. Its pack-changing findings were all fixture-level corrections
+  (native Docs DO report `sizeBytes`; every grant carries
+  `permissionDetails`; shared-drive rows drop exactly
+  `owners`+`shared`), plus three columns recorded as structural
+  residuals (`drives.org_unit_id`, `drives.theme_id`,
+  `file_permissions.expiration_time`).
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

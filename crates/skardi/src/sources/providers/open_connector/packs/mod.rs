@@ -6,6 +6,7 @@ pub mod discord;
 pub mod feishu;
 pub mod github;
 pub mod gmail;
+pub mod google_drive;
 pub mod mock;
 pub mod notion;
 pub mod one_drive;

@@ -1,0 +1,343 @@
+# Google Drive source pack. Wire contract reconciled against a live Open
+# Connector gateway (v1.3.4, open-connector at `2410fbe`, 2026-08-25):
+# the service is spelled `googledrive` upstream (one word), and its
+# action IDs carry TWO dots (`googledrive.files.list` — `service.name`
+# where the name itself is dotted). That shape is new to shipped packs
+# and already safe end to end: `validate_action_id` rejects only `/` and
+# bare dot segments, the client's percent-encode set keeps dots verbatim
+# in the URL path, and the `rsplit('.')` lookups elsewhere read TABLE
+# ids, not action ids.
+#
+# Rows are NORMALIZED upstream — the opposite of `one_drive`, and the
+# reason no column below uses Google's own REST field names. Every
+# executor rebuilds its rows through a `normalize*` function into a
+# fixed key set (`normalizeDriveFile`, `normalizeDrive`,
+# `normalizePermission`), every declared row object is
+# `additionalProperties: false`, and the executors pin their own
+# `fields` projection on the provider request — `files.list` does not
+# even declare a `fields` input (verified live: sending one 400s), so
+# the row shape is fully determined upstream and cannot be widened or
+# narrowed from here. Mapping Google's REST spellings
+# (`webContentLink`, string-typed `size`) would have shipped
+# always-NULL columns; the wire keys below are the normalizer's, read
+# from the executor source, and — with one deliberate exception on
+# `drives`, documented there — every mapped path resolves INSIDE the
+# declared item schema, so the fingerprint gate covers it.
+#
+# Key absence is not uniform, and fixtures model both spellings of
+# "no value": the `?? null` normalizer fields are ALWAYS present
+# (explicit JSON null on the wire), while the conditionally-spread ones
+# vanish from the row entirely when upstream omits them — on files:
+# `parents`, `owners`, `shared`, `starred`, `trashed`; on drives:
+# `hidden`, `capabilities`, `restrictions`; on permissions: `deleted`,
+# `pendingOwner`, `allowFileDiscovery` (their `optionalBoolean` result
+# is dropped at JSON serialization when undefined). Both spellings
+# extract as SQL NULL; the distinction matters only to fixtures and to
+# anyone reading raw wire captures.
+#
+# Pagination is uniform across all three actions: a `pageToken` input
+# (`minLength: 1`) against a top-level `nextPageToken` output declared
+# `anyOf: [string, null]` AND listed in the output schema's `required`
+# array — the key is always present, null exactly on the final page. No
+# executor filters rows after paginating (each is a bare
+# `payload.<key>.map(normalize…)`), so null-cursor termination is sound;
+# Google publishes no has-more flag and no total, so no override is
+# declared. In-band Google errors are consumed by the executor
+# (`assertGoogleResponse` throws on any non-2xx), so no table declares
+# `error_path`.
+#
+# Inputs are strict camelCase (`additionalProperties: false`). Verified
+# live on `files.list`: `fields`, `page`, `perPage`, `limit`,
+# lower-case `orderby`, `maxResults` and `cursor` each 400 as
+# `invalid_input`. Page-size bounds differ per action — 1–1000 on
+# `files.list`, 1–100 on `drives.list` and `permissions.list` — and each
+# pinned size below is the declared ceiling, verified to pass schema
+# validation live while `+1` and `0` both 400. A declared bound is not a
+# wire bound (feishu declared 100 and hard-failed above 50, PR #186);
+# phase 4 confirmed all three ceilings ARE wire bounds: 1000/100/100
+# each returned 200 live while 1001/101/0 each 400.
+#
+# No table declares a filter mapping, structurally: the one candidate
+# input (`q`) is a whole query LANGUAGE (`name = 'x' and trashed =
+# false`), and a FilterMapping sends a column's literal as the input's
+# value, which is never a legal `q`. It is an optional RESOURCE instead
+# (on `files` and `drives`): the binding pins the whole query string and
+# the table means "the rows matching this binding's query"; with no `q`
+# the table is the complete collection, so no capability is lost.
+#
+# Authz: all three actions declare `drive.readonly` +
+# `drive.metadata.readonly`, but the provider-level OAuth grant requests
+# the full read-write `https://www.googleapis.com/auth/drive` as well —
+# an upstream connection property a pack cannot narrow, documented as a
+# caveat in `docs/open-connector-google-drive.md`.
+kind: pack
+pack: google_drive
+version: 1
+
+tables:
+  files:
+    action: googledrive.files.list
+    row_path: "$.files"
+    fingerprint: 5da2805b9646b6e775d0126fe25917eb6cc84874e27c6e22a10fac4ad9b4c20f
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: pageSize
+      # The declared ceiling (1–1000; 1001 and 0 both 400 live). It
+      # bounds REQUESTS, not bytes: `pageSize` is sent verbatim and never
+      # narrowed to the SQL LIMIT, so `LIMIT 10` costs one request but
+      # still transfers up to 1000 rows. Rows are small normalized
+      # metadata objects (the executor's own `fields` projection strips
+      # everything else), so a full page sits far under the client's
+      # 16 MiB response cap: measured live, a fully-populated My Drive
+      # row serializes to ~700 bytes, so 1000 rows is under 1 MiB.
+      page_size: 1000
+    # The pack's ONE load-bearing behaviour pin. `files.list` forwards
+    # `supportsAllDrives` verbatim with NO default
+    # (`optionalBoolean(input.supportsAllDrives)`) — unlike the sibling
+    # actions, which run `resolveSupportsAllDrives` and default it TRUE
+    # — so an unpinned scan inherits Google's own default and silently
+    # omits every shared-drive file. A table named `files` that quietly
+    # excludes a whole class of the account's files is the
+    # confidently-wrong-rows failure mode; Google requires the pair
+    # together for shared-drive items to appear, so both are pinned.
+    # Phase 4 verified the pin directly: accepted on the wire, a
+    # seeded shared-drive file really present in a live scan (its
+    # `drive_id` carrying the real drive id), and no bad interaction
+    # with a bound `driveId` (Google's `corpora` inference) — the two
+    # compose live.
+    fixed_inputs:
+      supportsAllDrives: true
+      includeItemsFromAllDrives: true
+    # `q` pins a Drive query-language string (see the header: a resource
+    # because it cannot be a filter mapping); absent, the scan is the
+    # whole corpus. `driveId` scopes the scan to one shared drive; the
+    # two COMPOSE (a query within one drive is meaningful), so there is
+    # no exclusive group. Deliberately NOT declared: `teamDriveId`, the
+    # deprecated alias of `driveId` — declaring both would create
+    # exactly the silent-precedence trap one_drive needed
+    # `exclusive_resources` for. Also never sent: `corpora` and the
+    # deprecated `corpus` (superseded by the pinned all-drives pair),
+    # `spaces` (the default space is the files corpus this table means),
+    # `orderBy` (reorders a set the scan reads in full), and
+    # `includeLabels` / `includePermissionsForView` — structural no-ops
+    # here, because the executor's pinned `fields` projection contains
+    # neither `labelInfo` nor `permissions`, so the requested data has
+    # no way back out of the wire.
+    #
+    # Trashed files are INCLUDED: Drive's listing does not exclude them
+    # by default and this pack does not pin `q: "trashed = false"` to
+    # make it do so — that would silently narrow the table's meaning
+    # (and collide with `q` as a resource; the loader refuses that
+    # spelling outright). `trashed` is a mapped column; the filtering
+    # belongs in SQL where the operator can see it.
+    resources:
+      optional: [driveId, q]
+    columns:
+      # Identity non-null, the rest nullable — the convention every pack
+      # follows (rationale recorded in gmail.yaml's messages table).
+      # Upstream `id`/`name`/`mimeType` are `String(x ?? "")` — never
+      # null on the wire, possibly empty — and the declared item schema
+      # lists them `required` with plain string types; only `id` claims
+      # non-null here, per the convention.
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      # The de-facto type discriminator: folders are
+      # `application/vnd.google-apps.folder`, native Workspace files are
+      # `application/vnd.google-apps.*`, everything else is an ordinary
+      # MIME type.
+      - { name: mime_type, path: mimeType, type: utf8, nullable: true }
+      - { name: web_view_link, path: webViewLink, type: utf8, nullable: true }
+      # RFC 3339 on the wire; `timestamp_ms_utc` names the Arrow storage
+      # — Timestamp(ms, UTC) — and its converter accepts RFC 3339 or
+      # epoch-millis alike (see gmail.yaml's message_timestamp).
+      - { name: created_time, path: createdTime, type: timestamp_ms_utc, nullable: true }
+      - { name: modified_time, path: modifiedTime, type: timestamp_ms_utc, nullable: true }
+      # A normalization win worth naming: Google's REST API returns
+      # `size` as a decimal STRING; the executor's `parseSizeBytes`
+      # emits a real number (or null for anything without a byte size of
+      # its own), so this column is a true int64. Which files have none
+      # is a live finding, not a guess: FOLDERS came back null, while
+      # native Docs/Sheets/Slides reported real sizes (Workspace files
+      # count against storage quota since 2021). So an all-NULL
+      # `size_bytes` over real files is the always-NULL defect, not an
+      # expected shape.
+      - { name: size_bytes, path: sizeBytes, type: int64, nullable: true }
+      # Null on My Drive items; the join key to `drives.id` for
+      # shared-drive items.
+      - { name: drive_id, path: driveId, type: utf8, nullable: true }
+      # Conditionally spread upstream, so NULL where Google omits it
+      # — though live it was present on every row, shared-drive ones
+      # included; otherwise an array of parent folder IDs, in practice
+      # at most one since Drive dropped multi-parenting.
+      - { name: parents, path: parents, type: utf8_list, nullable: true }
+      # Two columns from ONE `owners` array under different pluck keys:
+      # the engine deliberately has no scalar array indexing, so these
+      # are lists rather than `owners[0].…` scalars. My Drive files
+      # carry exactly one owner; shared-drive items carry NONE (the
+      # drive owns them — the key is absent, so both columns are NULL
+      # there, which doubles as an ownership-model discriminator).
+      # Each owner object's four keys are always present (`?? null`
+      # normalizer), so the pluck never sees a missing key; a null
+      # displayName becomes a null LIST ITEM, not a failure. The
+      # `permissionId`/`photoLink` siblings stay unmapped: an opaque
+      # per-owner join id this pack cannot join, and an avatar URL.
+      - { name: owner_display_names, path: owners, type: utf8_list_from_object_key, key: displayName, nullable: true }
+      - { name: owner_email_addresses, path: owners, type: utf8_list_from_object_key, key: emailAddress, nullable: true }
+      # The three boolean flags are conditionally spread upstream:
+      # absent unless the provider sent a real boolean, so NULL here
+      # means "not reported", never false.
+      - { name: shared, path: shared, type: boolean, nullable: true }
+      - { name: starred, path: starred, type: boolean, nullable: true }
+      - { name: trashed, path: trashed, type: boolean, nullable: true }
+
+  drives:
+    action: googledrive.drives.list
+    row_path: "$.drives"
+    fingerprint: f85332b8ba49a7c3a36e70cfa5a04de0819ed4e8acadbdb74676c436a6212d81
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: pageSize
+      # Declared ceiling 100 (101 and 0 both 400 live).
+      page_size: 100
+    # SHARED drives only — `My Drive` is not a drive resource and never
+    # appears as a row, so on an account with no shared-drive membership
+    # this table is legitimately empty (witnessed live: a clean
+    # zero-row scan before the phase-4 account created its own shared
+    # drive and resolved design record R1).
+    # `q` is the drives query language (`name contains 'x'`, `hidden =
+    # true`), a resource for the same structural reason as on `files`.
+    # `useDomainAdminAccess` is never sent: it requires a Workspace
+    # admin and 403s for everyone else, so pinning it would break the
+    # common case to serve the rare one.
+    resources:
+      optional: [q]
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      # Conditionally spread upstream: absent unless Google reports it.
+      - { name: hidden, path: hidden, type: boolean, nullable: true }
+      # Theme/branding surface: organizer-managed. Live: `colorRgb`
+      # and `backgroundImageLink` carried real values; `themeId` stayed
+      # null even when a drive was CREATED with an explicit theme (it
+      # materializes as the other two), and `orgUnitId` reports only
+      # under Workspace org units — both keys PRESENT and null.
+      - { name: color_rgb, path: colorRgb, type: utf8, nullable: true }
+      - { name: created_time, path: createdTime, type: timestamp_ms_utc, nullable: true }
+      # Workspace org unit; null outside domain-managed drives.
+      - { name: org_unit_id, path: orgUnitId, type: utf8, nullable: true }
+      - { name: theme_id, path: themeId, type: utf8, nullable: true }
+      - { name: background_image_link, path: backgroundImageLink, type: utf8, nullable: true }
+      # ── The five restriction flags: the ONLY columns in this pack
+      # outside the fingerprint gate, and the trade is taken knowingly.
+      # `restrictions` is declared as a bare open object
+      # (`properties: {}`, `additionalProperties: {}`), so the contract
+      # promises the key and says nothing about its contents. Three
+      # consequences, worst first: (1) these five key spellings appear
+      # in NO capture — they come from Google's Drive v3 documentation,
+      # exactly the source the reconciliation discipline warns about;
+      # the executor passes the object through raw
+      # (`asOptionalObject(payload.restrictions)`, no renaming), and
+      # phase 4 supplied the verification the captures cannot: a real
+      # drive row carried all five spellings verbatim as present
+      # `false`s (alongside a nested `downloadRestriction` object left
+      # unmapped), closing the Notion `archived`/`is_archived` risk for
+      # today's upstream — the gate still cannot see tomorrow's. (2) Upstream can
+      # rename an inner key at runtime without touching the declaration
+      # — hash unchanged, registration passes, column silently all-NULL;
+      # the coverage test pins all five as a reviewed case-1 gap.
+      # (3) `restrictions` is not in the item's `required` array and is
+      # conditionally spread, so a drive with no restrictions set may
+      # carry no key at all — all five are nullable, and NULL means
+      # "unreported", never false.
+      # Why ship them at all: `domain_users_only` / `drive_members_only`
+      # answer "how open is this drive", squarely the sharing-audit
+      # question `file_permissions` exists for. Its per-caller sibling
+      # `capabilities` stays unmapped — its values change with the OAuth
+      # identity doing the scan ("Capabilities the current user has"),
+      # so the same table under two bindings would disagree; that is a
+      # permission view, not drive data, and no declaration shape would
+      # make it a column.
+      - { name: admin_managed_restrictions, path: restrictions.adminManagedRestrictions, type: boolean, nullable: true }
+      - { name: copy_requires_writer_permission, path: restrictions.copyRequiresWriterPermission, type: boolean, nullable: true }
+      - { name: domain_users_only, path: restrictions.domainUsersOnly, type: boolean, nullable: true }
+      - { name: drive_members_only, path: restrictions.driveMembersOnly, type: boolean, nullable: true }
+      - { name: sharing_folders_requires_organizer_permission, path: restrictions.sharingFoldersRequiresOrganizerPermission, type: boolean, nullable: true }
+      # `kind` (the constant "drive#drive") stays unmapped here and on
+      # `file_permissions` ("drive#permission"): a per-resource constant
+      # carries no information. `files` has no such key to skip —
+      # `normalizeDriveFile` never emits one.
+
+  file_permissions:
+    action: googledrive.permissions.list
+    row_path: "$.permissions"
+    fingerprint: 5275c28c30a13cb262bc9c8650ed93efd163d2a749ab9b9e88668de0bbc7a3e9
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: pageSize
+      # Declared ceiling 100 (101 and 0 both 400 live).
+      page_size: 100
+    # Who can reach ONE file — the binding names it, because the rows
+    # carry no file identity of their own (`permissions.list` rows have
+    # no `fileId` field, and a resource's value has no path into a row),
+    # so this table is "the permissions of the file this binding names",
+    # the `notion.block_children` shape. An operator auditing many files
+    # binds the pack once per file.
+    #
+    # `fileId` is REQUIRED, and the enforcement boundary is narrow in
+    # exactly the way one_drive's `query` is: the input schema's
+    # `required` array is EMPTY and `fileId` is merely `minLength: 1`,
+    # so a MISSING fileId passes schema validation and dies in the
+    # executor's own check (`resolveFileId` → 400 "fileId is required")
+    # — declaring it a required resource closes that case at
+    # registration, before any HTTP. `fileId: ""` is caught by the
+    # schema layer (400 `invalid_input`, verified live); a
+    # whitespace-only value passes resource validation
+    # (presence-and-non-null only) and fails at scan time on the
+    # upstream 400. Loud either way, never a silent empty table.
+    # One upstream convenience worth naming so it does not read as a
+    # bug: `resolveFileId` runs the value through `extractFileId`, which
+    # accepts a full Drive URL and pulls the ID out of it — a binding
+    # whose `fileId` is `https://drive.google.com/file/d/ABC/view`
+    # works.
+    #
+    # Never sent, though declared: `fields` (it would REPLACE the
+    # executor's default projection and can only narrow the normalized
+    # surface the columns below map), `includePermissionsForView`
+    # (adds `published` view entries the default projection then cannot
+    # widen into), `useDomainAdminAccess` (Workspace-admin-only, 403s
+    # otherwise), and `supportsAllDrives` — unlike `files.list`, this
+    # executor runs `resolveSupportsAllDrives`, which already defaults
+    # it TRUE upstream, so shared-drive files work with no pin.
+    resources:
+      required: [fileId]
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      # owner / organizer / fileOrganizer / writer / commenter / reader.
+      - { name: role, path: role, type: utf8, nullable: true }
+      # user / group / domain / anyone — with `domain` and `anyone`, the
+      # identity columns below are null and `domain` / discoverability
+      # carry the meaning instead.
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: email_address, path: emailAddress, type: utf8, nullable: true }
+      - { name: display_name, path: displayName, type: utf8, nullable: true }
+      - { name: domain, path: domain, type: utf8, nullable: true }
+      - { name: photo_link, path: photoLink, type: utf8, nullable: true }
+      # RFC 3339; set only on expiring grants.
+      - { name: expiration_time, path: expirationTime, type: timestamp_ms_utc, nullable: true }
+      # The three booleans are conditionally spread upstream (absent
+      # unless reported): NULL means "not reported", never false.
+      # `allow_file_discovery` is meaningful for `domain`/`anyone`
+      # grants — whether the link is findable by search.
+      - { name: allow_file_discovery, path: allowFileDiscovery, type: boolean, nullable: true }
+      - { name: deleted, path: deleted, type: boolean, nullable: true }
+      - { name: pending_owner, path: pendingOwner, type: boolean, nullable: true }
+      # `kind` (constant) and `permissionDetails` (an array of
+      # inherited-permission records — a second table's worth of shape,
+      # not a column; its useful content is per-entry role and
+      # inheritance source) stay unmapped.
