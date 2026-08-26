@@ -631,7 +631,7 @@ bindings:
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::testutil;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
+        MockGateway, MockResponse, RecordedRequest, collect, discovery_ok, envelope_ok,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -745,15 +745,6 @@ bindings:
         }
         register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
-    }
-
-    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-        ctx.sql(sql)
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("collect")
     }
 
     fn rows_of(batches: &[RecordBatch]) -> usize {

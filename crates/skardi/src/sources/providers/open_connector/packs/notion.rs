@@ -92,14 +92,14 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_ok,
-        fingerprint_uncovered_columns,
+        EnvVarGuard, MockGateway, MockResponse, boolean, collect, discovery_ok, envelope_ok,
+        fingerprint_uncovered_columns, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
         register_open_connector_udtfs,
     };
-    use arrow::array::{Array, BooleanArray, ListArray, StringArray, TimestampMillisecondArray};
+    use arrow::array::{Array, ListArray, StringArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -148,24 +148,6 @@ mod tests {
             .expect("converter")
             .convert(rows, 1)
             .expect("fixture converts")
-    }
-
-    fn utf8<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("column {name}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Utf8 column")
-    }
-
-    fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArray {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("column {name}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Boolean column")
     }
 
     #[test]
@@ -433,15 +415,6 @@ bindings:
         .expect("gateway registration succeeds");
         register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
-    }
-
-    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-        ctx.sql(sql)
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("collect")
     }
 
     fn ids_of(batches: &[RecordBatch]) -> Vec<String> {
