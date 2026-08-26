@@ -176,8 +176,8 @@ turns a folder of documents — or a datastore you already run — into governed
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
 pointed at Postgres + pgvector, MongoDB, or Lance. The same skill also runs on
-Codex, Cursor, Pi, OpenClaw, and Hermes; per-host installation instructions are in
-the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+Codex, Cursor, Pi, dsh, OpenClaw, and Hermes; per-host installation instructions
+are in the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
 **CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
 build from source — the one-liner below has no published artifact there):
