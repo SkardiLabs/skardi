@@ -73,12 +73,13 @@ async fn initialize_list_and_call_round_trip() {
     assert!(names.contains(&"query"), "{names:?}");
     assert!(names.contains(&"list_data_sources"), "{names:?}");
 
+    // CallToolRequestParams is #[non_exhaustive]: construct via its builder.
+    let args = json!({"brand": "acme"})
+        .as_object()
+        .cloned()
+        .expect("literal is an object");
     let result = client
-        .call_tool(CallToolRequestParams {
-            name: "product-search".into(),
-            arguments: json!({"brand": "acme"}).as_object().cloned(),
-            ..Default::default()
-        })
+        .call_tool(CallToolRequestParams::new("product-search").with_arguments(args))
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(false));
