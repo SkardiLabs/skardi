@@ -183,8 +183,8 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, collect, column_values, convert_page, discovery_ok,
-        envelope_err, envelope_ok, fingerprint_uncovered_columns, input_keys, utf8,
+        EnvVarGuard, MockGateway, MockResponse, collect, column_values, convert_first_page,
+        discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns, input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -254,7 +254,7 @@ mod tests {
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
-        convert_page(table, &page)
+        convert_first_page(table, &page)
     }
 
     fn int64<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
@@ -433,7 +433,7 @@ mod tests {
             ],
             "nextLink": null
         });
-        let batch = convert_page(table("drive_items"), &page);
+        let batch = convert_first_page(table("drive_items"), &page);
         assert_eq!(batch.num_rows(), 2);
 
         // Every nullable column, whatever its arrow type, and whether the
@@ -496,7 +496,7 @@ mod tests {
             }],
             "nextLink": null
         });
-        let batch = convert_page(table("drive_items"), &page);
+        let batch = convert_first_page(table("drive_items"), &page);
         assert!(utf8(&batch, "created_by_display_name").is_null(0));
         assert!(utf8(&batch, "last_modified_by_display_name").is_null(0));
         // The row is otherwise intact — a null identity is not a broken row.
@@ -945,7 +945,7 @@ mod tests {
         // the concurrency tags (phase 4), so drive_item_search maps 14.
         for (short, columns) in [("drive_items", 16), ("drive_item_search", 14)] {
             let t = table(short);
-            let batch = convert_page(t, &json!({"items": [], "nextLink": null}));
+            let batch = convert_first_page(t, &json!({"items": [], "nextLink": null}));
             assert_eq!(batch.num_rows(), 0, "{short}");
             assert_eq!(
                 batch.num_columns(),

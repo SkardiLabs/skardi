@@ -161,8 +161,9 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values, convert_page,
-        discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns, input_keys, utf8,
+        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values,
+        convert_first_page, discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns,
+        input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -219,7 +220,7 @@ mod tests {
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
-        convert_page(table, &page)
+        convert_first_page(table, &page)
     }
 
     fn int64<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
@@ -461,7 +462,7 @@ mod tests {
             ],
             "nextPageToken": null
         });
-        let batch = convert_page(table("drives"), &page);
+        let batch = convert_first_page(table("drives"), &page);
         assert!(boolean(&batch, "hidden").is_null(0));
         for flag in [
             "admin_managed_restrictions",
@@ -568,7 +569,7 @@ mod tests {
             }],
             "nextPageToken": null
         });
-        let synthetic = convert_page(table("file_permissions"), &page);
+        let synthetic = convert_first_page(table("file_permissions"), &page);
         assert!(timestamp(&synthetic, "expiration_time").is_valid(0));
 
         // `kind` (constant) and `permissionDetails` (a second table's
@@ -628,7 +629,7 @@ mod tests {
             ],
             "nextPageToken": null
         });
-        let batch = convert_page(table("files"), &page);
+        let batch = convert_first_page(table("files"), &page);
         assert_eq!(batch.num_rows(), 3);
 
         for column in ["web_view_link", "drive_id"] {
@@ -814,7 +815,7 @@ mod tests {
             ("file_permissions", "permissions", 11),
         ] {
             let t = table(short);
-            let batch = convert_page(t, &json!({row_key: [], "nextPageToken": null}));
+            let batch = convert_first_page(t, &json!({row_key: [], "nextPageToken": null}));
             assert_eq!(batch.num_rows(), 0, "{short}");
             assert_eq!(
                 batch.num_columns(),

@@ -198,8 +198,8 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, collect, column_values, convert_page, discovery_ok,
-        envelope_err, envelope_ok, fingerprint_uncovered_columns, input_keys, utf8,
+        EnvVarGuard, MockGateway, MockResponse, collect, column_values, convert_first_page,
+        discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns, input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -248,7 +248,7 @@ mod tests {
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
-        convert_page(table, &page)
+        convert_first_page(table, &page)
     }
 
     #[test]
@@ -323,7 +323,7 @@ mod tests {
         // back to "" (kept verbatim, never NULL), labelIds defaults to an
         // empty array (an empty list, not NULL), and an undeclared
         // upstream field rides along ignored.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("threads"),
             &json!({"threads": [
                 {"threadId": "t-1", "snippet": "", "historyId": null, "extra": true},
@@ -332,7 +332,7 @@ mod tests {
         assert!(utf8(&batch, "history_id").is_null(0));
         assert_eq!(utf8(&batch, "snippet").value(0), "");
 
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("messages"),
             &json!({"messages": [{
                 "messageId": "m-1", "threadId": "t-1", "labelIds": [],
@@ -351,7 +351,7 @@ mod tests {
         assert!(!labels.is_null(0));
         assert_eq!(labels.value(0).len(), 0);
 
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("drafts"),
             &json!({"drafts": [{"id": "r-1", "message": {"messageId": "", "threadId": ""}}]}),
         );
@@ -364,7 +364,7 @@ mod tests {
         // always emits `message`, but a nullable column behind a null
         // parent must become SQL NULL (not an error, not a panic) if that
         // ever drifts — the admission gate's null-parent category.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("drafts"),
             &json!({"drafts": [{"id": "r-1", "message": null}]}),
         );

@@ -185,8 +185,9 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values, convert_page,
-        discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns, input_keys, utf8,
+        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values,
+        convert_first_page, discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns,
+        input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -296,7 +297,7 @@ mod tests {
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
-        convert_page(table, &page)
+        convert_first_page(table, &page)
     }
 
     #[test]
@@ -631,7 +632,7 @@ mod tests {
         // SYNTHETIC: the live mailbox had no hidden folders (the pin's
         // on/off responses were identical), so the is_hidden=true
         // conversion arm is pinned here rather than by the capture.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("mail_folders"),
             &json!({"mailFolders": [
                 {"id": "f-hidden", "displayName": "Hidden", "isHidden": true},
@@ -652,7 +653,7 @@ mod tests {
         // parent becomes SQL NULL, never an error. Deleting this test
         // because "the wire never does that" would drop the only
         // coverage of the admission gate's null-parent category.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("messages"),
             &json!({"messages": [
                 {"id": "m-1", "from": null},
@@ -674,7 +675,7 @@ mod tests {
         // (SYNTHETIC — the live wire under the select pin never nulls
         // a field, but passthrough offers no such guarantee): null is
         // SQL NULL while "" stays an empty string.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("messages"),
             &json!({"messages": [
                 {"id": "m-1", "subject": "s"},
@@ -703,7 +704,7 @@ mod tests {
     fn empty_page_keeps_schema_stable() {
         // Zero rows still yield the full column set — an empty mailbox
         // must DESCRIBE like a populated one.
-        let batch = convert_page(table("messages"), &json!({"messages": []}));
+        let batch = convert_first_page(table("messages"), &json!({"messages": []}));
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), table("messages").fields.len());
     }

@@ -77,16 +77,18 @@ pub(crate) fn discovery_ok(
 pub(crate) async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
     ctx.sql(sql)
         .await
-        .expect("plan")
+        .unwrap_or_else(|e| panic!("failed to plan {sql}: {e}"))
         .collect()
         .await
-        .expect("collect")
+        .unwrap_or_else(|e| panic!("failed to collect {sql}: {e}"))
 }
 
 /// Convert one gateway page into a batch through the table's declared row
 /// path and field mappings — the same path the scan takes, so a fixture
-/// asserted through this helper vouches for the real conversion.
-pub(crate) fn convert_page(table: &SourcePackTable, page: &Value) -> RecordBatch {
+/// asserted through this helper vouches for the real conversion. Error
+/// context is pinned to page 1, as the name promises: fixtures are
+/// single-page corpora, never a mid-scan continuation.
+pub(crate) fn convert_first_page(table: &SourcePackTable, page: &Value) -> RecordBatch {
     let rows = RowPath::parse(table.row_path)
         .expect("row path")
         .rows(page, 1)
@@ -97,40 +99,50 @@ pub(crate) fn convert_page(table: &SourcePackTable, page: &Value) -> RecordBatch
         .expect("page converts")
 }
 
-/// A named column downcast to `StringArray`; panics name the missing
-/// column so a schema drift reads as itself, not as a bare `unwrap`.
+/// A named column downcast to `StringArray`; panics name the column and,
+/// on a type mismatch, the Arrow type actually found, so a schema drift
+/// reads as itself, not as a bare `unwrap`.
 pub(crate) fn utf8<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
-    batch
+    let column = batch
         .column_by_name(name)
-        .unwrap_or_else(|| panic!("column {name}"))
+        .unwrap_or_else(|| panic!("column {name}"));
+    column
         .as_any()
         .downcast_ref()
-        .expect("Utf8 column")
+        .unwrap_or_else(|| panic!("column {name} is {:?}, not Utf8", column.data_type()))
 }
 
 /// A named column downcast to `BooleanArray`.
 pub(crate) fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArray {
-    batch
+    let column = batch
         .column_by_name(name)
-        .unwrap_or_else(|| panic!("column {name}"))
+        .unwrap_or_else(|| panic!("column {name}"));
+    column
         .as_any()
         .downcast_ref()
-        .expect("Boolean column")
+        .unwrap_or_else(|| panic!("column {name} is {:?}, not Boolean", column.data_type()))
 }
 
 /// Every value of a Utf8 column across all result batches, in row order.
+/// Panics on a NULL slot rather than reading the underlying buffer as if
+/// it held a value — a caller asserting over a nullable column needs
+/// options, which this helper deliberately does not offer.
 pub(crate) fn column_values(batches: &[RecordBatch], name: &str) -> Vec<String> {
     batches
         .iter()
         .flat_map(|batch| {
-            let values = batch
+            let column = batch
                 .column_by_name(name)
-                .unwrap_or_else(|| panic!("column {name}"))
+                .unwrap_or_else(|| panic!("column {name}"));
+            let values = column
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .expect("Utf8 column")
+                .unwrap_or_else(|| panic!("column {name} is {:?}, not Utf8", column.data_type()))
                 .clone();
-            (0..values.len()).map(move |i| values.value(i).to_string())
+            (0..values.len()).map(move |i| {
+                assert!(!values.is_null(i), "column {name} is NULL at row {i}");
+                values.value(i).to_string()
+            })
         })
         .collect()
 }
