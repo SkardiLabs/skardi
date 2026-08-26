@@ -1575,6 +1575,47 @@ bindings:
     }
 
     #[tokio::test]
+    async fn drives_q_resource_forwards_verbatim() {
+        // `drives.list` has its own query language surface (`name` and
+        // `hidden`, rather than the files corpus fields). Pin the binding-to-
+        // wire path independently of `files.q`: the complete expression must
+        // survive verbatim alongside the action's page size and no other key.
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return google_drive_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/googledrive.drives.list" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"drives": [{"id": "d-1", "name": "Engineering"}],
+                            "nextPageToken": null})
+                    .to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_GDRIVE_DRIVES_Q",
+            "drives",
+            "{q: \"name contains 'x'\"}",
+        )
+        .await;
+
+        let batches = collect(&ctx, "SELECT id FROM saas.gdrive.drives").await;
+        assert_eq!(column_values(&batches, "id"), vec!["d-1"]);
+
+        let inputs = execute_inputs(&gateway, "googledrive.drives.list");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["q"], "name contains 'x'");
+        assert_eq!(inputs[0]["pageSize"], 100);
+        assert_eq!(input_keys(&inputs[0]), vec!["pageSize", "q"]);
+    }
+
+    #[tokio::test]
     async fn file_permissions_scan_forwards_its_required_file_id_on_every_page() {
         // The binding names the file, and the value rides EVERY request
         // including continuations — rows carry no file identity of their
