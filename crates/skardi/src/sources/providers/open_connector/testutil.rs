@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{BooleanArray, StringArray};
+use arrow::array::{Array, BooleanArray, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
