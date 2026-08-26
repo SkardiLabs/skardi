@@ -190,7 +190,13 @@ rename would not change the pinned fingerprint. The live pass witnessed
 all five spellings verbatim on a real drive row (as present `false`s,
 alongside a nested `downloadRestriction` object the pack leaves
 unmapped), which verifies today's upstream; the gate still cannot see
-tomorrow's. NULL in any of them means "unreported", never false. The per-caller sibling
+tomorrow's. NULL in any of them means "unreported", never false. If all
+five ever read NULL on drives that plainly have restrictions set, the
+raw action scan is the check — it types every object as an opaque JSON
+column, so `SELECT id, restrictions FROM open_connector_scan(<gateway>,
+'googledrive.drives.list', '{}', '$.drives')` shows the spellings
+upstream currently emits (the action must be in the gateway's
+`raw_action_allowlist`). The per-caller sibling
 `capabilities` ("capabilities the *current user* has") is deliberately
 unmapped: its values change with the OAuth identity doing the scan, so
 the same table under two connections would disagree.

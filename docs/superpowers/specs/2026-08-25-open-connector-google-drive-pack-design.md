@@ -483,6 +483,49 @@ Mapping it as one `json` column was rejected: a blob no SQL predicate
 can reach without JSON functions is not a usable answer to "which
 drives are domain-restricted".
 
+**Adding a raw `restrictions` json column *alongside* the five booleans
+was weighed separately, and also declined.** The distinction matters
+because the paragraph above argues against json-*instead-of* and says
+nothing about json-*in-addition-to*; review of the 5.9 PR raised the
+additive form, correctly. Its mechanics check out: `path: restrictions`
+IS declared, so such a column would sit inside the fingerprint gate and
+would not enlarge the pinned uncovered set, and an inner-key rename
+would then surface as five NULLs beside a blob carrying the new
+spellings. Three grounds against it. (1) It detects nothing — no
+refusal, no event; it pays off only when a human looks, and a human who
+is looking already has the raw action scan below, so the column buys a
+skipped allowlist entry rather than a capability. (2) It moves the risk
+downstream: the five booleans keep the documentation-sourced spellings
+in ONE reviewed place with a coverage test pinning them, while a blob
+makes every caller re-derive `domainUsersOnly` from Google's docs inside
+a `LIKE` or a JSON function — unreviewed, unpinned, multiplied by the
+number of readers. (3) No pack maps a subtree as `json` while also
+typing scalars out of it; mapping one path into two columns has
+precedent (`owners` here), but this pairing would be a new shape rather
+than the reuse of an old one.
+
+**Where to look when the five come back all-NULL.** The silent case is
+narrower than the caveat first reads: it requires upstream to rename an
+inner key *while still declaring nothing* about the object. Should
+Google start declaring these properties, the declaration changes, the
+fingerprint changes, and registration refuses — loudly, by design. For
+the remaining case the diagnosis path exists today and needs no pack
+change, because a raw action scan types every object as an opaque JSON
+column:
+
+```sql
+SELECT id, restrictions
+FROM open_connector_scan(<gateway>, 'googledrive.drives.list', '{}', '$.drives')
+```
+
+with `googledrive.drives.list` added to the gateway's
+`raw_action_allowlist`. What would actually *close* the class is a
+column spelling that fails when a key is missing under a PRESENT parent
+— the engine already holds exactly that doctrine for object-list plucks
+(a dropped pluck key fails the page instead of yielding an all-null
+list) and has no scalar equivalent. Adding one is engine work for its
+own milestone, not a pack decision.
+
 `useDomainAdminAccess` is never sent: it requires a Workspace admin and
 403s for everyone else, so pinning it would break the common case to
 serve the rare one. `q` is an optional resource here too.
