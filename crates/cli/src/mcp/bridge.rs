@@ -19,6 +19,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::client::{ApiClient, ApiError, encode_component};
 use crate::mcp::projection;
@@ -45,7 +46,7 @@ impl McpBridge {
         McpBridge {
             client,
             tool_map: RwLock::new(HashMap::new()),
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: Uuid::new_v4().to_string(),
         }
     }
 
@@ -60,7 +61,7 @@ impl McpBridge {
             // the three ways to configure it.
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let (tools, map) = projection::project(&inventory);
-        *self.tool_map.write().expect("tool map lock") = map;
+        *self.tool_map.write().unwrap_or_else(|p| p.into_inner()) = map;
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -76,7 +77,7 @@ impl McpBridge {
                 let pipeline = self
                     .tool_map
                     .read()
-                    .expect("tool map lock")
+                    .unwrap_or_else(|p| p.into_inner())
                     .get(name)
                     .cloned();
                 match pipeline {

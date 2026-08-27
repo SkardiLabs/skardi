@@ -22,7 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # The MCP-over-stdio bridge (`skardi mcp`). default-features = false keeps
 # rmcp's HTTP stack (and any axum version skew) out of the dependency graph;
 # `transport-io` is the server-side stdio transport.
-rmcp = { version = "3.1.4", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -39,7 +39,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 # Feature unification: these add the MCP *client* side (spawning the binary
 # as a child process) for the e2e tests only.
-rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-child-process"] }
 tempfile = { workspace = true }
 wiremock = "0.6"
 

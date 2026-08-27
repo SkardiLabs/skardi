@@ -30,11 +30,14 @@ fn sanitize(name: &str) -> String {
 
 /// Assign unique tool names in sorted order of ORIGINAL pipeline name.
 ///
-/// The taken set starts with the reserved built-ins; a candidate equal to a
-/// reserved name is first renamed with `_pipeline` (stderr warning), then
-/// the collision pass appends `_2`, `_3`, ... re-truncating the base so
-/// base + suffix never exceeds 64, iterating until unique against every
-/// name already assigned (reserved and previously suffixed ones included).
+/// The taken set starts with the reserved built-ins; an empty sanitized
+/// candidate (the server does not reject `name: ""` at load time) falls
+/// back to `pipeline` so the listing never carries a name below the
+/// 1-char MCP minimum; a candidate equal to a reserved name is renamed
+/// with `_pipeline` (stderr warning); then the collision pass appends
+/// `_2`, `_3`, ... re-truncating the base so base + suffix never exceeds
+/// 64, iterating until unique against every name already assigned
+/// (reserved and previously suffixed ones included).
 fn assign_tool_names(original_names: &[&str]) -> Vec<(String, String)> {
     let mut sorted: Vec<&str> = original_names.to_vec();
     sorted.sort_unstable();
@@ -42,6 +45,12 @@ fn assign_tool_names(original_names: &[&str]) -> Vec<(String, String)> {
     let mut assigned = Vec::with_capacity(sorted.len());
     for original in sorted {
         let mut candidate = sanitize(original);
+        if candidate.is_empty() {
+            eprintln!(
+                "warning: pipeline name '{original}' sanitizes to an empty MCP tool name; exposing it as `pipeline`"
+            );
+            candidate = "pipeline".to_string();
+        }
         if RESERVED_NAMES.contains(&candidate.as_str()) {
             eprintln!(
                 "warning: pipeline '{original}' collides with the built-in `{candidate}` tool; exposing it as `{candidate}_pipeline`"
@@ -212,6 +221,22 @@ mod tests {
         assert_eq!(map.get("a_b_2").map(String::as_str), Some("a_b"));
         assert_eq!(map.get("a_b_2_2").map(String::as_str), Some("a_b_2"));
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn empty_name_falls_back_and_still_collides_cleanly() {
+        // The server loads `name: ""` without complaint; the tool name must
+        // still satisfy the 1-char minimum. Sorted originals: "" < "pipeline",
+        // so the empty name claims the fallback and the literal one suffixes.
+        let (tools, map) = project(&inventory(json!([
+            {"name": "", "version": "1", "endpoint": "//execute",
+             "description": null, "parameters": []},
+            {"name": "pipeline", "version": "1", "endpoint": "/pipeline/execute",
+             "description": null, "parameters": []}
+        ])));
+        assert_eq!(map.get("pipeline").map(String::as_str), Some(""));
+        assert_eq!(map.get("pipeline_2").map(String::as_str), Some("pipeline"));
+        assert!(tools.iter().all(|t| !t.name.is_empty()));
     }
 
     #[test]
