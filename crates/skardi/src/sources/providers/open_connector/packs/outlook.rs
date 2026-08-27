@@ -186,16 +186,14 @@ mod tests {
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
         EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values,
-        convert_first_page, discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns,
-        input_keys, utf8,
+        convert_first_page, discovery_ok, envelope_err, envelope_ok, execute_inputs,
+        fingerprint_uncovered_columns, input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
         register_open_connector_udtfs,
     };
-    use arrow::array::{
-        Array, BooleanArray, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
-    };
+    use arrow::array::{Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -385,12 +383,7 @@ mod tests {
             utf8(&batch, "conversation_id").value(7),
         );
         assert_eq!(
-            batch
-                .column_by_name("conversation_id")
-                .expect("column")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Utf8")
+            utf8(&batch, "conversation_id")
                 .iter()
                 .flatten()
                 .collect::<std::collections::HashSet<_>>()
@@ -442,12 +435,7 @@ mod tests {
         assert_eq!(utf8(&batch, "well_known_name").value(7), "inbox");
         assert_eq!(utf8(&batch, "well_known_name").value(6), "sentitems");
         assert!(utf8(&batch, "well_known_name").is_null(0));
-        let hidden: &BooleanArray = batch
-            .column_by_name("is_hidden")
-            .expect("column")
-            .as_any()
-            .downcast_ref()
-            .expect("Boolean column");
+        let hidden = boolean(&batch, "is_hidden");
         assert!((0..9).all(|i| !hidden.value(i)));
         let children: &Int64Array = batch
             .column_by_name("child_folder_count")
@@ -981,18 +969,6 @@ bindings:
         .expect("gateway registration succeeds");
         register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
-    }
-
-    fn execute_inputs(gateway: &MockGateway, action_path: &str) -> Vec<Value> {
-        gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "POST" && r.path.ends_with(action_path))
-            .map(|r| {
-                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
-                    .clone()
-            })
-            .collect()
     }
 
     /// The full select pin, as the wire must carry it on every request.

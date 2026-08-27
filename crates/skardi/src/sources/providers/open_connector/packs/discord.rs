@@ -110,14 +110,14 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, boolean, collect, discovery_ok,
-        envelope_ok, fingerprint_uncovered_columns, utf8,
+        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, boolean, collect, column_values,
+        discovery_ok, envelope_ok, execute_inputs, fingerprint_uncovered_columns, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
         register_open_connector_udtfs,
     };
-    use arrow::array::{Array, ListArray, StringArray, UInt64Array};
+    use arrow::array::{Array, ListArray, UInt64Array};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -525,18 +525,6 @@ bindings:
         (gateway, ctx)
     }
 
-    fn execute_inputs(gateway: &MockGateway) -> Vec<Value> {
-        gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "POST")
-            .map(|r| {
-                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
-                    .clone()
-            })
-            .collect()
-    }
-
     fn sorted_keys(input: &Value) -> Vec<String> {
         let mut keys: Vec<String> = input
             .as_object()
@@ -596,19 +584,11 @@ bindings:
         let batches = collect(&ctx, "SELECT id FROM saas.me.guilds").await;
         // Row identity, not just cardinality: the exact ids of both pages
         // survive, in wire order, with no duplicate and no boundary drop.
-        let ids: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let col: &StringArray = b.column(0).as_any().downcast_ref().expect("Utf8 ids");
-                (0..col.len())
-                    .map(|i| col.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let ids = column_values(&batches, "id");
         let expected: Vec<String> = (1..=201).map(|i| format!("g-{i:04}")).collect();
         assert_eq!(ids, expected, "both pages scanned, boundary row intact");
 
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         // Three requests: two row pages plus the terminating empty page —
         // the standard keyset tax.
         assert_eq!(inputs.len(), 3, "two row pages plus the empty terminator");
@@ -673,7 +653,7 @@ bindings:
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 5, "LIMIT truncates the first page");
         assert_eq!(
-            execute_inputs(&gateway).len(),
+            execute_inputs(&gateway, "").len(),
             1,
             "a satisfied LIMIT issues exactly one request — no empty terminator"
         );
@@ -849,7 +829,7 @@ bindings:
         let batches = collect(&ctx, "SELECT connection_type FROM saas.me.connections").await;
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
 
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(inputs.len(), 1, "single_page = exactly one request");
         // The EXACT key set is empty: the action declares no inputs, and
         // single_page injects none — a stray key would be a strict-schema
@@ -890,18 +870,10 @@ bindings:
 
         // Row identity in wire order, not cardinality.
         let batches = collect(&ctx, "SELECT id FROM saas.me.sticker_packs").await;
-        let ids: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let col: &StringArray = b.column(0).as_any().downcast_ref().expect("Utf8 ids");
-                (0..col.len())
-                    .map(|i| col.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let ids = column_values(&batches, "id");
         assert_eq!(ids, ["sp-2", "sp-1"]);
 
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(inputs.len(), 1, "single_page = exactly one request");
         assert_eq!(sorted_keys(&inputs[0]), Vec::<String>::new());
     }

@@ -123,26 +123,42 @@ pub(crate) fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArra
         .unwrap_or_else(|| panic!("column {name} is {:?}, not Boolean", column.data_type()))
 }
 
-/// Every value of a Utf8 column across all result batches, in row order.
-/// Panics on a NULL slot rather than reading the underlying buffer as if
-/// it held a value — a caller asserting over a nullable column needs
-/// options, which this helper deliberately does not offer.
+/// Every value of a Utf8 column across all result batches, in row order;
+/// the panic's row index counts across batches, matching the returned
+/// Vec. Panics on a NULL slot rather than reading the underlying buffer
+/// as if it held a value — a deliberate tightening over the pack-local
+/// originals, which silently yielded `""` there. A caller asserting over
+/// a nullable column needs options, which this helper does not offer.
 pub(crate) fn column_values(batches: &[RecordBatch], name: &str) -> Vec<String> {
+    let mut offset = 0;
     batches
         .iter()
         .flat_map(|batch| {
-            let column = batch
-                .column_by_name(name)
-                .unwrap_or_else(|| panic!("column {name}"));
-            let values = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap_or_else(|| panic!("column {name} is {:?}, not Utf8", column.data_type()))
-                .clone();
+            let values = utf8(batch, name).clone();
+            let base = offset;
+            offset += values.len();
             (0..values.len()).map(move |i| {
-                assert!(!values.is_null(i), "column {name} is NULL at row {i}");
+                assert!(
+                    !values.is_null(i),
+                    "column {name} is NULL at row {}",
+                    base + i
+                );
                 values.value(i).to_string()
             })
+        })
+        .collect()
+}
+
+/// The `input` payload of every execute POST the gateway recorded, in
+/// wire order — filtered to one action when `action_path` is non-empty
+/// (a single-action pack passes `""` and takes every execute).
+pub(crate) fn execute_inputs(gateway: &MockGateway, action_path: &str) -> Vec<Value> {
+    gateway
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with(action_path))
+        .map(|r| {
+            serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"].clone()
         })
         .collect()
 }

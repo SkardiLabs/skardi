@@ -110,8 +110,8 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, boolean, collect, discovery_ok, envelope_ok,
-        fingerprint_uncovered_columns, utf8,
+        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values, discovery_ok,
+        envelope_ok, execute_inputs, fingerprint_uncovered_columns, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -542,34 +542,6 @@ bindings:
         (gateway, ctx)
     }
 
-    fn ids_of(batches: &[RecordBatch]) -> Vec<String> {
-        batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column_by_name("id")
-                    .expect("id column")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Utf8 ids")
-                    .clone();
-                (0..ids.len()).map(move |i| ids.value(i).to_string())
-            })
-            .collect()
-    }
-
-    fn execute_inputs(gateway: &MockGateway) -> Vec<Value> {
-        gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "POST")
-            .map(|r| {
-                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
-                    .clone()
-            })
-            .collect()
-    }
-
     fn chat_row(id: &str) -> Value {
         json!({"chat_id": id, "name": id})
     }
@@ -605,9 +577,9 @@ bindings:
             setup_with_gateway(gateway, "SKARDI_TEST_OC_FEISHU_CHATS", "chats").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.chats ORDER BY id").await;
-        assert_eq!(ids_of(&batches), vec!["oc-1", "oc-2", "oc-3"]);
+        assert_eq!(column_values(&batches, "id"), vec!["oc-1", "oc-2", "oc-3"]);
 
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(inputs.len(), 2, "two cursor pages");
         assert!(inputs[0].get("pageToken").is_none(), "{}", inputs[0]);
         assert_eq!(inputs[1]["pageToken"], "tok-2");
@@ -657,9 +629,9 @@ bindings:
         .await;
         // Inexact pushdown: DataFusion re-trims, so only the matching row
         // survives even though the stub returned both.
-        assert_eq!(ids_of(&batches), vec!["om-1"]);
+        assert_eq!(column_values(&batches, "id"), vec!["om-1"]);
 
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(inputs.len(), 1);
         let input = &inputs[0];
         assert_eq!(input["containerIdType"], "chat", "container kind pin");
@@ -738,7 +710,7 @@ bindings:
             .collect();
         assert_eq!(guids, vec!["t-1"], "status filtering happened locally");
 
-        let input = &execute_inputs(&gateway)[0];
+        let input = &execute_inputs(&gateway, "")[0];
         assert_eq!(input["type"], "my_tasks", "population pin");
         let mut keys: Vec<&str> = input
             .as_object()
@@ -785,7 +757,7 @@ bindings:
 
         let batches = collect(&ctx, "SELECT space_id FROM saas.ws.wiki_spaces").await;
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(
             inputs.len(),
             1,
@@ -844,7 +816,7 @@ bindings:
 
         let batches = collect(&ctx, "SELECT node_token FROM saas.ws.wiki_nodes").await;
         assert_eq!(batches[0].num_rows(), 1);
-        let input = &execute_inputs(&gateway)[0];
+        let input = &execute_inputs(&gateway, "")[0];
         assert_eq!(input["spaceId"], "sp-1", "required resource forwarded");
         assert_eq!(
             input["parentNodeToken"], "wikcn-parent",
@@ -918,9 +890,9 @@ bindings:
             setup_with_gateway(gateway, "SKARDI_TEST_OC_FEISHU_LIMIT", "chats").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.chats LIMIT 2").await;
-        assert_eq!(ids_of(&batches).len(), 2);
+        assert_eq!(column_values(&batches, "id").len(), 2);
         assert_eq!(
-            execute_inputs(&gateway).len(),
+            execute_inputs(&gateway, "").len(),
             1,
             "one page satisfied LIMIT"
         );
@@ -950,7 +922,7 @@ bindings:
 
         let from_table = collect(&ctx, "SELECT member_id, name FROM saas.ws.chat_members").await;
         assert_eq!(
-            execute_inputs(&gateway)[0]["pageSize"],
+            execute_inputs(&gateway, "")[0]["pageSize"],
             100,
             "declared page size rides the wire"
         );

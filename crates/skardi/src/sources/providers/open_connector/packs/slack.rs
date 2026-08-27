@@ -99,14 +99,14 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, boolean, collect, discovery_ok,
-        envelope_err, envelope_ok, utf8,
+        EnvVarGuard, MockGateway, MockResponse, RecordedRequest, boolean, collect, column_values,
+        discovery_ok, envelope_err, envelope_ok, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorError, OpenConnectorGateways,
         register_open_connector_tables, register_open_connector_udtfs,
     };
-    use arrow::array::{Array, ListArray, StringArray, TimestampMillisecondArray, UInt64Array};
+    use arrow::array::{Array, ListArray, TimestampMillisecondArray, UInt64Array};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -580,21 +580,6 @@ bindings:
     }
 
     /// The `id` column of collected batches, in emission order.
-    fn ids_of(batches: &[RecordBatch]) -> Vec<String> {
-        batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column_by_name("id")
-                    .expect("id column")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Utf8 ids")
-                    .clone();
-                (0..ids.len()).map(move |i| ids.value(i).to_string())
-            })
-            .collect()
-    }
 
     fn execute_bodies(gateway: &MockGateway) -> Vec<String> {
         gateway
@@ -861,7 +846,7 @@ bindings:
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.files WHERE user_id = 'U0001'").await;
         assert_eq!(
-            ids_of(&batches),
+            column_values(&batches, "id"),
             vec!["F0001"],
             "exactly U0001's file survives; the ignoring provider's extra row is trimmed"
         );
@@ -915,7 +900,7 @@ bindings:
         )
         .await;
         assert_eq!(
-            ids_of(&batches),
+            column_values(&batches, "id"),
             vec!["F0002", "F0003"],
             "the boundary row stays; the older row is filtered locally"
         );
@@ -1069,7 +1054,10 @@ bindings:
         let ctx = setup(&gateway, "users", "SKARDI_TEST_OC_SLACK_USERS_CURSOR").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.users ORDER BY id").await;
-        assert_eq!(ids_of(&batches), vec!["U0001", "U0002", "U0003"]);
+        assert_eq!(
+            column_values(&batches, "id"),
+            vec!["U0001", "U0002", "U0003"]
+        );
 
         let inputs: Vec<Value> = execute_bodies(&gateway)
             .iter()

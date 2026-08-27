@@ -162,8 +162,8 @@ mod tests {
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
         EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values,
-        convert_first_page, discovery_ok, envelope_err, envelope_ok, fingerprint_uncovered_columns,
-        input_keys, utf8,
+        convert_first_page, discovery_ok, envelope_err, envelope_ok, execute_inputs,
+        fingerprint_uncovered_columns, input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -1322,18 +1322,6 @@ bindings:
         .expect("gateway registration succeeds");
         register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
-    }
-
-    fn execute_inputs(gateway: &MockGateway, action_path: &str) -> Vec<Value> {
-        gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "POST" && r.path.ends_with(action_path))
-            .map(|r| {
-                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
-                    .clone()
-            })
-            .collect()
     }
 
     /// A minimal normalized file row: identity plus enough to prove the
