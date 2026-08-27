@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "tag": "file",
+      "name": "fine.txt",
+      "sizeBytes": 12
+    },
+    {
+      "tag": "file",
+      "name": "broken.txt",
+      "sizeBytes": "not-a-number"
+    }
+  ],
+  "cursor": "AAGxYzRedactedCursorValue",
+  "hasMore": false
+}

@@ -38,7 +38,9 @@ use crate::sources::providers::open_connector::error::OpenConnectorError;
 use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
-use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+use crate::sources::providers::open_connector::pagination::{
+    CursorContinuation, PaginationStrategy,
+};
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
     FixedValue, SourcePack, SourcePackTable,
@@ -133,12 +135,14 @@ fn convert_table(
         };
         fixed_inputs.push((leak_str(key), fixed));
     }
+    let action_id = leak_str(doc.action);
+    let (pagination, continuation) = doc.pagination.into_parts(action_id);
     let table = SourcePackTable {
         id,
-        action_id: leak_str(doc.action),
+        action_id,
         row_path: leak_str(doc.row_path),
         fields: leak_slice(fields),
-        pagination: doc.pagination.into_strategy(),
+        pagination,
         required_resources: leak_str_slice(doc.resources.required),
         optional_resources: leak_str_slice(doc.resources.optional),
         exclusive_resources: leak_str_groups(doc.resources.exclusive),
@@ -146,6 +150,7 @@ fn convert_table(
         filters: leak_slice(filters),
         error_path: doc.error_path.map(leak_str),
         expected_fingerprint: doc.fingerprint.map(leak_str),
+        continuation,
     };
     validate_table(&table)?;
     Ok(table)
@@ -266,26 +271,13 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     // predicate DataFusion never reapplies. Filter-vs-fixed-input overlap
     // is the one DELIBERATE collision (a pushed predicate overrides the
     // complete-collection pin) and stays legal.
-    let pagination_params: Vec<&str> = match table.pagination {
-        PaginationStrategy::PageNumber {
-            page_param,
-            per_page_param,
-            ..
-        } => vec![page_param, per_page_param],
-        PaginationStrategy::Cursor {
-            cursor_param,
-            page_size_param,
-            ..
-        } => std::iter::once(cursor_param)
-            .chain(page_size_param)
-            .collect(),
-        PaginationStrategy::Keyset {
-            cursor_param,
-            page_size_param,
-            ..
-        } => vec![cursor_param, page_size_param],
-        PaginationStrategy::SinglePage { .. } => Vec::new(),
-    };
+    //
+    // The strategy -> params mapping lives on `SourcePackTable` so this
+    // gate and the continuation input gates read the same list: this
+    // function used to carry its own copy of the match, and the two had
+    // already drifted once (`Keyset`/`single_page` arrived with the
+    // Discord pack and only one side was widened).
+    let pagination_params: Vec<&str> = table.pagination_input_keys();
     // An empty param name — under ANY strategy — would survive to scan
     // time as a literal `""` input key: a strict gateway's 400 blamed on
     // the request, or a lax gateway's page-1 refetch misdiagnosed as a
@@ -399,6 +391,76 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 "{id}: pagination input '{param}' collides with a declared resource — \
                  pagination is applied last and would overwrite the binding's value \
                  from page 2 onward"
+            ));
+        }
+    }
+    if let Some(continuation) = table.continuation {
+        // Half a gate is worse than an obvious hole: a table pinning its
+        // continuation action while leaving its OWN action unpinned would
+        // read as gated and verify only pages 2..N.
+        if table.expected_fingerprint.is_none() {
+            return Err(format!(
+                "{id}: continuation declares a fingerprint but the table does not; pin \
+                 the table's own action too or neither is gated"
+            ));
+        }
+        if continuation.action_id == table.action_id && !continuation.cursor_only {
+            // Same action, same inputs, same everything — the declaration
+            // describes exactly the default behavior, so it is either a
+            // no-op or (more likely) a missing `inputs: cursor_only`.
+            return Err(format!(
+                "{id}: continuation repeats the table's own action with the full input, \
+                 which is the default; drop the block or declare `inputs: cursor_only`"
+            ));
+        }
+        // One action, one discovered schema, one fingerprint. Two pins that
+        // disagree cannot BOTH be satisfied by any gateway, so this is
+        // unsatisfiable by construction rather than merely suspicious —
+        // and left to runtime it surfaces as a contract-gate failure
+        // pointing at the schema instead of at the two lines that cannot
+        // both be right. (The `open_connector_query` path looks the
+        // expectation up by action id and would silently check the first
+        // of the two; refusing here is what makes that lookup sound.)
+        if continuation.action_id == table.action_id
+            && table.expected_fingerprint != Some(continuation.expected_fingerprint)
+        {
+            return Err(format!(
+                "{id}: continuation names the table's own action '{}' but pins a different \
+                 fingerprint ({} vs {}); one action has one contract, so no gateway can \
+                 satisfy both",
+                continuation.action_id,
+                table.expected_fingerprint.unwrap_or("<none>"),
+                continuation.expected_fingerprint
+            ));
+        }
+        // `cursor_only` deliberately drops every non-cursor input on pages
+        // 2..N. An `Exact` filter is mapped to
+        // `TableProviderFilterPushDown::Exact`, which DELETES the `Filter`
+        // node from the plan — so page one applies the predicate as an
+        // action input and pages 2..N cannot, with no node left to
+        // re-apply it. That returns rows the query excluded, silently:
+        // the same failure class as a pushdown leak, and refused the same
+        // way. `Inexact` stays legal — the `Filter` node survives, so
+        // DataFusion re-applies the predicate and the ROWS are right. The
+        // waste is not free, though: pages 2..N fetch the unfiltered
+        // collection, and the scan bounds count what the gateway returned,
+        // not what survived the filter (`exec.rs` raises
+        // `ScanBoundsExceeded` off `rows_emitted`/page count pre-filter).
+        // So a selective `Inexact` filter moves the effective volume from
+        // the filtered subset to the whole collection, and wants
+        // `max_rows`/`max_pages` headroom sized for it — otherwise a query
+        // that works today becomes a hard scan failure, not a slower one.
+        if continuation.cursor_only
+            && let Some(filter) = table
+                .filters
+                .iter()
+                .find(|f| matches!(f.fidelity, Fidelity::Exact))
+        {
+            return Err(format!(
+                "{id}: filter on '{}' is Exact, which removes the Filter node from the \
+                 plan, but `inputs: cursor_only` cannot carry the predicate past page one; \
+                 declare the filter Inexact or drop `cursor_only`",
+                filter.input_field
             ));
         }
     }
@@ -552,6 +614,11 @@ enum PaginationDoc {
         page_size: u32,
         #[serde(default)]
         has_more_path: Option<String>,
+        /// Split-action continuation. Nested under the cursor variant so a
+        /// `page_number` table declaring one is a `deny_unknown_fields`
+        /// parse error — the invariant costs no hand-written check.
+        #[serde(default)]
+        continuation: Option<ContinuationDoc>,
     },
     /// No pagination envelope: the next cursor is a field of the previous
     /// page's LAST ROW (Discord's `after`). Only an empty page terminates
@@ -585,8 +652,42 @@ enum PaginationDoc {
     },
 }
 
+/// How pages 2..N are served, when not by repeating the table's action
+/// with the full input.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinuationDoc {
+    /// Action serving pages 2..N; defaults to the table's own action, for
+    /// providers that keep the action but reject its opening inputs
+    /// alongside a cursor.
+    #[serde(default)]
+    action: Option<String>,
+    /// Contract fingerprint of the continuation action — never optional:
+    /// this action serves most of a long scan.
+    fingerprint: String,
+    #[serde(default)]
+    inputs: ContinuationInputsDoc,
+}
+
+/// Which inputs a continuation request carries.
+#[derive(Deserialize, Default)]
+enum ContinuationInputsDoc {
+    /// The full assembled input, as page one — the conservative default.
+    #[serde(rename = "full")]
+    #[default]
+    Full,
+    /// The cursor and nothing else (Dropbox's `*_continue` actions).
+    #[serde(rename = "cursor_only")]
+    CursorOnly,
+}
+
 impl PaginationDoc {
-    fn into_strategy(self) -> PaginationStrategy {
+    /// Split into the engine's strategy and the table-level continuation
+    /// decl. `table_action` supplies the continuation's default action.
+    fn into_parts(
+        self,
+        table_action: &'static str,
+    ) -> (PaginationStrategy, Option<CursorContinuation>) {
         match self {
             Self::PageNumber {
                 page_input,
@@ -594,40 +695,57 @@ impl PaginationDoc {
                 page_size,
                 total_pages_path,
                 raw_page_size_path,
-            } => PaginationStrategy::PageNumber {
-                page_param: leak_str(page_input),
-                per_page_param: leak_str(page_size_input),
-                per_page: page_size,
-                total_pages_path: total_pages_path.map(leak_str),
-                raw_page_size_path: raw_page_size_path.map(leak_str),
-            },
+            } => (
+                PaginationStrategy::PageNumber {
+                    page_param: leak_str(page_input),
+                    per_page_param: leak_str(page_size_input),
+                    per_page: page_size,
+                    total_pages_path: total_pages_path.map(leak_str),
+                    raw_page_size_path: raw_page_size_path.map(leak_str),
+                },
+                None,
+            ),
             Self::Cursor {
                 cursor_input,
                 next_cursor_path,
                 page_size_input,
                 page_size,
                 has_more_path,
-            } => PaginationStrategy::Cursor {
-                cursor_param: leak_str(cursor_input),
-                next_cursor_path: leak_str(next_cursor_path),
-                page_size_param: page_size_input.map(leak_str),
-                page_size,
-                has_more_path: has_more_path.map(leak_str),
-            },
+                continuation,
+            } => (
+                PaginationStrategy::Cursor {
+                    cursor_param: leak_str(cursor_input),
+                    next_cursor_path: leak_str(next_cursor_path),
+                    page_size_param: page_size_input.map(leak_str),
+                    page_size,
+                    has_more_path: has_more_path.map(leak_str),
+                },
+                continuation.map(|doc| CursorContinuation {
+                    action_id: doc.action.map_or(table_action, leak_str),
+                    expected_fingerprint: leak_str(doc.fingerprint),
+                    cursor_only: matches!(doc.inputs, ContinuationInputsDoc::CursorOnly),
+                }),
+            ),
             Self::Keyset {
                 cursor_input,
                 row_cursor_field,
                 page_size_input,
                 page_size,
-            } => PaginationStrategy::Keyset {
-                cursor_param: leak_str(cursor_input),
-                row_cursor_field: leak_str(row_cursor_field),
-                page_size_param: leak_str(page_size_input),
-                page_size,
-            },
-            Self::SinglePage { next_cursor_path } => PaginationStrategy::SinglePage {
-                next_cursor_path: next_cursor_path.map(leak_str),
-            },
+            } => (
+                PaginationStrategy::Keyset {
+                    cursor_param: leak_str(cursor_input),
+                    row_cursor_field: leak_str(row_cursor_field),
+                    page_size_param: leak_str(page_size_input),
+                    page_size,
+                },
+                None,
+            ),
+            Self::SinglePage { next_cursor_path } => (
+                PaginationStrategy::SinglePage {
+                    next_cursor_path: next_cursor_path.map(leak_str),
+                },
+                None,
+            ),
         }
     }
 }
@@ -1466,5 +1584,200 @@ tables:
             let err = pack_with(body).expect_err(expected);
             assert!(err.contains(expected), "want {expected:?} in: {err}");
         }
+    }
+
+    #[test]
+    fn split_action_continuation_parses_with_its_defaults() {
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.entries"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size_input: limit
+      page_size: 2000
+      has_more_path: "$.hasMore"
+      continuation:
+        action: demo.list_continue
+        fingerprint: bb
+        inputs: cursor_only
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+        )
+        .expect("continuation parses");
+        let continuation = pack.tables[0].continuation.expect("declared");
+        assert_eq!(continuation.action_id, "demo.list_continue");
+        assert_eq!(continuation.expected_fingerprint, "bb");
+        assert!(continuation.cursor_only);
+
+        // Both actions are executed, and both are gated.
+        let table = &pack.tables[0];
+        assert_eq!(
+            table.actions().collect::<Vec<_>>(),
+            vec!["demo.list", "demo.list_continue"]
+        );
+        assert_eq!(
+            table.gated_actions().collect::<Vec<_>>(),
+            vec![("demo.list", "aa"), ("demo.list_continue", "bb")]
+        );
+    }
+
+    #[test]
+    fn continuation_action_defaults_to_the_tables_own() {
+        // The same-action flavor: a provider that keeps the action but
+        // rejects the opening inputs alongside a cursor.
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.entries"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 100
+      continuation:
+        fingerprint: aa
+        inputs: cursor_only
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+        )
+        .expect("continuation parses");
+        let continuation = pack.tables[0].continuation.expect("declared");
+        assert_eq!(continuation.action_id, "demo.list");
+        assert!(continuation.cursor_only);
+    }
+
+    #[test]
+    fn continuation_invariants_are_rejected_with_targeted_errors() {
+        for (body, expected) in [
+            // A continuation on a page-number table is nonsense; the YAML
+            // nesting makes it a deny_unknown_fields parse error for free.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination:
+      strategy: page_number
+      page_input: page
+      page_size_input: perPage
+      page_size: 10
+      continuation: { fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "unknown field",
+            ),
+            // Half a gate: pages 2..N pinned, page one unpinned.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { action: demo.list_continue, fingerprint: bb }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "the table does not",
+            ),
+            // Describes the default behavior — a no-op block, or (far more
+            // likely) a forgotten `inputs: cursor_only`.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { fingerprint: aa }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "which is the default",
+            ),
+            // The fingerprint is never optional on a continuation.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { action: demo.list_continue, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "missing field `fingerprint`",
+            ),
+            // One action has one contract, so two disagreeing pins on it
+            // cannot both be satisfied by any gateway.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+                "pins a different fingerprint",
+            ),
+            // The silent-wrong-rows pairing: an Exact filter deletes the
+            // Filter node from the plan, and `cursor_only` cannot carry
+            // the predicate past page one.
+            (
+                r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { action: demo.list_continue, fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: true }
+    filters:
+      - { column: state, op: eq, input: state, fidelity: exact }"#,
+                "cannot carry the predicate past page one",
+            ),
+        ] {
+            let err = pack_with(body).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
+    }
+
+    #[test]
+    fn an_inexact_filter_stays_legal_alongside_a_cursor_only_continuation() {
+        // The contrast case for the gate above. `Inexact` maps to
+        // `TableProviderFilterPushDown::Inexact`, which KEEPS the `Filter`
+        // node, so pages 2..N losing the pushed input is merely wasteful —
+        // DataFusion re-applies the predicate and the rows stay correct.
+        // Refusing this too would have been a false alarm.
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    fingerprint: aa
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size: 10
+      continuation: { action: demo.list_continue, fingerprint: bb, inputs: cursor_only }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+      - { name: state, path: state, type: utf8, nullable: true }
+    filters:
+      - { column: state, op: eq, input: state, fidelity: inexact }"#,
+        )
+        .expect("an Inexact filter cannot return rows the query excluded");
+        assert_eq!(pack.tables[0].filters.len(), 1);
     }
 }

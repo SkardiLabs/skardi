@@ -206,21 +206,43 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
             }
         }
 
-        // Same discovery and compatibility gates as YAML registration: the
-        // action must have been discovered when the gateway registered, and
-        // must still match the pack's expected contract fingerprint.
-        let meta = discovered_action(&handle, &gateway, table.action_id)?;
-        if let Some(expected) = table.expected_fingerprint
-            && meta.fingerprint() != expected
-        {
-            return Err(plan_error(OpenConnectorError::ActionContractMismatch {
-                table: table.id.to_string(),
-                reason: format!(
-                    "action '{}' fingerprint mismatch (expected {expected}, discovered {})",
-                    table.action_id,
-                    meta.fingerprint()
-                ),
-            }));
+        // Same discovery and compatibility gates as YAML registration: every
+        // action the table executes must have been discovered when the
+        // gateway registered, and must still match the pack's expected
+        // contract fingerprint.
+        //
+        // The loop is driven by `actions()`, NOT by `gated_actions()`,
+        // because an UNPINNED table still has to have been discovered and
+        // `gated_actions()` skips it. The expectation is looked up inside
+        // by action id, so the two paths check the same pairs — with one
+        // caveat that the loader is what closes: a lookup by id can only
+        // return one expectation per id, so a same-action continuation
+        // pinning a fingerprint different from the table's own would be
+        // half-checked here. `packs::loader` refuses that combination at
+        // registration (it is unsatisfiable by any gateway anyway), which
+        // is what makes this lookup equivalent to iterating the pairs.
+        for action_id in table.actions() {
+            let meta = discovered_action(&handle, &gateway, action_id)?;
+            if let Some((_, expected)) = table.gated_actions().find(|(id, _)| *id == action_id)
+                && meta.fingerprint() != expected
+            {
+                return Err(plan_error(OpenConnectorError::ActionContractMismatch {
+                    table: table.id.to_string(),
+                    reason: format!(
+                        "action '{action_id}' fingerprint mismatch (expected {expected}, discovered {})",
+                        meta.fingerprint()
+                    ),
+                }));
+            }
+            // Same input-schema gate the YAML path runs, on the same
+            // helper and in one call: an `inputs:` claim must not be
+            // admitted by one entry point and refused by the other, in
+            // either of its two spellings.
+            if table.continuation.is_some_and(|c| c.action_id == action_id) {
+                table
+                    .check_continuation_inputs(meta.input_schema())
+                    .map_err(plan_error)?;
+            }
         }
 
         let provider = OpenConnectorTableProvider::new(
@@ -330,6 +352,9 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 error_path: None,
                 fixed_inputs: &[],
                 source_pack_version: 0,
+                // Raw scans declare no pagination contract at all, so
+                // there is no listing to continue.
+                continuation: None,
             },
             converter,
             row_path,
