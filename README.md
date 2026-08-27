@@ -171,13 +171,43 @@ you:
 /plugin install auto-context@skardi-skills
 ```
 
-[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context)
+[`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
-pointed at Postgres + pgvector, MongoDB, or Lance. The same skill also runs on
-Codex, Cursor, Pi, dsh, OpenClaw, and Hermes; per-host installation instructions
-are in the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+pointed at Postgres + pgvector, MongoDB, or Lance.
+[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
+teaches the agent to answer questions from a `skardi-server` you already run.
+
+**Other Agent Skills hosts** — the same two skills run on Codex, Cursor, Pi,
+dsh, OpenClaw and Hermes. They differ only in where the skill directory goes,
+and all of them install from a checkout:
+
+```bash
+git clone https://github.com/SkardiLabs/skardi-skills.git && cd skardi-skills
+```
+
+Codex, Cursor, Pi and dsh all read the cross-tool `~/.agents/skills/`
+convention, so one copy covers all four:
+
+```bash
+mkdir -p ~/.agents/skills
+cp -r auto-context/skills/auto-context ~/.agents/skills/auto-context
+cp -r retrieval/skills/retrieval ~/.agents/skills/retrieval
+```
+
+[OpenClaw](https://docs.openclaw.ai/cli/skills) installs through its own CLI
+instead of copying, and [Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)
+reads `~/.hermes/skills/`:
+
+```bash
+openclaw skills install ./auto-context/skills/auto-context   # add --global for every workspace
+mkdir -p ~/.hermes/skills && cp -r auto-context/skills/auto-context ~/.hermes/skills/auto-context
+```
+
+Per-host native directories, project-scoped installs and the Hermes
+`external_dirs` option are covered in the
+[skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
 **CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
 build from source — the one-liner below has no published artifact there):
