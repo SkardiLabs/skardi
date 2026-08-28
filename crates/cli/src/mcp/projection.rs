@@ -6,9 +6,15 @@ use std::collections::{HashMap, HashSet};
 use rmcp::model::{JsonObject, Tool};
 use serde_json::{Value, json};
 
+/// The built-in tool names. `builtin_tools()` and the bridge's dispatch
+/// match use these same constants, and `RESERVED_NAMES` is built from them,
+/// so the three sites cannot drift apart.
+pub(crate) const QUERY: &str = "query";
+pub(crate) const LIST_DATA_SOURCES: &str = "list_data_sources";
+
 /// Tool names claimed by the built-ins; a pipeline sanitizing to one of
 /// these is renamed with a `_pipeline` suffix.
-pub(crate) const RESERVED_NAMES: [&str; 2] = ["query", "list_data_sources"];
+pub(crate) const RESERVED_NAMES: [&str; 2] = [QUERY, LIST_DATA_SOURCES];
 
 /// MCP clients commonly enforce `^[a-zA-Z0-9_-]{1,64}$` for tool names.
 const MAX_TOOL_NAME: usize = 64;
@@ -99,14 +105,39 @@ fn pipeline_tool(tool_name: &str, pipeline_name: &str, entry: &Value) -> Tool {
         Some(d) if !d.trim().is_empty() => format!("{d} (pipeline `{pipeline_name}`)"),
         _ => format!("Execute pipeline `{pipeline_name}`"),
     };
+    // No `parameters` key means a server predating the enriched inventory
+    // (the bridge may front a remote deployment, so version skew is a
+    // supported state). Publish an OPEN schema rather than a closed empty
+    // one: the model's attempt then reaches the server, whose error names
+    // the missing parameters — degraded but usable. A present-but-empty
+    // `parameters: []` is a real zero-parameter pipeline and keeps the
+    // closed empty schema below.
+    let Some(params) = entry.get("parameters").and_then(Value::as_array) else {
+        eprintln!(
+            "warning: pipeline '{pipeline_name}' carries no `parameters` in the inventory \
+             (skardi-server older than the CLI?); publishing an open input schema"
+        );
+        let open_schema = serde_json::from_value(json!({
+            "type": "object",
+            "additionalProperties": true
+        }))
+        .expect("open schema is a JSON object");
+        return Tool::new(tool_name.to_string(), description, open_schema);
+    };
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
-    if let Some(params) = entry["parameters"].as_array() {
-        for param in params {
-            if let Some(name) = param["name"].as_str() {
-                properties.insert(name.to_string(), param["json_schema"].clone());
-                required.push(name.to_string());
-            }
+    for param in params {
+        if let Some(name) = param["name"].as_str() {
+            // Version-skew guard: a property's schema must be an object or
+            // boolean; anything else (Null from a missing key) would make
+            // the whole listing invalid for strict hosts. `{}` = accept
+            // anything, the server stays the validator.
+            let schema = match &param["json_schema"] {
+                v @ (Value::Object(_) | Value::Bool(_)) => v.clone(),
+                _ => json!({}),
+            };
+            properties.insert(name.to_string(), schema);
+            required.push(name.to_string());
         }
     }
     Tool::new(
@@ -137,14 +168,14 @@ pub(crate) fn builtin_tools() -> Vec<Tool> {
     let list_data_sources_schema = object_schema(json!({}), Vec::new());
     vec![
         Tool::new(
-            "query",
+            QUERY,
             "Run ad-hoc SQL against Skardi's federated engine. DML is only accepted on \
              data sources configured with access_mode: read_write; DDL is always \
              rejected. Use list_data_sources first to see available tables.",
             query_schema,
         ),
         Tool::new(
-            "list_data_sources",
+            LIST_DATA_SOURCES,
             "List Skardi's data sources: tables, column schemas, and plain-English \
              semantic descriptions. Call this before writing ad-hoc SQL with `query`.",
             list_data_sources_schema,
@@ -296,6 +327,59 @@ mod tests {
             tool.description.as_deref(),
             Some("Search products (pipeline `p`)")
         );
+    }
+
+    #[test]
+    fn missing_parameters_key_publishes_an_open_schema() {
+        // Version skew: a server predating the enriched inventory has no
+        // `parameters` key at all. A closed empty schema would make the tool
+        // silently unusable; the open schema lets attempts reach the server.
+        let (tools, _) = project(&inventory(json!([
+            {"name": "old", "version": "1", "endpoint": "/old/execute"}
+        ])));
+        let tool = tools.iter().find(|t| t.name.as_ref() == "old").unwrap();
+        let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+        assert_eq!(
+            schema,
+            json!({"type": "object", "additionalProperties": true})
+        );
+        // an explicitly empty list is a real zero-parameter pipeline and
+        // keeps the closed empty schema
+        let (tools, _) = project(&inventory(json!([
+            {"name": "empty", "version": "1", "endpoint": "/empty/execute",
+             "description": null, "parameters": []}
+        ])));
+        let tool = tools.iter().find(|t| t.name.as_ref() == "empty").unwrap();
+        let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!([]));
+    }
+
+    #[test]
+    fn missing_json_schema_falls_back_to_accept_anything() {
+        // `param["json_schema"]` on an entry without the key yields Null,
+        // which is not a legal property schema — strict hosts would reject
+        // the whole listing. It must degrade to `{}` instead.
+        let (tools, _) = project(&inventory(json!([
+            {"name": "p", "version": "1", "endpoint": "/p/execute",
+             "description": null,
+             "parameters": [{"name": "brand", "data_type": "Utf8"}]}
+        ])));
+        let tool = tools.iter().find(|t| t.name.as_ref() == "p").unwrap();
+        let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+        assert_eq!(schema["properties"]["brand"], json!({}));
+        assert_eq!(schema["required"], json!(["brand"]));
+    }
+
+    #[test]
+    fn builtin_tool_names_match_the_reserved_set() {
+        // The reserved set seeds `taken` in assign_tool_names while project()
+        // appends builtin_tools() unconditionally — a built-in missing from
+        // RESERVED_NAMES would let a pipeline claim its name and the listing
+        // would carry duplicates. This pins the two sets to each other.
+        let tools = builtin_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(names, RESERVED_NAMES);
     }
 
     #[test]

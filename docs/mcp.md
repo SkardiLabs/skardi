@@ -87,6 +87,11 @@ arrays before execution), and multi-row `VALUES {name}` placeholders are
 typed as array-of-arrays with non-empty rows. Every parameter is required
 and unknown keys are rejected.
 
+Every pipeline call carries the connection's session id as
+`X-Skardi-Session-Id` — the same id `query` sends in
+`ai_context.session_id` — so one MCP session's pipeline runs and ad-hoc
+queries group together in the query audit ledger.
+
 ### `query`
 
 Ad-hoc SQL against the federated engine — the MCP face of `POST /query`.

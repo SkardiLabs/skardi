@@ -71,8 +71,8 @@ impl McpBridge {
         args: Option<JsonObject>,
     ) -> Result<CallToolResult, ErrorData> {
         let outcome = match name {
-            "query" => self.call_query(args).await,
-            "list_data_sources" => self.client.get("/data_source").await,
+            projection::QUERY => self.call_query(args).await,
+            projection::LIST_DATA_SOURCES => self.client.get("/data_source").await,
             _ => {
                 let pipeline = self
                     .tool_map
@@ -83,10 +83,21 @@ impl McpBridge {
                 match pipeline {
                     Some(pipeline) => {
                         // Arguments pass through as the flat execute body —
-                        // the server is the validator.
+                        // the server is the validator. The session header
+                        // gives pipeline runs the same ledger attribution as
+                        // `query`'s ai_context.session_id (the server reads
+                        // it in execute_pipeline_by_name), so the surface the
+                        // INSTRUCTIONS steer the model toward is not the
+                        // unattributed one.
                         let body = Value::Object(args.unwrap_or_default());
                         let path = format!("/{}/execute", encode_component(&pipeline));
-                        self.client.post(&path, &body).await
+                        self.client
+                            .post_with_headers(
+                                &path,
+                                &body,
+                                &[("x-skardi-session-id", &self.session_id)],
+                            )
+                            .await
                     }
                     None => {
                         // Protocol-level: covers host bugs and a server
@@ -242,6 +253,35 @@ mod tests {
         bridge.do_list_tools().await.unwrap(); // builds the dispatch map
         let args = json!({"brand": "acme"}).as_object().cloned();
         let result = bridge.do_call_tool("product-search", args).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn pipeline_call_carries_the_connection_session_id_header() {
+        // Ledger attribution parity: pipeline runs must land under the same
+        // session id that `query` sends in ai_context.session_id.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(inventory()))
+            .mount(&server)
+            .await;
+        let bridge = bridge_for(&server);
+        Mock::given(method("POST"))
+            .and(path("/product-search/execute"))
+            .and(wiremock::matchers::header(
+                "x-skardi-session-id",
+                bridge.session_id.as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"success": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        bridge.do_list_tools().await.unwrap();
+        let result = bridge
+            .do_call_tool("product-search", json!({"brand": "x"}).as_object().cloned())
+            .await
+            .unwrap();
         assert_eq!(result.is_error, Some(false));
     }
 
