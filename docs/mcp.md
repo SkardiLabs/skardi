@@ -82,8 +82,10 @@ server-side errors); pipelines without a description get
 from the inferred Arrow type — strings, integers, numbers, booleans, dates,
 timestamps, and arrays all map to their JSON Schema counterparts, each
 nullable (`"type": ["string", "null"]`) because explicit `NULL` is a valid
-parameter value. Multi-row `VALUES {name}` placeholders are typed as
-array-of-arrays. Every parameter is required and unknown keys are rejected.
+parameter value. Arrays declare `minItems: 1` (the server rejects empty
+arrays before execution), and multi-row `VALUES {name}` placeholders are
+typed as array-of-arrays with non-empty rows. Every parameter is required
+and unknown keys are rejected.
 
 ### `query`
 

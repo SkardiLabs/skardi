@@ -424,7 +424,11 @@ spec:
     assert_eq!(params[0]["data_type"].as_str(), Some("Utf8"));
     assert_eq!(
         params[0]["json_schema"],
-        json!({"type": "array", "items": {"type": "array"}})
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "array", "minItems": 1}
+        })
     );
 }
 

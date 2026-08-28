@@ -17,11 +17,19 @@ pub(crate) fn param_json_schema(
 ) -> Value {
     // `VALUES {name}` is a multi-row tuple list at request time; the inferred
     // Utf8 would be an actively wrong constraint, so it overrides wholesale.
+    // minItems on both levels: the renderer rejects `[]` (no zero-row VALUES
+    // expansion) and `[[]]` (rows must have a non-zero, consistent width) —
+    // equal width itself is not expressible in JSON Schema, so the renderer
+    // remains the backstop for that half.
     if VALUES_PLACEHOLDER_RE
         .captures_iter(sql_template)
         .any(|cap| &cap[1] == param_name)
     {
-        return json!({"type": "array", "items": {"type": "array"}});
+        return json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "array", "minItems": 1}
+        });
     }
     with_null_union(base_fragment(field_type))
 }
@@ -36,7 +44,13 @@ fn base_fragment(field_type: &DataType) -> Value {
         DataType::Date32 | DataType::Date64 => json!({"type": "string", "format": "date"}),
         DataType::Timestamp(_, _) => json!({"type": "string", "format": "date-time"}),
         DataType::List(inner) => {
-            json!({"type": "array", "items": base_fragment(inner.data_type())})
+            // minItems: the renderer rejects every empty array ("provide at
+            // least one row/element"); nesting inherits it via the recursion.
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "items": base_fragment(inner.data_type())
+            })
         }
         _ => json!({}),
     }
@@ -108,7 +122,7 @@ mod tests {
         let dt = DataType::List(Field::new("item", DataType::Utf8, true).into());
         assert_eq!(
             schema(dt),
-            json!({"type": ["array", "null"], "items": {"type": "string"}})
+            json!({"type": ["array", "null"], "minItems": 1, "items": {"type": "string"}})
         );
     }
 
@@ -122,7 +136,11 @@ mod tests {
         let sql = "INSERT INTO docs (id, name, vec) values {rows}";
         assert_eq!(
             param_json_schema(&DataType::Utf8, sql, "rows"),
-            json!({"type": "array", "items": {"type": "array"}})
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "array", "minItems": 1}
+            })
         );
         // only the parameter named in the VALUES clause gets the override
         assert_eq!(

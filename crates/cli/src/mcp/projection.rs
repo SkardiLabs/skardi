@@ -122,6 +122,9 @@ pub(crate) fn builtin_tools() -> Vec<Tool> {
             "sql": {"type": "string"},
             "max_rows": {
                 "type": "integer",
+                // The server rejects 0 ("must be a positive integer") and a
+                // negative value fails its usize deserialization outright.
+                "minimum": 1,
                 "description": "Result row cap; server default 1000."
             },
             "purpose": {
@@ -303,6 +306,7 @@ mod tests {
         assert_eq!(schema["required"], json!(["sql"]));
         assert_eq!(schema["properties"]["sql"], json!({"type": "string"}));
         assert_eq!(schema["properties"]["max_rows"]["type"], json!("integer"));
+        assert_eq!(schema["properties"]["max_rows"]["minimum"], json!(1));
         assert!(schema["properties"]["purpose"].is_object());
         assert_eq!(schema["additionalProperties"], json!(false));
         let lds = tools
