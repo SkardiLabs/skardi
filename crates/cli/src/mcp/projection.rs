@@ -117,7 +117,7 @@ fn pipeline_tool(tool_name: &str, pipeline_name: &str, entry: &Value) -> Tool {
             "warning: pipeline '{pipeline_name}' carries no `parameters` in the inventory \
              (skardi-server older than the CLI?); publishing an open input schema"
         );
-        let open_schema = serde_json::from_value(json!({
+        let open_schema: JsonObject = serde_json::from_value(json!({
             "type": "object",
             "additionalProperties": true
         }))
