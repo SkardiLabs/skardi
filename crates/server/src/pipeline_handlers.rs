@@ -388,10 +388,20 @@ fn enriched_parameters(pipeline: &StandardPipeline) -> Vec<Value> {
     fields
         .into_iter()
         .map(|(name, field)| {
+            let mut schema = param_json_schema(&field.field_type, sql, name);
+            // The author's one-liner rides inside the JSON Schema itself
+            // (standard `description` keyword), so schema consumers — the
+            // MCP bridge copies it verbatim into the tool's properties —
+            // surface it with no changes of their own.
+            if let Some(doc) = pipeline.parameter_docs.get(name) {
+                if !doc.trim().is_empty() {
+                    schema["description"] = serde_json::json!(doc);
+                }
+            }
             serde_json::json!({
                 "name": name,
                 "data_type": format!("{:?}", field.field_type),
-                "json_schema": param_json_schema(&field.field_type, sql, name),
+                "json_schema": schema,
             })
         })
         .collect()
