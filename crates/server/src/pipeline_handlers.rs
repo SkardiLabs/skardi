@@ -444,23 +444,18 @@ pub async fn get_pipelines_info(
     })?;
 
     if let Some(pipeline) = config.pipelines.get(&name) {
-        let sql = &pipeline.query_definition().sql;
-        let mut fields: Vec<_> = pipeline.request_schema().fields.iter().collect();
-        fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let params: Vec<Value> = fields
-            .into_iter()
-            .map(|(param_name, field_type)| {
-                serde_json::json!({
-                    "name": param_name,
-                    // Legacy Debug dump of the whole InferredFieldType, kept
-                    // as-is; `data_type` and `json_schema` are the additive,
-                    // machine-consumable forms.
-                    "type": format!("{:?}", field_type),
-                    "data_type": format!("{:?}", field_type.field_type),
-                    "json_schema": param_json_schema(&field_type.field_type, sql, param_name)
-                })
-            })
-            .collect();
+        // The shared parameter shape (ordering, data_type, json_schema) has
+        // one home in enriched_parameters; only this endpoint carries the
+        // legacy `type` key (a Debug dump of the whole InferredFieldType),
+        // so it is merged in here rather than widening the list endpoint.
+        let fields = &pipeline.request_schema().fields;
+        let mut params = enriched_parameters(pipeline);
+        for param in &mut params {
+            let field = param["name"].as_str().and_then(|n| fields.get(n));
+            if let Some(field) = field {
+                param["type"] = serde_json::json!(format!("{field:?}"));
+            }
+        }
 
         Ok(Json(serde_json::json!({
             "success": true,
