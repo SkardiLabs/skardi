@@ -85,7 +85,11 @@ nullable (`"type": ["string", "null"]`) because explicit `NULL` is a valid
 parameter value. Arrays declare `minItems: 1` (the server rejects empty
 arrays before execution), and multi-row `VALUES {name}` placeholders are
 typed as array-of-arrays with non-empty rows. Every parameter is required
-and unknown keys are rejected.
+and unknown keys are rejected. A pipeline author can attach a one-line
+description to any parameter via `spec.parameters` in the pipeline YAML
+(see [pipelines.md](pipelines.md)); it rides inside that parameter's
+schema as the standard `description` keyword, so the model no longer has
+to guess semantics from the parameter name alone.
 
 Every pipeline call carries the connection's session id as
 `X-Skardi-Session-Id` — the same id `query` sends in
