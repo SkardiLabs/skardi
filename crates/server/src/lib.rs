@@ -6,6 +6,7 @@ pub mod jobs_handlers;
 pub mod logging;
 pub mod metrics;
 pub mod optimizer_registry;
+pub(crate) mod param_schema;
 pub mod pipeline_handlers;
 // Extracted to its own crate so downstream distributions (the cloud engine)
 // can adopt the SAME ledger — file format, flags, semantics — without

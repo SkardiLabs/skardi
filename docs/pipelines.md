@@ -15,8 +15,8 @@ One pipeline YAML drives every agent-facing surface:
 - **Shell** — `skardi run <name> --param=…` from the CLI today.
 - **Claude skills** — auto-generated Markdown under `.claude/skills/` (v1.1
   roadmap).
-- **MCP tools** — same YAML projected to MCP for non-Claude hosts (v1.1
-  roadmap).
+- **MCP tools** — same YAML projected to MCP tools for non-Claude hosts via
+  `skardi mcp` — see [mcp.md](mcp.md).
 
 This page covers the pipeline YAML shape, parameter inference, invocation,
 and response format. For the HTTP binding and shared concerns (context

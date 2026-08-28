@@ -22,6 +22,7 @@ mod cloud;
 mod commands;
 mod config;
 mod login;
+mod mcp;
 mod output;
 mod params;
 mod session;
@@ -153,6 +154,13 @@ enum Commands {
         /// pipeline name (omit for overall server health)
         name: Option<String>,
     },
+
+    /// Serve MCP over stdio, proxying tools to the server (for MCP hosts).
+    ///
+    /// Spawned by an MCP host (Claude Desktop, Cursor, ...) as a long-lived
+    /// child process; speaks JSON-RPC on stdout, so it prints nothing else
+    /// there. Runs until the host closes stdin.
+    Mcp,
 }
 
 #[tokio::main]
@@ -266,6 +274,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Health { name } => commands::health::run(&client, name.as_deref()).await,
 
+        // Moves `client` by value: the bridge owns it for the process's
+        // lifetime (the host decides when that ends by closing stdin).
+        Commands::Mcp => mcp::run(client).await,
+
         // Returned above, before resolution.
         Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => Ok(()),
     };
@@ -284,6 +296,7 @@ fn capability_of(command: &Commands) -> Option<Capability> {
         Commands::Pipeline { .. } => Some(Capability::Pipeline),
         Commands::Job { .. } => Some(Capability::Job),
         Commands::Health { .. } => Some(Capability::Health),
+        Commands::Mcp => Some(Capability::Mcp),
         // Local, and returned before resolution: no capability to gate.
         Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => None,
     }
@@ -306,6 +319,7 @@ mod tests {
             (&["skardi", "pipeline", "list"], Capability::Pipeline),
             (&["skardi", "job", "list"], Capability::Job),
             (&["skardi", "health"], Capability::Health),
+            (&["skardi", "mcp"], Capability::Mcp),
         ];
         for (argv, expected) in cases {
             let cli = super::Cli::try_parse_from(argv).expect("parses");
@@ -377,7 +391,8 @@ mod tests {
                 | Commands::Pipeline { .. }
                 | Commands::Job { .. }
                 | Commands::Schema
-                | Commands::Health { .. } => true,
+                | Commands::Health { .. }
+                | Commands::Mcp => true,
             }
         }
         let cli = super::Cli::try_parse_from(["skardi", "schema"]).unwrap();

@@ -296,6 +296,140 @@ async fn http_list_pipelines_returns_registered() {
     assert_eq!(entry["name"].as_str(), Some("product-search"));
     assert_eq!(entry["version"].as_str(), Some("1.0.0"));
     assert_eq!(entry["endpoint"].as_str(), Some("/product-search/execute"));
+    assert_eq!(
+        entry["description"].as_str(),
+        Some("Filter products by brand + max price")
+    );
+    // Parameters are sorted by name: brand, max_price. `{max_price}` infers
+    // Float64 via the `max_` prefix strip → column `price`.
+    let params = entry["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 2, "params: {params:?}");
+    assert_eq!(params[0]["name"].as_str(), Some("brand"));
+    assert_eq!(params[0]["data_type"].as_str(), Some("Utf8"));
+    assert_eq!(
+        params[0]["json_schema"],
+        json!({"type": ["string", "null"]})
+    );
+    assert_eq!(params[1]["name"].as_str(), Some("max_price"));
+    assert_eq!(params[1]["data_type"].as_str(), Some("Float64"));
+    assert_eq!(
+        params[1]["json_schema"],
+        json!({"type": ["number", "null"]})
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /pipelines — a pipeline whose YAML omits `description:` reports JSON
+// null (present key), so bindings can distinguish "no description" cleanly.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_list_pipelines_description_is_null_when_yaml_omits_it() {
+    let (state, tmp) = make_app_state(false).await;
+    let ctx = Arc::clone(&state.session_ctx);
+    let yaml_path = tmp.path().join("no-description.yaml");
+    write_yaml(
+        &yaml_path,
+        r#"
+kind: pipeline
+metadata:
+  name: "no-description"
+  version: "1.0.0"
+spec:
+  query: |
+    SELECT id FROM products WHERE brand = {brand}
+"#,
+    );
+    let pipeline = StandardPipeline::load_from_file(&yaml_path, ctx)
+        .await
+        .unwrap();
+    state
+        .config
+        .write()
+        .unwrap()
+        .pipelines
+        .insert(pipeline.name().to_string(), pipeline);
+    let app = configure_routes(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/pipelines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    let entry = &body["pipelines"].as_array().unwrap()[0];
+    assert_eq!(entry["name"].as_str(), Some("no-description"));
+    assert!(
+        entry.get("description").is_some_and(Value::is_null),
+        "description should be a present JSON null, got: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /pipelines — a `VALUES {rows}` parameter gets the array-of-arrays
+// schema override instead of the (actively wrong) inferred-Utf8 mapping.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_list_pipelines_values_param_gets_array_of_arrays_schema() {
+    let (state, tmp) = make_app_state(false).await;
+    let ctx = Arc::clone(&state.session_ctx);
+    let yaml_path = tmp.path().join("bulk-insert.yaml");
+    write_yaml(
+        &yaml_path,
+        r#"
+kind: pipeline
+metadata:
+  name: "bulk-insert"
+  version: "1.0.0"
+spec:
+  query: |
+    INSERT INTO products (id, brand, price, category) VALUES {rows}
+"#,
+    );
+    let pipeline = StandardPipeline::load_from_file(&yaml_path, ctx)
+        .await
+        .unwrap();
+    state
+        .config
+        .write()
+        .unwrap()
+        .pipelines
+        .insert(pipeline.name().to_string(), pipeline);
+    let app = configure_routes(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/pipelines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp).await;
+    let entry = &body["pipelines"].as_array().unwrap()[0];
+    assert_eq!(entry["name"].as_str(), Some("bulk-insert"));
+    let params = entry["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 1, "params: {params:?}");
+    assert_eq!(params[0]["name"].as_str(), Some("rows"));
+    assert_eq!(params[0]["data_type"].as_str(), Some("Utf8"));
+    assert_eq!(
+        params[0]["json_schema"],
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "array", "minItems": 1}
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -322,17 +456,34 @@ async fn http_get_pipeline_info_returns_metadata_and_params() {
     assert_eq!(body["success"], true);
     assert_eq!(body["pipeline"]["name"].as_str(), Some("product-search"));
     assert_eq!(body["pipeline"]["version"].as_str(), Some("1.0.0"));
-    // Inferred params come from `{brand}` and `{max_price}` in the SQL.
-    // The handler returns them as an array of `{ name, type }` objects;
-    // iteration order is unstable so assert by name-set rather than index.
-    let names: Vec<&str> = body["pipeline"]["parameters"]
+    assert_eq!(
+        body["pipeline"]["description"].as_str(),
+        Some("Filter products by brand + max price")
+    );
+    // Inferred params come from `{brand}` and `{max_price}` in the SQL,
+    // sorted by name for a deterministic response.
+    let params = body["pipeline"]["parameters"]
         .as_array()
-        .expect("parameters array")
-        .iter()
-        .map(|p| p["name"].as_str().unwrap())
-        .collect();
-    assert!(names.contains(&"brand"), "params: {names:?}");
-    assert!(names.contains(&"max_price"), "params: {names:?}");
+        .expect("parameters array");
+    assert_eq!(params.len(), 2, "params: {params:?}");
+    assert_eq!(params[0]["name"].as_str(), Some("brand"));
+    assert_eq!(params[1]["name"].as_str(), Some("max_price"));
+    // The legacy `type` Debug dump of the whole InferredFieldType survives
+    // unchanged next to the additive machine-consumable fields.
+    assert!(
+        params[0]["type"].as_str().unwrap().contains("field_type"),
+        "params: {params:?}"
+    );
+    assert_eq!(params[0]["data_type"].as_str(), Some("Utf8"));
+    assert_eq!(
+        params[0]["json_schema"],
+        json!({"type": ["string", "null"]})
+    );
+    assert_eq!(params[1]["data_type"].as_str(), Some("Float64"));
+    assert_eq!(
+        params[1]["json_schema"],
+        json!({"type": ["number", "null"]})
+    );
 }
 
 // ---------------------------------------------------------------------------
