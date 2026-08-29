@@ -163,15 +163,7 @@ scratch.
 
 ## Install
 
-**Claude Code** — the fastest path. A skill that stands the whole thing up for
-you:
-
-```text
-/plugin marketplace add SkardiLabs/skardi-skills
-/plugin install auto-context@skardi-skills
-```
-
-[`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
+Two skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
@@ -179,16 +171,24 @@ pointed at Postgres + pgvector, MongoDB, or Lance.
 [`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
 teaches the agent to answer questions from a `skardi-server` you already run.
 
-**Other Agent Skills hosts** — the same two skills run on Codex, Cursor, Pi,
-dsh, OpenClaw and Hermes. They differ only in where the skill directory goes,
-and all of them install from a checkout:
+Both run on every [Agent Skills](https://agentskills.io/) host below. They
+differ only in where the skill directory goes.
+
+**Claude Code** installs from the marketplace:
+
+```text
+/plugin marketplace add SkardiLabs/skardi-skills
+/plugin install auto-context@skardi-skills
+```
+
+Every other host installs from a checkout:
 
 ```bash
 git clone https://github.com/SkardiLabs/skardi-skills.git && cd skardi-skills
 ```
 
-Codex, Cursor, Pi and dsh all read the cross-tool `~/.agents/skills/`
-convention, so one copy covers all four:
+**Codex, Cursor, Pi, dsh and OpenCode** all read the cross-tool
+`~/.agents/skills/` convention, so one copy covers all five:
 
 ```bash
 mkdir -p ~/.agents/skills
@@ -196,8 +196,8 @@ cp -r auto-context/skills/auto-context ~/.agents/skills/auto-context
 cp -r retrieval/skills/retrieval ~/.agents/skills/retrieval
 ```
 
-[OpenClaw](https://docs.openclaw.ai/cli/skills) installs through its own CLI
-instead of copying, and [Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)
+**[OpenClaw](https://docs.openclaw.ai/cli/skills)** installs through its own CLI
+instead of copying, and **[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)**
 reads `~/.hermes/skills/`:
 
 ```bash
