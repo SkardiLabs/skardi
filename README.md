@@ -120,6 +120,7 @@ skardi run weekly-churn -p window='7 days'
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
 # same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
+# from a source checkout until `skardi mcp` ships in a tagged release
 skardi mcp
 ```
 
@@ -165,21 +166,28 @@ scratch.
 
 ## Install
 
-**Claude Code** — the fastest path. A skill that stands the whole thing up for
-you:
+**Claude Code** — the fastest path. Two skills: one stands the whole thing up,
+the other queries what is already running.
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
 /plugin install auto-context@skardi-skills
+/plugin install retrieval@skardi-skills
 ```
 
-[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context)
+[`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
-pointed at Postgres + pgvector, MongoDB, or Lance. The same skill also runs on
-Codex, Cursor, Pi, dsh, OpenClaw, and Hermes; per-host installation instructions
-are in the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+pointed at Postgres + pgvector, MongoDB, or Lance.
+[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
+covers the other direction: answering questions from a server that is already
+running. It discovers the sources, named pipelines and table schemas that
+deployment exposes, tries semantic search before falling back to read-only SQL,
+and checks truncation before trusting a count. It builds no index, writes no
+data, and starts no server. Both also run on Codex, Cursor, Pi, dsh, OpenClaw,
+and Hermes; per-host installation instructions are in the
+[skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
 **CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
 build from source — the one-liner below has no published artifact there):
