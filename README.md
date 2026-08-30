@@ -109,9 +109,9 @@ spec:
     GROUP BY plan ORDER BY cancels DESC
 ```
 
-**4 — The agent has a new tool.** One definition, both bindings — so the same
-promoted pipeline works in Claude Code, Cursor, your own loop, or any HTTP host,
-with no wrapper code to maintain.
+**4 — The agent has a new tool.** One definition, every binding — shell, REST,
+and MCP — so the same promoted pipeline works in Claude Code, Cursor, your own
+loop, or any HTTP host, with no wrapper code to maintain.
 
 ```bash
 # shell verb — any agent with a Bash tool, no MCP config
@@ -119,6 +119,8 @@ skardi run weekly-churn -p window='7 days'
 # same pipeline, served as REST
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
+# same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
+skardi mcp
 ```
 
 Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
@@ -264,7 +266,7 @@ agents; deploy it next to your data, behind your usual auth.
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
 | CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
-| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive, Google Drive packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
+| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
 | Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
 | Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres; YAML views as catalog tables, `cypher_query` UDTF | [docs](docs/graph.md) |

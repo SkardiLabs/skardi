@@ -72,9 +72,7 @@ mod tests {
     use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
-    use arrow::array::{
-        Array, BooleanArray, ListArray, StringArray, TimestampMillisecondArray, UInt64Array,
-    };
+    use arrow::array::{Array, ListArray, StringArray, TimestampMillisecondArray, UInt64Array};
     use arrow::record_batch::RecordBatch;
 
     /// Discovery responses serve the CAPTURED live contracts, so every e2e
@@ -376,15 +374,6 @@ bindings:
             .expect("fixture converts")
     }
 
-    fn strings<'a>(batch: &'a RecordBatch, column: &str) -> &'a StringArray {
-        batch
-            .column_by_name(column)
-            .unwrap_or_else(|| panic!("column {column}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Utf8 column")
-    }
-
     fn u64s<'a>(batch: &'a RecordBatch, column: &str) -> &'a UInt64Array {
         batch
             .column_by_name(column)
@@ -392,15 +381,6 @@ bindings:
             .as_any()
             .downcast_ref()
             .expect("UInt64 column")
-    }
-
-    fn bools<'a>(batch: &'a RecordBatch, column: &str) -> &'a BooleanArray {
-        batch
-            .column_by_name(column)
-            .unwrap_or_else(|| panic!("column {column}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Boolean column")
     }
 
     fn timestamps<'a>(batch: &'a RecordBatch, column: &str) -> &'a TimestampMillisecondArray {
@@ -436,16 +416,13 @@ bindings:
 
         assert_eq!(u64s(&batch, "id").value(0), 101);
         assert_eq!(u64s(&batch, "number").value(2), 3);
-        assert_eq!(
-            strings(&batch, "title").value(0),
-            "Scan panics on empty page"
-        );
-        assert_eq!(strings(&batch, "state").value(1), "closed");
+        assert_eq!(utf8(&batch, "title").value(0), "Scan panics on empty page");
+        assert_eq!(utf8(&batch, "state").value(1), "closed");
 
         // JSON null body and null `user` parent become SQL NULL.
-        assert!(strings(&batch, "body").is_null(1));
-        assert_eq!(strings(&batch, "author_login").value(0), "octocat");
-        assert!(strings(&batch, "author_login").is_null(1));
+        assert!(utf8(&batch, "body").is_null(1));
+        assert_eq!(utf8(&batch, "author_login").value(0), "octocat");
+        assert!(utf8(&batch, "author_login").is_null(1));
 
         // Object lists pluck the declared key; empty arrays stay empty lists.
         assert_eq!(
@@ -512,12 +489,12 @@ bindings:
             include_str!("fixtures/github/repositories.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "full_name").value(0), "acme/widgets");
-        assert!(bools(&batch, "private").value(1));
-        assert!(bools(&batch, "archived").value(1));
-        assert_eq!(strings(&batch, "language").value(0), "Rust");
-        assert!(strings(&batch, "language").is_null(1));
-        assert!(strings(&batch, "description").is_null(1));
+        assert_eq!(utf8(&batch, "full_name").value(0), "acme/widgets");
+        assert!(boolean(&batch, "private").value(1));
+        assert!(boolean(&batch, "archived").value(1));
+        assert_eq!(utf8(&batch, "language").value(0), "Rust");
+        assert!(utf8(&batch, "language").is_null(1));
+        assert!(utf8(&batch, "description").is_null(1));
         assert!(timestamps(&batch, "pushed_at").is_null(1));
         assert_eq!(u64s(&batch, "stargazers_count").value(0), 42);
     }
@@ -529,9 +506,9 @@ bindings:
             include_str!("fixtures/github/issue_comments.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "body").value(0), "Reproduced on main.");
-        assert!(strings(&batch, "body").is_null(1));
-        assert!(strings(&batch, "author_login").is_null(1));
+        assert_eq!(utf8(&batch, "body").value(0), "Reproduced on main.");
+        assert!(utf8(&batch, "body").is_null(1));
+        assert!(utf8(&batch, "author_login").is_null(1));
     }
 
     #[test]
@@ -541,9 +518,9 @@ bindings:
             include_str!("fixtures/github/pull_requests.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "head_ref").value(0), "feature/dark-mode");
-        assert_eq!(strings(&batch, "base_ref").value(0), "main");
-        assert!(bools(&batch, "draft").value(0));
+        assert_eq!(utf8(&batch, "head_ref").value(0), "feature/dark-mode");
+        assert_eq!(utf8(&batch, "base_ref").value(0), "main");
+        assert!(boolean(&batch, "draft").value(0));
         assert!(timestamps(&batch, "merged_at").is_null(0), "open PR");
         assert!(!timestamps(&batch, "merged_at").is_null(1), "merged PR");
     }
@@ -555,9 +532,9 @@ bindings:
             include_str!("fixtures/github/reviews.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "state").value(0), "APPROVED");
-        assert!(strings(&batch, "author_login").is_null(1));
-        assert!(strings(&batch, "commit_id").is_null(1));
+        assert_eq!(utf8(&batch, "state").value(0), "APPROVED");
+        assert!(utf8(&batch, "author_login").is_null(1));
+        assert!(utf8(&batch, "commit_id").is_null(1));
         assert!(timestamps(&batch, "submitted_at").is_null(1));
     }
 
@@ -571,10 +548,10 @@ bindings:
             include_str!("fixtures/github/commits.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "author_login").value(0), "octocat");
-        assert!(strings(&batch, "author_login").is_null(1));
-        assert_eq!(strings(&batch, "author_name").value(1), "Legacy Importer");
-        assert_eq!(strings(&batch, "message").value(0), "feat: add dark mode");
+        assert_eq!(utf8(&batch, "author_login").value(0), "octocat");
+        assert!(utf8(&batch, "author_login").is_null(1));
+        assert_eq!(utf8(&batch, "author_name").value(1), "Legacy Importer");
+        assert_eq!(utf8(&batch, "message").value(0), "feat: add dark mode");
         assert!(!timestamps(&batch, "committed_at").is_null(0));
     }
 
@@ -585,13 +562,13 @@ bindings:
             include_str!("fixtures/github/workflow_runs.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "conclusion").value(0), "success");
+        assert_eq!(utf8(&batch, "conclusion").value(0), "success");
         assert!(
-            strings(&batch, "conclusion").is_null(1),
+            utf8(&batch, "conclusion").is_null(1),
             "conclusion is NULL while a run is in progress"
         );
-        assert!(strings(&batch, "name").is_null(1));
-        assert_eq!(strings(&batch, "status").value(1), "in_progress");
+        assert!(utf8(&batch, "name").is_null(1));
+        assert_eq!(utf8(&batch, "status").value(1), "in_progress");
         assert_eq!(u64s(&batch, "run_number").value(0), 128);
     }
 
@@ -602,11 +579,11 @@ bindings:
             include_str!("fixtures/github/releases.json"),
         );
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(strings(&batch, "tag_name").value(0), "v1.2.0");
-        assert!(bools(&batch, "draft").value(1));
+        assert_eq!(utf8(&batch, "tag_name").value(0), "v1.2.0");
+        assert!(boolean(&batch, "draft").value(1));
         assert!(timestamps(&batch, "published_at").is_null(1), "draft");
-        assert!(strings(&batch, "name").is_null(1));
-        assert!(strings(&batch, "author_login").is_null(1));
+        assert!(utf8(&batch, "name").is_null(1));
+        assert!(utf8(&batch, "author_login").is_null(1));
     }
 
     #[test]
@@ -631,7 +608,8 @@ bindings:
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::testutil;
     use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_ok,
+        MockGateway, MockResponse, RecordedRequest, boolean, collect, discovery_ok, envelope_ok,
+        utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
@@ -745,15 +723,6 @@ bindings:
         }
         register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
-    }
-
-    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-        ctx.sql(sql)
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("collect")
     }
 
     fn rows_of(batches: &[RecordBatch]) -> usize {

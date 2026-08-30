@@ -1,0 +1,250 @@
+# Dropbox source pack. Wire contract is Open Connector's. LIVE-VERIFIED
+# 2026-08-18 against a self-hosted Open Connector gateway at commit
+# a3efa99 and a real (free-tier) Dropbox account: all five actions
+# discovered, all five pinned fingerprints matched LIVE discovery
+# unchanged, and all three tables scanned real rows end to end. The
+# fingerprints below were derived from the provider source and the live
+# capture confirmed them byte-for-byte, so nothing needed re-pinning.
+# Two claims remain unobserved rather than confirmed, and are labelled
+# where they live: `shared_links.expires_at` (paid-tier link expiry) and
+# `file_search.match_type = 'content'` (content indexing never landed
+# during the pass).
+#
+# Every list executor NORMALIZES rows through `mapDropboxMetadata`: a
+# fixed camelCase shape whose fifteen keys are ALL declared `required`
+# under `additionalProperties: false`. Mapping Dropbox's own snake_case
+# (`path_display`, `client_modified`, `size`) would have produced
+# all-NULL columns — the Slack 5.2 failure mode. The upside of that
+# strictness: unlike the passthrough packs, every column below sits
+# INSIDE the fingerprint gate, and the coverage-gap pin is empty.
+#
+# PAGINATION IS THE REASON THIS PACK NEEDED AN ENGINE CHANGE. Dropbox
+# continues a listing through a DIFFERENT action than the one that
+# opened it: `list_folder` → `list_folder_continue`, `search_files` →
+# `search_files_continue`, each continue action declaring `cursor` as its
+# ONLY property. Feeding the cursor back to the opening action would not
+# be a quiet truncation but a hard 400, because `list_folder`'s input
+# schema is `additionalProperties: false` and does not declare `cursor`
+# — read off the schema and CONFIRMED on the wire 2026-08-18 (the
+# opening action refuses a `cursor` input, bare or alongside the full
+# input; the continue action refuses anything beyond it). Hence
+# `continuation: {action, fingerprint, inputs: cursor_only}`, whose
+# input-side claim registration now checks against the continuation
+# action's discovered input schema.
+#
+# TERMINATION. `list_folder` answers its FINAL page with a NON-EMPTY
+# cursor — OBSERVED 2026-08-18: the last page carried `hasMore: false`
+# beside a 259-character cursor, and following that cursor returns an
+# empty page. Cursor-spelling termination would refetch and fail as a
+# PaginationLoop, so `has_more_path` is load-bearing here, not
+# decorative. shared_links and search DO null their cursors, but declare
+# `$.hasMore` too: it is the provider's authoritative signal in all
+# three, and one termination rule across the pack beats three.
+#
+# Errors: `dropboxRpcRequest` throws on any non-2xx, so Dropbox's in-band
+# `error_summary` envelope AND its 429 rate limiting both surface as
+# gateway FAILURE envelopes, never as HTTP 200 rows — every table
+# declares no error_path.
+#
+# Scopes: files/file_search need `files.metadata.read`; shared_links
+# needs `sharing.read` — confirmed per-action in the live gateway's
+# `requiredScopes` metadata. No content or write scope is required by any
+# table here. NOTE that this is a statement about the ACTIONS, not about
+# what an operator can provision: the gateway's dropbox provider
+# requests the union of all six dropbox scopes (including
+# `files.content.write` and `sharing.write`) at authorize time, so a
+# connection created through its OAuth flow carries more than this pack
+# uses. See docs/open-connector-dropbox.md.
+#
+# Design rationale lives in the module docs of packs/dropbox.rs.
+kind: pack
+pack: dropbox
+version: 1
+
+tables:
+  # Every file and folder under `path` (the account root when the binding
+  # supplies none).
+  files:
+    action: dropbox.list_folder
+    row_path: "$.entries"
+    fingerprint: 87502bce0a4c30043fdbde3e45f6c02158ed64338ffeac203eb31f6bde7d6be1
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size_input: limit
+      # The schema's declared maximum, VERIFIED AT THE BOUNDARY
+      # (2026-08-18): `limit: 2000` returns rows, `limit: 2001` is
+      # refused. Continuation pages carry
+      # no `limit` at all — the continue action declares none — and
+      # Dropbox sizes them from this opening request. `page_size` is the
+      # size REQUESTED per page; it neither caps nor floors a pushed-down
+      # SQL LIMIT, which the exec applies by truncating batches.
+      page_size: 2000
+      # NOT optional here: see the TERMINATION note above.
+      has_more_path: "$.hasMore"
+      continuation:
+        action: dropbox.list_folder_continue
+        fingerprint: 87502bce0a4c30043fdbde3e45f6c02158ed64338ffeac203eb31f6bde7d6be1
+        inputs: cursor_only
+    resources:
+      optional: [path]
+    # `recursive` is the `state=all` move (5.1): a table named `files`
+    # that returns one directory level is a surprising contract, so the
+    # table means "every file under `path`". `includeMountedFolders`
+    # pins Dropbox's own default so it cannot drift. `includeDeleted`
+    # stays off deliberately — deleted tombstones carry a `deleted` tag
+    # and null everything else, informing no query.
+    fixed_inputs:
+      recursive: true
+      includeMountedFolders: true
+      includeDeleted: false
+    # No filter is pushed. The remaining inputs are scan-shape controls,
+    # not column predicates, and `path` selects the listing ROOT — which
+    # is a different claim from `path_lower = '/a/b'`. Pinned by a
+    # negative-space guard test.
+    columns:
+      # tag and name are executor-guaranteed (`resolveDropboxMetadataTag`
+      # always returns a string; `name` is `?? ""`), so a null arriving
+      # in either is drift and must fail the scan.
+      - { name: tag, path: tag, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: false }
+      - { name: id, path: id, type: utf8, nullable: true }
+      - { name: path_display, path: pathDisplay, type: utf8, nullable: true }
+      - { name: path_lower, path: pathLower, type: utf8, nullable: true }
+      # ISO 8601 strings on the wire, read by the RFC 3339 reader.
+      - { name: client_modified, path: clientModified, type: timestamp_ms_utc, nullable: true }
+      - { name: server_modified, path: serverModified, type: timestamp_ms_utc, nullable: true }
+      - { name: rev, path: rev, type: utf8, nullable: true }
+      - { name: size_bytes, path: sizeBytes, type: int64, nullable: true }
+      - { name: is_downloadable, path: isDownloadable, type: boolean, nullable: true }
+      - { name: content_hash, path: contentHash, type: utf8, nullable: true }
+      - { name: sharing_info, path: sharingInfo, type: json, nullable: true }
+      # url / expires_at / link_permissions are DELIBERATELY absent: the
+      # normalizer sources them from `record.url` / `.expires` /
+      # `.link_permissions`, which files/list_folder never returns, so
+      # mapping them would ship three structurally always-NULL columns.
+      # They live on shared_links, where they populate.
+
+  # Shared links for the current account, or for one path.
+  shared_links:
+    action: dropbox.list_shared_links
+    row_path: "$.links"
+    fingerprint: 7f7c822b99a1afcbf4ea81371527a14ab4d24918dbde170eb115037003144067
+    # No continuation block: the executor `compactObject`s `path` and
+    # `cursor` together and the input schema declares both, so pages 2..N
+    # repeat the action with the full input, the engine's default.
+    # CONFIRMED on the wire 2026-08-18 (design-spec open question 1):
+    # `list_shared_links` accepts `path` and `cursor` in one request, so
+    # no `cursor_only` continuation is needed here.
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      # No page-size input exists on this action; Dropbox sizes the
+      # pages. With no `page_size_input`, `page_size` is inert — the
+      # cursor strategy reads it only in `Pagination::apply`, under
+      # `page_size_param`, and nothing else in the engine consults it.
+      # The schema requires the key, so it is a placeholder, not a bound.
+      page_size: 100
+      has_more_path: "$.hasMore"
+    resources:
+      # `directOnly` is a scan-shape boolean, not a collection selector —
+      # the class of input this pack otherwise PINS (`recursive`,
+      # `includeDeleted`). It is a resource rather than a fixed input
+      # because neither setting is the honest default for a table named
+      # `shared_links`: pinned true, links inherited from a shared parent
+      # vanish; pinned false, the same file can appear through several
+      # ancestors. Leaving it to the binding makes that a per-deployment
+      # choice instead of a pack-wide guess. Resource values keep their
+      # YAML type, so `directOnly: true` reaches the strict schema as a
+      # JSON boolean — pinned by a forwarding test.
+      optional: [path, directOnly]
+    # `path` is a resource, not an `eq` push onto path_lower: the input
+    # accepts paths, file IDs AND rev IDs, so the mapping would be
+    # unfaithful across most of its value domain — Exact would be wrong
+    # and Inexact would still push a rev ID as though it were a path.
+    columns:
+      - { name: tag, path: tag, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: false }
+      # `url` is the natural identity but stays NULLABLE: the executor
+      # spells it `optionalString(record.url) ?? null`, so a non-null
+      # declaration would fail scans on a row the gateway considers
+      # legal.
+      - { name: url, path: url, type: utf8, nullable: true }
+      - { name: id, path: id, type: utf8, nullable: true }
+      - { name: path_lower, path: pathLower, type: utf8, nullable: true }
+      # Populates only on a link Dropbox let the account set an expiry on
+      # — a paid-tier feature. Structurally reachable, so mapped, but the
+      # live pass could not observe a non-NULL value (free account:
+      # `settings_error/not_authorized`).
+      - { name: expires_at, path: expiresAt, type: timestamp_ms_utc, nullable: true }
+      - { name: client_modified, path: clientModified, type: timestamp_ms_utc, nullable: true }
+      - { name: server_modified, path: serverModified, type: timestamp_ms_utc, nullable: true }
+      - { name: rev, path: rev, type: utf8, nullable: true }
+      - { name: size_bytes, path: sizeBytes, type: int64, nullable: true }
+      - { name: link_permissions, path: linkPermissions, type: json, nullable: true }
+      # path_display / is_downloadable / content_hash / sharing_info are
+      # DELIBERATELY ABSENT, the mirror image of the three columns files
+      # omits. `sharing/list_shared_links` returns SharedLinkMetadata,
+      # which carries `path_lower` but has NO `path_display`,
+      # `is_downloadable`, `content_hash` or `sharing_info` field at all;
+      # the shared normalizer reads those four off keys the payload never
+      # has, so mapping them shipped four structurally always-NULL
+      # columns. Live evidence (2026-08-18): 0/5 non-NULL across 3 file
+      # links and 2 folder links, and decisively, a file whose
+      # files-row carries all four came back with all four NULL on its
+      # own shared_links row — same file, same normalizer, different
+      # endpoint. Pinned by a negative-space guard test.
+
+  # Dropbox's search_v2 over files and folders. `query` is required: a
+  # search table without one is not a table (the GitHub owner/repo
+  # precedent).
+  file_search:
+    action: dropbox.search_files
+    row_path: "$.matches"
+    fingerprint: 472377cc3b4fd9890843390919e5b165e52fdd358d8ee08cc109c2a08f0d356c
+    pagination:
+      strategy: cursor
+      cursor_input: cursor
+      next_cursor_path: "$.cursor"
+      page_size_input: maxResults
+      # search_v2's declared maximum, verified at the boundary
+      # 2026-08-18 like files' 2000 above: 1000 returns rows, 1001 is
+      # refused.
+      page_size: 1000
+      has_more_path: "$.hasMore"
+      continuation:
+        action: dropbox.search_files_continue
+        fingerprint: 472377cc3b4fd9890843390919e5b165e52fdd358d8ee08cc109c2a08f0d356c
+        inputs: cursor_only
+    resources:
+      required: [query]
+      optional: [path]
+    # Pinned for the same reason includeDeleted is pinned off on files.
+    # `orderBy` is deliberately NOT pinned: search/continue_v2 pages a
+    # server-side snapshot taken at the opening call, so relevance order
+    # is stable within one scan (unlike Feishu's chats, whose default
+    # ordering reshuffles mid-scan and forced ByCreateTimeAsc).
+    fixed_inputs:
+      fileStatus: active
+    columns:
+      # `?? "unknown"` in the executor, so never null.
+      - { name: match_type, path: matchType, type: utf8, nullable: false }
+      - { name: tag, path: metadata.tag, type: utf8, nullable: false }
+      - { name: name, path: metadata.name, type: utf8, nullable: false }
+      - { name: id, path: metadata.id, type: utf8, nullable: true }
+      - { name: path_display, path: metadata.pathDisplay, type: utf8, nullable: true }
+      - { name: path_lower, path: metadata.pathLower, type: utf8, nullable: true }
+      - { name: client_modified, path: metadata.clientModified, type: timestamp_ms_utc, nullable: true }
+      - { name: server_modified, path: metadata.serverModified, type: timestamp_ms_utc, nullable: true }
+      - { name: rev, path: metadata.rev, type: utf8, nullable: true }
+      - { name: size_bytes, path: metadata.sizeBytes, type: int64, nullable: true }
+      - { name: is_downloadable, path: metadata.isDownloadable, type: boolean, nullable: true }
+      - { name: content_hash, path: metadata.contentHash, type: utf8, nullable: true }
+      - { name: sharing_info, path: metadata.sharingInfo, type: json, nullable: true }
+      # highlight_spans is unmapped and `includeHighlights` is never
+      # sent: the field only populates when highlights are requested,
+      # and the declared schema (nullable array) contradicts the
+      # executor (`readObjectArray`, which returns [] and never null).
+      # Recorded as a wire-vs-contract contradiction; not worth a column.

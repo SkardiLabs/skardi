@@ -33,6 +33,7 @@ pub enum Capability {
     Pipeline,
     Job,
     Health,
+    Mcp,
 }
 
 impl Capability {
@@ -49,6 +50,7 @@ impl Capability {
             Capability::Pipeline => "pipeline",
             Capability::Job => "job",
             Capability::Health => "health",
+            Capability::Mcp => "mcp",
         }
     }
 
@@ -56,7 +58,9 @@ impl Capability {
     ///
     /// The gateway's route table is `POST /query` and `GET /data_source`
     /// (§7.4); everything else is an engine-local surface that only a
-    /// `mode: server` context reaches.
+    /// `mode: server` context reaches. `mcp` straddles both (its tools need
+    /// pipeline execution and `/pipelines`, which the gateway does not
+    /// mount), so it is refused as a whole rather than served half-broken.
     pub const fn served_by_gateway(self) -> bool {
         matches!(self, Capability::Query | Capability::Schema)
     }
@@ -65,13 +69,14 @@ impl Capability {
 /// Every capability, so the "Available:" list is DERIVED from
 /// [`Capability::served_by_gateway`] rather than restated next to it — a
 /// hand-written list is the kind that survives the table changing under it.
-const ALL_CAPABILITIES: [Capability; 6] = [
+const ALL_CAPABILITIES: [Capability; 7] = [
     Capability::Query,
     Capability::Schema,
     Capability::Run,
     Capability::Pipeline,
     Capability::Job,
     Capability::Health,
+    Capability::Mcp,
 ];
 
 /// The comma-separated commands a cloud context can run.

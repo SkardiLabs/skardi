@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "cursor"
+  ],
+  "additionalProperties": false
+}

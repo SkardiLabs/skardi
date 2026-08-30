@@ -465,6 +465,36 @@ error. When the server has auditing enabled, a `503` with `error_type
 "query_audit_error"` means the job **was not submitted** and the call is
 safe to retry.
 
+## MCP — `skardi mcp`
+
+Serves the Model Context Protocol over stdio, bridging an MCP host (Claude
+Desktop, Cursor, …) to a running skardi-server: pipelines become MCP tools,
+plus built-in `query` and `list_data_sources` tools. The host spawns the
+subcommand as a child process — you don't run it by hand. Claude Desktop
+config:
+
+```json
+{
+  "mcpServers": {
+    "skardi": {
+      "command": "skardi",
+      "args": ["mcp", "--server", "http://localhost:8080"]
+    }
+  }
+}
+```
+
+There are no subcommand-specific flags: the global `--server` / `--token` /
+`--context` resolution applies, exactly as for every other subcommand. See
+[mcp.md](mcp.md) for the tool surface, host setup, auth notes, and
+troubleshooting.
+
+Exit codes follow the table below only for errors surfaced **before**
+serving starts (a cloud context is refused with `1`; nothing is probed at
+startup, so `2` is rare here). Once the MCP session is up, REST failures —
+unreachable server included — are reported in-band as tool errors, and the
+process exits `0` when the host closes stdin.
+
 ## Exit codes
 
 | Code | Meaning |

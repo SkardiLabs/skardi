@@ -1,6 +1,7 @@
 //! Test support for the Open Connector suites: the mock gateway (a thin
-//! flavor over the crate-shared mock HTTP server), envelope builders, and a
-//! tracing capture for asserting on emitted events.
+//! flavor over the crate-shared mock HTTP server), envelope builders, the
+//! Arrow/SQL accessors every pack suite leans on, and a tracing capture
+//! for asserting on emitted events.
 //!
 //! The server itself lives in [`crate::util::mock_http`] — hand-rolled over
 //! `tokio::net::TcpListener` so the test suite needs no mock HTTP crate,
@@ -12,7 +13,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow::array::{Array, BooleanArray, StringArray};
+use arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
+use serde_json::Value;
 use tracing::field::{Field, Visit};
+
+use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+use crate::sources::providers::open_connector::row_path::RowPath;
+use crate::sources::providers::open_connector::source_pack::SourcePackTable;
 
 pub(crate) use crate::util::mock_http::{
     MockHttpServer as MockGateway, MockResponse, RecordedRequest,
@@ -62,6 +71,109 @@ pub(crate) fn discovery_ok(
     envelope_ok(&format!(
         r#"{{"inputSchema":{input_schema},"outputSchema":{output_schema},"execution":{{"locallyExecutable":{locally_executable}{read_only}}}}}"#
     ))
+}
+
+/// Run one SQL statement to completion and return every result batch.
+pub(crate) async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+    ctx.sql(sql)
+        .await
+        .unwrap_or_else(|e| panic!("failed to plan {sql}: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("failed to collect {sql}: {e}"))
+}
+
+/// Convert one gateway page into a batch through the table's declared row
+/// path and field mappings — the same path the scan takes, so a fixture
+/// asserted through this helper vouches for the real conversion. Error
+/// context is pinned to page 1, as the name promises: fixtures are
+/// single-page corpora, never a mid-scan continuation.
+pub(crate) fn convert_first_page(table: &SourcePackTable, page: &Value) -> RecordBatch {
+    let rows = RowPath::parse(table.row_path)
+        .expect("row path")
+        .rows(page, 1)
+        .expect("row array");
+    RowConverter::new(table.fields)
+        .expect("converter")
+        .convert(rows, 1)
+        .expect("page converts")
+}
+
+/// A named column downcast to `StringArray`; panics name the column and,
+/// on a type mismatch, the Arrow type actually found, so a schema drift
+/// reads as itself, not as a bare `unwrap`.
+pub(crate) fn utf8<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+    let column = batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("column {name}"));
+    column
+        .as_any()
+        .downcast_ref()
+        .unwrap_or_else(|| panic!("column {name} is {:?}, not Utf8", column.data_type()))
+}
+
+/// A named column downcast to `BooleanArray`.
+pub(crate) fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArray {
+    let column = batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("column {name}"));
+    column
+        .as_any()
+        .downcast_ref()
+        .unwrap_or_else(|| panic!("column {name} is {:?}, not Boolean", column.data_type()))
+}
+
+/// Every value of a Utf8 column across all result batches, in row order;
+/// the panic's row index counts across batches, matching the returned
+/// Vec. Panics on a NULL slot rather than reading the underlying buffer
+/// as if it held a value — a deliberate tightening over the pack-local
+/// originals, which silently yielded `""` there. A caller asserting over
+/// a nullable column needs options, which this helper does not offer.
+pub(crate) fn column_values(batches: &[RecordBatch], name: &str) -> Vec<String> {
+    let mut offset = 0;
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let values = utf8(batch, name).clone();
+            let base = offset;
+            offset += values.len();
+            (0..values.len()).map(move |i| {
+                assert!(
+                    !values.is_null(i),
+                    "column {name} is NULL at row {}",
+                    base + i
+                );
+                values.value(i).to_string()
+            })
+        })
+        .collect()
+}
+
+/// The `input` payload of every execute POST the gateway recorded, in
+/// wire order — filtered to one action when `action_path` is non-empty
+/// (a single-action pack passes `""` and takes every execute).
+pub(crate) fn execute_inputs(gateway: &MockGateway, action_path: &str) -> Vec<Value> {
+    gateway
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with(action_path))
+        .map(|r| {
+            serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"].clone()
+        })
+        .collect()
+}
+
+/// The sorted top-level keys of one recorded executor input, for asserting
+/// exactly which inputs traveled on the wire.
+pub(crate) fn input_keys(input: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = input
+        .as_object()
+        .expect("input object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
 }
 
 /// One tracing event captured by [`capture_events`].

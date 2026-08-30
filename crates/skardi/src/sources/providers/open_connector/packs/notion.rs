@@ -92,14 +92,14 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_ok,
-        fingerprint_uncovered_columns,
+        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values, discovery_ok,
+        envelope_ok, execute_inputs, fingerprint_uncovered_columns, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
         register_open_connector_udtfs,
     };
-    use arrow::array::{Array, BooleanArray, ListArray, StringArray, TimestampMillisecondArray};
+    use arrow::array::{Array, ListArray, StringArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -148,24 +148,6 @@ mod tests {
             .expect("converter")
             .convert(rows, 1)
             .expect("fixture converts")
-    }
-
-    fn utf8<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("column {name}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Utf8 column")
-    }
-
-    fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArray {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("column {name}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Boolean column")
     }
 
     #[test]
@@ -435,43 +417,6 @@ bindings:
         (gateway, ctx)
     }
 
-    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-        ctx.sql(sql)
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("collect")
-    }
-
-    fn ids_of(batches: &[RecordBatch]) -> Vec<String> {
-        batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column_by_name("id")
-                    .expect("id column")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Utf8 ids")
-                    .clone();
-                (0..ids.len()).map(move |i| ids.value(i).to_string())
-            })
-            .collect()
-    }
-
-    fn execute_inputs(gateway: &MockGateway) -> Vec<Value> {
-        gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "POST")
-            .map(|r| {
-                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
-                    .clone()
-            })
-            .collect()
-    }
-
     fn user_row(id: &str) -> Value {
         json!({"object": "user", "id": id, "name": id, "type": "person"})
     }
@@ -507,9 +452,9 @@ bindings:
             setup_with_gateway(gateway, "SKARDI_TEST_OC_NOTION_USERS", "users").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.users ORDER BY id").await;
-        assert_eq!(ids_of(&batches), vec!["u-1", "u-2", "u-3"]);
+        assert_eq!(column_values(&batches, "id"), vec!["u-1", "u-2", "u-3"]);
 
-        let inputs = execute_inputs(&gateway);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(inputs.len(), 2, "two cursor pages");
         assert_eq!(inputs[1]["startCursor"], "cur-2");
         for (page, (input, expected_keys)) in inputs
@@ -570,11 +515,11 @@ bindings:
         .await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.pages").await;
-        assert_eq!(ids_of(&batches), vec!["p-1"]);
+        assert_eq!(column_values(&batches, "id"), vec!["p-1"]);
         let batches = collect(&ctx, "SELECT id FROM saas.ws.data_sources").await;
-        assert_eq!(ids_of(&batches), vec!["ds-1"]);
+        assert_eq!(column_values(&batches, "id"), vec!["ds-1"]);
 
-        for input in execute_inputs(&gateway) {
+        for input in execute_inputs(&gateway, "") {
             assert_eq!(input["query"], "", "empty query pin: {input}");
             assert_eq!(input["filter"]["property"], "object", "{input}");
             let mut keys: Vec<&str> = input
@@ -615,8 +560,8 @@ bindings:
             setup_with_gateway(gateway, "SKARDI_TEST_OC_NOTION_BLOCKS", "block_children").await;
 
         let batches = collect(&ctx, "SELECT id, type FROM saas.ws.block_children").await;
-        assert_eq!(ids_of(&batches), vec!["b-1"]);
-        let inputs = execute_inputs(&gateway);
+        assert_eq!(column_values(&batches, "id"), vec!["b-1"]);
+        let inputs = execute_inputs(&gateway, "");
         assert_eq!(
             inputs[0]["blockId"], "b-root",
             "resource forwarded verbatim"
@@ -687,9 +632,9 @@ bindings:
             setup_with_gateway(gateway, "SKARDI_TEST_OC_NOTION_LIMIT", "users").await;
 
         let batches = collect(&ctx, "SELECT id FROM saas.ws.users LIMIT 2").await;
-        assert_eq!(ids_of(&batches).len(), 2);
+        assert_eq!(column_values(&batches, "id").len(), 2);
         assert_eq!(
-            execute_inputs(&gateway).len(),
+            execute_inputs(&gateway, "").len(),
             1,
             "one page satisfied LIMIT"
         );

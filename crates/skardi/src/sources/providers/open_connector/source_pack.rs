@@ -11,10 +11,12 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use super::error::OpenConnectorError;
 use super::filters::FilterMapping;
 use super::json_to_arrow::FieldMapping;
-use super::pagination::PaginationStrategy;
+use super::pagination::{CursorContinuation, PaginationStrategy};
 
 /// A fixed action-input value a pack pins at compile time — a
 /// const-friendly stand-in for the JSON scalar set (`serde_json::Value`'s
@@ -105,6 +107,11 @@ pub struct SourcePackTable {
     /// Expected action-contract fingerprint. When set, registration compares
     /// it with the discovered action's fingerprint and fails on mismatch.
     pub expected_fingerprint: Option<&'static str>,
+    /// Split-action cursor continuation, for providers that serve pages
+    /// 2..N from a different action than the one that began the listing
+    /// (see [`CursorContinuation`]). `None` for every table whose provider
+    /// accepts the cursor on its own action.
+    pub continuation: Option<CursorContinuation>,
 }
 
 impl SourcePackTable {
@@ -131,6 +138,380 @@ impl SourcePackTable {
         }
         None
     }
+
+    /// Every action this table executes: its own, plus a split-action
+    /// continuation's. Registration discovers all of them, so a
+    /// continuation action missing from the gateway fails at startup rather
+    /// than on page two of the first scan.
+    pub fn actions(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.action_id).chain(self.continuation.map(|c| c.action_id))
+    }
+
+    /// Every `(action, expected fingerprint)` pair the compatibility gate
+    /// must verify. Both gate call sites — YAML binding registration and
+    /// the `open_connector_query` UDTF — iterate THIS, so a drifted
+    /// continuation action cannot be refused by one path and admitted by
+    /// the other.
+    pub fn gated_actions(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+        self.expected_fingerprint
+            .map(|fingerprint| (self.action_id, fingerprint))
+            .into_iter()
+            .chain(
+                self.continuation
+                    .map(|c| (c.action_id, c.expected_fingerprint)),
+            )
+    }
+
+    /// The ONE input-side gate a registration path calls: verify this
+    /// table's continuation declaration against the continuation action's
+    /// discovered INPUT schema. `Ok(())` for a table with no continuation.
+    ///
+    /// Deliberately a single entry point rather than two public checks the
+    /// caller picks between. `inputs:` has two spellings and each needs a
+    /// different argument, but "did we verify the continuation's inputs?"
+    /// is one question, and two call sites per entry point were two
+    /// independently droppable lines — a review round found both deletable
+    /// with the suite still green. Dispatching here means an entry point
+    /// either asks the question or visibly does not.
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::ActionContractMismatch`] naming the
+    /// continuation action and the specific disagreement.
+    pub fn check_continuation_inputs(
+        &self,
+        input_schema: Option<&Value>,
+    ) -> Result<(), OpenConnectorError> {
+        let Some(continuation) = self.continuation else {
+            return Ok(());
+        };
+        if continuation.cursor_only {
+            self.check_cursor_only_continuation_inputs(input_schema)
+        } else {
+            self.check_full_continuation_inputs(input_schema)
+        }
+    }
+
+    /// Verify a `cursor_only` continuation against the continuation action's
+    /// discovered INPUT schema. `Ok(())` for every table that declares no
+    /// continuation, or whose continuation sends the full input.
+    ///
+    /// The contract fingerprint cannot cover this: it hashes the OUTPUT
+    /// schema (`action_registry::fingerprint_schema`), while
+    /// `cursor_only` is a claim about inputs — that a request carrying the
+    /// cursor alone is accepted. Left ungated, a wrong or drifted claim
+    /// surfaces as a hard 400 on page two of a live scan, after N pages of
+    /// gateway budget are already spent. Two properties are checked, and
+    /// only two, because they are exactly the ways the claim can break:
+    ///
+    /// 1. the cursor input is a DECLARED property — otherwise our cursor is
+    ///    the undeclared extra that Open Connector's
+    ///    `additionalProperties: false` schemas reject;
+    /// 2. every REQUIRED input is one the pack sends, i.e. `required` is a
+    ///    subset of `{cursor}` — otherwise the request is missing a
+    ///    mandatory field.
+    ///
+    /// Deliberately NOT checked: whether the cursor is the action's *only*
+    /// property. An upstream release that adds an optional input alongside
+    /// it does not break a cursor-only request, and refusing to start over
+    /// it would be a false alarm.
+    ///
+    /// A continuation action publishing no input schema at all is refused
+    /// rather than waved through: an unverifiable claim about inputs is the
+    /// same default-deny case as an action with no read/write
+    /// classification (see `OpenConnectorScanFunction`).
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::ActionContractMismatch`] naming the
+    /// continuation action and the specific disagreement.
+    fn check_cursor_only_continuation_inputs(
+        &self,
+        input_schema: Option<&Value>,
+    ) -> Result<(), OpenConnectorError> {
+        let Some(continuation) = self.continuation.filter(|c| c.cursor_only) else {
+            return Ok(());
+        };
+        // The loader nests `continuation` under the cursor strategy, so a
+        // non-cursor table cannot declare one through YAML; a hand-built
+        // table that does is a pack bug and says so rather than passing.
+        let PaginationStrategy::Cursor { cursor_param, .. } = self.pagination else {
+            return Err(OpenConnectorError::ActionContractMismatch {
+                table: self.id.to_string(),
+                reason: format!(
+                    "action '{}' declares `inputs: cursor_only` on a non-cursor pagination \
+                     strategy, which has no cursor input to send",
+                    continuation.action_id
+                ),
+            });
+        };
+        let mismatch = |reason: String| OpenConnectorError::ActionContractMismatch {
+            table: self.id.to_string(),
+            reason,
+        };
+        // Two failures, two diagnostics: an action that publishes NOTHING
+        // and one that publishes a schema this gate cannot read from are
+        // both refused, but they live in different layers of the operator's
+        // gateway. Collapsing them sent someone hunting for a missing
+        // schema that was in fact present and shapeless.
+        let Some(schema) = input_schema else {
+            return Err(mismatch(format!(
+                "action '{}' publishes no input schema, so `inputs: cursor_only` cannot be \
+                 verified; a claim about inputs that the gateway will not confirm is refused \
+                 rather than discovered as a 400 on page two",
+                continuation.action_id
+            )));
+        };
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Err(mismatch(format!(
+                "action '{}' publishes no input properties, so `inputs: cursor_only` cannot \
+                 be verified; a schema with no readable `properties` confirms nothing and is \
+                 refused rather than discovered as a 400 on page two",
+                continuation.action_id
+            )));
+        };
+        if !properties.contains_key(cursor_param) {
+            let mut declared: Vec<&str> = properties.keys().map(String::as_str).collect();
+            declared.sort_unstable();
+            return Err(mismatch(format!(
+                "action '{}' does not declare the cursor input '{cursor_param}' (declares [{}]), \
+                 so a cursor-only continuation request would be rejected as an undeclared input",
+                continuation.action_id,
+                declared.join(", ")
+            )));
+        }
+        // Only inputs the pack actually sends may be mandatory. `required`
+        // is optional in JSON Schema; ABSENT means nothing is mandatory and
+        // is the one permissive reading this gate accepts. A `required`
+        // that is PRESENT but unparseable is refused instead, for the same
+        // reason a missing `properties` is: both come from the same
+        // untrusted discovery payload, and a gate that cannot read its
+        // input has not verified anything. Failing closed on one and open
+        // on the other was the defect.
+        let mut unsatisfiable =
+            required_beyond_cursor(Some(schema), cursor_param).map_err(|reason| {
+                mismatch(format!(
+                    "action '{}' publishes a `required` this gate cannot read ({reason}), so \
+                     `inputs: cursor_only` cannot be verified; an unreadable schema is \
+                     refused rather than waved through",
+                    continuation.action_id
+                ))
+            })?;
+        if !unsatisfiable.is_empty() {
+            unsatisfiable.sort_unstable();
+            return Err(mismatch(format!(
+                "action '{}' requires input(s) [{}] that a cursor-only continuation does not \
+                 send; pages 2..N would fail as a missing mandatory input",
+                continuation.action_id,
+                unsatisfiable.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// The pagination inputs this table's strategy injects. Sent on every
+    /// request the strategy applies to, so they count as guaranteed.
+    ///
+    /// `pub(super)` because `packs::loader::validate_table` needs the SAME
+    /// mapping for its input-namespace collision gates. It used to carry
+    /// its own copy of this match, and the two had already drifted once —
+    /// `Keyset` and `SinglePage` landed with the Discord pack and only one
+    /// side was widened. One definition, so a fifth strategy (or a new
+    /// page-size field on an existing one) cannot weaken one consumer
+    /// silently.
+    pub(super) fn pagination_input_keys(&self) -> Vec<&'static str> {
+        match self.pagination {
+            PaginationStrategy::Cursor {
+                cursor_param,
+                page_size_param,
+                ..
+            } => std::iter::once(cursor_param)
+                .chain(page_size_param)
+                .collect(),
+            PaginationStrategy::PageNumber {
+                page_param,
+                per_page_param,
+                ..
+            } => vec![page_param, per_page_param],
+            PaginationStrategy::Keyset {
+                cursor_param,
+                page_size_param,
+                ..
+            } => vec![cursor_param, page_size_param],
+            PaginationStrategy::SinglePage { .. } => Vec::new(),
+        }
+    }
+
+    /// Keys the pack sends on every request the CONTINUATION gates govern:
+    /// the complete-collection pins, the resources a binding MUST supply,
+    /// and the pagination inputs. Optional resources and pushed filters are
+    /// excluded — a binding may omit them, so they cannot satisfy an
+    /// action's `required`.
+    ///
+    /// Scoped to continuation requests deliberately: the pagination half
+    /// includes the cursor, which `Pagination::apply` inserts only once
+    /// `next_token` is `Some` — never on page one. On a continuation page
+    /// the cursor genuinely is always present, which is what makes it
+    /// guaranteed here. A future gate checking the OPENING action's
+    /// `required` must NOT reuse this set: it would report a mandatory
+    /// cursor as satisfied on page one, which is exactly the hard 400
+    /// these gates exist to prevent.
+    fn guaranteed_input_keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self
+            .fixed_inputs
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(self.required_resources.iter().copied())
+            .chain(self.pagination_input_keys())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// Every key the pack COULD put in a request: the guaranteed set plus
+    /// the optional resources and allowlisted filter inputs. Deliberately
+    /// the widest set — this drives the `additionalProperties: false`
+    /// check, where sending a key the action does not declare is the
+    /// failure, so an "only sometimes" key is still a rejection.
+    fn possible_input_keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self
+            .guaranteed_input_keys()
+            .into_iter()
+            .chain(self.optional_resources.iter().copied())
+            .chain(self.filters.iter().map(|f| f.input_field))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// Verify a FULL-input continuation that targets a DIFFERENT action
+    /// than the table's own, against that action's discovered input
+    /// schema. `Ok(())` for every other table.
+    ///
+    /// `inputs: full` is the default, so this is the shape a pack lands in
+    /// by omission. When the continuation repeats the table's own action
+    /// the skip is sound by construction — one action, one input schema,
+    /// and page one already satisfied it. When it names a different
+    /// action, "the opener's inputs satisfy the continue action" stops
+    /// being a fact and becomes an assumption about two independently
+    /// discovered schemas; unchecked, a disagreement is a 400 on every
+    /// page-2 request, found by an operator mid-scan.
+    ///
+    /// Two directions, matching the two ways an action schema rejects a
+    /// request:
+    ///
+    /// 1. every `required` input is one the pack sends on every request
+    ///    (`guaranteed_input_keys`);
+    /// 2. under `additionalProperties: false`, every key the pack COULD
+    ///    send (`possible_input_keys`) is a declared property.
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::ActionContractMismatch`] naming the
+    /// continuation action and the specific disagreement.
+    fn check_full_continuation_inputs(
+        &self,
+        input_schema: Option<&Value>,
+    ) -> Result<(), OpenConnectorError> {
+        let Some(continuation) = self
+            .continuation
+            .filter(|c| !c.cursor_only && c.action_id != self.action_id)
+        else {
+            return Ok(());
+        };
+        let mismatch = |reason: String| OpenConnectorError::ActionContractMismatch {
+            table: self.id.to_string(),
+            reason,
+        };
+        let Some(schema) = input_schema else {
+            return Err(mismatch(format!(
+                "action '{}' publishes no input schema, so a full-input continuation to a \
+                 DIFFERENT action cannot be verified; an unverifiable claim about inputs is \
+                 refused rather than discovered as a 400 on page two",
+                continuation.action_id
+            )));
+        };
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Err(mismatch(format!(
+                "action '{}' publishes no input properties, so a full-input continuation to \
+                 a DIFFERENT action cannot be verified",
+                continuation.action_id
+            )));
+        };
+        let sends = self.guaranteed_input_keys();
+        let mut missing: Vec<&str> = required_keys(schema)
+            .map_err(|reason| {
+                mismatch(format!(
+                    "action '{}' publishes a `required` this gate cannot read ({reason})",
+                    continuation.action_id
+                ))
+            })?
+            .into_iter()
+            .filter(|key| !sends.contains(key))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            missing.dedup();
+            return Err(mismatch(format!(
+                "action '{}' requires input(s) [{}] that this table does not send on every \
+                 request; pages 2..N would fail as a missing mandatory input",
+                continuation.action_id,
+                missing.join(", ")
+            )));
+        }
+        // `additionalProperties` absent defaults to `true` in JSON Schema,
+        // which permits the extra key — only an explicit `false` rejects.
+        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+            let mut undeclared: Vec<&str> = self
+                .possible_input_keys()
+                .into_iter()
+                .filter(|key| !properties.contains_key(*key))
+                .collect();
+            if !undeclared.is_empty() {
+                undeclared.sort_unstable();
+                return Err(mismatch(format!(
+                    "action '{}' declares `additionalProperties: false` and does not declare \
+                     input(s) [{}] that this table can send; pages 2..N would be rejected as \
+                     undeclared inputs",
+                    continuation.action_id,
+                    undeclared.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A discovered input schema's `required` list, as declared.
+///
+/// `Ok(vec![])` when `required` is absent — JSON Schema's "nothing is
+/// mandatory". `Err(reason)` when it is present but not an array of
+/// strings: that is a schema this gate does not understand, and "do not
+/// understand" is the case a gate exists to refuse.
+fn required_keys(schema: &Value) -> Result<Vec<&str>, &'static str> {
+    let Some(required) = schema.get("required") else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = required.as_array() else {
+        return Err("`required` is present but not an array");
+    };
+    items
+        .iter()
+        .map(|item| item.as_str().ok_or("`required` holds a non-string element"))
+        .collect()
+}
+
+/// `required_keys` minus the cursor the pack does send.
+fn required_beyond_cursor<'a>(
+    input_schema: Option<&'a Value>,
+    cursor_param: &str,
+) -> Result<Vec<&'a str>, &'static str> {
+    let Some(schema) = input_schema else {
+        return Ok(Vec::new());
+    };
+    Ok(required_keys(schema)?
+        .into_iter()
+        .filter(|key| *key != cursor_param)
+        .collect())
 }
 
 /// A versioned set of stable table definitions for one provider.
@@ -162,6 +543,7 @@ impl SourcePackRegistry {
         let mut packs = HashMap::new();
         for pack in [
             super::packs::mock::pack()?,
+            super::packs::dropbox::pack()?,
             super::packs::github::pack()?,
             super::packs::gmail::pack()?,
             super::packs::notion::pack()?,
@@ -290,6 +672,7 @@ mod tests {
             names,
             vec![
                 "discord",
+                "dropbox",
                 "feishu",
                 "github",
                 "gmail",
@@ -490,6 +873,296 @@ mod tests {
             filters: &[],
             error_path: None,
             expected_fingerprint: None,
+            continuation: None,
+        }
+    }
+
+    /// A cursor table continuing through a cursor-only action, for the
+    /// input-gate arms no pack-level e2e reaches.
+    fn cursor_only_table() -> SourcePackTable {
+        SourcePackTable {
+            pagination: PaginationStrategy::Cursor {
+                cursor_param: "cursor",
+                next_cursor_path: "$.cursor",
+                page_size_param: Some("limit"),
+                page_size: 10,
+                has_more_path: Some("$.hasMore"),
+            },
+            expected_fingerprint: Some("aa"),
+            continuation: Some(CursorContinuation {
+                action_id: "t.action_continue",
+                expected_fingerprint: "aa",
+                cursor_only: true,
+            }),
+            ..leaked_table("t.entries")
+        }
+    }
+
+    #[test]
+    fn cursor_only_inputs_accept_a_declaring_schema_and_ignore_optional_extras() {
+        let table = cursor_only_table();
+        // The exact Dropbox shape.
+        table
+            .check_continuation_inputs(Some(&serde_json::json!({
+                "type": "object",
+                "properties": {"cursor": {"type": "string"}},
+                "required": ["cursor"],
+                "additionalProperties": false
+            })))
+            .expect("cursor declared and nothing else required");
+        // An additive upstream release that grows an OPTIONAL input must not
+        // fail startup: a cursor-only request is still valid against it.
+        table
+            .check_continuation_inputs(Some(&serde_json::json!({
+                "type": "object",
+                "properties": {"cursor": {"type": "string"}, "hint": {"type": "string"}},
+                "required": ["cursor"]
+            })))
+            .expect("an optional extra input is not a breaking change");
+        // `required` absent entirely means nothing is mandatory.
+        table
+            .check_continuation_inputs(Some(&serde_json::json!({
+                "type": "object",
+                "properties": {"cursor": {"type": "string"}}
+            })))
+            .expect("no required list means nothing is required");
+    }
+
+    #[test]
+    fn cursor_only_inputs_reject_every_way_the_claim_can_break() {
+        let table = cursor_only_table();
+        for (schema, expected) in [
+            // The cursor input is not a declared property, so the request's
+            // one field is the undeclared extra a strict schema rejects.
+            (
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"pageToken": {"type": "string"}},
+                    "additionalProperties": false
+                })),
+                "does not declare the cursor input 'cursor'",
+            ),
+            // A mandatory input the pack never sends on a continuation page.
+            (
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"cursor": {"type": "string"}, "path": {"type": "string"}},
+                    "required": ["cursor", "path"]
+                })),
+                "requires input(s) [path]",
+            ),
+            // Unverifiable: default-deny rather than trust — and the two
+            // ways it can be unverifiable get different diagnostics, so a
+            // present-but-shapeless schema is not reported as absent.
+            (
+                Some(serde_json::json!({"type": "object"})),
+                "no input properties",
+            ),
+            (None, "no input schema"),
+        ] {
+            let err = table
+                .check_continuation_inputs(schema.as_ref())
+                .expect_err(expected);
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(expected),
+                "want {expected:?} in: {rendered}"
+            );
+            assert!(
+                rendered.contains("t.action_continue"),
+                "the continuation action names itself: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_continuation_on_a_non_cursor_strategy_is_a_pack_bug_not_a_pass() {
+        // Unreachable through YAML (the loader nests `continuation` under the
+        // cursor strategy), so this pins that a hand-built table cannot slip
+        // through the gate by having no cursor input to check.
+        let table = SourcePackTable {
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
+            ..cursor_only_table()
+        };
+        let err = table
+            .check_continuation_inputs(Some(&serde_json::json!({
+                "properties": {"cursor": {"type": "string"}}
+            })))
+            .expect_err("a continuation without a cursor strategy cannot be honored");
+        assert!(
+            err.to_string().contains("non-cursor pagination strategy"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_table_without_a_continuation_is_never_gated_on_inputs() {
+        // Every pre-existing pack: no continuation at all, so the single
+        // gate short-circuits before either arm.
+        leaked_table("t.plain")
+            .check_continuation_inputs(None)
+            .expect("no continuation, nothing to check");
+    }
+
+    #[test]
+    fn the_single_gate_routes_each_inputs_spelling_to_its_own_arm() {
+        // What the dispatcher must NOT do is apply the cursor-only
+        // reasoning to `inputs: full` or vice versa. Same argument
+        // (`None`), two different verdicts, which is only possible if the
+        // routing is real:
+        //   - cursor_only refuses an unverifiable claim about inputs;
+        //   - full to a DIFFERENT action refuses it too, but for its own
+        //     reason and with its own wording.
+        let cursor_only = cursor_only_table()
+            .check_continuation_inputs(None)
+            .expect_err("cursor_only cannot be verified against no schema");
+        assert!(
+            cursor_only.to_string().contains("`inputs: cursor_only`"),
+            "the cursor-only arm answered: {cursor_only}"
+        );
+        let full = full_continuation_table()
+            .check_continuation_inputs(None)
+            .expect_err("a full continuation to another action needs its schema");
+        assert!(
+            full.to_string().contains("full-input continuation"),
+            "the full arm answered: {full}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_required_is_refused_rather_than_read_as_empty() {
+        // The asymmetry this closes: a missing `properties` always
+        // default-DENIED, while a `required` that could not be parsed
+        // default-ALLOWED. Both come from the same untrusted discovery
+        // payload, so both fail closed now.
+        let table = cursor_only_table();
+        for required in [
+            serde_json::json!("cursor"),
+            serde_json::json!({"0": "cursor"}),
+            serde_json::json!(["cursor", 7]),
+            serde_json::json!([null]),
+        ] {
+            let err = table
+                .check_continuation_inputs(Some(&serde_json::json!({
+                    "type": "object",
+                    "properties": {"cursor": {"type": "string"}},
+                    "required": required,
+                })))
+                .expect_err("an unreadable `required` is not an empty one");
+            assert!(
+                err.to_string().contains("cannot read"),
+                "the gate says it did not understand the schema: {err}"
+            );
+        }
+    }
+
+    /// A cursor table whose continuation targets a DIFFERENT action with
+    /// the full input — the `inputs:` default, and the shape a new pack
+    /// lands in by omission.
+    fn full_continuation_table() -> SourcePackTable {
+        SourcePackTable {
+            required_resources: &["path"],
+            optional_resources: &["directOnly"],
+            fixed_inputs: &[("recursive", FixedValue::Bool(true))],
+            continuation: Some(CursorContinuation {
+                action_id: "t.action_continue",
+                expected_fingerprint: "aa",
+                cursor_only: false,
+            }),
+            ..cursor_only_table()
+        }
+    }
+
+    #[test]
+    fn a_full_continuation_to_another_action_accepts_a_schema_that_admits_the_input() {
+        let table = full_continuation_table();
+        table
+            .check_full_continuation_inputs(Some(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "cursor": {"type": "string"}, "limit": {"type": "integer"},
+                    "path": {"type": "string"}, "directOnly": {"type": "boolean"},
+                    "recursive": {"type": "boolean"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            })))
+            .expect("every sendable key is declared and every required key is sent");
+        // `additionalProperties` absent defaults to `true`, so an undeclared
+        // key the pack may send is not a rejection — no false alarm.
+        table
+            .check_full_continuation_inputs(Some(&serde_json::json!({
+                "type": "object",
+                "properties": {"cursor": {"type": "string"}}
+            })))
+            .expect("a permissive schema accepts extras by JSON Schema default");
+        // A same-action continuation is sound by construction: one action,
+        // one input schema, and page one already satisfied it.
+        SourcePackTable {
+            continuation: Some(CursorContinuation {
+                action_id: "t.action",
+                expected_fingerprint: "aa",
+                cursor_only: false,
+            }),
+            ..full_continuation_table()
+        }
+        .check_full_continuation_inputs(None)
+        .expect("the same action cannot disagree with itself");
+        // And a cursor-only continuation belongs to the other gate.
+        cursor_only_table()
+            .check_full_continuation_inputs(None)
+            .expect("cursor_only is checked by check_continuation_inputs");
+    }
+
+    #[test]
+    fn a_full_continuation_to_another_action_rejects_both_ways_a_request_can_400() {
+        let table = full_continuation_table();
+        for (schema, expected) in [
+            // Mandatory on the continue action, and NOT something the pack
+            // sends on every request: `directOnly` is optional, so a
+            // binding may omit it.
+            (
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cursor": {"type": "string"}, "limit": {"type": "integer"},
+                        "path": {"type": "string"}, "directOnly": {"type": "boolean"},
+                        "recursive": {"type": "boolean"}
+                    },
+                    "required": ["directOnly"]
+                })),
+                "requires input(s) [directOnly]",
+            ),
+            // Strict schema that does not declare keys the pack can send.
+            (
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"cursor": {"type": "string"}},
+                    "additionalProperties": false
+                })),
+                "does not declare input(s) [directOnly, limit, path, recursive]",
+            ),
+            // Unverifiable: default-deny rather than trust.
+            (
+                Some(serde_json::json!({"type": "object"})),
+                "no input properties",
+            ),
+            (None, "no input schema"),
+        ] {
+            let err = table
+                .check_full_continuation_inputs(schema.as_ref())
+                .expect_err(expected);
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(expected),
+                "want {expected:?} in: {rendered}"
+            );
+            assert!(
+                rendered.contains("t.action_continue"),
+                "the continuation action names itself: {rendered}"
+            );
         }
     }
 

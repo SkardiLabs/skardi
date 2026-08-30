@@ -6,9 +6,19 @@ use datafusion::sql::sqlparser::ast::{Expr, SetExpr, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::types::{InferredFieldType, RequestSchema, ResponseSchema};
+
+/// Detects the multi-row tuple-list shape `VALUES {name}` (case-insensitive,
+/// no trailing boundary — `}` is a non-word character, so a trailing `\b`
+/// would never match). Capture group 1 is the parameter name. Shared by the
+/// placeholder converters below and by skardi-server's parameter-schema
+/// enrichment, which must agree with the loader on what counts as this shape.
+pub static VALUES_PLACEHOLDER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bVALUES\s*\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+        .expect("VALUES placeholder regex is valid")
+});
 
 /// SQL schema inference engine for extracting parameter and response schemas from SQL queries
 /// TODO: Fix the issue that extra parameters in the request is allowed
@@ -175,9 +185,7 @@ impl SqlSchemaInferrer {
         // breaking pipeline load. Substitute with `VALUES (?)` so the SQL
         // parses as a single-row tuple stub; runtime types still come from
         // the renderer, not from this stub.
-        let values_pattern = regex::Regex::new(r"(?i)\bVALUES\s*\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
-            .map_err(|e| anyhow!("Failed to compile VALUES placeholder regex: {}", e))?;
-        sql_with_placeholders = values_pattern
+        sql_with_placeholders = VALUES_PLACEHOLDER_RE
             .replace_all(&sql_with_placeholders, "VALUES (?)")
             .to_string();
 
@@ -639,9 +647,9 @@ impl SqlSchemaInferrer {
     fn replace_parameters_for_parsing(&self, sql: &str) -> Result<String> {
         // Pre-pass: `VALUES {name}` → `VALUES (NULL)` so the multi-row
         // tuple-list shape parses (`VALUES NULL` is not valid SQL).
-        let values_pattern = regex::Regex::new(r"(?i)\bVALUES\s*\{[a-zA-Z_][a-zA-Z0-9_]*\}")
-            .map_err(|e| anyhow!("Failed to compile VALUES placeholder regex: {}", e))?;
-        let sql = values_pattern.replace_all(sql, "VALUES (NULL)").to_string();
+        let sql = VALUES_PLACEHOLDER_RE
+            .replace_all(sql, "VALUES (NULL)")
+            .to_string();
 
         let parameter_pattern = regex::Regex::new(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
             .map_err(|e| anyhow!("Failed to compile parameter regex: {}", e))?;
@@ -1269,5 +1277,22 @@ mod tests {
         assert!(inferrer.is_dml_statement("  insert into t (a) values (1)"));
         assert!(!inferrer.is_dml_statement("SELECT * FROM t"));
         assert!(!inferrer.is_dml_statement("  select * from t"));
+    }
+
+    #[test]
+    fn values_placeholder_regex_detects_the_multi_row_shape() {
+        let re = &*VALUES_PLACEHOLDER_RE;
+        // case-insensitive, optional whitespace, captures the name
+        let cap = re.captures("INSERT INTO t (a, b) values {rows}").unwrap();
+        assert_eq!(&cap[1], "rows");
+        let cap = re.captures("INSERT INTO t VALUES{rows}").unwrap();
+        assert_eq!(&cap[1], "rows");
+        // a parenthesized tuple of scalar params is NOT the multi-row shape
+        assert!(re.captures("INSERT INTO t VALUES ({a}, {b})").is_none());
+        // a parameter merely named like the keyword is not a match either
+        assert!(
+            re.captures("SELECT * FROM t WHERE x = {values_x}")
+                .is_none()
+        );
     }
 }

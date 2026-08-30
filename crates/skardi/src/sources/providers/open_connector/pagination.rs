@@ -12,6 +12,52 @@ use serde_json::{Map, Value};
 use super::error::OpenConnectorError;
 use super::row_path::{RowPath, json_kind};
 
+/// How a cursor-paginated table continues past its first page, when the
+/// provider does not accept the cursor on the action that started the
+/// listing.
+///
+/// Open Connector's Dropbox provider is the motivating shape: `list_folder`
+/// begins a folder listing and `list_folder_continue` — a **separate
+/// action** whose input schema declares `cursor` as its only property —
+/// serves pages 2..N. Feeding the cursor back to `list_folder` is not a
+/// quiet truncation but a hard 400, because Open Connector's action schemas
+/// are `additionalProperties: false`.
+///
+/// Absent (the default for every pre-existing pack), pages 2..N repeat the
+/// table's own action with the full assembled input, exactly as before.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorContinuation {
+    /// Action serving pages 2..N. Spelled explicitly even when it equals
+    /// the table's own action: a same-action continuation that only needs
+    /// `cursor_only` still names itself, so the fingerprint gate below can
+    /// never be handed a hole to fall through.
+    pub action_id: &'static str,
+    /// Contract fingerprint of `action_id`. Mandatory: the continuation
+    /// action serves most of a large scan, so gating only the action that
+    /// served page one would leave the rest of the collection unguarded
+    /// against contract drift.
+    ///
+    /// Scope worth knowing before relying on it: a fingerprint hashes the
+    /// action's OUTPUT schema, so this pin guards the ROW shape pages 2..N
+    /// deliver. Where an opener and its continuation publish the same
+    /// output schema — the Dropbox case — the two hashes are equal and this
+    /// pin can only fail together with the opener's. What actually differs
+    /// between the two actions is their INPUTS, and those are covered by
+    /// `SourcePackTable::check_continuation_inputs` instead, not here.
+    pub expected_fingerprint: &'static str,
+    /// Whether pages 2..N carry ONLY the cursor. Required whenever the
+    /// continuation action's schema accepts nothing else; kept separate
+    /// from `action_id` because the two vary independently — a provider can
+    /// continue through the same action while still rejecting the original
+    /// inputs alongside a cursor.
+    ///
+    /// Checked at registration against the continuation action's discovered
+    /// input schema (`SourcePackTable::check_continuation_inputs`), because
+    /// the fingerprint above cannot: a wrong claim here is otherwise a hard
+    /// 400 on page two of a live scan rather than a startup error.
+    pub cursor_only: bool,
+}
+
 /// How a source-pack table paginates.
 #[derive(Debug, Clone, Copy)]
 pub enum PaginationStrategy {
@@ -329,6 +375,25 @@ impl Pagination {
                 input.insert((*page_size_param).to_string(), Value::from(*page_size));
             }
             PaginationStrategy::SinglePage { .. } => {}
+        }
+    }
+
+    /// Inject ONLY the cursor input, for a continuation request whose action
+    /// accepts nothing else (see [`CursorContinuation::cursor_only`]).
+    ///
+    /// Deliberately omits the page-size input that [`Self::apply`] sends:
+    /// Dropbox's `list_folder_continue` declares `cursor` as its sole
+    /// property, so a `limit` alongside it is a 400. Continuation pages are
+    /// sized by the request that began the listing — a provider guarantee,
+    /// not something this engine enforces.
+    ///
+    /// A no-op on the first page (no token yet) and for non-cursor
+    /// strategies, neither of which a continuation can reach.
+    pub fn apply_cursor_only(&self, input: &mut Map<String, Value>) {
+        if let PaginationStrategy::Cursor { cursor_param, .. } = &self.strategy
+            && let Some(token) = &self.next_token
+        {
+            input.insert((*cursor_param).to_string(), Value::from(token.as_str()));
         }
     }
 
@@ -1076,6 +1141,47 @@ mod tests {
                 "for {envelope}: got {err}"
             );
         }
+    }
+
+    #[test]
+    fn cursor_only_carries_the_token_and_nothing_else() {
+        // The whole point of the continuation mode: Dropbox's
+        // list_folder_continue declares `cursor` as its ONLY property under
+        // additionalProperties: false, so the page-size input `apply` sends
+        // would be a hard 400 rather than a tolerated extra.
+        let mut pagination = cursor();
+        assert!(
+            pagination
+                .advance(&json!({"next_cursor": "c2"}), 50, None)
+                .unwrap()
+        );
+
+        let mut input = Map::new();
+        pagination.apply_cursor_only(&mut input);
+        assert_eq!(input.get("cursor"), Some(&json!("c2")));
+        assert_eq!(input.len(), 1, "cursor-only means exactly one key");
+
+        // The same paginator's full `apply` still sends the page size, so
+        // page one is unaffected by the continuation mode.
+        let mut full = Map::new();
+        pagination.apply(&mut full);
+        assert_eq!(full.get("limit"), Some(&json!(50)));
+    }
+
+    #[test]
+    fn cursor_only_is_a_noop_before_a_token_exists() {
+        // Page one has no cursor to send; a continuation can never be
+        // reached there, but an empty body beats inventing a null cursor.
+        let pagination = cursor();
+        let mut input = Map::new();
+        pagination.apply_cursor_only(&mut input);
+        assert!(input.is_empty());
+
+        // Non-cursor strategies have no cursor input at all.
+        let pagination = page_number(10);
+        let mut input = Map::new();
+        pagination.apply_cursor_only(&mut input);
+        assert!(input.is_empty());
     }
 
     #[test]

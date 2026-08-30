@@ -37,10 +37,13 @@ gateway **runtime token**.
 > search — live-verified against a real MSA drive; search rows are a
 > reduced projection and search continuations currently fail upstream
 > on personal drives, loudly, per the pack doc),
-> and [Google Drive](open-connector-google-drive.md) (files, drives,
+> [Google Drive](open-connector-google-drive.md) (files, drives,
 > file permissions — live-verified against a real Workspace account,
 > shared-drive rows included; three structurally unreachable columns
-> stay documented as residuals per the pack doc).
+> stay documented as residuals per the pack doc),
+> and [Dropbox](open-connector-dropbox.md) (files, shared links, file
+> search — split-action cursor continuation; live-verified against a real
+> account, all five pins captured from a live gateway).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
@@ -172,10 +175,15 @@ LIMIT 50;
 
 It compiles into exactly the scan the YAML-bound table uses: same stable
 Arrow schema, filter allowlist, pagination, safety bounds, and shared
-cache. The table's action must have been discovered when the gateway was
-registered — bind the table in YAML or add its action to
-`raw_action_allowlist`; otherwise planning fails with an error saying so
-(planning never contacts the gateway).
+cache. **Every** action the table executes must have been discovered when
+the gateway was registered — including a split-action continuation's, not
+just the opening action — so bind the table in YAML or add every one of
+its action ids to `raw_action_allowlist`; otherwise planning fails with an
+error saying so (planning never contacts the gateway). For a split-action
+table the allowlist route needs both ids: `dropbox.files` executes
+`dropbox.list_folder` on page one and `dropbox.list_folder_continue` on
+pages 2..N, and an allowlist naming only the opener fails planning on the
+continuation.
 
 ### 3. `open_connector_scan` — allowlisted raw read actions
 
@@ -288,6 +296,77 @@ page — a page without it fails as contract drift rather than guessing.
 Declare it only for providers that always emit the signal; for the
 omit-when-false pattern (Slack's `response_metadata`), leave it undeclared
 and let the cursor spellings terminate the scan.
+
+Some providers continue a listing through a **different action** than the
+one that opened it — Dropbox's `list_folder` → `list_folder_continue`,
+whose input schema declares `cursor` as its only property. A cursor-paginated
+pack table declares that with an optional `continuation` block; absent, pages
+2..N repeat the table's own action with the full assembled input, exactly as
+before:
+
+```yaml
+pagination:
+  strategy: cursor
+  cursor_input: cursor
+  next_cursor_path: "$.cursor"
+  page_size_input: limit
+  page_size: 2000
+  has_more_path: "$.hasMore"
+  continuation:
+    action: dropbox.list_folder_continue   # default: the table's own action
+    fingerprint: <blake3-hex>              # required, never optional
+    inputs: cursor_only                    # cursor_only | full (default: full)
+```
+
+Page 1 always uses the table's own action with the full input. `inputs:
+cursor_only` makes pages 2..N carry the cursor and nothing else — no
+resources, no fixed inputs, no page size — for continue actions that declare
+nothing else; the listing's shape was committed by the request that opened
+it, and the provider sizes continuation pages from that request.
+
+Both actions are discovered and fingerprint-gated at registration, so an
+undiscovered or drifted continue action fails at startup rather than on page
+two of the first scan. Because a fingerprint hashes the *output* schema, the
+input side is checked separately, against the continue action's discovered
+**input** schema — in both directions of `inputs:`, since a wrong claim
+either way is a hard 400 on page two of a live scan:
+
+- `inputs: cursor_only` — the cursor input must be a declared property and
+  no other input may be `required`.
+- `inputs: full` (the default) targeting a **different** action — every
+  input the table sends on every request must satisfy that action's
+  `required`, and under `additionalProperties: false` every input the table
+  *can* send must be a declared property. When the continuation names the
+  table's own action the check is skipped: one action has one input schema,
+  and page one already satisfied it.
+
+A continue action that publishes no input schema is refused rather than
+trusted, the same default-deny posture raw scans take toward a missing
+read/write classification — as is a `required` list that is present but is
+not an array of strings, since a gate that cannot read its input has
+verified nothing.
+
+Four authoring invariants are enforced by the loader:
+
+- a `continuation` on a non-cursor strategy is a parse error;
+- a table that pins its continuation's fingerprint must pin its own
+  action's too (half a gate reads as gated while verifying only pages 2..N);
+- a same-action continuation may not pin a fingerprint different from the
+  table's own — one action has one contract, so no gateway can satisfy
+  both;
+- `inputs: cursor_only` may not be paired with an **Exact**-fidelity
+  filter. Exact pushdown deletes the `Filter` node from the plan, so page
+  one would apply the predicate as an action input while pages 2..N could
+  not, with no node left to re-apply it — silently returning rows the query
+  excluded. Declare such a filter `Inexact` instead: the `Filter` node
+  survives, so DataFusion re-applies the predicate and the rows are
+  right. The waste is not free, though — pages 2..N fetch the *unfiltered*
+  collection, and `max_rows`/`max_pages` count what the gateway returned,
+  not what survived the filter. A selective `Inexact` filter paired with
+  `cursor_only` therefore needs bounds sized for the whole collection; a
+  query that works today can otherwise turn into a hard
+  `ScanBoundsExceeded` rather than a slower one.
+
 Conversion errors report the action, row
 path, page, row, column, and expected type — with the offending JSON
 *kind*, never the value.
@@ -307,9 +386,16 @@ otherwise report `RowPathNotFound` on an in-band error page.
 
 Each pack table pins the full relational contract and an expected
 action-contract fingerprint captured from a live gateway (a canonicalized
-BLAKE3 hash of the discovered output schema; both the github and slack
-packs are pinned, with the captured schemas committed next to each pack
-under `fixtures/<provider>/contracts/`). At registration a pinned
+BLAKE3 hash of the discovered output schema; every *provider* pack is
+pinned, with the schemas committed next to each pack under
+`fixtures/<provider>/contracts/`, all captured from a live gateway — the
+synthetic `mock` pack is the one built-in that pins nothing, having no
+upstream contract to drift against).
+Split-action
+tables pin BOTH the opening action and the continuation action; where the
+two publish the same output schema, the continuation pin guards the row
+shape of pages 2..N and its input-side claim is gated separately (see
+[Bounds, retries, and errors](#bounds-retries-and-errors)). At registration a pinned
 table's fingerprint is compared against the discovered contract and any
 difference — breaking or additive, since a hash cannot tell them apart —
 fails with a targeted error instead of silently changing a table's

@@ -699,6 +699,80 @@ event carrying the scan identity and error.
       the fixtures (native Docs DO report `sizeBytes`; every grant
       carries `permissionDetails`; shared-drive rows drop exactly
       `owners`+`shared`).
+- [x] 5.10 Dropbox pack (OAuth, cursor pagination with SPLIT-ACTION
+      continuation, normalized wire shape — `mapDropboxMetadata` rebuilds
+      every row into a strict fully-`required` camelCase object): files,
+      shared_links, file_search.
+      **Live-verified 2026-08-18** against a self-hosted gateway at commit
+      `a3efa99` and a real free-tier Dropbox account, per the runbook
+      `docs/superpowers/plans/2026-08-18-dropbox-live-evaluation.md`. All five
+      actions discovered; all five committed fingerprints matched LIVE
+      discovery unchanged, so registration passed the contract gate with no
+      re-pinning (the source-derived captures turned out byte-identical to the
+      live ones, and the opener/continuation schema identity is a fact about
+      the wire). Page sizes probed at the boundary: 2000 and 1000 return rows,
+      2001 and 1001 are refused. Termination confirmed as designed — the final
+      `list_folder` page carries `hasMore: false` beside a NON-empty
+      259-character cursor, so `has_more_path` is load-bearing. Real
+      multi-page pagination through `list_folder_continue` (`pages=2
+      rows=378`), and `LIMIT` collapsed the same scan to `pages=1 rows=1`.
+      Both design-spec open questions answered on the wire: `{path, cursor}`
+      together IS accepted by `list_shared_links` (no `cursor_only` needed),
+      and `matches[].metadata` can never be null (the executor always returns
+      a full object), so `file_search.tag`/`name` stay non-nullable.
+      **What the live pass changed:** `shared_links` lost four columns —
+      `path_display`, `is_downloadable`, `content_hash`, `sharing_info` —
+      which `sharing/list_shared_links` has no field for and which measured
+      0/5 non-NULL; a file whose `files` row carries all four returns all four
+      NULL on its own `shared_links` row. 15 → 11 columns, pinned by a
+      negative-space test. Per-column coverage after the trim: 12/12 on
+      `files` (378 rows), 11/11 on `shared_links` bar the labelled
+      `expires_at`, 13/13 on `file_search`. Two claims left UNOBSERVED, both
+      environmental: `shared_links.expires_at` (paid-tier link expiry) and
+      `file_search.match_type = 'content'` (content indexing did not land).
+      Row fixtures remain authored shapes rather than redacted captures,
+      because the verified account holds personal files.
+      **Gateway defect, filed upstream, not worked around — resolved:** at
+      the checkout the pass used (`a3efa99`, 2026-07-07) the gateway's
+      `GET /v1/actions/<id>` omits the `execution` block, so Skardi's
+      default-deny action registry refuses every action from EVERY pack on
+      that checkout (reproduced with the merged `github` pack). Filed as
+      oomol-lab/open-connector#358, closed as completed — upstream `1607633`
+      (#149, 2026-07-19) already serialized the block, so no prerequisite
+      exists on a gateway at or after that commit. Skardi's gate is correct
+      and was deliberately left untouched — no compatibility fallback was
+      added.
+      Engine extension (backward-compatible, opt-in, `None` for every
+      pre-existing pack): `pagination.continuation` — pages 2..N may target a
+      DIFFERENT action (`list_folder` → `list_folder_continue`) and, with
+      `inputs: cursor_only`, carry the cursor and nothing else. Both actions
+      are discovered and fingerprint-gated at both gate call sites; because a
+      fingerprint hashes the OUTPUT schema, the INPUT side is checked
+      separately against the continuation action's discovered input schema,
+      in BOTH directions of `inputs:` — `cursor_only` (cursor declared,
+      nothing else `required`) and `full` when it targets a different action
+      (the table's guaranteed keys satisfy `required`; under
+      `additionalProperties: false` every key it can send is declared).
+      A missing input schema is refused, as is a `required` that is present
+      but not an array of strings. Three loader-side authoring refusals
+      beyond the parse-level ones: a continuation pinned while the table's
+      own action is not; a same-action continuation pinning a DIFFERENT
+      fingerprint (unsatisfiable — one action, one contract); and
+      `cursor_only` paired with an `Exact`-fidelity filter, which would
+      apply the predicate on page one, drop it on pages 2..N, and have no
+      `Filter` node left to re-apply it — silently returning rows the query
+      excluded.
+      Because the rows are normalized and strictly declared, every mapped
+      column sits inside the fingerprint gate and the coverage-gap pin is
+      empty. That is narrower than it sounds, and the live pass proved it:
+      all five list actions publish the SAME normalized 15-key schema, so a
+      fingerprint match says nothing about whether a key is populated for a
+      given action — which is exactly how the four `shared_links` columns
+      passed every contract-level check while being structurally always-NULL.
+      Real rows remain the only column truth here too. Verification: 965
+      full library suite, 324 open_connector (`cargo test -p skardi --lib
+      sources::providers::open_connector`), 25 pack-scoped (`… --lib
+      packs::dropbox`).
 
 **Gate for each pack** (from the design spec): complete terminating pagination,
 deterministic schema, read-only allowlist, documented authz/rate limits,
@@ -708,26 +782,14 @@ bounded safety defaults, null/empty/nested fixtures, docs.
 
 ## Review notes
 
-- **Current PR**: milestone 5.9 (Google Drive pack — files, drives,
-  file_permissions; PR #226). Milestones 1–4 and 5.1–5.8 (GitHub, Slack,
-  Notion, Feishu, Gmail, Discord, Outlook, OneDrive packs) are merged;
-  this PR adds the second Google pack over normalized rows, with zero
-  engine changes — the pack-shaping decisions are the two-dot action IDs
-  (`googledrive.files.list`, verified engine-safe), the load-bearing
-  all-drives fixed-input pair on `files`, and the five knowingly
-  outside-the-gate `restrictions.*` columns on `drives`. Live
-  verification (phase 4) ran 2026-08-25 against a real Workspace
-  account and closed both load-bearing items: design record R1
-  resolved in its favor (zero shared drives at first, then the account
-  proved able to CREATE one, so `drives` was verified on real rows and
-  all five restriction spellings came back verbatim), and the pinned
-  all-drives pair really surfaced a shared-drive file through a live
-  scan. Its pack-changing findings were all fixture-level corrections
-  (native Docs DO report `sizeBytes`; every grant carries
-  `permissionDetails`; shared-drive rows drop exactly
-  `owners`+`shared`), plus three columns recorded as structural
-  residuals (`drives.org_unit_id`, `drives.theme_id`,
-  `file_permissions.expiration_time`).
+- **Current PR**: milestone 5.10 (Dropbox pack + `pagination.continuation`)
+  — open as #216, live-verified 2026-08-18; see the entry above.
+  Milestones 1–4 and 5.1–5.9 (GitHub, Slack, Notion, Feishu, Gmail,
+  Discord, Outlook, OneDrive, Google Drive packs) are merged; this PR adds
+  the Dropbox pack against Open Connector's normalized Dropbox contract,
+  plus the one engine extension it required: `pagination.continuation`,
+  which lets pages 2..N target a different action and, with
+  `inputs: cursor_only`, carry the cursor alone.
 - **Invariants to hold in review**: no provider credentials in Skardi;
   read-only until explicitly designed otherwise; pure validation shared by
   CLI and server; no network I/O at query-planning time; no `.unwrap()` in

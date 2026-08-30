@@ -185,16 +185,15 @@ mod tests {
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
-        EnvVarGuard, MockGateway, MockResponse, discovery_ok, envelope_err, envelope_ok,
-        fingerprint_uncovered_columns,
+        EnvVarGuard, MockGateway, MockResponse, boolean, collect, column_values,
+        convert_first_page, discovery_ok, envelope_err, envelope_ok, execute_inputs,
+        fingerprint_uncovered_columns, input_keys, utf8,
     };
     use crate::sources::providers::open_connector::{
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
         register_open_connector_udtfs,
     };
-    use arrow::array::{
-        Array, BooleanArray, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
-    };
+    use arrow::array::{Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -296,36 +295,7 @@ mod tests {
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
-        convert_page(table, &page)
-    }
-
-    fn convert_page(table: &SourcePackTable, page: &Value) -> RecordBatch {
-        let rows = RowPath::parse(table.row_path)
-            .expect("row path")
-            .rows(page, 1)
-            .expect("row array");
-        RowConverter::new(table.fields)
-            .expect("converter")
-            .convert(rows, 1)
-            .expect("page converts")
-    }
-
-    fn utf8<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("column {name}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Utf8 column")
-    }
-
-    fn boolean<'a>(batch: &'a RecordBatch, name: &str) -> &'a BooleanArray {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("column {name}"))
-            .as_any()
-            .downcast_ref()
-            .expect("Boolean column")
+        convert_first_page(table, &page)
     }
 
     #[test]
@@ -413,12 +383,7 @@ mod tests {
             utf8(&batch, "conversation_id").value(7),
         );
         assert_eq!(
-            batch
-                .column_by_name("conversation_id")
-                .expect("column")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Utf8")
+            utf8(&batch, "conversation_id")
                 .iter()
                 .flatten()
                 .collect::<std::collections::HashSet<_>>()
@@ -470,12 +435,7 @@ mod tests {
         assert_eq!(utf8(&batch, "well_known_name").value(7), "inbox");
         assert_eq!(utf8(&batch, "well_known_name").value(6), "sentitems");
         assert!(utf8(&batch, "well_known_name").is_null(0));
-        let hidden: &BooleanArray = batch
-            .column_by_name("is_hidden")
-            .expect("column")
-            .as_any()
-            .downcast_ref()
-            .expect("Boolean column");
+        let hidden = boolean(&batch, "is_hidden");
         assert!((0..9).all(|i| !hidden.value(i)));
         let children: &Int64Array = batch
             .column_by_name("child_folder_count")
@@ -660,7 +620,7 @@ mod tests {
         // SYNTHETIC: the live mailbox had no hidden folders (the pin's
         // on/off responses were identical), so the is_hidden=true
         // conversion arm is pinned here rather than by the capture.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("mail_folders"),
             &json!({"mailFolders": [
                 {"id": "f-hidden", "displayName": "Hidden", "isHidden": true},
@@ -681,7 +641,7 @@ mod tests {
         // parent becomes SQL NULL, never an error. Deleting this test
         // because "the wire never does that" would drop the only
         // coverage of the admission gate's null-parent category.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("messages"),
             &json!({"messages": [
                 {"id": "m-1", "from": null},
@@ -703,7 +663,7 @@ mod tests {
         // (SYNTHETIC — the live wire under the select pin never nulls
         // a field, but passthrough offers no such guarantee): null is
         // SQL NULL while "" stays an empty string.
-        let batch = convert_page(
+        let batch = convert_first_page(
             table("messages"),
             &json!({"messages": [
                 {"id": "m-1", "subject": "s"},
@@ -732,7 +692,7 @@ mod tests {
     fn empty_page_keeps_schema_stable() {
         // Zero rows still yield the full column set — an empty mailbox
         // must DESCRIBE like a populated one.
-        let batch = convert_page(table("messages"), &json!({"messages": []}));
+        let batch = convert_first_page(table("messages"), &json!({"messages": []}));
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), table("messages").fields.len());
     }
@@ -1009,54 +969,6 @@ bindings:
         .expect("gateway registration succeeds");
         register_open_connector_udtfs(&ctx, gateways).expect("UDTF registration succeeds");
         (gateway, ctx)
-    }
-
-    async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-        ctx.sql(sql)
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("collect")
-    }
-
-    fn column_values(batches: &[RecordBatch], name: &str) -> Vec<String> {
-        batches
-            .iter()
-            .flat_map(|batch| {
-                let values = batch
-                    .column_by_name(name)
-                    .unwrap_or_else(|| panic!("column {name}"))
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Utf8 column")
-                    .clone();
-                (0..values.len()).map(move |i| values.value(i).to_string())
-            })
-            .collect()
-    }
-
-    fn execute_inputs(gateway: &MockGateway, action_path: &str) -> Vec<Value> {
-        gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "POST" && r.path.ends_with(action_path))
-            .map(|r| {
-                serde_json::from_str::<Value>(&r.body).expect("request body is JSON")["input"]
-                    .clone()
-            })
-            .collect()
-    }
-
-    fn input_keys(input: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = input
-            .as_object()
-            .expect("input object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     /// The full select pin, as the wire must carry it on every request.

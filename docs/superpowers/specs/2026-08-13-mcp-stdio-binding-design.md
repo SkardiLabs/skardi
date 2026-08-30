@@ -434,11 +434,13 @@ here needs `#[ignore]`, as all tests are self-contained.
 - `docs/cli.md` — new `mcp` subcommand section with host config examples.
 - `docs/pipelines.md` — MCP moves from "v1.1 roadmap" to shipped in the
   surfaces list.
-- `README.md` — check the roadmap `5` MCP box; revise "MCP-soon" phrasing.
+- `README.md` — §4 "One definition, both bindings" copy now covers three
+  bindings. (The roadmap checkboxes and "MCP-soon" phrasing this item
+  originally targeted were removed by the #205 repositioning.)
 - New `docs/mcp.md` — host setup (Claude Desktop, Cursor), tool surface,
   auth notes, troubleshooting.
-- `docs/agent_data_plane.md` — MCP binding status + the identity-seam
-  paragraph gets its "first carrier" footnote (`ai_context` via `query`).
+- ~~`docs/agent_data_plane.md`~~ — removed from the tree by #205; no longer
+  applicable.
 
 ## Non-goals (v1)
 
@@ -467,21 +469,14 @@ here needs `#[ignore]`, as all tests are self-contained.
   "Server-side change". This is a required change to `crates/server`, not
   deferred — the zero-server-change alternative (Option B) is rejected and
   kept in that section only for the record.
-
-## Open decisions
-
-1. **`purpose` parameter on `query`** — include as optional (recommended,
-   as specced) or omit entirely from v1.
-2. **Built-in tool naming** — `query` / `list_data_sources` as specced, or
-   e.g. `skardi_query` prefixing to reduce collision odds with user
-   pipeline names (recommendation: unprefixed; MCP hosts already namespace
-   tools per server, and reserved-name suffixing covers the edge).
-3. **Bridge lifecycle knobs** — three currently-implicit choices to pin at
-   implementation time: whether concurrent `tools/call` requests are served
-   in parallel as rmcp dispatches them (recommendation: yes — a slow
-   `query` must not block `list_tools`); what happens on stdin close
-   (recommendation: abort in-flight REST calls, exit 0); and whether the
-   bridge sets a request timeout — `ApiClient` builds its reqwest client
-   with **no timeout today**, so a hung server hangs the tool call until
-   the host's own tool-call timeout fires (recommendation: rely on the
-   host's timeout in v1 and say so in docs/mcp.md).
+- **`purpose` parameter on `query`: included** (2026-08-25) — optional
+  string, sent as `ai_context: {purpose, session_id}` with one v4 UUID per
+  MCP connection as the session id; omitted entirely when not provided.
+- **Built-in tool naming: unprefixed** `query` / `list_data_sources`
+  (2026-08-25) — MCP hosts already namespace tools per server, and
+  reserved-name suffixing (`_pipeline`) covers the collision edge.
+- **Bridge lifecycle** (2026-08-25) — concurrent `tools/call` requests are
+  served in parallel (rmcp's default per-request task spawn); stdin close →
+  exit 0 (in-flight REST calls die with the process); no bridge-side
+  request timeout — the host's tool-call timeout is the backstop,
+  documented in docs/mcp.md.
