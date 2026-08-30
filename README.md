@@ -120,6 +120,7 @@ skardi run weekly-churn -p window='7 days'
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
 # same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
+# from a source checkout until `skardi mcp` ships in a tagged release
 skardi mcp
 ```
 
