@@ -526,9 +526,14 @@ impl StandardPipeline {
             .await?;
 
         // A described parameter the SQL does not declare is a typo or a doc
-        // string gone stale after a query edit — refuse to load rather than
-        // publish documentation that lies. Same all-at-once, sorted
-        // reporting as the blank check above.
+        // string gone stale after a query edit. The description would never
+        // be read (the publisher looks descriptions up by declared name), so
+        // the failure mode is a sentence silently missing from the published
+        // schema — refuse to load instead. The blast radius is deliberate:
+        // the server propagates any pipeline load failure, so this typo
+        // aborts startup; a loud deploy-time error over a quiet runtime
+        // omission. Same all-at-once, sorted reporting as the blank check
+        // above.
         let mut unknown: Vec<&String> = parameter_docs
             .keys()
             .filter(|k| !request_schema.fields.contains_key(*k))
