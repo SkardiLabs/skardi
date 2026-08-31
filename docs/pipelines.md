@@ -75,7 +75,7 @@ description to any parameter:
 spec:
   parameters:
     brand: "Exact brand name; null matches every brand"
-    max_price: "Upper price bound in USD, inclusive"
+    max_price: "Upper price bound in USD, exclusive"
   query: |
     SELECT ...
     WHERE ({brand} IS NULL OR "Brand" = {brand})
@@ -85,11 +85,16 @@ spec:
 Descriptions are documentation, not declaration — the parameter set still
 comes from the SQL, and every key under `spec.parameters` must name a
 `{placeholder}` the query declares; a misspelled or stale key fails the
-load. Each description is published as the standard `description` keyword
+load, and so does a blank description. Text is trimmed on load, so block
+scalars (`>`) publish without their trailing newline. Each description is published as the standard `description` keyword
 inside that parameter's `json_schema` in the enriched `GET /pipelines`
 inventory, which `skardi mcp` projects verbatim into MCP tool input
 schemas — the sentence written here is exactly what a model reads before
 filling the parameter.
+
+Job YAML (`kind: job`) shares the same loader, so `spec.parameters` is
+accepted and validated there too — but only pipelines publish the text:
+`GET /jobs` lists parameter names alone.
 
 ### Parameter shapes
 
