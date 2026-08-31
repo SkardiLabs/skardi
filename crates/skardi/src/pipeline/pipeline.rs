@@ -490,11 +490,35 @@ impl StandardPipeline {
         };
 
         // Optional author-written parameter descriptions (name → one line).
-        let parameter_docs: HashMap<String, String> = match spec_section.get("parameters") {
+        // Normalized right here so downstream consumers publish the text
+        // as-is: YAML block scalars keep a trailing newline (trimmed away),
+        // and a blank description is an author slip, not a request to
+        // publish nothing.
+        let raw_docs: HashMap<String, String> = match spec_section.get("parameters") {
             Some(section) => serde_yaml::from_value(section.clone())
                 .map_err(|e| anyhow!("Failed to parse spec.parameters section: {}", e))?,
             None => HashMap::new(),
         };
+        let mut parameter_docs = HashMap::with_capacity(raw_docs.len());
+        let mut blank: Vec<String> = Vec::new();
+        for (name, doc) in raw_docs {
+            let doc = doc.trim();
+            if doc.is_empty() {
+                blank.push(name);
+            } else {
+                parameter_docs.insert(name, doc.to_string());
+            }
+        }
+        // All offenders at once, sorted: HashMap iteration order is
+        // arbitrary, and naming one random slip per restart would make the
+        // author fix them one server boot at a time.
+        if !blank.is_empty() {
+            blank.sort();
+            return Err(anyhow!(
+                "spec.parameters gives blank descriptions for {:?} — write one line or drop the key",
+                blank,
+            ));
+        }
 
         let inferencer = SqlSchemaInferrer::new(ctx.clone())?;
         let request_schema = inferencer
@@ -503,18 +527,21 @@ impl StandardPipeline {
 
         // A described parameter the SQL does not declare is a typo or a doc
         // string gone stale after a query edit — refuse to load rather than
-        // publish documentation that lies.
-        for documented in parameter_docs.keys() {
-            if !request_schema.fields.contains_key(documented) {
-                let mut declared: Vec<&String> = request_schema.fields.keys().collect();
-                declared.sort();
-                return Err(anyhow!(
-                    "spec.parameters describes '{}', but the SQL declares no {{{}}} placeholder (declared parameters: {:?})",
-                    documented,
-                    documented,
-                    declared,
-                ));
-            }
+        // publish documentation that lies. Same all-at-once, sorted
+        // reporting as the blank check above.
+        let mut unknown: Vec<&String> = parameter_docs
+            .keys()
+            .filter(|k| !request_schema.fields.contains_key(*k))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort();
+            let mut declared: Vec<&String> = request_schema.fields.keys().collect();
+            declared.sort();
+            return Err(anyhow!(
+                "spec.parameters describes {:?}, but the SQL declares no such placeholder (declared parameters: {:?})",
+                unknown,
+                declared,
+            ));
         }
 
         let response_schema = inferencer
@@ -1192,18 +1219,40 @@ metadata:
   version: "1.0.0"
 spec:
   parameters:
-    brand: "Exact brand name; null matches every brand"
+    brand: >
+      Exact brand name; null matches every brand
   query: |
     SELECT brand, price FROM products
     WHERE ({brand} IS NULL OR brand = {brand}) AND price < {max_price}
 "#;
         let pipeline = load_yaml(yaml, ctx_with_products()).await.unwrap();
+        // The `>` block scalar carries a trailing newline; the loader
+        // normalizes it away, so the stored text is exactly the sentence.
         assert_eq!(
             pipeline.parameter_docs.get("brand").map(String::as_str),
             Some("Exact brand name; null matches every brand")
         );
         // Descriptions are optional per parameter: no entry, no error.
         assert!(!pipeline.parameter_docs.contains_key("max_price"));
+    }
+
+    #[tokio::test]
+    async fn spec_parameters_reject_blank_descriptions() {
+        let yaml = r#"
+kind: pipeline
+metadata:
+  name: "blank"
+  version: "1.0.0"
+spec:
+  parameters:
+    brand: "   "
+  query: |
+    SELECT brand, price FROM products WHERE brand = {brand}
+"#;
+        let err = load_yaml(yaml, ctx_with_products())
+            .await
+            .expect_err("a blank description is an author slip and must fail the load");
+        assert!(err.to_string().contains("blank description"), "{err}");
     }
 
     #[tokio::test]
@@ -1216,14 +1265,18 @@ metadata:
 spec:
   parameters:
     brnad: "typo for brand"
+    prise: "typo for price"
   query: |
     SELECT brand, price FROM products WHERE brand = {brand}
 "#;
         let err = load_yaml(yaml, ctx_with_products())
             .await
             .expect_err("a described parameter missing from the SQL must fail the load");
+        // Both offenders in one error (sorted), not one arbitrary pick per
+        // restart — HashMap iteration order must not leak into the message.
         let msg = err.to_string();
-        assert!(msg.contains("'brnad'"), "{msg}");
+        assert!(msg.contains(r#""brnad""#), "{msg}");
+        assert!(msg.contains(r#""prise""#), "{msg}");
         assert!(msg.contains("declared parameters"), "{msg}");
     }
 }

@@ -392,11 +392,10 @@ fn enriched_parameters(pipeline: &StandardPipeline) -> Vec<Value> {
             // The author's one-liner rides inside the JSON Schema itself
             // (standard `description` keyword), so schema consumers — the
             // MCP bridge copies it verbatim into the tool's properties —
-            // surface it with no changes of their own.
+            // surface it with no changes of their own. The loader already
+            // normalized: entries are trimmed and never blank.
             if let Some(doc) = pipeline.parameter_docs.get(name) {
-                if !doc.trim().is_empty() {
-                    schema["description"] = serde_json::json!(doc);
-                }
+                schema["description"] = serde_json::json!(doc);
             }
             serde_json::json!({
                 "name": name,
