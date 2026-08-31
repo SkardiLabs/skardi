@@ -30,6 +30,30 @@ tables:
       - { name: topic, path: topic, type: utf8, nullable: true }
       - { name: purpose, path: purpose, type: utf8, nullable: true }
 
+  messages:
+    # The governed content table: one conversation's history, bound by
+    # `channelId` (the same key skardi-cloud's registry binds — the strings
+    # are one contract). Cursor pagination exists because our vendored build
+    # added it: the upstream action dropped Slack's cursor on the floor, and
+    # single_page's premise check refuses a boolean hasMore. Fingerprint
+    # pinned from OUR build b2b33e57 (skardi/slack-acl in open-connector),
+    # not an oomol-lab release.
+    action: slack.get_channel_messages
+    row_path: "$.messages"
+    fingerprint: e69af337f869bae3c6f25dabe4e064c5567459089166f079c57b8c984617bc79
+    pagination:
+      strategy: cursor
+      page_size_input: limit
+      cursor_input: cursor
+      next_cursor_path: "$.nextCursor"
+      page_size: 100
+    resources:
+      required: [channelId]
+    columns:
+      - { name: ts, path: ts, type: utf8, nullable: false }
+      - { name: user_id, path: userId, type: utf8, nullable: true }
+      - { name: text, path: text, type: utf8, nullable: true }
+
   users:
     action: slack.list_users
     row_path: "$.users"

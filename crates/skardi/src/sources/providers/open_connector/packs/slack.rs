@@ -128,7 +128,9 @@ mod tests {
     /// registration exercises the same fingerprint gate the real gateway
     /// does — a stub schema would fail the pinned tables at registration.
     fn slack_discovery(path: &str) -> MockResponse {
-        let output_schema = if path.ends_with("slack.list_conversations") {
+        let output_schema = if path.ends_with("slack.get_channel_messages") {
+            include_str!("fixtures/slack/contracts/get_channel_messages.json")
+        } else if path.ends_with("slack.list_conversations") {
             include_str!("fixtures/slack/contracts/list_conversations.json")
         } else if path.ends_with("slack.list_users") {
             include_str!("fixtures/slack/contracts/list_users.json")
@@ -150,6 +152,11 @@ mod tests {
         // change is a conscious decision.
         use crate::sources::providers::open_connector::testutil::fingerprint_uncovered_columns;
         for (short, contract, expected) in [
+            (
+                "messages",
+                include_str!("fixtures/slack/contracts/get_channel_messages.json"),
+                &[] as &[&str],
+            ),
             (
                 "conversations",
                 include_str!("fixtures/slack/contracts/list_conversations.json"),
@@ -194,6 +201,10 @@ mod tests {
         // `ActionContractMismatch` instead of surfacing at scan time.
         let mut mismatches = Vec::new();
         for (table, contract) in [
+            (
+                table("messages"),
+                include_str!("fixtures/slack/contracts/get_channel_messages.json"),
+            ),
             (
                 table("conversations"),
                 include_str!("fixtures/slack/contracts/list_conversations.json"),
@@ -466,8 +477,10 @@ bindings:
         }
         assert_eq!(
             pack().expect("embedded asset parses").tables.len(),
-            3,
-            "messages/threads stay gated"
+            4,
+            "threads stay gated; messages arrived when the vendored gateway \
+             build (open-connector skardi/slack-acl) gave get_channel_messages \
+             the cursor contract the pagination gate requires"
         );
     }
 

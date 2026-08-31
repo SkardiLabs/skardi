@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ts": {
+            "type": "string",
+            "description": "The message timestamp identifier."
+          },
+          "userId": {
+            "type": "string",
+            "description": "The user ID of the message author."
+          },
+          "text": {
+            "type": "string",
+            "description": "The text content of the message."
+          }
+        },
+        "additionalProperties": true,
+        "description": "A Slack message record."
+      },
+      "description": "The list of messages in the conversation."
+    },
+    "hasMore": {
+      "type": "boolean",
+      "description": "Whether more messages are available beyond this page."
+    },
+    "nextCursor": {
+      "type": "string",
+      "description": "The cursor for the next page, or an empty string when this is the last page."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "messages",
+    "hasMore",
+    "nextCursor"
+  ],
+  "description": "The output payload for this action."
+}
