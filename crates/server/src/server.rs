@@ -537,8 +537,24 @@ fn resolve_jobs_db_path(explicit: Option<&PathBuf>) -> Result<PathBuf> {
     Ok(home.join(".skardi").join("jobs.db"))
 }
 
-/// Configure all application routes
+/// Configure all application routes: the REST router exactly as before,
+/// plus the MCP service nested at `/mcp`. The MCP handler captures the
+/// PRE-middleware REST router — `configure_middleware` wraps the final
+/// router (transport middleware, applied once to the inbound `/mcp`
+/// request), while synthetic dispatches traverse routing + handlers only,
+/// which is where every execution concern lives (`require_session`,
+/// parameter validation, audit recording). If auth ever moved into
+/// `configure_middleware`, synthetic dispatch would bypass it — see the
+/// tripwire test on the MCP handler.
 pub fn configure_routes(state: AppState) -> Router {
+    let rest = rest_router(state.clone());
+    crate::mcp::attach(rest, state)
+}
+
+/// The REST routing table + handlers, without the `/mcp` nest and without
+/// transport middleware. `pub(crate)` so the MCP tests can pin that the
+/// captured router really is this pre-middleware one.
+pub(crate) fn rest_router(state: AppState) -> Router {
     tracing::info!("Configuring HTTP routes");
 
     let mut router = Router::new()
