@@ -4,6 +4,7 @@ pub mod gui;
 pub mod handlers;
 pub mod jobs_handlers;
 pub mod logging;
+pub(crate) mod mcp;
 pub mod metrics;
 pub mod optimizer_registry;
 pub(crate) mod param_schema;
