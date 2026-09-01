@@ -167,7 +167,20 @@ that:
 `--query-audit-db <path>` turns on a durable, queryable record of what ran.
 Off by default; when off, raw SQL is never persisted anywhere.
 
-Each accepted statement is committed to a SQLite `query_audit` table **before**
+The same ledger can live in **Postgres** instead: set the
+`SKARDI_QUERY_AUDIT_PG_DSN` environment variable to a DSN
+(`postgres://user:pass@host:5432/audit`). An environment variable, never a
+flag — the DSN carries a credential, and argv is visible to every process
+listing. The two selectors are mutually exclusive; the server refuses to
+start with both. Everything below — the schema, the fail-closed semantics,
+retention — applies identically to either backend; the schema is mirrored
+column-for-column (TEXT timestamps included, so ordering semantics are
+shared — cast with `created_at::timestamptz` / `ai_context::jsonb` when
+analysing). Pick Postgres when the consumer of the ledger is itself a
+database-shaped pipeline (e.g. training an agent on `ai_context` + outcome
+pairs); pick the file when one machine and one process own the trail.
+
+Each accepted statement is committed to the `query_audit` table **before**
 execution and updated with its outcome afterwards:
 
 | column | notes |
@@ -225,9 +238,20 @@ batch is bounded like any other write, so on pathologically slow storage the
 that makes a broken ledger fatal rather than silently skipped. Later hourly
 prunes only warn.
 
-The ledger holds raw SQL, so it is created owner-only (`0600` on Unix,
-including the WAL sidecars). It is a local database, never the OTLP/tracing
-pipeline, so enabling it does not push query text to external collectors.
+The ledger holds raw SQL, so the file backend is created owner-only
+(`0600` on Unix, including the WAL sidecars); on the Postgres backend that
+duty becomes role hygiene — point the DSN at a role and database only the
+operator reads. Neither backend feeds the OTLP/tracing pipeline, so enabling
+auditing does not push query text to external collectors. The server never
+logs the DSN; its startup line and errors carry only the redacted
+`postgres://host/db` authority.
+
+One Postgres-specific caveat: the corrective `audit_write_timeout` update
+after a timed-out pre-execution write is best-effort there (a connection
+pool has no FIFO guarantee the way the file backend's single writer thread
+does), so a row whose INSERT lands after the correction stays `started`
+until the next startup reconciles it — the same class as a crash, and the
+same repair.
 
 #### Pipeline executions in the ledger
 

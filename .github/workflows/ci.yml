@@ -610,6 +610,11 @@ jobs:
           exit 1
 
       - name: Execute Integration tests
+        env:
+          # The query-audit Postgres-backend live suite
+          # (crates/query-audit/tests/pg_live.rs) — pointed at the job's
+          # postgres service; each test creates its own throwaway database.
+          SKARDI_QUERY_AUDIT_LIVE_URL: postgres://skardi_user:skardi_pass@127.0.0.1:5432/mydb
         run: cargo llvm-cov --no-report nextest --all-features -- --ignored
 
       # MinIO gives the `documents` connector's object-store path real S3

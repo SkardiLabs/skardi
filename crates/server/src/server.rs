@@ -65,9 +65,11 @@ pub struct AppState {
     /// [`crate::config::adhoc_policy_from_sources`] for why a snapshot is
     /// safe (no runtime writer mutates access modes).
     pub adhoc_policy: Arc<AdhocSqlPolicy>,
-    /// Durable audit ledger for `/query`. `Some` only when the operator passed
-    /// `--query-audit-db`. `None` means raw SQL is never persisted anywhere.
-    /// See [`crate::query_audit`].
+    /// Durable audit ledger for `/query`. `Some` only when the operator
+    /// selected a backend — `--query-audit-db` (the SQLite file) or the
+    /// `SKARDI_QUERY_AUDIT_PG_DSN` environment variable (Postgres; an env
+    /// var because the DSN carries a credential). `None` means raw SQL is
+    /// never persisted anywhere. See [`crate::query_audit`].
     pub query_audit: Option<Arc<QueryAuditStore>>,
     /// Graph source handles by connection name (shared with the
     /// OptimizerRegistry that data-source registration fills). Read by
@@ -260,34 +262,60 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         None
     };
 
-    // Open the `/query` audit ledger if the operator asked for one. Every
-    // failure here is fatal: a configured audit trail that silently doesn't
-    // record would be worse than none at all.
-    let query_audit = match config.args.query_audit_db.as_ref() {
-        Some(path) => {
-            tracing::info!(
-                "Opening query-audit ledger (ad-hoc + pipeline executions) at {}",
-                path.display()
-            );
-            let store = Arc::new(QueryAuditStore::open(path).await.with_context(|| {
-                format!("Failed to open --query-audit-db at {}", path.display())
-            })?);
-            let orphaned = store
-                .reconcile_orphaned("server restarted before the query completed")
-                .await?;
-            if orphaned > 0 {
-                tracing::warn!(
-                    "Reconciled {} query-audit record(s) left in flight by a previous run",
-                    orphaned
-                );
+    // Open the `/query` audit ledger if the operator asked for one — the
+    // SQLite file (`--query-audit-db`) or Postgres (`SKARDI_QUERY_AUDIT_PG_DSN`;
+    // an env var because the DSN carries a credential, and argv leaks into
+    // process listings). Every failure here is fatal: a configured audit
+    // trail that silently doesn't record would be worse than none at all.
+    let pg_audit_dsn = std::env::var(skardi_query_audit::PG_DSN_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let query_audit =
+        match select_query_audit_backend(config.args.query_audit_db.as_deref(), pg_audit_dsn)? {
+            None => None,
+            Some(selection) => {
+                let store = match selection {
+                    QueryAuditBackend::File(path) => {
+                        tracing::info!(
+                            "Opening query-audit ledger (ad-hoc + pipeline executions) at {}",
+                            path.display()
+                        );
+                        Arc::new(QueryAuditStore::open(&path).await.with_context(|| {
+                            format!("Failed to open --query-audit-db at {}", path.display())
+                        })?)
+                    }
+                    QueryAuditBackend::Postgres(dsn) => {
+                        let store =
+                            Arc::new(QueryAuditStore::open_postgres(&dsn).await.with_context(
+                                || {
+                                    format!(
+                                        "Failed to open the {} Postgres query-audit ledger",
+                                        skardi_query_audit::PG_DSN_ENV
+                                    )
+                                },
+                            )?);
+                        tracing::info!(
+                            "Opened query-audit ledger (ad-hoc + pipeline executions) at {}",
+                            store.path().display()
+                        );
+                        store
+                    }
+                };
+                let orphaned = store
+                    .reconcile_orphaned("server restarted before the query completed")
+                    .await?;
+                if orphaned > 0 {
+                    tracing::warn!(
+                        "Reconciled {} query-audit record(s) left in flight by a previous run",
+                        orphaned
+                    );
+                }
+                if let Some(days) = config.args.query_audit_retention_days {
+                    spawn_query_audit_retention(Arc::clone(&store), days).await?;
+                }
+                Some(store)
             }
-            if let Some(days) = config.args.query_audit_retention_days {
-                spawn_query_audit_retention(Arc::clone(&store), days).await?;
-            }
-            Some(store)
-        }
-        None => None,
-    };
+        };
 
     // Both ledgers are open and both have reconciled their own orphans, which
     // is the only point in startup where the correlation between them can be
@@ -384,6 +412,34 @@ pub async fn repair_lost_job_correlations(
 /// The first prune is awaited so a broken retention setup surfaces at startup
 /// alongside every other audit failure; subsequent ones only warn, since a
 /// transient prune failure must not take a running server down.
+/// The audit backend the configuration selects. Two knobs, one ledger:
+/// `--query-audit-db` names the SQLite file, `SKARDI_QUERY_AUDIT_PG_DSN`
+/// names a Postgres DSN (an env var because it carries a credential). Both
+/// set is refused loudly — each backend has its own operational posture
+/// (file permissions vs role hygiene), and picking one silently would
+/// surprise whoever configured the other.
+#[derive(Debug, PartialEq, Eq)]
+enum QueryAuditBackend {
+    File(std::path::PathBuf),
+    Postgres(String),
+}
+
+fn select_query_audit_backend(
+    file: Option<&std::path::Path>,
+    pg_dsn: Option<String>,
+) -> Result<Option<QueryAuditBackend>> {
+    match (file, pg_dsn) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "--query-audit-db and {} are both set; the query-audit ledger has \
+             exactly one backend per server — unset one",
+            skardi_query_audit::PG_DSN_ENV
+        ),
+        (Some(path), None) => Ok(Some(QueryAuditBackend::File(path.to_path_buf()))),
+        (None, Some(dsn)) => Ok(Some(QueryAuditBackend::Postgres(dsn))),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn spawn_query_audit_retention(
     store: Arc<QueryAuditStore>,
     retention_days: u32,
@@ -774,5 +830,38 @@ spec:
         let config2 = cloned_state.config.read().unwrap();
         assert_eq!(config1.pipelines.len(), config2.pipelines.len());
         assert_eq!(config1.args.port, config2.args.port);
+    }
+}
+
+#[cfg(test)]
+mod query_audit_backend_tests {
+    use super::{QueryAuditBackend, select_query_audit_backend};
+    use std::path::Path;
+
+    /// One ledger, one backend: the flag alone selects the file, the env
+    /// alone selects Postgres, neither selects nothing, and both together
+    /// refuse loudly instead of silently preferring one.
+    #[test]
+    fn selection_covers_all_four_configurations() {
+        assert_eq!(select_query_audit_backend(None, None).unwrap(), None);
+        assert_eq!(
+            select_query_audit_backend(Some(Path::new("/var/a.db")), None).unwrap(),
+            Some(QueryAuditBackend::File("/var/a.db".into()))
+        );
+        assert_eq!(
+            select_query_audit_backend(None, Some("postgres://u:p@h/db".into())).unwrap(),
+            Some(QueryAuditBackend::Postgres("postgres://u:p@h/db".into()))
+        );
+        let err = select_query_audit_backend(
+            Some(Path::new("/var/a.db")),
+            Some("postgres://u:p@h/db".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exactly one backend"), "{err}");
+        assert!(
+            !err.contains("u:p"),
+            "the refusal must not echo the credential: {err}"
+        );
     }
 }

@@ -1,11 +1,14 @@
 //! Durable audit store for ad-hoc `/query` statements and pipeline
 //! executions.
 //!
-//! Off unless the operator sets `--query-audit-db <path>`. When enabled, every
-//! statement the `/query` endpoint accepts — and every `POST /:name/execute`
-//! pipeline run — is written to a SQLite database *before* execution and
-//! updated with its outcome afterwards, so the store answers "what ran, on
-//! whose behalf, and did it succeed" rather than merely "what was attempted".
+//! Off unless the operator selects a backend: `--query-audit-db <path>` (the
+//! SQLite file) or the [`PG_DSN_ENV`] environment variable (Postgres — an
+//! env var because the DSN carries a credential; see [`pg`]'s module doc for
+//! the storage-swap rules). Either way, every statement the `/query`
+//! endpoint accepts — and every `POST /:name/execute` pipeline run — is
+//! written *before* execution and updated with its outcome afterwards, so
+//! the store answers "what ran, on whose behalf, and did it succeed" rather
+//! than merely "what was attempted".
 //!
 //! The `sql` column is overloaded by row kind: raw SQL for ad-hoc rows,
 //! `name@version` for `statement_kind = 'pipeline'` rows (the versioned
@@ -36,6 +39,9 @@
 //! forever, and pruning/rotation is the operator's call.
 
 use anyhow::{Context, Result, anyhow};
+
+mod pg;
+pub use pg::PG_DSN_ENV;
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -83,7 +89,7 @@ pub const MAX_SESSION_ID_CHARS: usize = 200;
 /// [`QueryAuditStore::spawn_timeout_correction`] — everywhere else this
 /// converts straight to `anyhow::Error` via `?`, same as before.
 #[derive(Debug)]
-enum BoundedError {
+pub(crate) enum BoundedError {
     /// Elapsed `timeout` without the write completing. It may still land
     /// later on the writer thread.
     TimedOut(anyhow::Error),
@@ -92,7 +98,7 @@ enum BoundedError {
 }
 
 impl BoundedError {
-    fn is_timeout(&self) -> bool {
+    pub(crate) fn is_timeout(&self) -> bool {
         matches!(self, BoundedError::TimedOut(_))
     }
 }
@@ -117,11 +123,14 @@ impl std::error::Error for BoundedError {}
 /// `QueryAuditStore::write_timeout`). Elapsed is an error like any other
 /// write failure — see the timeout const for why — but callers that need to
 /// react specifically to a timeout can check [`BoundedError::is_timeout`].
-async fn bounded<T>(
-    write: impl Future<Output = tokio_rusqlite::Result<T>>,
+pub(crate) async fn bounded<T, E>(
+    write: impl Future<Output = std::result::Result<T, E>>,
     what: &'static str,
     timeout: Duration,
-) -> std::result::Result<T, BoundedError> {
+) -> std::result::Result<T, BoundedError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     match tokio::time::timeout(timeout, write).await {
         Ok(result) => result.context(what).map_err(BoundedError::Other),
         Err(_) => Err(BoundedError::TimedOut(anyhow!(
@@ -334,20 +343,29 @@ impl QueryAuditStatus {
     }
 }
 
-/// SQLite-backed audit ledger for `/query`.
+/// Durable audit ledger for `/query` — the SQLite file by default, or the
+/// Postgres backend when [`PG_DSN_ENV`] selects it. Same fail-closed
+/// contract either way; see [`pg`]'s module doc for the storage-swap rules
+/// and the one honest divergence.
 pub struct QueryAuditStore {
-    conn: Connection,
-    path: PathBuf,
+    backend: Backend,
     /// Bound passed to [`bounded`] for every write. [`AUDIT_WRITE_TIMEOUT`]
     /// in production; overridable in tests via [`Self::with_write_timeout`]
     /// so the timeout branch can be exercised without waiting 5s.
     write_timeout: Duration,
 }
 
+/// The two storage arms. Private: callers select via [`QueryAuditStore::open`]
+/// vs [`QueryAuditStore::open_postgres`] and are backend-blind afterwards.
+enum Backend {
+    Sqlite { conn: Connection, path: PathBuf },
+    Postgres(pg::PgAudit),
+}
+
 impl std::fmt::Debug for QueryAuditStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryAuditStore")
-            .field("path", &self.path)
+            .field("path", &self.path())
             .finish()
     }
 }
@@ -417,8 +435,20 @@ impl QueryAuditStore {
         }
 
         Ok(Self {
-            conn,
-            path,
+            backend: Backend::Sqlite { conn, path },
+            write_timeout: AUDIT_WRITE_TIMEOUT,
+        })
+    }
+
+    /// Open the POSTGRES-backed ledger at `dsn` (see [`PG_DSN_ENV`]).
+    ///
+    /// Connects eagerly and applies the schema: like [`Self::open`], errors
+    /// are fatal to startup by design — an operator who asked for an audit
+    /// trail must not get a server that quietly runs without one. The DSN is
+    /// never logged; `path()`/`Debug` render the redacted authority only.
+    pub async fn open_postgres(dsn: &str) -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Postgres(pg::PgAudit::open(dsn).await?),
             write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
@@ -436,14 +466,32 @@ impl QueryAuditStore {
         .await
         .context("Failed to initialise in-memory query-audit db")?;
         Ok(Self {
-            conn,
-            path: PathBuf::from(":memory:"),
+            backend: Backend::Sqlite {
+                conn,
+                path: PathBuf::from(":memory:"),
+            },
             write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
 
+    /// The ledger's location: the file path on SQLite, the redacted
+    /// `postgres://host/db` authority on Postgres (never the DSN — it
+    /// carries a credential).
     pub fn path(&self) -> &Path {
-        &self.path
+        match &self.backend {
+            Backend::Sqlite { path, .. } => path,
+            Backend::Postgres(pg) => pg.redacted(),
+        }
+    }
+
+    /// The sqlite connection, tests only — a handful of tests hold the
+    /// writer thread hostage or issue raw SQL to stage legacy data.
+    #[cfg(test)]
+    fn sqlite_conn(&self) -> Connection {
+        match &self.backend {
+            Backend::Sqlite { conn, .. } => conn.clone(),
+            Backend::Postgres(_) => panic!("test helper: sqlite backend expected"),
+        }
     }
 
     /// Override the write bound. Tests only — lets a test exercise the
@@ -460,7 +508,12 @@ impl QueryAuditStore {
     /// Exists so tests can exercise the handler's fail-closed path (a store
     /// that cannot record must stop queries from running).
     pub async fn close_for_test(&self) {
-        let _ = self.conn.clone().close().await;
+        match &self.backend {
+            Backend::Sqlite { conn, .. } => {
+                let _ = conn.clone().close().await;
+            }
+            Backend::Postgres(pg) => pg.close_for_test().await,
+        }
     }
 
     /// Commit the pre-execution record and return its id.
@@ -489,6 +542,23 @@ impl QueryAuditStore {
         statement_kind: &str,
         identity: Option<&QueryIdentity>,
     ) -> Result<String> {
+        let conn = match &self.backend {
+            // The pg arm owns its timeout correction (it holds the row id).
+            Backend::Postgres(pg) => {
+                return pg
+                    .record_started_for(
+                        sql,
+                        ai_context,
+                        max_rows,
+                        statement_kind,
+                        identity,
+                        self.write_timeout,
+                    )
+                    .await
+                    .map_err(Into::into);
+            }
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = new_id();
         let created_at = chrono::Utc::now().to_rfc3339();
         // `session_id` is denormalised out of the context object so the index
@@ -504,7 +574,7 @@ impl QueryAuditStore {
         let identity = identity.cloned().unwrap_or_default();
 
         match bounded(
-            self.conn.call(move |conn| -> SqlResult<()> {
+            conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
@@ -560,6 +630,20 @@ impl QueryAuditStore {
         version: &str,
         session_id: Option<&str>,
     ) -> Result<String> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => {
+                return pg
+                    .record_name_at_version_started(
+                        &format!("{pipeline_name}@{version}"),
+                        session_id,
+                        PIPELINE_STATEMENT_KIND,
+                        self.write_timeout,
+                    )
+                    .await
+                    .map_err(Into::into);
+            }
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = new_id();
         let created_at = chrono::Utc::now().to_rfc3339();
         let name_at_version = format!("{pipeline_name}@{version}");
@@ -567,7 +651,7 @@ impl QueryAuditStore {
         let row_id = id.clone();
 
         match bounded(
-            self.conn.call(move |conn| -> SqlResult<()> {
+            conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
@@ -613,6 +697,20 @@ impl QueryAuditStore {
         version: &str,
         session_id: Option<&str>,
     ) -> Result<String> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => {
+                return pg
+                    .record_name_at_version_started(
+                        &format!("{job_name}@{version}"),
+                        session_id,
+                        JOB_STATEMENT_KIND,
+                        self.write_timeout,
+                    )
+                    .await
+                    .map_err(Into::into);
+            }
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = new_id();
         let created_at = chrono::Utc::now().to_rfc3339();
         let name_at_version = format!("{job_name}@{version}");
@@ -620,7 +718,7 @@ impl QueryAuditStore {
         let row_id = id.clone();
 
         match bounded(
-            self.conn.call(move |conn| -> SqlResult<()> {
+            conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
@@ -685,13 +783,21 @@ impl QueryAuditStore {
         status: QueryAuditStatus,
         error: Option<&str>,
     ) -> Result<()> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => {
+                return pg
+                    .record_job_outcome(id, job_run_id, status, error, self.write_timeout)
+                    .await;
+            }
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = id.to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = status.as_str();
         let job_run_id = job_run_id.map(str::to_string);
         let error = error.map(str::to_string);
         bounded(
-            self.conn.call(move |conn| -> SqlResult<()> {
+            conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "UPDATE query_audit
                         SET status = ?2, finished_at = ?3, job_run_id = ?4, error = ?5
@@ -725,6 +831,14 @@ impl QueryAuditStore {
         row_count: Option<usize>,
         error: Option<&str>,
     ) -> Result<()> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => {
+                return pg
+                    .record_outcome(id, status, row_count, error, self.write_timeout)
+                    .await;
+            }
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = id.to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
         let status = status.as_str();
@@ -732,7 +846,7 @@ impl QueryAuditStore {
         let error = error.map(str::to_string);
 
         bounded(
-            self.conn.call(move |conn| -> SqlResult<()> {
+            conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "UPDATE query_audit
                         SET status = ?2, finished_at = ?3, row_count = ?4, error = ?5
@@ -778,7 +892,12 @@ impl QueryAuditStore {
     /// the time this could resolve, so the caller does not await it. Any
     /// failure here can only be observed via logging.
     fn spawn_timeout_correction(&self, id: String) {
-        let conn = self.conn.clone();
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => {
+                return pg.spawn_timeout_correction(id, self.write_timeout);
+            }
+            Backend::Sqlite { conn, .. } => conn.clone(),
+        };
         // The correction is triggered by a stalled writer, which is exactly
         // the condition under which awaiting it could never resolve — so the
         // task gives up on the *await*, not on the work. The UPDATE closure
@@ -822,10 +941,13 @@ impl QueryAuditStore {
     /// Rewrite rows still marked `started` to `unknown`. Called at startup so a
     /// crash-killed query does not masquerade as still running.
     pub async fn reconcile_orphaned(&self, reason: &str) -> Result<usize> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => return pg.reconcile_orphaned(reason).await,
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let reason = reason.to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
-        let updated = self
-            .conn
+        let updated = conn
             .call(move |conn| -> SqlResult<usize> {
                 let n = conn.execute(
                     "UPDATE query_audit
@@ -861,8 +983,11 @@ impl QueryAuditStore {
     /// both ledgers: `job_runs.submission_id` carries this id, so each of these
     /// resolves through `JobStore::get_run_by_submission_id`.
     pub async fn job_rows_missing_run_id(&self) -> Result<Vec<String>> {
-        let ids = self
-            .conn
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => return pg.job_rows_missing_run_id().await,
+            Backend::Sqlite { conn, .. } => conn,
+        };
+        let ids = conn
             .call(move |conn| -> SqlResult<Vec<String>> {
                 let mut stmt = conn.prepare(
                     "SELECT id FROM query_audit
@@ -893,10 +1018,13 @@ impl QueryAuditStore {
     /// as `unknown`, which stays the truth: the outcome was never observed, only
     /// the linkage is recovered.
     pub async fn backfill_job_run_id(&self, id: &str, job_run_id: &str) -> Result<bool> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => return pg.backfill_job_run_id(id, job_run_id).await,
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = id.to_string();
         let job_run_id = job_run_id.to_string();
-        let updated = self
-            .conn
+        let updated = conn
             .call(move |conn| -> SqlResult<usize> {
                 conn.execute(
                     "UPDATE query_audit
@@ -929,12 +1057,16 @@ impl QueryAuditStore {
     /// behind the prune get a chance to interleave rather than all landing
     /// after it.
     pub async fn prune_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => return pg.prune_before(cutoff, self.write_timeout).await,
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let cutoff = cutoff.to_rfc3339();
         let mut total = 0usize;
         loop {
             let batch_cutoff = cutoff.clone();
             let deleted = bounded(
-                self.conn.call(move |conn| -> SqlResult<usize> {
+                conn.call(move |conn| -> SqlResult<usize> {
                     let n = conn.execute(
                         "DELETE FROM query_audit WHERE id IN (
                             SELECT id FROM query_audit WHERE created_at < ?1 LIMIT ?2
@@ -958,9 +1090,12 @@ impl QueryAuditStore {
 
     /// Fetch one record as a JSON object. Test/diagnostic helper.
     pub async fn get(&self, id: &str) -> Result<Option<Value>> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => return pg.get(id).await,
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let id = id.to_string();
-        let row = self
-            .conn
+        let row = conn
             .call(move |conn| -> SqlResult<Option<Value>> {
                 let mut stmt = conn.prepare(
                     "SELECT id, created_at, finished_at, sql, ai_context, session_id,
@@ -1003,9 +1138,21 @@ impl QueryAuditStore {
     /// All records for one `session_id`, oldest first. Test/diagnostic helper
     /// that also demonstrates the session index.
     pub async fn list_by_session(&self, session_id: &str) -> Result<Vec<Value>> {
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => {
+                let ids = pg.list_session_ids(session_id).await?;
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(record) = self.get(&id).await? {
+                        out.push(record);
+                    }
+                }
+                return Ok(out);
+            }
+            Backend::Sqlite { conn, .. } => conn,
+        };
         let session_id = session_id.to_string();
-        let ids = self
-            .conn
+        let ids = conn
             .call(move |conn| -> SqlResult<Vec<String>> {
                 let mut stmt = conn.prepare(
                     // `id` breaks created_at ties: `to_rfc3339` emits
@@ -1034,8 +1181,11 @@ impl QueryAuditStore {
 
     /// Total record count. Test/diagnostic helper.
     pub async fn count(&self) -> Result<usize> {
-        let n = self
-            .conn
+        let conn = match &self.backend {
+            Backend::Postgres(pg) => return pg.count().await,
+            Backend::Sqlite { conn, .. } => conn,
+        };
+        let n = conn
             .call(|conn| -> SqlResult<i64> {
                 let n: i64 =
                     conn.query_row("SELECT count(*) FROM query_audit", [], |r| r.get(0))?;
@@ -1090,7 +1240,7 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 }
 
 /// Statement-kind marker distinguishing pipeline rows from ad-hoc SQL rows.
-const PIPELINE_STATEMENT_KIND: &str = "pipeline";
+pub(crate) const PIPELINE_STATEMENT_KIND: &str = "pipeline";
 
 /// Statement-kind markers for the two ad-hoc row kinds.
 ///
@@ -1113,7 +1263,7 @@ pub const OTHER_STATEMENT_KIND: &str = "other";
 /// Statement-kind marker for job-submission rows. Nothing outside this
 /// module reads it directly (Task 2 goes through `record_job_submitted`),
 /// so it stays private, mirroring `PIPELINE_STATEMENT_KIND`'s narrowing.
-const JOB_STATEMENT_KIND: &str = "job";
+pub(crate) const JOB_STATEMENT_KIND: &str = "job";
 
 /// `max_rows` does not apply to pipeline executions, but the column is NOT
 /// NULL; pipeline rows store this sentinel. Job-submission rows share it for
@@ -1125,20 +1275,20 @@ const JOB_STATEMENT_KIND: &str = "job";
 /// row. That invariant lives in a
 /// different module — if `/query` ever starts allowing `max_rows: 0`, this
 /// sentinel needs a new value (or a dedicated column) first.
-const PIPELINE_MAX_ROWS_SENTINEL: i64 = 0;
+pub(crate) const PIPELINE_MAX_ROWS_SENTINEL: i64 = 0;
 
 /// Rows deleted per [`QueryAuditStore::prune_before`] batch. Small enough
 /// that a batch delete is comfortably inside [`AUDIT_WRITE_TIMEOUT`] even on
 /// a slow disk; see that method's doc comment for why batching exists at
 /// all.
-const PRUNE_BATCH_SIZE: usize = 1000;
+pub(crate) const PRUNE_BATCH_SIZE: usize = 1000;
 
 /// Random-ish unique row id. Avoids a `uuid` dependency: the timestamp keeps
 /// ids ordered and the zero-padded hex counter disambiguates within the same
 /// nanosecond without breaking lexicographic order — `list_by_session`'s
 /// `id ASC` tie-break (and any other string sort) depends on same-width
 /// hex; an unpadded counter would sort `…-f` after `…-10`.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -1392,7 +1542,7 @@ mod tests {
 
         // Occupy the dedicated writer thread well past the bound so the
         // next write has to wait behind it instead of running immediately.
-        let blocker = store.conn.clone();
+        let blocker = store.sqlite_conn();
         let blocker_task = tokio::spawn(async move {
             let _ = blocker
                 .call(|_conn| -> SqlResult<()> {
@@ -1437,7 +1587,7 @@ mod tests {
             .unwrap()
             .with_write_timeout(Duration::from_millis(100));
 
-        let blocker = store.conn.clone();
+        let blocker = store.sqlite_conn();
         let blocker_task = tokio::spawn(async move {
             let _ = blocker
                 .call(|_conn| -> SqlResult<()> {
@@ -1879,7 +2029,7 @@ mod tests {
         // migrated one.
         async fn index_exists(store: &QueryAuditStore) -> bool {
             store
-                .conn
+                .sqlite_conn()
                 .call(|conn| -> SqlResult<bool> {
                     conn.prepare(
                         "SELECT 1 FROM sqlite_master

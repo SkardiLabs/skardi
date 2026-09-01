@@ -94,15 +94,21 @@ pub struct CliArgs {
     /// logs or traces. The ledger records raw SQL (which may embed
     /// secrets/PII); it is created owner-only, and a failure to open it is
     /// fatal rather than a silent downgrade. See [`crate::query_audit`].
+    ///
+    /// The same ledger can live in Postgres instead: set
+    /// `SKARDI_QUERY_AUDIT_PG_DSN` (an env var, never a flag — the DSN
+    /// carries a credential). Mutually exclusive with this flag; the server
+    /// refuses to start with both.
     #[arg(
         long = "query-audit-db",
-        help = "Record /query statements in this SQLite audit ledger (off by default; created 0600)"
+        help = "Record /query statements in this SQLite audit ledger (off by default; created 0600). \
+                For a Postgres ledger set SKARDI_QUERY_AUDIT_PG_DSN instead"
     )]
     pub query_audit_db: Option<PathBuf>,
 
     /// Delete audit records older than this many days, at startup and hourly
-    /// thereafter. Unset means keep everything. Ignored without
-    /// `--query-audit-db`.
+    /// thereafter. Unset means keep everything. Applies to whichever audit
+    /// backend is selected; ignored when neither is.
     #[arg(
         long = "query-audit-retention-days",
         help = "Prune /query audit records older than N days (default: keep forever)"

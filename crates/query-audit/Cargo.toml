@@ -8,6 +8,9 @@ description = "SQLite-backed durable audit ledger for /query — shared by the O
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = { workspace = true }
+# The Postgres storage backend (same fail-closed contract, storage swapped).
+# Workspace-pinned: the same sqlx the postgres source provider already builds.
+sqlx = { workspace = true }
 tokio-rusqlite = { workspace = true }
 # The pipeline-audit path (#213) bounds its ledger write with
 # `tokio::time::timeout` and reports a lost outcome through `tracing`. Both
@@ -19,4 +22,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+# The live-Postgres suite (tests/pg_live.rs) builds throwaway databases and
+# stages legacy rows directly.
+url = "2"
+

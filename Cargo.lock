@@ -9742,10 +9742,12 @@ dependencies = [
  "anyhow",
  "chrono",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-rusqlite",
  "tracing",
+ "url",
 ]
 
 [[package]]
