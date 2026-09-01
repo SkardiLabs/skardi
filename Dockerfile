@@ -25,6 +25,15 @@ RUN if [ -n "$FEATURES" ]; then \
       cargo build --release -p skardi-server; \
     fi
 
+# The `documents` feature does not link PDFium into the binary: liteparse's
+# pdfium-sys downloads libpdfium.so at build time (to ~/.cache/pdfium-rs/)
+# and dlopens it at runtime, so the runtime image must carry the .so.
+# Stage it here; the directory stays empty for builds without `documents`.
+RUN mkdir -p /pdfium-lib && \
+    if [ -d /root/.cache/pdfium-rs ]; then \
+      find /root/.cache/pdfium-rs -name 'libpdfium.so' -exec cp {} /pdfium-lib/ \; ; \
+    fi
+
 # Runtime stage - debian-slim includes all required runtime dependencies
 FROM debian:trixie-slim
 
@@ -37,6 +46,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/skardi-server /usr/local/bin/skardi-server
+# pdfium-sys searches for libpdfium.so next to the executable at runtime;
+# empty (no-op) for builds without the `documents` feature.
+COPY --from=builder /pdfium-lib/ /usr/local/bin/
 
 EXPOSE 8080
 
