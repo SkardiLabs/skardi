@@ -30,20 +30,18 @@ pub(crate) fn attach(rest: Router, state: AppState) -> Router {
     let service = StreamableHttpService::new(
         move || Ok(McpHandler::new(handler_rest.clone())),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig {
-            allowed_hosts,
-            // Everything else stays at rmcp's defaults, each one a spec
-            // decision: sse_keep_alive 15s (bytes keep flowing during long
-            // tool calls, resetting reverse-proxy idle timers well under
-            // nginx's 60s proxy_read_timeout default), legacy_session_mode
-            // true (legacy-protocol clients keep the session behavior they
-            // expect; the gate guards the state they create), json_response
-            // false (SSE responses, so the keep-alive applies), and
-            // allowed_origins empty (MCP hosts are not browsers; the
-            // Bearer-only gate is the actual barrier, so there is no
-            // CSRF-shaped surface for Origin to guard).
-            ..Default::default()
-        },
+        // The config is #[non_exhaustive], so it's built from the defaults
+        // via the builder. Everything except allowed_hosts stays at rmcp's
+        // defaults, each one a spec decision: sse_keep_alive 15s (bytes
+        // keep flowing during long tool calls, resetting reverse-proxy
+        // idle timers well under nginx's 60s proxy_read_timeout default),
+        // legacy_session_mode true (legacy-protocol clients keep the
+        // session behavior they expect; the gate guards the state they
+        // create), json_response false (SSE responses, so the keep-alive
+        // applies), and allowed_origins empty (MCP hosts are not browsers;
+        // the Bearer-only gate is the actual barrier, so there is no
+        // CSRF-shaped surface for Origin to guard).
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
     rest.nest_service("/mcp", SessionGate::new(service, state))
 }
