@@ -107,13 +107,14 @@ is possible. rmcp's streamable-HTTP server service is a tower `Service`, so
 
 The inverse collision exists and is accepted: the nest shadows REST's
 `/:name/execute` for a pipeline literally named `mcp` — the router
-prefers the static `mcp` segment, so inbound `POST /mcp/execute` reaches
-the nested MCP service, never that pipeline. The pipeline stays fully
-callable *through* `/mcp` (the captured router is the pre-nest one — the
-same property that makes recursion impossible) and via the stdio bridge;
-only its direct REST endpoint is lost. The mount point stays `/mcp`
-because that is the endpoint path MCP hosts preconfigure — one shadowed
-name is a smaller cost than a nonstandard endpoint.
+prefers the static `mcp` segment, so every URL-borne caller loses that
+pipeline: the REST endpoint, `skardi run`, and the stdio bridge, which
+builds the same path over real HTTP and — its `tools/list` coming from
+an unaffected `GET /pipelines` — advertises a tool whose calls then
+fail. Only `/mcp` itself still reaches it: the captured router is the
+pre-nest one. Accepted as a known limitation — no data operation is
+plausibly named `mcp`, and the mount point is the path MCP hosts
+preconfigure.
 
 ---
 
