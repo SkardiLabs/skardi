@@ -1,0 +1,50 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "description": "A raw docx block object."
+      },
+      "description": "The items on this page."
+    },
+    "pageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The token to fetch the next page, when hasMore is true."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "hasMore": {
+      "anyOf": [
+        {
+          "type": "boolean",
+          "description": "Whether more pages are available."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "total": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "description": "The total number of items, when the API reports it."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "description": "A page of a Feishu docx document's structured blocks."
+}

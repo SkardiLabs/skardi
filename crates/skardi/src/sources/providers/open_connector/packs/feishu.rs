@@ -24,7 +24,9 @@
 //!   `$.pageToken` out; page size 100 for chats/chat_members/tasks, 50
 //!   for wiki — and 50 for `messages`, whose REAL wire cap is 50 despite
 //!   the schema's declared 100: Feishu hard-fails larger values with
-//!   99992402, live-verified 2026-08-04), with `$.hasMore` declared as
+//!   99992402, live-verified 2026-08-04 — plus 500 for
+//!   `document_blocks` (501 hard-fails with the same code,
+//!   live-verified 2026-09-01), with `$.hasMore` declared as
 //!   the AUTHORITATIVE
 //!   termination signal (`has_more_path`). That is a live-verification
 //!   correction, not a nicety: Feishu's wiki space listing answers its
@@ -61,6 +63,11 @@
 //! - **`wiki_nodes` lists ONE level** (children of `parentNodeToken`,
 //!   space root when omitted) — the action's own shape; full-tree
 //!   traversal is client-side recursion, documented in the pack doc.
+//! - **`document_blocks` requires ONE document binding** and exposes the
+//!   stable `block_id` / `block_type` / `parent_id` fields. The payload
+//!   lives under a key selected by block type (`page`, `text`,
+//!   `heading1`, …), which a fixed mapping cannot address; the captured
+//!   fixtures retain it while the relational table deliberately omits it.
 //! - **In-band provider errors never reach rows**: executors throw on
 //!   Feishu's non-zero `code` envelope, so the gateway returns a failure
 //!   envelope and `error_path` is `None` for every table.
@@ -69,13 +76,15 @@
 //!   item schema LOOSE (`additionalProperties: true`, zero declared
 //!   properties) — so ALL mapped columns ride passthrough outside the
 //!   fingerprint gate, and the coverage-gap pin records that honestly.
-//!   Column truth is therefore settled ONLY by real rows, and ALL SIX
-//!   tables are reconciled against a live workspace (2026-08-04; every
-//!   fixture is a redacted live capture). What the pass changed: chats
+//!   Column truth is therefore settled ONLY by real rows, and ALL SEVEN
+//!   tables are reconciled against a live workspace (2026-08-04, with
+//!   document_blocks recaptured 2026-09-01; every fixture is a redacted
+//!   live capture). What the pass changed: chats
 //!   gained `chat_mode`/`chat_status`; tasks lost the nonexistent
 //!   `completed` boolean for `status`/`completed_at`; wiki tables
 //!   gained `open_sharing`/`creator`/`url`; messages' page size dropped
-//!   to the real 50 cap. Two operational findings the pack doc records:
+//!   to the real 50 cap; document_blocks pinned its real 500 cap and
+//!   dynamic payload shape. Two operational findings the pack doc records:
 //!   reading messages under the user identity requires the
 //!   `im:message:readonly` (or `im:message` /
 //!   `im:message.history:readonly`) scope — the `get_as_user` scopes
@@ -83,7 +92,8 @@
 //!   (99991679 names the real set) — plus the app's bot capability
 //!   (232025). `message_position` (a digit string on every live row) is
 //!   deliberately unmapped: no public Feishu doc pins its semantics.
-//!   Live e2e evidence: 86 messages over two real cursor pages with
+//!   Live e2e evidence: 86 messages over two real cursor pages and four
+//!   document blocks over two real cursor pages with
 //!   zero duplicate ids; the `create_time >=` pushdown narrowing a
 //!   live scan; wiki's non-empty final token terminating cleanly.
 
@@ -107,6 +117,7 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
+    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
@@ -117,7 +128,7 @@ mod tests {
         OpenConnectorConfig, OpenConnectorGateways, register_open_connector_tables,
         register_open_connector_udtfs,
     };
-    use arrow::array::{Array, StringArray, TimestampMillisecondArray};
+    use arrow::array::{Array, Int64Array, StringArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
@@ -141,6 +152,8 @@ mod tests {
             include_str!("fixtures/feishu/contracts/list_messages.json")
         } else if path.ends_with("feishu.list_chat_members") {
             include_str!("fixtures/feishu/contracts/list_chat_members.json")
+        } else if path.ends_with("feishu.list_document_blocks") {
+            include_str!("fixtures/feishu/contracts/list_document_blocks.json")
         } else if path.ends_with("feishu.list_tasks") {
             include_str!("fixtures/feishu/contracts/list_tasks.json")
         } else if path.ends_with("feishu.list_wiki_spaces") {
@@ -153,10 +166,10 @@ mod tests {
         MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
     }
 
-    // ── Contract tests: bundled fixtures are the build-time conversion
-    // contract (null-bearing, nested, empty, extra upstream fields, and a
-    // schema mismatch per the admission gate). DRAFT status: synthetic,
-    // re-derived from live captures in the real-data phase. ─────────────
+    // ── Contract tests: bundled fixtures are redacted live captures and
+    // the build-time conversion contract (null-bearing, nested, empty,
+    // extra upstream fields, and a schema mismatch per the admission
+    // gate). ────────────────────────────────────────────────────────────
 
     fn convert_fixture(table: &SourcePackTable, fixture: &str) -> RecordBatch {
         let page: Value = serde_json::from_str(fixture).expect("fixture parses");
@@ -268,9 +281,9 @@ mod tests {
         // Round-2 review blind spot: real member names survived inside the
         // JSON-encoded `body.content` payload — strings one decode level
         // BELOW the outer tree the redaction pass walked. Two tripwires:
-        // no CJK text anywhere in any feishu fixture (the live workspace's
-        // real names were Chinese), and every membership entry inside a
-        // decoded message payload is a `member-NNNN` placeholder.
+        // no CJK text anywhere in the audited row fixtures (the live
+        // workspace's real names were Chinese), and every membership entry
+        // inside a decoded message payload is a `member-NNNN` placeholder.
         let fixtures = [
             (
                 "chat_members",
@@ -280,6 +293,14 @@ mod tests {
             (
                 "chats_type_mismatch",
                 include_str!("fixtures/feishu/chats_type_mismatch.json"),
+            ),
+            (
+                "document_blocks",
+                include_str!("fixtures/feishu/document_blocks.json"),
+            ),
+            (
+                "document_blocks_page_2",
+                include_str!("fixtures/feishu/document_blocks_page_2.json"),
             ),
             ("messages", include_str!("fixtures/feishu/messages.json")),
             ("tasks", include_str!("fixtures/feishu/tasks.json")),
@@ -377,6 +398,62 @@ mod tests {
     }
 
     #[test]
+    fn document_blocks_fixture_converts_stable_fields_and_keeps_dynamic_payload() {
+        // Redacted live capture (2026-09-01): the root page block and a
+        // child text block carry payload objects under keys selected by
+        // block_type (`page` / `text`). A fixed relational mapping cannot
+        // address that dynamic key, so the payload stays in the contract
+        // fixture while the stable identity fields become columns.
+        let fixture = include_str!("fixtures/feishu/document_blocks.json");
+        let batch = convert_fixture(table("document_blocks"), fixture);
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(utf8(&batch, "block_id").value(0), "docx_0001");
+        assert_eq!(
+            batch
+                .column_by_name("block_type")
+                .expect("block_type")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64")
+                .value(1),
+            2
+        );
+        assert_eq!(utf8(&batch, "parent_id").value(0), "");
+
+        let page: Value = serde_json::from_str(fixture).expect("fixture parses");
+        assert_eq!(
+            page["items"][0]["page"]["elements"][0]["text_run"]["content"],
+            "skardi-acl-measure-doc"
+        );
+        assert_eq!(
+            page["items"][1]["text"]["elements"][0]["text_run"]["content"],
+            "skardi-document-block-fixture-1"
+        );
+    }
+
+    #[test]
+    fn document_blocks_page_size_cap_matches_the_live_rejection() {
+        let rejection: Value = serde_json::from_str(include_str!(
+            "fixtures/feishu/document_blocks_page_size_501_error.json"
+        ))
+        .expect("cap fixture parses");
+        assert_eq!(rejection["code"], 99992402);
+        assert_eq!(
+            rejection["error"]["field_violations"][0]["field"],
+            "page_size"
+        );
+        assert_eq!(rejection["error"]["field_violations"][0]["value"], "501");
+        assert_eq!(
+            rejection["error"]["field_violations"][0]["description"],
+            "the max value is 500"
+        );
+        match table("document_blocks").pagination {
+            PaginationStrategy::Cursor { page_size, .. } => assert_eq!(page_size, 500),
+            other => panic!("expected cursor pagination, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn chats_mismatch_fixture_fails_with_the_targeted_error() {
         // Admission-gate schema-mismatch fixture: a number where Utf8 is
         // declared fails with the full row-scoped identity, never a quiet
@@ -429,6 +506,10 @@ mod tests {
                 include_str!("fixtures/feishu/contracts/list_chat_members.json"),
             ),
             (
+                "document_blocks",
+                include_str!("fixtures/feishu/contracts/list_document_blocks.json"),
+            ),
+            (
                 "tasks",
                 include_str!("fixtures/feishu/contracts/list_tasks.json"),
             ),
@@ -468,6 +549,7 @@ mod tests {
             "chats",
             "messages",
             "chat_members",
+            "document_blocks",
             "tasks",
             "wiki_spaces",
             "wiki_nodes",
@@ -477,6 +559,9 @@ mod tests {
                 "chats" => include_str!("fixtures/feishu/contracts/list_chats.json"),
                 "messages" => include_str!("fixtures/feishu/contracts/list_messages.json"),
                 "chat_members" => include_str!("fixtures/feishu/contracts/list_chat_members.json"),
+                "document_blocks" => {
+                    include_str!("fixtures/feishu/contracts/list_document_blocks.json")
+                }
                 "tasks" => include_str!("fixtures/feishu/contracts/list_tasks.json"),
                 "wiki_spaces" => include_str!("fixtures/feishu/contracts/list_wiki_spaces.json"),
                 "wiki_nodes" => include_str!("fixtures/feishu/contracts/list_wiki_nodes.json"),
@@ -501,6 +586,8 @@ mod tests {
             "resource: { containerId: oc_root }"
         } else if tables.contains("chat_members") {
             "resource: { chatId: oc_root }"
+        } else if tables.contains("document_blocks") {
+            "resource: { documentId: docx_root }"
         } else if tables.contains("wiki_nodes") {
             "resource: { spaceId: sp_root }"
         } else {
@@ -589,6 +676,74 @@ bindings:
                 input["sortType"], "ByCreateTimeAsc",
                 "ordering pin: {input}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn document_blocks_forward_document_and_follow_the_live_two_page_cursor() {
+        // Both responses are redacted 2026-09-01 captures from the pinned
+        // gateway. They pin the camelCase envelope, pageToken forwarding,
+        // authoritative hasMore termination, and the independently measured
+        // 500-row cap (501 fails upstream with 99992402).
+        let page_1 = include_str!("fixtures/feishu/document_blocks.json");
+        let page_2 = include_str!("fixtures/feishu/document_blocks_page_2.json");
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return feishu_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/feishu.list_document_blocks" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let page = match body["input"].get("pageToken").and_then(Value::as_str) {
+                    None => page_1,
+                    Some("page-token-0002") => page_2,
+                    Some(other) => return MockResponse::new(400, format!("bad token {other}")),
+                };
+                return MockResponse::ok(&envelope_ok(page));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_FEISHU_DOCUMENT_BLOCKS",
+            "document_blocks",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT block_id, block_type, parent_id FROM saas.ws.document_blocks",
+        )
+        .await;
+        assert_eq!(
+            column_values(&batches, "block_id"),
+            vec!["docx_0001", "doxcn_0001", "doxcn_0002", "doxcn_0003"]
+        );
+        let block_types: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("block_type")
+                    .expect("block_type")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                (0..column.len()).map(move |row| column.value(row))
+            })
+            .collect();
+        assert_eq!(block_types, vec![1, 2, 2, 2]);
+
+        let inputs = execute_inputs(&gateway, "");
+        assert_eq!(inputs.len(), 2, "hasMore:false ends the live second page");
+        assert!(inputs[0].get("pageToken").is_none(), "{}", inputs[0]);
+        assert_eq!(inputs[1]["pageToken"], "page-token-0002");
+        for input in &inputs {
+            assert_eq!(input["documentId"], "docx_root");
+            assert_eq!(input["pageSize"], 500, "live-verified page-size cap");
         }
     }
 
@@ -860,6 +1015,46 @@ bindings:
         .await
         .expect_err("missing containerId must fail registration");
         assert!(err.to_string().contains("containerId"), "{err}");
+        assert!(
+            gateway.requests().iter().all(|r| r.path == "/v1/health"),
+            "resource enforcement precedes discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_blocks_require_document_id_before_discovery() {
+        let gateway = MockGateway::start(|req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = EnvVarGuard::set("SKARDI_TEST_OC_FEISHU_NO_DOC", "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(
+            r#"
+runtime_token_env: SKARDI_TEST_OC_FEISHU_NO_DOC
+bindings:
+  - name: ws
+    source_pack: feishu
+    tables: [document_blocks]
+"#,
+        )
+        .expect("config parses");
+        let mut ctx = SessionContext::new();
+        let gateways = OpenConnectorGateways::default();
+        let err = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect_err("missing documentId must fail registration");
+        assert!(err.to_string().contains("documentId"), "{err}");
         assert!(
             gateway.requests().iter().all(|r| r.path == "/v1/health"),
             "resource enforcement precedes discovery"
