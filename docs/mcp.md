@@ -1,15 +1,26 @@
-# MCP Binding — `skardi mcp`
+# MCP Binding
 
-`skardi mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io)
-over stdio, making Skardi's pipelines and ad-hoc query surface available to
-any MCP host — Claude Desktop, Cursor, or your own agent loop. It is the
-third agent-facing binding of the same pipeline YAML, next to the shell verb
-(`skardi run`) and REST (`POST /<name>/execute`).
+Skardi serves the [Model Context Protocol](https://modelcontextprotocol.io)
+over two transports of the same tool surface — pipelines, ad-hoc `query`,
+and `list_data_sources`:
 
-The subcommand is a transport bridge, not a second engine: the host spawns
-`skardi mcp` as a long-lived child process and speaks JSON-RPC to it over
-stdin/stdout; every tool call is proxied to a running `skardi-server` over
-REST and the response is returned verbatim.
+- **Local (stdio)** — `skardi mcp`, a CLI subcommand the host spawns as a
+  child process. For hosts that run a local binary: Claude Desktop, Cursor,
+  your own agent loop.
+- **Remote (streamable HTTP)** — `/mcp` on skardi-server itself. For hosts
+  that cannot spawn one: claude.ai, mobile clients, hosted agent platforms.
+  See [Remote (streamable HTTP)](#remote-streamable-http).
+
+Both are the same agent-facing binding of the same pipeline YAML, next to
+the shell verb (`skardi run`) and REST (`POST /<name>/execute`). The stdio
+bridge is not retired by the HTTP endpoint.
+
+Neither transport is a second engine. The bridge is a long-lived child
+process speaking JSON-RPC over stdin/stdout that proxies every tool call to
+a running `skardi-server` over REST and returns the response verbatim; the
+HTTP endpoint is a protocol adapter inside the server that dispatches each
+tool call to its own REST routes in-process — same handlers, same
+validation, same audit path.
 
 ```
 ┌──────────────┐  stdio (JSON-RPC)  ┌────────────────────┐  HTTP (REST)  ┌───────────────┐
@@ -17,11 +28,17 @@ REST and the response is returned verbatim.
 │ (Claude       │  spawned as a     │  (CLI subcommand:   │  ApiClient,  │  (executes     │
 │  Desktop, …)  │  child process    │   MCP ⇄ REST bridge)│  Bearer auth │   SQL)         │
 └──────────────┘                    └────────────────────┘               └───────────────┘
+
+┌──────────────┐  streamable HTTP (JSON-RPC over POST + SSE)  ┌────────────────────────┐
+│  MCP host     │ ◄──────────────────────────────────────────► │  skardi-server /mcp     │
+│ (claude.ai,   │  Authorization: Bearer <token>               │  (in-process dispatch   │
+│  hosted, …)   │                                              │   to its REST handlers) │
+└──────────────┘                                               └────────────────────────┘
 ```
 
 ---
 
-## Host setup
+## Host setup (stdio bridge)
 
 Claude Desktop (`claude_desktop_config.json`):
 
@@ -63,6 +80,60 @@ before serving instead of offering tools that would all fail.
 
 ---
 
+## Remote (streamable HTTP)
+
+skardi-server serves the same MCP tool surface at `http://<server>/mcp` —
+default-on, no config flag. Hosts that take a URL instead of a command
+connect directly:
+
+```json
+{
+  "mcpServers": {
+    "skardi": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+**Auth is Bearer-only and covers everything.** With auth enabled, every
+`/mcp` request — `initialize` and `tools/list` included — requires
+`Authorization: Bearer <token>`. This is a deliberate divergence from REST,
+where `GET /pipelines` is readable without a token: on `/mcp` the tool
+inventory sits behind the same credential as execution. Session cookies are
+never accepted on `/mcp`.
+
+**Host allowlist.** As DNS-rebinding protection, a request is accepted only
+when its `Host` header is on the allowlist: loopback (`localhost`,
+`127.0.0.1`, `::1`) by default, plus any values declared with the
+repeatable server flag:
+
+```bash
+skardi-server --mcp-allowed-host api.example.com --mcp-allowed-host api.example.com:8443
+```
+
+An entry with a port matches that port exactly; a portless entry matches
+the host on any port. There is deliberately no allow-any option — a public
+deployment names its hostnames.
+
+**Reverse proxies.** Either forward the public `Host` and declare it via
+`--mcp-allowed-host`, or rewrite `Host` to the upstream loopback authority.
+A mismatch presents as `403 Forbidden: Host header is not allowed`. Long
+tool calls hold their POST open for the whole run; responses are SSE with a
+15 s keep-alive so bytes keep flowing, but deployments running long
+pipelines should still check proxy read timeouts (nginx's
+`proxy_read_timeout` defaults to 60 s, and a keep-alive only helps when the
+proxy counts any bytes as liveness).
+
+**Audit grouping.** A legacy-protocol session (2025-11-25 and earlier)
+groups its queries and pipeline runs in the query-audit ledger under the
+transport's `Mcp-Session-Id`. Stateless-protocol requests (2026-07-28 and
+later) are attributed per-request with a minted UUID — that protocol
+revision removed the conversation-level handle, so there is nothing durable
+to group by.
+
+---
+
 ## Tool surface
 
 ### Pipeline tools
@@ -91,10 +162,11 @@ description to any parameter via `spec.parameters` in the pipeline YAML
 schema as the standard `description` keyword, so the model no longer has
 to guess semantics from the parameter name alone.
 
-Every pipeline call carries the connection's session id as
-`X-Skardi-Session-Id` — the same id `query` sends in
-`ai_context.session_id` — so one MCP session's pipeline runs and ad-hoc
-queries group together in the query audit ledger.
+Every pipeline call carries a session id as `X-Skardi-Session-Id` — the
+same id `query` sends in `ai_context.session_id` — so an MCP session's
+pipeline runs and ad-hoc queries group together in the query audit ledger.
+On the stdio bridge that id is one UUID per MCP connection; on `/mcp` see
+audit grouping under [Remote (streamable HTTP)](#remote-streamable-http).
 
 ### `query`
 
@@ -104,7 +176,7 @@ Ad-hoc SQL against the federated engine — the MCP face of `POST /query`.
 |---|---|---|
 | `sql` | string, **required** | One statement. DML only on `access_mode: read_write` sources; DDL is always rejected. |
 | `max_rows` | integer, optional | Result row cap; server default 1000. |
-| `purpose` | string, optional | One line on why you are running this query. Sent as `ai_context: {purpose, session_id}` and recorded in the server's query audit log; the `session_id` is one UUID per MCP connection, so a session's queries group together in the ledger. Omitted entirely when not provided. |
+| `purpose` | string, optional | One line on why you are running this query. Sent as `ai_context: {purpose, session_id}` and recorded in the server's query audit log; the `session_id` is the same per-connection (bridge) or per-session/per-request (`/mcp`) id pipeline calls carry, so related calls group together in the ledger. Omitted entirely when not provided. |
 
 ### `list_data_sources`
 
@@ -118,24 +190,34 @@ Call it before writing ad-hoc SQL with `query`.
 
 The pipeline inventory is fetched from `GET /pipelines` on **every**
 `tools/list` request — a pipeline added to the server appears as soon as the
-host re-lists. Hosts that list once at connect time and never again keep
-their snapshot until reconnect. The bridge does not emit `listChanged`
-notifications in v1.
+host re-lists. (`/mcp` goes one further and re-resolves the inventory on
+every pipeline `tools/call` too, so a rename between list and call is an
+in-band "unknown tool" nudge to re-list, never a stale dispatch.) Hosts
+that list once at connect time and never again keep their snapshot until
+reconnect. Neither binding emits `listChanged` notifications in v1.
 
 ---
 
 ## Auth notes
 
-The bridge sends the Bearer token it inherits from normal CLI config
-resolution on every REST call. Note that on today's server, `GET /pipelines`
-(the tool inventory) and `GET /data_source` are readable without a token —
-existing REST behavior, not something the bridge adds. Deployments whose
-table names or column semantics are sensitive should weigh access to
-`/data_source` and `/pipelines` together.
+Per binding:
+
+- **stdio bridge** — sends the Bearer token it inherits from normal CLI
+  config resolution on every REST call. Note that on today's server,
+  `GET /pipelines` (the tool inventory) and `GET /data_source` are readable
+  without a token — existing REST behavior, not something the bridge adds.
+  Deployments whose table names or column semantics are sensitive should
+  weigh access to `/data_source` and `/pipelines` together.
+- **`/mcp`** — once auth is on, the Bearer token is required for every
+  request, tool inventory included, and cookies are never accepted; see
+  [Remote (streamable HTTP)](#remote-streamable-http). The REST inventory
+  exception above does not extend here.
 
 ---
 
 ## Timeouts & lifecycle
+
+Stdio bridge:
 
 - **No bridge-side request timeout.** A hung server hangs the tool call
   until the MCP host's own tool-call timeout fires — every mainstream host
@@ -146,12 +228,27 @@ table names or column semantics are sensitive should weigh access to
 - **Lifecycle is host-driven.** When the host closes stdin, the bridge exits
   `0`; in-flight REST calls die with the process.
 
-REST failures during serving are reported in-band, not as crashes: any
-failed tool call — a 4xx/5xx from the server or an unreachable server —
-becomes a tool result with `isError: true` carrying the error text (the same
-"cannot reach skardi-server" wording the CLI prints). A `tools/list` that
-can't reach the server is the one JSON-RPC-level error, since there is no
-tool result to attach it to.
+`/mcp`:
+
+- **Per-request lifecycle — there is no process to exit.** Each JSON-RPC
+  request is one HTTP exchange; a host that disconnects simply stops
+  sending requests.
+- **Disconnect semantics follow the SSE response mode.** A tool call's
+  response is an SSE stream with a 15 s keep-alive; a client that drops the
+  connection abandons that response.
+- **The host's tool-call timeout remains the backstop.** The endpoint adds
+  no timeout of its own; the keep-alive exists so reverse proxies don't
+  fire theirs first (see the reverse-proxy notes above).
+
+Execution failures are reported in-band on both transports: a 4xx/5xx from
+the REST handlers becomes a tool result with `isError: true` carrying the
+error text, for the model to see and react to. On the bridge, an
+unreachable server surfaces the same way (the "cannot reach skardi-server"
+wording the CLI prints), and a `tools/list` that can't reach the server is
+the one JSON-RPC-level error, since there is no tool result to attach it
+to; in-process dispatch on `/mcp` has no unreachable-server case, and its
+one JSON-RPC-level tool-call error is an unknown tool name (with a nudge to
+re-issue `tools/list`).
 
 ---
 
@@ -171,5 +268,6 @@ tool result to attach it to.
   collision rules above; the original pipeline name is always echoed in the
   tool description.
 - **Result size** — `query` results are capped by `max_rows` (default
-  1000). Pipeline executions are not row-capped server-side; the bridge
-  refuses response bodies over 256 MB (the CLI-wide client ceiling).
+  1000). Pipeline executions are not row-capped server-side; both bindings
+  refuse response bodies over 256 MB (the CLI-wide client ceiling, restated
+  by the `/mcp` handler).
