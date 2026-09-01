@@ -3,7 +3,7 @@
 //!
 //! Off unless the operator selects a backend: `--query-audit-db <path>` (the
 //! SQLite file) or the [`PG_DSN_ENV`] environment variable (Postgres — an
-//! env var because the DSN carries a credential; see [`pg`]'s module doc for
+//! env var because the DSN carries a credential; see [`postgres`]'s module doc for
 //! the storage-swap rules). Either way, every statement the `/query`
 //! endpoint accepts — and every `POST /:name/execute` pipeline run — is
 //! written *before* execution and updated with its outcome afterwards, so
@@ -40,8 +40,8 @@
 
 use anyhow::{Context, Result, anyhow};
 
-mod pg;
-pub use pg::PG_DSN_ENV;
+mod postgres;
+pub use postgres::PG_DSN_ENV;
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -345,7 +345,7 @@ impl QueryAuditStatus {
 
 /// Durable audit ledger for `/query` — the SQLite file by default, or the
 /// Postgres backend when [`PG_DSN_ENV`] selects it. Same fail-closed
-/// contract either way; see [`pg`]'s module doc for the storage-swap rules
+/// contract either way; see [`postgres`]'s module doc for the storage-swap rules
 /// and the one honest divergence.
 pub struct QueryAuditStore {
     backend: Backend,
@@ -359,7 +359,7 @@ pub struct QueryAuditStore {
 /// vs [`QueryAuditStore::open_postgres`] and are backend-blind afterwards.
 enum Backend {
     Sqlite { conn: Connection, path: PathBuf },
-    Postgres(pg::PgAudit),
+    Postgres(postgres::PgAudit),
 }
 
 impl std::fmt::Debug for QueryAuditStore {
@@ -448,7 +448,7 @@ impl QueryAuditStore {
     /// never logged; `path()`/`Debug` render the redacted authority only.
     pub async fn open_postgres(dsn: &str) -> Result<Self> {
         Ok(Self {
-            backend: Backend::Postgres(pg::PgAudit::open(dsn).await?),
+            backend: Backend::Postgres(postgres::PgAudit::open(dsn).await?),
             write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
