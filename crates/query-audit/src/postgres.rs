@@ -90,6 +90,17 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_statement_kind
 CREATE INDEX IF NOT EXISTS idx_query_audit_job_run_id
     ON query_audit (job_run_id) WHERE job_run_id IS NOT NULL;";
 
+/// Serialises the boot DDL across concurrently-starting servers.
+/// `CREATE TABLE/INDEX IF NOT EXISTS` is NOT race-safe in Postgres — the
+/// existence check and the create are not atomic, so of two servers
+/// first-booting the same fresh database, the loser can die on 42P07
+/// (`duplicate_table`) and crash-loop a replica. The file backend handles
+/// its equivalent race (`is_duplicate_column`); this backend takes the
+/// advisory lock instead, which also covers the casing normalisation.
+/// The key is arbitrary but fixed — every creator of this schema must take
+/// the same one.
+const DDL_ADVISORY_LOCK_KEY: i64 = 0x5153_4152_4449_4131; // "SKARDIA1"-ish
+
 /// The Postgres arm's connection and identity. Constructed only by
 /// [`PgAudit::open`]; all writes are driven through the store facade, which
 /// owns the timeout.
@@ -133,29 +144,62 @@ impl PgAudit {
                     redacted.display()
                 )
             })?;
-        sqlx::raw_sql(INIT_SCHEMA_PG)
-            .execute(&pool)
+        // The DDL runs on ONE pinned connection under the advisory lock (see
+        // DDL_ADVISORY_LOCK_KEY). Session-scoped advisory locks survive the
+        // connection's return to the pool, so the unlock must run on every
+        // path — the result is captured, the unlock always attempted, and
+        // only then propagated.
+        let mut conn = pool.acquire().await.with_context(|| {
+            format!(
+                "Failed to acquire a connection for the query-audit schema at {}",
+                redacted.display()
+            )
+        })?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(DDL_ADVISORY_LOCK_KEY)
+            .execute(&mut *conn)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to initialise the Postgres query-audit schema at {}",
-                    redacted.display()
+            .context("Failed to take the query-audit DDL advisory lock")?;
+        // Sequential, not an inner async block: a block borrowing the pinned
+        // connection trips rustc's higher-ranked-lifetime limitation once
+        // this future crosses a spawn.
+        let mut ddl: Result<(), sqlx::Error> = sqlx::raw_sql(INIT_SCHEMA_PG)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ());
+        if ddl.is_ok() {
+            // The same one-shot normalisation `ensure_schema_additions` runs
+            // on the file: harmless on fresh databases, load-bearing on a
+            // table populated by a pre-#219 writer.
+            for (current, legacy) in [
+                (crate::QUERY_STATEMENT_KIND, "Query"),
+                (crate::OTHER_STATEMENT_KIND, "Other"),
+            ] {
+                if let Err(e) = sqlx::query(
+                    "UPDATE query_audit SET statement_kind = $1 WHERE statement_kind = $2",
                 )
-            })?;
-        // The same one-shot normalisation `ensure_schema_additions` runs on
-        // the file: harmless on fresh databases, load-bearing on a table
-        // populated by a pre-#219 writer.
-        for (current, legacy) in [
-            (crate::QUERY_STATEMENT_KIND, "Query"),
-            (crate::OTHER_STATEMENT_KIND, "Other"),
-        ] {
-            sqlx::query("UPDATE query_audit SET statement_kind = $1 WHERE statement_kind = $2")
                 .bind(current)
                 .bind(legacy)
-                .execute(&pool)
+                .execute(&mut *conn)
                 .await
-                .context("Failed to normalise legacy statement_kind casing")?;
+                {
+                    ddl = Err(e);
+                    break;
+                }
+            }
         }
+        let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(DDL_ADVISORY_LOCK_KEY)
+            .execute(&mut *conn)
+            .await;
+        drop(conn);
+        ddl.with_context(|| {
+            format!(
+                "Failed to initialise the Postgres query-audit schema at {}",
+                redacted.display()
+            )
+        })?;
+        unlocked.context("Failed to release the query-audit DDL advisory lock")?;
         Ok(Self { pool, redacted })
     }
 

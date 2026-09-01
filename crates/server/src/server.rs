@@ -267,9 +267,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // an env var because the DSN carries a credential, and argv leaks into
     // process listings). Every failure here is fatal: a configured audit
     // trail that silently doesn't record would be worse than none at all.
-    let pg_audit_dsn = std::env::var(skardi_query_audit::PG_DSN_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let pg_audit_dsn = pg_dsn_from_env(std::env::var_os(skardi_query_audit::PG_DSN_ENV))?;
     let query_audit =
         match select_query_audit_backend(config.args.query_audit_db.as_deref(), pg_audit_dsn)? {
             None => None,
@@ -422,6 +420,29 @@ pub async fn repair_lost_job_correlations(
 enum QueryAuditBackend {
     File(std::path::PathBuf),
     Postgres(String),
+}
+
+/// Decode the Postgres audit DSN from its environment variable. A set-but-
+/// non-UTF-8 value REFUSES startup instead of being flattened to "unset"
+/// (`env::var(..).ok()` does exactly that flattening): without the flag the
+/// server would then boot with auditing silently OFF — the precise
+/// "configured but unaudited" state the boot-fatal posture exists to
+/// prevent. Whitespace-only counts as unset, matching empty.
+fn pg_dsn_from_env(value: Option<std::ffi::OsString>) -> Result<Option<String>> {
+    match value {
+        None => Ok(None),
+        Some(v) => match v.into_string() {
+            Ok(s) => {
+                let s = s.trim();
+                Ok((!s.is_empty()).then(|| s.to_string()))
+            }
+            Err(_) => anyhow::bail!(
+                "{} is set but is not valid UTF-8; refusing to start rather than \
+                 run with auditing silently disabled",
+                skardi_query_audit::PG_DSN_ENV
+            ),
+        },
+    }
 }
 
 fn select_query_audit_backend(
@@ -835,8 +856,29 @@ spec:
 
 #[cfg(test)]
 mod query_audit_backend_tests {
-    use super::{QueryAuditBackend, select_query_audit_backend};
+    use super::{QueryAuditBackend, pg_dsn_from_env, select_query_audit_backend};
     use std::path::Path;
+
+    /// A set-but-undecodable DSN refuses startup; unset and blank read as
+    /// unset. `env::var(..).ok()` flattened NotUnicode into None — booting
+    /// with auditing silently OFF, the exact state boot-fatal exists to
+    /// prevent.
+    #[test]
+    fn non_utf8_dsn_refuses_instead_of_disabling_audit() {
+        assert_eq!(pg_dsn_from_env(None).unwrap(), None);
+        assert_eq!(pg_dsn_from_env(Some("  ".into())).unwrap(), None);
+        assert_eq!(
+            pg_dsn_from_env(Some("postgres://u:p@h/db".into())).unwrap(),
+            Some("postgres://u:p@h/db".to_string())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let garbage = std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0xff, 0xfe]);
+            let err = pg_dsn_from_env(Some(garbage)).unwrap_err().to_string();
+            assert!(err.contains("not valid UTF-8"), "{err}");
+        }
+    }
 
     /// One ledger, one backend: the flag alone selects the file, the env
     /// alone selects Postgres, neither selects nothing, and both together

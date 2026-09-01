@@ -67,6 +67,27 @@ async fn fresh_db(url: &str) -> (String, sqlx::PgPool) {
     (dsn, pool)
 }
 
+/// Concurrent FIRST boots against one fresh database must all succeed:
+/// `CREATE TABLE/INDEX IF NOT EXISTS` is not race-safe in Postgres (the
+/// loser of the catalog race dies on 42P07 and would crash-loop a
+/// replica), so the boot DDL runs under an advisory lock. Eight parallel
+/// opens are the regression canary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn concurrent_first_boots_are_race_free() {
+    let Some(url) = live_url() else { return };
+    let (dsn, _pool) = fresh_db(&url).await;
+    // join_all, not spawn: the opens interleave at every await, so the DDL
+    // statements are genuinely concurrent on the server side (spawn trips a
+    // rustc higher-ranked-lifetime limitation on sqlx's `&mut conn`
+    // executor borrows).
+    let results =
+        futures::future::join_all((0..8).map(|_| QueryAuditStore::open_postgres(&dsn))).await;
+    for result in results {
+        result.expect("every concurrent first boot must succeed");
+    }
+}
+
 /// Round trip with identity and ai_context: every column lands and reads
 /// back; `session_id` is denormalised out of the context for the index.
 #[tokio::test]
