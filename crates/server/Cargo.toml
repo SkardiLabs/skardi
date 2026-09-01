@@ -89,6 +89,13 @@ url = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 http-body-util = "0.1"
+# Client half of the /mcp end-to-end suite (tests/mcp_http.rs): a real rmcp
+# client over HTTP against the served router. Same pin as the main
+# dependency; features union in test builds.
+rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+# Raw HTTP probes for what the rmcp client can't express (an invented
+# Mcp-Session-Id). Loopback plain-HTTP only, so no TLS backend.
+reqwest = { version = "0.12", default-features = false }
 skardi = { path = "../skardi" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
