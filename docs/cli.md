@@ -336,6 +336,10 @@ skardi query -e "SELECT * FROM events" --max-rows 50
 
 # Render as an ASCII table instead of JSON
 skardi query -e "SELECT * FROM products LIMIT 10" --table
+
+# Record why this query ran, and which session it belongs to
+skardi query -e "SELECT count(*) FROM orders WHERE status = 'paid'" \
+  --purpose "weekly paid-order count" --session-id sess-2026-08-27
 ```
 
 Default output is the response's `data` array, pretty-printed JSON, on
@@ -358,6 +362,28 @@ piping:
 ```
 note: results truncated; pass a higher --max-rows to see the rest
 ```
+
+### Recording intent — `--purpose` / `--session-id`
+
+The two flags travel together as the request body's `ai_context` object,
+which the server records in its query audit ledger when it was started with
+`--query-audit-db`. `--purpose` says why the query ran; `--session-id`
+groups it with the rest of one agent session, so a later reader can tell a
+repeated question from a one-off. Without them the ledger still records the
+SQL, but nothing about intent — the column that makes "we have answered this
+before" answerable stays empty.
+
+Either flag requires the other: the server rejects an `ai_context` carrying
+only one of the pair, so the CLI refuses it at parse time rather than
+spending a round trip on a 400. Values are checked client-side before any
+request (non-empty, `--purpose` ≤ 2000 characters, `--session-id` ≤ 200).
+
+Unlike `run --session-id`, which travels as an HTTP header and is therefore
+held to header-safe characters, these values ride inside JSON — any
+non-empty string within the cap is accepted, spaces and non-ASCII included.
+
+The ledger is opt-in and off by default; see `--query-audit-db` in
+[docs/server.md](server.md).
 
 ## Pipelines
 
