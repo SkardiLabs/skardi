@@ -22,6 +22,9 @@
 # them under the user identity requires the im:message:readonly (or
 # im:message / im:message.history:readonly) scope — the get_as_user
 # scopes the gateway declares are NOT honored for this path (99991679).
+# document_blocks is live-verified 2026-09-01 over two cursor pages; its
+# real page_size cap is 500 (99992402 at 501), and its block-type payload
+# remains under a dynamic `page` / `text` / `heading1` / ... key.
 # `message_position` (a digit string on every row) is deliberately
 # unmapped: it appears in no public Feishu doc we could pin semantics
 # to.
@@ -115,6 +118,30 @@ tables:
       # doctrine that means zero evidence trail; kept because the Feishu
       # message resource documents it, typed utf8 like every other id.
       - { name: upper_message_id, path: upper_message_id, type: utf8, nullable: true }
+
+  document_blocks:
+    action: feishu.list_document_blocks
+    row_path: "$.items"
+    fingerprint: 8b27c6542e4e2b3dc113f52e56b111863cc20b87df0c8bfd4b629b97661ff63a
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      # Live-verified 2026-09-01: 500 succeeds and 501 hard-fails with
+      # Feishu 99992402 (`the max value is 500`).
+      page_size: 500
+      has_more_path: "$.hasMore"
+    resources:
+      required: [documentId]
+    columns:
+      # The block-type payload (`page`, `text`, `heading1`, ...) lives
+      # under a key selected BY block_type. A fixed relational mapping
+      # cannot address that dynamic key; the live fixtures retain it for
+      # contract evidence while this table exposes the stable row fields.
+      - { name: block_id, path: block_id, type: utf8, nullable: false }
+      - { name: block_type, path: block_type, type: int64, nullable: true }
+      - { name: parent_id, path: parent_id, type: utf8, nullable: true }
 
   chat_members:
     action: feishu.list_chat_members
