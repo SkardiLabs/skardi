@@ -142,24 +142,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: default
+          # lite = default server build (includes `chunking` so stock servers
+          # run generated etl bundles); full = every stable server feature.
+          # Anything in between is a local build:
+          #   docker build --build-arg FEATURES=<flags> .
+          - variant: lite
             features: ""
-            suffix: ""
+            suffix: "-lite"
             platform: linux/amd64
             runner: ubuntu-latest
-          - variant: default
+          - variant: lite
             features: ""
-            suffix: ""
+            suffix: "-lite"
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - variant: rag
-            features: "rag"
-            suffix: "-rag"
+          - variant: full
+            features: "rag,llm-extract,documents,rss"
+            suffix: "-full"
             platform: linux/amd64
             runner: ubuntu-latest
-          - variant: rag
-            features: "rag"
-            suffix: "-rag"
+          - variant: full
+            features: "rag,llm-extract,documents,rss"
+            suffix: "-full"
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -220,10 +224,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: default
-            suffix: ""
-          - variant: rag
-            suffix: "-rag"
+          - variant: lite
+            suffix: "-lite"
+          - variant: full
+            suffix: "-full"
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
