@@ -362,6 +362,9 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 error_path: None,
                 fixed_inputs: &[],
                 source_pack_version: 0,
+                // Raw actions are array-only; see
+                // `ObjectRowsUnsupportedForRawAction`.
+                row_shape: RowShape::Array,
                 // Raw scans declare no pagination contract at all, so
                 // there is no listing to continue.
                 continuation: None,
@@ -435,7 +438,6 @@ impl TableProvider for RawScanProvider {
             self.target.clone(),
             Arc::clone(&self.converter),
             self.row_path.clone(),
-            RowShape::Array,
             self.input.clone(),
             Vec::new(),
             projection.cloned(),
@@ -1064,6 +1066,27 @@ raw_action_allowlist:
             r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
                                                  '{"workspace":"demo"}', '$.items')"#,
             "is classified as mutating",
+        )
+        .await;
+        assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");
+    }
+
+    #[tokio::test]
+    async fn scan_udtf_rejects_the_object_root_path_before_http() {
+        // Object rows are a pack-declared contract. A caller asking for one
+        // ad hoc must be told so at planning time, by the targeted error —
+        // not fall through to `RowPath::parse`'s generic "no segments", and
+        // not reach the gateway.
+        let gateway =
+            MockGateway::start(|req| gateway_handler(req, 5, Some(true), ITEMS_OUTPUT_SCHEMA))
+                .await;
+        let config = parse_config(ALLOWLIST_CONFIG, "SKARDI_TEST_OC_UDTF_SCAN_OBJECT_ROOT", 0);
+        let ctx = setup(&gateway, &config, "SKARDI_TEST_OC_UDTF_SCAN_OBJECT_ROOT").await;
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
+                                                 '{"workspace":"demo"}', '$')"#,
+            "do not support object rows",
         )
         .await;
         assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");

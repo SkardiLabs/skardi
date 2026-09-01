@@ -63,6 +63,12 @@ pub struct ScanTarget {
     /// [`super::pagination::CursorContinuation`]); `None` for raw scans and
     /// for every table whose provider accepts the cursor on its own action.
     pub continuation: Option<CursorContinuation>,
+    /// Whether the row path locates an array of rows or a single row object
+    /// (see [`RowShape`]). Carried on the target rather than passed
+    /// alongside it: this is the per-table response contract, exactly like
+    /// `pagination` and `error_path`. Raw scans are always
+    /// [`RowShape::Array`].
+    pub row_shape: RowShape,
 }
 
 impl ScanTarget {
@@ -76,6 +82,7 @@ impl ScanTarget {
             fixed_inputs: table.fixed_inputs,
             source_pack_version,
             continuation: table.continuation,
+            row_shape: table.row_shape,
         }
     }
 }
@@ -91,7 +98,6 @@ pub struct OpenConnectorExec {
     target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
-    row_shape: RowShape,
     resource: Value,
     filter_inputs: Vec<(String, Value)>,
     projection: Option<Vec<usize>>,
@@ -128,7 +134,6 @@ impl OpenConnectorExec {
         target: ScanTarget,
         converter: Arc<RowConverter>,
         row_path: RowPath,
-        row_shape: RowShape,
         resource: Value,
         filter_inputs: Vec<(String, Value)>,
         projection: Option<Vec<usize>>,
@@ -157,7 +162,6 @@ impl OpenConnectorExec {
             target,
             converter,
             row_path,
-            row_shape,
             resource,
             filter_inputs,
             projection,
@@ -279,7 +283,6 @@ struct ScanState {
     target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
-    row_shape: RowShape,
     resource: Value,
     filter_inputs: Vec<(String, Value)>,
     projection: Option<Vec<usize>>,
@@ -367,7 +370,6 @@ impl ScanState {
             target: exec.target.clone(),
             converter: exec.converter.clone(),
             row_path: exec.row_path.clone(),
-            row_shape: exec.row_shape,
             resource: exec.resource.clone(),
             filter_inputs: exec.filter_inputs.clone(),
             projection: exec.projection.clone(),
@@ -552,7 +554,7 @@ impl ScanState {
         // converter as a one-element slice: `from_ref` borrows it in place,
         // so there is no clone of the response and no second conversion
         // path to keep in sync with schema, projection, and error handling.
-        let rows = match self.row_shape {
+        let rows = match self.target.row_shape {
             RowShape::Array => self.row_path.rows(&envelope, page)?,
             RowShape::Object => slice::from_ref(self.row_path.row_object(&envelope, page)?),
         };
@@ -673,7 +675,6 @@ mod tests {
             ScanTarget::from_pack_table(table, source_pack_version),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse(table.row_path).expect("row path"),
-            table.row_shape,
             json!({}),
             vec![],
             None,
@@ -818,7 +819,6 @@ mod tests {
             ScanTarget::from_pack_table(table, 1),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse_object_root(table.row_path).expect("object root"),
-            table.row_shape,
             json!({"documentId": "doc-1"}),
             vec![],
             None,
@@ -874,7 +874,6 @@ mod tests {
             ScanTarget::from_pack_table(table, 1),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse_object_root(table.row_path).expect("object root"),
-            table.row_shape,
             json!({"documentId": "doc-1"}),
             vec![],
             None,
@@ -936,7 +935,6 @@ mod tests {
             ScanTarget::from_pack_table(table, 1),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse(table.row_path).expect("row path"),
-            table.row_shape,
             json!({"path": "/docs"}),
             vec![],
             None,

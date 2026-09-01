@@ -670,6 +670,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_shipped_table_is_array_shaped() {
+        // The zero-behaviour-change invariant, asserted against what
+        // actually ships rather than a synthetic YAML: object rows are new,
+        // so no built-in table may have acquired the shape by accident. The
+        // day a pack legitimately declares one (feishu document_content),
+        // this test names it explicitly instead of being deleted.
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+        let mut object_tables = Vec::new();
+        for pack in registry.packs.values() {
+            for table in pack.tables {
+                if table.row_shape == RowShape::Object {
+                    object_tables.push(table.id);
+                }
+            }
+        }
+        assert!(
+            object_tables.is_empty(),
+            "no shipped pack declares object rows yet, found: {object_tables:?}"
+        );
+    }
+
+    #[test]
     fn builtin_mock_pack_is_registered() {
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let pack = registry.require("mock").unwrap();

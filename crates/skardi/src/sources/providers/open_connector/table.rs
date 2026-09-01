@@ -160,7 +160,6 @@ impl TableProvider for OpenConnectorTableProvider {
             ScanTarget::from_pack_table(self.table, self.source_pack_version),
             Arc::clone(&self.converter),
             self.row_path.clone(),
-            self.table.row_shape,
             self.resource.clone(),
             translated.inputs,
             projection.cloned(),
