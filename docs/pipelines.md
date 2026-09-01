@@ -66,6 +66,36 @@ Each `POST /<name>/execute` body is a JSON object keyed by placeholder
 name; the CLI takes `--param name=value` flags with optional typed
 suffixes (`--param limit:int=10`).
 
+### Parameter descriptions
+
+An optional `spec.parameters` map attaches a one-line, human-written
+description to any parameter:
+
+```yaml
+spec:
+  parameters:
+    brand: "Exact brand name; null matches every brand"
+    max_price: "Upper price bound in USD, exclusive"
+  query: |
+    SELECT ...
+    WHERE ({brand} IS NULL OR "Brand" = {brand})
+      AND ({max_price} IS NULL OR "Price" < {max_price})
+```
+
+Descriptions are documentation, not declaration — the parameter set still
+comes from the SQL, and every key under `spec.parameters` must name a
+`{placeholder}` the query declares; a misspelled or stale key fails the
+load, and so does a blank description. Text is trimmed on load, so block
+scalars (`>`) publish without their trailing newline. Each description is published as the standard `description` keyword
+inside that parameter's `json_schema` in the enriched `GET /pipelines`
+inventory, which `skardi mcp` projects verbatim into MCP tool input
+schemas — the sentence written here is exactly what a model reads before
+filling the parameter.
+
+Job YAML (`kind: job`) shares the same loader, so `spec.parameters` is
+accepted and validated there too — but only pipelines publish the text:
+`GET /jobs` lists parameter names alone.
+
 ### Parameter shapes
 
 The `{name}` token is replaced with a SQL-safe literal at execution time.
