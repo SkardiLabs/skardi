@@ -27,7 +27,17 @@ fn live_url() -> Option<String> {
 /// raw pool for direct assertions. Unique per call so tests cannot see each
 /// other's rows.
 async fn fresh_db(url: &str) -> (String, sqlx::PgPool) {
-    let db = format!("qa_{}", std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos());
+    // Unique across THREE axes, because each has failed alone: a per-process
+    // counter (two threads can read the same coarse-clock nanos), the pid
+    // (nextest runs each test in its own process, where the counter resets),
+    // and the nanos (so back-to-back suite runs never collide either).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let db = format!(
+        "qa_{}_{}_{}",
+        std::process::id(),
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let boot = sqlx::PgPool::connect(url).await.expect("connect server");
     // Concurrent CREATE DATABASE calls serialize on the template lock and
     // the loser errors ("source database template1 is being accessed by
