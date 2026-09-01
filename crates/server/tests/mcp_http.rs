@@ -20,7 +20,9 @@ use datafusion::prelude::SessionContext;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, ProtocolVersion};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::{RoleClient, ServiceExt, service::RunningService};
+use rmcp::{
+    ClientLifecycleMode, ClientServiceExt, RoleClient, ServiceExt, service::RunningService,
+};
 use serde_json::{Value, json};
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use tempfile::TempDir;
@@ -365,6 +367,15 @@ async fn anonymous_initialize_is_a_transport_401() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
+/// rmcp's stateless client is the Discover lifecycle: no `initialize`
+/// handshake, no session — `server/discover` negotiates the version and
+/// every request carries self-contained `_meta` (SEP-2575).
+fn discover_2026_07_28() -> ClientLifecycleMode {
+    ClientLifecycleMode::Discover {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+    }
+}
+
 /// The stateless-protocol regression test: a 2026-07-28 client carries no
 /// session, so every request stands alone — `tools/call` must resolve the
 /// pipeline per-call with no `tools/list` state to lean on.
@@ -375,10 +386,9 @@ async fn stateless_2026_07_28_client_lists_and_calls() {
 
     let transport = StreamableHttpClientTransport::from_uri(mcp_uri(addr));
     let client = ClientInfo::default()
-        .with_protocol_version(ProtocolVersion::V_2026_07_28)
-        .serve(transport)
+        .serve_with_lifecycle(transport, discover_2026_07_28())
         .await
-        .expect("stateless initialize");
+        .expect("discover startup");
     // Guard the premise: the negotiated version is the stateless protocol
     // (rmcp serves >= 2026-07-28 statelessly regardless of session config).
     assert_eq!(
@@ -418,10 +428,9 @@ async fn stateless_pipeline_call_records_a_uuid_audit_session_id() {
     // the handler's minted per-request UUID.
     let transport = StreamableHttpClientTransport::from_uri(mcp_uri(addr));
     let client = ClientInfo::default()
-        .with_protocol_version(ProtocolVersion::V_2026_07_28)
-        .serve(transport)
+        .serve_with_lifecycle(transport, discover_2026_07_28())
         .await
-        .expect("stateless initialize");
+        .expect("discover startup");
     let result = client
         .call_tool(call_params(
             "product-search",
