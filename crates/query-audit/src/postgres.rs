@@ -76,7 +76,8 @@ const INIT_SCHEMA_PG: &str = "CREATE TABLE IF NOT EXISTS query_audit (
     workspace_id   TEXT,
     user_id        TEXT,
     run_id         TEXT,
-    job_run_id     TEXT
+    job_run_id     TEXT,
+    writer         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_audit_session_created
     ON query_audit (session_id, created_at DESC);
@@ -166,6 +167,10 @@ impl PgAudit {
         self.pool.close().await;
     }
 
+    // One parameter per column group; splitting a param struct across two
+    // crates-worth of one caller buys nothing (same call the sqlite arm
+    // makes, same shape the facade holds).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_started_for(
         &self,
         sql: &str,
@@ -173,6 +178,7 @@ impl PgAudit {
         max_rows: usize,
         statement_kind: &str,
         identity: Option<&QueryIdentity>,
+        writer: &str,
         timeout: std::time::Duration,
     ) -> std::result::Result<String, BoundedError> {
         let id = new_id();
@@ -187,9 +193,9 @@ impl PgAudit {
             sqlx::query(
                 "INSERT INTO query_audit
                     (id, created_at, sql, ai_context, session_id, max_rows,
-                     statement_kind, status,
+                     statement_kind, status, writer,
                      request_id, org_id, workspace_id, user_id, run_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             )
             .bind(&id)
             .bind(&created_at)
@@ -199,6 +205,7 @@ impl PgAudit {
             .bind(max_rows as i64)
             .bind(statement_kind)
             .bind(QueryAuditStatus::Started.as_str())
+            .bind(writer)
             .bind(&identity.request_id)
             .bind(&identity.org_id)
             .bind(&identity.workspace_id)
@@ -231,6 +238,7 @@ impl PgAudit {
         name_at_version: &str,
         session_id: Option<&str>,
         statement_kind: &str,
+        writer: &str,
         timeout: std::time::Duration,
     ) -> std::result::Result<String, BoundedError> {
         let id = new_id();
@@ -239,8 +247,8 @@ impl PgAudit {
             sqlx::query(
                 "INSERT INTO query_audit
                     (id, created_at, sql, ai_context, session_id, max_rows,
-                     statement_kind, status)
-                 VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)",
+                     statement_kind, status, writer)
+                 VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8)",
             )
             .bind(&id)
             .bind(&created_at)
@@ -249,6 +257,7 @@ impl PgAudit {
             .bind(crate::PIPELINE_MAX_ROWS_SENTINEL)
             .bind(statement_kind)
             .bind(QueryAuditStatus::Started.as_str())
+            .bind(writer)
             .execute(&self.pool),
             "Failed to write pre-execution audit record",
             timeout,
@@ -354,17 +363,22 @@ impl PgAudit {
         });
     }
 
-    pub(crate) async fn reconcile_orphaned(&self, reason: &str) -> Result<usize> {
+    /// See the facade's doc: scoped to `writer = $5 OR writer IS NULL`,
+    /// because several servers sharing one DSN is the NATURAL topology here
+    /// and an unscoped boot reconcile rewrites a peer's live rows to
+    /// `unknown` — permanently, thanks to the monotonic outcome guard.
+    pub(crate) async fn reconcile_orphaned(&self, reason: &str, writer: &str) -> Result<usize> {
         let finished_at = chrono::Utc::now().to_rfc3339();
         let done = sqlx::query(
             "UPDATE query_audit
                 SET status = $1, finished_at = $2, error = $3
-              WHERE status = $4",
+              WHERE status = $4 AND (writer = $5 OR writer IS NULL)",
         )
         .bind(QueryAuditStatus::Unknown.as_str())
         .bind(&finished_at)
         .bind(reason)
         .bind(QueryAuditStatus::Started.as_str())
+        .bind(writer)
         .execute(&self.pool)
         .await
         .context("Failed to reconcile orphaned query-audit records")?;
@@ -443,7 +457,7 @@ impl PgAudit {
             "SELECT id, created_at, finished_at, sql, ai_context, session_id,
                     max_rows, statement_kind, status, row_count, error,
                     request_id, org_id, workspace_id, user_id, run_id,
-                    job_run_id
+                    job_run_id, writer
                FROM query_audit WHERE id = $1",
         )
         .bind(id)
@@ -470,6 +484,7 @@ impl PgAudit {
                 "user_id": row.get::<Option<String>, _>("user_id"),
                 "run_id": row.get::<Option<String>, _>("run_id"),
                 "job_run_id": row.get::<Option<String>, _>("job_run_id"),
+                "writer": row.get::<Option<String>, _>("writer"),
             })
         }))
     }

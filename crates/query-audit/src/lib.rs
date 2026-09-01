@@ -42,6 +42,27 @@ use anyhow::{Context, Result, anyhow};
 
 mod postgres;
 pub use postgres::PG_DSN_ENV;
+
+/// Overrides the writer identity every `started` row is stamped with (see
+/// [`QueryAuditStore::with_writer_identity`]). Resolution:
+/// this variable → `HOSTNAME` (set by Kubernetes and Docker, exactly the
+/// topologies where several servers share one Postgres DSN) → a fixed
+/// fallback. Co-hosted servers sharing a DSN outside a container runtime
+/// MUST set this to distinct values — the fallback cannot tell them apart.
+pub const WRITER_ID_ENV: &str = "SKARDI_QUERY_AUDIT_WRITER_ID";
+
+/// See [`WRITER_ID_ENV`].
+fn default_writer_identity() -> String {
+    for var in [WRITER_ID_ENV, "HOSTNAME"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    "skardi-server".to_string()
+}
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -185,7 +206,8 @@ const INIT_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS query_audit (
     workspace_id   TEXT,
     user_id        TEXT,
     run_id         TEXT,
-    job_run_id     TEXT
+    job_run_id     TEXT,
+    writer         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_query_audit_session_created
     ON query_audit (session_id, created_at DESC);
@@ -211,6 +233,16 @@ const IDENTITY_COLUMNS: [&str; 5] = ["request_id", "org_id", "workspace_id", "us
 /// Deliberately not the identity envelope's `run_id`, which names the caller's
 /// own run — one column, one meaning.
 const BRIDGE_COLUMNS: [&str; 1] = ["job_run_id"];
+
+/// The writer-identity column, reconciled like the lists above. Stamped on
+/// every `started` row so [`QueryAuditStore::reconcile_orphaned`] can scope
+/// itself to ITS OWN orphans: several servers sharing one Postgres DSN is a
+/// natural topology, and an unscoped boot reconcile there rewrites a peer's
+/// LIVE in-flight rows to `unknown` — which the monotonic outcome guard then
+/// makes permanent. NULL (rows from before this column, or a writer that
+/// predates the stamp) stays reconcilable by anyone: those rows have no
+/// owner left to claim them.
+const WRITER_COLUMNS: [&str; 1] = ["writer"];
 
 /// Index over the `job_run_id` bridge, applied after [`ensure_added_columns`]
 /// has guaranteed the column exists — so it cannot live in
@@ -300,6 +332,7 @@ fn normalise_statement_kind_casing(conn: &rusqlite::Connection) -> SqlResult<()>
 fn ensure_schema_additions(conn: &rusqlite::Connection) -> SqlResult<()> {
     ensure_added_columns(conn, &IDENTITY_COLUMNS)?;
     ensure_added_columns(conn, &BRIDGE_COLUMNS)?;
+    ensure_added_columns(conn, &WRITER_COLUMNS)?;
     conn.execute_batch(JOB_RUN_ID_INDEX_SQL)?;
     normalise_statement_kind_casing(conn)?;
     Ok(())
@@ -349,6 +382,9 @@ impl QueryAuditStatus {
 /// and the one honest divergence.
 pub struct QueryAuditStore {
     backend: Backend,
+    /// Stamped on every `started` row; scopes [`Self::reconcile_orphaned`].
+    /// See [`WRITER_ID_ENV`] and [`Self::with_writer_identity`].
+    writer: String,
     /// Bound passed to [`bounded`] for every write. [`AUDIT_WRITE_TIMEOUT`]
     /// in production; overridable in tests via [`Self::with_write_timeout`]
     /// so the timeout branch can be exercised without waiting 5s.
@@ -436,6 +472,7 @@ impl QueryAuditStore {
 
         Ok(Self {
             backend: Backend::Sqlite { conn, path },
+            writer: default_writer_identity(),
             write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
@@ -449,6 +486,7 @@ impl QueryAuditStore {
     pub async fn open_postgres(dsn: &str) -> Result<Self> {
         Ok(Self {
             backend: Backend::Postgres(postgres::PgAudit::open(dsn).await?),
+            writer: default_writer_identity(),
             write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
@@ -470,6 +508,7 @@ impl QueryAuditStore {
                 conn,
                 path: PathBuf::from(":memory:"),
             },
+            writer: default_writer_identity(),
             write_timeout: AUDIT_WRITE_TIMEOUT,
         })
     }
@@ -482,6 +521,24 @@ impl QueryAuditStore {
             Backend::Sqlite { path, .. } => path,
             Backend::Postgres(pg) => pg.redacted(),
         }
+    }
+
+    /// The writer identity every `started` row is stamped with. Resolved
+    /// from [`WRITER_ID_ENV`] → `HOSTNAME` → a fixed fallback at open;
+    /// override with [`Self::with_writer_identity`].
+    pub fn writer_identity(&self) -> &str {
+        &self.writer
+    }
+
+    /// Replace the writer identity (before the first write — rows already
+    /// stamped keep the identity they were written under). For deployments
+    /// that want explicit identity rather than the env/hostname resolution —
+    /// REQUIRED for co-hosted servers sharing one Postgres DSN, whose
+    /// hostname cannot tell them apart — and for tests that need two
+    /// distinct writers in one process.
+    pub fn with_writer_identity(mut self, id: impl Into<String>) -> Self {
+        self.writer = id.into();
+        self
     }
 
     /// The sqlite connection, tests only — a handful of tests hold the
@@ -552,6 +609,7 @@ impl QueryAuditStore {
                         max_rows,
                         statement_kind,
                         identity,
+                        &self.writer,
                         self.write_timeout,
                     )
                     .await
@@ -572,15 +630,16 @@ impl QueryAuditStore {
         let statement_kind = statement_kind.to_string();
         let row_id = id.clone();
         let identity = identity.cloned().unwrap_or_default();
+        let writer = self.writer.clone();
 
         match bounded(
             conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
-                         statement_kind, status,
+                         statement_kind, status, writer,
                          request_id, org_id, workspace_id, user_id, run_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         row_id,
                         created_at,
@@ -590,6 +649,7 @@ impl QueryAuditStore {
                         max_rows as i64,
                         statement_kind,
                         QueryAuditStatus::Started.as_str(),
+                        writer,
                         identity.request_id,
                         identity.org_id,
                         identity.workspace_id,
@@ -637,6 +697,7 @@ impl QueryAuditStore {
                         &format!("{pipeline_name}@{version}"),
                         session_id,
                         PIPELINE_STATEMENT_KIND,
+                        &self.writer,
                         self.write_timeout,
                     )
                     .await
@@ -649,14 +710,15 @@ impl QueryAuditStore {
         let name_at_version = format!("{pipeline_name}@{version}");
         let session_id = session_id.map(str::to_string);
         let row_id = id.clone();
+        let writer = self.writer.clone();
 
         match bounded(
             conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
-                         statement_kind, status)
-                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                         statement_kind, status, writer)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         row_id,
                         created_at,
@@ -665,6 +727,7 @@ impl QueryAuditStore {
                         PIPELINE_MAX_ROWS_SENTINEL,
                         PIPELINE_STATEMENT_KIND,
                         QueryAuditStatus::Started.as_str(),
+                        writer,
                     ],
                 )?;
                 Ok(())
@@ -704,6 +767,7 @@ impl QueryAuditStore {
                         &format!("{job_name}@{version}"),
                         session_id,
                         JOB_STATEMENT_KIND,
+                        &self.writer,
                         self.write_timeout,
                     )
                     .await
@@ -716,14 +780,15 @@ impl QueryAuditStore {
         let name_at_version = format!("{job_name}@{version}");
         let session_id = session_id.map(str::to_string);
         let row_id = id.clone();
+        let writer = self.writer.clone();
 
         match bounded(
             conn.call(move |conn| -> SqlResult<()> {
                 conn.execute(
                     "INSERT INTO query_audit
                         (id, created_at, sql, ai_context, session_id, max_rows,
-                         statement_kind, status)
-                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                         statement_kind, status, writer)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         row_id,
                         created_at,
@@ -732,6 +797,7 @@ impl QueryAuditStore {
                         PIPELINE_MAX_ROWS_SENTINEL,
                         JOB_STATEMENT_KIND,
                         QueryAuditStatus::Started.as_str(),
+                        writer,
                     ],
                 )?;
                 Ok(())
@@ -938,26 +1004,39 @@ impl QueryAuditStore {
         });
     }
 
-    /// Rewrite rows still marked `started` to `unknown`. Called at startup so a
-    /// crash-killed query does not masquerade as still running.
+    /// Rewrite THIS WRITER's rows still marked `started` to `unknown`.
+    /// Called at startup so a crash-killed query does not masquerade as
+    /// still running.
+    ///
+    /// Scoped to `writer = self OR writer IS NULL` — several servers sharing
+    /// one ledger (natural on the Postgres backend, pathological-but-possible
+    /// on a shared file) must not rewrite a PEER's live in-flight rows: the
+    /// monotonic outcome guard would then swallow the peer's real result and
+    /// the ledger would record a successful query as `unknown` forever.
+    /// NULL-writer rows (from before the column existed) have no owner left
+    /// to claim them, so anyone may reconcile them.
     pub async fn reconcile_orphaned(&self, reason: &str) -> Result<usize> {
         let conn = match &self.backend {
-            Backend::Postgres(pg) => return pg.reconcile_orphaned(reason).await,
+            Backend::Postgres(pg) => {
+                return pg.reconcile_orphaned(reason, &self.writer).await;
+            }
             Backend::Sqlite { conn, .. } => conn,
         };
         let reason = reason.to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
+        let writer = self.writer.clone();
         let updated = conn
             .call(move |conn| -> SqlResult<usize> {
                 let n = conn.execute(
                     "UPDATE query_audit
                         SET status = ?1, finished_at = ?2, error = ?3
-                      WHERE status = ?4",
+                      WHERE status = ?4 AND (writer = ?5 OR writer IS NULL)",
                     params![
                         QueryAuditStatus::Unknown.as_str(),
                         finished_at,
                         reason,
                         QueryAuditStatus::Started.as_str(),
+                        writer,
                     ],
                 )?;
                 Ok(n)
@@ -1101,7 +1180,7 @@ impl QueryAuditStore {
                     "SELECT id, created_at, finished_at, sql, ai_context, session_id,
                             max_rows, statement_kind, status, row_count, error,
                             request_id, org_id, workspace_id, user_id, run_id,
-                            job_run_id
+                            job_run_id, writer
                        FROM query_audit WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -1125,6 +1204,7 @@ impl QueryAuditStore {
                             "user_id": row.get::<_, Option<String>>(14)?,
                             "run_id": row.get::<_, Option<String>>(15)?,
                             "job_run_id": row.get::<_, Option<String>>(16)?,
+                            "writer": row.get::<_, Option<String>>(17)?,
                         }))
                     })
                     .ok();
@@ -1303,6 +1383,67 @@ pub(crate) fn new_id() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Reconcile is scoped to the caller's writer identity: server B's boot
+    /// must not rewrite server A's LIVE in-flight rows to `unknown` — the
+    /// monotonic outcome guard would make that permanent, recording a
+    /// successful query as `unknown` forever. Legacy rows with no writer
+    /// stamp have no owner left, so anyone may reconcile them.
+    #[tokio::test]
+    async fn reconcile_touches_only_this_writers_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        let a = QueryAuditStore::open(&path)
+            .await
+            .unwrap()
+            .with_writer_identity("server-a");
+        let b = QueryAuditStore::open(&path)
+            .await
+            .unwrap()
+            .with_writer_identity("server-b");
+
+        let live_on_a = a
+            .record_started("SELECT pg_sleep(600)", None, 10, "query")
+            .await
+            .unwrap();
+        // A legacy row from before the writer column: started, writer NULL.
+        a.sqlite_conn()
+            .call(|conn| -> SqlResult<()> {
+                conn.execute(
+                    "INSERT INTO query_audit
+                        (id, created_at, sql, max_rows, statement_kind, status)
+                     VALUES ('legacy-1', '2020-01-01T00:00:00Z', 'SELECT 1', 10,
+                             'query', 'started')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // B reboots: it may claim the ownerless legacy row, never A's.
+        let n = b.reconcile_orphaned("b restarted").await.unwrap();
+        assert_eq!(n, 1, "only the legacy NULL-writer row");
+        let row = a.get(&live_on_a).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("started"), "A's live row untouched");
+        assert_eq!(row["writer"], json!("server-a"));
+
+        // A's own outcome still lands — the whole point of the scoping.
+        a.record_outcome(&live_on_a, QueryAuditStatus::Succeeded, Some(1), None)
+            .await
+            .unwrap();
+        let row = a.get(&live_on_a).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("succeeded"));
+
+        // A's next boot reconciles A's own orphans.
+        let orphan = a
+            .record_started("SELECT 2", None, 10, "query")
+            .await
+            .unwrap();
+        assert_eq!(a.reconcile_orphaned("a restarted").await.unwrap(), 1);
+        let row = a.get(&orphan).await.unwrap().unwrap();
+        assert_eq!(row["status"], json!("unknown"));
+    }
 
     /// The identity columns exist for downstream distributions whose caller
     /// is authenticated (the cloud engine's envelope): five nullable columns,

@@ -139,6 +139,53 @@ async fn outcome_stamps_are_monotonic() {
     assert!(record["error"].is_null());
 }
 
+/// Reconcile is writer-scoped (review P1): several servers sharing one DSN
+/// is the NATURAL Postgres topology, and server B's boot must not rewrite
+/// server A's live in-flight rows to `unknown` — the monotonic outcome
+/// guard would make that permanent. Ownerless NULL-writer rows stay
+/// reconcilable by anyone.
+#[tokio::test]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn reconcile_is_scoped_to_the_writer() {
+    let Some(url) = live_url() else { return };
+    let (dsn, pool) = fresh_db(&url).await;
+    let a = QueryAuditStore::open_postgres(&dsn)
+        .await
+        .expect("open a")
+        .with_writer_identity("server-a");
+    let b = QueryAuditStore::open_postgres(&dsn)
+        .await
+        .expect("open b")
+        .with_writer_identity("server-b");
+
+    let live_on_a = a
+        .record_started("SELECT pg_sleep(600)", None, 10, "query")
+        .await
+        .expect("a records");
+    // A legacy pre-writer-column row: started, writer NULL.
+    sqlx::query(
+        "INSERT INTO query_audit (id, created_at, sql, max_rows, statement_kind, status) \
+         VALUES ('legacy-1', '2020-01-01T00:00:00Z', 'SELECT 1', 10, 'query', 'started')",
+    )
+    .execute(&pool)
+    .await
+    .expect("stage legacy row");
+
+    // B reboots mid-A's-query: it claims only the ownerless legacy row.
+    assert_eq!(b.reconcile_orphaned("b restarted").await.expect("b"), 1);
+    let row = a.get(&live_on_a).await.expect("get").expect("row");
+    assert_eq!(row["status"], json!("started"), "A's live row untouched");
+
+    // A's real outcome still lands — the failure mode this scoping kills is
+    // exactly this stamp matching zero rows.
+    a.record_outcome(&live_on_a, QueryAuditStatus::Succeeded, Some(1), None)
+        .await
+        .expect("a stamps");
+    let row = a.get(&live_on_a).await.expect("get").expect("row");
+    assert_eq!(row["status"], json!("succeeded"));
+    assert_eq!(row["writer"], json!("server-a"));
+}
+
 /// Startup reconcile: rows left `started` by a crash rewrite to `unknown`
 /// with the reason, terminal rows untouched — and the count is reported.
 #[tokio::test]
