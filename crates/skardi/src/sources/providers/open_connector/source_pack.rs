@@ -58,6 +58,28 @@ impl FixedValue {
     }
 }
 
+/// How an action's response carries its rows.
+///
+/// Every table mapped before 2026-09 locates a row *array* (`$.items`), and
+/// that stays the default: a pack that says nothing about shape behaves
+/// exactly as it did. [`RowShape::Object`] covers point-read actions whose
+/// entire response IS one row — `feishu.get_document_content`, Notion's
+/// rendered Markdown — which have no array anywhere to point a row path at.
+///
+/// This is a response-shape declaration, not a query feature: the object is
+/// handed to the same converter as an array of one, so there is a single
+/// conversion path and object rows get the same schema, projection, and
+/// error handling as every other row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowShape {
+    /// The row path resolves to an array of row objects.
+    #[default]
+    Array,
+    /// The row path resolves to a single object that IS the row. Valid only
+    /// with single-page pagination.
+    Object,
+}
+
 /// One stable table definition inside a source pack.
 #[derive(Debug, Clone, Copy)]
 pub struct SourcePackTable {
@@ -65,8 +87,13 @@ pub struct SourcePackTable {
     pub id: &'static str,
     /// Open Connector action backing the table (read-only by construction).
     pub action_id: &'static str,
-    /// Fixed row path of the row array in the action response.
+    /// Fixed row path of the rows in the action response. For
+    /// [`RowShape::Array`] this locates the row array; for
+    /// [`RowShape::Object`] it is the root `$`.
     pub row_path: &'static str,
+    /// Whether `row_path` resolves to an array of rows or to a single row
+    /// object. Defaults to [`RowShape::Array`]; see [`RowShape`].
+    pub row_shape: RowShape,
     /// Fixed Arrow schema and field mappings.
     pub fields: &'static [FieldMapping],
     /// Pagination strategy.
@@ -862,6 +889,7 @@ mod tests {
             id,
             action_id: "t.action",
             row_path: "$.items",
+            row_shape: RowShape::Array,
             fields: &[],
             pagination: PaginationStrategy::SinglePage {
                 next_cursor_path: None,

@@ -55,6 +55,7 @@ use super::json_to_arrow::RowConverter;
 use super::pagination::PaginationStrategy;
 use super::raw_schema::derive_raw_columns;
 use super::row_path::RowPath;
+use super::source_pack::RowShape;
 use super::source_pack::SourcePackRegistry;
 use super::table::OpenConnectorTableProvider;
 use crate::sources::providers::udtf_args::strict_string_arg;
@@ -329,6 +330,15 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             "action inputs",
         )?;
 
+        // Raw actions stay array-only; see
+        // `OpenConnectorError::ObjectRowsUnsupportedForRawAction` for why the
+        // object shape is a pack-declared contract rather than something a
+        // caller can request ad hoc.
+        if row_path == "$" {
+            return Err(plan_error(
+                OpenConnectorError::ObjectRowsUnsupportedForRawAction,
+            ));
+        }
         let row_path = RowPath::parse(&row_path).map_err(plan_error)?;
         // Deterministic row type or planning error — derived purely from the
         // in-memory discovered output schema.
@@ -425,6 +435,7 @@ impl TableProvider for RawScanProvider {
             self.target.clone(),
             Arc::clone(&self.converter),
             self.row_path.clone(),
+            RowShape::Array,
             self.input.clone(),
             Vec::new(),
             projection.cloned(),
