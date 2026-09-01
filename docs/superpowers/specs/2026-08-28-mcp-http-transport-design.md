@@ -26,7 +26,12 @@ The MCP layer added to skardi-server is a **protocol adapter, not a second
 execution path**. The handler holds a clone of the server's own REST
 `Router`; every tool call is translated into a synthetic HTTP request and
 dispatched in-process via `tower::ServiceExt::oneshot` — the same mechanism
-the server's HTTP tests already use. No network hop, no socket, but the
+the server's HTTP tests already use. (`ServiceExt` sits behind tower's
+`util` feature, which the server's default-features `tower = "0.4"`
+dependency gets only transitively from axum/tower-http today, and only
+tests use it; promoting `oneshot` to production code comes with an
+explicit `features = ["util"]` on the server's `tower` entry rather than
+leaning on feature unification.) No network hop, no socket, but the
 request runs the routing table and the unmodified REST handlers (see
 "Transport vs. execution middleware" below for exactly which layers a
 synthetic request does and does not traverse).
@@ -100,6 +105,16 @@ and the final router is the REST router with the MCP service nested at
 is possible. rmcp's streamable-HTTP server service is a tower `Service`, so
 `nest_service` mounts it regardless of rmcp's internal axum version.
 
+The inverse collision exists and is accepted: the nest shadows REST's
+`/:name/execute` for a pipeline literally named `mcp` — the router
+prefers the static `mcp` segment, so inbound `POST /mcp/execute` reaches
+the nested MCP service, never that pipeline. The pipeline stays fully
+callable *through* `/mcp` (the captured router is the pre-nest one — the
+same property that makes recursion impossible) and via the stdio bridge;
+only its direct REST endpoint is lost. The mount point stays `/mcp`
+because that is the endpoint path MCP hosts preconfigure — one shadowed
+name is a smaller cost than a nonstandard endpoint.
+
 ---
 
 ## Shared code: `crates/mcp-core` (package `skardi-mcp-core`)
@@ -119,8 +134,26 @@ Moves from `crates/cli/src/mcp/` into the new crate:
   contract and both dispatchers need it. The CLI re-imports it from the
   crate.
 
-Dependencies of the new crate: `rmcp = "=3.1.4"` (model types only),
-`serde_json`. Both `skardi-cli` and `skardi-server` depend on it.
+Dependencies of the new crate: `rmcp = { version = "=3.1.4",
+default-features = false }` — model types only, no features, preserving
+the intent behind the CLI's deliberate `default-features = false` pin;
+`serde_json`; and `percent-encoding` (`encode_component` is built on
+`utf8_percent_encode` / `AsciiSet`). Both `skardi-cli` and
+`skardi-server` depend on it.
+
+`skardi-server`'s own Cargo changes: `skardi-mcp-core`; `rmcp`
+(`default-features = false`, features `["server",
+"transport-streamable-http-server"]`); `uuid` for the per-request audit
+ids (already in `[workspace.dependencies]`); and the explicit tower
+`util` feature named above. One consequence stated rather than silently
+caused: with `resolver = "2"`, features unify across workspace members
+built together, so a workspace build now compiles rmcp's HTTP stack into
+the CLI binary's graph too. The comment on the CLI's rmcp entry —
+"keeps rmcp's HTTP stack (and any axum version skew) out of the
+dependency graph" (`crates/cli/Cargo.toml`) — stops being true at
+workspace-build granularity and is updated in the same PR; its axum-skew
+worry is separately answered by R2 below (rmcp has no runtime axum
+dependency).
 
 **Deliberately NOT shared:** the dispatch `match` (three arms: `query`,
 `list_data_sources`, pipeline fallthrough) stays duplicated between the
@@ -180,10 +213,27 @@ version, missing credentials would otherwise surface only as tool errors
 inside HTTP 200 responses instead of the transport-level 401 that host
 credential flows key on. A thin tower layer wrapping only the nested
 MCP service closes this: every inbound `/mcp` request passes
-`verify_session(&state, &headers)` — the same single-home check the REST
-handlers call — before reaching rmcp; failures return a transport-level
-401, which is also the signal host credential flows key on. On a no-auth
-deployment `verify_session` always allows and the gate is a no-op.
+`verify_session` — the same single-home check the REST handlers call,
+with one carrier narrowed below — before reaching rmcp; failures return
+a transport-level 401. On a no-auth deployment `verify_session` always
+allows and the gate is a no-op.
+
+The gate accepts Bearer only. On the REST surface `verify_session` takes
+the token from `Authorization` *or* falls back to the better-auth
+session cookie (`crates/server/src/auth/routes.rs`). Honoring that
+fallback here would be a trap: a cookie-only caller would pass the gate,
+but synthetic requests forward only `Authorization`, so every tool call
+would then fail handler-level `require_session` — a 401 surfacing as
+`isError` inside an HTTP 200, the exact failure shape this gate exists
+to avoid, reachable by a caller the gate deliberately admitted. So the
+gate calls `verify_session` on a headers view with `cookie` stripped:
+token validation stays single-home, the accepted carrier narrows to the
+one MCP hosts actually send, and a cookie-only caller gets the
+transport-level 401. The alternative — forwarding `cookie` alongside
+`Authorization` on synthetic requests — was rejected: it would hand a
+browser's ambient session silent access to a JSON-RPC surface no browser
+page has any business driving, and it also keeps the open
+`allowed_origins` posture below honest.
 
 One deliberate parity divergence, worth naming: with auth enabled, the
 MCP inventory (`tools/list`) requires a token even though REST's
@@ -192,6 +242,22 @@ server-side and is gated as a whole; deployments already weigh
 `/pipelines` exposure per the v1 auth notes. Handler-level
 `require_session` (reached via synthetic dispatch) stays as the second
 layer of defense.
+
+A limitation, stated rather than left to the reader: the gate
+authenticates *a* session, not *the* session that owns the MCP session.
+`verify_session` answers "is some active token present", never "which
+principal" — and auth is multi-user (better-auth sign-up,
+`sessions.user_id`). Under `legacy_session_mode`, any valid-token holder
+can therefore attach to an `Mcp-Session-Id` minted for another user: the
+gate passes and rmcp accepts. The blast radius today is small: REST
+grants every authenticated session identical privilege (no handler does
+per-user authorization), so attaching buys no data access the attacher
+did not already have — it is cross-user visibility of that MCP session's
+in-flight server→client traffic, plus corrupted audit grouping (the
+attacher's pipeline runs get the victim's session id). Binding —
+recording the principal at `initialize` and requiring a match on every
+subsequent session request — is the follow-up if per-user authorization
+ever lands.
 
 ### Public host allowlist — the DNS-rebinding guard, configured
 
@@ -218,14 +284,35 @@ default in the wild, stripping the loopback protection the default
 exists for.
 
 `allowed_origins` stays at rmcp's default (no restriction): MCP hosts
-are not browsers, the session gate is the actual barrier, and an open
-Origin posture is consistent with the existing CORS
-`mirror_request` configuration.
+are not browsers, and the session gate is the actual barrier — it
+accepts Bearer only, so a browser's ambient cookie cannot authenticate
+`/mcp` and there is no CSRF-shaped surface for Origin to guard. An open
+Origin posture is consistent with the existing CORS `mirror_request`
+configuration.
+
+### Response mode — SSE with keep-alive
+
+A tool call blocks its `/mcp` POST for the whole synthetic dispatch, and
+v1 sends no progress notifications — a multi-minute pipeline run is a
+connection with no application payload until the result arrives. Reverse
+proxies recycle connections that look idle (nginx's
+`proxy_read_timeout` defaults to 60 s), and the remote deployments this
+transport targets sit behind one almost by definition: skardi-server
+speaks plain HTTP, so TLS for remote hosts means a proxy in front. rmcp
+offers two response modes; the service is configured for SSE responses
+with `sse_keep_alive` pings (interval chosen at plan time) rather than
+`json_response`, so bytes keep flowing and proxy idle timers keep
+resetting during long calls. The stdio bridge's "no request timeout —
+the host's tool-call timeout is the backstop" reasoning stays valid here
+only because of this: the keep-alive is what prevents a proxy from
+firing before the host does. docs/mcp.md still advises checking proxy
+read timeouts, since a keep-alive only helps proxies that count any
+bytes as liveness.
 
 ### Tool call translation
 
-Identical tool surface to the stdio bridge — same projection, same three
-built-ins, same pipeline tools:
+Identical tool surface to the stdio bridge — same projection, same two
+built-ins (`query`, `list_data_sources`), same pipeline tools:
 
 | Tool call | Synthetic request |
 |---|---|
@@ -248,7 +335,16 @@ name:
 - A request carrying `Mcp-Session-Id` (legacy-protocol clients under
   `legacy_session_mode`) uses that value: the session's pipeline runs and
   ad-hoc queries group together in the query audit ledger, matching the
-  stdio bridge's per-connection grouping.
+  stdio bridge's per-connection grouping. The forwarding target has a
+  strict validator — `session_id_from_headers` accepts only non-empty
+  visible ASCII, no commas, at most `MAX_SESSION_ID_CHARS` (200)
+  characters, and 400s the whole execute on a malformed value
+  (`crates/server/src/session_header.rs`). rmcp mints UUIDs, which
+  always pass, but the handler must not lean on that invisible
+  coupling: it validates the value against the same predicate before
+  forwarding (the third mirror, after the server's and the CLI's in
+  `crates/cli/src/session.rs`) and falls back to a minted UUID on
+  mismatch — losing that call's session grouping, not the call.
 - A stateless request (protocol `2026-07-28` and later) gets a UUID v4
   minted per request: attribution stays intact, grouping granularity is
   honestly per-request — the protocol removed the conversation-level
@@ -275,7 +371,11 @@ The server handler collects synthetic-response bodies with the same
 constant — deliberately not configurable, so one pipeline behaves
 identically through both bindings. The constant lives in the server MCP
 module with a comment naming the parity; it is not shared because the
-CLI's ceiling is client-wide, not MCP-specific.
+CLI's ceiling is client-wide, not MCP-specific. The collector is
+`axum::body::to_bytes(body, MAX_RESPONSE_BYTES)` — already this crate's
+bounded-collect idiom (`crates/server/src/auth/routes.rs` uses it) — not
+a hand-rolled ceiling over `http_body_util::BodyExt::collect`, which is
+a dev-dependency only today.
 
 Stated honestly: in-process, this cap bounds only the MCP layer's own
 copy of the result and the size of the tool result handed to rmcp and
@@ -320,9 +420,28 @@ contexts stays as is.
   the header actually reaches the handlers: a dropped `Authorization`
   would make the handler-level `require_session` reject the synthetic
   request even though the session gate had already passed the caller.
+- **Negative auth test at the `do_*` level**: the session gate makes the
+  no-credential path unreachable end-to-end (an anonymous caller never
+  gets past the transport), so the second layer of defense needs its own
+  regression test: drive the handler's `do_*` tool-call entry directly
+  with a token-required router and no `Authorization`, asserting the
+  handler-level `require_session` 401 surfaces as `isError: true`. If
+  auth ever migrated into `configure_middleware`, this call would start
+  succeeding — the test is the tripwire for the middleware-boundary
+  constraint the design depends on.
+- **Middleware-once test**: an `/mcp` tool-call response carries exactly
+  one `access-control-allow-origin` header (transport middleware wraps
+  the nested service once), and a synthetic dispatch through the
+  captured router carries none (the capture is pre-middleware — the
+  direct pin, since the handler consumes synthetic responses body-only
+  and a double-wrapped capture would never show in `/mcp` response
+  headers). Together they turn the "transport vs. execution middleware"
+  boundary into tested properties.
 - **Session gate tests**: with auth enabled, an anonymous `initialize` is
   rejected with a transport-level 401 and yields no usable session (a
-  follow-up request claiming a session id fails the same way); the same
+  follow-up request claiming a session id fails the same way); a
+  cookie-only `initialize` (valid session cookie, no `Authorization`) is
+  rejected the same way — pinning the Bearer-only carrier; the same
   `initialize` with the Bearer token succeeds. With auth disabled,
   anonymous `initialize` works — pinning the gate's no-op behavior.
 - **Host allowlist tests**: a request with a non-loopback `Host` header
@@ -349,15 +468,37 @@ needs `#[ignore]`.
 
 ## Documentation
 
-- `docs/mcp.md` — new "Remote (streamable HTTP)" section: the `/mcp`
-  endpoint, host configuration for URL-based MCP servers, Bearer-token
-  guidance, and an explicit statement of the local-vs-remote split (stdio
-  for local hosts, `/mcp` for hosts that cannot spawn a binary). The
-  architecture diagram gains the second path. Includes a reverse-proxy
-  subsection: either forward the public `Host` and declare it via
-  `--mcp-allowed-host`, or have the proxy rewrite `Host` to the upstream
-  loopback authority — and how the 403 from a mismatch presents.
-- `docs/pipelines.md` — roadmap note moves to shipped.
+- `docs/mcp.md` — the page grows from a bridge manual into the manual
+  for both bindings, which means edits to existing prose, not just a new
+  section:
+  - New "Remote (streamable HTTP)" section: the `/mcp` endpoint, host
+    configuration for URL-based MCP servers, Bearer-token guidance, and
+    an explicit statement of the local-vs-remote split (stdio for local
+    hosts, `/mcp` for hosts that cannot spawn a binary). The
+    architecture diagram gains the second path. Includes a
+    reverse-proxy subsection: either forward the public `Host` and
+    declare it via `--mcp-allowed-host`, or have the proxy rewrite
+    `Host` to the upstream loopback authority — and how the 403 from a
+    mismatch presents. The same subsection covers proxy read/idle
+    timeouts: a long tool call keeps its POST open for the whole run,
+    and proxies cut idle connections at ~60 s defaults (nginx
+    `proxy_read_timeout`) — the SSE keep-alive below keeps bytes
+    flowing, but deployments running long pipelines should still check
+    their proxy's timeout.
+  - Title drops the `— \`skardi mcp\`` suffix — the page no longer
+    covers only the stdio bridge.
+  - "Auth notes" currently states that `GET /pipelines` and
+    `GET /data_source` are readable without a token. That stays true
+    for the bridge's REST calls but is false for `/mcp` once the
+    session gate lands — the section gains the per-binding split.
+  - "Timeouts & lifecycle" is written in stdio terms ("when the host
+    closes stdin, the bridge exits `0`") — it gains the HTTP lifecycle:
+    per-request, no process to exit, disconnect semantics per the
+    response-mode section above.
+- `docs/pipelines.md` — the MCP bullet in the surface list reads "via
+  `skardi mcp`" today; it broadens to name both bindings (stdio bridge
+  and the server's `/mcp` endpoint). There is no `/mcp` roadmap marker
+  to flip — the only roadmap note there is Claude skills.
 
 ---
 
@@ -441,3 +582,17 @@ needs `#[ignore]`.
   configurable ceiling is deferred to the execution-resource-governance
   design, and the cap's honest (second-copy) role is stated in its
   section. Added for a review finding on the initial spec.
+- **`/mcp` gate accepts Bearer only — no cookie fallback** (2026-09-01)
+  — `verify_session`'s cookie fallback would admit callers whose every
+  tool call then fails handler-level auth, since synthetic requests
+  forward only `Authorization`; the gate strips `cookie` before calling
+  `verify_session`, keeping token validation single-home while 401ing
+  ambient-credential callers at the transport. Also what keeps the open
+  `allowed_origins` posture honest. Added for a review finding on the
+  spec.
+- **SSE responses with keep-alive over `json_response`** (2026-08-31) —
+  long tool calls otherwise carry no bytes until completion, and reverse
+  proxies cut idle connections (~60 s defaults) well before host
+  tool-call timeouts fire; keep-alive pings keep the connection visibly
+  alive. The ping interval is a plan-time detail. Added for a review
+  finding on the initial spec.
