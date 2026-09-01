@@ -4,6 +4,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -293,6 +294,11 @@ pub struct StandardPipeline {
     pub request_schema: Arc<RequestSchema>,
     /// Query definition containing the SQL query and parameter list
     pub query_definition: QueryDefinition,
+    /// Author-written one-line parameter descriptions from `spec.parameters`
+    /// in the YAML, keyed by parameter name. Optional per parameter; every
+    /// key is validated at load time against the inferred request schema.
+    #[serde(skip)]
+    pub parameter_docs: HashMap<String, String>,
     /// Response schema defining the output fields and their types (inferred at runtime)
     #[serde(skip)]
     pub response_schema: Arc<ResponseSchema>,
@@ -352,6 +358,7 @@ impl StandardPipeline {
             request_schema: Arc::new(request_schema),
             query_definition,
             response_schema: Arc::new(response_schema),
+            parameter_docs: HashMap::new(),
             inferencer: Arc::new(SqlSchemaInferrer::new(ctx)?),
         })
     }
@@ -452,8 +459,9 @@ impl StandardPipeline {
 
     /// Build a `StandardPipeline` from an already-parsed YAML root.
     ///
-    /// Pulls `metadata` + `spec.query` out of the value and infers request
-    /// and response schemas against `ctx`. Does not inspect the `kind:`
+    /// Pulls `metadata` + `spec.query` (and the optional `spec.parameters`
+    /// description map) out of the value and infers request and response
+    /// schemas against `ctx`. Does not inspect the `kind:`
     /// discriminator — callers are expected to have already validated it.
     /// Used by both the pipeline loader (`kind: pipeline`) and the job
     /// loader (`kind: job`), which share the same metadata + query body.
@@ -481,21 +489,79 @@ impl StandardPipeline {
             parameters: Vec::new(),
         };
 
+        // Optional author-written parameter descriptions (name → one line).
+        // Normalized right here so downstream consumers publish the text
+        // as-is: YAML block scalars keep a trailing newline (trimmed away),
+        // and a blank description is an author slip, not a request to
+        // publish nothing.
+        let raw_docs: HashMap<String, String> = match spec_section.get("parameters") {
+            Some(section) => serde_yaml::from_value(section.clone())
+                .map_err(|e| anyhow!("Failed to parse spec.parameters section: {}", e))?,
+            None => HashMap::new(),
+        };
+        let mut parameter_docs = HashMap::with_capacity(raw_docs.len());
+        let mut blank: Vec<String> = Vec::new();
+        for (name, doc) in raw_docs {
+            let doc = doc.trim();
+            if doc.is_empty() {
+                blank.push(name);
+            } else {
+                parameter_docs.insert(name, doc.to_string());
+            }
+        }
+        // All offenders at once, sorted: HashMap iteration order is
+        // arbitrary, and naming one random slip per restart would make the
+        // author fix them one server boot at a time.
+        if !blank.is_empty() {
+            blank.sort();
+            return Err(anyhow!(
+                "spec.parameters gives blank descriptions for {:?} — write one line or drop the key",
+                blank,
+            ));
+        }
+
         let inferencer = SqlSchemaInferrer::new(ctx.clone())?;
         let request_schema = inferencer
             .extract_request_schema(&query_definition.sql)
             .await?;
+
+        // A described parameter the SQL does not declare is a typo or a doc
+        // string gone stale after a query edit. The description would never
+        // be read (the publisher looks descriptions up by declared name), so
+        // the failure mode is a sentence silently missing from the published
+        // schema — refuse to load instead. The blast radius is deliberate:
+        // the server propagates any pipeline load failure, so this typo
+        // aborts startup; a loud deploy-time error over a quiet runtime
+        // omission. Same all-at-once, sorted reporting as the blank check
+        // above.
+        let mut unknown: Vec<&String> = parameter_docs
+            .keys()
+            .filter(|k| !request_schema.fields.contains_key(*k))
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort();
+            let mut declared: Vec<&String> = request_schema.fields.keys().collect();
+            declared.sort();
+            return Err(anyhow!(
+                "spec.parameters describes {:?}, but the SQL declares no such placeholder (declared parameters: {:?})",
+                unknown,
+                declared,
+            ));
+        }
+
         let response_schema = inferencer
             .extract_response_schema(&query_definition.sql)
             .await?;
 
-        StandardPipeline::new(
+        let mut pipeline = StandardPipeline::new(
             metadata,
             request_schema,
             query_definition,
             response_schema,
             ctx,
-        )
+        )?;
+        pipeline.parameter_docs = parameter_docs;
+        Ok(pipeline)
     }
 }
 
@@ -1117,5 +1183,105 @@ spec:
             re_inferred_response.fields.len(),
             response_schema.fields.len()
         );
+    }
+
+    /// A minimal registered table so `{brand}` / `{max_price}` inference works.
+    fn ctx_with_products() -> Arc<SessionContext> {
+        use datafusion::arrow::array::{Float64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let ctx = Arc::new(SessionContext::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("brand", DataType::Utf8, true),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("Apple")])),
+                Arc::new(Float64Array::from(vec![1.0])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("products", batch).unwrap();
+        ctx
+    }
+
+    async fn load_yaml(yaml: &str, ctx: Arc<SessionContext>) -> Result<StandardPipeline> {
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(yaml.as_bytes()).unwrap();
+        StandardPipeline::load_from_file(temp.path(), ctx).await
+    }
+
+    #[tokio::test]
+    async fn spec_parameters_load_into_parameter_docs() {
+        let yaml = r#"
+kind: pipeline
+metadata:
+  name: "documented"
+  version: "1.0.0"
+spec:
+  parameters:
+    brand: >
+      Exact brand name; null matches every brand
+  query: |
+    SELECT brand, price FROM products
+    WHERE ({brand} IS NULL OR brand = {brand}) AND price < {max_price}
+"#;
+        let pipeline = load_yaml(yaml, ctx_with_products()).await.unwrap();
+        // The `>` block scalar carries a trailing newline; the loader
+        // normalizes it away, so the stored text is exactly the sentence.
+        assert_eq!(
+            pipeline.parameter_docs.get("brand").map(String::as_str),
+            Some("Exact brand name; null matches every brand")
+        );
+        // Descriptions are optional per parameter: no entry, no error.
+        assert!(!pipeline.parameter_docs.contains_key("max_price"));
+    }
+
+    #[tokio::test]
+    async fn spec_parameters_reject_blank_descriptions() {
+        let yaml = r#"
+kind: pipeline
+metadata:
+  name: "blank"
+  version: "1.0.0"
+spec:
+  parameters:
+    brand: "   "
+  query: |
+    SELECT brand, price FROM products WHERE brand = {brand}
+"#;
+        let err = load_yaml(yaml, ctx_with_products())
+            .await
+            .expect_err("a blank description is an author slip and must fail the load");
+        assert!(err.to_string().contains("blank description"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn spec_parameters_reject_names_the_sql_does_not_declare() {
+        let yaml = r#"
+kind: pipeline
+metadata:
+  name: "typoed"
+  version: "1.0.0"
+spec:
+  parameters:
+    brnad: "typo for brand"
+    prise: "typo for price"
+  query: |
+    SELECT brand, price FROM products WHERE brand = {brand}
+"#;
+        let err = load_yaml(yaml, ctx_with_products())
+            .await
+            .expect_err("a described parameter missing from the SQL must fail the load");
+        // Both offenders in one error (sorted), not one arbitrary pick per
+        // restart — HashMap iteration order must not leak into the message.
+        let msg = err.to_string();
+        assert!(msg.contains(r#""brnad""#), "{msg}");
+        assert!(msg.contains(r#""prise""#), "{msg}");
+        assert!(msg.contains("declared parameters"), "{msg}");
     }
 }

@@ -107,6 +107,19 @@ enum Commands {
         /// render results as a table instead of JSON
         #[arg(long)]
         table: bool,
+
+        /// Why this query is being run, recorded with it in the server's
+        /// audit ledger (sent as ai_context.purpose). Requires
+        /// --session-id: the server rejects an ai_context carrying only one
+        /// of the pair.
+        #[arg(long, value_name = "TEXT", requires = "session_id")]
+        purpose: Option<String>,
+
+        /// Session id grouping this query with the rest of its session in
+        /// the server's audit ledger (sent as ai_context.session_id).
+        /// Requires --purpose, for the same reason.
+        #[arg(long, value_name = "ID", requires = "purpose")]
+        session_id: Option<String>,
     },
 
     /// Execute a named server pipeline and print the result.
@@ -256,7 +269,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             file,
             max_rows,
             table,
-        } => commands::query::run(&client, sql, file, max_rows, table).await,
+            purpose,
+            session_id,
+        } => commands::query::run(&client, sql, file, max_rows, table, purpose, session_id).await,
 
         Commands::Run {
             name,

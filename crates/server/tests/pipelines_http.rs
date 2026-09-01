@@ -79,6 +79,8 @@ metadata:
   version: "1.0.0"
   description: "Filter products by brand + max price"
 spec:
+  parameters:
+    brand: "Exact brand name; null matches every brand"
   query: |
     SELECT id, brand, price, category
     FROM products
@@ -301,14 +303,19 @@ async fn http_list_pipelines_returns_registered() {
         Some("Filter products by brand + max price")
     );
     // Parameters are sorted by name: brand, max_price. `{max_price}` infers
-    // Float64 via the `max_` prefix strip → column `price`.
+    // Float64 via the `max_` prefix strip → column `price`. `brand` carries
+    // the author's spec.parameters one-liner inside its json_schema;
+    // undocumented `max_price` gets no description key.
     let params = entry["parameters"].as_array().expect("parameters array");
     assert_eq!(params.len(), 2, "params: {params:?}");
     assert_eq!(params[0]["name"].as_str(), Some("brand"));
     assert_eq!(params[0]["data_type"].as_str(), Some("Utf8"));
     assert_eq!(
         params[0]["json_schema"],
-        json!({"type": ["string", "null"]})
+        json!({
+            "type": ["string", "null"],
+            "description": "Exact brand name; null matches every brand"
+        })
     );
     assert_eq!(params[1]["name"].as_str(), Some("max_price"));
     assert_eq!(params[1]["data_type"].as_str(), Some("Float64"));
@@ -475,9 +482,14 @@ async fn http_get_pipeline_info_returns_metadata_and_params() {
         "params: {params:?}"
     );
     assert_eq!(params[0]["data_type"].as_str(), Some("Utf8"));
+    // Both inventory endpoints get the description from the one shared
+    // enrichment (enriched_parameters).
     assert_eq!(
         params[0]["json_schema"],
-        json!({"type": ["string", "null"]})
+        json!({
+            "type": ["string", "null"],
+            "description": "Exact brand name; null matches every brand"
+        })
     );
     assert_eq!(params[1]["data_type"].as_str(), Some("Float64"));
     assert_eq!(

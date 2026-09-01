@@ -9741,11 +9741,14 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-rusqlite",
  "tracing",
+ "url",
 ]
 
 [[package]]

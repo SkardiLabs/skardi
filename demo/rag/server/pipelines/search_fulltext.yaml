@@ -10,11 +10,10 @@ metadata:
     used to generate the pgvector embedding, so FTS and vector search
     stay on a single source of truth.
 
-# Parameters:
-#   {query} - Search terms (web-search syntax: AND, "phrase", or, -not)
-#   {limit} - Maximum number of results
-
 spec:
+  parameters:
+    query: 'Search terms (web-search syntax: AND, "phrase", or, -not)'
+    limit: "Maximum number of results"
   query: |
     SELECT id, content, _score
     FROM pg_fts('documents', 'content', {query}, {limit})
