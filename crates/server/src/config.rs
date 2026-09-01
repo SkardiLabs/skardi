@@ -114,6 +114,19 @@ pub struct CliArgs {
         help = "Prune /query audit records older than N days (default: keep forever)"
     )]
     pub query_audit_retention_days: Option<u32>,
+
+    /// Extra `Host` header values `/mcp` accepts, appended to the
+    /// always-allowed loopback trio (localhost / 127.0.0.1 / ::1). rmcp's
+    /// loopback-only default is a DNS-rebinding defense; a remote deployment
+    /// declares its public hostnames here — deliberately no allow-any escape
+    /// hatch. An entry with a port matches that port exactly; without one it
+    /// matches any port. Repeatable.
+    #[arg(
+        long = "mcp-allowed-host",
+        help = "Allow this Host header value on /mcp, in addition to loopback \
+                (repeatable; host or host:port)"
+    )]
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Main server configuration containing pipelines and data sources
@@ -2339,6 +2352,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2366,6 +2380,7 @@ spec:
             port: 3000,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2422,6 +2437,7 @@ spec:
             port: 3000,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2452,6 +2468,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let result = load_server_config(args).await;
@@ -2478,6 +2495,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2735,6 +2753,30 @@ spec:
         assert!(args.pipeline_path.is_none());
         assert_eq!(args.ctx_file, None);
         assert_eq!(args.port, 8080); // default value
+    }
+
+    #[test]
+    fn mcp_allowed_host_is_repeatable_and_defaults_empty() {
+        use clap::Parser;
+
+        let args = CliArgs::try_parse_from([
+            "skardi-server",
+            "--mcp-allowed-host",
+            "api.example.com",
+            "--mcp-allowed-host",
+            "skardi.internal:8443",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.mcp_allowed_hosts,
+            vec![
+                "api.example.com".to_string(),
+                "skardi.internal:8443".to_string()
+            ]
+        );
+
+        let args = CliArgs::try_parse_from(["skardi-server"]).unwrap();
+        assert!(args.mcp_allowed_hosts.is_empty());
     }
 
     #[test]

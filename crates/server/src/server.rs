@@ -697,6 +697,7 @@ spec:
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         };
 
@@ -722,6 +723,7 @@ spec:
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         }
     }
@@ -765,6 +767,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
         let config = crate::config::load_server_config(args)
             .await

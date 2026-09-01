@@ -384,6 +384,7 @@ mod tests {
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         };
         let session_ctx = Arc::new(SessionContext::new());
@@ -444,6 +445,7 @@ mod tests {
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         };
         let session_ctx = Arc::new(SessionContext::new());

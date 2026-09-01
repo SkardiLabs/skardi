@@ -1283,6 +1283,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = ServerConfig {
@@ -1373,6 +1374,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = ServerConfig {
@@ -2111,6 +2113,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
         let config = ServerConfig {
             pipelines: HashMap::new(),

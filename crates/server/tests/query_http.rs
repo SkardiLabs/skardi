@@ -93,6 +93,7 @@ fn make_state_with_audit(query_audit: Option<Arc<QueryAuditStore>>) -> AppState 
             port: 0,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         },
     };
     AppState::new(
