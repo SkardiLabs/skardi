@@ -1,0 +1,20 @@
+[package]
+name = "skardi-mcp-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared MCP projection layer: pipeline inventory -> MCP tool definitions"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+# Model types only — no features. Preserves the intent behind the CLI's
+# deliberate default-features = false pin (rmcp's transports stay out of
+# this crate's own graph; each binding picks its transport itself).
+rmcp = { version = "=3.1.4", default-features = false }
+percent-encoding = "2.3"
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

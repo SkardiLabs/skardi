@@ -4,7 +4,6 @@
 //! JSON-RPC channel, so nothing on this path may print to it.
 
 mod bridge;
-mod projection;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;

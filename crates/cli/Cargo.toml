@@ -20,9 +20,14 @@ dirs = "5.0"
 percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # The MCP-over-stdio bridge (`skardi mcp`). default-features = false keeps
-# rmcp's HTTP stack (and any axum version skew) out of the dependency graph;
-# `transport-io` is the server-side stdio transport.
+# rmcp's optional stacks out of THIS crate's own dependency graph;
+# `transport-io` is the server-side stdio transport. Note: with resolver = "2",
+# a whole-workspace build unifies features across members, so skardi-server's
+# rmcp HTTP features do get compiled into that build graph — the pin here
+# governs what `cargo build -p skardi-cli` alone pulls in. rmcp has no runtime
+# axum dependency (verified against the 3.1.4 source), so no axum skew either way.
 rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
+skardi-mcp-core = { path = "../mcp-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

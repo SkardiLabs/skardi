@@ -9729,10 +9729,20 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "skardi-mcp-core",
  "tempfile",
  "tokio",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "skardi-mcp-core"
+version = "0.5.0"
+dependencies = [
+ "percent-encoding",
+ "rmcp",
+ "serde_json",
 ]
 
 [[package]]

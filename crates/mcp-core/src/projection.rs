@@ -1,20 +1,22 @@
 //! Projection of the enriched pipeline inventory into MCP tool definitions.
 //! Pure functions — everything here is unit-testable without a server.
+//! Shared by the CLI's stdio bridge and the server's `/mcp` handler, so the
+//! two bindings cannot drift apart on the tool surface.
 
 use std::collections::{HashMap, HashSet};
 
 use rmcp::model::{JsonObject, Tool};
 use serde_json::{Value, json};
 
-/// The built-in tool names. `builtin_tools()` and the bridge's dispatch
+/// The built-in tool names. `builtin_tools()` and each binding's dispatch
 /// match use these same constants, and `RESERVED_NAMES` is built from them,
-/// so the three sites cannot drift apart.
-pub(crate) const QUERY: &str = "query";
-pub(crate) const LIST_DATA_SOURCES: &str = "list_data_sources";
+/// so the sites cannot drift apart.
+pub const QUERY: &str = "query";
+pub const LIST_DATA_SOURCES: &str = "list_data_sources";
 
 /// Tool names claimed by the built-ins; a pipeline sanitizing to one of
 /// these is renamed with a `_pipeline` suffix.
-pub(crate) const RESERVED_NAMES: [&str; 2] = [QUERY, LIST_DATA_SOURCES];
+pub const RESERVED_NAMES: [&str; 2] = [QUERY, LIST_DATA_SOURCES];
 
 /// MCP clients commonly enforce `^[a-zA-Z0-9_-]{1,64}$` for tool names.
 const MAX_TOOL_NAME: usize = 64;
@@ -147,7 +149,7 @@ fn pipeline_tool(tool_name: &str, pipeline_name: &str, entry: &Value) -> Tool {
     )
 }
 
-pub(crate) fn builtin_tools() -> Vec<Tool> {
+pub fn builtin_tools() -> Vec<Tool> {
     let query_schema = object_schema(
         json!({
             "sql": {"type": "string"},
@@ -186,7 +188,7 @@ pub(crate) fn builtin_tools() -> Vec<Tool> {
 /// Project the enriched `GET /pipelines` body into (tools, tool → pipeline
 /// name map). The built-ins are appended after the pipeline tools; the map
 /// covers pipeline tools only.
-pub(crate) fn project(inventory: &Value) -> (Vec<Tool>, HashMap<String, String>) {
+pub fn project(inventory: &Value) -> (Vec<Tool>, HashMap<String, String>) {
     let entries: HashMap<&str, &Value> = inventory["pipelines"]
         .as_array()
         .map(|entries| {
