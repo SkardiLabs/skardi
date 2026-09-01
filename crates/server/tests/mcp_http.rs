@@ -298,7 +298,9 @@ async fn failing_sql_surfaces_as_is_error_tool_result() {
     let client = connect(serve(state).await).await;
 
     // Passes statement validation, fails in the engine — an execution
-    // error the model should see and react to, not a protocol error.
+    // error the model should see and react to, not a protocol error. The
+    // REST error envelope arrives verbatim; the engine's own message stays
+    // in the server logs by design, so the envelope is what's pinned here.
     let result = client
         .call_tool(call_params(
             "query",
@@ -308,7 +310,7 @@ async fn failing_sql_surfaces_as_is_error_tool_result() {
         .unwrap();
     assert_eq!(result.is_error, Some(true), "{result:?}");
     let content = serde_json::to_string(&result.content).unwrap();
-    assert!(content.contains("no_such_table"), "{content}");
+    assert!(content.contains("query_execution_error"), "{content}");
 
     client.cancel().await.unwrap();
 }
