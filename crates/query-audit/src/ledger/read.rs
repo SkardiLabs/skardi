@@ -7,6 +7,9 @@
 //! response says so (`truncated: true` + `next_cursor`), because 500 rows of
 //! even ingestion-bounded fields can pass the `/data_source` budget.
 
+use std::error::Error;
+use std::fmt;
+
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -68,8 +71,8 @@ pub enum ReadError {
     Unavailable(SqlxError),
 }
 
-impl std::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReadError::BadRequest(m) => write!(f, "{m}"),
             ReadError::Unavailable(_) => write!(f, "ledger read failed"),
@@ -77,8 +80,8 @@ impl std::fmt::Display for ReadError {
     }
 }
 
-impl std::error::Error for ReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for ReadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ReadError::BadRequest(_) => None,
             ReadError::Unavailable(e) => Some(e),
@@ -260,11 +263,11 @@ mod tests {
     fn read_error_display_and_source() {
         let bad = ReadError::BadRequest("limit must be >= 1".into());
         assert_eq!(bad.to_string(), "limit must be >= 1");
-        assert!(std::error::Error::source(&bad).is_none());
+        assert!(Error::source(&bad).is_none());
 
         let unavailable = ReadError::Unavailable(SqlxError::PoolClosed);
         assert_eq!(unavailable.to_string(), "ledger read failed");
-        let src = std::error::Error::source(&unavailable).expect("driver cause");
+        let src = Error::source(&unavailable).expect("driver cause");
         assert!(src.to_string().contains("closed"), "{src}");
     }
 
