@@ -20,7 +20,7 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 
 **A vault is a directory.** Notes are `.md` files; the note title is the file stem; subfolders are the user's folder tree; attachments live alongside. Obsidian keeps its own configuration under `.obsidian/` and deleted notes under `.trash/` — metadata and garbage, not content.
 
-**The three structures have precise rules.** Frontmatter is a leading YAML block fenced by `---` lines. Tags are `#` followed by letters, digits, `_`, `-`, `/` (Unicode letters allowed), must contain at least one non-digit character, and are not recognized inside code. Links come in three syntaxes — `[[wikilinks]]` with optional `#heading`, `#^block`, and `|display` parts and an `!` prefix for embeds; standard Markdown `[text](target)`; and `<autolinks>` — and a bare wikilink target resolves against the whole vault by file name, then by frontmatter alias, with ambiguity possible when names repeat. Links also live in frontmatter: Obsidian's Properties documentation states that Text and List properties "can contain … [[Internal links]] using the `[[Link]]` syntax" and that such links "must be surrounded with quotes" (a bare `[[x]]` is a nested YAML sequence). Only the wikilink syntax is recognized there; Markdown-style links in properties are plain text.
+**The three structures have precise rules.** Frontmatter is a leading YAML block fenced by `---` lines. Tags are `#` followed by letters, digits, `_`, `-`, `/` (Unicode letters allowed), must contain at least one non-digit character, and are not recognized inside code. Links come in three syntaxes — `[[wikilinks]]` with optional `#heading`, `#^block`, and `|display` parts and an `!` prefix for embeds; standard Markdown `[text](target)`; and `<autolinks>` — and a bare wikilink target resolves against the whole vault by file name, with ambiguity possible when names repeat. Aliases are display text, not destinations: Obsidian's Aliases documentation says it "creates the link with the alias as its custom display text, for example `[[Artificial Intelligence|AI]]`" and, "rather than just using the alias as the link destination (`[[AI]]`)", does so deliberately for wikilink interoperability — a hand-written `[[AI]]` is an unresolved link in Obsidian. Links also live in frontmatter: Obsidian's Properties documentation states that Text and List properties "can contain … [[Internal links]] using the `[[Link]]` syntax" and that such links "must be surrounded with quotes" (a bare `[[x]]` is a nested YAML sequence). Only the wikilink syntax is recognized there; Markdown-style links in properties are plain text.
 
 **The existing `documents` source already solves file access.** Its `blob::BlobStore` abstracts "list a prefix, read a blob" over a local directory or an `s3://` prefix under an env-only credential contract. It is compiled behind the `documents` Cargo feature today, alongside the PDF tooling it was written for.
 
@@ -50,7 +50,7 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 - Model one source as one vault. Two vaults are two sources; they cannot link to each other, so nothing is lost.
 - Register three fixed tables as a catalog under the conventional `main` schema — `<name>.main.notes`, `<name>.main.links`, `<name>.main.tags` — mirroring the `rss` and `sqlite` catalog convention. `hierarchy_level: catalog` is required.
 - Key everything by `path`: the note's path relative to the vault root with forward slashes. `links.from_path`, `links.to_path`, and `tags.path` all join to `notes.path`.
-- Serve frontmatter as one `frontmatter_json` column rather than exploding keys into columns. Frontmatter is schemaless per note; a fixed column set would be wrong for every vault. `aliases` alone is lifted to a typed column because link resolution depends on it.
+- Serve frontmatter as one `frontmatter_json` column rather than exploding keys into columns. Frontmatter is schemaless per note; a fixed column set would be wrong for every vault. `aliases` alone is lifted to a typed column because it is the one property Obsidian itself gives semantics to (search, link autocomplete) and because it powers the alias-repair query over dangling links (see Documentation Commitments).
 
 **Freshness and execution**
 
@@ -68,7 +68,8 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 - Extract links from frontmatter too: every string value in the parsed frontmatter is scanned with the same wikilink pattern as the body, because Obsidian recognizes `[[…]]` in Text and List properties and counts them as links. Only the wikilink syntax is recognized there. A missed frontmatter link would understate a note's in-degree and misreport orphans — the queries the `links` table exists for.
 - Record where each link came from in `links.source` (`body` / `frontmatter`), mirroring `tags.source`, and leave `line` NULL for frontmatter links: parsed YAML values carry no positions, and scanning the raw YAML text for line numbers would also catch `[[…]]` in comments and keys that Obsidian does not treat as links.
 - Classify links by syntax and by target: `wikilink`, `embed`, `markdown`, or `external` (any target with a URL scheme, regardless of syntax).
-- Resolve internal links in a fixed order — exact path, unique file name, unique alias — and report `ambiguous` or `missing` with `to_path = NULL` rather than choosing.
+- Resolve internal links in a fixed order — exact path, then unique file name — and report `ambiguous` or `missing` with `to_path = NULL` rather than choosing.
+- Never resolve through aliases. Obsidian writes alias links as `[[Note|Alias]]` and treats a bare `[[Alias]]` as unresolved; resolving it here would report a dangling link as an edge and hide it from the dangling-link query. The alias-repair query (a join of `missing` links against `notes.aliases`) recovers the intent without misstating the graph.
 
 **Configuration and registration**
 
@@ -157,7 +158,7 @@ Unchanged API: `Loc::parse`, `BlobStore::resolve`, `list`, `get`. Gated on `any(
 
 ### `obsidian/resolve.rs`
 
-`Index::build(all_paths, aliases_by_path)` and `Index::resolve(from_path, target) -> (Option<path>, Resolution)`. Pure, tested against the rule table below.
+`Index::build(all_paths)` and `Index::resolve(from_path, target) -> (Option<path>, Resolution)`. Pure, tested against the rule table below.
 
 ### `obsidian/scan.rs`
 
@@ -226,7 +227,7 @@ No `created_at`: filesystem birth time is not portable and S3 has none; users wh
 | `display_text` | Utf8 | yes | Text after `\|` in a wikilink, or the bracketed text of a Markdown link. NULL when absent. |
 | `heading` | Utf8 | yes | Text after `#` (not `#^`) in the target, percent-decoded for Markdown links. |
 | `block_id` | Utf8 | yes | Text after `#^` in the target. |
-| `resolution` | Utf8 | no | `exact`, `name`, `alias`, `ambiguous`, `missing`, `external` — see Link Resolution. |
+| `resolution` | Utf8 | no | `exact`, `name`, `ambiguous`, `missing`, `external` — see Link Resolution. |
 | `source` | Utf8 | no | `body` (found in the Markdown body) or `frontmatter` (found in a property value). |
 | `line` | Int32 | yes | 1-based line of the link's start in the source file for body links; NULL for frontmatter links. |
 
@@ -264,7 +265,7 @@ After the frontmatter parses, every string value it contains — top-level scala
 
 ### Link Resolution
 
-Inputs: the target string, the linking note's folder, and an index over every listed file (including attachments) keyed by lowercased file name — the stem for `.md` files (`Note` matches `Note.md`), the full name for others (`a.png` matches `a.png`) — plus an index of lowercased aliases to note paths. All matching is case-insensitive, matching Obsidian's behavior on case-insensitive filesystems.
+Inputs: the target string, the linking note's folder, and an index over every listed file (including attachments) keyed by lowercased file name — the stem for `.md` files (`Note` matches `Note.md`), the full name for others (`a.png` matches `a.png`). All matching is case-insensitive, matching Obsidian's behavior on case-insensitive filesystems. Aliases take no part in resolution.
 
 Applied in order; the first step that applies decides:
 
@@ -274,18 +275,19 @@ Applied in order; the first step that applies decides:
 | `exact` (relative) | target starts with `./` or `../` | resolve against the note's folder and normalize; `.md` appended if the result has no extension; must exist, else `missing` |
 | `exact` (vault path) | target contains `/` or has a file extension | match the relative path from the vault root, `.md` optional for notes; must exist, else `missing` |
 | `name` | exactly one file has that name | that file |
-| `alias` | no file has that name and exactly one note declares that alias | that note |
-| `ambiguous` | more than one file has that name, or no file does and more than one note declares the alias | `to_path = NULL` |
+| `ambiguous` | more than one file has that name | `to_path = NULL` |
 | `missing` | nothing matched | `to_path = NULL` |
 
 Obsidian resolves an ambiguous bare name to one of the candidates by its own heuristics; this provider does not imitate them. Reporting `ambiguous` is the honest answer and lets the user fix the vault.
+
+A bare `[[Alias]]` whose text matches a note's `aliases` entry but no file name is `missing`, exactly as in Obsidian, where such a link opens a new empty note. Obsidian's autocomplete never produces this form — it writes `[[Note|Alias]]`, which resolves through `Note` — so a `missing` link matching an alias is almost always a hand-written mistake, and the alias-repair query in `docs/obsidian.md` surfaces it as one.
 
 ## Scan Execution
 
 1. `BlobStore::list(root, recursive = true)`, skipping symlinks. Paths are normalized to forward-slash relative form and filtered by `exclude_globs`. `.md` files are notes; every other path is an attachment candidate for the resolution index.
 2. Each note is read with `BlobStore::get`; a blob larger than `max_file_bytes` is skipped with a `tracing::warn!` naming the path. Bytes are decoded lossily as UTF-8.
 3. Frontmatter is split and parsed, and its string values are scanned for wikilinks; the body is walked for tags and raw links.
-4. The resolution index is built from all listed paths and all notes' aliases; every raw link is resolved.
+4. The resolution index is built from all listed paths; every raw link is resolved.
 5. The requesting table projects its columns, applies `LIMIT`, and returns one `RecordBatch`.
 
 Reads are sequential in the first release. Concurrency is an internal detail that can change without touching the surface.
@@ -313,8 +315,8 @@ Registration logs the source name, root, and `surface_version = 1` at `info`. Ea
 
 All tests live in the crate, behind `feature = "obsidian"`, and run in CI with the rest of the library suite.
 
-- **Unit, pure functions.** `frontmatter::split`/`parse`: no block, valid block, malformed block, `...` terminator, `---` in body text, aliases as scalar/list/other, tags as list/string/`tag:` key. `frontmatter::links`: a quoted wikilink in a text property, several in a list property, one with `#heading|display`, one inside a nested map, an unquoted `[[x]]` (no link), a Markdown-style link (no link), a link inside `aliases`. `markdown::extract`: every wikilink variant (`|display`, `#heading`, `#^block`, embed, spaces and CJK in target, adjacent links, empty target), Markdown links and images, autolinks, external classification for `https:`/`mailto:`/`obsidian:`, tags at line start / after whitespace / rejected in `C#` and URLs and `# Heading` / rejected all-digit / nested `a/b` / trailing punctuation, everything inside fenced, indented, and inline code ignored, correct `line` numbers. `resolve::Index`: one case per row of the resolution table, including case-insensitivity and the `.md`-optional rule.
-- **Fixture vault.** `crates/skardi/src/sources/providers/obsidian/fixtures/vault/` — a hand-written vault of roughly fifteen files covering every rule above plus `.obsidian/` and `.trash/` content that must not appear, an attachment, two same-named notes in different folders (ambiguity), an alias target, and a note whose only inbound link is a frontmatter property on another note (so the in-degree and orphan queries are wrong unless frontmatter links are extracted). Tests register it and assert full table contents for all three tables, projection, `LIMIT`, deterministic order, and the two canonical graph queries (in-degree by `to_path`; orphan notes via anti-join).
+- **Unit, pure functions.** `frontmatter::split`/`parse`: no block, valid block, malformed block, `...` terminator, `---` in body text, aliases as scalar/list/other, tags as list/string/`tag:` key. `frontmatter::links`: a quoted wikilink in a text property, several in a list property, one with `#heading|display`, one inside a nested map, an unquoted `[[x]]` (no link), a Markdown-style link (no link), a link inside `aliases`. `markdown::extract`: every wikilink variant (`|display`, `#heading`, `#^block`, embed, spaces and CJK in target, adjacent links, empty target), Markdown links and images, autolinks, external classification for `https:`/`mailto:`/`obsidian:`, tags at line start / after whitespace / rejected in `C#` and URLs and `# Heading` / rejected all-digit / nested `a/b` / trailing punctuation, everything inside fenced, indented, and inline code ignored, correct `line` numbers. `resolve::Index`: one case per row of the resolution table, including case-insensitivity, the `.md`-optional rule, and a bare alias resolving to `missing`.
+- **Fixture vault.** `crates/skardi/src/sources/providers/obsidian/fixtures/vault/` — a hand-written vault of roughly fifteen files covering every rule above plus `.obsidian/` and `.trash/` content that must not appear, an attachment, two same-named notes in different folders (ambiguity), a note declaring an alias plus one `[[Note|Alias]]` link to it (resolves through `Note`) and one bare `[[Alias]]` link (`missing`, found by the alias-repair query), and a note whose only inbound link is a frontmatter property on another note (so the in-degree and orphan queries are wrong unless frontmatter links are extracted). Tests register it and assert full table contents for all three tables, projection, `LIMIT`, deterministic order, and the two canonical graph queries (in-degree by `to_path`; orphan notes via anti-join).
 - **Registration.** Non-catalog rejected; read-write rejected; missing root rejected; unknown option rejected; default excludes applied; custom `exclude_globs` replaces the default; `max_file_bytes` skips and warns.
 - **Blob move.** The existing `documents` tests continue to pass unchanged after `blob.rs` moves, and `Loc::parse` tests for `s3://` URIs run under the `obsidian` feature alone.
 
@@ -347,7 +349,7 @@ README.md                                         # source list entry
 
 ## Documentation Commitments
 
-`docs/obsidian.md` documents the build flag, configuration and options, the catalog namespace, all three schemas, the frontmatter/tag/link rules including the resolution table and the frontmatter-link rules (quoting, wikilink syntax only), the failure-mode table, the double-parse cost of joins, and example queries: notes by tag, notes by frontmatter property, most-linked notes, orphan notes, dangling links, external sites referenced.
+`docs/obsidian.md` documents the build flag, configuration and options, the catalog namespace, all three schemas, the frontmatter/tag/link rules including the resolution table and the frontmatter-link rules (quoting, wikilink syntax only), the failure-mode table, the double-parse cost of joins, and example queries: notes by tag, notes by frontmatter property, most-linked notes, orphan notes, dangling links, the alias-repair query (`missing` links whose `target` appears in another note's `aliases`, with the note they probably meant), external sites referenced.
 
 ## Future Extensions
 
