@@ -159,13 +159,15 @@ impl RowDraft {
         requested_max_rows: Option<usize>,
         default_max_rows: usize,
     ) -> Self {
-        let (sql, sql_truncated) = truncate_utf8(sql, SQL_MAX_BYTES);
+        let (sql, sql_truncated) = bound_text(sql, SQL_MAX_BYTES);
         let session_id = ai_context
             .and_then(|c| c.get("session_id"))
             .and_then(Value::as_str)
             // A longer value is a malformed caller assertion, dropped rather
-            // than truncated into a different-looking session.
-            .filter(|s| s.chars().count() <= crate::MAX_SESSION_ID_CHARS)
+            // than truncated into a different-looking session — and one
+            // carrying U+0000 (unstorable in TEXT) is dropped for the same
+            // reason: scrubbing would make it a different-looking session.
+            .filter(|s| s.chars().count() <= crate::MAX_SESSION_ID_CHARS && !s.contains('\0'))
             .map(str::to_string);
         // The column bound (≤ 4 KiB) is enforced HERE, not only by a route's
         // own refusal: a refused row for an oversized ai_context must not
@@ -176,13 +178,21 @@ impl RowDraft {
                 serde_json::to_vec(c)
                     .map(|v| v.len() <= ERROR_MAX_BYTES)
                     .unwrap_or(false)
+                    // JSONB cannot represent U+0000 anywhere in the document
+                    // (keys included); like the oversize case this drops the
+                    // WHOLE document rather than mutating it — an edited JSON
+                    // document is a different document.
+                    && !json_contains_nul(c)
             })
             .cloned();
         Self {
-            org_id: org_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            user_id: user_id.to_string(),
-            request_id: request_id.to_string(),
+            // Identity values arrive gate-validated in production, but
+            // assembly is the single bounding point and must not trust that:
+            // one NUL here would still poison the batch.
+            org_id: scrub_nul(org_id),
+            workspace_id: scrub_nul(workspace_id),
+            user_id: scrub_nul(user_id),
+            request_id: scrub_nul(request_id),
             session_id,
             created_at: Utc::now(),
             sql,
@@ -220,9 +230,47 @@ impl RowDraft {
             max_rows: self.max_rows,
             status,
             row_count: row_count.map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
-            error: error.map(|e| truncate_utf8(&e, ERROR_MAX_BYTES).0),
+            error: error.map(|e| bound_text(&e, ERROR_MAX_BYTES).0),
         }
     }
+}
+
+/// U+0000 cannot be stored in Postgres TEXT or JSONB — one NUL in one
+/// field would reject the INSERT and poison the row's whole flush batch
+/// (up to [`FLUSH_BATCH_ROWS`] of OTHER callers' rows), which is exactly
+/// what assembly-time bounding exists to prevent. Scrubbed to U+FFFD, the
+/// standard replacement character, so the row still records that a value
+/// was there and was altered.
+fn scrub_nul(s: &str) -> String {
+    if s.contains('\0') {
+        s.replace('\0', "\u{FFFD}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// True when any string in the document — values or object KEYS — contains
+/// U+0000, which JSONB cannot represent.
+fn json_contains_nul(v: &serde_json::Value) -> bool {
+    match v {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(a) => a.iter().any(json_contains_nul),
+        Value::Object(o) => o
+            .iter()
+            .any(|(k, val)| k.contains('\0') || json_contains_nul(val)),
+        _ => false,
+    }
+}
+
+/// Scrub then truncate to at most `max` bytes on a char boundary. Returns
+/// the (possibly shortened) string and whether TRUNCATION happened (the NUL
+/// scrub is not flagged — a NUL was never valid content to preserve).
+/// Scrub first: the replacement char is 3 bytes where NUL was 1, so the
+/// byte bound must be applied to the final text.
+fn bound_text(s: &str, max: usize) -> (String, bool) {
+    let scrubbed = scrub_nul(s);
+    let (t, truncated) = truncate_utf8(&scrubbed, max);
+    (t, truncated)
 }
 
 /// Truncate to at most `max` bytes on a char boundary. Returns the (possibly
@@ -362,6 +410,53 @@ mod tests {
         let ai = json!({"session_id": "s".repeat(201)});
         let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ai), None, 1000);
         assert!(draft.session_id.is_none());
+    }
+
+    /// U+0000 is legal in a Rust String but unstorable in Postgres TEXT and
+    /// JSONB — one NUL would reject the INSERT and poison the row's whole
+    /// flush batch. Assembly scrubs text fields (U+FFFD), drops a NUL-bearing
+    /// session_id (scrubbing would rename the session), and drops a
+    /// NUL-bearing ai_context whole, keys included.
+    #[test]
+    fn nul_never_survives_assembly() {
+        let ai = json!({"session_id": "s\u{0}1", "purpose": "p"});
+        let draft = RowDraft::capture(
+            "o\u{0}rg",
+            "w",
+            "u",
+            "r",
+            "SELECT '\u{0}'",
+            Some(&ai),
+            None,
+            1000,
+        );
+        assert_eq!(draft.sql, "SELECT '\u{FFFD}'");
+        assert!(!draft.sql_truncated, "a scrub is not a truncation");
+        assert_eq!(draft.org_id, "o\u{FFFD}rg");
+        assert!(draft.session_id.is_none(), "a NUL session id is dropped");
+        assert!(
+            draft.ai_context.is_none(),
+            "a NUL-bearing document is dropped"
+        );
+
+        // NUL hiding in an object KEY is caught too.
+        let keyed = json!({"purpose": "p", "me\u{0}ta": {"x": 1}});
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&keyed), None, 1000);
+        assert!(draft.ai_context.is_none());
+
+        // A nested NUL in an array value is caught.
+        let nested = json!({"purpose": "p", "tags": ["ok", "ba\u{0}d"]});
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&nested), None, 1000);
+        assert!(draft.ai_context.is_none());
+
+        // A clean document still travels.
+        let clean = json!({"session_id": "s-1", "purpose": "p"});
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&clean), None, 1000);
+        assert!(draft.ai_context.is_some());
+
+        // The error text is scrubbed at finish.
+        let row = draft.finish(RowStatus::Failed, None, Some("boom\u{0}!".into()));
+        assert_eq!(row.error.as_deref(), Some("boom\u{FFFD}!"));
     }
 
     /// The 200 bound is CHARACTERS, the unit the wire validation counts in —

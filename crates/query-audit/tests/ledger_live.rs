@@ -465,3 +465,58 @@ async fn a_rejected_insert_counts_its_losses() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// The P1 regression against real Postgres: a row whose caller-supplied
+/// text carried U+0000 lands IN THE SAME BATCH as clean rows, and every row
+/// survives — before assembly scrubbed NULs, that one row rejected the
+/// whole multi-row INSERT and up to 63 other callers' rows were lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn a_nul_bearing_row_cannot_poison_its_batch() {
+    let Some(url) = live_url() else { return };
+    let (dsn, pool) = fresh_db(&url).await;
+    let pg = PgLedger::spawn(&dsn).expect("pool");
+
+    // Enqueued back-to-back so the writer drains them as ONE batch.
+    pg.record(draft(WS, "SELECT 1", "r-clean-1").finish(RowStatus::Succeeded, Some(1), None));
+    pg.record(
+        RowDraft::capture(
+            "acme",
+            WS,
+            "user:acme/u1",
+            "r-poison",
+            "SELECT '\u{0}'",
+            Some(&json!({"session_id": "s\u{0}", "purpose": "p"})),
+            None,
+            1000,
+        )
+        .finish(RowStatus::Failed, None, Some("bad\u{0}input".into())),
+    );
+    pg.record(draft(WS, "SELECT 2", "r-clean-2").finish(RowStatus::Succeeded, Some(1), None));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM query_ledger")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the batch was poisoned: only {n} of 3 rows landed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (sql, err, session): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT sql, error, session_id FROM query_ledger WHERE request_id = 'r-poison'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("poisoned row landed");
+    assert_eq!(sql, "SELECT '\u{FFFD}'");
+    assert_eq!(err, "bad\u{FFFD}input");
+    assert!(session.is_none(), "the NUL session id was dropped");
+}
