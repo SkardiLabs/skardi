@@ -6,7 +6,7 @@
 
 ## Summary
 
-Skardi will support Obsidian vaults as a first-class, read-only native data source, `type: obsidian`. One configured source binds one vault — a directory of Markdown files on the local filesystem or under an `s3://` prefix — and exposes three fixed tables as a catalog: `notes`, one row per Markdown file with its body and parsed frontmatter; `links`, one row per link found in a note, resolved to its target file with Obsidian's own resolution rules; and `tags`, one row per note × tag from both frontmatter and body.
+Skardi will support Obsidian vaults as a first-class, read-only native data source, `type: obsidian`. One configured source binds one vault — a directory of Markdown files on the local filesystem or under an `s3://` prefix — and exposes three fixed tables as a catalog: `notes`, one row per Markdown file with its body and parsed frontmatter; `links`, one row per link found in a note — in its body or in its frontmatter properties — resolved to its target file with Obsidian's own resolution rules; and `tags`, one row per note × tag from both frontmatter and body.
 
 Every scan re-reads the vault from scratch: list, read, parse, emit one `RecordBatch`. There is no cache, no network, no external process, and no write path. The provider is a format adapter: it understands exactly the three Obsidian-specific structures — YAML frontmatter, `[[wikilinks]]`, and `#tags` — and leaves everything else (search, embedding, graph analytics) to SQL over the three tables.
 
@@ -20,7 +20,7 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 
 **A vault is a directory.** Notes are `.md` files; the note title is the file stem; subfolders are the user's folder tree; attachments live alongside. Obsidian keeps its own configuration under `.obsidian/` and deleted notes under `.trash/` — metadata and garbage, not content.
 
-**The three structures have precise rules.** Frontmatter is a leading YAML block fenced by `---` lines. Tags are `#` followed by letters, digits, `_`, `-`, `/` (Unicode letters allowed), must contain at least one non-digit character, and are not recognized inside code. Links come in three syntaxes — `[[wikilinks]]` with optional `#heading`, `#^block`, and `|display` parts and an `!` prefix for embeds; standard Markdown `[text](target)`; and `<autolinks>` — and a bare wikilink target resolves against the whole vault by file name, then by frontmatter alias, with ambiguity possible when names repeat.
+**The three structures have precise rules.** Frontmatter is a leading YAML block fenced by `---` lines. Tags are `#` followed by letters, digits, `_`, `-`, `/` (Unicode letters allowed), must contain at least one non-digit character, and are not recognized inside code. Links come in three syntaxes — `[[wikilinks]]` with optional `#heading`, `#^block`, and `|display` parts and an `!` prefix for embeds; standard Markdown `[text](target)`; and `<autolinks>` — and a bare wikilink target resolves against the whole vault by file name, then by frontmatter alias, with ambiguity possible when names repeat. Links also live in frontmatter: Obsidian's Properties documentation states that Text and List properties "can contain … [[Internal links]] using the `[[Link]]` syntax" and that such links "must be surrounded with quotes" (a bare `[[x]]` is a nested YAML sequence). Only the wikilink syntax is recognized there; Markdown-style links in properties are plain text.
 
 **The existing `documents` source already solves file access.** Its `blob::BlobStore` abstracts "list a prefix, read a blob" over a local directory or an `s3://` prefix under an env-only credential contract. It is compiled behind the `documents` Cargo feature today, alongside the PDF tooling it was written for.
 
@@ -58,13 +58,15 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 - Execute as a single partition producing one `RecordBatch` through a `MemoryStream`, as `DocumentsTable` does. Vaults are thousands of files, not millions; parsing them is tens to hundreds of milliseconds locally.
 - Scan each table independently. A query joining `notes` and `links` parses the vault twice. This is accepted for the first release in exchange for zero shared state; the cost is documented.
 - Support column projection and `LIMIT`; do not push filters down. DataFusion filters the in-memory batch.
-- Order rows deterministically: `notes` by `path`; `links` by `(from_path, line, occurrence)`; `tags` by `(path, tag, source)`.
+- Order rows deterministically: `notes` by `path`; `links` by `from_path`, then frontmatter links in traversal order, then body links by `(line, occurrence)`; `tags` by `(path, tag, source)`.
 
 **Parsing**
 
 - Parse Markdown with `pulldown-cmark`. Its event stream identifies code blocks and code spans (where tags and wikilinks are not recognized) and yields standard links and images with their destinations. Wikilinks and tags — Obsidian extensions no CommonMark parser knows — are extracted by pattern from the non-code text ranges.
 - Parse frontmatter with `serde_yaml` (already a workspace dependency) and re-serialize to JSON. A frontmatter block that is present but malformed yields `frontmatter_json = NULL` and a populated `frontmatter_error`; the row is kept.
 - Decode file bytes as UTF-8 with lossy replacement. No row is dropped for encoding.
+- Extract links from frontmatter too: every string value in the parsed frontmatter is scanned with the same wikilink pattern as the body, because Obsidian recognizes `[[…]]` in Text and List properties and counts them as links. Only the wikilink syntax is recognized there. A missed frontmatter link would understate a note's in-degree and misreport orphans — the queries the `links` table exists for.
+- Record where each link came from in `links.source` (`body` / `frontmatter`), mirroring `tags.source`, and leave `line` NULL for frontmatter links: parsed YAML values carry no positions, and scanning the raw YAML text for line numbers would also catch `[[…]]` in comments and keys that Obsidian does not treat as links.
 - Classify links by syntax and by target: `wikilink`, `embed`, `markdown`, or `external` (any target with a URL scheme, regardless of syntax).
 - Resolve internal links in a fixed order — exact path, unique file name, unique alias — and report `ambiguous` or `missing` with `to_path = NULL` rather than choosing.
 
@@ -147,7 +149,7 @@ Unchanged API: `Loc::parse`, `BlobStore::resolve`, `list`, `get`. Gated on `any(
 
 ### `obsidian/frontmatter.rs`
 
-`split(text) -> (Option<&str> yaml, &str body)`: a frontmatter block is a first line of exactly `---`, YAML until the next line of exactly `---` (or `...`), and the body is everything after. `parse(yaml) -> Result<(serde_json::Value), String>`. Helpers lift `aliases` and `tags`/`tag` (list, or comma-/space-separated string; leading `#` stripped) out of the JSON value.
+`split(text) -> (Option<&str> yaml, &str body)`: a frontmatter block is a first line of exactly `---`, YAML until the next line of exactly `---` (or `...`), and the body is everything after. `parse(yaml) -> Result<(serde_json::Value), String>`. Helpers lift `aliases` and `tags`/`tag` (list, or comma-/space-separated string; leading `#` stripped) out of the JSON value. `links(value) -> Vec<RawLink>` walks every string value in the parsed frontmatter (top-level, inside lists, and inside nested maps, in document order) and applies the wikilink pattern shared with `markdown.rs`.
 
 ### `obsidian/markdown.rs`
 
@@ -159,7 +161,7 @@ Unchanged API: `Loc::parse`, `BlobStore::resolve`, `list`, `get`. Gated on `any(
 
 ### `obsidian/scan.rs`
 
-`VaultScan::run(store, root, opts) -> Vec<ParsedNote>`: list, filter, read, parse, then resolve links using an index over all listed files. Async because `BlobStore::get` is.
+`VaultScan::run(store, root, opts) -> Vec<ParsedNote>`: list, filter, read, parse (frontmatter links first, then body links), then resolve every link using an index over all listed files. Async because `BlobStore::get` is.
 
 ### `obsidian/table.rs`
 
@@ -225,7 +227,8 @@ No `created_at`: filesystem birth time is not portable and S3 has none; users wh
 | `heading` | Utf8 | yes | Text after `#` (not `#^`) in the target, percent-decoded for Markdown links. |
 | `block_id` | Utf8 | yes | Text after `#^` in the target. |
 | `resolution` | Utf8 | no | `exact`, `name`, `alias`, `ambiguous`, `missing`, `external` — see Link Resolution. |
-| `line` | Int32 | no | 1-based line of the link's start in the source file. |
+| `source` | Utf8 | no | `body` (found in the Markdown body) or `frontmatter` (found in a property value). |
+| `line` | Int32 | yes | 1-based line of the link's start in the source file for body links; NULL for frontmatter links. |
 
 ### `tags` — one row per distinct (note, tag, source)
 
@@ -255,6 +258,10 @@ Wikilinks are matched in non-code text: optional `!`, `[[`, target, optional `#h
 
 A destination with a URL scheme (`[a-zA-Z][a-zA-Z0-9+.-]*:` prefix, e.g. `https:`, `mailto:`, `obsidian:`) is `external`: `to_path` NULL, `resolution = 'external'`, `target` = the full destination. Everything else is internal and goes through resolution.
 
+### Links in frontmatter
+
+After the frontmatter parses, every string value it contains — top-level scalars, list elements, and strings inside nested maps, visited in document order — is scanned with the same wikilink pattern as the body. Each match becomes a `links` row with `source = 'frontmatter'`, `line = NULL`, and `kind`/`heading`/`block_id`/`display_text` filled exactly as for a body wikilink; it then goes through the same resolution. Two consequences follow from Obsidian's own rules and are documented rather than worked around: an unquoted `[[x]]` parses as a nested YAML list whose string is `x`, so it yields no link (Obsidian requires the quotes too); and Markdown-style `[text](target)` inside a property is plain text, not a link. `aliases` and `tags` values are scanned like any other string; a `[[…]]` there is a link as well as an alias or tag, which is what Obsidian does. Obsidian defines property links only for Text and List properties; this provider also scans strings in nested maps because Obsidian assigns nested maps no behavior at all, and one uniform rule is easier to state and test than an exclusion.
+
 ### Link Resolution
 
 Inputs: the target string, the linking note's folder, and an index over every listed file (including attachments) keyed by lowercased file name — the stem for `.md` files (`Note` matches `Note.md`), the full name for others (`a.png` matches `a.png`) — plus an index of lowercased aliases to note paths. All matching is case-insensitive, matching Obsidian's behavior on case-insensitive filesystems.
@@ -277,7 +284,7 @@ Obsidian resolves an ambiguous bare name to one of the candidates by its own heu
 
 1. `BlobStore::list(root, recursive = true)`, skipping symlinks. Paths are normalized to forward-slash relative form and filtered by `exclude_globs`. `.md` files are notes; every other path is an attachment candidate for the resolution index.
 2. Each note is read with `BlobStore::get`; a blob larger than `max_file_bytes` is skipped with a `tracing::warn!` naming the path. Bytes are decoded lossily as UTF-8.
-3. Frontmatter is split and parsed; the body is walked for tags and raw links.
+3. Frontmatter is split and parsed, and its string values are scanned for wikilinks; the body is walked for tags and raw links.
 4. The resolution index is built from all listed paths and all notes' aliases; every raw link is resolved.
 5. The requesting table projects its columns, applies `LIMIT`, and returns one `RecordBatch`.
 
@@ -306,8 +313,8 @@ Registration logs the source name, root, and `surface_version = 1` at `info`. Ea
 
 All tests live in the crate, behind `feature = "obsidian"`, and run in CI with the rest of the library suite.
 
-- **Unit, pure functions.** `frontmatter::split`/`parse`: no block, valid block, malformed block, `...` terminator, `---` in body text, aliases as scalar/list/other, tags as list/string/`tag:` key. `markdown::extract`: every wikilink variant (`|display`, `#heading`, `#^block`, embed, spaces and CJK in target, adjacent links, empty target), Markdown links and images, autolinks, external classification for `https:`/`mailto:`/`obsidian:`, tags at line start / after whitespace / rejected in `C#` and URLs and `# Heading` / rejected all-digit / nested `a/b` / trailing punctuation, everything inside fenced, indented, and inline code ignored, correct `line` numbers. `resolve::Index`: one case per row of the resolution table, including case-insensitivity and the `.md`-optional rule.
-- **Fixture vault.** `crates/skardi/src/sources/providers/obsidian/fixtures/vault/` — a hand-written vault of roughly fifteen files covering every rule above plus `.obsidian/` and `.trash/` content that must not appear, an attachment, two same-named notes in different folders (ambiguity), and an alias target. Tests register it and assert full table contents for all three tables, projection, `LIMIT`, deterministic order, and the two canonical graph queries (in-degree by `to_path`; orphan notes via anti-join).
+- **Unit, pure functions.** `frontmatter::split`/`parse`: no block, valid block, malformed block, `...` terminator, `---` in body text, aliases as scalar/list/other, tags as list/string/`tag:` key. `frontmatter::links`: a quoted wikilink in a text property, several in a list property, one with `#heading|display`, one inside a nested map, an unquoted `[[x]]` (no link), a Markdown-style link (no link), a link inside `aliases`. `markdown::extract`: every wikilink variant (`|display`, `#heading`, `#^block`, embed, spaces and CJK in target, adjacent links, empty target), Markdown links and images, autolinks, external classification for `https:`/`mailto:`/`obsidian:`, tags at line start / after whitespace / rejected in `C#` and URLs and `# Heading` / rejected all-digit / nested `a/b` / trailing punctuation, everything inside fenced, indented, and inline code ignored, correct `line` numbers. `resolve::Index`: one case per row of the resolution table, including case-insensitivity and the `.md`-optional rule.
+- **Fixture vault.** `crates/skardi/src/sources/providers/obsidian/fixtures/vault/` — a hand-written vault of roughly fifteen files covering every rule above plus `.obsidian/` and `.trash/` content that must not appear, an attachment, two same-named notes in different folders (ambiguity), an alias target, and a note whose only inbound link is a frontmatter property on another note (so the in-degree and orphan queries are wrong unless frontmatter links are extracted). Tests register it and assert full table contents for all three tables, projection, `LIMIT`, deterministic order, and the two canonical graph queries (in-degree by `to_path`; orphan notes via anti-join).
 - **Registration.** Non-catalog rejected; read-write rejected; missing root rejected; unknown option rejected; default excludes applied; custom `exclude_globs` replaces the default; `max_file_bytes` skips and warns.
 - **Blob move.** The existing `documents` tests continue to pass unchanged after `blob.rs` moves, and `Loc::parse` tests for `s3://` URIs run under the `obsidian` feature alone.
 
@@ -317,7 +324,7 @@ No live or mocked S3 test in the first release (see Non-goals).
 
 - A context declaring `type: obsidian` over the fixture vault registers, and `SELECT * FROM vault.main.notes / links / tags` return the expected rows in the documented order.
 - Every column in the three schemas is non-NULL for at least one fixture row, and every documented NULL case appears in at least one.
-- Every `resolution` value and every `kind` value appears in the fixture results.
+- Every `resolution` value, every `kind` value, and both `links.source` values appear in the fixture results.
 - Editing a fixture note between two scans changes the second result with no restart.
 - `.obsidian/` and `.trash/` never appear; a symlink out of the vault is never read.
 - `cargo test -p skardi --lib --features obsidian` and the full library suite pass; `cargo fmt` and `cargo clippy` are clean; a build with `--features documents` alone and one with `--features obsidian` alone both compile.
@@ -340,7 +347,7 @@ README.md                                         # source list entry
 
 ## Documentation Commitments
 
-`docs/obsidian.md` documents the build flag, configuration and options, the catalog namespace, all three schemas, the frontmatter/tag/link rules including the resolution table, the failure-mode table, the double-parse cost of joins, and example queries: notes by tag, notes by frontmatter property, most-linked notes, orphan notes, dangling links, external sites referenced.
+`docs/obsidian.md` documents the build flag, configuration and options, the catalog namespace, all three schemas, the frontmatter/tag/link rules including the resolution table and the frontmatter-link rules (quoting, wikilink syntax only), the failure-mode table, the double-parse cost of joins, and example queries: notes by tag, notes by frontmatter property, most-linked notes, orphan notes, dangling links, external sites referenced.
 
 ## Future Extensions
 
