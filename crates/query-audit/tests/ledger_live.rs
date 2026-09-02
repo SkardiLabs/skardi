@@ -690,3 +690,33 @@ async fn shutdown_with_a_dead_server_counts_and_returns() {
         "the drained-but-unflushable batch is counted"
     );
 }
+
+/// EVERY concurrent shutdown caller awaits the same drain (review): the
+/// completion latch is shared watch state, so a second caller — even one
+/// that controls runtime teardown — holds until the writer has really
+/// exited, and no caller's return depends on being "first".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_shutdown_callers_all_await_the_drain() {
+    let pg = PgLedger::spawn("postgres://u:p@192.0.2.1:5432/skardi_ledger").expect("lazy pool");
+    pg.record(draft(WS, "SELECT 1", "r-cc").finish(RowStatus::Succeeded, Some(1), None));
+    let before = ledger::METRICS
+        .insert_failures_pg
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let a = pg.clone();
+    let b = pg.clone();
+    let (ra, rb) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(20), async move { a.shutdown().await }),
+        tokio::time::timeout(Duration::from_secs(20), async move { b.shutdown().await }),
+    );
+    ra.expect("caller A completes");
+    rb.expect("caller B completes");
+
+    // BOTH returned only after the drain finished — by then the doomed
+    // batch has been counted, so a caller that tears the runtime down next
+    // cannot be racing an in-flight flush.
+    let after = ledger::METRICS
+        .insert_failures_pg
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(after > before, "the drain completed before either returned");
+}

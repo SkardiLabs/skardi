@@ -29,10 +29,13 @@ pub mod queries;
 pub mod read;
 pub mod writer;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc, watch};
 
 /// `sql` is truncated to this at ROW ASSEMBLY: the learn loop wants
 /// patterns, not megabyte literals, and bounding at ingestion is what keeps
@@ -308,19 +311,22 @@ fn truncate_utf8(s: &str, max: usize) -> (String, bool) {
 /// (see [`Self::shutdown`]).
 #[derive(Clone)]
 pub struct PgLedger {
-    tx: tokio::sync::mpsc::Sender<LedgerRow>,
+    tx: mpsc::Sender<LedgerRow>,
     pool: sqlx::PgPool,
-    writer: std::sync::Arc<WriterControl>,
+    writer: Arc<WriterControl>,
 }
 
 /// The writer task's shutdown plumbing. Held behind an `Arc` so every clone
 /// of the handle can trigger and await the same drain.
 pub(crate) struct WriterControl {
     /// Signals the writer to close its receiver and drain what is buffered.
-    pub(crate) drain: tokio::sync::Notify,
-    /// The writer's JoinHandle, kept — a detached task dies WITH the runtime,
-    /// mid-flush, and rows lost that way would be counted by nobody.
-    handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) drain: Notify,
+    /// Becomes `true` when the writer task has exited — set by a drop guard
+    /// inside the task, so it fires on the graceful path, on a panic, and on
+    /// an abort alike. SHARED completion state, not a taken JoinHandle:
+    /// every concurrent shutdown caller awaits the same signal, and a
+    /// cancelled waiter cancels only itself.
+    done: watch::Receiver<bool>,
 }
 
 impl PgLedger {
@@ -339,13 +345,19 @@ impl PgLedger {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy(dsn)?;
-        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
-        let writer = std::sync::Arc::new(WriterControl {
-            drain: tokio::sync::Notify::new(),
-            handle: std::sync::Mutex::new(None),
+        if capacity == 0 {
+            // tokio's bounded channel PANICS on zero; this constructor
+            // advertises Result, so invalid configuration must not be able
+            // to take the process down.
+            anyhow::bail!("ledger queue capacity must be >= 1 (got 0)");
+        }
+        let (tx, rx) = mpsc::channel(capacity);
+        let (done_tx, done_rx) = watch::channel(false);
+        let writer = Arc::new(WriterControl {
+            drain: Notify::new(),
+            done: done_rx,
         });
-        let handle = tokio::spawn(writer::run(pool.clone(), rx, writer.clone()));
-        *writer.handle.lock().expect("fresh mutex") = Some(handle);
+        tokio::spawn(writer::run(pool.clone(), rx, writer.clone(), done_tx));
         Ok(Self { tx, pool, writer })
     }
 
@@ -360,17 +372,17 @@ impl PgLedger {
     /// Unbounded by design — the drain is at most `capacity / FLUSH_BATCH`
     /// flushes of [`FLUSH_TIMEOUT`] each; a caller with a deadline wraps
     /// this in `tokio::time::timeout`, and rows still queued at a HARD
-    /// abort remain the accepted pod-crash loss class. Concurrent callers:
-    /// the first drives the drain; later calls return once it is done (the
-    /// handle is taken exactly once).
+    /// abort remain the accepted pod-crash loss class. Concurrent callers
+    /// all await the SAME completion state (a watch the writer's drop guard
+    /// sets on every exit path, panic included), so whichever caller
+    /// controls teardown holds it open until the drain is really done, and
+    /// one cancelled waiter cancels nobody else.
     pub async fn shutdown(&self) {
         self.writer.drain.notify_one();
-        let handle = self.writer.handle.lock().expect("writer mutex").take();
-        if let Some(handle) = handle {
-            // A panicked writer is already logged by the runtime; shutdown's
-            // job is only to not leave rows behind silently.
-            let _ = handle.await;
-        }
+        let mut done = self.writer.done.clone();
+        // Err = the sender dropped, which only happens when the task is
+        // gone; either way, the writer is no longer running.
+        let _ = done.wait_for(|finished| *finished).await;
     }
 
     /// Enqueue one decided row. Never waits, never errors to the caller: a
@@ -381,8 +393,7 @@ impl PgLedger {
                 .insert_failures_channel_full
                 .fetch_add(1, Ordering::Relaxed);
             let request_id = match &e {
-                tokio::sync::mpsc::error::TrySendError::Full(r)
-                | tokio::sync::mpsc::error::TrySendError::Closed(r) => r.request_id.clone(),
+                TrySendError::Full(r) | TrySendError::Closed(r) => r.request_id.clone(),
             };
             tracing::warn!(%request_id, "ledger row dropped: queue full or writer gone");
         }
@@ -468,6 +479,17 @@ mod tests {
         let ai = json!({"session_id": "s".repeat(201)});
         let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ai), None, 1000);
         assert!(draft.session_id.is_none());
+    }
+
+    /// tokio's bounded channel panics on zero; the Result-returning
+    /// constructor must refuse instead (AGENTS.md: no panics in production).
+    #[tokio::test]
+    async fn zero_capacity_is_an_error_not_a_panic() {
+        let err = match PgLedger::spawn_with_capacity("postgres://u:p@192.0.2.1:5432/x", 0) {
+            Ok(_) => panic!("zero capacity must refuse"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("capacity"), "{err}");
     }
 
     /// The queue's ~40 MiB worst case requires EVERY field bounded — an

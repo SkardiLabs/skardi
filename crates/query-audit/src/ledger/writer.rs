@@ -5,18 +5,31 @@
 //! loss is accepted by design and never silent (see the module doc for the
 //! contract).
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 
 use super::{FLUSH_BATCH_ROWS, FLUSH_TIMEOUT, LedgerRow, METRICS, WriterControl, queries};
 
 pub(crate) async fn run(
     pool: PgPool,
     mut rx: Receiver<LedgerRow>,
-    control: std::sync::Arc<WriterControl>,
+    control: Arc<WriterControl>,
+    done: watch::Sender<bool>,
 ) {
+    // The completion latch every shutdown() caller awaits. A drop guard,
+    // not a final statement, so it fires on EVERY exit: graceful return,
+    // panic unwind, and task drop at runtime teardown.
+    struct Done(watch::Sender<bool>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let _ = self.0.send(true);
+        }
+    }
+    let _done = Done(done);
     let mut batch: Vec<LedgerRow> = Vec::with_capacity(FLUSH_BATCH_ROWS);
     loop {
         batch.clear();

@@ -128,9 +128,11 @@ acting on *intentions*: when every weekday morning ends with the same GitHub +
 Slack queries, each declaring `purpose: "daily standup"`, the pattern isn't a
 pipeline — it's a routine, and any harness that can run an agent on a schedule
 (Claude Code routines, a cron-driven CLI run) can have the standup drafted
-before anyone asks. And because the ledger is one SQLite file, you can hand a
-window of it to an LLM and ask what keeps being needed that nobody turned into a
-tool — recurring intentions the user hasn't noticed yet. One boundary is yours
+before anyone asks. And because the ledger is one SQLite file (or one
+Postgres database, via `SKARDI_QUERY_AUDIT_PG_DSN` — same fail-closed
+contract, storage swapped), you can hand a window of it to an LLM and ask
+what keeps being needed that nobody turned into a tool — recurring
+intentions the user hasn't noticed yet. One boundary is yours
 to set: ledger rows carry raw SQL, literals included, so keep that analysis on a
 local model or redact first — sending a window to a hosted LLM should be a
 deliberate opt-in, not a default. Both land as skills on
