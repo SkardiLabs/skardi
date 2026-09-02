@@ -120,6 +120,7 @@ skardi run weekly-churn -p window='7 days'
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
 # same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
+# from a source checkout until `skardi mcp` ships in a tagged release
 skardi mcp
 ```
 
@@ -165,21 +166,51 @@ scratch.
 
 ## Install
 
-**Claude Code** — the fastest path. A skill that stands the whole thing up for
-you:
+Two skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
+turns a folder of documents — or a datastore you already run — into governed,
+searchable context served over HTTP by `skardi-server`: hybrid search (vector +
+FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
+pointed at Postgres + pgvector, MongoDB, or Lance.
+[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
+teaches the agent to answer questions from a `skardi-server` you already run.
+
+Both run on every [Agent Skills](https://agentskills.io/) host below. They
+differ only in where the skill directory goes.
+
+**Claude Code** installs from the marketplace:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
 /plugin install auto-context@skardi-skills
 ```
 
-[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context)
-turns a folder of documents — or a datastore you already run — into governed,
-searchable context served over HTTP by `skardi-server`: hybrid search (vector +
-FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
-pointed at Postgres + pgvector, MongoDB, or Lance. The same skill also runs on
-Codex, Cursor, Pi, dsh, OpenClaw, and Hermes; per-host installation instructions
-are in the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+Every other host installs from a checkout:
+
+```bash
+git clone https://github.com/SkardiLabs/skardi-skills.git && cd skardi-skills
+```
+
+**Codex, Cursor, Pi, dsh and OpenCode** all read the cross-tool
+`~/.agents/skills/` convention, so one copy covers all five:
+
+```bash
+mkdir -p ~/.agents/skills
+cp -r auto-context/skills/auto-context ~/.agents/skills/auto-context
+cp -r retrieval/skills/retrieval ~/.agents/skills/retrieval
+```
+
+**[OpenClaw](https://docs.openclaw.ai/cli/skills)** installs through its own CLI
+instead of copying, and **[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)**
+reads `~/.hermes/skills/`:
+
+```bash
+openclaw skills install ./auto-context/skills/auto-context   # add --global for every workspace
+mkdir -p ~/.hermes/skills && cp -r auto-context/skills/auto-context ~/.hermes/skills/auto-context
+```
+
+Per-host native directories, project-scoped installs and the Hermes
+`external_dirs` option are covered in the
+[skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
 **CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
 build from source — the one-liner below has no published artifact there):
