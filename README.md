@@ -226,9 +226,20 @@ sudo mv skardi /usr/local/bin/
 
 ```bash
 git clone https://github.com/SkardiLabs/skardi.git && cd skardi
-cargo build --release -p skardi-server     # add --features rag for embedding + chunk UDFs
-cargo install --locked --path crates/cli   # the CLI, from the same checkout
+cargo build --release -p skardi-server --features candle,chunking   # local embeddings + chunk(); pure Rust
+cargo install --locked --path crates/cli                            # the CLI, from the same checkout
 ```
+
+That gives the retrieval skills what they need — `chunk()` plus a local
+embedding UDF — and builds with cargo alone. (`chunking` is already a default
+server feature; naming it keeps the line correct against older tags.)
+
+**`--features rag` widens that to all four embedding backends, and one of them
+— `gguf` — compiles llama.cpp through `cmake`, so that build needs `cmake` and a
+C++ toolchain on the machine.** Reach for `rag` when you want `gguf`, `onnx` or
+`remote_embed`; otherwise the line above is the cheaper build. Or skip building
+altogether and run a published server image that ships the embedding backends
+(see **Docker & cloud** under More).
 
 ---
 
