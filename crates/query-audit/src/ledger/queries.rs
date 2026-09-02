@@ -49,14 +49,21 @@ pub const DATABASE_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM pg_database WHER
 /// See [`LEDGER_DB_NAME`] for why the name is spelled twice.
 pub const CREATE_DATABASE: &str = r#"CREATE DATABASE "skardi_ledger""#;
 
-/// The `query_ledger` schema — the SINGLE SOURCE OF TRUTH. This module runs
-/// no DDL itself (its writers connect as roles that deliberately cannot);
-/// the consumer's migration path applies it, and the consumer's migration
-/// file must stay BYTE-IDENTICAL to this constant (skardi-cloud pins that
-/// with a test against its sqlx migration, whose checksum is itself locked).
-/// Changing this string is a schema migration: coordinate with every
-/// consumer before touching it.
-pub const QUERY_LEDGER_DDL: &str = r#"-- The cloud query ledger (design: 2026-08-30-query-ledger-postgres-design.md §3).
+/// Migration 0001 — the `query_ledger` schema's first (and so far only)
+/// migration, and the single source of truth for it. This module runs no
+/// DDL itself (its writers connect as roles that deliberately cannot); the
+/// consumer's migration path applies it, and each consumer migration file
+/// must stay BYTE-IDENTICAL to its versioned constant here (skardi-cloud
+/// pins that with a test against its sqlx migration, whose checksum is
+/// itself locked and append-only).
+///
+/// **This constant is IMMUTABLE once a consumer has shipped it** — exactly
+/// like the migration files it feeds. A schema change is a NEW versioned
+/// constant (`QUERY_LEDGER_MIGRATION_0002`, …) that consumers append as a
+/// new migration and pin the same way; the full schema is the ordered
+/// application of every constant. Editing an existing constant would break
+/// every consumer's locked checksum and is never the answer.
+pub const QUERY_LEDGER_MIGRATION_0001: &str = r#"-- The cloud query ledger (design: 2026-08-30-query-ledger-postgres-design.md §3).
 --
 -- One row per DECIDED statement — status ∈ (succeeded, failed, refused);
 -- there is no `started` phase and no orphan reconciliation, because the
@@ -95,7 +102,7 @@ CREATE TABLE query_ledger (
 ALTER TABLE query_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE query_ledger FORCE ROW LEVEL SECURITY;
 
-CREATE INDEX ledger_ws_created_idx  ON query_ledger (workspace_id, created_at DESC);
-CREATE INDEX ledger_ws_session_idx  ON query_ledger (workspace_id, session_id, created_at DESC);
+CREATE INDEX ledger_ws_created_idx  ON query_ledger (workspace_id, created_at DESC, id DESC);
+CREATE INDEX ledger_ws_session_idx  ON query_ledger (workspace_id, session_id, created_at DESC, id DESC);
 CREATE INDEX ledger_org_created_idx ON query_ledger (org_id, created_at DESC);
 "#;

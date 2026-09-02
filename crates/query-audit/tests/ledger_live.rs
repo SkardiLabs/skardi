@@ -5,7 +5,7 @@
 //! Gated exactly like `pg_live.rs`: `#[ignore]` by default, run with
 //! `SKARDI_QUERY_AUDIT_LIVE_URL=postgres://… cargo test -- --ignored`.
 //! Each test creates its own throwaway database and applies
-//! [`queries::QUERY_LEDGER_DDL`] — the module runs no DDL itself.
+//! [`queries::QUERY_LEDGER_MIGRATION_0001`] — the module runs no DDL itself.
 
 use serde_json::{Value, json};
 use skardi_query_audit::ledger::{self, PgLedger, RowDraft, RowStatus, queries, read};
@@ -52,7 +52,7 @@ async fn fresh_db(url: &str) -> (String, sqlx::PgPool) {
     parsed.set_path(&format!("/{db}"));
     let dsn = parsed.to_string();
     let pool = sqlx::PgPool::connect(&dsn).await.expect("connect test db");
-    sqlx::raw_sql(queries::QUERY_LEDGER_DDL)
+    sqlx::raw_sql(queries::QUERY_LEDGER_MIGRATION_0001)
         .execute(&pool)
         .await
         .expect("apply the ledger DDL");
@@ -519,4 +519,114 @@ async fn a_nul_bearing_row_cannot_poison_its_batch() {
     assert_eq!(sql, "SELECT '\u{FFFD}'");
     assert_eq!(err, "bad\u{FFFD}input");
     assert!(session.is_none(), "the NUL session id was dropped");
+}
+
+/// The P1 regression: a row written PAST the assembly (DDL has no length
+/// constraints) with a body far over the 8 MiB budget must not livelock the
+/// cursor. The read path re-applies the ingestion bounds, so the monster
+/// row comes back bounded (sql cut to 32 KiB with the flag forced true,
+/// oversized ai_context elided), the page stays under budget, and the
+/// keyset advances to the rows behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn a_monster_row_reads_back_bounded_and_never_livelocks() {
+    let Some(url) = live_url() else { return };
+    let (_dsn, pool) = fresh_db(&url).await;
+    // Newest first: the monster is the FIRST row of the page.
+    sqlx::query(
+        "INSERT INTO query_ledger (org_id, workspace_id, user_id, request_id, \
+         created_at, finished_at, sql, statement_kind, max_rows, status, error, ai_context) \
+         VALUES ('acme', $1, 'u', 'r-old', now() - interval '1 hour', now(), \
+                 'SELECT 1', 'query', 10, 'succeeded', NULL, NULL)",
+    )
+    .bind(WS)
+    .execute(&pool)
+    .await
+    .expect("normal row");
+    sqlx::query(
+        "INSERT INTO query_ledger (org_id, workspace_id, user_id, request_id, \
+         created_at, finished_at, sql, statement_kind, max_rows, status, error, ai_context) \
+         VALUES ('acme', $1, 'u', 'r-monster', now(), now(), \
+                 repeat('m', 10 * 1024 * 1024), 'query', 10, 'failed', \
+                 repeat('e', 9 * 1024 * 1024), \
+                 jsonb_build_object('blob', repeat('b', 64 * 1024)))",
+    )
+    .bind(WS)
+    .execute(&pool)
+    .await
+    .expect("monster row");
+
+    let page = read::list_page(&pool, WS, read::PageQuery::default())
+        .await
+        .expect("the monster must not fail the page");
+    assert!(
+        page.to_string().len() <= read::RESPONSE_MAX_BYTES,
+        "the body must fit the budget even with the monster first"
+    );
+    let rows = page["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "the page advances past the monster");
+    assert_eq!(rows[0]["request_id"], "r-monster");
+    assert!(rows[0]["sql"].as_str().unwrap().len() <= 32 * 1024);
+    assert_eq!(rows[0]["sql_truncated"], json!(true), "the cut is declared");
+    assert!(
+        rows[0]["ai_context"].is_null(),
+        "over-bound document elided"
+    );
+    assert!(rows[0]["error"].as_str().unwrap().len() <= 4 * 1024);
+    assert_eq!(rows[1]["request_id"], "r-old");
+}
+
+/// The P2 regression: schema drift (here: a mutant table whose max_rows is
+/// TEXT) must surface as ReadError::Unavailable — the designed 503 — never
+/// a decode panic that kills the request task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn schema_drift_is_a_read_error_not_a_panic() {
+    let Some(url) = live_url() else { return };
+    // A bare database WITHOUT the real DDL: build a mutant query_ledger
+    // whose columns exist but max_rows decodes as TEXT.
+    let (_dsn, pool) = {
+        // fresh_db applies the real DDL; make our own db instead.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let db = format!(
+            "lgrmut_{}_{}_{}",
+            std::process::id(),
+            std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let boot = sqlx::PgPool::connect(&url).await.expect("connect server");
+        sqlx::raw_sql(&format!(r#"CREATE DATABASE "{db}""#))
+            .execute(&boot)
+            .await
+            .expect("create");
+        boot.close().await;
+        let mut parsed = url::Url::parse(&url).expect("url");
+        parsed.set_path(&format!("/{db}"));
+        let dsn = parsed.to_string();
+        let pool = sqlx::PgPool::connect(&dsn).await.expect("connect");
+        (dsn, pool)
+    };
+    sqlx::raw_sql(
+        "CREATE TABLE query_ledger (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            org_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+            user_id TEXT NOT NULL, request_id TEXT NOT NULL, session_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ NOT NULL,
+            sql TEXT NOT NULL, sql_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+            ai_context JSONB, statement_kind TEXT NOT NULL,
+            max_rows TEXT NOT NULL, status TEXT NOT NULL,
+            row_count BIGINT, error TEXT);
+         INSERT INTO query_ledger (org_id, workspace_id, user_id, request_id,
+            created_at, finished_at, sql, statement_kind, max_rows, status)
+         VALUES ('acme', 'ws-core', 'u', 'r-drift', now(), now(),
+                 'SELECT 1', 'query', 'not-a-number', 'succeeded');",
+    )
+    .execute(&pool)
+    .await
+    .expect("mutant schema");
+
+    let err = read::list_page(&pool, WS, read::PageQuery::default())
+        .await
+        .expect_err("drift must be an error, not a panic");
+    assert!(matches!(err, read::ReadError::Unavailable(_)), "got {err}");
 }

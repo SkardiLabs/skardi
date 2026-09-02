@@ -20,8 +20,9 @@
 //! [`QueryAuditStore`]; if you want "learn-loop analytics that never costs a
 //! query", you want this.
 //!
-//! Schema: the [`queries::QUERY_LEDGER_DDL`] table (`query_ledger`), applied
-//! by the DOWNSTREAM deployment's migration path — this module runs no DDL
+//! Schema: the `query_ledger` table, versioned migration constants in
+//! [`queries`] (`QUERY_LEDGER_MIGRATION_0001`, …), applied by the DOWNSTREAM
+//! deployment's migration path — this module runs no DDL
 //! (its writers connect as roles that deliberately cannot).
 
 pub mod queries;
@@ -106,40 +107,48 @@ impl RowStatus {
 /// field is bounded and coerced**: `sql` truncated to [`SQL_MAX_BYTES`],
 /// `error` to [`ERROR_MAX_BYTES`], `max_rows` clamped into `i64` — so a batch
 /// can never be poisoned by one row.
+/// Fields are deliberately NOT public: the bound is a TYPE invariant.
+/// The only way to obtain a `LedgerRow` is [`RowDraft::capture`] →
+/// [`RowDraft::finish`], so a row handed to [`PgLedger::record`] is bounded
+/// by construction — public fields would let any caller bypass assembly and
+/// break both the ~40 MiB queue worst case and the no-poisoned-batch
+/// guarantee.
 #[derive(Debug, Clone)]
 pub struct LedgerRow {
-    pub org_id: String,
-    pub workspace_id: String,
-    pub user_id: String,
-    pub request_id: String,
-    pub session_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub finished_at: DateTime<Utc>,
-    pub sql: String,
-    pub sql_truncated: bool,
-    pub ai_context: Option<Value>,
-    pub statement_kind: &'static str,
-    pub max_rows: i64,
-    pub status: RowStatus,
-    pub row_count: Option<i64>,
-    pub error: Option<String>,
+    pub(crate) org_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) user_id: String,
+    pub(crate) request_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) finished_at: DateTime<Utc>,
+    pub(crate) sql: String,
+    pub(crate) sql_truncated: bool,
+    pub(crate) ai_context: Option<Value>,
+    pub(crate) statement_kind: &'static str,
+    pub(crate) max_rows: i64,
+    pub(crate) status: RowStatus,
+    pub(crate) row_count: Option<i64>,
+    pub(crate) error: Option<String>,
 }
 
 /// The identity + request facts captured once the caller's identity gate has
 /// passed. The `sql` snapshot is truncated at capture, so a pending context
 /// never pins a multi-MiB statement.
+/// Same visibility rule as [`LedgerRow`]: constructed only by
+/// [`RowDraft::capture`], so the bounds cannot be bypassed.
 #[derive(Debug, Clone)]
 pub struct RowDraft {
-    pub org_id: String,
-    pub workspace_id: String,
-    pub user_id: String,
-    pub request_id: String,
-    pub session_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub sql: String,
-    pub sql_truncated: bool,
-    pub ai_context: Option<Value>,
-    pub max_rows: i64,
+    pub(crate) org_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) user_id: String,
+    pub(crate) request_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) sql: String,
+    pub(crate) sql_truncated: bool,
+    pub(crate) ai_context: Option<Value>,
+    pub(crate) max_rows: i64,
 }
 
 impl RowDraft {

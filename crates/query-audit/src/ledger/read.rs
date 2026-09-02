@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
-use super::queries;
+use super::{ERROR_MAX_BYTES, SQL_MAX_BYTES, queries};
 
 pub const LIMIT_DEFAULT: i64 = 100;
 pub const LIMIT_MAX: i64 = 500;
@@ -23,6 +23,16 @@ pub const LIMIT_MAX: i64 = 500;
 /// turns into a deterministic 413 — and the same cursor fetches the same
 /// page, so the caller is livelocked until the rows age out.
 pub const RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read-side bound on any single text field. The DDL deliberately carries
+/// no length constraints (ingestion bounds live at assembly), so a row
+/// written PAST the assembly — by hand, by another tool, by a future writer
+/// with a bug — can be arbitrarily large. The read path re-applies the
+/// ingestion bounds when serializing, which makes the 8 MiB body budget
+/// STRUCTURAL: every emitted row is ≤ ~50 KiB, so even the page's first row
+/// can never overflow the budget, and the keyset always advances past a
+/// monster row instead of livelocking the cursor on it.
+const READ_FIELD_MAX_BYTES: usize = 4 * 1024;
 
 /// Headroom [`list_page`] holds back from [`RESPONSE_MAX_BYTES`] for
 /// everything that is not a row: the envelope framing
@@ -134,34 +144,25 @@ pub async fn list_page(pool: &PgPool, workspace: &str, q: PageQuery) -> Result<V
     let mut last_key: Option<(DateTime<Utc>, i64)> = None;
     let fetched = rows.len();
     for row in rows {
-        let id: i64 = row.get("id");
-        let created_at: DateTime<Utc> = row.get("created_at");
-        let finished_at: DateTime<Utc> = row.get("finished_at");
-        let obj = json!({
-            "id": id,
-            "org_id": row.get::<String, _>("org_id"),
-            "workspace_id": row.get::<String, _>("workspace_id"),
-            "user_id": row.get::<String, _>("user_id"),
-            "request_id": row.get::<String, _>("request_id"),
-            "session_id": row.get::<Option<String>, _>("session_id"),
-            "created_at": created_at.to_rfc3339(),
-            "finished_at": finished_at.to_rfc3339(),
-            "sql": row.get::<String, _>("sql"),
-            "sql_truncated": row.get::<bool, _>("sql_truncated"),
-            "ai_context": row.get::<Option<Value>, _>("ai_context"),
-            "statement_kind": row.get::<String, _>("statement_kind"),
-            "max_rows": row.get::<i64, _>("max_rows"),
-            "status": row.get::<String, _>("status"),
-            "row_count": row.get::<Option<i64>, _>("row_count"),
-            "error": row.get::<Option<String>, _>("error"),
-        });
+        // `try_get`, never `get`: `get` PANICS on a missing column, a type
+        // mismatch, or a decode failure — a momentary migration/engine skew
+        // downstream must surface as the designed 503, not kill the task.
+        let obj = serialize_row(&row).map_err(ReadError::Unavailable)?;
+        let id = obj["id"].as_i64().expect("serialize_row sets id");
+        let created_at = obj["__created_at_key"]
+            .as_i64()
+            .expect("serialize_row sets the key");
+        let created_at =
+            DateTime::<Utc>::from_timestamp_micros(created_at).expect("stored timestamp");
+        let obj = strip_key(obj);
         // Byte cap: elide from the tail once the budget is spent. The
-        // budget is the WHOLE body's, not the rows': the gateway 413s one
-        // byte over `RESPONSE_MAX_BYTES` and the same cursor re-fetches the
-        // same page, so under-counting the envelope turns a full page into
-        // a permanent 413 (a ~226-row page of 32 KiB-sql rows gets there in
-        // ordinary use). Each row is charged its serialized length plus its
+        // budget is the WHOLE body's, not the rows': the consumer's relay
+        // 413s one byte over `RESPONSE_MAX_BYTES` and the same cursor
+        // re-fetches the same page, so an over-budget body is a permanent
+        // 413. Each row is charged its serialized length plus its
         // separating comma; the fixed framing comes out of the reserve.
+        // `serialize_row` bounds every field ([`READ_FIELD_MAX_BYTES`]), so
+        // even the FIRST row fits and the loop always makes progress.
         let row_bytes = obj.to_string().len() + 1;
         if bytes + row_bytes > RESPONSE_MAX_BYTES - ENVELOPE_RESERVE_BYTES && !out.is_empty() {
             truncated = true;
@@ -184,6 +185,67 @@ pub async fn list_page(pool: &PgPool, workspace: &str, q: PageQuery) -> Result<V
         "truncated": truncated,
         "next_cursor": next_cursor,
     }))
+}
+
+/// One row → the wire object, every step fallible and every text field
+/// bounded (see [`READ_FIELD_MAX_BYTES`]). Carries the keyset key in a
+/// private `__created_at_key` member that [`strip_key`] removes, so the
+/// caller never sees it and the loop never re-parses RFC 3339.
+fn serialize_row(row: &sqlx::postgres::PgRow) -> Result<Value, sqlx::Error> {
+    fn bound(s: String, max: usize) -> String {
+        if s.len() <= max {
+            return s;
+        }
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    }
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    let finished_at: DateTime<Utc> = row.try_get("finished_at")?;
+    let sql: String = row.try_get("sql")?;
+    let sql_over = sql.len() > SQL_MAX_BYTES;
+    let ai_context: Option<Value> = row.try_get("ai_context")?;
+    // The same drop-not-truncate rule as ingestion: an over-bound document
+    // (only writable past the assembly) is elided whole.
+    let ai_context = ai_context.filter(|c| {
+        serde_json::to_vec(c)
+            .map(|v| v.len() <= ERROR_MAX_BYTES)
+            .unwrap_or(false)
+    });
+    Ok(json!({
+        "id": row.try_get::<i64, _>("id")?,
+        "org_id": bound(row.try_get("org_id")?, READ_FIELD_MAX_BYTES),
+        "workspace_id": bound(row.try_get("workspace_id")?, READ_FIELD_MAX_BYTES),
+        "user_id": bound(row.try_get("user_id")?, READ_FIELD_MAX_BYTES),
+        "request_id": bound(row.try_get("request_id")?, READ_FIELD_MAX_BYTES),
+        "session_id": row
+            .try_get::<Option<String>, _>("session_id")?
+            .map(|s| bound(s, READ_FIELD_MAX_BYTES)),
+        "created_at": created_at.to_rfc3339(),
+        "finished_at": finished_at.to_rfc3339(),
+        "sql": bound(sql, SQL_MAX_BYTES),
+        // True when ingestion truncated it OR the read had to: either way
+        // the reader is told the text is not the whole statement.
+        "sql_truncated": row.try_get::<bool, _>("sql_truncated")? || sql_over,
+        "ai_context": ai_context,
+        "statement_kind": bound(row.try_get("statement_kind")?, READ_FIELD_MAX_BYTES),
+        "max_rows": row.try_get::<i64, _>("max_rows")?,
+        "status": bound(row.try_get("status")?, READ_FIELD_MAX_BYTES),
+        "row_count": row.try_get::<Option<i64>, _>("row_count")?,
+        "error": row
+            .try_get::<Option<String>, _>("error")?
+            .map(|e| bound(e, ERROR_MAX_BYTES)),
+        "__created_at_key": created_at.timestamp_micros(),
+    }))
+}
+
+fn strip_key(mut obj: Value) -> Value {
+    obj.as_object_mut()
+        .expect("serialize_row emits an object")
+        .remove("__created_at_key");
+    obj
 }
 
 #[cfg(test)]
