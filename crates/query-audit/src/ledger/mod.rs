@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sqlx::postgres::PgPoolOptions;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc, watch};
@@ -52,6 +53,79 @@ pub const ERROR_MAX_BYTES: usize = 4 * 1024;
 /// Queue capacity in ROWS; with every field bounded at assembly the byte
 /// worst case is ~40 MiB per process.
 pub const QUEUE_CAPACITY: usize = 1024;
+
+/// The transport bound the read path's SELECT enforces on
+/// `ai_context::text` (2× [`ERROR_MAX_BYTES`]). Ingestion guarantees it:
+/// [`RowDraft::capture`] drops any document whose PG-CANONICAL text form
+/// (estimated by [`jsonb_text_len_estimate`]) exceeds this, so the SELECT's
+/// CASE can only ever null out-of-band writes, never a row this module
+/// accepted.
+pub const AI_CONTEXT_TRANSPORT_MAX_BYTES: usize = 2 * ERROR_MAX_BYTES;
+
+/// Estimate the length of Postgres's `jsonb::text` rendering of `v`. Two
+/// things grow past the compact serde form and both are covered: a space
+/// after every `:` and `,`, and NUMERIC CANONICALIZATION — jsonb stores
+/// numbers as `numeric` and prints them as plain decimals, so a 5-byte
+/// `1e300` becomes 301 digits, which no fixed multiplier on the compact
+/// length can bound. Escapes and key ordering only shrink or hold, so the
+/// estimate upper-bounds the real rendering for ingestion's purposes.
+fn jsonb_text_len_estimate(v: &Value) -> usize {
+    match v {
+        Value::Null => 4,
+        Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(n) => decimal_len_estimate(&n.to_string()),
+        Value::String(s) => serde_json::to_string(s).map(|t| t.len()).unwrap_or(2),
+        Value::Array(a) => {
+            let inner: usize = a.iter().map(jsonb_text_len_estimate).sum();
+            2 + inner + a.len().saturating_sub(1) * 2
+        }
+        Value::Object(o) => {
+            let inner: usize = o
+                .iter()
+                .map(|(k, val)| {
+                    serde_json::to_string(k).map(|t| t.len()).unwrap_or(2)
+                        + 2
+                        + jsonb_text_len_estimate(val)
+                })
+                .sum();
+            2 + inner + o.len().saturating_sub(1) * 2
+        }
+    }
+}
+
+/// Length of the plain-decimal expansion of a JSON number given its compact
+/// (ryu) rendering. `1e300` → 301, `1.5e-7` → 9-ish (`0.00000015`); plain
+/// forms pass through. Saturating, so absurd exponents cannot overflow.
+fn decimal_len_estimate(compact: &str) -> usize {
+    let lower = compact.to_ascii_lowercase();
+    let Some((mantissa, exp)) = lower.split_once('e') else {
+        return compact.len();
+    };
+    let Ok(exp) = exp.parse::<i64>() else {
+        // An exponent too large for i64 could not be a finite f64 anyway;
+        // if one ever appears, erring HUGE drops the document — the safe
+        // direction for a bound.
+        return usize::MAX;
+    };
+    let sign = usize::from(mantissa.starts_with('-'));
+    let digits = mantissa.chars().filter(|c| c.is_ascii_digit()).count();
+    if exp >= 0 {
+        let exp = usize::try_from(exp).unwrap_or(usize::MAX);
+        // Integer part grows to exp+1 digits (or keeps its own), plus room
+        // for a fraction remainder and its dot.
+        sign + digits.max(exp.saturating_add(1)).saturating_add(2)
+    } else {
+        let exp = usize::try_from(-exp).unwrap_or(usize::MAX);
+        // 0.<zeros><digits>
+        sign + 2usize.saturating_add(exp).saturating_add(digits)
+    }
+}
 
 /// Bound on each identity field (`org_id`, `workspace_id`, `user_id`,
 /// `request_id`) at assembly. Production values are gate-validated slugs a
@@ -204,6 +278,12 @@ impl RowDraft {
                     // WHOLE document rather than mutating it — an edited JSON
                     // document is a different document.
                     && !json_contains_nul(c)
+                    // The PG-canonical rendering must fit the read path's
+                    // transport bound: jsonb numeric canonicalization can
+                    // expand a compact-legal document without limit (1e300
+                    // is 5 bytes compact, 301 canonical), and a document the
+                    // read path would have to null was never worth queueing.
+                    && jsonb_text_len_estimate(c) <= AI_CONTEXT_TRANSPORT_MAX_BYTES
             })
             .cloned();
         Self {
@@ -359,9 +439,7 @@ impl PgLedger {
             "the ledger writer needs a running Tokio runtime; construct the \
              ledger from within one",
         )?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(dsn)?;
+        let pool = PgPoolOptions::new().max_connections(2).connect_lazy(dsn)?;
         let (tx, rx) = mpsc::channel(capacity);
         let (done_tx, done_rx) = watch::channel(false);
         let writer = Arc::new(WriterControl {
@@ -490,6 +568,44 @@ mod tests {
         let ai = json!({"session_id": "s".repeat(201)});
         let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ai), None, 1000);
         assert!(draft.session_id.is_none());
+    }
+
+    /// jsonb numeric canonicalization defeats any fixed multiplier: 1e300 is
+    /// 5 compact bytes and 301 canonical digits. Ingestion must drop what
+    /// the transport bound would null, so the read path never silently
+    /// loses an accepted document.
+    #[test]
+    fn exponent_heavy_ai_context_is_dropped_at_ingestion() {
+        // 500 × "1e300," ≈ 3.5 KB compact (passes the compact bound),
+        // canonical ≈ 150 KB (fails transport).
+        let bomb = Value::Array(vec![serde_json::json!(1e300); 500]);
+        assert!(serde_json::to_vec(&bomb).unwrap().len() <= ERROR_MAX_BYTES);
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&bomb), None, 1000);
+        assert!(
+            draft.ai_context.is_none(),
+            "canonical form exceeds transport"
+        );
+
+        // A normal near-limit document still passes (its whitespace-only
+        // expansion fits the 2x transport bound).
+        let mut obj = serde_json::Map::new();
+        for i in 0..330 {
+            obj.insert(format!("key{i:04}"), serde_json::json!(1));
+        }
+        let ok = Value::Object(obj);
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ok), None, 1000);
+        assert!(draft.ai_context.is_some());
+    }
+
+    /// The decimal estimator upper-bounds PG's rendering for the shapes
+    /// that matter.
+    #[test]
+    fn decimal_estimates_cover_canonical_expansion() {
+        assert!(decimal_len_estimate("1e300") >= 301);
+        assert!(decimal_len_estimate("1.5e-7") >= "0.00000015".len());
+        assert_eq!(decimal_len_estimate("42"), 2);
+        assert_eq!(decimal_len_estimate("-3.25"), 5);
+        assert!(decimal_len_estimate("1e18446744073709551615") > 1_000_000);
     }
 
     /// `tokio::spawn` panics outside a runtime; the synchronous constructor
