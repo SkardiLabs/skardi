@@ -32,8 +32,10 @@ pub mod writer;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -342,22 +344,31 @@ impl PgLedger {
     /// queue-full contract — drop + count, never block — is testable without
     /// enqueueing a thousand rows against a hung writer.
     pub fn spawn_with_capacity(dsn: &str, capacity: usize) -> anyhow::Result<Self> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(dsn)?;
         if capacity == 0 {
             // tokio's bounded channel PANICS on zero; this constructor
             // advertises Result, so invalid configuration must not be able
             // to take the process down.
             anyhow::bail!("ledger queue capacity must be >= 1 (got 0)");
         }
+        // Same reasoning as the capacity check, and it must come BEFORE the
+        // pool: `tokio::spawn` AND sqlx's `connect_lazy` (whose pool spawns
+        // its reaper) both PANIC outside a runtime, and a synchronous
+        // Result-returning constructor must refuse invalid initialization,
+        // not abort the process.
+        let runtime = Handle::try_current().context(
+            "the ledger writer needs a running Tokio runtime; construct the \
+             ledger from within one",
+        )?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(dsn)?;
         let (tx, rx) = mpsc::channel(capacity);
         let (done_tx, done_rx) = watch::channel(false);
         let writer = Arc::new(WriterControl {
             drain: Notify::new(),
             done: done_rx,
         });
-        tokio::spawn(writer::run(pool.clone(), rx, writer.clone(), done_tx));
+        runtime.spawn(writer::run(pool.clone(), rx, writer.clone(), done_tx));
         Ok(Self { tx, pool, writer })
     }
 
@@ -481,6 +492,18 @@ mod tests {
         assert!(draft.session_id.is_none());
     }
 
+    /// `tokio::spawn` panics outside a runtime; the synchronous constructor
+    /// must refuse instead — a plain #[test] has no ambient runtime, which
+    /// is exactly the failing caller.
+    #[test]
+    fn constructing_outside_a_runtime_is_an_error_not_a_panic() {
+        let err = match PgLedger::spawn("postgres://u:p@192.0.2.1:5432/x") {
+            Ok(_) => panic!("must refuse without a runtime"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Tokio runtime"), "{err}");
+    }
+
     /// tokio's bounded channel panics on zero; the Result-returning
     /// constructor must refuse instead (AGENTS.md: no panics in production).
     #[tokio::test]
@@ -517,8 +540,11 @@ mod tests {
         assert!(q.contains(&format!("left(sql, {SQL_MAX_BYTES})")));
         assert!(q.contains(&format!("octet_length(sql) > {SQL_MAX_BYTES}")));
         assert!(q.contains(&format!("left(error, {ERROR_MAX_BYTES})")));
+        // TRANSPORT bound: 2× ingestion, because jsonb::text re-adds
+        // whitespace the compact form (which ingestion measured) lacks.
         assert!(q.contains(&format!(
-            "octet_length(ai_context::text) <= {ERROR_MAX_BYTES}"
+            "octet_length(ai_context::text) <= {}",
+            2 * ERROR_MAX_BYTES
         )));
         for col in [
             "org_id",

@@ -31,6 +31,15 @@ pub const INSERT_HEAD: &str = "INSERT INTO query_ledger \
 /// cut is still declared to the reader. The literals must equal
 /// `SQL_MAX_BYTES` / `ERROR_MAX_BYTES` / the read field bound — pinned by a
 /// unit test.
+///
+/// The `ai_context` CASE is a TRANSPORT bound at 2× the ingestion limit,
+/// not the limit itself: Postgres renders `jsonb::text` with spaces after
+/// `:` and `,`, so a document whose COMPACT form fits 4096 bytes (which is
+/// what ingestion accepted) can measure larger here — nulling at 4096 would
+/// silently lose valid context. 2× safely covers the expansion (a compact
+/// 4096-byte document holds < 2048 separators, so < +2048 bytes of
+/// whitespace); the byte-precise compact check re-runs in Rust after
+/// decoding, which stays the authority.
 pub const SELECT_PAGE: &str = "SELECT id, \
             left(org_id, 4096) AS org_id, \
             left(workspace_id, 4096) AS workspace_id, \
@@ -40,7 +49,7 @@ pub const SELECT_PAGE: &str = "SELECT id, \
             created_at, finished_at, \
             left(sql, 32768) AS sql, \
             (sql_truncated OR octet_length(sql) > 32768) AS sql_truncated, \
-            CASE WHEN octet_length(ai_context::text) <= 4096 THEN ai_context \
+            CASE WHEN octet_length(ai_context::text) <= 8192 THEN ai_context \
                  ELSE NULL END AS ai_context, \
             left(statement_kind, 4096) AS statement_kind, \
             max_rows, status, row_count, \

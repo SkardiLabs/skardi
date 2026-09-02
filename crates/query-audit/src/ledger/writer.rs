@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
 
@@ -56,7 +56,7 @@ pub(crate) async fn run(
 }
 
 async fn flush(pool: &PgPool, batch: &[LedgerRow]) {
-    let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(queries::INSERT_HEAD);
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(queries::INSERT_HEAD);
     qb.push_values(batch, |mut b, row| {
         // Binding order = queries::INSERT_HEAD column order.
         b.push_bind(&row.org_id)

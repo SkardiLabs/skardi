@@ -720,3 +720,60 @@ async fn concurrent_shutdown_callers_all_await_the_drain() {
         .load(std::sync::atomic::Ordering::Relaxed);
     assert!(after > before, "the drain completed before either returned");
 }
+
+/// The ai_context transport bound (review): Postgres renders jsonb::text
+/// with whitespace the compact form lacks, so a document that PASSED the
+/// 4 KiB compact ingestion bound can measure larger in SQL — it must still
+/// read back, not silently null. Built with enough small members that the
+/// jsonb::text form crosses 4096 while the compact form stays under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn near_limit_ai_context_survives_the_read_bound() {
+    let Some(url) = live_url() else { return };
+    let (dsn, pool) = fresh_db(&url).await;
+    // ~330 members of "keyNNNN":1 — compact ≈ 3960 bytes (< 4096), while
+    // jsonb::text adds a space after every ':' and ',' ≈ +660 (> 4096).
+    let mut obj = serde_json::Map::new();
+    for i in 0..330 {
+        obj.insert(format!("key{i:04}"), json!(1));
+    }
+    let ctx = Value::Object(obj);
+    let compact = serde_json::to_vec(&ctx).unwrap().len();
+    assert!(compact <= 4096, "fixture must pass ingestion: {compact}");
+
+    let pg = PgLedger::spawn(&dsn).expect("pool");
+    let draft = RowDraft::capture(
+        "acme",
+        WS,
+        "user:acme/u1",
+        "r-near",
+        "SELECT 1",
+        Some(&ctx),
+        None,
+        1000,
+    );
+    pg.record(draft.finish(RowStatus::Succeeded, Some(1), None));
+    pg.shutdown().await;
+
+    // Prove the premise: the stored jsonb's text form exceeds the old bound.
+    let text_len: i32 =
+        sqlx::query_scalar("SELECT octet_length(ai_context::text) FROM query_ledger")
+            .fetch_one(&pool)
+            .await
+            .expect("len");
+    assert!(
+        text_len > 4096,
+        "fixture must exercise the expansion: {text_len}"
+    );
+
+    let page = read::list_page(&pool, WS, read::PageQuery::default())
+        .await
+        .expect("page");
+    let row = &page["rows"].as_array().unwrap()[0];
+    assert!(
+        row["ai_context"].is_object(),
+        "valid near-limit context must survive the read: {}",
+        row["ai_context"]
+    );
+    assert_eq!(row["ai_context"]["key0000"], json!(1));
+}
