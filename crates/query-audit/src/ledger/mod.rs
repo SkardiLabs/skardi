@@ -292,6 +292,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The metrics text the consumer splices into its /metrics endpoint:
+    /// both loss reasons render, with live counter values.
+    #[test]
+    fn metrics_render_names_both_loss_reasons() {
+        let m = Metrics::default();
+        m.insert_failures_pg.store(3, Ordering::Relaxed);
+        m.insert_failures_channel_full.store(7, Ordering::Relaxed);
+        let text = m.render();
+        assert!(text.contains("ledger_insert_failures_total{reason=\"pg\"} 3"));
+        assert!(text.contains("ledger_insert_failures_total{reason=\"channel_full\"} 7"));
+        assert!(text.starts_with("# TYPE ledger_insert_failures_total counter"));
+    }
+
     #[test]
     fn assembly_bounds_every_field() {
         // An 8 MiB statement lands truncated at 32 KiB with the flag set.

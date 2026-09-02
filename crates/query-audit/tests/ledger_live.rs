@@ -346,3 +346,122 @@ async fn ai_context_lands_as_jsonb_and_reads_back() {
     assert_eq!(row["session_id"], json!("s-1"));
     assert_eq!(row["status"], json!("succeeded"));
 }
+
+/// The writer's loss accounting, no server needed: a blackholed DSN makes
+/// the first flush fail (connect timeout inside the 5 s flush bound), the
+/// batch is dropped, and `insert_failures_total{reason="pg"}` counts it —
+/// the caller saw none of this. Also pins the pool accessor and that a
+/// dropped handle shuts the writer down rather than leaking it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_flush_counts_its_losses() {
+    let pg = PgLedger::spawn("postgres://u:p@192.0.2.1:5432/skardi_ledger").expect("lazy pool");
+    assert!(!pg.pool().is_closed(), "lazy pool, no connection yet");
+    let before = ledger::METRICS
+        .insert_failures_pg
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    pg.record(draft(WS, "SELECT 1", "r-flush-fail").finish(RowStatus::Succeeded, Some(1), None));
+
+    // The flush pays its 5 s bound (plus the doomed connect) before counting.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let now = ledger::METRICS
+            .insert_failures_pg
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now > before {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the dropped batch was never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Dropping the handle closes the channel; the writer's recv sees it and
+    // exits. Nothing to assert beyond "this does not hang or panic" — the
+    // yield gives the writer task a turn to observe the close.
+    drop(pg);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// The read page's byte budget elides from the tail and pages on: ~300
+/// worst-case rows (32 KiB sql each) cannot fit the 8 MiB body, so the page
+/// ends early with `truncated: true` and a cursor — never an over-budget
+/// body (the consumer's relay 413s one byte over).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn the_byte_budget_elides_the_tail_and_pages_on() {
+    let Some(url) = live_url() else { return };
+    let (_dsn, pool) = fresh_db(&url).await;
+    sqlx::query(
+        "INSERT INTO query_ledger (org_id, workspace_id, user_id, request_id, \
+         created_at, finished_at, sql, sql_truncated, statement_kind, max_rows, \
+         status, error) \
+         SELECT 'acme', $1, 'user:acme/u1', 'req-' || n, now(), now(), \
+                repeat('x', 32768), true, 'query', 100, 'failed', \
+                'execution-failed: ' || repeat('e', 4096) \
+         FROM generate_series(1, 300) AS n",
+    )
+    .bind(WS)
+    .execute(&pool)
+    .await
+    .expect("seed 300 worst-case rows");
+
+    let page = read::list_page(
+        &pool,
+        WS,
+        read::PageQuery {
+            limit: Some(500),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("page");
+    let rows = page["rows"].as_array().unwrap();
+    assert!(
+        !rows.is_empty() && rows.len() < 300,
+        "the byte cap, not the row limit, must end this page (got {})",
+        rows.len()
+    );
+    assert_eq!(page["truncated"], json!(true));
+    assert!(page["next_cursor"].as_str().is_some());
+    assert!(
+        page.to_string().len() <= read::RESPONSE_MAX_BYTES,
+        "the whole body must fit the budget"
+    );
+}
+
+/// The flush-error arm that is NOT a timeout: the server answers and says
+/// no (here: the table is gone). The batch drops, the loss is counted, the
+/// caller never heard about any of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn a_rejected_insert_counts_its_losses() {
+    let Some(url) = live_url() else { return };
+    let (dsn, pool) = fresh_db(&url).await;
+    sqlx::raw_sql("DROP TABLE query_ledger")
+        .execute(&pool)
+        .await
+        .expect("sabotage");
+    let pg = PgLedger::spawn(&dsn).expect("pool");
+    let before = ledger::METRICS
+        .insert_failures_pg
+        .load(std::sync::atomic::Ordering::Relaxed);
+    pg.record(draft(WS, "SELECT 1", "r-rejected").finish(RowStatus::Succeeded, Some(1), None));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if ledger::METRICS
+            .insert_failures_pg
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > before
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rejected batch was never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

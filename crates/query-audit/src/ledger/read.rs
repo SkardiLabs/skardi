@@ -190,6 +190,43 @@ pub async fn list_page(pool: &PgPool, workspace: &str, q: PageQuery) -> Result<V
 mod tests {
     use super::*;
 
+    /// The hand-rolled error impls (no `thiserror` in this crate): Display
+    /// keeps driver detail out of the caller-facing variant, and source()
+    /// exposes it for operators.
+    #[test]
+    fn read_error_display_and_source() {
+        let bad = ReadError::BadRequest("limit must be >= 1".into());
+        assert_eq!(bad.to_string(), "limit must be >= 1");
+        assert!(std::error::Error::source(&bad).is_none());
+
+        let unavailable = ReadError::Unavailable(sqlx::Error::PoolClosed);
+        assert_eq!(unavailable.to_string(), "ledger read failed");
+        let src = std::error::Error::source(&unavailable).expect("driver cause");
+        assert!(src.to_string().contains("closed"), "{src}");
+    }
+
+    /// `limit < 1` refuses BEFORE any query: a lazy pool to a blackhole
+    /// address proves no connection is attempted.
+    #[tokio::test]
+    async fn non_positive_limits_refuse_before_any_query() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@192.0.2.1:5432/nowhere")
+            .expect("lazy");
+        for n in [0, -5] {
+            let err = list_page(
+                &pool,
+                "ws",
+                PageQuery {
+                    limit: Some(n),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("must refuse");
+            assert!(matches!(err, ReadError::BadRequest(_)), "{err}");
+        }
+    }
+
     #[test]
     fn cursor_round_trips() {
         let at = Utc::now();
