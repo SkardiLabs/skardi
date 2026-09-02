@@ -1,0 +1,208 @@
+//! The read half: one page of one workspace's rows, newest-first over the
+//! stable `(created_at, id)` keyset.
+//!
+//! The route owns authorization (envelope + admin re-check); this module
+//! owns semantics: filters, the cursor, the row cap (≤ 500, default 100),
+//! and the 8 MiB response byte cap — rows are elided from the tail and the
+//! response says so (`truncated: true` + `next_cursor`), because 500 rows of
+//! even ingestion-bounded fields can pass the `/data_source` budget.
+
+use base64::Engine as _;
+use chrono::{DateTime, Utc};
+use serde_json::{Value, json};
+use sqlx::{PgPool, Row};
+
+use super::queries;
+
+pub const LIMIT_DEFAULT: i64 = 100;
+pub const LIMIT_MAX: i64 = 500;
+
+/// The whole response body stays under this. The consumer's relay enforces
+/// the same 8 MiB as a hard cap and answers 413 above it, so this is a HARD
+/// wire contract, not a soft target: a body that lands even one byte over
+/// turns into a deterministic 413 — and the same cursor fetches the same
+/// page, so the caller is livelocked until the rows age out.
+pub const RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Headroom [`list_page`] holds back from [`RESPONSE_MAX_BYTES`] for
+/// everything that is not a row: the envelope framing
+/// (`{"success":…,"rows":[…],"truncated":…,"next_cursor":"…"}`, with the
+/// cursor well under 100 bytes) plus the `rows` array's brackets. The
+/// per-row comma is counted per row instead, so this only has to cover the
+/// fixed part — 1 KiB is an order of magnitude more than it needs, and one
+/// elided row against a 32 KiB-sql worst case is noise.
+const ENVELOPE_RESERVE_BYTES: usize = 1024;
+
+/// Parsed, validated query inputs. The route builds this from the query
+/// string; `workspace` always comes from the envelope.
+#[derive(Debug, Default)]
+pub struct PageQuery {
+    pub session_id: Option<String>,
+    pub status: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+/// Hand-rolled rather than derived: this crate deliberately carries no
+/// `thiserror` (its only other error surface is `anyhow` + one bespoke
+/// timeout enum), and two variants do not justify the dependency.
+#[derive(Debug)]
+pub enum ReadError {
+    /// Caller-shaped: a malformed filter/cursor (400).
+    BadRequest(String),
+    /// Backend-shaped: PG unreachable or the query failed (503; the ledger
+    /// is degraded, the caller should retry).
+    Unavailable(sqlx::Error),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::BadRequest(m) => write!(f, "{m}"),
+            ReadError::Unavailable(_) => write!(f, "ledger read failed"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReadError::BadRequest(_) => None,
+            ReadError::Unavailable(e) => Some(e),
+        }
+    }
+}
+
+/// The opaque cursor: base64 of `<created_at micros>:<id>`. Opaque to
+/// callers by contract — the encoding may change; only round-tripping a
+/// returned value is supported.
+fn encode_cursor(created_at: DateTime<Utc>, id: i64) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+        "{}:{}",
+        created_at.timestamp_micros(),
+        id
+    ))
+}
+
+fn decode_cursor(cursor: &str) -> Result<(DateTime<Utc>, i64), ReadError> {
+    let bad = || ReadError::BadRequest("cursor is not a value a prior response returned".into());
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| bad())?;
+    let s = String::from_utf8(bytes).map_err(|_| bad())?;
+    let (t, id) = s.split_once(':').ok_or_else(bad)?;
+    let micros: i64 = t.parse().map_err(|_| bad())?;
+    let id: i64 = id.parse().map_err(|_| bad())?;
+    let created_at = DateTime::<Utc>::from_timestamp_micros(micros).ok_or_else(bad)?;
+    Ok((created_at, id))
+}
+
+/// One page. Returns the JSON body the consumer's route serves verbatim.
+pub async fn list_page(pool: &PgPool, workspace: &str, q: PageQuery) -> Result<Value, ReadError> {
+    let limit = match q.limit {
+        None => LIMIT_DEFAULT,
+        Some(n) if n < 1 => {
+            return Err(ReadError::BadRequest("limit must be >= 1".into()));
+        }
+        Some(n) => n.min(LIMIT_MAX),
+    };
+    let (cursor_at, cursor_id) = match &q.cursor {
+        Some(c) => decode_cursor(c)?,
+        // First page: a keyset upper bound above every real row, so the one
+        // prepared statement serves both cases (queries::SELECT_PAGE).
+        None => (DateTime::<Utc>::MAX_UTC, i64::MAX),
+    };
+
+    let rows = sqlx::query(queries::SELECT_PAGE)
+        .bind(workspace)
+        .bind(cursor_at)
+        .bind(cursor_id)
+        .bind(q.since)
+        .bind(q.until)
+        .bind(&q.session_id)
+        .bind(&q.status)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(ReadError::Unavailable)?;
+
+    let mut out: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut bytes = 0usize;
+    let mut truncated = false;
+    let mut last_key: Option<(DateTime<Utc>, i64)> = None;
+    let fetched = rows.len();
+    for row in rows {
+        let id: i64 = row.get("id");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let finished_at: DateTime<Utc> = row.get("finished_at");
+        let obj = json!({
+            "id": id,
+            "org_id": row.get::<String, _>("org_id"),
+            "workspace_id": row.get::<String, _>("workspace_id"),
+            "user_id": row.get::<String, _>("user_id"),
+            "request_id": row.get::<String, _>("request_id"),
+            "session_id": row.get::<Option<String>, _>("session_id"),
+            "created_at": created_at.to_rfc3339(),
+            "finished_at": finished_at.to_rfc3339(),
+            "sql": row.get::<String, _>("sql"),
+            "sql_truncated": row.get::<bool, _>("sql_truncated"),
+            "ai_context": row.get::<Option<Value>, _>("ai_context"),
+            "statement_kind": row.get::<String, _>("statement_kind"),
+            "max_rows": row.get::<i64, _>("max_rows"),
+            "status": row.get::<String, _>("status"),
+            "row_count": row.get::<Option<i64>, _>("row_count"),
+            "error": row.get::<Option<String>, _>("error"),
+        });
+        // Byte cap: elide from the tail once the budget is spent. The
+        // budget is the WHOLE body's, not the rows': the gateway 413s one
+        // byte over `RESPONSE_MAX_BYTES` and the same cursor re-fetches the
+        // same page, so under-counting the envelope turns a full page into
+        // a permanent 413 (a ~226-row page of 32 KiB-sql rows gets there in
+        // ordinary use). Each row is charged its serialized length plus its
+        // separating comma; the fixed framing comes out of the reserve.
+        let row_bytes = obj.to_string().len() + 1;
+        if bytes + row_bytes > RESPONSE_MAX_BYTES - ENVELOPE_RESERVE_BYTES && !out.is_empty() {
+            truncated = true;
+            break;
+        }
+        bytes += row_bytes;
+        last_key = Some((created_at, id));
+        out.push(obj);
+    }
+    // A full fetch means the keyset may continue; an elided tail always does.
+    let more_may_exist = truncated || fetched == limit as usize;
+    let next_cursor = match (more_may_exist, last_key) {
+        (true, Some((at, id))) => Some(encode_cursor(at, id)),
+        _ => None,
+    };
+
+    Ok(json!({
+        "success": true,
+        "rows": out,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_round_trips() {
+        let at = Utc::now();
+        let enc = encode_cursor(at, 42);
+        let (back_at, back_id) = decode_cursor(&enc).expect("round trip");
+        assert_eq!(back_id, 42);
+        assert_eq!(back_at.timestamp_micros(), at.timestamp_micros());
+    }
+
+    #[test]
+    fn garbage_cursors_are_bad_requests() {
+        for c in ["", "!!!", "bm9jb2xvbg", "MTIz"] {
+            assert!(matches!(decode_cursor(c), Err(ReadError::BadRequest(_))));
+        }
+    }
+}

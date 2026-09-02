@@ -17,7 +17,18 @@ tokio-rusqlite = { workspace = true }
 # arrived with that change while this crate was being extracted, so they are
 # declared here rather than inherited from the server that used to host the
 # module.
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "sync", "rt"] }
+# The best-effort ledger module's opaque read cursor (`ledger::read`).
+base64 = "0.22"
+# chrono/json Encode/Decode for the ledger module's TIMESTAMPTZ + JSONB
+# columns, enabled on sqlx's INTERNAL postgres node rather than the facade:
+# the facade's `chrono`/`json` features textually reference
+# `sqlx-sqlite?/...`, which makes the resolver pull sqlx-sqlite into the
+# lock, whose libsqlite3-sys (0.30) `links`-conflicts with tokio-rusqlite's
+# (0.35). Feature unification lands these on the same node the facade
+# re-exports, so `sqlx::query` sees the impls; the version range must keep
+# resolving to the facade's pinned sqlx-postgres.
+sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono", "json"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

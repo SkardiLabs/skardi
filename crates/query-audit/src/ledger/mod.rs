@@ -1,0 +1,370 @@
+//! The best-effort query ledger — the SECOND contract this crate hosts, and
+//! deliberately not a storage backend of [`QueryAuditStore`].
+//!
+//! [`QueryAuditStore`](crate::QueryAuditStore) is a **compliance record**:
+//! durable before execution, fail-closed (a statement that cannot be
+//! recorded does not run), two-phase (`started` → outcome, with startup
+//! reconciliation). This module is an **analytics ledger**: one row per
+//! DECIDED statement (`succeeded` / `failed` / `refused`), written
+//! best-effort AFTER the outcome is known, on a bounded queue the caller
+//! never waits for. A Postgres outage degrades the ledger and never the
+//! query path; loss is counted ([`METRICS`]), never silent.
+//!
+//! The OSS server does not wire this module; its consumer is the governed
+//! cloud engine (skardi-cloud's `2026-08-30-query-ledger-postgres-design.md`),
+//! whose N per-workspace pods share one Postgres and write as RLS-pinned
+//! per-workspace roles. It lives here so the audit domain has one home and
+//! the shared vocabulary (identity columns, `MAX_SESSION_ID_CHARS`) cannot
+//! drift — NOT because the two contracts are interchangeable. If you want
+//! "audit that refuses to run unrecorded statements", you want
+//! [`QueryAuditStore`]; if you want "learn-loop analytics that never costs a
+//! query", you want this.
+//!
+//! Schema: the [`queries::QUERY_LEDGER_DDL`] table (`query_ledger`), applied
+//! by the DOWNSTREAM deployment's migration path — this module runs no DDL
+//! (its writers connect as roles that deliberately cannot).
+
+pub mod queries;
+pub mod read;
+pub mod writer;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+
+/// `sql` is truncated to this at ROW ASSEMBLY: the learn loop wants
+/// patterns, not megabyte literals, and bounding at ingestion is what keeps
+/// the queue's worst case ~40 MiB instead of ~8 GiB (1024 rows × an 8 MiB
+/// statement ceiling).
+pub const SQL_MAX_BYTES: usize = 32 * 1024;
+
+/// `error` shares `ai_context`'s 4 KiB bound: failures and refusals are the
+/// most instructive rows, but they carry engine text, not documents.
+pub const ERROR_MAX_BYTES: usize = 4 * 1024;
+
+/// Queue capacity in ROWS; with every field bounded at assembly the byte
+/// worst case is ~40 MiB per process.
+pub const QUEUE_CAPACITY: usize = 1024;
+
+/// Rows per multi-row INSERT flush.
+pub const FLUSH_BATCH_ROWS: usize = 64;
+
+/// Wall-clock bound on one flush. A slow PG drops the batch (counted),
+/// never stalls the writer behind an unbounded await.
+pub const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Loss accounting: dropped is never silent. The consumer renders this into
+/// its own metrics surface.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    /// A flush failed or timed out; the whole batch was dropped (logged with
+    /// its request ids).
+    pub insert_failures_pg: AtomicU64,
+    /// `try_send` refused — the channel was full; the row was dropped.
+    pub insert_failures_channel_full: AtomicU64,
+}
+
+pub static METRICS: Metrics = Metrics {
+    insert_failures_pg: AtomicU64::new(0),
+    insert_failures_channel_full: AtomicU64::new(0),
+};
+
+impl Metrics {
+    pub fn render(&self) -> String {
+        format!(
+            "# TYPE ledger_insert_failures_total counter\n\
+             ledger_insert_failures_total{{reason=\"pg\"}} {}\n\
+             ledger_insert_failures_total{{reason=\"channel_full\"}} {}\n",
+            self.insert_failures_pg.load(Ordering::Relaxed),
+            self.insert_failures_channel_full.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Row status vocabulary. `refused` is this ledger's extension to the
+/// [`QueryAuditStatus`](crate::QueryAuditStatus) set; `started`/`unknown`
+/// have no counterpart here because there is no two-phase write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowStatus {
+    Succeeded,
+    Failed,
+    Refused,
+}
+
+impl RowStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowStatus::Succeeded => "succeeded",
+            RowStatus::Failed => "failed",
+            RowStatus::Refused => "refused",
+        }
+    }
+}
+
+/// One fully-bounded, insert-ready row. **Assembly is the single place every
+/// field is bounded and coerced**: `sql` truncated to [`SQL_MAX_BYTES`],
+/// `error` to [`ERROR_MAX_BYTES`], `max_rows` clamped into `i64` — so a batch
+/// can never be poisoned by one row.
+#[derive(Debug, Clone)]
+pub struct LedgerRow {
+    pub org_id: String,
+    pub workspace_id: String,
+    pub user_id: String,
+    pub request_id: String,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub sql: String,
+    pub sql_truncated: bool,
+    pub ai_context: Option<Value>,
+    pub statement_kind: &'static str,
+    pub max_rows: i64,
+    pub status: RowStatus,
+    pub row_count: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// The identity + request facts captured once the caller's identity gate has
+/// passed. The `sql` snapshot is truncated at capture, so a pending context
+/// never pins a multi-MiB statement.
+#[derive(Debug, Clone)]
+pub struct RowDraft {
+    pub org_id: String,
+    pub workspace_id: String,
+    pub user_id: String,
+    pub request_id: String,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub sql: String,
+    pub sql_truncated: bool,
+    pub ai_context: Option<Value>,
+    pub max_rows: i64,
+}
+
+impl RowDraft {
+    /// Capture the bounded draft. `session_id` is denormalized out of
+    /// `ai_context` exactly as [`QueryAuditStore`](crate::QueryAuditStore)
+    /// does, so session lookups keep working on the same key — and the bound
+    /// is [`MAX_SESSION_ID_CHARS`](crate::MAX_SESSION_ID_CHARS) in
+    /// CHARACTERS, the same unit the wire validation counts in.
+    #[allow(clippy::too_many_arguments)] // mirrors the row's identity columns
+    pub fn capture(
+        org_id: &str,
+        workspace_id: &str,
+        user_id: &str,
+        request_id: &str,
+        sql: &str,
+        ai_context: Option<&Value>,
+        requested_max_rows: Option<usize>,
+        default_max_rows: usize,
+    ) -> Self {
+        let (sql, sql_truncated) = truncate_utf8(sql, SQL_MAX_BYTES);
+        let session_id = ai_context
+            .and_then(|c| c.get("session_id"))
+            .and_then(Value::as_str)
+            // A longer value is a malformed caller assertion, dropped rather
+            // than truncated into a different-looking session.
+            .filter(|s| s.chars().count() <= crate::MAX_SESSION_ID_CHARS)
+            .map(str::to_string);
+        // The column bound (≤ 4 KiB) is enforced HERE, not only by a route's
+        // own refusal: a refused row for an oversized ai_context must not
+        // smuggle the very payload the refusal exists to bound. Dropped, not
+        // truncated — a truncated JSON document is not a JSON document.
+        let ai_context = ai_context
+            .filter(|c| {
+                serde_json::to_vec(c)
+                    .map(|v| v.len() <= ERROR_MAX_BYTES)
+                    .unwrap_or(false)
+            })
+            .cloned();
+        Self {
+            org_id: org_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            user_id: user_id.to_string(),
+            request_id: request_id.to_string(),
+            session_id,
+            created_at: Utc::now(),
+            sql,
+            sql_truncated,
+            ai_context,
+            // Clamped into i64 at assembly: a refused row's requested value
+            // may exceed any ceiling — a 3,000,000,000 must land clamped,
+            // not sink its batch.
+            max_rows: requested_max_rows
+                .unwrap_or(default_max_rows)
+                .try_into()
+                .unwrap_or(i64::MAX),
+        }
+    }
+
+    /// Finish the draft into an insert-ready row.
+    pub fn finish(
+        self,
+        status: RowStatus,
+        row_count: Option<usize>,
+        error: Option<String>,
+    ) -> LedgerRow {
+        LedgerRow {
+            org_id: self.org_id,
+            workspace_id: self.workspace_id,
+            user_id: self.user_id,
+            request_id: self.request_id,
+            session_id: self.session_id,
+            created_at: self.created_at,
+            finished_at: Utc::now(),
+            sql: self.sql,
+            sql_truncated: self.sql_truncated,
+            ai_context: self.ai_context,
+            statement_kind: "query",
+            max_rows: self.max_rows,
+            status,
+            row_count: row_count.map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
+            error: error.map(|e| truncate_utf8(&e, ERROR_MAX_BYTES).0),
+        }
+    }
+}
+
+/// Truncate to at most `max` bytes on a char boundary. Returns the (possibly
+/// shortened) string and whether truncation happened.
+fn truncate_utf8(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
+/// The queued recorder: a bounded queue into the writer task and the lazy
+/// pool the read path shares. Cloning shares both.
+#[derive(Clone)]
+pub struct PgLedger {
+    tx: tokio::sync::mpsc::Sender<LedgerRow>,
+    pool: sqlx::PgPool,
+}
+
+impl PgLedger {
+    /// Construct the lazy pool (max 2 connections — the consumer's many
+    /// processes share one PG) and spawn the writer. Makes NO connection:
+    /// nothing about the ledger is boot-fatal.
+    pub fn spawn(dsn: &str) -> anyhow::Result<Self> {
+        Self::spawn_with_capacity(dsn, QUEUE_CAPACITY)
+    }
+
+    /// [`spawn`](Self::spawn) with an explicit queue bound. Production always
+    /// goes through `spawn` ([`QUEUE_CAPACITY`]); this seam exists so the
+    /// queue-full contract — drop + count, never block — is testable without
+    /// enqueueing a thousand rows against a hung writer.
+    pub fn spawn_with_capacity(dsn: &str, capacity: usize) -> anyhow::Result<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(dsn)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        tokio::spawn(writer::run(pool.clone(), rx));
+        Ok(Self { tx, pool })
+    }
+
+    /// Enqueue one decided row. Never waits, never errors to the caller: a
+    /// full channel drops the row and counts it.
+    pub fn record(&self, row: LedgerRow) {
+        if let Err(e) = self.tx.try_send(row) {
+            METRICS
+                .insert_failures_channel_full
+                .fetch_add(1, Ordering::Relaxed);
+            let request_id = match &e {
+                tokio::sync::mpsc::error::TrySendError::Full(r)
+                | tokio::sync::mpsc::error::TrySendError::Closed(r) => r.request_id.clone(),
+            };
+            tracing::warn!(%request_id, "ledger row dropped: queue full or writer gone");
+        }
+    }
+
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn assembly_bounds_every_field() {
+        // An 8 MiB statement lands truncated at 32 KiB with the flag set.
+        let big_sql = "S".repeat(8 * 1024 * 1024);
+        let draft = RowDraft::capture(
+            "acme",
+            "acme-prod",
+            "user:acme/u1",
+            "req-1",
+            &big_sql,
+            Some(&json!({"session_id": "s-1", "purpose": "test"})),
+            // The poison case: a refused row whose requested max_rows
+            // exceeds i64 must clamp, not sink its batch.
+            Some(usize::MAX),
+            1000,
+        );
+        assert_eq!(draft.sql.len(), SQL_MAX_BYTES);
+        assert!(draft.sql_truncated);
+        assert_eq!(draft.max_rows, i64::MAX);
+        assert_eq!(draft.session_id.as_deref(), Some("s-1"));
+
+        let row = draft.finish(
+            RowStatus::Refused,
+            None,
+            Some("plan-error: ".to_string() + &"x".repeat(64 * 1024)),
+        );
+        assert_eq!(row.status.as_str(), "refused");
+        assert!(row.error.as_ref().unwrap().len() <= ERROR_MAX_BYTES);
+        assert!(row.row_count.is_none());
+        assert!(row.finished_at >= row.created_at);
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // A multi-byte char straddling the cut must not split.
+        let s = format!("{}文", "a".repeat(SQL_MAX_BYTES - 1));
+        let (t, truncated) = truncate_utf8(&s, SQL_MAX_BYTES);
+        assert!(truncated);
+        assert!(t.len() <= SQL_MAX_BYTES);
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn oversized_ai_context_never_reaches_a_row() {
+        // The refused row for an oversized ai_context must not carry it.
+        let big = json!({"session_id": "s-1", "blob": "x".repeat(64 * 1024)});
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&big), None, 1000);
+        assert!(draft.ai_context.is_none());
+        // session_id extraction still happened before the drop.
+        assert_eq!(draft.session_id.as_deref(), Some("s-1"));
+    }
+
+    #[test]
+    fn overlong_session_ids_are_dropped_not_truncated() {
+        let ai = json!({"session_id": "s".repeat(201)});
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ai), None, 1000);
+        assert!(draft.session_id.is_none());
+    }
+
+    /// The 200 bound is CHARACTERS, the unit the wire validation counts in —
+    /// a 150-char CJK id is 450 UTF-8 bytes and contract-valid, and a
+    /// byte-counted filter would silently drop it, breaking its own session
+    /// filter. 201 chars stays dropped in any alphabet.
+    #[test]
+    fn session_id_bound_counts_characters_not_bytes() {
+        let cjk = "审".repeat(150);
+        assert_eq!(cjk.len(), 450, "the fixture must be multi-byte");
+        let ai = json!({ "session_id": cjk.clone() });
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ai), None, 1000);
+        assert_eq!(draft.session_id.as_deref(), Some(cjk.as_str()));
+
+        let too_long = json!({ "session_id": "审".repeat(201) });
+        let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&too_long), None, 1000);
+        assert!(draft.session_id.is_none());
+    }
+}
