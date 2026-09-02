@@ -29,9 +29,9 @@ pub mod queries;
 pub mod read;
 pub mod writer;
 
-use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -39,10 +39,9 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tokio::runtime::Handle;
+use tokio::runtime::Builder;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::time::sleep;
 
 /// `sql` is truncated to this at ROW ASSEMBLY: the learn loop wants
 /// patterns, not megabyte literals, and bounding at ingestion is what keeps
@@ -427,6 +426,17 @@ impl PgLedger {
     /// goes through `spawn` ([`QUEUE_CAPACITY`]); this seam exists so the
     /// queue-full contract — drop + count, never block — is testable without
     /// enqueueing a thousand rows against a hung writer.
+    ///
+    /// The writer runs on its OWN single-thread Tokio runtime, on a
+    /// dedicated OS thread, with the timer enabled — so construction needs
+    /// no ambient runtime at all, and the caller's runtime configuration
+    /// (present or not, timer or not, `panic = "abort"` or not) can never
+    /// panic the write pipeline: earlier designs probed the ambient timer
+    /// by catching a deliberate panic, which an abort profile turns into a
+    /// process abort. The pool is created inside that runtime too, so its
+    /// internal tasks and deadlines live where the timer is. The READ path
+    /// ([`read::list_page`]) runs on the caller's runtime and needs it
+    /// sqlx-capable (timer enabled), like any sqlx call.
     pub fn spawn_with_capacity(dsn: &str, capacity: usize) -> anyhow::Result<Self> {
         if capacity == 0 {
             // tokio's bounded channel PANICS on zero; this constructor
@@ -434,39 +444,29 @@ impl PgLedger {
             // to take the process down.
             anyhow::bail!("ledger queue capacity must be >= 1 (got 0)");
         }
-        // Same reasoning as the capacity check, and it must come BEFORE the
-        // pool: `tokio::spawn` AND sqlx's `connect_lazy` (whose pool spawns
-        // its reaper) both PANIC outside a runtime, and a synchronous
-        // Result-returning constructor must refuse invalid initialization,
-        // not abort the process.
-        let runtime = Handle::try_current().context(
-            "the ledger writer needs a running Tokio runtime; construct the \
-             ledger from within one",
-        )?;
-        // A current handle proves a RUNTIME, not a TIMER: a runtime built
-        // without `enable_time` lets construction succeed and then panics at
-        // the writer's first `timeout` — inside the detached task, killing
-        // it and losing accepted rows with neither counter touched. Probe
-        // the timer here by creating (never awaiting) a zero Sleep,
-        // converting tokio's panic into this constructor's Result. The one
-        // stderr panic line in the misconfigured case accompanies an actual
-        // configuration error being reported.
-        if catch_unwind(|| drop(sleep(Duration::ZERO))).is_err() {
-            anyhow::bail!(
-                "the ledger writer needs a Tokio runtime with its timer \
-                 enabled (enable_time / enable_all); this one has no timer \
-                 driver, and the flush deadline would panic inside the \
-                 writer task"
-            );
-        }
-        let pool = PgPoolOptions::new().max_connections(2).connect_lazy(dsn)?;
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build the ledger writer's runtime")?;
+        // Created under the writer runtime's context: sqlx's pool spawns
+        // internal tasks and takes deadlines from the runtime that is
+        // CURRENT at creation, and those must not depend on the caller's.
+        let pool = {
+            let _entered = runtime.enter();
+            PgPoolOptions::new().max_connections(2).connect_lazy(dsn)?
+        };
         let (tx, rx) = mpsc::channel(capacity);
         let (done_tx, done_rx) = watch::channel(false);
         let writer = Arc::new(WriterControl {
             drain: Notify::new(),
             done: done_rx,
         });
-        runtime.spawn(writer::run(pool.clone(), rx, writer.clone(), done_tx));
+        let writer_pool = pool.clone();
+        let writer_control = writer.clone();
+        thread::Builder::new()
+            .name("skardi-ledger-writer".to_string())
+            .spawn(move || runtime.block_on(writer::run(writer_pool, rx, writer_control, done_tx)))
+            .context("spawn the ledger writer thread")?;
         Ok(Self { tx, pool, writer })
     }
 
@@ -628,34 +628,40 @@ mod tests {
         assert!(decimal_len_estimate("1e18446744073709551615") > 1_000_000);
     }
 
-    /// A runtime WITHOUT `enable_time` passes the handle check but would
-    /// panic at the writer's first flush deadline — construction must
-    /// refuse it instead (the panic would land inside the detached task,
-    /// losing rows uncounted).
+    /// The writer owns its runtime, so the ambient one is irrelevant: a
+    /// plain #[test] (no runtime at all) can construct and record, the
+    /// writer's OWN timer bounds the doomed flush and counts the loss, and
+    /// a TIMERLESS caller runtime can still drive shutdown (a watch await
+    /// needs no timer). This is the panic-free answer to both "no runtime"
+    /// and "runtime without enable_time" — including under panic = "abort",
+    /// where the previous catch_unwind probe would itself abort.
     #[test]
-    fn a_runtime_without_a_timer_is_refused() {
+    fn ambient_runtime_configuration_cannot_panic_the_write_pipeline() {
+        let pg =
+            PgLedger::spawn("postgres://u:p@192.0.2.1:5432/x").expect("no ambient runtime needed");
+        let before = METRICS.insert_failures_pg.load(Ordering::Relaxed);
+        pg.record(
+            RowDraft::capture("o", "w", "u", "r-own-rt", "SELECT 1", None, None, 1000).finish(
+                RowStatus::Succeeded,
+                Some(1),
+                None,
+            ),
+        );
+        // The writer's own timer pays the flush bound and counts the loss;
+        // poll with std sleeps — deliberately no async here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while METRICS.insert_failures_pg.load(Ordering::Relaxed) == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer's own timer must bound the flush and count the loss"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+        // A timerless caller runtime is enough to drive shutdown.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("runtime without enable_time");
-        let err = rt.block_on(async {
-            match PgLedger::spawn("postgres://u:p@192.0.2.1:5432/x") {
-                Ok(_) => panic!("must refuse a timerless runtime"),
-                Err(e) => e,
-            }
-        });
-        assert!(err.to_string().contains("timer"), "{err}");
-    }
-
-    /// `tokio::spawn` panics outside a runtime; the synchronous constructor
-    /// must refuse instead — a plain #[test] has no ambient runtime, which
-    /// is exactly the failing caller.
-    #[test]
-    fn constructing_outside_a_runtime_is_an_error_not_a_panic() {
-        let err = match PgLedger::spawn("postgres://u:p@192.0.2.1:5432/x") {
-            Ok(_) => panic!("must refuse without a runtime"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("Tokio runtime"), "{err}");
+            .expect("timerless runtime");
+        rt.block_on(pg.shutdown());
     }
 
     /// tokio's bounded channel panics on zero; the Result-returning
