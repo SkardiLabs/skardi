@@ -48,6 +48,13 @@ pub const ERROR_MAX_BYTES: usize = 4 * 1024;
 /// worst case is ~40 MiB per process.
 pub const QUEUE_CAPACITY: usize = 1024;
 
+/// Bound on each identity field (`org_id`, `workspace_id`, `user_id`,
+/// `request_id`) at assembly. Production values are gate-validated slugs a
+/// few dozen bytes long; the cap exists because the ~40 MiB queue worst
+/// case is only true if EVERY field is bounded — an unbounded identity
+/// string would let 1,024 queued rows hold arbitrarily more.
+pub const IDENTITY_MAX_BYTES: usize = 4 * 1024;
+
 /// Rows per multi-row INSERT flush.
 pub const FLUSH_BATCH_ROWS: usize = 64;
 
@@ -197,11 +204,12 @@ impl RowDraft {
         Self {
             // Identity values arrive gate-validated in production, but
             // assembly is the single bounding point and must not trust that:
-            // one NUL here would still poison the batch.
-            org_id: scrub_nul(org_id),
-            workspace_id: scrub_nul(workspace_id),
-            user_id: scrub_nul(user_id),
-            request_id: scrub_nul(request_id),
+            // one NUL here would still poison the batch, and one unbounded
+            // string would void the queue's ~40 MiB worst case.
+            org_id: bound_text(org_id, IDENTITY_MAX_BYTES).0,
+            workspace_id: bound_text(workspace_id, IDENTITY_MAX_BYTES).0,
+            user_id: bound_text(user_id, IDENTITY_MAX_BYTES).0,
+            request_id: bound_text(request_id, IDENTITY_MAX_BYTES).0,
             session_id,
             created_at: Utc::now(),
             sql,
@@ -419,6 +427,48 @@ mod tests {
         let ai = json!({"session_id": "s".repeat(201)});
         let draft = RowDraft::capture("o", "w", "u", "r", "SELECT 1", Some(&ai), None, 1000);
         assert!(draft.session_id.is_none());
+    }
+
+    /// The queue's ~40 MiB worst case requires EVERY field bounded — an
+    /// oversized identity string must cap at assembly like everything else.
+    #[test]
+    fn identity_fields_are_bounded_at_assembly() {
+        let huge = "x".repeat(1024 * 1024);
+        let draft = RowDraft::capture(&huge, &huge, &huge, &huge, "SELECT 1", None, None, 1000);
+        for v in [
+            &draft.org_id,
+            &draft.workspace_id,
+            &draft.user_id,
+            &draft.request_id,
+        ] {
+            assert_eq!(v.len(), IDENTITY_MAX_BYTES);
+        }
+    }
+
+    /// The SELECT bounds fields server-side so `fetch_all` cannot
+    /// materialize unbounded rows; its hardcoded literals must track the
+    /// Rust consts, or the two layers drift.
+    #[test]
+    fn select_page_literals_track_the_rust_bounds() {
+        let q = queries::SELECT_PAGE;
+        assert!(q.contains(&format!("left(sql, {SQL_MAX_BYTES})")));
+        assert!(q.contains(&format!("octet_length(sql) > {SQL_MAX_BYTES}")));
+        assert!(q.contains(&format!("left(error, {ERROR_MAX_BYTES})")));
+        assert!(q.contains(&format!(
+            "octet_length(ai_context::text) <= {ERROR_MAX_BYTES}"
+        )));
+        for col in [
+            "org_id",
+            "workspace_id",
+            "user_id",
+            "request_id",
+            "session_id",
+        ] {
+            assert!(
+                q.contains(&format!("left({col}, {IDENTITY_MAX_BYTES})")),
+                "{col} must be bounded in the SELECT"
+            );
+        }
     }
 
     /// U+0000 is legal in a Rust String but unstorable in Postgres TEXT and

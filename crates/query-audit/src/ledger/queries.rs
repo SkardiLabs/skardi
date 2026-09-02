@@ -21,9 +21,30 @@ pub const INSERT_HEAD: &str = "INSERT INTO query_ledger \
 /// `$4`/`$5` are `since`/`until` (NULL = unbounded), `$6` the optional
 /// `session_id`, `$7` the optional `status`, `$8` the LIMIT (already capped
 /// at 500 by the route).
-pub const SELECT_PAGE: &str = "SELECT id, org_id, workspace_id, user_id, request_id, session_id, \
-            created_at, finished_at, sql, sql_truncated, ai_context, \
-            statement_kind, max_rows, status, row_count, error \
+/// Text fields are BOUNDED IN THE SELECT (`left(...)`), not only at Rust
+/// serialization: a row written past the assembly can be arbitrarily large,
+/// and `fetch_all` materializes up to 500 whole rows before Rust sees one —
+/// unbounded fields there are an OOM, not a formatting problem. `left`
+/// counts characters (so a multi-byte page may still exceed the BYTE bound
+/// by ~4x); the Rust side re-applies the byte-precise bounds, and the
+/// `sql_truncated` flag is computed here from `octet_length` so a SQL-side
+/// cut is still declared to the reader. The literals must equal
+/// `SQL_MAX_BYTES` / `ERROR_MAX_BYTES` / the read field bound — pinned by a
+/// unit test.
+pub const SELECT_PAGE: &str = "SELECT id, \
+            left(org_id, 4096) AS org_id, \
+            left(workspace_id, 4096) AS workspace_id, \
+            left(user_id, 4096) AS user_id, \
+            left(request_id, 4096) AS request_id, \
+            left(session_id, 4096) AS session_id, \
+            created_at, finished_at, \
+            left(sql, 32768) AS sql, \
+            (sql_truncated OR octet_length(sql) > 32768) AS sql_truncated, \
+            CASE WHEN octet_length(ai_context::text) <= 4096 THEN ai_context \
+                 ELSE NULL END AS ai_context, \
+            left(statement_kind, 4096) AS statement_kind, \
+            max_rows, status, row_count, \
+            left(error, 4096) AS error \
      FROM query_ledger \
      WHERE workspace_id = $1 \
        AND (created_at, id) < ($2, $3) \
