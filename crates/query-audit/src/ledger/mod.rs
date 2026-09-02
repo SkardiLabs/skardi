@@ -29,8 +29,10 @@ pub mod queries;
 pub mod read;
 pub mod writer;
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Duration;
 
@@ -38,8 +40,9 @@ use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::runtime::Builder;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -444,29 +447,64 @@ impl PgLedger {
             // to take the process down.
             anyhow::bail!("ledger queue capacity must be >= 1 (got 0)");
         }
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build the ledger writer's runtime")?;
-        // Created under the writer runtime's context: sqlx's pool spawns
-        // internal tasks and takes deadlines from the runtime that is
-        // CURRENT at creation, and those must not depend on the caller's.
-        let pool = {
-            let _entered = runtime.enter();
-            PgPoolOptions::new().max_connections(2).connect_lazy(dsn)?
-        };
+        // The channel PANICS above the semaphore's permit ceiling too — the
+        // upper twin of the zero check.
+        if capacity > Semaphore::MAX_PERMITS {
+            anyhow::bail!(
+                "ledger queue capacity must be <= {} (got {capacity})",
+                Semaphore::MAX_PERMITS
+            );
+        }
+        // Parsed HERE, the only fallible piece of pool construction: a bad
+        // DSN must be an ordinary Err before any runtime exists — an error
+        // path that drops a Runtime on an async caller's stack panics
+        // instead of returning.
+        let options = PgConnectOptions::from_str(dsn).context("parse the ledger DSN")?;
         let (tx, rx) = mpsc::channel(capacity);
         let (done_tx, done_rx) = watch::channel(false);
         let writer = Arc::new(WriterControl {
             drain: Notify::new(),
             done: done_rx,
         });
-        let writer_pool = pool.clone();
+        // The runtime is built, used, and DROPPED entirely on the dedicated
+        // thread: tokio prohibits dropping a Runtime in async context, so no
+        // constructor error path may ever hold one on the caller's stack
+        // (the earlier shape dropped it there on connect/spawn failures).
+        // The startup handshake hands back the pool — created under the
+        // writer runtime so sqlx's internal tasks and deadlines live where
+        // the timer is — or the build error; connect_lazy_with itself is
+        // infallible and does no I/O, so the recv is microseconds.
+        let (pool_tx, pool_rx) = sync_channel::<anyhow::Result<PgPool>>(1);
         let writer_control = writer.clone();
         thread::Builder::new()
             .name("skardi-ledger-writer".to_string())
-            .spawn(move || runtime.block_on(writer::run(writer_pool, rx, writer_control, done_tx)))
+            .spawn(move || {
+                let runtime = match Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        let _ =
+                            pool_tx
+                                .send(Err(anyhow::Error::from(e)
+                                    .context("build the ledger writer's runtime")));
+                        return;
+                    }
+                };
+                let pool = {
+                    let _entered = runtime.enter();
+                    PgPoolOptions::new()
+                        .max_connections(2)
+                        .connect_lazy_with(options)
+                };
+                if pool_tx.send(Ok(pool.clone())).is_err() {
+                    // The constructor gave up; nothing to run for.
+                    return;
+                }
+                runtime.block_on(writer::run(pool, rx, writer_control, done_tx));
+            })
             .context("spawn the ledger writer thread")?;
+        let pool = pool_rx
+            .recv()
+            .context("the ledger writer thread died during startup")??;
         Ok(Self { tx, pool, writer })
     }
 
@@ -626,6 +664,25 @@ mod tests {
         assert_eq!(decimal_len_estimate("42"), 2);
         assert_eq!(decimal_len_estimate("-3.25"), 5);
         assert!(decimal_len_estimate("1e18446744073709551615") > 1_000_000);
+    }
+
+    /// Both channel-capacity panics are refused as errors: zero, and the
+    /// semaphore permit ceiling the bounded channel asserts against.
+    #[test]
+    fn out_of_range_capacities_are_errors_not_panics() {
+        for capacity in [0, Semaphore::MAX_PERMITS + 1] {
+            let result = PgLedger::spawn_with_capacity("postgres://u:p@192.0.2.1:5432/x", capacity);
+            assert!(result.is_err(), "capacity {capacity} must refuse");
+        }
+    }
+
+    /// A malformed DSN from an ASYNC caller must be an ordinary Err: the
+    /// earlier shape built the runtime first and the error path dropped it
+    /// on the async stack, which tokio answers with a panic, not our Result.
+    #[tokio::test]
+    async fn a_bad_dsn_from_async_context_is_an_error_not_a_panic() {
+        let result = PgLedger::spawn("definitely not a dsn");
+        assert!(result.is_err());
     }
 
     /// The writer owns its runtime, so the ambient one is irrelevant: a
