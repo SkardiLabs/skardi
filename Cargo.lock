@@ -9740,10 +9740,12 @@ name = "skardi-query-audit"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "serde_json",
  "sqlx",
+ "sqlx-postgres",
  "tempfile",
  "tokio",
  "tokio-rusqlite",
@@ -9951,6 +9953,7 @@ checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -10025,6 +10028,7 @@ dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.0",
  "byteorder",
+ "chrono",
  "crc",
  "dotenvy",
  "etcetera",

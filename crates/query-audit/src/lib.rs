@@ -43,6 +43,8 @@ use anyhow::{Context, Result, anyhow};
 mod postgres;
 pub use postgres::PG_DSN_ENV;
 
+pub mod ledger;
+
 /// Overrides the writer identity every `started` row is stamped with (see
 /// [`QueryAuditStore::with_writer_identity`]). Resolution:
 /// this variable → `HOSTNAME` (set by Kubernetes and Docker, exactly the

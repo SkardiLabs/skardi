@@ -216,6 +216,28 @@ kind selected — with plain SQL. `job_run_id` carries its own partial index
 `GET /jobs/runs`, which session submitted it — does not scan a table that is
 append-only and has retention off by default.
 
+#### A second ledger contract, library-only: the best-effort query ledger
+
+The `skardi-query-audit` crate also hosts `ledger::*` — a **different
+contract** from the audit ledger above, for downstream distributions whose
+many server processes share one Postgres and treat the record as analytics
+rather than compliance. Where the audit ledger is fail-closed (durable
+before execution; a statement that cannot be recorded does not run,
+two-phase with startup reconciliation), the best-effort ledger writes one
+row per DECIDED statement (`succeeded`/`failed`/`refused`) AFTER the
+outcome, on a bounded queue the query path never waits for: a Postgres
+outage degrades the ledger and never a query, and loss is counted
+(`ledger::METRICS`), never silent. Its schema (`query_ledger`) ships as
+versioned migration constants (`ledger::queries::QUERY_LEDGER_MIGRATION_*`)
+that the consumer's own migration path applies — the module runs no DDL.
+
+**This server does not wire it.** Nothing here reads or writes
+`query_ledger`; the OSS flags above always drive the fail-closed audit
+ledger. The consumer is the governed cloud engine (skardi-cloud), whose
+deployment docs own the operational story (per-workspace roles, RLS,
+retention). It lives in this crate so the audit domain has one home and the
+shared vocabulary (identity columns, session-id bounds) cannot drift.
+
 What is **not** here: job runs. `POST /jobs/:name/run` executes its own SQL
 through the same engine but is recorded in the separate jobs run ledger (see
 [jobs.md](jobs.md)), not in `query_audit`. An operator reasoning about

@@ -612,8 +612,9 @@ jobs:
       - name: Execute Integration tests
         env:
           # The query-audit Postgres-backend live suite
-          # (crates/query-audit/tests/pg_live.rs) — pointed at the job's
-          # postgres service; each test creates its own throwaway database.
+          # (crates/query-audit/tests/pg_live.rs and ledger_live.rs) —
+          # pointed at the job's postgres service; each test creates its own
+          # throwaway database.
           SKARDI_QUERY_AUDIT_LIVE_URL: postgres://skardi_user:skardi_pass@127.0.0.1:5432/mydb
         run: cargo llvm-cov --no-report nextest --all-features -- --ignored
 
