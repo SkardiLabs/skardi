@@ -58,6 +58,7 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 - Execute as a single partition producing one `RecordBatch` through a `MemoryStream`, as `DocumentsTable` does. Vaults are thousands of files, not millions; parsing them is tens to hundreds of milliseconds locally.
 - Scan each table independently. A query joining `notes` and `links` parses the vault twice. This is accepted for the first release in exchange for zero shared state; the cost is documented.
 - Support column projection and `LIMIT`; do not push filters down. DataFusion filters the in-memory batch.
+- Fail the scan, not the row, when every attempted read fails. A non-empty listing where no `get` succeeds — S3 credentials with `List` but not `Get`, or credentials expired after registration — must surface as an error naming the root and the first failure, not as three empty tables that look like an empty vault. This is the guard `documents` already applies (`parse.rs`, "all matched objects failed to fetch/parse"). The denominator is *attempted reads*: files skipped by policy (over `max_file_bytes`, symlinks) are not failures, so a vault whose only note is oversized yields an empty result with a warning, not a credentials error. A malformed frontmatter block is a kept row, not a failure. An empty listing is a valid, empty vault.
 - Order rows deterministically: `notes` by `path`; `links` by `from_path`, then frontmatter links in traversal order, then body links by `(line, occurrence)`; `tags` by `(path, tag, source)`.
 
 **Parsing**
@@ -79,7 +80,7 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 
 **Packaging**
 
-- Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]`.
+- Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]` in `crates/skardi`, and the same two-level mapping the siblings use in `crates/server/Cargo.toml`: `obsidian = ["skardi/obsidian"]`, since the server's `config.rs` arm is gated on the *server's* feature name. Without it, `cargo build -p skardi-server --features obsidian` is an unknown-feature error.
 - Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`), and extend its `list` in one bounded way: it takes `ListOptions { recursive, follow_symlinks }` and returns `Vec<BlobEntry { loc, rel_key, size, modified }>`, carrying the metadata both backends already have at listing time (`DirEntry::metadata()` locally, `ObjectMeta` on S3). `get` is unchanged. `documents` adapts to the new entry type and passes `follow_symlinks: true`, so its behavior does not change in this work; it simply ignores the two new fields. This is the one refactor in scope.
 - Enforce `max_file_bytes` from the listing's `size`, before any `get`. Without listing metadata the cap could only fire after a huge object was already in memory (S3 has no cheaper alternative than a HEAD per object), which would make the cap decorative.
 
@@ -183,7 +184,11 @@ Three `TableProvider`s sharing one `ExecutionPlan` implementation parameterized 
 
 ### `crates/server/src/config.rs`
 
-One `DataSourceType::Obsidian` arm, structured like the `Rss` arm: feature-gated, re-checking nothing the provider checks itself.
+One `DataSourceType::Obsidian` arm, structured like the `Rss` arm: gated on the server's `obsidian` feature, re-checking nothing the provider checks itself, with a `#[cfg(not(feature = "obsidian"))]` arm that fails registration with "obsidian data source type requires the `obsidian` feature to be enabled at build time" — the same shape as the `documents` and `rss` arms.
+
+### `crates/server/Cargo.toml`
+
+`obsidian = ["skardi/obsidian"]`, with a comment in the style of the `rss` entry.
 
 ## Configuration
 
@@ -298,7 +303,7 @@ A bare `[[Alias]]` whose text matches a note's `aliases` entry but no file name 
 ## Scan Execution
 
 1. `BlobStore::list(root, ListOptions { recursive: true, follow_symlinks: false })`. Paths are normalized to forward-slash relative form and filtered by `exclude_globs`. `.md` files are notes; every other path is an attachment candidate for the resolution index. Each entry's `size` and `modified` feed `notes.size_bytes` and `notes.modified_at` directly.
-2. Each note whose listed `size` exceeds `max_file_bytes` is skipped with a `tracing::warn!` naming the path and size — before any read. The rest are read with `BlobStore::get` and decoded lossily as UTF-8.
+2. Each note whose listed `size` exceeds `max_file_bytes` is skipped with a `tracing::warn!` naming the path and size — before any read. The rest are read with `BlobStore::get` and decoded lossily as UTF-8. A read that fails is skipped with a warning; if at least one read was attempted and every one failed, the scan stops here with an error naming the root, the attempted count, and the first failure (path and cause) — see Failure Modes.
 3. Frontmatter is split and parsed, and its string values are scanned for wikilinks; the body is walked for tags and raw links.
 4. The resolution index is built from all listed paths; every raw link is resolved.
 5. The requesting table projects its columns, applies `LIMIT`, and returns one `RecordBatch`.
@@ -315,7 +320,9 @@ Reads are sequential in the first release. Concurrency is an internal detail tha
 | Invalid UTF-8 | Row kept; lossy decode. |
 | File larger than `max_file_bytes` | File skipped before it is read (size comes from the listing); warning with path and size. Documented as the one case that drops a row. |
 | Symlinked file or directory inside the vault | Skipped at listing time; warning with path. |
-| Single file unreadable mid-scan (deleted, permission) | File skipped; warning with path. |
+| Some files unreadable mid-scan (deleted, permission) while others read | Failed files skipped; warning with path and cause; remaining rows returned. |
+| Every attempted read fails (S3 `List` without `Get`, credentials expired after registration, vault directory permissions) | Scan fails with a `DataFusionError::External` naming the root, the attempted count, and the first failure — never an empty result. Policy skips (size cap, symlinks) do not count as attempts. |
+| Vault lists no `.md` files (empty vault, or everything excluded/oversized) | Three empty tables; no error. Skips are still warned individually. |
 | Root becomes unreadable between registration and a scan | Scan fails with a `DataFusionError::External` naming the root. |
 | Link to a file that exists only case-differently | Resolves (`exact`/`name`), since matching is case-insensitive. |
 
@@ -332,6 +339,8 @@ All tests live in the crate, behind `feature = "obsidian"`, and run in CI with t
 - **Unit, pure functions.** `frontmatter::split`/`parse`: no block, valid block, malformed block, `...` terminator, `---` in body text, aliases as scalar/list/other, tags as list/string/`tag:` key. `frontmatter::links`: a quoted wikilink in a text property, several in a list property, one with `#heading|display`, one inside a nested map, an unquoted `[[x]]` (no link), a Markdown-style link (no link), a link inside `aliases`. `markdown::extract`: every wikilink variant (`|display`, `#heading`, `#^block`, embed, spaces and CJK in target, adjacent links, empty target), Markdown links and images, autolinks, external classification for `https:`/`mailto:`/`obsidian:`, tags at line start / after whitespace / rejected in `C#` and URLs and `# Heading` / rejected all-digit / nested `a/b` / trailing punctuation, everything inside fenced, indented, and inline code ignored, correct `line` numbers. `resolve::Index`: one case per row of the resolution table, including case-insensitivity, the `.md`-optional rule, and a bare alias resolving to `missing`.
 - **Fixture vault.** `crates/skardi/src/sources/providers/obsidian/fixtures/vault/` — a hand-written vault of roughly fifteen files covering every rule above plus `.obsidian/` and `.trash/` content that must not appear, an attachment, two same-named notes in different folders (ambiguity), a note declaring an alias plus one `[[Note|Alias]]` link to it (resolves through `Note`) and one bare `[[Alias]]` link (`missing`, found by the alias-repair query), and a note whose only inbound link is a frontmatter property on another note (so the in-degree and orphan queries are wrong unless frontmatter links are extracted). Tests register it and assert full table contents for all three tables, projection, `LIMIT`, deterministic order, and the two canonical graph queries (in-degree by `to_path`; orphan notes via anti-join).
 - **Registration.** Non-catalog rejected; read-write rejected; missing root rejected; unknown option rejected; default excludes applied; custom `exclude_globs` replaces the default; `max_file_bytes` skips and warns.
+- **Wholesale-failure guard.** Three cases on temp-directory copies of the fixture: an empty vault (no `.md`) returns three empty tables without error; every note made unreadable (`#[cfg(unix)]`, mode `000`; the test first checks that the file really is unreadable and skips itself when running as root) fails the scan with the root and the first path in the message; one note unreadable and the rest intact returns the intact rows and only warns. A fourth case: a vault whose only note exceeds a test-lowered `max_file_bytes` returns empty tables with a warning, not the guard's error.
+- **Server feature mapping.** `cargo build -p skardi-server --features obsidian` and `cargo build -p skardi-server` (no feature) both compile; the no-feature build's registration of a `type: obsidian` source fails with the "requires the `obsidian` feature" error, tested the way the `documents`/`rss` no-feature arms are.
 - **Blob move and `list` extension.** The existing `documents` tests continue to pass after `blob.rs` moves and `list` returns `BlobEntry`. New `blob` unit tests on a temp directory: `size` and `modified` match `fs::metadata`; a symlinked file and a symlinked directory (pointing outside the root) are skipped under `follow_symlinks: false` and included under `true`; `rel_key` is unchanged from today. `Loc::parse` tests for `s3://` URIs run under the `obsidian` feature alone.
 
 No live or mocked S3 test in the first release (see Non-goals).
@@ -343,7 +352,8 @@ No live or mocked S3 test in the first release (see Non-goals).
 - Every `resolution` value, every `kind` value, and both `links.source` values appear in the fixture results.
 - Editing a fixture note between two scans changes the second result with no restart.
 - `.obsidian/` and `.trash/` never appear; a symlink out of the vault is never read; a file over `max_file_bytes` is never read (verified by a fixture file whose size exceeds a test-lowered cap and a `get` that would fail if reached).
-- `cargo test -p skardi --lib --features obsidian` and the full library suite pass; `cargo fmt` and `cargo clippy` are clean; a build with `--features documents` alone and one with `--features obsidian` alone both compile.
+- An empty vault yields three empty tables; a non-empty vault whose every read fails yields an error naming the root, not empty tables; a partially unreadable vault yields the readable rows.
+- `cargo test -p skardi --lib --features obsidian` and the full library suite pass; `cargo fmt` and `cargo clippy` are clean; a build with `--features documents` alone and one with `--features obsidian` alone both compile for `skardi` **and** for `skardi-server`; a `skardi-server` build without the feature compiles and rejects a `type: obsidian` source with the build-capability error.
 
 ## Expected Repository Shape
 
@@ -356,7 +366,8 @@ crates/skardi/src/sources/providers/documents/    # imports super::blob; adapts 
 crates/skardi/src/sources/providers/obsidian/
   mod.rs  config.rs  frontmatter.rs  markdown.rs  resolve.rs  scan.rs  table.rs
   fixtures/vault/…
-crates/server/src/config.rs                       # DataSourceType::Obsidian arm
+crates/server/Cargo.toml                          # obsidian = ["skardi/obsidian"]
+crates/server/src/config.rs                       # DataSourceType::Obsidian arm (+ no-feature arm)
 docs/obsidian.md                                  # user documentation
 README.md                                         # source list entry
 ```
