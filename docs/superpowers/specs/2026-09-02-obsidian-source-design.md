@@ -22,7 +22,7 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 
 **The three structures have precise rules.** Frontmatter is a leading YAML block fenced by `---` lines. Tags are `#` followed by letters, digits, `_`, `-`, `/` (Unicode letters allowed), must contain at least one non-digit character, and are not recognized inside code. Links come in three syntaxes — `[[wikilinks]]` with optional `#heading`, `#^block`, and `|display` parts and an `!` prefix for embeds; standard Markdown `[text](target)`; and `<autolinks>` — and a bare wikilink target resolves against the whole vault by file name, with ambiguity possible when names repeat. Aliases are display text, not destinations: Obsidian's Aliases documentation says it "creates the link with the alias as its custom display text, for example `[[Artificial Intelligence|AI]]`" and, "rather than just using the alias as the link destination (`[[AI]]`)", does so deliberately for wikilink interoperability — a hand-written `[[AI]]` is an unresolved link in Obsidian. Links also live in frontmatter: Obsidian's Properties documentation states that Text and List properties "can contain … [[Internal links]] using the `[[Link]]` syntax" and that such links "must be surrounded with quotes" (a bare `[[x]]` is a nested YAML sequence). Only the wikilink syntax is recognized there; Markdown-style links in properties are plain text.
 
-**The existing `documents` source already solves file access.** Its `blob::BlobStore` abstracts "list a prefix, read a blob" over a local directory or an `s3://` prefix under an env-only credential contract. It is compiled behind the `documents` Cargo feature today, alongside the PDF tooling it was written for.
+**The existing `documents` source already solves file access.** Its `blob::BlobStore` abstracts "list a prefix, read a blob" over a local directory or an `s3://` prefix under an env-only credential contract. It is compiled behind the `documents` Cargo feature today, alongside the PDF tooling it was written for. Three details of its current shape matter here: `list` returns only `(Loc, rel_key)` — the S3 listing's `ObjectMeta.size` and `last_modified` are discarded and the local walk never calls `metadata()`; `get` buffers the whole object (`std::fs::read`, `bytes().to_vec()`); and the local walk decides directories with `Path::is_dir`, which follows symlinks. A size cap enforced before reading, non-null `size_bytes`/`modified_at`, and a no-symlink guarantee therefore all need a small, explicit extension of that API, not just a move.
 
 ## Goals
 
@@ -80,12 +80,13 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 **Packaging**
 
 - Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]`.
-- Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`). This is the one refactor in scope: the file moves, its API does not change, and `documents` keeps working unchanged.
+- Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`), and extend its `list` in one bounded way: it takes `ListOptions { recursive, follow_symlinks }` and returns `Vec<BlobEntry { loc, rel_key, size, modified }>`, carrying the metadata both backends already have at listing time (`DirEntry::metadata()` locally, `ObjectMeta` on S3). `get` is unchanged. `documents` adapts to the new entry type and passes `follow_symlinks: true`, so its behavior does not change in this work; it simply ignores the two new fields. This is the one refactor in scope.
+- Enforce `max_file_bytes` from the listing's `size`, before any `get`. Without listing metadata the cap could only fire after a huge object was already in memory (S3 has no cheaper alternative than a HEAD per object), which would make the cap decorative.
 
 **Security and trust boundary**
 
 - Treat the vault as trusted user data, not hostile input. There is no network egress, no HTML rendering, and no execution of anything found in a note. Parser robustness (malformed YAML, odd bytes, huge files) is a correctness concern, handled per file.
-- Do not follow symbolic links when listing. A symlink inside the vault pointing outside it would otherwise let `path: ~/vault` read arbitrary files. Symlinked files and directories are skipped.
+- Do not follow symbolic links when listing (`ListOptions::follow_symlinks = false`). A symlink inside the vault pointing outside it would otherwise let `path: ~/vault` read arbitrary files. Symlinked files and directories are skipped with a warning; detection uses `DirEntry::file_type()`, which does not follow links. This is a listing-time rule because the walk descends inside `list` — a caller cannot filter out a directory it has already been walked through. `documents` keeps following symlinks as it does today.
 - Cap per-file size (`max_file_bytes`, default 16 MiB). A file over the cap is skipped with a warning.
 - Inherit the `documents` S3 credential contract: credentials come only from the environment; any credential-shaped key in `options` is rejected at registration. Errors and logs carry paths, never file contents.
 
@@ -138,7 +139,19 @@ MemoryCatalogProvider <name>
 
 ### `sources/providers/blob.rs` (moved from `documents/blob.rs`)
 
-Unchanged API: `Loc::parse`, `BlobStore::resolve`, `list`, `get`. Gated on `any(feature = "documents", feature = "obsidian")`. `documents` imports it from the new location.
+`Loc::parse`, `BlobStore::resolve`, `get`, and `put` are unchanged. `list(prefix, ListOptions) -> Vec<BlobEntry>` replaces `list(prefix, recursive) -> Vec<(Loc, String)>`:
+
+```rust
+pub struct ListOptions { pub recursive: bool, pub follow_symlinks: bool }
+pub struct BlobEntry {
+    pub loc: Loc,
+    pub rel_key: String,             // relative to prefix, `/` separators (as today)
+    pub size: u64,                   // fs metadata len / ObjectMeta.size
+    pub modified: DateTime<Utc>,     // fs mtime / ObjectMeta.last_modified
+}
+```
+
+Locally, `follow_symlinks: false` skips any entry whose `DirEntry::file_type()` is a symlink; `true` reproduces today's `Path::is_dir` behavior. S3 has no symlinks; the flag is ignored there. Gated on `any(feature = "documents", feature = "obsidian")`. `documents` imports it from the new location, passes `follow_symlinks: true`, and destructures `BlobEntry` where it used the tuple.
 
 ### `sources/providers/obsidian/mod.rs`
 
@@ -284,8 +297,8 @@ A bare `[[Alias]]` whose text matches a note's `aliases` entry but no file name 
 
 ## Scan Execution
 
-1. `BlobStore::list(root, recursive = true)`, skipping symlinks. Paths are normalized to forward-slash relative form and filtered by `exclude_globs`. `.md` files are notes; every other path is an attachment candidate for the resolution index.
-2. Each note is read with `BlobStore::get`; a blob larger than `max_file_bytes` is skipped with a `tracing::warn!` naming the path. Bytes are decoded lossily as UTF-8.
+1. `BlobStore::list(root, ListOptions { recursive: true, follow_symlinks: false })`. Paths are normalized to forward-slash relative form and filtered by `exclude_globs`. `.md` files are notes; every other path is an attachment candidate for the resolution index. Each entry's `size` and `modified` feed `notes.size_bytes` and `notes.modified_at` directly.
+2. Each note whose listed `size` exceeds `max_file_bytes` is skipped with a `tracing::warn!` naming the path and size — before any read. The rest are read with `BlobStore::get` and decoded lossily as UTF-8.
 3. Frontmatter is split and parsed, and its string values are scanned for wikilinks; the body is walked for tags and raw links.
 4. The resolution index is built from all listed paths; every raw link is resolved.
 5. The requesting table projects its columns, applies `LIMIT`, and returns one `RecordBatch`.
@@ -300,7 +313,8 @@ Reads are sequential in the first release. Concurrency is an internal detail tha
 | `hierarchy_level` is not `catalog`; `access_mode: read_write`; unknown option key | Registration fails naming the offending field. |
 | Malformed frontmatter | Row kept; `frontmatter_json` NULL; `frontmatter_error` set. |
 | Invalid UTF-8 | Row kept; lossy decode. |
-| File larger than `max_file_bytes` | File skipped; warning with path. Documented as the one case that drops a row. |
+| File larger than `max_file_bytes` | File skipped before it is read (size comes from the listing); warning with path and size. Documented as the one case that drops a row. |
+| Symlinked file or directory inside the vault | Skipped at listing time; warning with path. |
 | Single file unreadable mid-scan (deleted, permission) | File skipped; warning with path. |
 | Root becomes unreadable between registration and a scan | Scan fails with a `DataFusionError::External` naming the root. |
 | Link to a file that exists only case-differently | Resolves (`exact`/`name`), since matching is case-insensitive. |
@@ -318,7 +332,7 @@ All tests live in the crate, behind `feature = "obsidian"`, and run in CI with t
 - **Unit, pure functions.** `frontmatter::split`/`parse`: no block, valid block, malformed block, `...` terminator, `---` in body text, aliases as scalar/list/other, tags as list/string/`tag:` key. `frontmatter::links`: a quoted wikilink in a text property, several in a list property, one with `#heading|display`, one inside a nested map, an unquoted `[[x]]` (no link), a Markdown-style link (no link), a link inside `aliases`. `markdown::extract`: every wikilink variant (`|display`, `#heading`, `#^block`, embed, spaces and CJK in target, adjacent links, empty target), Markdown links and images, autolinks, external classification for `https:`/`mailto:`/`obsidian:`, tags at line start / after whitespace / rejected in `C#` and URLs and `# Heading` / rejected all-digit / nested `a/b` / trailing punctuation, everything inside fenced, indented, and inline code ignored, correct `line` numbers. `resolve::Index`: one case per row of the resolution table, including case-insensitivity, the `.md`-optional rule, and a bare alias resolving to `missing`.
 - **Fixture vault.** `crates/skardi/src/sources/providers/obsidian/fixtures/vault/` — a hand-written vault of roughly fifteen files covering every rule above plus `.obsidian/` and `.trash/` content that must not appear, an attachment, two same-named notes in different folders (ambiguity), a note declaring an alias plus one `[[Note|Alias]]` link to it (resolves through `Note`) and one bare `[[Alias]]` link (`missing`, found by the alias-repair query), and a note whose only inbound link is a frontmatter property on another note (so the in-degree and orphan queries are wrong unless frontmatter links are extracted). Tests register it and assert full table contents for all three tables, projection, `LIMIT`, deterministic order, and the two canonical graph queries (in-degree by `to_path`; orphan notes via anti-join).
 - **Registration.** Non-catalog rejected; read-write rejected; missing root rejected; unknown option rejected; default excludes applied; custom `exclude_globs` replaces the default; `max_file_bytes` skips and warns.
-- **Blob move.** The existing `documents` tests continue to pass unchanged after `blob.rs` moves, and `Loc::parse` tests for `s3://` URIs run under the `obsidian` feature alone.
+- **Blob move and `list` extension.** The existing `documents` tests continue to pass after `blob.rs` moves and `list` returns `BlobEntry`. New `blob` unit tests on a temp directory: `size` and `modified` match `fs::metadata`; a symlinked file and a symlinked directory (pointing outside the root) are skipped under `follow_symlinks: false` and included under `true`; `rel_key` is unchanged from today. `Loc::parse` tests for `s3://` URIs run under the `obsidian` feature alone.
 
 No live or mocked S3 test in the first release (see Non-goals).
 
@@ -328,7 +342,7 @@ No live or mocked S3 test in the first release (see Non-goals).
 - Every column in the three schemas is non-NULL for at least one fixture row, and every documented NULL case appears in at least one.
 - Every `resolution` value, every `kind` value, and both `links.source` values appear in the fixture results.
 - Editing a fixture note between two scans changes the second result with no restart.
-- `.obsidian/` and `.trash/` never appear; a symlink out of the vault is never read.
+- `.obsidian/` and `.trash/` never appear; a symlink out of the vault is never read; a file over `max_file_bytes` is never read (verified by a fixture file whose size exceeds a test-lowered cap and a `get` that would fail if reached).
 - `cargo test -p skardi --lib --features obsidian` and the full library suite pass; `cargo fmt` and `cargo clippy` are clean; a build with `--features documents` alone and one with `--features obsidian` alone both compile.
 
 ## Expected Repository Shape
@@ -337,8 +351,8 @@ No live or mocked S3 test in the first release (see Non-goals).
 crates/skardi/Cargo.toml                          # obsidian feature; pulldown-cmark dep
 crates/skardi/src/sources/data_source_type.rs     # Obsidian variant
 crates/skardi/src/sources/providers/mod.rs        # pub mod blob (shared); pub mod obsidian
-crates/skardi/src/sources/providers/blob.rs       # moved from documents/blob.rs
-crates/skardi/src/sources/providers/documents/    # imports super::blob
+crates/skardi/src/sources/providers/blob.rs       # moved from documents/blob.rs; list → ListOptions / BlobEntry
+crates/skardi/src/sources/providers/documents/    # imports super::blob; adapts to BlobEntry, follow_symlinks: true
 crates/skardi/src/sources/providers/obsidian/
   mod.rs  config.rs  frontmatter.rs  markdown.rs  resolve.rs  scan.rs  table.rs
   fixtures/vault/…
