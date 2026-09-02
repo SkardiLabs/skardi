@@ -36,7 +36,7 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, Error, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -421,7 +421,7 @@ impl PgLedger {
     /// Construct the lazy pool (max 2 connections — the consumer's many
     /// processes share one PG) and spawn the writer. Makes NO connection:
     /// nothing about the ledger is boot-fatal.
-    pub fn spawn(dsn: &str) -> anyhow::Result<Self> {
+    pub fn spawn(dsn: &str) -> Result<Self> {
         Self::spawn_with_capacity(dsn, QUEUE_CAPACITY)
     }
 
@@ -440,17 +440,17 @@ impl PgLedger {
     /// internal tasks and deadlines live where the timer is. The READ path
     /// ([`read::list_page`]) runs on the caller's runtime and needs it
     /// sqlx-capable (timer enabled), like any sqlx call.
-    pub fn spawn_with_capacity(dsn: &str, capacity: usize) -> anyhow::Result<Self> {
+    pub fn spawn_with_capacity(dsn: &str, capacity: usize) -> Result<Self> {
         if capacity == 0 {
             // tokio's bounded channel PANICS on zero; this constructor
             // advertises Result, so invalid configuration must not be able
             // to take the process down.
-            anyhow::bail!("ledger queue capacity must be >= 1 (got 0)");
+            bail!("ledger queue capacity must be >= 1 (got 0)");
         }
         // The channel PANICS above the semaphore's permit ceiling too — the
         // upper twin of the zero check.
         if capacity > Semaphore::MAX_PERMITS {
-            anyhow::bail!(
+            bail!(
                 "ledger queue capacity must be <= {} (got {capacity})",
                 Semaphore::MAX_PERMITS
             );
@@ -474,7 +474,7 @@ impl PgLedger {
         // writer runtime so sqlx's internal tasks and deadlines live where
         // the timer is — or the build error; connect_lazy_with itself is
         // infallible and does no I/O, so the recv is microseconds.
-        let (pool_tx, pool_rx) = sync_channel::<anyhow::Result<PgPool>>(1);
+        let (pool_tx, pool_rx) = sync_channel::<Result<PgPool>>(1);
         let writer_control = writer.clone();
         thread::Builder::new()
             .name("skardi-ledger-writer".to_string())
@@ -482,10 +482,9 @@ impl PgLedger {
                 let runtime = match Builder::new_current_thread().enable_all().build() {
                     Ok(runtime) => runtime,
                     Err(e) => {
-                        let _ =
-                            pool_tx
-                                .send(Err(anyhow::Error::from(e)
-                                    .context("build the ledger writer's runtime")));
+                        let _ = pool_tx.send(Err(
+                            Error::from(e).context("build the ledger writer's runtime")
+                        ));
                         return;
                     }
                 };
