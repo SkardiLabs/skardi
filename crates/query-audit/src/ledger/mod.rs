@@ -357,7 +357,7 @@ fn scrub_nul(s: &str) -> String {
 
 /// True when any string in the document — values or object KEYS — contains
 /// U+0000, which JSONB cannot represent.
-fn json_contains_nul(v: &serde_json::Value) -> bool {
+fn json_contains_nul(v: &Value) -> bool {
     match v {
         Value::String(s) => s.contains('\0'),
         Value::Array(a) => a.iter().any(json_contains_nul),
