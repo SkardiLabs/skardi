@@ -29,16 +29,20 @@ pub mod queries;
 pub mod read;
 pub mod writer;
 
+use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc, watch};
+use tokio::time::sleep;
 
 /// `sql` is truncated to this at ROW ASSEMBLY: the learn loop wants
 /// patterns, not megabyte literals, and bounding at ingestion is what keeps
@@ -139,7 +143,7 @@ pub const FLUSH_BATCH_ROWS: usize = 64;
 
 /// Wall-clock bound on one flush. A slow PG drops the batch (counted),
 /// never stalls the writer behind an unbounded await.
-pub const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Loss accounting: dropped is never silent. The consumer renders this into
 /// its own metrics surface.
@@ -394,7 +398,7 @@ fn truncate_utf8(s: &str, max: usize) -> (String, bool) {
 #[derive(Clone)]
 pub struct PgLedger {
     tx: mpsc::Sender<LedgerRow>,
-    pool: sqlx::PgPool,
+    pool: PgPool,
     writer: Arc<WriterControl>,
 }
 
@@ -439,6 +443,22 @@ impl PgLedger {
             "the ledger writer needs a running Tokio runtime; construct the \
              ledger from within one",
         )?;
+        // A current handle proves a RUNTIME, not a TIMER: a runtime built
+        // without `enable_time` lets construction succeed and then panics at
+        // the writer's first `timeout` — inside the detached task, killing
+        // it and losing accepted rows with neither counter touched. Probe
+        // the timer here by creating (never awaiting) a zero Sleep,
+        // converting tokio's panic into this constructor's Result. The one
+        // stderr panic line in the misconfigured case accompanies an actual
+        // configuration error being reported.
+        if catch_unwind(|| drop(sleep(Duration::ZERO))).is_err() {
+            anyhow::bail!(
+                "the ledger writer needs a Tokio runtime with its timer \
+                 enabled (enable_time / enable_all); this one has no timer \
+                 driver, and the flush deadline would panic inside the \
+                 writer task"
+            );
+        }
         let pool = PgPoolOptions::new().max_connections(2).connect_lazy(dsn)?;
         let (tx, rx) = mpsc::channel(capacity);
         let (done_tx, done_rx) = watch::channel(false);
@@ -488,7 +508,7 @@ impl PgLedger {
         }
     }
 
-    pub fn pool(&self) -> &sqlx::PgPool {
+    pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 }
@@ -606,6 +626,24 @@ mod tests {
         assert_eq!(decimal_len_estimate("42"), 2);
         assert_eq!(decimal_len_estimate("-3.25"), 5);
         assert!(decimal_len_estimate("1e18446744073709551615") > 1_000_000);
+    }
+
+    /// A runtime WITHOUT `enable_time` passes the handle check but would
+    /// panic at the writer's first flush deadline — construction must
+    /// refuse it instead (the panic would land inside the detached task,
+    /// losing rows uncounted).
+    #[test]
+    fn a_runtime_without_a_timer_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime without enable_time");
+        let err = rt.block_on(async {
+            match PgLedger::spawn("postgres://u:p@192.0.2.1:5432/x") {
+                Ok(_) => panic!("must refuse a timerless runtime"),
+                Err(e) => e,
+            }
+        });
+        assert!(err.to_string().contains("timer"), "{err}");
     }
 
     /// `tokio::spawn` panics outside a runtime; the synchronous constructor

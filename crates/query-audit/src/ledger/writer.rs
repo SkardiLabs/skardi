@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
+use tokio::time::timeout;
 
 use super::{FLUSH_BATCH_ROWS, FLUSH_TIMEOUT, LedgerRow, METRICS, WriterControl, queries};
 
@@ -76,7 +77,7 @@ async fn flush(pool: &PgPool, batch: &[LedgerRow]) {
             .push_bind(&row.error);
     });
     let fut = qb.build().execute(pool);
-    let outcome = tokio::time::timeout(FLUSH_TIMEOUT, fut).await;
+    let outcome = timeout(FLUSH_TIMEOUT, fut).await;
     let err: Option<String> = match outcome {
         Ok(Ok(_)) => None,
         Ok(Err(e)) => Some(e.to_string()),

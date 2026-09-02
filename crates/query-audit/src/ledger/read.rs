@@ -10,7 +10,8 @@
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
+use sqlx::postgres::PgRow;
+use sqlx::{Error as SqlxError, PgPool, Row};
 
 use super::{ERROR_MAX_BYTES, SQL_MAX_BYTES, queries};
 
@@ -64,7 +65,7 @@ pub enum ReadError {
     BadRequest(String),
     /// Backend-shaped: PG unreachable or the query failed (503; the ledger
     /// is degraded, the caller should retry).
-    Unavailable(sqlx::Error),
+    Unavailable(SqlxError),
 }
 
 impl std::fmt::Display for ReadError {
@@ -191,7 +192,7 @@ pub async fn list_page(pool: &PgPool, workspace: &str, q: PageQuery) -> Result<V
 /// bounded (see [`READ_FIELD_MAX_BYTES`]). Carries the keyset key in a
 /// private `__created_at_key` member that [`strip_key`] removes, so the
 /// caller never sees it and the loop never re-parses RFC 3339.
-fn serialize_row(row: &sqlx::postgres::PgRow) -> Result<Value, sqlx::Error> {
+fn serialize_row(row: &PgRow) -> Result<Value, SqlxError> {
     fn bound(s: String, max: usize) -> String {
         if s.len() <= max {
             return s;
@@ -261,7 +262,7 @@ mod tests {
         assert_eq!(bad.to_string(), "limit must be >= 1");
         assert!(std::error::Error::source(&bad).is_none());
 
-        let unavailable = ReadError::Unavailable(sqlx::Error::PoolClosed);
+        let unavailable = ReadError::Unavailable(SqlxError::PoolClosed);
         assert_eq!(unavailable.to_string(), "ledger read failed");
         let src = std::error::Error::source(&unavailable).expect("driver cause");
         assert!(src.to_string().contains("closed"), "{src}");
