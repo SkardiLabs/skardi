@@ -630,3 +630,63 @@ async fn schema_drift_is_a_read_error_not_a_panic() {
         .expect_err("drift must be an error, not a panic");
     assert!(matches!(err, read::ReadError::Unavailable(_)), "got {err}");
 }
+
+/// Graceful shutdown drains: rows enqueued before shutdown() LAND (the
+/// drain hands the backlog to a final flush instead of dying with the
+/// runtime), and rows recorded after are counted as channel losses — the
+/// loss-is-never-silent contract survives a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs SKARDI_QUERY_AUDIT_LIVE_URL"]
+async fn shutdown_drains_the_queue_before_exiting() {
+    let Some(url) = live_url() else { return };
+    let (dsn, pool) = fresh_db(&url).await;
+    let pg = PgLedger::spawn(&dsn).expect("pool");
+    for i in 0..10 {
+        pg.record(draft(WS, "SELECT 1", &format!("r-drain-{i}")).finish(
+            RowStatus::Succeeded,
+            Some(1),
+            None,
+        ));
+    }
+    pg.shutdown().await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM query_ledger")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        n, 10,
+        "every accepted row must land before shutdown returns"
+    );
+
+    // Post-shutdown rows are refused by the closed channel and COUNTED.
+    let before = ledger::METRICS
+        .insert_failures_channel_full
+        .load(std::sync::atomic::Ordering::Relaxed);
+    pg.record(draft(WS, "SELECT 1", "r-late").finish(RowStatus::Succeeded, Some(1), None));
+    let after = ledger::METRICS
+        .insert_failures_channel_full
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after - before, 1, "a post-shutdown row is a counted loss");
+}
+
+/// Shutdown against an unreachable server still terminates (the drain's
+/// final flush pays its bound, fails, COUNTS the batch) — a stalled PG must
+/// not turn graceful shutdown into a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_a_dead_server_counts_and_returns() {
+    let pg = PgLedger::spawn("postgres://u:p@192.0.2.1:5432/skardi_ledger").expect("lazy pool");
+    let before = ledger::METRICS
+        .insert_failures_pg
+        .load(std::sync::atomic::Ordering::Relaxed);
+    pg.record(draft(WS, "SELECT 1", "r-dead-drain").finish(RowStatus::Succeeded, Some(1), None));
+    tokio::time::timeout(Duration::from_secs(20), pg.shutdown())
+        .await
+        .expect("shutdown must complete within the flush bound, not hang");
+    let after = ledger::METRICS
+        .insert_failures_pg
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "the drained-but-unflushable batch is counted"
+    );
+}

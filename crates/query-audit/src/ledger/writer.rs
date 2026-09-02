@@ -10,20 +10,35 @@ use std::sync::atomic::Ordering;
 use sqlx::PgPool;
 use tokio::sync::mpsc::Receiver;
 
-use super::{FLUSH_BATCH_ROWS, FLUSH_TIMEOUT, LedgerRow, METRICS, queries};
+use super::{FLUSH_BATCH_ROWS, FLUSH_TIMEOUT, LedgerRow, METRICS, WriterControl, queries};
 
-pub async fn run(pool: PgPool, mut rx: Receiver<LedgerRow>) {
+pub(crate) async fn run(
+    pool: PgPool,
+    mut rx: Receiver<LedgerRow>,
+    control: std::sync::Arc<WriterControl>,
+) {
     let mut batch: Vec<LedgerRow> = Vec::with_capacity(FLUSH_BATCH_ROWS);
     loop {
         batch.clear();
         // Block for the first row, then drain whatever else is queued up to
         // the batch bound — natural batching under load, no ticker at rest.
-        let n = rx.recv_many(&mut batch, FLUSH_BATCH_ROWS).await;
-        if n == 0 {
-            // Channel closed: the handle is gone, the process is winding down.
-            return;
+        // The drain signal closes the receiver: senders start failing fast
+        // (counted by `record` as channel losses) while recv_many hands over
+        // everything already buffered, then returns 0 and the task exits —
+        // the graceful path never abandons an accepted row.
+        tokio::select! {
+            n = rx.recv_many(&mut batch, FLUSH_BATCH_ROWS) => {
+                if n == 0 {
+                    // Channel closed and drained: every sender is gone, or a
+                    // shutdown finished handing over the backlog.
+                    return;
+                }
+                flush(&pool, &batch).await;
+            }
+            _ = control.drain.notified() => {
+                rx.close();
+            }
         }
-        flush(&pool, &batch).await;
     }
 }
 

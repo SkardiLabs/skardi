@@ -304,11 +304,23 @@ fn truncate_utf8(s: &str, max: usize) -> (String, bool) {
 }
 
 /// The queued recorder: a bounded queue into the writer task and the lazy
-/// pool the read path shares. Cloning shares both.
+/// pool the read path shares. Cloning shares both, and the writer's handle
+/// (see [`Self::shutdown`]).
 #[derive(Clone)]
 pub struct PgLedger {
     tx: tokio::sync::mpsc::Sender<LedgerRow>,
     pool: sqlx::PgPool,
+    writer: std::sync::Arc<WriterControl>,
+}
+
+/// The writer task's shutdown plumbing. Held behind an `Arc` so every clone
+/// of the handle can trigger and await the same drain.
+pub(crate) struct WriterControl {
+    /// Signals the writer to close its receiver and drain what is buffered.
+    pub(crate) drain: tokio::sync::Notify,
+    /// The writer's JoinHandle, kept — a detached task dies WITH the runtime,
+    /// mid-flush, and rows lost that way would be counted by nobody.
+    handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl PgLedger {
@@ -328,8 +340,37 @@ impl PgLedger {
             .max_connections(2)
             .connect_lazy(dsn)?;
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
-        tokio::spawn(writer::run(pool.clone(), rx));
-        Ok(Self { tx, pool })
+        let writer = std::sync::Arc::new(WriterControl {
+            drain: tokio::sync::Notify::new(),
+            handle: std::sync::Mutex::new(None),
+        });
+        let handle = tokio::spawn(writer::run(pool.clone(), rx, writer.clone()));
+        *writer.handle.lock().expect("fresh mutex") = Some(handle);
+        Ok(Self { tx, pool, writer })
+    }
+
+    /// Graceful shutdown: signal the writer to stop accepting rows, drain and
+    /// flush everything already queued, and wait for it to finish. Call this
+    /// before letting the Tokio runtime wind down — a detached writer is
+    /// aborted WITH the runtime, mid-flush, and rows lost that way are
+    /// counted by nobody, which would break the loss-is-never-silent
+    /// contract. After shutdown, [`Self::record`] counts every further row
+    /// as a channel loss (the same accounting as a full queue).
+    ///
+    /// Unbounded by design — the drain is at most `capacity / FLUSH_BATCH`
+    /// flushes of [`FLUSH_TIMEOUT`] each; a caller with a deadline wraps
+    /// this in `tokio::time::timeout`, and rows still queued at a HARD
+    /// abort remain the accepted pod-crash loss class. Concurrent callers:
+    /// the first drives the drain; later calls return once it is done (the
+    /// handle is taken exactly once).
+    pub async fn shutdown(&self) {
+        self.writer.drain.notify_one();
+        let handle = self.writer.handle.lock().expect("writer mutex").take();
+        if let Some(handle) = handle {
+            // A panicked writer is already logged by the runtime; shutdown's
+            // job is only to not leave rows behind silently.
+            let _ = handle.await;
+        }
     }
 
     /// Enqueue one decided row. Never waits, never errors to the caller: a
