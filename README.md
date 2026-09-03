@@ -121,6 +121,7 @@ skardi run weekly-churn -p window='7 days'
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
 # same pipeline as an MCP tool — hosts that spawn a local process (Claude Desktop, …)
+# from a source checkout until `skardi mcp` ships in a tagged release
 skardi mcp
 # … and as remote MCP — hosts that only take a URL (claude.ai, hosted agents):
 # the server above already serves http://localhost:8080/mcp. With auth enabled
@@ -137,9 +138,11 @@ acting on *intentions*: when every weekday morning ends with the same GitHub +
 Slack queries, each declaring `purpose: "daily standup"`, the pattern isn't a
 pipeline — it's a routine, and any harness that can run an agent on a schedule
 (Claude Code routines, a cron-driven CLI run) can have the standup drafted
-before anyone asks. And because the ledger is one SQLite file, you can hand a
-window of it to an LLM and ask what keeps being needed that nobody turned into a
-tool — recurring intentions the user hasn't noticed yet. One boundary is yours
+before anyone asks. And because the ledger is one SQLite file (or one
+Postgres database, via `SKARDI_QUERY_AUDIT_PG_DSN` — same fail-closed
+contract, storage swapped), you can hand a window of it to an LLM and ask
+what keeps being needed that nobody turned into a tool — recurring
+intentions the user hasn't noticed yet. One boundary is yours
 to set: ledger rows carry raw SQL, literals included, so keep that analysis on a
 local model or redact first — sending a window to a hosted LLM should be a
 deliberate opt-in, not a default. Both land as skills on
@@ -174,21 +177,51 @@ scratch.
 
 ## Install
 
-**Claude Code** — the fastest path. A skill that stands the whole thing up for
-you:
+Two skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
+turns a folder of documents — or a datastore you already run — into governed,
+searchable context served over HTTP by `skardi-server`: hybrid search (vector +
+FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
+pointed at Postgres + pgvector, MongoDB, or Lance.
+[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
+teaches the agent to answer questions from a `skardi-server` you already run.
+
+Both run on every [Agent Skills](https://agentskills.io/) host below. They
+differ only in where the skill directory goes.
+
+**Claude Code** installs from the marketplace:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
 /plugin install auto-context@skardi-skills
 ```
 
-[`auto_context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto_context)
-turns a folder of documents — or a datastore you already run — into governed,
-searchable context served over HTTP by `skardi-server`: hybrid search (vector +
-FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
-pointed at Postgres + pgvector, MongoDB, or Lance. The same skill also runs on
-Codex, Cursor, Pi, dsh, OpenClaw, and Hermes; per-host installation instructions
-are in the [skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
+Every other host installs from a checkout:
+
+```bash
+git clone https://github.com/SkardiLabs/skardi-skills.git && cd skardi-skills
+```
+
+**Codex, Cursor, Pi, dsh and OpenCode** all read the cross-tool
+`~/.agents/skills/` convention, so one copy covers all five:
+
+```bash
+mkdir -p ~/.agents/skills
+cp -r auto-context/skills/auto-context ~/.agents/skills/auto-context
+cp -r retrieval/skills/retrieval ~/.agents/skills/retrieval
+```
+
+**[OpenClaw](https://docs.openclaw.ai/cli/skills)** installs through its own CLI
+instead of copying, and **[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)**
+reads `~/.hermes/skills/`:
+
+```bash
+openclaw skills install ./auto-context/skills/auto-context   # add --global for every workspace
+mkdir -p ~/.hermes/skills && cp -r auto-context/skills/auto-context ~/.hermes/skills/auto-context
+```
+
+Per-host native directories, project-scoped installs and the Hermes
+`external_dirs` option are covered in the
+[skardi-skills README](https://github.com/SkardiLabs/skardi-skills#installation).
 
 **CLI** — pre-built for `x86_64`/`aarch64` Linux and Apple Silicon (Intel Macs:
 build from source — the one-liner below has no published artifact there):
@@ -202,9 +235,20 @@ sudo mv skardi /usr/local/bin/
 
 ```bash
 git clone https://github.com/SkardiLabs/skardi.git && cd skardi
-cargo build --release -p skardi-server     # add --features rag for embedding + chunk UDFs
-cargo install --locked --path crates/cli   # the CLI, from the same checkout
+cargo build --release -p skardi-server --features candle,chunking   # local embeddings + chunk(); pure Rust
+cargo install --locked --path crates/cli                            # the CLI, from the same checkout
 ```
+
+That gives the retrieval skills what they need — `chunk()` plus a local
+embedding UDF — and builds with cargo alone. (`chunking` is already a default
+server feature; naming it keeps the line correct against older tags.)
+
+**`--features rag` widens that to all four embedding backends, and one of them
+— `gguf` — compiles llama.cpp through `cmake`, so that build needs `cmake` and a
+C++ toolchain on the machine.** Reach for `rag` when you want `gguf`, `onnx` or
+`remote_embed`; otherwise the line above is the cheaper build. Or skip building
+altogether and run a published server image that ships the embedding backends
+(see **Docker & cloud** under More).
 
 ---
 
@@ -280,13 +324,24 @@ infrastructure layer. See [docs/rss.md](docs/rss.md).
 docker run --rm -p 8080:8080 \
   -v /path/to/ctx.yaml:/config/ctx.yaml \
   -v /path/to/pipelines:/config/pipelines \
-  ghcr.io/skardilabs/skardi/skardi-server:latest \
+  ghcr.io/skardilabs/skardi/skardi-server-lite:latest \
   --ctx /config/ctx.yaml --pipeline /config/pipelines --port 8080
 ```
 
-Use the `skardi-server-rag` tag for the embedding + chunk UDFs, or build locally
-with `docker build -t skardi .` (`--build-arg FEATURES=rag`). The fastest cloud
-path is the [Sealos](https://sealos.io/products/app-store/skardi/) template.
+Two images are published per release: `skardi-server-lite` (default build —
+chunking only) and `skardi-server-full` (every stable feature: RAG/embedding,
+LLM extraction, documents, RSS). For anything in between, build locally with
+`docker build -t skardi --build-arg FEATURES=<flags> .` (e.g. `FEATURES=rag`).
+The fastest cloud path is the
+[Sealos](https://sealos.io/products/app-store/skardi/) template.
+
+The full image's `documents` support is **PDF-only**: it ships PDFium, but not
+the LibreOffice/ImageMagick converters that Office/ODF/image inputs need, and
+OCR is HTTP-only (`ocr_server_url`) in every build. For a non-PDF corpus,
+derive an image that installs those tools —
+`FROM ghcr.io/skardilabs/skardi/skardi-server-full:latest` plus
+`apt-get install -y libreoffice imagemagick`. See
+[docs/documents.md](docs/documents.md).
 
 </details>
 
