@@ -60,7 +60,7 @@ fn allowed_hosts(state: &AppState) -> Vec<String> {
         state
             .config
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .args
             .mcp_allowed_hosts
             .iter()
