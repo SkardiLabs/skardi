@@ -661,7 +661,7 @@ mod tests {
         let note = parse_note(
             "Projects/Design.md",
             42,
-            chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH),
+            DateTime::<Utc>::from(std::time::UNIX_EPOCH),
             text,
             &index,
         );
