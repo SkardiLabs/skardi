@@ -9750,6 +9750,7 @@ dependencies = [
  "skardi-mcp-core",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]
@@ -9761,6 +9762,7 @@ dependencies = [
  "percent-encoding",
  "rmcp",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

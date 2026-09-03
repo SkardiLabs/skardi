@@ -54,14 +54,14 @@ fn assign_tool_names(original_names: &[&str]) -> Vec<(String, String)> {
     for original in sorted {
         let mut candidate = sanitize(original);
         if candidate.is_empty() {
-            eprintln!(
-                "warning: pipeline name '{original}' sanitizes to an empty MCP tool name; exposing it as `pipeline`"
+            tracing::warn!(
+                "pipeline name '{original}' sanitizes to an empty MCP tool name; exposing it as `pipeline`"
             );
             candidate = "pipeline".to_string();
         }
         if RESERVED_NAMES.contains(&candidate.as_str()) {
-            eprintln!(
-                "warning: pipeline '{original}' collides with the built-in `{candidate}` tool; exposing it as `{candidate}_pipeline`"
+            tracing::warn!(
+                "pipeline '{original}' collides with the built-in `{candidate}` tool; exposing it as `{candidate}_pipeline`"
             );
             candidate = format!("{candidate}_pipeline");
             candidate.truncate(MAX_TOOL_NAME);
@@ -115,8 +115,8 @@ fn pipeline_tool(tool_name: &str, pipeline_name: &str, entry: &Value) -> Tool {
     // `parameters: []` is a real zero-parameter pipeline and keeps the
     // closed empty schema below.
     let Some(params) = entry.get("parameters").and_then(Value::as_array) else {
-        eprintln!(
-            "warning: pipeline '{pipeline_name}' carries no `parameters` in the inventory \
+        tracing::warn!(
+            "pipeline '{pipeline_name}' carries no `parameters` in the inventory \
              (skardi-server older than the CLI?); publishing an open input schema"
         );
         let open_schema: JsonObject = serde_json::from_value(json!({

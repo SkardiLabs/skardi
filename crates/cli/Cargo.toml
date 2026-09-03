@@ -28,6 +28,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # axum dependency (verified against the 3.1.4 source), so no axum skew either way.
 rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
 skardi-mcp-core = { path = "../mcp-core" }
+# mcp-core emits its projection warnings via `tracing`; the bridge installs a
+# stderr subscriber (stdout is the JSON-RPC channel) so hosts still see them.
+tracing-subscriber = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

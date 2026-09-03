@@ -15,6 +15,10 @@ license.workspace = true
 rmcp = { version = "=3.1.4", default-features = false }
 percent-encoding = "2.3"
 serde_json = { workspace = true }
+# Projection warnings (name collisions, missing inventory fields) go through
+# tracing: the server routes them into its structured logs, and the stdio
+# bridge installs a stderr subscriber so hosts still see them.
+tracing = { workspace = true }
 
 [lints]
 workspace = true
